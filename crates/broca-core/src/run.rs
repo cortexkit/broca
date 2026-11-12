@@ -9661,6 +9661,7 @@ fn attempt_hook_error(detail: impl std::fmt::Display) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -10349,7 +10350,7 @@ async fn run_step<P: Provider>(
             limit_window: None,
             account_ref: None,
             credential_id: None,
-            affordable_max_tokens: None, },
+            affordable_max_tokens: None, account_continue: None, },
         },
     })
 }
@@ -13746,7 +13747,7 @@ mod tests {
             limit_window: None,
             account_ref: None,
             credential_id: None,
-            affordable_max_tokens: None, },
+            affordable_max_tokens: None, account_continue: None, },
             retries_used: 0,
         })
     }

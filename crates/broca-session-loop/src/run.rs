@@ -250,6 +250,47 @@ pub struct Seams<'a, P, T> {
     /// The credential source requires sign-in before another model call. A held resume first
     /// syncs the results already supplied by its tool provider, then records the auth pause.
     pub pause_for_auth_at_start: Option<ProviderError>,
+    /// Asks for another provider account when a step's account has spent its usage window and
+    /// the run would otherwise end (see [`crate::account_move`]). Without it such a step ends
+    /// the run, as before.
+    pub account_continue: Option<&'a dyn crate::account_move::AccountContinue<P>>,
+}
+
+impl<'a, P, T> Seams<'a, P, T> {
+    /// These seams, with the run moved to another account: `provider` sends on it and
+    /// `auth_selection` names it.
+    fn moved_to<'b>(
+        &'b self,
+        provider: &'b P,
+        auth_selection: broca_wal::AuthSelection,
+    ) -> Seams<'b, P, T> {
+        Seams {
+            provider,
+            tools: self.tools,
+            bind: self.bind.clone(),
+            out: self.out,
+            cancel: self.cancel.clone(),
+            stop: self.stop.clone(),
+            held: self.held,
+            approval: self.approval,
+            hook_plane: self.hook_plane.clone(),
+            now_ms: self.now_ms,
+            session_address: self.session_address.clone(),
+            compaction_plane: self.compaction_plane,
+            compaction_session: self.compaction_session.clone(),
+            compaction_changes: self.compaction_changes,
+            keep_warm: self.keep_warm.clone(),
+            account_reports: self.account_reports.clone(),
+            max_same_account_wait: self.max_same_account_wait,
+            auth_selection: Some(auth_selection),
+            step_progress: self.step_progress.clone(),
+            model_call_ready: self.model_call_ready.clone(),
+            // A sign-in the credential needed at the run's start was dealt with before any
+            // step, so a move, which happens inside a step, has none to make.
+            pause_for_auth_at_start: None,
+            account_continue: self.account_continue,
+        }
+    }
 }
 
 /// Something a run's model calls wait for (see [`Seams::model_call_ready`]).
@@ -272,6 +313,10 @@ pub trait AccountReports: Send + Sync {
     fn run_started(&self, event_id: &str, seq: u64);
     /// A provider attempt's record was appended at `seq`.
     fn attempt_recorded(&self, event_id: &str, seq: u64, attempt: &ModelAttempt);
+    /// The run moved to the account `selection` names at a quota wall, and the record that
+    /// says so, at `seq`, is durable. Reported once per move, before any attempt on that
+    /// account. The default reports nothing.
+    fn account_moved(&self, _event_id: &str, _seq: u64, _selection: &broca_wal::AuthSelection) {}
 }
 
 /// The id an account report names a record by: the session's id and the record's seq.
@@ -1538,6 +1583,33 @@ pub fn run_config_of_start(
     serde_json::from_value(Value::Object(config)).map_err(|e| LoopError::Parts(e.to_string()))
 }
 
+/// The run's frozen config as it renders and bills now: its start's, with the render config and
+/// the account its refreezes recorded since applied, as [`frozen_admission`] reads them.
+///
+/// A resume is admitted from this, so a run that moved to another account at a quota wall
+/// resumes on the account it moved to, with that account's render config. A resume never asks
+/// routing again; admitting it from the start's config would instead send it back to the
+/// account that refused it, and its provider would render a config the run no longer froze.
+pub fn run_config_of_run(
+    run: &broca_session_store::fold::operations::Run,
+    parts: &dyn Parts,
+) -> Result<broca_wal::RunConfig, LoopError> {
+    let start = run.start.as_ref().ok_or(LoopError::Unsupported(
+        "a run whose start isn't in the fold",
+    ))?;
+    let mut config = run_config_of_start(start, parts)?;
+    if let Some(refrozen) = &run.refrozen_render {
+        config.frozen_render_config = refrozen["render_config"].clone();
+        if let Some(version) = decode::<u32>(Some(refrozen["renderer_version"].clone()))? {
+            config.renderer_version = version;
+        }
+    }
+    if let Some(selection) = &run.refrozen_auth {
+        config.auth_selection = decode(Some(selection.clone()))?;
+    }
+    Ok(config)
+}
+
 /// The admission a run's start froze: its model, settings, tools and system text, read back from
 /// the setup parts the start names.
 pub fn admission_of_start(
@@ -1909,6 +1981,10 @@ fn finalize_tool_choice<W: Writer>(writer: &W, opts: &mut CallOptions) -> bool {
 }
 
 /// Model steps and tool batches from the run's current state until a decision ends the run.
+///
+/// A step whose account spent its usage window may move the run to another account (see
+/// [`crate::account_move`]): the step is then entered again on the new account's provider, under
+/// the selection and render config the move made durable, until the run ends or moves again.
 async fn drive<W, P, T>(
     writer: &mut W,
     parts: &dyn Parts,
@@ -1921,9 +1997,90 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    let mut moving = None;
+    let finished = drive_from(
+        writer,
+        parts,
+        admission,
+        seams,
+        compaction,
+        None,
+        &mut moving,
+    )
+    .await?;
+    let Some(mut next) = moving.take() else {
+        return Ok(finished);
+    };
+    // The account the run left is not sent to again by this run.
+    seams.provider.close_run_transport();
+    loop {
+        let run = run_state(writer);
+        let structured_downgraded = run.structured_downgraded;
+        // The run goes on under what the move refroze, as a resume reads it back.
+        let admission = frozen_admission(run, parts)?;
+        let crate::account_move::Moving { moved, reentry } = next;
+        // A strict schema the run already downgraded stays downgraded on the new provider, which
+        // was built from the run's frozen config without it.
+        if structured_downgraded {
+            moved.provider.downgrade_structured_output();
+        }
+        // The new account's provider owns its transport for the rest of the run, as the run's
+        // own provider does: bound to the session, seeded with what the log says the new
+        // account last accepted (which a timed pause on it weighs), and completed or closed
+        // with the run's end, or closed at the next move.
+        let mut transport = crate::transport::Guard::bind(&moved.provider, &seams.bind);
+        crate::transport::seed(
+            &*writer,
+            &moved.provider,
+            moved.selection.account_ref.as_deref(),
+            &admission.render_config,
+            (seams.now_ms)(),
+        )
+        .await?;
+        let moved_seams = seams.moved_to(&moved.provider, moved.selection.clone());
+        let finished = drive_from(
+            writer,
+            parts,
+            &admission,
+            &moved_seams,
+            compaction,
+            Some(reentry),
+            &mut moving,
+        )
+        .await?;
+        let Some(again) = moving.take() else {
+            transport.finished(&finished);
+            return Ok(finished);
+        };
+        drop(transport);
+        next = again;
+    }
+}
+
+/// [`drive`], from the run's current state or, with `reentry`, from inside the step a move
+/// interrupted. A move at a wall puts what it made durable in `moving` and returns a placeholder
+/// the caller discards.
+async fn drive_from<W, P, T>(
+    writer: &mut W,
+    parts: &dyn Parts,
+    admission: &Admission,
+    seams: &Seams<'_, P, T>,
+    compaction: Option<&crate::compaction::Ctx>,
+    mut reentry: Option<crate::account_move::Reentry>,
+    moving: &mut Option<crate::account_move::Moving<P>>,
+) -> Result<Finished, LoopError>
+where
+    W: Writer,
+    P: Provider,
+    T: ToolPlane,
+{
     let warming = Warming::of(admission, seams);
-    // The pause a timed same-account wait left, which the step it resumes must match.
-    let mut account_limit_replay = account_limit_of(writer)?;
+    // The pause a timed same-account wait left, which the step it resumes must match. A step
+    // entered again after a move resumes no pause.
+    let mut account_limit_replay = match reentry {
+        Some(_) => None,
+        None => account_limit_of(writer)?,
+    };
     // Each window run's place in the prompt and render config, and the signed floor its runs'
     // tools set. A run adds no episode once its input is placed, so these hold until a seal
     // inside the run moves runs out of the window, which replaces them (see below). Each request
@@ -2060,21 +2217,29 @@ where
         }
     }
     loop {
+        // A step entered again after a move at a wall started already: it writes no boundary,
+        // and what is steered or delivered meanwhile waits for the next one.
+        let entering = reentry.take();
         // A crash can keep a tool turn durable and lose the budget firings its barrier carried,
         // since today's log writes them record by record. Any firing the durable call count
         // makes due is written here, before anything else at this boundary, as today's loop
         // derives it again before its next request.
-        writer
-            .append_with(
-                &mut |conversation, operations, first_seq| {
-                    crate::budget::due(conversation, operations, first_seq, 0, 0)
-                },
-                true,
-            )
-            .await?;
+        if entering.is_none() {
+            writer
+                .append_with(
+                    &mut |conversation, operations, first_seq| {
+                        crate::budget::due(conversation, operations, first_seq, 0, 0)
+                    },
+                    true,
+                )
+                .await?;
+        }
         let completed_steps = run_state(writer).completed_steps;
         // Step ids count from 1 within a run, as today's loop numbers them.
         let step_id = completed_steps + 1;
+        debug_assert!(entering
+            .as_ref()
+            .is_none_or(|entering| entering.step_id == step_id));
         // The boundary: messages steered or delivered since the last one enter the conversation
         // here, in the same batch as either the step's start or, when a caller cancelled the run
         // now or at this boundary, the run's end. The run's state is read as the batch is built,
@@ -2125,130 +2290,137 @@ where
         }
         // Queued sends with a delivery order are read before the batch is built, since their
         // records may be sealed. One queued after this read waits for the next boundary.
-        let ordered = Box::pin(ordered_sends(writer)).await?;
-        let boundary = writer
-            .append_with(
-                &mut |conversation, operations, first_seq| {
-                    let run = operations.run.as_ref().expect("a run is active");
-                    if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
-                        return restart_pause.take().into_iter().collect();
-                    }
-                    if cancelled_now || run.cancel.is_some() {
-                        let mut batch = placed_copies(operations, &run_id);
-                        batch.extend(cancelled_end.take());
-                        return batch;
-                    }
-                    if stopping {
-                        let mut batch = placed_copies(operations, &run_id);
-                        batch.extend(stopped_end.take());
-                        return batch;
-                    }
-                    // A step starts: ordered sends whose first possible mode here is `steer` or
-                    // `turn_system` are delivered, and expired ones end, in queue order, by
-                    // today's rules (`broca_core::delivery_order`). Their records come first,
-                    // then every waiting message's copy (steers before deliveries), then the
-                    // step's start.
-                    let mut batch = Vec::new();
-                    let mut delivered = Vec::new();
-                    let queued: Vec<_> = operations
-                        .queue
-                        .iter()
-                        .filter(|pending| pending.ordered)
-                        .filter_map(|pending| {
-                            ordered
-                                .get(&pending.submission_id)
-                                .map(|send| (pending, send))
-                        })
-                        .collect();
-                    // A turn-scoped system message is possible only where the route takes one:
-                    // after the message it would follow (the last one placed here so far, else
-                    // the last steered, else the conversation's last) and, on a route that needs
-                    // it last, with no user message to follow it in this request. As in today's
-                    // loop, any later send that may steer counts as one.
-                    let mut preceding: Option<Message> = run
-                        .pending_steers
-                        .iter()
-                        .rev()
-                        .find_map(|pending| pending.messages.last())
-                        .or(conversation.messages.last())
-                        .cloned();
-                    let last_user = queued.iter().rposition(|(_, send)| {
-                        !send.order.expired_at(now)
-                            && send.order.modes.contains(&DeliveryMode::Steer)
-                    });
-                    for (index, (pending, send)) in queued.iter().enumerate() {
-                        if send.order.expired_at(now) {
-                            batch.push(Record::SendEnded(SendEnded {
-                                submission_id: pending.submission_id.clone(),
-                                reason: Some(json!({"kind": "expired"})),
-                            }));
-                            continue;
+        let ordered = match entering {
+            Some(_) => Default::default(),
+            None => Box::pin(ordered_sends(writer)).await?,
+        };
+        let boundary = if entering.is_some() {
+            Vec::new()
+        } else {
+            writer
+                .append_with(
+                    &mut |conversation, operations, first_seq| {
+                        let run = operations.run.as_ref().expect("a run is active");
+                        if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
+                            return restart_pause.take().into_iter().collect();
                         }
-                        let has_text = appended_text(&send.input).is_some();
-                        let followed_by_user = last_user.is_some_and(|last| last > index);
-                        let boundary = Boundary {
-                            turn_system: seams
-                                .provider
-                                .turn_system_possible(preceding.as_ref(), followed_by_user),
-                            ..Boundary::STEP
-                        };
-                        let (mode, placement, input) =
-                            match choose_mode(&send.order, boundary, has_text) {
-                                Some(DeliveryMode::Steer) => {
-                                    ("steer", Placement::Delivered, send.input.clone())
-                                }
-                                Some(DeliveryMode::TurnSystem) => (
-                                    "turn_system",
-                                    Placement::DeliveredTurnSystem,
-                                    turn_system_input(send, &pending.submission_id, &run_id),
-                                ),
-                                _ => continue,
-                            };
-                        let seq = first_seq + batch.len() as u64;
-                        delivered.extend(input.iter().map(|message| {
-                            Record::Input(Input {
-                                // A delivered copy's media are stored where the send's queued
-                                // record stored them.
-                                media: send.media_of(message),
-                                run_id: run_id.clone(),
-                                placement,
-                                message: message.clone(),
-                                written_at_ms: send.written_at_ms,
-                                submission_id: Some(pending.submission_id.clone()),
-                                notice: None,
-                                tags_v1: None,
-                                receipt_seq: Some(seq),
-                                pruned: Vec::new(),
+                        if cancelled_now || run.cancel.is_some() {
+                            let mut batch = placed_copies(operations, &run_id);
+                            batch.extend(cancelled_end.take());
+                            return batch;
+                        }
+                        if stopping {
+                            let mut batch = placed_copies(operations, &run_id);
+                            batch.extend(stopped_end.take());
+                            return batch;
+                        }
+                        // A step starts: ordered sends whose first possible mode here is `steer` or
+                        // `turn_system` are delivered, and expired ones end, in queue order, by
+                        // today's rules (`broca_core::delivery_order`). Their records come first,
+                        // then every waiting message's copy (steers before deliveries), then the
+                        // step's start.
+                        let mut batch = Vec::new();
+                        let mut delivered = Vec::new();
+                        let queued: Vec<_> = operations
+                            .queue
+                            .iter()
+                            .filter(|pending| pending.ordered)
+                            .filter_map(|pending| {
+                                ordered
+                                    .get(&pending.submission_id)
+                                    .map(|send| (pending, send))
                             })
-                        }));
-                        if let Some(last) = input.last() {
-                            preceding = Some(last.clone());
+                            .collect();
+                        // A turn-scoped system message is possible only where the route takes one:
+                        // after the message it would follow (the last one placed here so far, else
+                        // the last steered, else the conversation's last) and, on a route that needs
+                        // it last, with no user message to follow it in this request. As in today's
+                        // loop, any later send that may steer counts as one.
+                        let mut preceding: Option<Message> = run
+                            .pending_steers
+                            .iter()
+                            .rev()
+                            .find_map(|pending| pending.messages.last())
+                            .or(conversation.messages.last())
+                            .cloned();
+                        let last_user = queued.iter().rposition(|(_, send)| {
+                            !send.order.expired_at(now)
+                                && send.order.modes.contains(&DeliveryMode::Steer)
+                        });
+                        for (index, (pending, send)) in queued.iter().enumerate() {
+                            if send.order.expired_at(now) {
+                                batch.push(Record::SendEnded(SendEnded {
+                                    submission_id: pending.submission_id.clone(),
+                                    reason: Some(json!({"kind": "expired"})),
+                                }));
+                                continue;
+                            }
+                            let has_text = appended_text(&send.input).is_some();
+                            let followed_by_user = last_user.is_some_and(|last| last > index);
+                            let boundary = Boundary {
+                                turn_system: seams
+                                    .provider
+                                    .turn_system_possible(preceding.as_ref(), followed_by_user),
+                                ..Boundary::STEP
+                            };
+                            let (mode, placement, input) =
+                                match choose_mode(&send.order, boundary, has_text) {
+                                    Some(DeliveryMode::Steer) => {
+                                        ("steer", Placement::Delivered, send.input.clone())
+                                    }
+                                    Some(DeliveryMode::TurnSystem) => (
+                                        "turn_system",
+                                        Placement::DeliveredTurnSystem,
+                                        turn_system_input(send, &pending.submission_id, &run_id),
+                                    ),
+                                    _ => continue,
+                                };
+                            let seq = first_seq + batch.len() as u64;
+                            delivered.extend(input.iter().map(|message| {
+                                Record::Input(Input {
+                                    // A delivered copy's media are stored where the send's queued
+                                    // record stored them.
+                                    media: send.media_of(message),
+                                    run_id: run_id.clone(),
+                                    placement,
+                                    message: message.clone(),
+                                    written_at_ms: send.written_at_ms,
+                                    submission_id: Some(pending.submission_id.clone()),
+                                    notice: None,
+                                    tags_v1: None,
+                                    receipt_seq: Some(seq),
+                                    pruned: Vec::new(),
+                                })
+                            }));
+                            if let Some(last) = input.last() {
+                                preceding = Some(last.clone());
+                            }
+                            batch.push(Record::Delivery(Delivery {
+                                submission_id: pending.submission_id.clone(),
+                                run_id: run_id.clone(),
+                                mode: mode.into(),
+                                input,
+                                tool_call_id: None,
+                                appended_text: None,
+                                written_at_ms: send.written_at_ms,
+                                tags_v1: None,
+                                input_listed: Some(true),
+                            }));
                         }
-                        batch.push(Record::Delivery(Delivery {
-                            submission_id: pending.submission_id.clone(),
+                        batch.extend(placed_copies(operations, &run_id));
+                        batch.extend(delivered);
+                        batch.push(Record::StepStart(StepStart {
                             run_id: run_id.clone(),
-                            mode: mode.into(),
-                            input,
-                            tool_call_id: None,
-                            appended_text: None,
-                            written_at_ms: send.written_at_ms,
-                            tags_v1: None,
-                            input_listed: Some(true),
+                            step_id,
+                            // Minted by the entry-facts writer once the batch's seqs are known.
+                            mid: None,
                         }));
-                    }
-                    batch.extend(placed_copies(operations, &run_id));
-                    batch.extend(delivered);
-                    batch.push(Record::StepStart(StepStart {
-                        run_id: run_id.clone(),
-                        step_id,
-                        // Minted by the entry-facts writer once the batch's seqs are known.
-                        mid: None,
-                    }));
-                    batch
-                },
-                false,
-            )
-            .await?;
+                        batch
+                    },
+                    false,
+                )
+                .await?
+        };
         match decision(&boundary) {
             Some(Record::RunEnd(end)) => return Ok(finished(writer, end.reason)),
             Some(Record::Pause(_)) => {
@@ -2324,6 +2496,7 @@ where
                 opts,
                 &mut kept_prompt,
                 &rendered,
+                entering.as_ref().map(|entering| &*entering.accepted_under),
             )
             .await?
             {
@@ -2454,7 +2627,13 @@ where
         // flag, and the same step is sent again, its retries counting the refused attempt's, as
         // today's loop does.
         let mut downgraded_now = false;
-        let mut prior_retries = 0;
+        // A step entered again after a move counts the retries its refused attempts used, and
+        // records its attempts after theirs.
+        let entered_retries = entering.as_ref().map_or(0, |entering| entering.retries);
+        let first_attempt = entering
+            .as_ref()
+            .map_or(0, |entering| entering.first_attempt);
+        let mut prior_retries = entered_retries;
         // The retries of an attempt the run's own model refused, which the re-sent step's count.
         let mut refusal_retries = 0u32;
         drop(request_timing);
@@ -2467,6 +2646,7 @@ where
                 opts.clone(),
                 requested_cache_ttl(admission),
                 admission.account_limit_pause,
+                first_attempt,
             )
             .await?;
             if let Err(StepFailure::Error(error, retries_used, _)) = &outcome {
@@ -2487,7 +2667,7 @@ where
                         frozen.downgrade_grammar();
                     }
                     downgraded_now = true;
-                    prior_retries = *retries_used;
+                    prior_retries = entered_retries.saturating_add(*retries_used);
                     continue;
                 }
             }
@@ -2599,8 +2779,8 @@ where
                 // The provider refused the account's limit, which resets soon enough that the
                 // session's cache on that account outlives the wait: the run pauses on the same
                 // account until then, as today's loop decides it.
-                if let Some(pause_on) = limited.and_then(|limited| {
-                    account_limit_pause(seams, admission, step_id, &limited, &error)
+                if let Some(pause_on) = limited.as_deref().and_then(|limited| {
+                    account_limit_pause(seams, admission, step_id, limited, &error)
                 }) {
                     return pause(
                         writer,
@@ -2611,6 +2791,50 @@ where
                         Some(pause_on),
                     )
                     .await;
+                }
+                // No timed pause, so the run would end here: when the refused attempt hit a quota
+                // wall, routing may move the run to another account instead, and the step is
+                // entered again there. Otherwise routing's answer, if it gave one, goes on the
+                // error the run ends with.
+                let mut error = error;
+                if let Some(limited) = limited.as_deref() {
+                    let mut refused = entering
+                        .as_ref()
+                        .map(|entering| entering.refused.clone())
+                        .unwrap_or_default();
+                    match crate::account_move::at_wall(
+                        writer,
+                        parts,
+                        seams,
+                        admission,
+                        step_id,
+                        limited,
+                        &mut refused,
+                    )
+                    .await?
+                    {
+                        Some(crate::account_move::AtWall::Moved(moved)) => {
+                            let accepted_under = match entering {
+                                Some(entering) => entering.accepted_under,
+                                None => Box::new(admission.clone()),
+                            };
+                            *moving = Some(crate::account_move::Moving {
+                                moved,
+                                reentry: crate::account_move::Reentry {
+                                    step_id,
+                                    refused,
+                                    retries,
+                                    first_attempt: limited.attempt.attempt.saturating_add(1),
+                                    accepted_under,
+                                },
+                            });
+                            return Ok(finished(writer, RunFinishReason::Interrupted));
+                        }
+                        Some(crate::account_move::AtWall::Stayed(Some(answer))) => {
+                            error.account_continue = Some(Box::new(answer));
+                        }
+                        Some(crate::account_move::AtWall::Stayed(None)) | None => {}
+                    }
                 }
                 let now = (seams.now_ms)();
                 let mut record = run_end(writer, &admission.run_id, RunFinishReason::Error, now);
@@ -3681,6 +3905,7 @@ fn incomplete_stream() -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -3701,7 +3926,10 @@ use broca_core::account_limit_pause::FailedAccountLimitAttempt;
 /// Runs one model call and assembles its answer. Display events go straight to the listener.
 /// Asks the provider for one step. Each HTTP attempt's evidence is appended as the attempt
 /// ends, without a barrier, as today's loop records it: billing and cache evidence read it.
-/// The outer error is the store's; the inner one is the step's.
+/// The outer error is the store's; the inner one is the step's. `first_attempt` is the ordinal
+/// the call's first attempt is recorded with: zero, or after the attempts a step entered again
+/// after an account move already recorded.
+#[allow(clippy::too_many_arguments)]
 async fn model_step<W: Writer, P: Provider, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -3710,6 +3938,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     opts: CallOptions,
     requested_ttl_ms: Option<u64>,
     account_limit_pause: bool,
+    first_attempt: u32,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     // The step is in flight from here until the call's stream ends: published for the session's
@@ -3760,7 +3989,7 @@ async fn model_step<W: Writer, P: Provider, T>(
         deadline: None,
         seal: send_seal.clone(),
         progress: seams.step_progress.clone(),
-        first_attempt: 0,
+        first_attempt,
         attempt_hook: None,
     };
     // A cancel drops the call while it hasn't returned its stream yet, as today's loop drops its
@@ -4897,7 +5126,7 @@ pub fn warm_spend<C: ?Sized + Sync>(
 
 /// The account the run uses: the one routing gives it now, else the one it froze at admission,
 /// as today's loop chooses it.
-fn run_selection<'a, P, T>(
+pub(crate) fn run_selection<'a, P, T>(
     seams: &'a Seams<'_, P, T>,
     admission: &'a Admission,
 ) -> Option<&'a broca_wal::AuthSelection> {
@@ -6308,7 +6537,7 @@ fn decision(records: &[Record]) -> Option<&Record> {
         .find(|record| !matches!(record, Record::EntryFacts(_)))
 }
 
-fn run_state<W: Writer>(writer: &W) -> &broca_session_store::fold::operations::Run {
+pub(crate) fn run_state<W: Writer>(writer: &W) -> &broca_session_store::fold::operations::Run {
     writer
         .operations()
         .run

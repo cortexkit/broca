@@ -1841,6 +1841,25 @@ pub fn admission_started_body(event_id: &str, admission_id: &str, run_id: &str) 
     Value::Object(body)
 }
 
+/// `admission_started` again, after the run moved to another account at a quota wall: the same
+/// admission and run, now on the offered credential and account. Routing takes it as the offer
+/// being used.
+pub fn admission_moved_body(
+    event_id: &str,
+    admission_id: &str,
+    run_id: &str,
+    credential_id: &str,
+    served_account_id: Option<&str>,
+) -> Value {
+    let mut body = report("admission_started", event_id, admission_id);
+    body.insert("run_id".into(), json!(run_id));
+    body.insert("credential_id".into(), json!(credential_id));
+    if let Some(account) = served_account_id {
+        body.insert("served_account_id".into(), json!(account));
+    }
+    Value::Object(body)
+}
+
 /// Whether an attempt ended before any status line arrived.
 fn attempt_reached_no_upstream(attempt: &ModelAttempt) -> bool {
     attempt.http_status.is_none()
@@ -1970,6 +1989,12 @@ enum ReportEvent {
         wal_seq: u64,
         credential_id: Option<String>,
         provider_code: Option<String>,
+    },
+    Moved {
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        credential_id: String,
+        account: Option<String>,
     },
 }
 
@@ -2159,6 +2184,26 @@ impl RunReporter {
                             ))
                             .await;
                     }
+                    ReportEvent::Moved {
+                        lineage,
+                        wal_seq,
+                        credential_id,
+                        account,
+                    } => {
+                        if let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        {
+                            client
+                                .observe(admission_moved_body(
+                                    &id,
+                                    &admission_id,
+                                    &run_id,
+                                    &credential_id,
+                                    account.as_deref(),
+                                ))
+                                .await;
+                        }
+                    }
                     ReportEvent::Finished {
                         lineage,
                         wal_seq,
@@ -2191,6 +2236,23 @@ impl RunReporter {
             lineage,
             wal_seq,
             reason,
+        });
+    }
+
+    /// The run moved, at a quota wall, to the account routing offered; the record naming it, at
+    /// `wal_seq`, is durable. Queued once, behind the refused attempt's report and ahead of any
+    /// attempt on the new account, and sent once: routing counts it as the offer being used.
+    pub fn moved(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        selection: &broca_wal::AuthSelection,
+    ) {
+        let _ = self.tx.send(ReportEvent::Moved {
+            lineage,
+            wal_seq,
+            credential_id: selection.credential_id.clone(),
+            account: selection.account_ref.clone(),
         });
     }
 
@@ -2419,6 +2481,136 @@ impl ListingCache {
             .unwrap()
             .as_ref()
             .map(|(listing, at)| (Arc::clone(listing), at.elapsed() >= LISTING_MAX_AGE))
+    }
+}
+
+/// What a continue request came to, as the run acts on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContinueOutcome {
+    /// Routing answered with an offer, a hold or a refusal. A routing error body (an
+    /// `invalid_request`, say) reads as a refusal under the error's code.
+    Answered(cortexkit_role_routing::account_continue::ContinueAnswer),
+    /// Routing doesn't serve continuation, or that couldn't be told: nothing was sent.
+    NotDeclared,
+    /// No usable answer: a failed route or a reply broca can't read.
+    Unreachable(String),
+    /// No answer before the budget ran out.
+    NoAnswerWithinBudget,
+}
+
+/// The continue request for a wall, in routing's types: the run, its original admission and
+/// conversation key, the decision the run uses now, and the exhausted account with the evidence
+/// of the refused attempt's own record. `None` when the run's selection lacks what routing needs
+/// to find the run (an admission id, a conversation key, a decision id).
+pub fn continue_request(
+    wall: &broca_session_loop::account_move::Wall<'_>,
+) -> Option<cortexkit_role_routing::account_continue::ContinueRequest> {
+    use cortexkit_role_routing::account_continue::{ContinueRequest, ExhaustedAccount};
+    let decision = wall.selection.account_decision.as_ref()?;
+    let mut exhausted = ExhaustedAccount::new(
+        wall.credential_id,
+        wall.account,
+        wall.limit_window,
+        wall.observed_at_ms,
+    );
+    if let Some(resets_at_ms) = wall.resets_at_ms {
+        exhausted = exhausted.with_resets_at_ms(resets_at_ms);
+    }
+    Some(ContinueRequest::new(
+        wall.run_id,
+        decision.admission_id.as_deref()?,
+        decision.conversation_key.as_deref()?,
+        decision.decision_id.as_deref()?,
+        exhausted,
+        continue_selection_id(wall),
+    ))
+}
+
+/// The `selection_id` of a continue request: derived from the run, the step and the refused
+/// attempt's record, so it names this wall and is the same for every transport retry of one
+/// question, and from whether this is the wall's second question (asked after an offer lapsed),
+/// which routing must check afresh. 32 hex digits keep it far inside routing's length bound.
+pub fn continue_selection_id(wall: &broca_session_loop::account_move::Wall<'_>) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(
+        format!(
+            "broca-account-continue-v1\0{}\0{}\0{}\0{}",
+            wall.run_id,
+            wall.step_id,
+            wall.attempt_seq,
+            u8::from(wall.reask)
+        )
+        .as_bytes(),
+    );
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("wall-{hex}")
+}
+
+impl RoutingClient {
+    /// Asks routing for another account for a run whose account spent its usage window, by
+    /// `route.account_for` with `mode: "continue"`, over the same route as an admission, giving up
+    /// at `deadline`. `routing_serves_continuation` is true only when routing declares both
+    /// `account_continue` and `account_continue_resume` (unknown counts as false); otherwise
+    /// nothing is sent.
+    pub async fn account_continue(
+        &self,
+        routing_serves_continuation: bool,
+        request: &cortexkit_role_routing::account_continue::ContinueRequest,
+        deadline: tokio::time::Instant,
+    ) -> ContinueOutcome {
+        if !routing_serves_continuation {
+            self.counters.bump("continue_not_declared");
+            return ContinueOutcome::NotDeclared;
+        }
+        let body = match serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": request }))
+        {
+            Ok(body) => body,
+            Err(error) => return ContinueOutcome::Unreachable(format!("encode request: {error}")),
+        };
+        let outcome = match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
+            Err(_) => ContinueOutcome::NoAnswerWithinBudget,
+            Ok(Err(cause)) => ContinueOutcome::Unreachable(cause),
+            Ok(Ok(reply)) => classify_continue_reply(reply),
+        };
+        self.counters.bump(match &outcome {
+            ContinueOutcome::Answered(_) => "continue_answered",
+            ContinueOutcome::NotDeclared => "continue_not_declared",
+            ContinueOutcome::Unreachable(_) => "continue_unreachable",
+            ContinueOutcome::NoAnswerWithinBudget => "continue_no_answer_within_budget",
+        });
+        outcome
+    }
+}
+
+/// Reads one continue reply: `result` is the tagged answer; an error body is routing refusing
+/// the question, read as a refusal under its code.
+pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutcome {
+    use cortexkit_role_routing::account_continue::{ContinueAnswer, ContinueRefusal};
+    match reply {
+        Ok(body) => {
+            #[derive(Deserialize)]
+            struct Response {
+                result: ContinueAnswer,
+            }
+            match serde_json::from_slice::<Response>(&body) {
+                Ok(response) => ContinueOutcome::Answered(response.result),
+                Err(error) => {
+                    ContinueOutcome::Unreachable(format!("continue answer did not decode: {error}"))
+                }
+            }
+        }
+        Err(body) => match serde_json::from_slice::<ErrorBodyView>(&body) {
+            Ok(error) => ContinueOutcome::Answered(ContinueAnswer::Refuse(ContinueRefusal::new(
+                error.code,
+                error.detail.unwrap_or(Value::Null),
+            ))),
+            Err(decode) => {
+                ContinueOutcome::Unreachable(format!("error reply is not an error body: {decode}"))
+            }
+        },
     }
 }
 

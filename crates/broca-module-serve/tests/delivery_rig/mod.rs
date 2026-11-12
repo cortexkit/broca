@@ -689,6 +689,7 @@ impl RunExecutor for CoreExec {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
         }
         // A resume keeps the decision its episode froze; a fresh episode decides from its send,
@@ -848,6 +849,7 @@ impl RunExecutor for CoreExec {
                 step_progress: control.step_progress.clone(),
                 model_call_ready,
                 pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
+                account_continue: None,
             };
             match mode {
                 StoreRunMode::Fresh => {

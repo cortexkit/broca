@@ -1762,6 +1762,7 @@ async fn send_warm_legacy(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }))
     };
     let exchange = async {
@@ -1935,6 +1936,7 @@ async fn send_warm_journaled(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }))
     };
     let mut id = None;
@@ -3041,6 +3043,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 };
                 tokio::select! {
                     biased;
@@ -3736,7 +3739,7 @@ fn account_changed_error(frozen: Option<&str>, served: Option<&str>) -> Option<P
     limit_window: None,
     account_ref: None,
     credential_id: None,
-    affordable_max_tokens: None, })
+    affordable_max_tokens: None, account_continue: None, })
 }
 
 /// ChatGPT carries an account in its headers as well as in vault metadata. Neither may
@@ -5049,6 +5052,7 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5072,6 +5076,7 @@ fn content_timeout_error() -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5110,6 +5115,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5141,6 +5147,7 @@ fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> Pro
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5161,6 +5168,7 @@ fn transport_error(message: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5181,6 +5189,7 @@ fn stream_limit_error(message: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5377,7 +5386,7 @@ fn classify_chatgpt_upstream_key_rejection(
     limit_window: None,
     account_ref: None,
     credential_id: None,
-    affordable_max_tokens: None, }
+    affordable_max_tokens: None, account_continue: None, }
 }
 
 /// A 429 that says one ACCOUNT has used up a usage window, rather than that the route is
@@ -5738,6 +5747,7 @@ fn meta_subscription_quota_exhausted(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -5789,6 +5799,7 @@ fn chatgpt_usage_limit_reached(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -5862,6 +5873,7 @@ fn xai_spending_limit_reached(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
             ..error.clone()
         })
     } else {
@@ -5899,6 +5911,7 @@ fn opencode_payment_required(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -5940,6 +5953,7 @@ fn inception_payment_required(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -5993,6 +6007,7 @@ fn kimi_usage_limit_reached(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -6067,6 +6082,7 @@ fn google_quota_exhausted(body: &str, now: SystemTime, error: ProviderError) -> 
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         provider_details,
         ..error
     }
@@ -6396,6 +6412,7 @@ fn http_error_in_family(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     // Run after the context-overflow and billing classification above, so a 400 those give a
     // more specific code keeps it.
@@ -6956,6 +6973,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
                 retries_used: 0,
             })])
@@ -10133,6 +10151,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         assert_eq!(retry_delay(&error, 0), Duration::from_millis(2_500));
     }
@@ -10155,6 +10174,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         assert_eq!(retry_delay(&error, 0), Duration::from_secs(120));
     }
@@ -10177,6 +10197,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         for (failed_attempt_index, nominal_secs) in [
             (0, 2.0),
@@ -10500,7 +10521,7 @@ mod tests {
         limit_window: None,
         account_ref: None,
         credential_id: None,
-        affordable_max_tokens: None, };
+        affordable_max_tokens: None, account_continue: None, };
         let error = classify_account_limit_exhausted(
             WireFamilyId::AnthropicMessages,
             429,
@@ -10809,6 +10830,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let usage_no_reset = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#;
         let usage_string_reset = r#"{"error":{"type":"usage_limit_reached","resets_at":"1790021043","resets_in_seconds":60}}"#;
@@ -11274,6 +11296,7 @@ mod tests {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             };
             let classified = classify_account_limit_exhausted(
                 WireFamilyId::OpenAiChat,

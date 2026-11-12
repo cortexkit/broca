@@ -1877,6 +1877,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

@@ -1527,9 +1527,14 @@ message! {
 }
 
 message! {
-    /// A paused run resumed before any provider call, and its provider now renders with a
-    /// different config than the run froze: the run renders with this one from here on. Only
-    /// before the first call is that safe, since no request bytes depend on the old config.
+    /// The run renders with a different config than it froze, from here on. Written in two
+    /// places. A paused run resumed before any provider call, whose provider now renders with
+    /// a different config: only before the first call is that safe, since no request bytes
+    /// depend on the old config. And together with an [`AuthRefrozen`], in the same batch, when
+    /// the run moves to another account at a quota wall and its config names the account (a
+    /// Claude Code persona does): the next request is the first on the new account, which has
+    /// none of the old account's cache to keep. A resume that finds any other config change
+    /// after a provider call still ends the run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct ConfigRefrozen {
         1 req run_id: String,
@@ -1541,10 +1546,13 @@ message! {
 }
 
 message! {
-    /// A paused run resumed on another provider account than it froze, which routing gave it:
-    /// its later requests and its spend name this account. Account metadata changes no request
-    /// bytes, so this may follow provider calls. Not written for a run paused on its account's
-    /// limit, which resumes only on that account.
+    /// The run uses another provider account than it froze, from here on: its later requests
+    /// and its spend name this account. Written when a paused run resumes on another account
+    /// routing gives it, and when routing moves the run to another account inside a step whose
+    /// account spent its usage window. Account metadata changes no request bytes, so this may
+    /// follow provider calls; a config that names the account is refrozen with it (see
+    /// [`ConfigRefrozen`]). Not written for a run paused on its account's limit, which resumes
+    /// only on that account.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct AuthRefrozen {
         1 req run_id: String,

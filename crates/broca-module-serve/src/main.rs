@@ -2316,6 +2316,7 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             })),
             Err(e @ VaultError::Transport(_)) => AuthDecision::FailAdmissionTransient(format!(
                 "credentials service unreachable (transient — retry): {e}"
@@ -2732,6 +2733,9 @@ mod executor {
         run_id: broca_protocol::RunId,
         config: broca_wal::RunConfig,
         idle: bool,
+        /// The run moved to another account at a quota wall: its config names the account it
+        /// moved to. Only a run in the new storage moves.
+        moved: bool,
     }
 
     fn prior_run_view_from_checkpoint(
@@ -2744,6 +2748,7 @@ mod executor {
                 run_id: episode.run_id.clone(),
                 config: episode.config.clone(),
                 idle: episode.disposition == broca_core::EpisodeDisposition::Finished,
+                moved: false,
             })
     }
 
@@ -2762,6 +2767,11 @@ mod executor {
         /// Whether the session is kept in the new session storage, whose fresh runs may be
         /// selected for a probe placement of rides (see `broca_module_serve::experiments`).
         new_storage: bool,
+        /// For a run moving to another account at a quota wall: the account routing offered,
+        /// which the run is admitted to in place of asking routing (see `AccountMoves`).
+        continue_offer: Option<&'a AccountChoice>,
+        /// Whether routing serves continuation (see `resume_asks_routing`).
+        routing_serves_continuation: bool,
     }
 
     /// What a run's admission reads from the session's history.
@@ -2913,6 +2923,7 @@ mod executor {
             step_progress: control.step_progress.clone(),
             model_call_ready: None,
             pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
+            account_continue: None,
         }
     }
 
@@ -2923,6 +2934,38 @@ mod executor {
         prior_run: Option<PriorRunView>,
         persona: PersonaHistory,
         head_seq: u64,
+    }
+
+    /// The config a store session's latest run is read with for the next admission.
+    ///
+    /// An unfinished run is resumed under what it froze, refreezes included: in particular a
+    /// run that moved to another account at a quota wall resumes on the account it moved to,
+    /// with that account's render config. A resume never asks routing (only a fresh run does,
+    /// see `choose_account_for_episode`), and routing would today answer a moved run's admission
+    /// with its original decision, the account at its wall; so the recorded selection is the
+    /// one to resume on. A finished run is read from its start, as before, because a fresh
+    /// run inherits from it.
+    fn store_prior_config(
+        run: &broca_session_store::fold::operations::Run,
+        start: &broca_session_store::record::RunStart,
+        parts: &dyn broca_session_loop::parts::Parts,
+    ) -> Result<broca_wal::RunConfig, broca_session_loop::LoopError> {
+        if run.finished.is_none() {
+            broca_session_loop::run::run_config_of_run(run, parts)
+        } else {
+            broca_session_loop::run::run_config_of_start(start, parts)
+        }
+    }
+
+    /// Whether a resumed run asks routing for its account again. A run that never moved resumes
+    /// on the account it froze without asking, as every resume does. A run that moved to another
+    /// account at a quota wall asks only when routing serves continuation: then routing answers a
+    /// moved run's repeated admission with the run's current account. Any other router answers
+    /// with the run's original decision, the account at its wall, so the run keeps the account
+    /// from its own record. `routing_serves_continuation` is true only when routing declares
+    /// `account_continue_resume` and `account_continue`; unknown counts as false.
+    fn resume_asks_routing(moved: bool, routing_serves_continuation: bool) -> bool {
+        moved && routing_serves_continuation
     }
 
     fn store_history(
@@ -2940,8 +2983,9 @@ mod executor {
                 })?;
                 Some(PriorRunView {
                     run_id: broca_protocol::RunId(run.run_id.clone()),
-                    config: broca_session_loop::run::run_config_of_start(start, parts)?,
+                    config: store_prior_config(run, start, parts)?,
                     idle: run.finished.is_some(),
+                    moved: run.refrozen_auth.is_some(),
                 })
             }
             None => None,
@@ -3009,6 +3053,337 @@ mod executor {
             attempt: &broca_protocol::ModelAttempt,
         ) {
             broca_core::AccountReporter::attempt_recorded(&*self.0, None, seq, attempt);
+        }
+
+        fn account_moved(&self, _event_id: &str, seq: u64, selection: &broca_core::AuthSelection) {
+            self.0.moved(None, seq, selection);
+        }
+    }
+
+    /// What a run that moved reports at its end in place of what it was admitted with: the
+    /// credential it sends on now and the token version and refresher the vault served for it.
+    struct MovedCredential {
+        selection: broca_core::AuthSelection,
+        record_version: Option<u64>,
+        in_run_refresh: Option<InRunRefresh>,
+    }
+
+    /// A store run's moves to another account at a quota wall (see
+    /// `broca_session_loop::account_move`). It asks routing with `mode: "continue"`, and admits
+    /// the offered account the way a resume of the run on that account would be admitted: the
+    /// offered credential read from the vault and checked to belong to the offered account, and
+    /// a provider built from the run's recorded render config, with the Claude Code persona, when
+    /// the config has one, refrozen for the new account.
+    struct AccountMoves<'a, W> {
+        executor: &'a LiveLoopExecutor<W>,
+        req: &'a broca_core::RunRequest,
+        auth: &'a Option<broca_protocol::AuthRequest>,
+        clock: Option<&'a broca_core::Clock>,
+        /// Whether routing serves continuation: true only when it declares both
+        /// `account_continue` and `account_continue_resume`; unknown counts as false. Without
+        /// it the run is never asked to move, and ends or pauses at a wall as before.
+        routing_serves_continuation: bool,
+        /// The media renderer the run's provider was given, which the new provider needs too.
+        media: Option<Arc<broca_module::store_media::LazyRenderer>>,
+        /// The end of each wall's budget, by the refused attempt's seq: a second question at the
+        /// same wall shares the first one's budget.
+        deadlines: std::sync::Mutex<HashMap<u64, tokio::time::Instant>>,
+        /// The credentials of moves prepared but not yet durable, and of the newest durable one.
+        prepared: std::sync::Mutex<Vec<MovedCredential>>,
+        adopted: std::sync::Mutex<Option<MovedCredential>>,
+    }
+
+    impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
+        fn new(
+            executor: &'a LiveLoopExecutor<W>,
+            req: &'a broca_core::RunRequest,
+            auth: &'a Option<broca_protocol::AuthRequest>,
+            clock: Option<&'a broca_core::Clock>,
+            routing_serves_continuation: bool,
+            media: Option<Arc<broca_module::store_media::LazyRenderer>>,
+        ) -> Self {
+            Self {
+                executor,
+                req,
+                auth,
+                clock,
+                routing_serves_continuation,
+                media,
+                deadlines: Default::default(),
+                prepared: Default::default(),
+                adopted: Default::default(),
+            }
+        }
+
+        /// The credential of the run's newest durable move, if it moved.
+        fn moved(&self) -> Option<MovedCredential> {
+            self.adopted.lock().unwrap().take()
+        }
+
+        /// Routing's answer at `wall`, read as the loop acts on it, and the offer if there is
+        /// one to admit.
+        async fn offer(
+            &self,
+            wall: &broca_session_loop::account_move::Wall<'_>,
+        ) -> Result<
+            cortexkit_role_routing::account_continue::ContinueOffer,
+            Option<broca_protocol::error::AccountContinueAnswer>,
+        > {
+            use broca_module_serve::account_routing::{ContinueOutcome, ADMISSION_BUDGET};
+            use cortexkit_role_routing::account_continue::ContinueAnswer;
+            let Some(routing) = self.executor.routing.as_ref() else {
+                return Err(None);
+            };
+            let Some(request) = broca_module_serve::account_routing::continue_request(wall) else {
+                tracing::warn!(
+                    target: "accounts",
+                    run_id = wall.run_id,
+                    "the run's selection lacks the admission, conversation key or decision \
+                     routing knows it by; it does not ask to move at its quota wall"
+                );
+                return Err(None);
+            };
+            let deadline = *self
+                .deadlines
+                .lock()
+                .unwrap()
+                .entry(wall.attempt_seq)
+                .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
+            let answer = match routing
+                .account_continue(self.routing_serves_continuation, &request, deadline)
+                .await
+            {
+                ContinueOutcome::Answered(answer) => answer,
+                ContinueOutcome::NotDeclared => return Err(None),
+                outcome => {
+                    tracing::warn!(
+                        target: "accounts",
+                        run_id = wall.run_id,
+                        ?outcome,
+                        "routing gave no answer to the run's continue request at its quota wall"
+                    );
+                    return Err(None);
+                }
+            };
+            match answer {
+                ContinueAnswer::Offer(offer) => Ok(offer),
+                ContinueAnswer::Hold(hold) => {
+                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                        routing_code: hold.routing_code,
+                        until_ms: hold.until_ms,
+                    }))
+                }
+                ContinueAnswer::Refuse(refusal) => {
+                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                        routing_code: refusal.routing_code,
+                        until_ms: None,
+                    }))
+                }
+                _ => Err(None),
+            }
+        }
+
+        /// The run's recorded config with the offered account in place of the walled one: the
+        /// selection names the offered credential and account under the offer's decision, and a
+        /// Claude Code persona, which the request body carries, is refrozen for that account.
+        /// The persona keeps its version, session id, pinned `cc_version` suffix and prompt
+        /// ordinal; its device id and account id are the new account's, and its prompt id is
+        /// new, as a fresh run on that account would freeze them.
+        fn moved_config(
+            &self,
+            wall: &broca_session_loop::account_move::Wall<'_>,
+            offer: &cortexkit_role_routing::account_continue::ContinueOffer,
+            decision: &broca_core::AccountDecision,
+        ) -> Result<broca_wal::RunConfig, String> {
+            let mut config = wall.run_config.clone();
+            config.auth_selection = Some(broca_core::AuthSelection {
+                credential_id: offer.credential_id.clone(),
+                account_ref: Some(offer.account.clone()),
+                resolved_credential_id: Some(offer.credential_id.clone()),
+                vault_request: None,
+                account_decision: Some(decision.clone()),
+                auth_method: wall.selection.auth_method.clone(),
+                billing_vault_facts: None,
+            });
+            let recorded = config
+                .frozen_render_config
+                .get("claude_code_persona")
+                .filter(|persona| !persona.is_null())
+                .cloned();
+            if let Some(recorded) = recorded {
+                let persona: broca_provider::wire::ClaudeCodePersona =
+                    serde_json::from_value(recorded)
+                        .map_err(|error| format!("the recorded persona doesn't decode: {error}"))?;
+                let install_id = self
+                    .executor
+                    .claude_code_install_id
+                    .as_deref()
+                    .ok_or("no installation id to derive the new account's persona from")?;
+                let persona = broca_module_serve::claude_code_identity::moved_persona(
+                    &persona,
+                    install_id,
+                    Some(&offer.account),
+                    &offer.credential_id,
+                    &self.req.session,
+                )
+                .map_err(|error| format!("the new account's persona: {error}"))?;
+                config.frozen_render_config["claude_code_persona"] = serde_json::to_value(&persona)
+                    .map_err(|error| format!("the new account's persona: {error}"))?;
+            }
+            Ok(config)
+        }
+    }
+
+    #[async_trait]
+    impl<W: ExecutorWalStore + 'static>
+        broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provider::Provider>>
+        for AccountMoves<'_, W>
+    {
+        async fn ask(
+            &self,
+            wall: &broca_session_loop::account_move::Wall<'_>,
+        ) -> broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>
+        {
+            use broca_session_loop::account_move::{Answer, Move};
+            let offer = match self.offer(wall).await {
+                Ok(offer) => offer,
+                Err(answer) => return Answer::Stay(answer),
+            };
+            let refuse = |reason: &str| {
+                tracing::warn!(
+                    target: "accounts",
+                    run_id = wall.run_id,
+                    step_id = wall.step_id,
+                    offered = %offer.account,
+                    "routing offered an account at a quota wall, and the run does not take it: \
+                     {reason}"
+                );
+                Answer::Stay(None)
+            };
+            // The loop checks the reservation just before it writes the move, and asks again
+            // once if it lapsed; an account that refused this step is never offered usefully.
+            if wall.refused_accounts.contains(&offer.account) {
+                return refuse("the offered account already refused this step");
+            }
+            let method = wall
+                .selection
+                .auth_method
+                .as_deref()
+                .and_then(AuthMethod::from_token)
+                .or_else(|| {
+                    broca_module_serve::auth_routing::CredentialId::parse(
+                        &wall.selection.credential_id,
+                    )
+                    .map(|id| id.method)
+                });
+            let (Some(method), Some(previous)) = (method, wall.selection.account_decision.as_ref())
+            else {
+                return refuse("the run's credential names no auth method");
+            };
+            let decision = broca_core::AccountDecision {
+                decision_id: Some(offer.decision_id.clone()),
+                ..previous.clone()
+            };
+            let config = match self.moved_config(wall, &offer, &decision) {
+                Ok(config) => config,
+                Err(error) => return refuse(&error),
+            };
+            let choice = AccountChoice::Routed {
+                account_id: offer.account.clone(),
+                credential_id: offer.credential_id.clone(),
+                method,
+                decision,
+                // The listing digest of the run's first choice isn't kept; routing names the
+                // offer by its decision instead.
+                view_digest: String::new(),
+                service_tier_chosen: None,
+            };
+            let history = EpisodeHistory {
+                prior_run: Some(PriorRunView {
+                    run_id: self.req.run_id.clone(),
+                    config: config.clone(),
+                    idle: false,
+                    moved: true,
+                }),
+                last_config: Some(&config),
+                head_seq: 0,
+                persona: PersonaHistory::Store {
+                    first_user: None,
+                    first_user_sealed: false,
+                    human_prompts: 0,
+                },
+            };
+            let mut queued_service_tier = None;
+            let admitted = self
+                .executor
+                .admit_episode(
+                    EpisodeJob {
+                        req: self.req,
+                        kind: RunKind::FreshOrResume,
+                        auth: self.auth,
+                        conversation_key: &None,
+                        queued_service_tier: &mut queued_service_tier,
+                        media_profile: &None,
+                        clock: self.clock,
+                        // Only a run in the new session storage moves.
+                        new_storage: true,
+                        continue_offer: Some(&choice),
+                        routing_serves_continuation: self.routing_serves_continuation,
+                    },
+                    &history,
+                )
+                .await;
+            // The vault refusing the credential, or serving it for another account than the
+            // offer names, ends here: nothing is sent on an account routing didn't offer.
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(error) => return refuse(&format!("its credential wasn't admitted: {error}")),
+            };
+            let selection = match admitted.resolution.selection.clone() {
+                Some(selection)
+                    if !admitted.fresh_episode
+                        && admitted.resolution.pause.is_none()
+                        && admitted.routing_decision_error.is_none()
+                        && selection.account_ref.as_deref() == Some(offer.account.as_str()) =>
+                {
+                    selection
+                }
+                _ => return refuse("its credential isn't usable for the offered account"),
+            };
+            let provider = admitted.resolved.provider;
+            provider
+                .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
+            if let Some(media) = &self.media {
+                provider.set_media_request_renderer(media.renderer());
+            }
+            let blob = provider.render_config_blob();
+            let renderer_version = provider.renderer_version();
+            let render = (blob != wall.run_config.frozen_render_config
+                || renderer_version != wall.run_config.renderer_version)
+                .then_some((renderer_version, blob));
+            self.prepared.lock().unwrap().push(MovedCredential {
+                selection: selection.clone(),
+                record_version: admitted.resolution.record_version,
+                in_run_refresh: admitted.resolution.in_run_refresh,
+            });
+            Answer::Move(Box::new(Move {
+                selection,
+                account: offer.account,
+                valid_until_ms: offer.valid_until_ms,
+                render,
+                provider,
+            }))
+        }
+
+        fn adopted(&self, selection: &broca_core::AuthSelection) {
+            let mut prepared = self.prepared.lock().unwrap();
+            if let Some(position) = prepared
+                .iter()
+                .position(|moved| moved.selection == *selection)
+            {
+                *self.adopted.lock().unwrap() = Some(prepared.swap_remove(position));
+            }
+            prepared.clear();
         }
     }
 
@@ -3863,33 +4238,44 @@ mod executor {
                 .and_then(|selection| selection.account_decision.as_ref())
                 .and_then(|decision| decision.conversation_key.as_deref());
             let mut routing_decision_error = None;
-            let account_choice = match self
-                .choose_account_for_episode(
-                    job.req,
-                    fresh_episode,
-                    EpisodeAccountPreference {
-                        pin: (pinned_method, pinned_account),
-                        pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
-                        credential_id: job
-                            .auth
-                            .as_ref()
-                            .and_then(|auth| auth.credential_id.as_deref()),
-                    },
-                    (job.conversation_key.as_deref(), inherited_key),
-                    broca_module_serve::account_routing::account_hold_cap(
-                        self.max_same_account_wait,
-                        history.last_config,
-                        job.clock
-                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
-                        |account| {
-                            self.provider_client
-                                .session_last_accepted_at_ms(&job.req.session, account)
+            // A run moving at a quota wall takes the account routing already offered it.
+            // A resumed run that moved to another account asks routing for its account again
+            // only where routing answers that with the run's current account.
+            let moved = !fresh_episode && prior_run.as_ref().is_some_and(|prior| prior.moved);
+            let resume_asks = resume_asks_routing(moved, job.routing_serves_continuation);
+            let chosen = match job.continue_offer {
+                Some(offer) => Ok(offer.clone()),
+                None => {
+                    self.choose_account_for_episode(
+                        job.req,
+                        fresh_episode || resume_asks,
+                        EpisodeAccountPreference {
+                            pin: (pinned_method, pinned_account),
+                            pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
+                            credential_id: job
+                                .auth
+                                .as_ref()
+                                .and_then(|auth| auth.credential_id.as_deref()),
                         },
-                    ),
-                    job.queued_service_tier.as_deref(),
-                )
-                .await
-            {
+                        (job.conversation_key.as_deref(), inherited_key),
+                        broca_module_serve::account_routing::account_hold_cap(
+                            self.max_same_account_wait,
+                            history.last_config,
+                            job.clock.map_or_else(
+                                || epoch_millis().max(0) as u64,
+                                |clock| clock.now_ms(),
+                            ),
+                            |account| {
+                                self.provider_client
+                                    .session_last_accepted_at_ms(&job.req.session, account)
+                            },
+                        ),
+                        job.queued_service_tier.as_deref(),
+                    )
+                    .await
+                }
+            };
+            let account_choice = match chosen {
                 Ok(choice) => choice,
                 Err(RunError::AccountSelectionRefused(refusal))
                     if job.req.route_decision_id.is_some()
@@ -4160,7 +4546,7 @@ mod executor {
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
                 queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
                 clock: Some(&self.clock),
-                frozen_account_ref: if fresh_episode {
+                frozen_account_ref: if fresh_episode || resume_asks {
                     resolution
                         .selection
                         .as_ref()
@@ -4582,6 +4968,12 @@ mod executor {
                     .await
                     .map_err(StoreRunError::Loop);
             }
+            // Whether routing serves continuation, so a run may move to another account at a
+            // quota wall and a moved run's resume may ask routing for its account: true only
+            // when routing declares `account_continue` and `account_continue_resume`; unknown
+            // counts as false. No reader of routing's `role.describe` is installed here yet, so
+            // runs neither move nor ask on resume.
+            let routing_serves_continuation = false;
             let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
             if let Some(config) = &last_config {
@@ -4619,6 +5011,8 @@ mod executor {
                         media_profile: &None,
                         clock: control.clock.as_ref(),
                         new_storage: true,
+                        continue_offer: None,
+                        routing_serves_continuation,
                     },
                     &history,
                 )
@@ -4645,6 +5039,7 @@ mod executor {
                 .chain(writer.conversation().messages.iter())
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
             let mut model_call_ready = None;
+            let mut media_renderer = None;
             if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty())
             {
                 // As `execute` installs today's renderer for a run that may carry media: the
@@ -4693,6 +5088,7 @@ mod executor {
                 resolved
                     .provider
                     .set_media_request_renderer(lazy.renderer());
+                media_renderer = Some(Arc::clone(&lazy));
                 model_call_ready = Some(lazy as Arc<dyn broca_session_loop::run::ModelCallReady>);
             }
             if broca_provider::person_media::references(&req.input)
@@ -4747,6 +5143,28 @@ mod executor {
                 Arc::new(StoreAccountReports(reporter))
                     as Arc<dyn broca_session_loop::AccountReports>
             });
+            let fresh_admission = if fresh_episode {
+                match broca_session_loop::admit::admission(
+                    req,
+                    &control,
+                    &resolved.provider,
+                    writer.operations(),
+                    Some(now()),
+                ) {
+                    Ok(admission) => Some(admission),
+                    Err(error) => return Err(StoreRunError::Admission(error)),
+                }
+            } else {
+                None
+            };
+            let moves = AccountMoves::new(
+                self,
+                req,
+                auth,
+                clock.as_ref(),
+                routing_serves_continuation,
+                media_renderer,
+            );
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -4762,23 +5180,33 @@ mod executor {
             );
             seams.model_call_ready = model_call_ready;
             seams.keep_warm = keep_warm;
-            let finished = if fresh_episode {
-                match broca_session_loop::admit::admission(
-                    req,
-                    &control,
-                    &resolved.provider,
-                    writer.operations(),
-                    Some(now()),
-                ) {
-                    Ok(admission) => {
-                        // Keep the loop body off the executor's poll frame, as the legacy
-                        // loop does, even though async_trait already boxes the outer executor.
-                        Box::pin(broca_session_loop::run(writer, parts, admission, &seams)).await
-                    }
-                    Err(error) => return Err(StoreRunError::Admission(error)),
+            seams.account_continue = Some(&moves);
+            let finished = match fresh_admission {
+                Some(admission) => {
+                    // Keep the loop body off the executor's poll frame, as the legacy loop
+                    // does, even though async_trait already boxes the outer executor.
+                    Box::pin(broca_session_loop::run(writer, parts, admission, &seams)).await
                 }
-            } else {
-                Box::pin(broca_session_loop::resume(writer, parts, &seams)).await
+                None => Box::pin(broca_session_loop::resume(writer, parts, &seams)).await,
+            };
+            // A run that moved to another account at a quota wall reports its end under the
+            // credential it moved to.
+            let moved = moves.moved();
+            let (report_selection, used_credential, in_run_refresh) = match &moved {
+                Some(moved) => (
+                    Some(moved.selection.clone()),
+                    used_credential_for_report(
+                        &None,
+                        Some(moved.selection.clone()),
+                        moved.record_version,
+                    ),
+                    moved.in_run_refresh.as_ref(),
+                ),
+                None => (
+                    report_selection,
+                    used_credential,
+                    resolution.in_run_refresh.as_ref(),
+                ),
             };
             // The run's end, for routing and the vault, as `execute` reports it. The reports
             // read only how the run ended or paused.
@@ -4799,7 +5227,7 @@ mod executor {
                 account_reporter.as_deref(),
                 report_selection,
                 used_credential,
-                resolution.in_run_refresh.as_ref(),
+                in_run_refresh,
                 || store_terminal_error(reader),
                 None,
                 &durable_head,
@@ -5884,6 +6312,8 @@ mod executor {
                         media_profile: &job.media_profile,
                         clock: job.control.clock.as_ref(),
                         new_storage: false,
+                        continue_offer: None,
+                        routing_serves_continuation: false,
                     },
                     &history,
                 )
@@ -6256,6 +6686,7 @@ mod executor {
 
         include!("credential_source_guard_tests.rs");
         include!("frozen_auth_method_resume_tests.rs");
+        include!("account_move_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
         /// that omitted `cache`) takes the cache policy and caller cache key frozen in the
@@ -6821,6 +7252,7 @@ mod executor {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 }),
                 selection: Some(broca_core::AuthSelection {
                     billing_vault_facts: None,
@@ -6957,6 +7389,7 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
             assert_eq!(
                 used_credential_for_report(&pause, selection(), Some(7)),
@@ -7429,6 +7862,7 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             }
         }
 
@@ -7595,6 +8029,7 @@ mod executor {
                 account_ref: Some("d4bc9dbc".into()),
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             };
             assert_eq!(wire_auth_status(&exhausted), None);
             let mut records = vec![run_started(1, "limit-run")];
@@ -8321,6 +8756,7 @@ mod executor {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 }),
                 None
             );

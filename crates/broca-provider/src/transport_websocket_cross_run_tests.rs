@@ -356,6 +356,7 @@ async fn codex_auth_required_pause_retires_healthy_socket() {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             }),
             ..Default::default()
         };

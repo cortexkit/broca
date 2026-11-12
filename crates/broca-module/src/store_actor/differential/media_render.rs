@@ -86,6 +86,7 @@ fn refusal(code: String) -> broca_protocol::ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -437,6 +438,7 @@ impl RunExecutor for RenderExecutor {
                 step_progress: control.step_progress.clone(),
                 model_call_ready: ready,
                 pause_for_auth_at_start: None,
+                account_continue: None,
             };
             match mode {
                 crate::executor::StoreRunMode::Fresh => {

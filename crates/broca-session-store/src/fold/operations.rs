@@ -426,15 +426,17 @@ state! {
             reset: "a step's start",
             bound: Bound::OpenWork("the warms of one tool wait"),
         },
-        /// The render config a paused run's resume refroze before any provider call, which the
-        /// run renders with in place of its start's: `{renderer_version, render_config}`.
+        /// The render config the run renders with in place of its start's:
+        /// `{renderer_version, render_config}`. Refrozen by a paused run's resume before any
+        /// provider call, or with an account move at a quota wall when the config names the
+        /// account.
         27 opt pub refrozen_render: serde_json::Value => {
             owner: "provider layer",
             reset: "run_start",
             bound: Bound::Config("one render config"),
         },
-        /// The provider account a paused run's resume refroze, which the run uses in place of
-        /// its start's.
+        /// The provider account the run uses in place of its start's: refrozen by a paused
+        /// run's resume, or by a move to another account at a quota wall.
         28 opt pub refrozen_auth: serde_json::Value => {
             owner: "admission",
             reset: "run_start",

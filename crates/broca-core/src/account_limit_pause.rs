@@ -142,6 +142,7 @@ pub fn request_changed_error() -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         provider_details: None,
     }
 }

@@ -3228,3 +3228,257 @@ async fn auth_routing_hints_are_ignored_for_unlisted_methods() {
     );
     assert!(routing.requests.lock().unwrap().is_empty());
 }
+
+/// A wall on `account`, as the run loop states it, for a run routed under `decision-a`.
+fn continue_wall<'a>(
+    selection: &'a broca_wal::AuthSelection,
+    config: &'a broca_wal::RunConfig,
+    refused: &'a [String],
+    reask: bool,
+) -> broca_session_loop::account_move::Wall<'a> {
+    broca_session_loop::account_move::Wall {
+        run_id: "run-1",
+        step_id: 2,
+        selection,
+        credential_id: &selection.credential_id,
+        account: "acct-a",
+        limit_window: "seven_day",
+        resets_at_ms: Some(NOW as u64 + 3_600_000),
+        observed_at_ms: NOW as u64,
+        attempt_seq: 41,
+        refused_accounts: refused,
+        renderer_version: config.renderer_version,
+        render_config: &config.frozen_render_config,
+        run_config: config,
+        reask,
+    }
+}
+
+fn continue_selection() -> broca_wal::AuthSelection {
+    serde_json::from_value(json!({
+        "credential_id": "credential-a",
+        "account_ref": "acct-a",
+        "auth_method": "oauth",
+        "account_decision": {
+            "path": "routed",
+            "admission_id": "run-1",
+            "decision_id": "decision-a",
+            "conversation_key": "broca-session:abc",
+        },
+    }))
+    .unwrap()
+}
+
+fn continue_config() -> broca_wal::RunConfig {
+    serde_json::from_value(json!({
+        "model": {"provider_module_id": "anthropic", "model_id": "m"},
+        "tools": [],
+        "tool_choice": {"type": "auto"},
+        "generation": {},
+        "response_format": {"type": "text"},
+        "context_epoch": 0,
+        "renderer_version": 1,
+        "frozen_render_config": {},
+    }))
+    .unwrap()
+}
+
+/// The continue request names the run, its original admission and conversation key, the
+/// decision it uses now and the walled account with the refused attempt's evidence, in
+/// routing's own types and field names.
+#[test]
+fn a_continue_request_is_built_from_the_wall_and_the_runs_selection() {
+    let selection = continue_selection();
+    let config = continue_config();
+    let refused = vec!["acct-a".to_owned()];
+    let wall = continue_wall(&selection, &config, &refused, false);
+    let request = continue_request(&wall).unwrap();
+    let id = continue_selection_id(&wall);
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        json!({
+            "mode": "continue",
+            "run_id": "run-1",
+            "admission_id": "run-1",
+            "conversation_key": "broca-session:abc",
+            "previous_decision_id": "decision-a",
+            "exhausted": {
+                "credential_id": "credential-a",
+                "account": "acct-a",
+                "limit_window": "seven_day",
+                "resets_at_ms": NOW as u64 + 3_600_000,
+                "observed_at_ms": NOW as u64,
+            },
+            "selection_id": id,
+        })
+    );
+    // The id names the wall: the same for the same wall, new for a second question at it.
+    assert_eq!(continue_selection_id(&wall), id);
+    assert!(id.len() <= cortexkit_role_routing::account::ADMISSION_ID_MAX_CHARS);
+    let again = continue_wall(&selection, &config, &refused, true);
+    assert_ne!(continue_selection_id(&again), id);
+    // Routing's own parser reads the request back as the same question.
+    let describe = cortexkit_role_routing::describe::RoleDescribe::new(Vec::new(), false)
+        .with_capability(cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE);
+    let parsed = cortexkit_role_routing::account_continue::parse_continue_request(
+        &serde_json::to_value(&request).unwrap(),
+        &describe,
+    )
+    .unwrap();
+    assert!(parsed.same_question(&request));
+}
+
+#[test]
+fn a_selection_without_a_decision_asks_nothing() {
+    let mut selection = continue_selection();
+    selection.account_decision.as_mut().unwrap().decision_id = None;
+    let config = continue_config();
+    let wall = continue_wall(&selection, &config, &[], false);
+    assert!(continue_request(&wall).is_none());
+}
+
+#[test]
+fn continue_replies_are_read_as_offer_hold_refusal_or_nothing() {
+    use cortexkit_role_routing::account_continue::ContinueAnswer;
+    let reply = |value: Value| Ok(serde_json::to_vec(&value).unwrap());
+    let offer = classify_continue_reply(reply(json!({"result": {
+        "kind": "offer", "credential_id": "credential-b", "account": "acct-b",
+        "decision_id": "decision-b", "valid_until_ms": 9,
+    }})));
+    assert!(matches!(
+        offer,
+        ContinueOutcome::Answered(ContinueAnswer::Offer(ref offer))
+            if offer.account == "acct-b" && offer.decision_id == "decision-b"
+    ));
+    let hold = classify_continue_reply(reply(json!({"result": {
+        "kind": "hold", "routing_code": "no_compatible_account", "detail": {}, "until_ms": 7,
+    }})));
+    assert!(matches!(
+        hold,
+        ContinueOutcome::Answered(ContinueAnswer::Hold(ref hold))
+            if hold.routing_code == "no_compatible_account" && hold.until_ms == Some(7)
+    ));
+    let refused = classify_continue_reply(Err(serde_json::to_vec(
+        &json!({"code": "invalid_request", "message": "no", "detail": {"field": "mode"}}),
+    )
+    .unwrap()));
+    assert!(matches!(
+        refused,
+        ContinueOutcome::Answered(ContinueAnswer::Refuse(ref refusal))
+            if refusal.routing_code == "invalid_request"
+    ));
+    assert!(matches!(
+        classify_continue_reply(reply(json!({"result": {"kind": "maybe"}}))),
+        ContinueOutcome::Unreachable(_)
+    ));
+}
+
+/// Without routing serving continuation (both `account_continue` and `account_continue_resume`
+/// declared), nothing is sent; with it, the request goes over the admission route as
+/// `route.account_for`.
+#[tokio::test]
+async fn a_continue_request_is_sent_only_to_a_router_that_serves_continuation() {
+    let selection = continue_selection();
+    let config = continue_config();
+    let wall = continue_wall(&selection, &config, &[], false);
+    let request = continue_request(&wall).unwrap();
+    let routing = FakeRouting::answering(Ok(Ok(b"{}".to_vec())));
+    let outcome = client(&routing)
+        .account_continue(
+            false,
+            &request,
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    assert_eq!(outcome, ContinueOutcome::NotDeclared);
+    assert!(routing.requests.lock().unwrap().is_empty());
+    let routing = FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result": {
+        "kind": "refuse", "routing_code": "account_pinned", "detail": {},
+    }}))
+    .unwrap())));
+    let outcome = client(&routing)
+        .account_continue(
+            true,
+            &request,
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    assert!(matches!(outcome, ContinueOutcome::Answered(_)));
+    assert_eq!(
+        *routing.requests.lock().unwrap(),
+        vec![json!({"method": ACCOUNT_FOR_OP, "params": serde_json::to_value(&request).unwrap()})]
+    );
+    // A router that doesn't answer within the budget is no answer.
+    let routing = FakeRouting::hung();
+    let outcome = client(&routing)
+        .account_continue(
+            true,
+            &request,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await;
+    assert_eq!(outcome, ContinueOutcome::NoAnswerWithinBudget);
+}
+
+/// After a move, routing hears `admission_started` again under the run's original admission,
+/// naming the offered credential and account, after the refused attempt and before any attempt
+/// on the new account.
+#[tokio::test]
+async fn a_move_is_reported_once_in_order_under_the_original_admission() {
+    let routing = Arc::new(FakeRouting::default());
+    let client = Arc::new(client(&routing));
+    let reporter = RunReporter::start(
+        Arc::clone(&client),
+        "adm-move".into(),
+        "run-move".into(),
+        None,
+        Arc::new(AtomicU64::new(100)),
+    );
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::attempt_recorded(
+        reporter.as_ref(),
+        Some(lineage),
+        5,
+        &attempt(Some(429), AttemptAccountObservation::default()),
+    );
+    let mut moved = continue_selection();
+    moved.credential_id = "credential-b".into();
+    moved.account_ref = Some("acct-b".into());
+    reporter.moved(Some(lineage), 6, &moved);
+    broca_core::AccountReporter::attempt_recorded(
+        reporter.as_ref(),
+        Some(lineage),
+        7,
+        &attempt(Some(200), AttemptAccountObservation::default()),
+    );
+    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    settle(&routing, 5).await;
+    let observed = routing.observed();
+    let kinds: Vec<_> = observed.iter().map(|body| body["kind"].clone()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            json!("admission_started"),
+            json!("attempt"),
+            json!("admission_started"),
+            json!("attempt"),
+            json!("run_finished"),
+        ]
+    );
+    assert_eq!(
+        observed[2],
+        json!({
+            "event_id": format!("{lineage}:6"),
+            "caller": {"runner": "broca"},
+            "kind": "admission_started",
+            "admission_id": "adm-move",
+            "run_id": "run-move",
+            "credential_id": "credential-b",
+            "served_account_id": "acct-b",
+        })
+    );
+    assert!(observed
+        .iter()
+        .all(|body| body["admission_id"] == "adm-move"));
+}

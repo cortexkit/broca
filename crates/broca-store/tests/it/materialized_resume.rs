@@ -2060,6 +2060,7 @@ async fn paused_budgeted_run_projects_once_at_pause() {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             },
             retries_used: 0,
         },

@@ -302,6 +302,7 @@ fn assert_resume_replays_the_admitted_cache_policy(
             run_id: broca_protocol::RunId("admitted".into()),
             config,
             idle: false,
+            moved: false,
         }
     };
 

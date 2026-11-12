@@ -339,6 +339,7 @@ pub fn refusal(reason: String) -> broca_protocol::ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

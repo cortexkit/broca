@@ -564,6 +564,7 @@ pub(crate) fn error(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 fn refusal(

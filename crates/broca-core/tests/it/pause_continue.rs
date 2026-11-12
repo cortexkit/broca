@@ -346,6 +346,7 @@ fn auth_error_step() -> Vec<NormalizedEvent> {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         },
         retries_used: 0,
     })]
@@ -978,6 +979,7 @@ async fn pause_for_auth_at_start_admits_then_pauses_then_continues() {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }),
         auth_selection: Some(AuthSelection {
             billing_vault_facts: None,
@@ -1179,6 +1181,7 @@ async fn auth_resume_with_the_same_selection_is_silent_and_keeps_one_segment() {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             }),
             auth_selection: Some(selection.clone()),
             ..Default::default()
@@ -1258,6 +1261,7 @@ async fn pause_before_first_call_refreezes_project_on_auth_resume() {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }),
         ..Default::default()
     };
@@ -1409,6 +1413,7 @@ async fn auth_resume_refreezes_use_run_clock() {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             }),
             ..Default::default()
         },
@@ -1787,6 +1792,7 @@ async fn null_blob_cannot_refreeze_an_at_start_auth_pause() {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }),
         ..Default::default()
     };

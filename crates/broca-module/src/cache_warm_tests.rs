@@ -614,6 +614,7 @@ impl RunExecutor for WarmExecutor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
         }
         run_loop_on_writer_admitted_with_prior_snapshot(

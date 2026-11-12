@@ -515,6 +515,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }
     }
 
@@ -595,6 +596,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
                 ProviderError {
                     provider_details: None,
@@ -612,6 +614,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
             ] {
                 assert_eq!(

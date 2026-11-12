@@ -569,6 +569,7 @@ fn error_value(message: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -1292,6 +1293,7 @@ async fn run_status_reports_an_exhausted_account_with_its_reset_window_and_accou
         account_ref: Some("d4bc9dbc".into()),
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     append_seed(
         &rig.wal_store,
