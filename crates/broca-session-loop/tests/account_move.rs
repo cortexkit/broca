@@ -2025,3 +2025,129 @@ async fn a_crash_at_every_point_of_a_move_resumes_on_what_the_log_holds() {
     assert!(crashes > 5, "the run was cut at {crashes} points");
     assert!(resumed_sends > 0, "some resume sent step 2 again");
 }
+/// A run on A pauses for a restart after its first step, then resumes on `account` (routing
+/// gave it that one) with a provider rendering `render`. What the resume did: its end, the log
+/// and the requests sent.
+async fn resume_paused_run_on(
+    account: &str,
+    render: Value,
+) -> (
+    Result<broca_session_loop::Finished, broca_session_loop::LoopError>,
+    Vec<(u64, Record)>,
+    Vec<Sent>,
+) {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log: Log = Arc::default();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let provider: Box<dyn Provider> = Box::new(Account::new("A", vec![Reply::Tool], &sent, &log));
+    let a = routed("A", "decision-A");
+    let mut request = request();
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    let control = broca_core::RunControl {
+        cancel: Some(Default::default()),
+        auth_selection: Some(a.clone()),
+        ..Default::default()
+    };
+    let now = || NOW;
+    let admission = broca_session_loop::admit::admission(
+        &mut request,
+        &control,
+        &provider,
+        Writer::operations(&session),
+        Some(now()),
+    )
+    .unwrap();
+    let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
+    let first = seams(
+        &provider,
+        &tools,
+        &now,
+        None,
+        &log,
+        a,
+        Default::default(),
+        stop.clone(),
+    );
+    let mut writer = Logging {
+        session: &mut session,
+        log: Arc::clone(&log),
+        refuse_moves: false,
+        stop_after_batches: Some((1, stop.clone())),
+    };
+    let paused = broca_session_loop::run::run(&mut writer, &mut parts, admission, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.paused,
+        Some(broca_protocol::caller::PauseReason::Restart)
+    );
+    drop(first);
+    let mut resumed_on = Account::new(account, vec![Reply::Answer], &sent, &log);
+    resumed_on.render_config = render;
+    let resumed_on: Box<dyn Provider> = Box::new(resumed_on);
+    let second = seams(
+        &resumed_on,
+        &tools,
+        &now,
+        None,
+        &log,
+        routed(account, &format!("decision-{account}")),
+        Default::default(),
+        Default::default(),
+    );
+    let finished = broca_session_loop::resume(&mut writer, &parts, &second).await;
+    drop(second);
+    let records = session.open_log_records().await.unwrap();
+    let sent = sent.lock().unwrap().clone();
+    (finished, records, sent)
+}
+
+/// A paused run that resumes on another account than it ran on, after provider calls, takes
+/// the provider's persona refrozen for that account: the config and the account are refrozen
+/// in one batch, and the next request goes out on the new account.
+#[tokio::test]
+async fn a_resume_on_another_account_refreezes_the_persona_with_it() {
+    let (finished, records, sent) = resume_paused_run_on("C", render_config("C")).await;
+    assert_eq!(
+        finished.unwrap().reason,
+        RunFinishReason::Completed,
+        "{records:#?}"
+    );
+    let refreezes: Vec<_> = records
+        .iter()
+        .filter_map(|(seq, record)| match record {
+            Record::ConfigRefrozen(config) => Some((*seq, config.render_config.clone())),
+            Record::AuthRefrozen(auth) => Some((*seq, auth.auth_selection["account_ref"].clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refreezes.len(), 2, "{refreezes:#?}");
+    assert_eq!(refreezes[0].1, render_config("C"));
+    assert_eq!(refreezes[1].1, json!("C"));
+    assert_eq!(
+        refreezes[0].0 + 1,
+        refreezes[1].0,
+        "one batch, config first"
+    );
+    let last = sent.last().unwrap();
+    assert_eq!((last.account.as_str(), last.step), ("C", 2));
+}
+
+/// Any other change of the render config after a provider call still ends the run, account
+/// change or not, and so does a persona change without one.
+#[tokio::test]
+async fn a_resume_whose_config_changes_beyond_the_persona_still_ends_the_run() {
+    let mut beyond = render_config("C");
+    beyond["other"] = json!(1);
+    for (account, render) in [("C", beyond), ("A", render_config("C"))] {
+        let (finished, records, sent) = resume_paused_run_on(account, render).await;
+        assert_eq!(finished.unwrap().reason, RunFinishReason::Interrupted);
+        assert!(!records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::ConfigRefrozen(_))));
+        assert_eq!(sent.len(), 1, "only the first step was sent");
+    }
+}

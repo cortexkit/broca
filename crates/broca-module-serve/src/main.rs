@@ -3412,6 +3412,39 @@ mod executor {
     }
 
     /// Decode the whole admission bundle so upstream routing changes cannot move a resumed run.
+    /// Refreezes `frozen`'s Claude Code persona for the account `selection` names, when that
+    /// differs from `previous_account`, the account the run last ran on (see
+    /// `claude_code_identity::moved_persona`). A config without a persona, or a selection on the
+    /// same account, is left as it is.
+    fn persona_for_resumed_account(
+        frozen: &mut broca_provider::wire::FrozenRenderConfig,
+        install_id: Option<&str>,
+        previous_account: Option<&str>,
+        selection: Option<&broca_core::AuthSelection>,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<(), String> {
+        let (Some(persona), Some(selection)) = (frozen.claude_code_persona.as_ref(), selection)
+        else {
+            return Ok(());
+        };
+        let account = selection.account_ref.as_deref();
+        if account.is_none() || account == previous_account {
+            return Ok(());
+        }
+        let install_id =
+            install_id.ok_or("no installation id to derive the new account's persona from")?;
+        let moved = broca_module_serve::claude_code_identity::moved_persona(
+            persona,
+            install_id,
+            account,
+            &selection.credential_id,
+            session,
+        )
+        .map_err(|error| format!("the resumed account's persona: {error}"))?;
+        frozen.claude_code_persona = Some(moved);
+        Ok(())
+    }
+
     fn decode_recorded_render_config(
         config: &broca_wal::RunConfig,
     ) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
@@ -4624,6 +4657,26 @@ mod executor {
                 .as_ref()
                 .filter(|_| !fresh_episode)
                 .map(|prior| decode_recorded_render_config(&prior.config));
+            // A moved run whose resume asked routing again may be given another account than
+            // the one it ran on. The recorded Claude Code persona names that account in the
+            // request body, so it is refrozen for the account routing gave, as a move inside the
+            // run refreezes it; the loop records the config with the account.
+            let recorded_render_config = match recorded_render_config {
+                Some(Ok(mut frozen)) if resume_asks => match persona_for_resumed_account(
+                    &mut frozen,
+                    self.claude_code_install_id.as_deref(),
+                    prior_run
+                        .as_ref()
+                        .and_then(|prior| prior.config.auth_selection.as_ref())
+                        .and_then(|selection| selection.account_ref.as_deref()),
+                    resolution.selection.as_ref(),
+                    &job.req.session,
+                ) {
+                    Ok(()) => Some(Ok(frozen)),
+                    Err(error) => return Err(RunError::Config(error)),
+                },
+                other => other,
+            };
             // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
             // core's provider type until resume rebuilds real credentials and runs the pre-call
             // refreeze check. The core durably writes RunStarted and RunPaused without rendering or

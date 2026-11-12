@@ -714,11 +714,34 @@ where
     };
     let mut refrozen = Vec::new();
     if let Resolution::Paused(reason) = resolution {
+        // A paused run resumed on another account than it froze (routing gave it one), on a
+        // route whose render config names the account: the Claude Code persona, which the
+        // request body carries. The provider renders the persona refrozen for the new account,
+        // and the run takes it even after a provider call, as a move inside a run does: the
+        // next request is the first on that account, which holds none of the old one's cache.
+        // Any other difference still ends the run.
+        let persona_follows_account = seams
+            .auth_selection
+            .as_ref()
+            .and_then(|selection| selection.account_ref.as_deref())
+            .is_some_and(|account| {
+                reason != PauseReason::AccountLimit
+                    && admission
+                        .auth_selection
+                        .as_ref()
+                        .and_then(|frozen| frozen.account_ref.as_deref())
+                        != Some(account)
+            })
+            && seams.provider.renderer_version() == admission.renderer_version
+            && differs_only_in_persona(
+                &seams.provider.render_config_blob(),
+                &admission.render_config,
+            );
         if let Some(error) = &drift {
             // Before any provider call no request depends on the old config, so the run takes
             // the provider's current one; after a call, or when either config can't be read, the
             // run can't go on.
-            if run.provider_call_started
+            if (run.provider_call_started && !persona_follows_account)
                 || error.provider_code.as_deref() == Some("frozen_render_config_unverifiable")
             {
                 return end_with_error(
@@ -1978,6 +2001,23 @@ fn finalize_tool_choice<W: Writer>(writer: &W, opts: &mut CallOptions) -> bool {
         opts.tool_choice = Arc::new(ToolChoice::None);
     }
     finalizing
+}
+
+/// Whether two render configs differ, and only in the Claude Code persona they freeze.
+fn differs_only_in_persona(current: &Value, frozen: &Value) -> bool {
+    const PERSONA: &str = "claude_code_persona";
+    let (Some(current), Some(frozen)) = (current.as_object(), frozen.as_object()) else {
+        return false;
+    };
+    if current.get(PERSONA) == frozen.get(PERSONA) {
+        return false;
+    }
+    let without = |config: &serde_json::Map<String, Value>| {
+        let mut config = config.clone();
+        config.remove(PERSONA);
+        config
+    };
+    without(current) == without(frozen)
 }
 
 /// Model steps and tool batches from the run's current state until a decision ends the run.
