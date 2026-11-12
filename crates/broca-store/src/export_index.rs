@@ -1042,6 +1042,225 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn write_export_facts_reader_fixture_when_requested() {
+        let Some(path) = std::env::var_os("BROCA_EXPORT_FACTS_READER_FIXTURE") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        assert!(!path.exists(), "refusing to overwrite an existing fixture");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        drop(conn);
+        let store = ExportStore::open(&path).unwrap();
+        let resolver = |_: &str, _: &str| (ChargeBasis::MeteredApi, 7);
+
+        fn fixture_records(
+            number: u64,
+            session: BindIdentity,
+            segments: usize,
+            account: &str,
+        ) -> Vec<FramedRecord> {
+            let mut records = records_with_usage_policy(
+                &format!("run-fixture-{number}"),
+                segments,
+                "open_ai_usage_reasoning_separate",
+                session,
+            );
+            let base_ms = 1_700_000_000_000 + number * 1_000;
+            for framed in &mut records {
+                match &mut framed.record {
+                    WalRecord::RunStarted {
+                        config,
+                        ts_ms,
+                        scope,
+                        ..
+                    } => {
+                        *ts_ms = Some(base_ms);
+                        config.model = ModelHandle::new(
+                            "synthetic-provider",
+                            format!("synthetic-model-{number}"),
+                        );
+                        config.frozen_render_config["wire_model_id"] =
+                            config.model.model_id.clone().into();
+                        let auth = config.auth_selection.as_mut().unwrap();
+                        auth.credential_id = format!("apikey:synthetic-provider:{account}");
+                        auth.account_ref = Some(account.into());
+                        auth.resolved_credential_id =
+                            Some(format!("synthetic-credential-{account}"));
+                        auth.vault_request = Some(broca_wal::VaultRequest {
+                            min_ttl_ms: None,
+                            force_refresh: Some(false),
+                            op: Some(broca_wal::VaultReadOp::Get),
+                        });
+                        config.work_class = Some("synthetic-fixture-work".into());
+                        if number == 3 || number == 4 {
+                            *scope = Some(broca_protocol::SessionScope {
+                                owner: broca_protocol::BindPrincipal::Reserved {
+                                    module_id: "synthetic-owner".into(),
+                                },
+                                scope_ref: format!("synthetic-agent-scope-{number}"),
+                                scope_epoch: 1,
+                                flow_id: None,
+                                sender: None,
+                                agent_id: Some(format!("synthetic-agent-{number}")),
+                                run_id: Some(format!("synthetic-agent-run-{number}")),
+                                agent_id_frozen: false,
+                            });
+                        }
+                    }
+                    WalRecord::RunConfigRefrozen {
+                        ts_ms,
+                        frozen_render_config,
+                        ..
+                    } => {
+                        *ts_ms = Some(base_ms + 100);
+                        frozen_render_config["wire_model_id"] =
+                            format!("synthetic-model-{number}").into();
+                    }
+                    WalRecord::ModelStepFinished {
+                        usage,
+                        service_tier_used,
+                        ..
+                    } => {
+                        usage.cached_input_tokens = Some(0);
+                        usage.cache_write_tokens = Some(3);
+                        usage.cache_write_5m_tokens = Some(2);
+                        usage.cache_write_1h_tokens = Some(1);
+                        usage.reasoning_tokens = Some(1);
+                        *service_tier_used = Some("synthetic-tier".into());
+                    }
+                    WalRecord::RunFinished { ts_ms, reason, .. } => {
+                        *ts_ms = Some(base_ms + 200);
+                        if number == 5 {
+                            *reason = RunFinishReason::Error;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            records
+        }
+
+        let legacy = BindIdentity::new(
+            "/synthetic/project-a",
+            "synthetic-harness",
+            "synthetic-legacy-session",
+        );
+        let first = fixture_records(1, legacy.clone(), 1, "acct1");
+        store
+            .emit_export_run(&first, &RunId("run-fixture-1".into()), &resolver)
+            .unwrap();
+        // A replay consumes an AUTOINCREMENT candidate even though the duplicate is ignored.
+        store
+            .emit_export_run(&first, &RunId("run-fixture-1".into()), &resolver)
+            .unwrap();
+        store
+            .emit_export_run(
+                &fixture_records(2, legacy, 1, "acct1"),
+                &RunId("run-fixture-2".into()),
+                &resolver,
+            )
+            .unwrap();
+
+        let head = BindIdentity::new(
+            broca_protocol::session::UNSCOPED_SESSION_ROOT,
+            "synthetic-agent-harness",
+            "synthetic-agent-head",
+        );
+        let mut head_records = fixture_records(3, head, 2, "acct2");
+        let warm_usage = Usage {
+            input_tokens: Some(1),
+            cached_input_tokens: Some(20),
+            output_tokens: Some(0),
+            ..Usage::default()
+        };
+        let sent_at_ms = 1_700_000_003_300;
+        head_records.push(FramedRecord {
+            seq: 6,
+            fence: 1,
+            record: WalRecord::CacheWarmed {
+                attempt_id: None,
+                reservation: None,
+                envelope: Some(Box::new(broca_wal::record::AttemptEnvelope {
+                    sent: broca_wal::record::AttemptSent::Yes,
+                    response_bytes: 128,
+                    outcome: broca_wal::record::BillingAttemptOutcome::Complete,
+                    sent_at_ms: Some(sent_at_ms),
+                    finished_at_ms: Some(sent_at_ms + 10),
+                    http_status: Some(200),
+                    usage: Some(warm_usage),
+                    ..Default::default()
+                })),
+                trigger: Some("keep_warm".into()),
+                run_id: RunId("run-fixture-3".into()),
+                step_id: StepId(1),
+                request_body_sha256: "a".repeat(64),
+                warm_body_sha256: "b".repeat(64),
+                usage: warm_usage,
+                served_account_ref: Some("acct2".into()),
+                ratelimit_headers: Default::default(),
+                sent_at_ms,
+                ttl_ms: Some(300_000),
+                expires_at_ms: Some(sent_at_ms + 300_000),
+            },
+        });
+        store
+            .emit_export_run(&head_records, &RunId("run-fixture-3".into()), &resolver)
+            .unwrap();
+        for (number, session) in [(4, "synthetic-worker"), (5, "synthetic-error-session")] {
+            let session =
+                BindIdentity::new("/synthetic/project-b", "synthetic-agent-harness", session);
+            store
+                .emit_export_run(
+                    &fixture_records(number, session, 1, "acct2"),
+                    &RunId(format!("run-fixture-{number}")),
+                    &resolver,
+                )
+                .unwrap();
+        }
+
+        use sha2::Digest as _;
+        let classifier = broca_core::system_one_fact::SystemOneFact {
+            fact_id: sha2::Sha256::digest(b"synthetic-classifier-fact-1")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            batch_id: "synthetic-batch-1".into(),
+            item_index: 0,
+            provider: "synthetic-classifier-provider".into(),
+            model: "synthetic-classifier-model".into(),
+            auth_selection: None,
+            account_ref: Some("acct1".into()),
+            run_id: None,
+            flow_id: Some("synthetic-flow-1".into()),
+            charge_basis: ChargeBasis::MeteredApi,
+            charge_basis_mapping_version: 7,
+            charge_basis_overrides: "none".into(),
+            usage: broca_core::system_one_fact::SystemOneUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(1),
+            },
+            occurred_at_ms: 1_700_000_006_200,
+        };
+        assert!(store.emit_system_one_fact(&classifier).unwrap());
+
+        let conn = store.conn.lock().unwrap();
+        // This reader fixture excludes the empty writer-only imported-run bookkeeping table.
+        conn.execute_batch("DROP TABLE export_imported_runs;")
+            .unwrap();
+        let sequences = conn
+            .prepare("SELECT export_seq FROM export_facts ORDER BY export_seq")
+            .unwrap()
+            .query_map([], |row| row.get::<_, u64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(sequences, vec![1, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(store.export_high_water(), 9);
+    }
+
     fn projection_bytes(store: &SqliteStore) -> Vec<Vec<String>> {
         projection_bytes_for(store, None)
     }
