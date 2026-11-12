@@ -2221,8 +2221,10 @@ pub struct MemoryHolders {
     /// compaction provider's entries for the window's messages, and the message states they were
     /// built from.
     pub compaction_entries: u64,
-    /// The media fold: what the session's actor keeps to render the media its records name, such
-    /// as records waiting for the ledger record that claims them and where each medium is stored.
+    /// The session's image index: what the session's actor keeps to render the media its
+    /// records name, such as the media it captured, their aging, and where each medium is
+    /// stored. The member keeps the name it had when a per-run media fold held this, so the
+    /// report's readers keep reading it.
     pub media_fold: u64,
     /// The request of a model call in flight: its prompt and options, without the tool list,
     /// which `setup_parts` counts.

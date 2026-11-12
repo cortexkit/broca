@@ -27,7 +27,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             step.as_ref()?.request.upgrade()
         });
         let request_in_flight = request.as_deref().map_or(0, request_bytes);
-        let media_fold = self.media_fold.as_ref().map_or(0, |fold| fold.held_bytes());
+        let media_fold = self.media.held_bytes();
         let first_episode = self.admission.known();
         let mut setup = first_episode.map_or_else(Vec::new, setup_of);
         if let Some(request) = &request {

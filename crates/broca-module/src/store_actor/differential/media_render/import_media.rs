@@ -260,13 +260,13 @@ async fn an_installed_view_over_the_imported_images_leaves_them_out_without_a_re
     }
 }
 
-/// The session's records right after an import of `export`, through a store actor over a
-/// session in memory.
-async fn imported_records(
+/// The session right after an import of `export`, through a store actor over a session in
+/// memory, with its backend and its next seq.
+async fn imported_session(
     export: &[u8],
 ) -> (
-    BindIdentity,
-    Vec<(u64, broca_session_store::record::Record)>,
+    broca_session_store::session::Session<&'static broca_session_store::backend::MemoryBackend>,
+    &'static broca_session_store::backend::MemoryBackend,
     u64,
 ) {
     use broca_session_loop::parts::{MemoryParts, SharedParts};
@@ -319,19 +319,28 @@ async fn imported_records(
     drop(commands);
     let session = served.await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    let records = session.open_log_records().await.unwrap();
-    (key, records, session.next_seq())
+    let next = session.next_seq();
+    (session, backend, next)
 }
 
-/// The media fold takes in an import's batch whole, with or without images in its history, and
-/// stays able to render.
+/// The session's image index takes in an import's batch whole, with or without images in its
+/// history, and stays able to render: the imported images are captured, and none is otherwise.
 #[tokio::test]
-async fn the_media_fold_takes_in_an_import_with_or_without_images() {
+async fn the_image_index_takes_in_an_import_with_or_without_images() {
     for images in [true, false] {
-        let (key, records, next) = imported_records(&export(images)).await;
-        let mut fold = crate::store_media::MediaFold::new(key);
-        fold.take(&records, &broca_session_loop::parts::MemoryParts::default());
-        assert_eq!(fold.broken(), None, "images: {images}");
-        assert_eq!(fold.next_seq(), next, "images: {images}");
+        let (session, backend, next) = imported_session(&export(images)).await;
+        let history = session.media_history(next - 1).await.unwrap();
+        let index = crate::store_media::SessionIndex::from_history(
+            &session,
+            backend,
+            history,
+            next - 1,
+            &broca_session_loop::parts::MemoryParts::default(),
+        );
+        assert_eq!(index.broken(), None, "images: {images}");
+        let captured = index
+            .index()
+            .map_or(0, |index| index.session().facts().captures.len());
+        assert_eq!(captured > 0, images, "images: {images}");
     }
 }

@@ -49,6 +49,12 @@ crate::fold::state! {
         7 opt pub activity_ms: u64 => {
             owner: "session", reset: "Moved", bound: Bound::Fixed,
         },
+        /// The media fold's state and the saved media index, current through one seq (see
+        /// `fold::media`). Optional and not must-understand: an older build skips it, and a
+        /// checkpoint without it makes the session build its media index once.
+        8 opt pub media: crate::fold::media::MediaIndexRef => {
+            owner: "media", reset: "ChangeIntent", bound: Bound::Declared,
+        },
     }
 }
 

@@ -1354,6 +1354,7 @@ mod stored {
     use super::{Gen, G};
     use crate::checkpoint::Checkpoint;
     use crate::directory::{DirEntry, Page, PageRef};
+    use crate::fold::media::{Captured, MediaFold, MediaIndexRef};
     use crate::head::*;
     use crate::idindex::*;
     use crate::segment::{BlockBody, BlockEntry, SegmentHeader, SegmentIndex, StoredRecord};
@@ -1366,7 +1367,23 @@ mod stored {
         transcript_base,
         ledger_base,
         activity_ms,
+        media,
     });
+    crate::fuzzing::gen::fields!(MediaIndexRef {
+        through,
+        object,
+        fold
+    });
+    crate::fuzzing::gen::fields!(Captured { first_accepted });
+
+    impl Gen for MediaFold {
+        fn gen(g: &mut G<'_>) -> Self {
+            let mut fold =
+                MediaFold::from_scalars(super::gen(g), super::gen(g), super::gen(g), super::gen(g));
+            fold.captured = super::gen(g);
+            fold
+        }
+    }
     crate::fuzzing::gen::fields!(SessionTriple {
         project_root,
         harness,

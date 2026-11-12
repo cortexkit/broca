@@ -358,7 +358,7 @@ pub struct StoreRunJob {
     pub parts: Box<dyn broca_session_loop::parts::Parts>,
     pub mode: StoreRunMode,
     /// What the run renders media from, as today's runs render it (see `store_media`), sent
-    /// once the session's media fold is ready. `None` for a seal, which calls no model.
+    /// once the session's image index is ready. `None` for a seal, which calls no model.
     pub media: Option<crate::store_media::StoreRunMediaWait>,
     /// The service tier level the send admitted, as [`RunJob::queued_service_tier`]: routing may
     /// choose another, and a fresh run's admission applies it to the request it freezes.

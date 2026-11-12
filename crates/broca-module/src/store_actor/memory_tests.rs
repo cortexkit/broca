@@ -366,11 +366,12 @@ fn sessions_on_one_plan_hold_no_more_copies_of_its_tool_list_than_the_budget() {
     );
 }
 
-/// The estimates the memory report makes of a live projection, a media fold and a request in
+/// The estimates the memory report makes of a live projection, an image index and a request in
 /// flight are each within [`ESTIMATE_TOLERANCE`] of what the allocator measured for the same
-/// value, built from the synthetic session.
+/// value: the projection and the request built from the synthetic session, which holds no
+/// images, and the index from a session of [`INDEXED_IMAGES`] images.
 #[test]
-fn the_estimates_of_a_projection_a_media_fold_and_a_request_match_the_allocator() {
+fn the_estimates_of_a_projection_an_image_index_and_a_request_match_the_allocator() {
     use broca_test_support::alloc::measure;
 
     assert!(
@@ -393,12 +394,8 @@ fn the_estimates_of_a_projection_a_media_fold_and_a_request_match_the_allocator(
         }
         control
     });
-    let parts = MemoryParts::default();
-    let (fold, folded) = measure(|| {
-        let mut fold = Box::new(crate::store_media::MediaFold::new(bind()));
-        fold.take(&records, &parts);
-        fold
-    });
+    let images = images(INDEXED_IMAGES);
+    let (index, indexed) = measure(|| Box::new(index_of(&images)));
     let (request, built) = measure(|| {
         Box::new(broca_protocol::request::CallOptions::new(
             session.conversation.messages.clone(),
@@ -406,7 +403,11 @@ fn the_estimates_of_a_projection_a_media_fold_and_a_request_match_the_allocator(
     });
     let rows = [
         ("live projection", control.held_bytes(), projected),
-        ("media fold", fold.held_bytes(), folded),
+        (
+            "image index",
+            std::mem::size_of::<crate::store_media::SessionIndex>() + index.held_bytes(),
+            indexed,
+        ),
         (
             "request in flight",
             super::memory::request_bytes(&request),
@@ -482,4 +483,184 @@ fn the_report_of_a_synthetic_store_carries_sizes_and_counts_only() {
     }
     drop(deliveries);
     drop(actor);
+}
+
+/// Images in the session an image index's estimate and budget are measured on.
+const INDEXED_IMAGES: u32 = 500;
+
+/// What the image index of a session with [`INDEXED_IMAGES`] images may hold, in bytes: 500 KiB,
+/// so about 1 KiB per image.
+const INDEX_OF_500_IMAGES: u64 = 500 * 1024;
+
+/// A session of `count` runs, each sending one image, written as the actor serves a run's
+/// writes.
+fn images(count: u32) -> crate::store_media::tests::Store {
+    use crate::store_media::tests::{photo, Store};
+    futures::executor::block_on(async {
+        let mut store = Store::new().await;
+        for n in 0..count {
+            store.run(&format!("r{n}"), photo("look", n), Some(n)).await;
+        }
+        store
+    })
+}
+
+/// The image index an open builds for `store`'s session from all its records.
+fn index_of(store: &crate::store_media::tests::Store) -> crate::store_media::SessionIndex {
+    futures::executor::block_on(async {
+        let last = store.session.next_seq() - 1;
+        let history = store.session.media_history(last).await.unwrap();
+        crate::store_media::SessionIndex::from_history(
+            &store.session,
+            store.backend,
+            history,
+            last,
+            &store.parts,
+        )
+    })
+}
+
+/// A session that never sent an image holds no image index, however long it runs: over 1,000
+/// model steps, applying what each step's writes handed over allocates nothing that stays.
+#[test]
+fn a_session_without_images_holds_no_image_index_after_a_thousand_steps() {
+    use crate::store_media::tests::{
+        assistant, attempt, facts, input, said, start, step_end, step_start, Store,
+    };
+    use broca_session_store::record::Placement;
+    use broca_test_support::alloc::measure;
+
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    let (grown, content) = futures::executor::block_on(async {
+        let mut store = Store::new().await;
+        let mid = store.session.message_id(2);
+        let config = store.config.clone();
+        store
+            .append(
+                vec![
+                    start("r1", vec![config]),
+                    input("r1", Placement::RunInput, None, said("go")),
+                    facts(1, mid),
+                ],
+                true,
+            )
+            .await;
+        let mut grown = 0;
+        for step in 1..=1_000 {
+            let ordinal = store.session.conversation.placed + 1;
+            let mid = store.session.message_id(2);
+            for records in [
+                vec![step_start("r1", step)],
+                vec![attempt("r1", step)],
+                vec![
+                    assistant("r1", step),
+                    step_end("r1", step, 0),
+                    facts(ordinal, mid.clone()),
+                ],
+            ] {
+                store.session.append(&records, true).await.unwrap();
+                let Store {
+                    session,
+                    index,
+                    parts,
+                    ..
+                } = &mut store;
+                let ((), counts) = measure(|| index.absorb(session, parts));
+                grown += counts.held;
+            }
+        }
+        assert!(store.index.index().is_none());
+        (grown, store.index.content_bytes())
+    });
+    let budget = Budget::new(
+        "the image index of a session without images, over 1,000 steps",
+        "byte",
+        1,
+    )
+    .holder("index growth, measured", grown.max(0) as u64, 0)
+    .holder("index content, estimated", content as u64, 0);
+    eprintln!("{}", budget.table());
+    budget.check();
+}
+
+/// A session with [`INDEXED_IMAGES`] images holds under [`INDEX_OF_500_IMAGES`] of image index:
+/// the engine, its aging state and where each image's bytes are, as an open that builds the index
+/// from the session's records holds them.
+#[test]
+fn a_session_with_500_images_holds_under_500_kb_of_image_index() {
+    use broca_test_support::alloc::measure;
+
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    let images = images(INDEXED_IMAGES);
+    let (index, counts) = measure(|| index_of(&images));
+    let captures = index
+        .index()
+        .map(|index| index.session().facts().captures.len());
+    assert_eq!(captures, Some(INDEXED_IMAGES as usize));
+    let budget = Budget::new(
+        format!("the image index of a session with {INDEXED_IMAGES} images"),
+        "KiB",
+        1024,
+    )
+    .holder("index", counts.held.max(0) as u64, INDEX_OF_500_IMAGES);
+    let per_image = |bytes: usize| bytes as f64 / f64::from(INDEXED_IMAGES);
+    let parts: String = index
+        .held_parts()
+        .iter()
+        .map(|(part, bytes)| {
+            format!(
+                "\n    {part:<28} {bytes:>10} B, {:>8.1} B per image",
+                per_image(*bytes)
+            )
+        })
+        .collect();
+    eprintln!(
+        "{}\n  estimated: {} bytes ({:.1} per image), by part:{parts}",
+        budget.table(),
+        index.held_bytes(),
+        per_image(index.held_bytes()),
+    );
+    budget.check();
+}
+
+/// An open of a sealed session with images starts from the image index its seal saved, then
+/// applies the events of the open log's later records, which the session's load already read
+/// and handed over. Opening the index reads that one saved object and no record.
+#[test]
+fn an_open_of_a_sealed_session_reads_no_record_twice() {
+    use crate::store_media::tests::{addr, deployment, photo, triple};
+
+    let mut store = images(50);
+    let (log_reads, object_reads, ready) = futures::executor::block_on(async {
+        store.seal().await;
+        for n in 50..60 {
+            store.run(&format!("r{n}"), photo("look", n), Some(n)).await;
+        }
+        let backend = store.backend;
+        let parts = store.parts;
+        store.session.close().await.unwrap();
+        let mut session = Session::load(backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        let (logs, objects) = (backend.log_reads(), backend.object_reads());
+        let mut index = crate::store_media::SessionIndex::new(&session, Some(backend));
+        index.open(&mut session, &parts).await;
+        (
+            backend.log_reads() - logs,
+            backend.object_reads() - objects,
+            index.ready(),
+        )
+    });
+    assert!(ready, "the saved index carried the session, with no build");
+    let budget = Budget::new("an open of a sealed session with images", "read", 1)
+        .holder("log reads by the index's open", log_reads as u64, 0)
+        .holder("object reads by the index's open", object_reads as u64, 1);
+    eprintln!("{}", budget.table());
+    budget.check();
 }

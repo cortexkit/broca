@@ -63,7 +63,7 @@ use crate::record::{
 };
 
 use super::seal::{Created, Sealed, GRACE_MS};
-use super::{chain_base, log_bind, Session, SessionError};
+use super::{chain_base, log_bind, MediaFeed, MediaFold, Session, SessionError};
 use crate::directory::{Pages, FANOUT};
 use crate::segment::Segment;
 
@@ -135,6 +135,28 @@ fn ledger_run(record: &Record) -> Option<&str> {
 
 fn fold_error(error: impl std::fmt::Debug) -> SessionError {
     SessionError::Fold(format!("recovery: {error:?}"))
+}
+
+/// Folds a record the recovery keeps into the media fold it continues, when the damaged log's
+/// checkpoint named one, and the record comes after what that fold was current through. Nothing
+/// is handed over: the recovery's session is loaded again before anyone reads its media.
+fn fold_media(
+    media: &mut Option<MediaFold>,
+    through: u64,
+    seq: u64,
+    record: &Record,
+    conversation: &Conversation,
+    operations: &crate::fold::operations::Operations,
+) {
+    if let Some(fold) = media.as_mut().filter(|_| seq > through) {
+        fold.apply(
+            seq,
+            record,
+            conversation,
+            operations,
+            &mut MediaFeed::default(),
+        );
+    }
 }
 
 fn digest(bytes: &[u8]) -> Digest {
@@ -226,6 +248,13 @@ impl<B: SessionBackend> Session<B> {
         };
         let checkpoint = Checkpoint::decode(&body).map_err(SessionError::Checkpoint)?;
         let first_damage = debris.at();
+        // The media fold continues from the damaged log's checkpoint over the records the
+        // recovery keeps, as a load would; the recovery's cut leaves no saved index.
+        let (mut media, media_through, media_object) =
+            match super::media_index::recovery_start(&checkpoint) {
+                Some((fold, through, object)) => (Some(fold), through, object),
+                None => (None, 0, None),
+            };
 
         // The intent, in the head: nothing writes to the damaged log again.
         let change = random_id();
@@ -293,14 +322,38 @@ impl<B: SessionBackend> Session<B> {
             while let Some((kept_seq, kept)) =
                 kept_transcript.next_if(|(transcript_seq, _)| transcript_seq < seq)
             {
+                fold_media(
+                    &mut media,
+                    media_through,
+                    kept_seq,
+                    kept,
+                    &conversation,
+                    &operations,
+                );
                 conversation.apply(kept).map_err(fold_error)?;
                 activity.note(kept_seq, kept);
             }
+            fold_media(
+                &mut media,
+                media_through,
+                *seq,
+                record,
+                &conversation,
+                &operations,
+            );
             operations.apply(record).map_err(fold_error)?;
             activity.note(*seq, record);
             conversation.enrolled(operations.enrolled_through());
         }
         for (seq, kept) in kept_transcript {
+            fold_media(
+                &mut media,
+                media_through,
+                seq,
+                kept,
+                &conversation,
+                &operations,
+            );
             conversation.apply(kept).map_err(fold_error)?;
             activity.note(seq, kept);
         }
@@ -507,10 +560,22 @@ impl<B: SessionBackend> Session<B> {
         let mut seq = ceiling;
         for record in final_batch {
             seq += 1;
+            fold_media(
+                &mut media,
+                media_through,
+                seq,
+                &record,
+                &conversation,
+                &operations,
+            );
             operations.apply(&record).map_err(fold_error)?;
             ledger.push((seq, record));
         }
         let intent_seq = seq;
+        if let Some(fold) = media.as_mut() {
+            fold.flush(&mut MediaFeed::default());
+        }
+        let media = super::media_index::recovery_commit(media, intent_seq);
         let mut settled = operations;
         settled.open_change = None;
 
@@ -533,6 +598,7 @@ impl<B: SessionBackend> Session<B> {
             sealed_entries: Default::default(),
             observer: None,
             kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),
+            media: Default::default(),
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
@@ -545,6 +611,7 @@ impl<B: SessionBackend> Session<B> {
             transcript_base: checkpoint.transcript_base,
             ledger_base: Some(intent_seq),
             activity_ms,
+            media: media.member(),
         }
         .encode();
         let created = async {
@@ -651,10 +718,16 @@ impl<B: SessionBackend> Session<B> {
                 ledger_dir: ledger_sealed.ledger_dir,
                 id_index: ledger_sealed.id_index,
                 retired_index: ledger_sealed.retired_index,
-                replaced: ledger_sealed.replaced,
+                // An index the new checkpoint no longer names is deleted with the rest.
+                replaced: ledger_sealed
+                    .replaced
+                    .into_iter()
+                    .chain(media_object)
+                    .collect(),
                 history_version,
                 abandoned: None,
                 cold_since_ms: None,
+                media: Some(media),
             })
         }
         .await?;

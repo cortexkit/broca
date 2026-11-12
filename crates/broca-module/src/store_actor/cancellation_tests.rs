@@ -283,6 +283,10 @@ async fn a_cancelled_media_build_does_not_deliver_a_failure_to_the_run() {
     let mut executor = executor(Vec::new(), None);
     executor.waits_for_media = true;
     let mut fixture = Fixture::new(executor).await;
+    // The session's image index is being built once from its records, as an open that finds
+    // no saved index starts it, so the run waits for it.
+    fixture.actor.media.build_from_records(0);
+    assert_eq!(fixture.actor.media.start_build(), Some(0));
     // A queued blocking job can be cancelled before its worker starts. An async pending
     // task supplies that same JoinError without depending on blocking-pool saturation.
     fixture.actor.media_build = Some(tokio::spawn(std::future::pending()));
@@ -305,8 +309,8 @@ async fn a_cancelled_media_build_does_not_deliver_a_failure_to_the_run() {
         "the run still waits for media"
     );
     assert!(
-        fixture.actor.media_fold.is_none(),
-        "no synthetic failed fold"
+        !fixture.actor.media.ready(),
+        "no failed index stands in for the build"
     );
     assert_eq!(fixture.actor.session.next_seq(), before);
     fixture.abort_run().await;

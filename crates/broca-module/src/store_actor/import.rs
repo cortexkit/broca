@@ -355,6 +355,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             )
         })?;
         self.session.replace_with(published);
+        // The published session is a new history, which the index of the empty one it replaced
+        // never saw: the index starts again from what the published session's open hands over.
+        self.reopen_media().await;
         Ok(seed.receipt)
     }
 

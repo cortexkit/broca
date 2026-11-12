@@ -131,6 +131,18 @@ fn transcript(prompt: &[Message]) -> impl DoubleEndedIterator<Item = &Message> {
         .filter(|message| message.ordinal.is_some() && message.role != Role::System)
 }
 
+/// What [`rendered_history`] renders from a state that holds no compaction, when the caller
+/// keeps the set of references the session may render itself: the transcript messages of
+/// `prompt`, with each medium outside that set replaced by its provenance marker.
+pub(crate) fn uncompacted_history(
+    prompt: &[Message],
+    captured: impl Fn(&broca_protocol::MediaRef) -> bool,
+) -> Vec<Message> {
+    let mut history: Vec<Message> = transcript(prompt).cloned().collect();
+    super::media::enforce_by(&mut history, captured);
+    history
+}
+
 /// Locate a half-open ordinal range in the stamped, append-only prompt. Unstamped system
 /// messages, when present, precede the transcript and are not part of an ordinal range.
 pub(super) fn ordinal_range(prompt: &[Message], from: u64, to: u64) -> &[Message] {
