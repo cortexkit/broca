@@ -14,6 +14,10 @@
 //!
 //! A module that is stopping refuses every request with one body too, whichever path refused it,
 //! and a keyed resend it refused is answered from the record after the restart.
+//!
+//! A routing module's refusal to choose an account reaches the caller with an outer code that says
+//! whether to wait, directly and for a queued send refused at its own admission. Set
+//! `BROCA_ACCOUNT_WAIT_SAMPLES` to a folder to write those bodies there.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -45,6 +49,9 @@ const CONSULT: &str = "consult";
 /// completed end, on the new storage the new loop over a provider answering one text step.
 struct Refusing {
     error: Mutex<Option<RunError>>,
+    /// When set, a run this executor admits waits for it before answering its first step (on
+    /// today's storage, before its end), so a later send queues behind a running run.
+    hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Refusing {
@@ -100,6 +107,11 @@ impl RunExecutor for Refusing {
         if let Some(ack) = job.on_admitted {
             let _ = ack.send(Ok(job.req.run_id.clone()));
         }
+        // A held run stays running after its start until the test releases it.
+        let hold = self.hold.lock().unwrap().clone();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
         job.writer.record(broca_wal::WalRecord::RunFinished {
             interrupt_reason: None,
             ts_ms: None,
@@ -144,7 +156,10 @@ impl RunExecutor for Refusing {
             mode,
             ..
         } = job;
-        let provider = broca_core::provider::StubProvider::new(vec![text_step("answered")]);
+        let provider = Gated {
+            inner: broca_core::provider::StubProvider::new(vec![text_step("answered")]),
+            hold: self.hold.lock().unwrap().clone(),
+        };
         let result = async {
             let tools = broca_core::StubToolPlane::new();
             let now = || 1;
@@ -260,6 +275,7 @@ impl Rig {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor = Arc::new(Refusing {
             error: Mutex::new(None),
+            hold: Mutex::new(None),
         });
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
@@ -786,5 +802,226 @@ async fn run_starts(rig: &Rig, key: &broca_protocol::BindIdentity, new_storage: 
             .into_iter()
             .filter(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }))
             .count()
+    }
+}
+
+/// A provider that waits for `hold` before answering its step, so a run on the new storage stays
+/// running after its start.
+struct Gated {
+    inner: broca_core::provider::StubProvider,
+    hold: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[async_trait]
+impl broca_core::provider::Provider for Gated {
+    async fn step(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: &broca_protocol::CallOptions,
+    ) -> mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        if let Some(hold) = &self.hold {
+            hold.notified().await;
+        }
+        self.inner.step(step_id, opts).await
+    }
+}
+
+/// The refusal the module's executor returns when routing answers `route.account_for` with the
+/// error reply `body`, read through broca's own conversion of that reply.
+fn routing_refusal(body: Value) -> RunError {
+    match broca_module_serve::account_routing::classify_account_for_reply(Err(serde_json::to_vec(
+        &body,
+    )
+    .unwrap()))
+    {
+        broca_module_serve::account_routing::AccountForOutcome::Refused(refusal) => {
+            RunError::AccountSelectionRefused(refusal)
+        }
+        _ => panic!("routing body {body} is not a refusal"),
+    }
+}
+
+/// A routing refusal, the outer code it must reach the caller with, and the whole body.
+struct AccountCase {
+    name: &'static str,
+    routing: Value,
+    body: &'static str,
+}
+
+fn account_cases() -> Vec<AccountCase> {
+    vec![
+        // Transient, an account limit: callers wait.
+        AccountCase {
+            name: "pool_exhausted",
+            routing: json!({"code": "account_pool_exhausted", "message": "exhausted",
+                "detail": {"retry_after_s": 120, "accounts": ["acct1", "acct2"]}}),
+            body: r#"{"code":"account_limit_exhausted","message":"the routing module refused to choose a provider account for this send (account_pool_exhausted); retry after 120 s","detail":{"routing_code":"account_pool_exhausted","class":"transient","retry_after_s":120,"retry_after_secs":120.0,"provider_code":"account_limit_exhausted","routing_detail":{"accounts":["acct1","acct2"],"retry_after_s":120}}}"#,
+        },
+        // Transient, not an account limit: callers may retry.
+        AccountCase {
+            name: "selection_unavailable",
+            routing: json!({"code": "account_selection_unavailable", "message": "unavailable",
+                "detail": {"retry_after_s": 30}}),
+            body: r#"{"code":"account_selection_refused","message":"the routing module refused to choose a provider account for this send (account_selection_unavailable); retry after 30 s","detail":{"routing_code":"account_selection_unavailable","class":"transient","retry_after_s":30,"retry_after_secs":30.0,"routing_detail":{"retry_after_s":30}}}"#,
+        },
+        // Permanent: waiting can't change it.
+        AccountCase {
+            name: "not_authorized",
+            routing: json!({"code": "account_not_authorized", "message": "excluded",
+                "detail": {"account": "acct2"}}),
+            body: r#"{"code":"account_selection_final","message":"the routing module refused to choose a provider account for this send (account_not_authorized)","detail":{"routing_code":"account_not_authorized","class":"permanent","routing_detail":{"account":"acct2"}}}"#,
+        },
+        // A code broca does not know is final until broca learns it, even with a wait.
+        AccountCase {
+            name: "unknown_code",
+            routing: json!({"code": "route_state_unavailable", "message": "new",
+                "detail": {"retry_after_s": 60}}),
+            body: r#"{"code":"account_selection_final","message":"the routing module refused to choose a provider account for this send (route_state_unavailable); retry after 60 s","detail":{"routing_code":"route_state_unavailable","class":"permanent","retry_after_s":60,"retry_after_secs":60.0,"routing_detail":{"retry_after_s":60}}}"#,
+        },
+    ]
+}
+
+/// A routing refusal's outer code says whether to wait, on both storages and with or without a
+/// fetch plan: a wait code for a transient class, `account_selection_final` for a permanent one.
+#[tokio::test]
+async fn account_selection_refusals_say_by_their_code_whether_to_wait() {
+    let samples = std::env::var_os("BROCA_ACCOUNT_WAIT_SAMPLES").map(PathBuf::from);
+    if let Some(samples) = &samples {
+        std::fs::create_dir_all(samples).unwrap();
+    }
+    let mut mismatches = Vec::new();
+    for (storage, new_storage) in [("todays", false), ("new", true)] {
+        let mut rig = Rig::start(&format!("account-{storage}"), new_storage).await;
+        for case in account_cases() {
+            for (plan_name, plan) in [("plain", false), ("plan", true)] {
+                let channel = rig.bind(&format!("{}-{plan_name}", case.name)).await;
+                *rig.executor.error.lock().unwrap() = Some(routing_refusal(case.routing.clone()));
+                let reply = rig.send(channel, "turn-1", plan).await;
+                let name = format!("{}.{storage}.{plan_name}.json", case.name);
+                check_body(
+                    samples.as_deref(),
+                    &name,
+                    &reply,
+                    case.body,
+                    &mut mismatches,
+                );
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// A send queued behind a running run and refused at its own admission ends with its run's
+/// `error.provider_code` from the same mapping as a direct send's refusal code, with its class and
+/// timing: `account_limit_exhausted` for the limit set, `account_selection_refused` for another
+/// transient code, `account_selection_final` for a permanent one. On both storages, as Core sends
+/// (a fetch plan, a scope).
+#[tokio::test]
+async fn a_queued_send_refused_by_routing_ends_with_the_refusal_code() {
+    let samples = std::env::var_os("BROCA_ACCOUNT_WAIT_SAMPLES").map(PathBuf::from);
+    if let Some(samples) = &samples {
+        std::fs::create_dir_all(samples).unwrap();
+    }
+    let cases = [
+        (
+            json!({"code": "account_pool_exhausted", "message": "exhausted",
+                "detail": {"retry_after_s": 120, "reset_at_ms": 4_102_444_800_000u64,
+                    "accounts": ["acct1", "acct2"]}}),
+            "account_limit_exhausted",
+            "transient",
+            json!(120.0),
+            json!(4_102_444_800_000u64),
+        ),
+        (
+            json!({"code": "account_selection_unavailable", "message": "unavailable",
+                "detail": {"retry_after_s": 30}}),
+            "account_selection_refused",
+            "transient",
+            json!(30.0),
+            Value::Null,
+        ),
+        (
+            json!({"code": "account_not_authorized", "message": "excluded",
+                "detail": {"account": "acct2"}}),
+            "account_selection_final",
+            "permanent",
+            Value::Null,
+            Value::Null,
+        ),
+    ];
+    for (storage, new_storage) in [("todays", false), ("new", true)] {
+        let mut rig = Rig::start(&format!("account-queued-{storage}"), new_storage).await;
+        for (routing, provider_code, class, retry_after_secs, resets_at_ms) in &cases {
+            let channel = rig.bind(&format!("queued-{provider_code}")).await;
+            let hold = Arc::new(tokio::sync::Notify::new());
+            *rig.executor.error.lock().unwrap() = None;
+            *rig.executor.hold.lock().unwrap() = Some(hold.clone());
+            let first = rig.send(channel, "turn-1", true).await;
+            assert_eq!(
+                first.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&first.body)
+            );
+            *rig.executor.hold.lock().unwrap() = None;
+            *rig.executor.error.lock().unwrap() = Some(routing_refusal(routing.clone()));
+            let queued_reply = rig.send(channel, "turn-2", true).await;
+            let queued: Value = serde_json::from_slice(&queued_reply.body).unwrap();
+            assert_eq!(queued["result"]["state"], "pending", "{queued}");
+            let submission = queued["result"]["submission_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let run_id = submission
+                .strip_prefix("sub-")
+                .unwrap_or(&submission)
+                .to_owned();
+            hold.notify_one();
+            let status = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+                loop {
+                    let reply = rig
+                        .request(
+                            channel,
+                            json!({"method": "session.send_status",
+                                "params": {"send_id": "turn-2"}}),
+                        )
+                        .await;
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    if body["result"]["state"] != "pending" {
+                        break reply.body.to_vec();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the queued send ends");
+            let run = rig
+                .request(
+                    channel,
+                    json!({"method": "run.status", "params": {"run_id": run_id}}),
+                )
+                .await;
+            if let Some(samples) = &samples {
+                let prefix = format!("5_queued_{provider_code}.{storage}");
+                for (part, body) in [
+                    ("session_send", &queued_reply.body[..]),
+                    ("session_send_status", &status[..]),
+                    ("run_status", &run.body[..]),
+                ] {
+                    std::fs::write(samples.join(format!("{prefix}.{part}.json")), body).unwrap();
+                }
+            }
+            let status: Value = serde_json::from_slice(&status).unwrap();
+            assert_eq!(status["result"]["reason"], "error", "{status}");
+            let run: Value = serde_json::from_slice(&run.body).unwrap();
+            let error = &run["result"]["error"];
+            assert_eq!(error["provider_code"], *provider_code, "{storage}: {run}");
+            assert_eq!(error["class"], *class, "{storage}: {run}");
+            assert_eq!(
+                error["retry_after_secs"], *retry_after_secs,
+                "{storage}: {run}"
+            );
+            assert_eq!(error["resets_at_ms"], *resets_at_ms, "{storage}: {run}");
+        }
     }
 }

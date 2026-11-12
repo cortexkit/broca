@@ -2408,10 +2408,11 @@ async fn routing_refusals_keep_their_code_and_pool_limits_are_account_limits() {
             "account_limit_exhausted",
             "transient",
         ),
+        // A routing code broca does not know is final until broca learns it, even with a wait.
         (
             "route_state_unavailable",
-            "account_selection_refused",
-            "transient",
+            "account_selection_final",
+            "permanent",
         ),
     ] {
         rig.routing.set(RoutingMode::Refuse {
@@ -2591,7 +2592,7 @@ async fn account_not_authorized_refuses_permanently_without_pausing_or_writing()
     let (error, _) = rig
         .refused_send("not-authorized", "send-not-authorized")
         .await;
-    assert_eq!(error["code"], "account_selection_refused");
+    assert_eq!(error["code"], "account_selection_final");
     assert_eq!(error["detail"]["class"], "permanent");
     assert_eq!(error["detail"]["routing_code"], "account_not_authorized");
     assert_eq!(
