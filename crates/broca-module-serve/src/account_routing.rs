@@ -302,6 +302,20 @@ pub trait RoutingTransport: Send + Sync {
         Ok(false)
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply;
+    /// [`Self::request`], sent only to a routing module known to declare every capability in
+    /// `names`; `None` when it doesn't, and then nothing was sent. A transport that can reach
+    /// another registration of routing between the check and the send checks again against the
+    /// route the request actually goes out on.
+    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+        for name in names {
+            if self.capability(name).await
+                != crate::routing_capabilities::CapabilitySupport::Declared
+            {
+                return None;
+            }
+        }
+        Some(self.request(body).await)
+    }
 }
 
 enum RouteSlot {
@@ -409,6 +423,10 @@ pub struct SubcRoutingTransport {
     capability_reader: crate::routing_capabilities::RoutingCapabilities,
     #[cfg(test)]
     stale_opens_for_test: std::sync::atomic::AtomicUsize,
+    /// Closes the route a capability-checked request is about to go out on, so a test can make
+    /// it stale between the check and the send.
+    #[cfg(test)]
+    stale_before_checked_send_for_test: std::sync::atomic::AtomicBool,
 }
 
 impl SubcRoutingTransport {
@@ -426,6 +444,8 @@ impl SubcRoutingTransport {
             capability_reader: Default::default(),
             #[cfg(test)]
             stale_opens_for_test: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            stale_before_checked_send_for_test: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -565,16 +585,79 @@ impl RoutingTransport for SubcRoutingTransport {
             .into_result("observe_credential_refused")
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
-        self.request_on_cached_route(body, |error| {
-            format!(
-                "routing module '{}': {error}",
-                self.module_id
-                    .as_deref()
-                    .unwrap_or(cortexkit_role_routing::PROVIDES)
-            )
-        })
-        .await
-        .map(|(_, reply)| reply)
+        self.request_on_cached_route(body, |error| self.request_error(error))
+            .await
+            .map(|(_, reply)| reply)
+    }
+
+    /// A stale route is reopened once, as for any request, and the reopened route may reach a
+    /// re-registered routing module that declares other capabilities. Its description is read
+    /// again (a closed route drops the cached one) before the request is sent there.
+    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+        let declared = || async {
+            for name in names {
+                if self.capability(name).await
+                    != crate::routing_capabilities::CapabilitySupport::Declared
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        if !declared().await {
+            return None;
+        }
+        let route = match self.route().await {
+            Ok(route) => route,
+            Err(error) => return Some(Err(error)),
+        };
+        #[cfg(test)]
+        if self
+            .stale_before_checked_send_for_test
+            .swap(false, Ordering::SeqCst)
+        {
+            self.conn
+                .route_close(&route)
+                .await
+                .expect("close test route");
+        }
+        match self.conn.route_request_terminal(&route, body.clone()).await {
+            Ok(reply) => return Some(Ok(reply)),
+            Err(error) => {
+                self.forget(route);
+                if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
+                    return Some(Err(self.request_error(error)));
+                }
+            }
+        }
+        // A stale handle fails before the request frame is built, so nothing was delivered.
+        if !declared().await {
+            return None;
+        }
+        let route = match self.route().await {
+            Ok(route) => route,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(
+            self.conn
+                .route_request_terminal(&route, body)
+                .await
+                .map_err(|error| {
+                    self.forget(route);
+                    self.request_error(error)
+                }),
+        )
+    }
+}
+
+impl SubcRoutingTransport {
+    fn request_error(&self, error: broca_subc::ConnError) -> String {
+        format!(
+            "routing module '{}': {error}",
+            self.module_id
+                .as_deref()
+                .unwrap_or(cortexkit_role_routing::PROVIDES)
+        )
     }
 }
 
@@ -2662,10 +2745,20 @@ impl RoutingClient {
             Ok(body) => body,
             Err(error) => return ContinueOutcome::Unreachable(format!("encode request: {error}")),
         };
-        let outcome = match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
+        // Sent only where routing declares both capabilities, checked again on the route the
+        // request goes out on.
+        let sent = self.transport.request_where_declared(
+            body,
+            &[
+                cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
+                crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+            ],
+        );
+        let outcome = match tokio::time::timeout_at(deadline, sent).await {
             Err(_) => ContinueOutcome::NoAnswerWithinBudget,
-            Ok(Err(cause)) => ContinueOutcome::Unreachable(cause),
-            Ok(Ok(reply)) => classify_continue_reply(reply),
+            Ok(None) => ContinueOutcome::NotDeclared,
+            Ok(Some(Err(cause))) => ContinueOutcome::Unreachable(cause),
+            Ok(Some(Ok(reply))) => classify_continue_reply(reply),
         };
         self.counters.bump(match &outcome {
             ContinueOutcome::Answered(_) => "continue_answered",

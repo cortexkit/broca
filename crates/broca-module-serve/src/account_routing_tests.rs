@@ -3455,10 +3455,24 @@ async fn a_continue_request_is_sent_only_to_a_router_that_serves_continuation() 
         .await;
     assert_eq!(outcome, ContinueOutcome::NotDeclared);
     assert!(routing.requests.lock().unwrap().is_empty());
-    let routing = FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result": {
-        "kind": "refuse", "routing_code": "account_pinned", "detail": {},
-    }}))
-    .unwrap())));
+    // The transport checks the capabilities again on the route it sends on.
+    let serving = |routing: Arc<FakeRouting>| {
+        Arc::new(FakeRouting {
+            declared: Some(vec![
+                "account_continue",
+                crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+            ]),
+            reply: Mutex::new(routing.reply.lock().unwrap().take()),
+            hang: routing.hang,
+            ..FakeRouting::default()
+        })
+    };
+    let routing = serving(FakeRouting::answering(Ok(Ok(serde_json::to_vec(
+        &json!({"result": {
+            "kind": "refuse", "routing_code": "account_pinned", "detail": {},
+        }}),
+    )
+    .unwrap()))));
     let outcome = client(&routing)
         .account_continue(
             true,
@@ -3472,7 +3486,7 @@ async fn a_continue_request_is_sent_only_to_a_router_that_serves_continuation() 
         vec![json!({"method": ACCOUNT_FOR_OP, "params": serde_json::to_value(&request).unwrap()})]
     );
     // A router that doesn't answer within the budget is no answer.
-    let routing = FakeRouting::hung();
+    let routing = serving(FakeRouting::hung());
     let outcome = client(&routing)
         .account_continue(
             true,

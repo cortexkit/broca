@@ -988,3 +988,66 @@ async fn stale_routing_reopen_stays_inside_the_original_admission_deadline() {
     );
     assert!(daemon.request_bodies().is_empty());
 }
+
+/// A continue question whose route goes stale between the capability check and the send is
+/// sent again only after the reopened route's description is read: here the routing module
+/// behind it no longer declares continuation, so nothing is sent there and the answer is
+/// NotDeclared.
+#[tokio::test]
+async fn a_continue_request_on_a_reopened_route_rechecks_the_capabilities() {
+    use crate::routing_capabilities::{CapabilitySupport, ACCOUNT_CONTINUE_RESUME};
+    let daemon = RoutingDaemon::start(
+        describe_reply(&["account_continue", ACCOUNT_CONTINUE_RESUME]),
+        false,
+    )
+    .await;
+    let client = daemon.client();
+    assert!(client.answers_moved_runs_with_current_account().await);
+    // Routing registers again without continuation, and the route the question is about to go
+    // out on goes stale after the (cached) capabilities were read for it.
+    *daemon.reply.lock().unwrap() = describe_reply(&[]);
+    daemon
+        .transport
+        .stale_before_checked_send_for_test
+        .store(true, Ordering::SeqCst);
+    let request = cortexkit_role_routing::account_continue::ContinueRequest::new(
+        "run-1",
+        "run-1",
+        "broca-session:abc",
+        "decision-a",
+        cortexkit_role_routing::account_continue::ExhaustedAccount::new(
+            "credential-a",
+            "acct-a",
+            "seven_day",
+            7,
+        ),
+        "wall-1",
+    );
+    let outcome = client
+        .account_continue(
+            true,
+            &request,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(outcome, ContinueOutcome::NotDeclared);
+    let methods: Vec<String> = daemon
+        .request_bodies()
+        .iter()
+        .map(|body| {
+            serde_json::from_slice::<Value>(body).unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        ["role.describe", "role.describe"],
+        "no continue request was sent"
+    );
+    assert_eq!(
+        client.capability("account_continue").await,
+        CapabilitySupport::NotDeclared
+    );
+}
