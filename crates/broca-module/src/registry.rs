@@ -1034,6 +1034,8 @@ struct Inner {
     attribution_notices: Mutex<BoundedSessionCache<()>>,
     unbound_cursor_notices: Mutex<BoundedSessionCache<()>>,
     retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
+    /// Serves the fork operations of the heads kept in the new storage, made on the first one.
+    forks: std::sync::OnceLock<Arc<crate::fork_answer::ForkManager>>,
     #[cfg(test)]
     close_started: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
@@ -2112,6 +2114,28 @@ impl LineageRegistry {
         self.inner.opener.compaction_supported()
     }
 
+    /// What serves `session.fork_*` on heads kept in the new storage, dated by retention's
+    /// clock. Refuses on a module without the new storage, which serves no fork.
+    pub fn fork_manager(
+        &self,
+    ) -> Result<Arc<crate::fork_answer::ForkManager>, crate::fork_answer::ForkError> {
+        if let Some(forks) = self.inner.forks.get() {
+            return Ok(Arc::clone(forks));
+        }
+        let runtime = self.store_runtime().ok_or_else(|| {
+            crate::fork_answer::ForkError::Unsupported("this module keeps no new storage".into())
+        })?;
+        // Retention's clock when the daemon installed it; else the clock it would install, read
+        // from the same state root.
+        let clock = match self.inner.retention.get() {
+            Some(service) => service.clock.clone(),
+            None => broca_core::Clock::for_state_root(runtime.state_root()).unwrap_or_default(),
+        };
+        Ok(Arc::clone(self.inner.forks.get_or_init(|| {
+            Arc::new(crate::fork_answer::ForkManager::new(runtime, clock))
+        })))
+    }
+
     /// The runtime serving sessions kept in the new storage, for reads that take no lease.
     pub fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.inner.opener.store_runtime()
@@ -2196,6 +2220,7 @@ impl LineageRegistry {
                     SESSION_CACHE_SESSIONS,
                 )),
                 retention: std::sync::OnceLock::new(),
+                forks: std::sync::OnceLock::new(),
                 store_moves: Default::default(),
                 store_mover: std::sync::OnceLock::new(),
                 conversion_guard: std::sync::OnceLock::new(),

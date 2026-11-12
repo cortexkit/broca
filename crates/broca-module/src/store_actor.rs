@@ -4656,7 +4656,7 @@ mod keep_warm;
 mod memory;
 mod ordered;
 mod pauses;
-mod recorded_warm;
+pub(crate) mod recorded_warm;
 mod restart;
 mod retention;
 mod retries;

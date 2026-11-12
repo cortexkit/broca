@@ -22,6 +22,7 @@ mod compaction_watch;
 pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
+pub mod fork_answer;
 pub mod fork_state;
 pub mod head_time;
 pub mod held_slots;
