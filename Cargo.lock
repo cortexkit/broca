@@ -555,6 +555,8 @@ dependencies = [
  "broca-owner-only",
  "broca-protocol",
  "broca-replay",
+ "broca-session-loop",
+ "broca-session-store",
  "broca-test-support",
  "broca-wal",
  "broca-wal-reader",

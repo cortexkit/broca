@@ -414,6 +414,51 @@ fn bind(session: &str) -> BindIdentity {
 }
 
 #[tokio::test]
+async fn codex_store_two_completed_runs_reuse_the_websocket_lease() {
+    use broca_session_loop::{parts::MemoryParts, writer::Writer};
+    use broca_session_store::{backend::{MemoryBackend, SessionAddr}, head::SessionTriple, keys::DeploymentKey, session::Session};
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let client = build_provider_http_client();
+    let bind = bind("store-pool");
+    let backend = MemoryBackend::default();
+    let mut session = Session::create(&backend, SessionAddr("0123456789abcdef".into()),
+        SessionTriple { project_root: "/project".into(), harness: "harness".into(), session: "store-pool".into() },
+        &DeploymentKey::new(1, &[7; 32]), false).await.unwrap();
+    let mut parts = MemoryParts::default();
+    let tools = StubToolPlane::new();
+    let (out, mut events) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+    for turn in ["one", "two"] {
+        let provider = run_provider(&mock, &client, turn);
+        let mut request = tool_run_request(&bind);
+        request.run_id = RunId(format!("store-{turn}"));
+        request.tools.clear();
+        request.policy_allowed.clear();
+        request.input[0].content = vec![ContentBlock::Text { text: format!("question {turn}") }];
+        let control = broca_core::RunControl::default();
+        let admission = broca_session_loop::admit::admission(&mut request, &control, &provider, session.operations(), Some(1)).unwrap();
+        let seams = broca_session_loop::Seams {
+            provider: &provider, tools: &tools, bind: bind.clone(), out: Some(&out),
+            cancel: Default::default(), stop: Default::default(), held: None, approval: &AllowAll,
+            hook_plane: None, now_ms: &|| 1000, session_address: None, compaction_plane: None,
+            compaction_session: None, compaction_changes: false, keep_warm: None, account_reports: None,
+            max_same_account_wait: Default::default(), auth_selection: None, step_progress: None,
+            model_call_ready: None, pause_for_auth_at_start: None,
+        };
+        let finished = broca_session_loop::run(&mut session, &mut parts, admission, &seams).await.unwrap();
+        assert_eq!(finished.reason, RunFinishReason::Completed);
+    }
+    drop(out);
+    drain.await.unwrap();
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1, "the store loop must return the first run's lease to the session pool");
+    assert_eq!(seen.requests.len(), 2);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["previous_response_id"], "r");
+    assert_eq!(frame["client_metadata"]["turn_id"], "two");
+}
+
+#[tokio::test]
 async fn codex_cross_run_two_completed_runs_reuse_handshake_and_suffix() {
     let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
     let client = build_provider_http_client();

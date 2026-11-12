@@ -5646,6 +5646,37 @@ where
     // In particular, on a resume-after-auth where the credential is STILL dead, the caller
     // sets it again and we re-pause here rather than make a doomed provider call.
     if let Some(error) = control.pause_for_auth_at_start.clone() {
+        // A tool provider's delivered answer must not wait for model sign-in. Sync it before
+        // parking so the late-results feed can acknowledge the answer independently of auth.
+        if let Some(pending) = pending_turn
+            .as_ref()
+            .filter(|turn| !turn.provider_held.is_empty())
+        {
+            let batch = crate::resume::sync_deposited_held_results(
+                prior.open_tool_batch.clone(),
+                pending,
+                &BatchCtx {
+                    batch_id: pending.batch_id.clone().expect("held batch exists"),
+                    run_id: resolved_run_id.clone(),
+                    bind: req.session.clone(),
+                    scope: req.scope.clone(),
+                    media_capture: None,
+                },
+                writer,
+                control.provider_held_lifecycle.clone(),
+            )
+            .await?;
+            if let Some(batch) = batch.filter(|batch| {
+                batch
+                    .calls
+                    .iter()
+                    .all(|(_, state)| *state == crate::replay::OpenCallState::Terminated)
+            }) {
+                writer.record(WalRecord::ToolBatchFinished {
+                    batch_id: batch.batch_id,
+                });
+            }
+        }
         return pause_run(
             writer,
             out,

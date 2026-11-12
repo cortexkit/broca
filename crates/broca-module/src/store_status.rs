@@ -1524,6 +1524,31 @@ struct SendLookup<'a, B: SessionBackend> {
     session: &'a Session<B>,
 }
 
+/// Whether a send was recorded for the caller or for the one predecessor its current plan
+/// names with `succeeds`.
+pub(crate) async fn authorization_own_send<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    run: &RunId,
+    send_id: &str,
+    principal: Option<&broca_protocol::BindPrincipal>,
+) -> Result<bool, crate::serve::ServeError> {
+    let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal else {
+        return Ok(false);
+    };
+    let senders = broca_session_loop::plan::senders(&session.operations, parts)
+        .map_err(crate::serve::ServeError::Transient)?;
+    // Reject unrelated callers before looking up the send's recorded sender.
+    if !senders.iter().any(|entry| matches!(sender, broca_protocol::BindPrincipal::Reserved { module_id } if module_id == &entry.module)) {
+        return Ok(false);
+    }
+    let lookup = SendLookup { session };
+    let Ok((run, recorded)) = lookup.retry_run_id(run, send_id, sender, &senders).await? else {
+        return Ok(false);
+    };
+    Ok(lookup.recorded_sender(&run).await?.as_ref() == Some(&recorded))
+}
+
 /// The key of the call `call` in `step`, a step's records from its assistant message on, as
 /// today's reads key the call a tool-result delivery rode on: the last copy of the call's id the
 /// step dispatched or answered, keyed by its intent, or by its outcome when it had no intent.
@@ -1933,13 +1958,26 @@ impl Reader<'_> {
         };
         let (own_run, lookup_sender) =
             if let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal {
-                let senders = match &first_start {
-                    Some(start) => admission(start)?
-                        .manifest
-                        .as_deref()
-                        .map(broca_core::admission::manifest_senders)
-                        .unwrap_or_default(),
-                    None => Vec::new(),
+                let admitted =
+                    broca_session_loop::plan::sender_manifest(&session.operations, self.parts)
+                        .map_err(ServeError::Transient)?;
+                let restricted = admitted.as_ref().is_some_and(|manifest| {
+                    serde_json::from_str::<Value>(manifest.plan.as_json_text())
+                        .ok()
+                        .is_some_and(|plan| plan.get("readers").is_some())
+                });
+                let senders = if restricted {
+                    broca_session_loop::plan::senders(&session.operations, self.parts)
+                        .map_err(ServeError::Transient)?
+                } else {
+                    match &first_start {
+                        Some(start) => admission(start)?
+                            .manifest
+                            .as_deref()
+                            .map(broca_core::admission::manifest_senders)
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    }
                 };
                 let (id, sender) = lookup
                     .retry_run_id(&own_run, send_id, sender, &senders)

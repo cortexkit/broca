@@ -16,6 +16,27 @@ use tokio_util::sync::CancellationToken;
 
 pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
 
+/// What a session's history proves about accepted model sends on one account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedSendEvidence {
+    NotLoaded,
+    At(u64),
+    /// No accepted send was found before crossing the frozen cache policy's lifetime.
+    NoneWithinWindow,
+    /// The entire available ledger was searched without an accepted send.
+    None,
+}
+
+impl AcceptedSendEvidence {
+    pub fn loaded_at_ms(self) -> Option<Option<u64>> {
+        match self {
+            Self::NotLoaded => None,
+            Self::At(sent) => Some(Some(sent)),
+            Self::NoneWithinWindow | Self::None => Some(None),
+        }
+    }
+}
+
 /// Session-owned media rendering, installed when media is enabled at boot.
 /// The booleans select tag rendering and commit the durable step boundary to aging,
 /// respectively. That commit is not physical-send permission.
@@ -97,6 +118,15 @@ pub trait Provider: Send + Sync {
     fn set_cache_evidence_view(&self, _view: Option<u64>) {}
     fn annotate_cache_evidence(&self, _attempt: &mut broca_protocol::ModelAttempt) {}
     fn cache_attempt_recorded(&self, _locator: Option<String>) {}
+
+    /// Restore accepted-send evidence read from a bounded session-store tail. Other accounts
+    /// remain unloaded until their own history is read.
+    fn seed_accepted_send(&self, _account: &str, _evidence: AcceptedSendEvidence) {}
+
+    fn accepted_send_evidence(&self, account: &str) -> AcceptedSendEvidence {
+        self.last_accepted_at_ms(account)
+            .map_or(AcceptedSendEvidence::NotLoaded, AcceptedSendEvidence::At)
+    }
 
     /// Latest 2xx model-attempt send for this account in the bound session. Refusals do
     /// not refresh this clock, even though cache diagnostics compare against the latest
@@ -391,6 +421,14 @@ impl Provider for Box<dyn Provider> {
     }
     fn cache_attempt_recorded(&self, locator: Option<String>) {
         (**self).cache_attempt_recorded(locator)
+    }
+
+    fn seed_accepted_send(&self, account: &str, evidence: AcceptedSendEvidence) {
+        (**self).seed_accepted_send(account, evidence)
+    }
+
+    fn accepted_send_evidence(&self, account: &str) -> AcceptedSendEvidence {
+        (**self).accepted_send_evidence(account)
     }
 
     fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {

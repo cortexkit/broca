@@ -53,9 +53,11 @@ impl Provider for Stalling {
 /// Runs each store job through the session loop (`broca_session_loop`). The next fresh run, when
 /// `fails_next` is set, has its model call stall, and its loop stops with [`LOOP_FAILED`] once
 /// `fail` is notified: the run's start and step are written, and no end.
+/// When set for a resume, `fails_next` refuses admission instead, before the loop is called.
 struct FailingExecutor {
     script: Arc<StubProvider>,
     fails_next: AtomicBool,
+    temporarily_refuse_resume: AtomicBool,
     fail: Notify,
 }
 
@@ -82,7 +84,7 @@ impl RunExecutor for FailingExecutor {
             mode,
             ..
         } = job;
-        let fails = mode == StoreRunMode::Fresh && self.fails_next.swap(false, Ordering::SeqCst);
+        let fails = self.fails_next.swap(false, Ordering::SeqCst);
         let provider = Stalling {
             script: Arc::clone(&self.script),
             stalls: fails,
@@ -111,6 +113,7 @@ impl RunExecutor for FailingExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
+                pause_for_auth_at_start: None,
             };
             match mode {
                 StoreRunMode::Fresh => {
@@ -141,6 +144,14 @@ impl RunExecutor for FailingExecutor {
                         .map_err(StoreRunError::Loop)
                 }
                 StoreRunMode::Resume => {
+                    if self.temporarily_refuse_resume.swap(false, Ordering::SeqCst) {
+                        return Err(StoreRunError::Admission(RunError::CredentialsUnavailable));
+                    }
+                    if fails {
+                        return Err(StoreRunError::Admission(RunError::Config(
+                            "resume admission failed".into(),
+                        )));
+                    }
                     broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams)
                         .await
                         .map_err(StoreRunError::Loop)
@@ -211,7 +222,10 @@ impl Side {
     }
 
     async fn send(&self, run_id: &str, text: &str) -> SendOutcome {
-        let key = SendKey::Minted;
+        self.send_keyed(run_id, text, SendKey::Minted).await
+    }
+
+    async fn send_keyed(&self, run_id: &str, text: &str, key: SendKey) -> SendOutcome {
         let request = self.caller.shape(run_id, &key, request(text));
         self.registry
             .route_submission_with_order(
@@ -271,6 +285,7 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
         ])),
         fails_next: AtomicBool::new(true),
         fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
     });
     let side = Side::new(Arc::clone(&executor)).await;
     let sent = side.send("r1", "first").await;
@@ -300,4 +315,125 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
         "a new send starts a run: {next:?}"
     );
     side.until_state("r3", "completed").await;
+}
+
+#[tokio::test]
+async fn a_failed_admission_of_an_existing_auth_pause_records_an_error() {
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![
+            super::tests::auth_failure(),
+            text_step("a2", "next answer"),
+        ])),
+        fails_next: AtomicBool::new(false),
+        fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
+    });
+    let side = Side::new(executor.clone()).await;
+    let key = || SendKey::SendId("synthetic-send".into());
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    side.until_state("r1", "paused").await;
+    executor.fails_next.store(true, Ordering::SeqCst);
+    side.send_keyed("r1", "first", key()).await;
+    let failed = side.until_state("r1", "error").await;
+    assert_eq!(failed["error"]["provider_code"], "runner_error");
+    assert!(failed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("resume admission failed"));
+    side.send("r2", "next").await;
+    side.until_state("r2", "completed").await;
+}
+
+/// A dependency that is not ready says nothing permanent about the paused run. Keep the
+/// pause and its start intact, then continue the same run when the caller retries later.
+#[tokio::test]
+async fn a_temporary_admission_failure_keeps_the_pause_for_a_later_resume() {
+    use broca_session_store::record::Record;
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![
+            super::tests::auth_failure(),
+            text_step("a2", "recovered answer"),
+        ])),
+        fails_next: AtomicBool::new(false),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        fail: Notify::new(),
+    });
+    let side = Side::new(executor.clone()).await;
+    let key = || SendKey::SendId("temporary-admission-send".into());
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    let paused = side.until_state("r1", "paused").await;
+    let runtime = side.registry.store_runtime().unwrap();
+    let before = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    executor
+        .temporarily_refuse_resume
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("temporary admission task parks", || async {
+        match side.registry.route_status(&side.key).await.unwrap() {
+            crate::actor::LineageStatus::Idle => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert_eq!(side.run_status("r1").await, paused);
+    let after = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "temporary admission writes no end or other record"
+    );
+    assert!(!after
+        .iter()
+        .any(|(_, record)| matches!(record, Record::RunEnd(_))));
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    side.until_state("r1", "completed").await;
+    let records = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunStart(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunEnd(_)))
+            .count(),
+        1
+    );
+    assert!(side.registry.stop_and_seal().await);
 }

@@ -34,6 +34,8 @@ use subc_protocol::{
 use subc_transport::{read_frame, write_frame};
 use tokio::sync::mpsc;
 
+mod app_readers;
+
 /// The compaction provider the planned session's plan names.
 const PROVIDER: &str = "ck-mc";
 
@@ -111,6 +113,8 @@ impl broca_core::CompactionPlane for ReadyProvider {
 /// `compaction-runner/v1` route admits that provider.
 struct StoreLoop {
     provider: broca_core::provider::StubProvider,
+    gate: Option<Arc<app_readers::RunGate>>,
+    requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     compaction: Arc<ReadyProvider>,
     /// The display marks every send's run records, as admission would have checked them.
     marks: Option<broca_protocol::MessageMarks>,
@@ -127,6 +131,15 @@ impl StoreLoop {
 
 #[async_trait]
 impl RunExecutor for StoreLoop {
+    async fn compaction_context_limit(
+        &self,
+        model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        assert_eq!(model.provider, "stub");
+        assert_eq!(model.model, "m");
+        Ok(Some(200_000))
+    }
+
     async fn execute(
         &self,
         _job: RunJob,
@@ -163,8 +176,13 @@ impl RunExecutor for StoreLoop {
         let result = async {
             let tools = broca_core::StubToolPlane::new().with_canned_text("read", "file contents");
             let now = || 1;
-            let seams = broca_session_loop::run::Seams {
+            let provider = app_readers::GatedProvider {
                 provider: &self.provider,
+                gate: self.gate.as_deref(),
+                requests: &self.requests,
+            };
+            let seams = broca_session_loop::run::Seams {
+                provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),
                 out: Some(&out),
@@ -184,6 +202,7 @@ impl RunExecutor for StoreLoop {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
+                pause_for_auth_at_start: None,
             };
             match mode {
                 StoreRunMode::Fresh => {
@@ -272,6 +291,7 @@ struct Rig {
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     _serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
     corr: u64,
+    requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Drop for Rig {
@@ -295,6 +315,16 @@ impl Rig {
         compaction: ReadyProvider,
         marks: Option<broca_protocol::MessageMarks>,
     ) -> Self {
+        Self::start_gated(tag, steps, compaction, marks, None).await
+    }
+
+    async fn start_gated(
+        tag: &str,
+        steps: Vec<Vec<NormalizedEvent>>,
+        compaction: ReadyProvider,
+        marks: Option<broca_protocol::MessageMarks>,
+        gate: Option<Arc<app_readers::RunGate>>,
+    ) -> Self {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-store-ops-serve-{}-{tag}",
             std::process::id()
@@ -303,8 +333,11 @@ impl Rig {
         std::fs::create_dir_all(&dir).unwrap();
         broca_core::media_store::create_media_directories(&dir).unwrap();
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let executor: Arc<dyn RunExecutor> = Arc::new(StoreLoop {
             provider: broca_core::provider::StubProvider::new(steps),
+            gate,
+            requests: requests.clone(),
             compaction: Arc::new(compaction),
             marks,
         });
@@ -382,6 +415,7 @@ impl Rig {
             writer,
             _serve: serve,
             corr: 1,
+            requests,
         }
     }
 
@@ -516,11 +550,16 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reader))
-            .await
-            .expect("a reply")
-            .unwrap()
-            .unwrap()
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let reply = read_frame(&mut self.reader).await.unwrap().unwrap();
+                if reply.header.channel == channel && reply.header.corr == self.corr {
+                    return reply;
+                }
+            }
+        })
+        .await
+        .expect("a reply")
     }
 
     /// Binds `channel` to the session as the daemon relays it, stamped with `principal`, for the

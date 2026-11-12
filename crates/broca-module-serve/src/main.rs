@@ -1354,14 +1354,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                     engine
                         .run_live(
                             runtime.deployment(),
-                            Some(runtime.as_ref()),
+                            Some(&runtime),
                             Some(registry.as_ref()),
                         )
                         .await?;
                     engine
                         .run_background(
                             runtime.deployment(),
-                            runtime.as_ref(),
+                            &runtime,
                             registry.as_ref(),
                             Duration::from_millis(250),
                         )
@@ -2912,6 +2912,7 @@ mod executor {
             // The actor's in-flight step, which `run.status` serves for its active run.
             step_progress: control.step_progress.clone(),
             model_call_ready: None,
+            pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
         }
     }
 
@@ -4583,6 +4584,24 @@ mod executor {
             }
             let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
+            if let Some(config) = &last_config {
+                if let Some(account) = config
+                    .auth_selection
+                    .as_ref()
+                    .and_then(|auth| auth.account_ref.as_deref())
+                {
+                    seed_store_accepted_send(
+                        &self.provider_client,
+                        writer,
+                        &req.session,
+                        account,
+                        &config.frozen_render_config,
+                        now(),
+                    )
+                    .await
+                    .map_err(|error| StoreRunError::Loop(error.into()))?;
+                }
+            }
             let history = EpisodeHistory {
                 prior_run: stored.prior_run,
                 last_config: last_config.as_ref(),
@@ -4614,23 +4633,11 @@ mod executor {
                 mode: _,
                 resolved,
             } = admitted;
-            // The new run loop doesn't yet start a run paused for sign-in; today's loop writes
-            // such a run's start and its pause before any model call. A session in the new
-            // storage refuses that run by name until it does. A routing refusal of the caller's
-            // decision goes to the loop as the run's pre-model error, as `episode_control` hands
-            // it to today's loop: the run's start is written, then the run ends with that error.
             if fresh_episode != (mode == StoreRunMode::Fresh) {
                 return Err(StoreRunError::Admission(RunError::Config(format!(
                     "the store actor asked for a {mode:?} run, but the session's latest run says \
                      otherwise"
                 ))));
-            }
-            if routing_decision_error.is_none() && resolution.pause.is_some() {
-                return Err(StoreRunError::Admission(RunError::Config(
-                    "a run that starts paused for sign-in isn't served on the new session \
-                     storage yet"
-                        .into(),
-                )));
             }
             let holds_media = req
                 .input
@@ -6227,12 +6234,15 @@ mod executor {
         }
     }
 
+    include!("store_cache_evidence.rs");
+
     #[cfg(test)]
     mod tests {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("store_run_tests.rs");
+        include!("store_cache_evidence_tests.rs");
         include!("store_run_cancel_tests.rs");
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
