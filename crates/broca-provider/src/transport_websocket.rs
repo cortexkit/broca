@@ -1437,6 +1437,14 @@ pub(super) fn warn_failure_decision(
 // Responses sockets can wrap an HTTP refusal in an error event. This is transport
 // metadata, not a second Responses decoder; ordinary event errors stay with the normalizer.
 pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<AttemptFailure> {
+    if crate::quota::frame_candidate(raw) {
+        if let Ok(frame) = serde_json::from_slice::<Value>(raw) {
+            if frame.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+                trace.chatgpt_frame_window = Some(super::chatgpt_frame_window(&frame));
+                return None;
+            }
+        }
+    }
     let value: Value = serde_json::from_slice(raw).ok()?;
     if value.get("type")?.as_str()? != "error" {
         return None;
@@ -1484,7 +1492,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     let error = classify_http_error(status, &text, retry, None);
     let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
     let observed_at_ms = now_millis();
-    let error = classify_account_limit_exhausted(
+    let mut error = classify_account_limit_exhausted(
         family,
         status,
         &headers,
@@ -1492,6 +1500,15 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
         UNIX_EPOCH + Duration::from_millis(observed_at_ms),
         error,
     );
+    // A frame carries no quota headers of its own as a rule: the window comes from the newest
+    // `codex.rate_limits` frame of this same response, never from an earlier response's.
+    if error.is_account_limit_exhausted() && error.limit_window.is_none() {
+        if let Some(Some(window)) = trace.chatgpt_frame_window {
+            error.limit_window = Some(broca_protocol::error::AccountLimitWindow::Quota(
+                window.into(),
+            ));
+        }
+    }
     trace.http_status = Some(status);
     if error.is_account_limit_exhausted() {
         trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {

@@ -587,6 +587,11 @@ struct AttemptTrace {
     wrapped_error_frame: Option<Box<responses_websocket::WrappedErrorFrame>>,
     /// The account evidence the response carried; see [`broca_protocol::AttemptAccountObservation`].
     account_observation: broca_protocol::AttemptAccountObservation,
+    /// What the newest `codex.rate_limits` frame of this response on a ChatGPT Responses socket
+    /// shows spent (see [`chatgpt_frame_window`]): `None` before any such frame, then the window
+    /// that frame shows spent, if exactly one. A usage limit the socket reports later in the same
+    /// response takes its window from here.
+    chatgpt_frame_window: Option<Option<&'static str>>,
 }
 
 impl AttemptTrace {
@@ -5837,11 +5842,48 @@ fn chatgpt_spent_window(headers: &crate::wire::ResponseHeaders) -> Option<&'stat
         ((true, minutes), (false, _)) | ((false, _), (true, minutes)) => minutes,
         _ => return None,
     };
+    continued_window(minutes)
+}
+
+/// Routing's name for a ChatGPT usage window of `minutes`: `five_hour` for 300, `seven_day` for
+/// 10080, none for any other length.
+fn continued_window(minutes: u64) -> Option<&'static str> {
     match minutes {
         300 => Some("five_hour"),
         10_080 => Some("seven_day"),
         _ => None,
     }
+}
+
+/// The usage window a ChatGPT/Codex `codex.rate_limits` socket frame shows spent, by the same
+/// rule as the response headers (see [`chatgpt_spent_window`]): exactly one of
+/// `rate_limits.primary` and `rate_limits.secondary` at or above 100 `used_percent`, named by its
+/// `window_minutes`. A window the frame leaves out or sends as `null` isn't spent. A window
+/// whose numbers are missing or don't parse, both or neither spent, or another length give no
+/// window. Reset times are never read.
+///
+/// Captured 2026-11-02 on a socket for an account past its weekly allowance:
+/// `{"type":"codex.rate_limits", "rate_limits":{"allowed":false,"limit_reached":true,
+/// "primary":{"used_percent":100,"window_minutes":10080,...},"secondary":null}, ...}`.
+pub(crate) fn chatgpt_frame_window(frame: &Value) -> Option<&'static str> {
+    let limits = frame.get("rate_limits")?;
+    let read = |name: &str| -> Option<Option<(bool, u64)>> {
+        match limits.get(name) {
+            None | Some(Value::Null) => Some(None),
+            Some(window) => {
+                let used = window.get("used_percent")?.as_f64()?;
+                let minutes = window.get("window_minutes")?.as_u64()?;
+                used.is_finite().then_some(Some((used >= 100.0, minutes)))
+            }
+        }
+    };
+    let spent = |window: Option<(bool, u64)>| window.filter(|(spent, _)| *spent);
+    let (primary, secondary) = (read("primary")?, read("secondary")?);
+    let minutes = match (spent(primary), spent(secondary)) {
+        (Some((_, minutes)), None) | (None, Some((_, minutes))) => minutes,
+        _ => return None,
+    };
+    continued_window(minutes)
 }
 
 /// OpenRouter's refusal of a request its credential's remaining credit cannot pay for: HTTP 402
