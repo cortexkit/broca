@@ -612,7 +612,10 @@ impl<B: SessionBackend> Session<B> {
             } => {
                 // No writer was opened, so nothing may be appended: every write checks this.
                 session.poisoned = true;
-                session.kept = kept::KeptRecords::whole_log(std::mem::take(&mut read.records));
+                let checkpoint =
+                    Checkpoint::decode(&read.checkpoint).map_err(SessionError::Checkpoint)?;
+                session.kept =
+                    kept::KeptRecords::whole_log(std::mem::take(&mut read.records), checkpoint);
                 Ok(SessionView(*session))
             }
         }
@@ -888,6 +891,7 @@ impl<B: SessionBackend> Session<B> {
             self.window.note(first + position as u64, record);
             self.kept.note(first + position as u64, record);
         }
+        self.advance_send_ids(first, records);
         self.poisoned = false;
         drop(timing);
         self.observed(Appended::Records {
@@ -939,8 +943,11 @@ impl<B: SessionBackend> Session<B> {
 
     /// The log holding `seq`, from its start through `last` (see
     /// [`StoredRecords::from_log_holding`]), read over this session's own backend. It reads
-    /// storage, so a read from memory only refuses it.
+    /// storage unless an immutable view retained that log and its checkpoint.
     pub async fn from_log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, SessionError> {
+        if let Some(log) = self.kept.log_from(seq, last) {
+            return Ok(log);
+        }
         self.storage_read()?;
         stored::from_log_holding(&self.place(), seq, last).await
     }

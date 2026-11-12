@@ -191,6 +191,12 @@ fn a_view_keeps_every_record_it_read(cipher: Cipher) {
         let _memory = fresh.in_memory();
         assert_eq!(fresh.records_from(1).await.unwrap(), expected);
         assert_eq!(fresh.open_log_records().await.unwrap(), expected);
+        let loaded = fresh
+            .from_log_holding(fresh.next_seq(), u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(loaded.checkpoint.covers_through, 0);
+        assert_eq!(loaded.records, expected);
     });
 }
 

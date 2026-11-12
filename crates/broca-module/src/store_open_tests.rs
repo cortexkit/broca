@@ -106,6 +106,245 @@ async fn create_in(root: &Path, class: StorageClass, key: &BindIdentity) {
     );
 }
 
+#[cfg(feature = "test-clock")]
+async fn closed_read_fixture(
+    name: &str,
+    max_bytes: u64,
+) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
+    use broca_session_store::record::Record;
+    let root = state_root(name);
+    let key = key(&root, name);
+    let memory = broca_session_store::backend::MemoryBackend::default();
+    let addr = SessionAddr(broca_core::session_addr(&key));
+    let mut source = Session::create(&memory, addr.clone(), triple(&key), &deployment(), false)
+        .await
+        .unwrap();
+    let mut shape = broca_session_store::synthetic::Shape::production(64);
+    shape.runs = 4;
+    broca_session_store::synthetic::write(&mut source, &shape)
+        .await
+        .unwrap();
+    let mut records = source.open_log_records().await.unwrap();
+    for (_, record) in &mut records {
+        if let Record::RunStart(start) = record {
+            start.run_choices = Some(serde_json::json!({"config": {
+                "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+                "response_format": {"type": "text"}, "context_epoch": 0
+            }}));
+        }
+        if let Record::EntryFacts(facts) = record {
+            if facts.native {
+                facts.sender = None;
+            }
+        }
+    }
+    let mut session = Session::create(
+        LocalBackend::new(StorageClass::Ordinary.store_root(&root)),
+        addr,
+        triple(&key),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    session
+        .append(
+            &records
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>(),
+            true,
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    let runtime = Arc::new(
+        StoreRuntime::open(
+            &root,
+            deployment(),
+            Arc::new(NoRuns),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap()
+        .with_view_bytes_for_test(max_bytes),
+    );
+    let (_, registry) = module(
+        &root,
+        Arc::new(FileWalStore::new(root.join("wal"))),
+        runtime.clone(),
+    );
+    (root, runtime, registry, key)
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn cached_closed_pages_read_the_log_once() {
+    use crate::serve::ServeHandler;
+    use std::sync::atomic::Ordering;
+    let (root, runtime, registry, key) =
+        closed_read_fixture("cached-pages", crate::store_reads::ViewCache::MAX_BYTES).await;
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    for from in [1, 8, 15, 1] {
+        let page = registry
+            .read(crate::serve::SessionReadRequest::new(
+                key.clone(),
+                Some(from),
+                Some(7),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.messages.len(), 7);
+        assert_eq!(
+            runtime.log_reads.load(Ordering::Relaxed),
+            1,
+            "page from {from}"
+        );
+        assert!(registry.slot_state(&key).is_none());
+    }
+    eprintln!("cached closed session.read: pages=4 log_reads=1");
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn stored_read_future_stays_small() {
+    fn future_bytes<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    let root = state_root("read-future-size");
+    let runtime = runtime(&root).await;
+    let (_, registry) = module(
+        &root,
+        Arc::new(FileWalStore::new(root.join("wal"))),
+        runtime.clone(),
+    );
+    let key = key(&root, "size");
+    let bytes = future_bytes(|| {
+        runtime.read_inner(
+            &registry,
+            &key,
+            crate::store_reads::StoreReadRequest::Page(Default::default()),
+        )
+    });
+    eprintln!("stored read future bytes={bytes}");
+    assert!(bytes < 20 * 1024, "stored read future uses {bytes} bytes");
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn uncached_closed_pages_load_once_per_read() {
+    use crate::serve::ServeHandler;
+    use std::sync::atomic::Ordering;
+    let (root, runtime, registry, key) = closed_read_fixture("uncached-pages", 0).await;
+    for from in [1, 8, 15, 1] {
+        runtime.log_reads.store(0, Ordering::Relaxed);
+        let page = registry
+            .read(crate::serve::SessionReadRequest::new(
+                key.clone(),
+                Some(from),
+                Some(7),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.messages.len(), 7);
+        assert_eq!(
+            runtime.log_reads.load(Ordering::Relaxed),
+            1,
+            "page from {from}"
+        );
+        assert_eq!(runtime.views.usage(), (0, 0));
+        assert!(registry.slot_state(&key).is_none());
+    }
+    eprintln!("uncached closed session.read: pages=4 log_reads=4 (one per read)");
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn raw_sender_pages_reuse_the_stored_position_with_or_without_an_actor() {
+    use std::sync::atomic::Ordering;
+    let (root, runtime, registry, key) =
+        closed_read_fixture("raw-sender-pages", crate::store_reads::ViewCache::MAX_BYTES).await;
+    let request =
+        serde_json::from_value(serde_json::json!({"form": "raw", "from_ordinal": 1, "limit": 7}))
+            .unwrap();
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    let first = crate::history::read(&registry, &key, &request)
+        .await
+        .unwrap();
+    assert!(first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.get("sender").is_some()));
+    assert_eq!(runtime.log_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        first,
+        crate::history::read(&registry, &key, &request)
+            .await
+            .unwrap()
+    );
+    assert_eq!(runtime.log_reads.load(Ordering::Relaxed), 1);
+    assert!(registry.slot_state(&key).is_none());
+
+    let handle = registry.actor_for(&key).await.unwrap();
+    broca_test_support::wait_until("the actor's control projection serving reads", || async {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        handle
+            .send(crate::actor::LineageCmd::StoreRead {
+                request: Box::new(crate::store_reads::StoreReadRequest::Page(
+                    Default::default(),
+                )),
+                reply,
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the actor stopped before answering a read"));
+        match answer.await.unwrap() {
+            crate::store_reads::StoreReadOutcome::Served(_) => Ok(()),
+            _ => Err("the actor is still preparing its projection".into()),
+        }
+    })
+    .await;
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    let open = crate::history::read(&registry, &key, &request)
+        .await
+        .unwrap();
+    assert_eq!(open["messages"], first["messages"]);
+    assert_eq!(
+        runtime.log_reads.load(Ordering::Relaxed),
+        1,
+        "first sender page may load a stored view"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            open,
+            crate::history::read(&registry, &key, &request)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        runtime.log_reads.load(Ordering::Relaxed),
+        1,
+        "later sender pages reuse the view and its index"
+    );
+    assert_eq!(registry.slot_state(&key), Some("open"));
+    eprintln!("raw sender history: closed pages=2 log_reads=1; open pages=4 log_reads=1");
+    // The actor owns files until the registry shuts it down; the shared scratch root reclaims them.
+    drop(handle);
+    drop(registry);
+    drop(runtime);
+    let _ = root;
+}
+
 #[tokio::test]
 async fn a_finished_administrative_install_retires_its_recovery_candidate() {
     let root = state_root("installed-candidate");

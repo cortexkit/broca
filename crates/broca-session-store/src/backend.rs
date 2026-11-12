@@ -654,6 +654,8 @@ pub struct LocalBackend {
     root: PathBuf,
     fences: Mutex<HashMap<SessionAddr, Version>>,
     open_logs: Mutex<HashMap<(SessionAddr, Id128), File>>,
+    #[cfg(feature = "fs-override")]
+    log_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 const VERSION_LEN: usize = 8;
@@ -676,7 +678,19 @@ impl LocalBackend {
             root: root.into(),
             fences: Mutex::new(HashMap::new()),
             open_logs: Mutex::new(HashMap::new()),
+            #[cfg(feature = "fs-override")]
+            log_reads: None,
         }
+    }
+
+    /// Count actual file reads across handles belonging to one test runtime.
+    #[cfg(feature = "fs-override")]
+    pub fn with_log_reads_for_test(
+        mut self,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.log_reads = Some(reads);
+        self
     }
 
     fn head_dir(&self, s: &SessionAddr) -> PathBuf {
@@ -1049,6 +1063,10 @@ impl SessionBackend for LocalBackend {
             let mut bytes = vec![0u8; (range.end - range.start) as usize];
             file.seek(SeekFrom::Start(range.start))?;
             file.read_exact(&mut bytes)?;
+            #[cfg(feature = "fs-override")]
+            if let Some(reads) = &self.log_reads {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(bytes)
         })
     }

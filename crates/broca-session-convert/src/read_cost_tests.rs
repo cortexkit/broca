@@ -534,9 +534,9 @@ fn conversion_history_walks_open_the_log_a_constant_number_of_times() {
                 );
             }
             let reads = stored.backend.take();
-            // One load of the view and one projection of its shared stream head, regardless
-            // of the number of pages or the direction and form of the four history walks.
-            assert_eq!(reads.log_reads, 2, "{messages} messages: {reads:?}");
+            // The head projection uses the view's retained checkpoint and records, so all
+            // four walks together read the log only for the initial view load.
+            assert_eq!(reads.log_reads, 1, "{messages} messages: {reads:?}");
             eprintln!(
                 "messages={messages} history_walks=4 log_reads={} log_bytes={}",
                 reads.log_reads, reads.log_bytes

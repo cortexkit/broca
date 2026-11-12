@@ -70,7 +70,7 @@ impl Module {
             .unwrap()
     }
 
-    async fn view(&self) -> Arc<broca_session_store::session::SessionView<LocalBackend>> {
+    async fn view(&self) -> Arc<crate::store_read::StoredView<LocalBackend>> {
         self.runtime
             .current_view(&bind())
             .await

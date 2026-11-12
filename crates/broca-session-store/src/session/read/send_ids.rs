@@ -148,6 +148,25 @@ impl SendIdIndex {
 }
 
 impl<B: SessionBackend> Session<B> {
+    /// Keep an already requested read index current without building one on the write path.
+    pub(in crate::session) fn advance_send_ids(&self, first: u64, records: &[Record]) {
+        let mut caches = self.sealed_caches();
+        let Some(index) = caches.send_ids.as_mut() else {
+            return;
+        };
+        let contiguous = index.through.checked_add(1) == Some(first);
+        if !contiguous
+            || records
+                .iter()
+                .enumerate()
+                .any(|(offset, record)| index.observe(first + offset as u64, record).is_err())
+        {
+            // A seal or history replacement can leave a gap. The read cache is not an
+            // authority for writes; discard it so a later read derives it from storage again.
+            caches.send_ids = None;
+        }
+    }
+
     /// Caller-visible send ids for entries whose old facts do not carry one. The first lookup
     /// builds a session-local index by folding the actual input placements and their receipts;
     /// later pages fold only new records. A revert drops the index with the other read caches.

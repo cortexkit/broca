@@ -457,7 +457,69 @@ pub async fn serve_view<B: SessionBackend>(
 pub struct ViewReader<'a, B: SessionBackend> {
     session: &'a Session<B>,
     parts: &'a dyn Parts,
-    stream_head: Option<broca_core::Cursor>,
+    stream_head: ViewHead,
+}
+
+/// An immutable stored position and its control-stream head share one cache lifetime.
+pub struct StoredView<B: SessionBackend> {
+    view: Box<broca_session_store::session::SessionView<B>>,
+    stream_head: ViewHead,
+    position: broca_session_store::session::Position,
+}
+
+/// A local stored snapshot shared by expiry, recovery and page serving.
+pub type StoredLocalView = std::sync::Arc<StoredView<broca_session_store::backend::LocalBackend>>;
+
+impl<B: SessionBackend> StoredView<B> {
+    pub async fn new(
+        view: Box<broca_session_store::session::SessionView<B>>,
+        position: broca_session_store::session::Position,
+    ) -> Self {
+        // Head projection walks records through several large folds. Keep that future off
+        // the caller's stack while a stored read is also loading its view.
+        let stream_head = Box::pin(ViewHead::new(&view)).await;
+        Self {
+            view,
+            stream_head,
+            position,
+        }
+    }
+
+    /// The probed byte position, including any harmless tail the decoder did not fold.
+    pub fn position(&self) -> broca_session_store::session::Position {
+        self.position
+    }
+
+    pub(crate) fn stream_head(
+        &self,
+    ) -> Result<Option<broca_core::Cursor>, crate::serve::ServeError> {
+        self.stream_head.get()
+    }
+}
+
+impl<B: SessionBackend> std::ops::Deref for StoredView<B> {
+    type Target = broca_session_store::session::SessionView<B>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+struct ViewHead(Result<Option<broca_core::Cursor>, String>);
+
+impl ViewHead {
+    async fn new<B: SessionBackend>(session: &Session<B>) -> Self {
+        Self(crate::store_fanout::last_cursor(session).await)
+    }
+
+    fn get(&self) -> Result<Option<broca_core::Cursor>, crate::serve::ServeError> {
+        self.0.as_ref().copied().map_err(|error| {
+            crate::serve::ServeError::Open(
+                format!("the session's control stream can't be projected: {error}"),
+                Some(broca_protocol::ErrorClass::Permanent),
+            )
+        })
+    }
 }
 
 impl<'a, B: SessionBackend> ViewReader<'a, B> {
@@ -467,14 +529,8 @@ impl<'a, B: SessionBackend> ViewReader<'a, B> {
         session: &'a Session<B>,
         parts: &'a dyn Parts,
     ) -> Result<Self, crate::serve::ServeError> {
-        let stream_head = crate::store_fanout::last_cursor(session)
-            .await
-            .map_err(|error| {
-                crate::serve::ServeError::Open(
-                    format!("the session's control stream can't be projected: {error}"),
-                    Some(broca_protocol::ErrorClass::Permanent),
-                )
-            })?;
+        let stream_head = ViewHead::new(session).await;
+        stream_head.get()?;
         Ok(Self {
             session,
             parts,
@@ -491,7 +547,7 @@ impl<'a, B: SessionBackend> ViewReader<'a, B> {
             self.session,
             self.parts,
             &crate::store_reads::PageRequest::of(req),
-            Some(self.stream_head),
+            Some(self.stream_head.get()?),
         )
         .await?;
         finish(answer, req)
@@ -605,14 +661,7 @@ pub(crate) async fn page<B: SessionBackend>(
     // log, a read of storage, so a read from memory only is then served from a view instead.
     let stream_head = match stream_head {
         Some(known) => known,
-        None => crate::store_fanout::last_cursor(session)
-            .await
-            .map_err(|error| {
-                ServeError::Open(
-                    format!("the session's control stream can't be projected: {error}"),
-                    Some(broca_protocol::ErrorClass::Permanent),
-                )
-            })?,
+        None => ViewHead::new(session).await.get()?,
     };
     response.head = stream_head.map(broca_wire::CursorWire::from);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {

@@ -34,6 +34,8 @@ pub(crate) struct KeptRecords {
     /// Whether a new run start drops the records before it, as a writer's copy does to stay
     /// bounded by one run. A view keeps everything it read.
     per_run: bool,
+    /// A view's original checkpoint, paired with the complete records it loaded.
+    checkpoint: Option<Box<crate::checkpoint::Checkpoint>>,
 }
 
 impl KeptRecords {
@@ -46,11 +48,15 @@ impl KeptRecords {
             whole,
             latest_start: None,
             per_run: true,
+            checkpoint: None,
         }
     }
 
     /// The records a view read: all of the open log's.
-    pub(crate) fn whole_log(records: Vec<(u64, Record)>) -> Self {
+    pub(crate) fn whole_log(
+        records: Vec<(u64, Record)>,
+        checkpoint: crate::checkpoint::Checkpoint,
+    ) -> Self {
         let latest_start = latest_start(&records);
         Self {
             from: 0,
@@ -58,6 +64,7 @@ impl KeptRecords {
             whole: true,
             latest_start,
             per_run: false,
+            checkpoint: Some(Box::new(checkpoint)),
         }
     }
 
@@ -78,6 +85,7 @@ impl KeptRecords {
                     whole,
                     latest_start,
                     per_run: true,
+                    checkpoint: None,
                 }
             }
             None => Self::from_next(next_seq, records.is_empty()),
@@ -117,6 +125,20 @@ impl KeptRecords {
     /// Every record of the open log, when they are all kept.
     pub(crate) fn whole(&self) -> Option<&[(u64, Record)]> {
         self.whole.then_some(self.records.as_slice())
+    }
+
+    /// The log as loaded by an immutable view, without reopening a possibly longer log.
+    pub(crate) fn log_from(&self, seq: u64, last: u64) -> Option<super::LogFrom> {
+        let checkpoint = self.checkpoint.as_ref()?;
+        (checkpoint.covers_through < seq).then(|| super::LogFrom {
+            checkpoint: (**checkpoint).clone(),
+            records: self
+                .records
+                .iter()
+                .filter(|(at, _)| *at <= last)
+                .cloned()
+                .collect(),
+        })
     }
 
     /// The retained suffix, without cloning the rest of the run for a tail lookup.
@@ -278,7 +300,8 @@ impl KeptRecords {
                 .iter()
                 .map(|(_, record)| record.heap_bytes())
                 .sum::<usize>()
-            + self.latest_start.heap_bytes();
+            + self.latest_start.heap_bytes()
+            + self.checkpoint.heap_bytes();
         let spare = (self.records.capacity() - self.records.len()) * slot;
         (contents, spare)
     }

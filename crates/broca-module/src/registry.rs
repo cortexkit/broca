@@ -8520,13 +8520,26 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
+        self.check_expired_with_view(key, run).await.map(|_| ())
+    }
+
+    /// Check the same expiry barrier as every operation, retaining its stored snapshot so a
+    /// read can serve it without loading an over-budget view again.
+    pub(crate) async fn check_expired_with_view(
+        &self,
+        key: &LineageKey,
+        run: Option<&str>,
+    ) -> Result<Option<crate::store_read::StoredLocalView>, OpenError> {
+        let mut view = None;
         if let Some(runtime) = self.store_runtime() {
             let now_ms = self
                 .inner
                 .retention
                 .get()
                 .map_or(0, |service| service.clock.now_ms());
-            if let Some(expired_at_ms) = runtime.expired_at(key, run, now_ms).await? {
+            let (expired_at_ms, loaded) = runtime.expiry_with_view(key, run, now_ms).await?;
+            view = loaded;
+            if let Some(expired_at_ms) = expired_at_ms {
                 // While creating sends may still use legacy storage, a fresh legacy WAL can
                 // follow store deletion. Its live history wins over the address's old marker,
                 // but deleted run IDs still expire. Remove this guard with legacy fallback.
@@ -8549,11 +8562,11 @@ impl LineageRegistry {
         // Today's retention doesn't decide a session the new storage owns, or a move is
         // taking there: its WAL is the copy being moved or the retired one left behind.
         if self.store_owner_refusal(key)?.is_some() {
-            return Ok(());
+            return Ok(view);
         }
         self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(());
+            return Ok(view);
         };
         let head = match self.inner.slots.lock().unwrap().get(key) {
             Some(Entry::Open { handle, .. }) => Some(handle.durable_head.load(Ordering::Acquire)),
@@ -8590,7 +8603,7 @@ impl LineageRegistry {
         if let Some(expired_at_ms) = expired {
             return Err(OpenError::Expired { expired_at_ms });
         }
-        Ok(())
+        Ok(view)
     }
 
     async fn check_history_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
