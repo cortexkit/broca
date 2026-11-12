@@ -1319,6 +1319,7 @@ fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
 
     Some(ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: classify_error_with_status_defaults(provider_code, status),

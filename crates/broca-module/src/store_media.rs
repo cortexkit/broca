@@ -707,6 +707,7 @@ pub fn refusal(reason: String) -> broca_protocol::ProviderError {
         message: reason,
         provider_code: Some("store_media_unavailable".into()),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,

@@ -141,3 +141,124 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_run_starts_paused_for_sign_in_and_resumes_after_vault_repair() {
+    use broca_session_loop::writer::Writer as _;
+    use broca_session_store::record::Record;
+    let server = resume_http_fixture().await;
+    let root = fresh_vault_root("store-sign-in");
+    install_alias_catalog();
+    let daemon =
+        CapturingVaultDaemon::start_handling_reports(&root, ReportScript::NeedsReauth).await;
+    daemon.record.lock().unwrap().reported = true;
+    let executor = executor_with_capturing_vault(&root, &daemon)
+        .await
+        .with_provider_overrides(runtime_overrides(&server.url));
+    let mut session = store_session().await;
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let mut req = drift_request(&root);
+    req.model = broca_protocol::request::ModelHandle {
+        provider_module_id: "deepseek".into(),
+        model_id: "alias-model".into(),
+    };
+    req.context_limit = Some(8192);
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "hello".into(),
+        }],
+    )];
+    let paused = serve_store_run(
+        &executor,
+        &mut session,
+        &parts,
+        req.clone(),
+        broca_module::executor::StoreRunMode::Fresh,
+    )
+    .await
+    .result
+    .unwrap();
+    assert_eq!(
+        paused.paused,
+        Some(broca_protocol::PauseReason::AuthRequired)
+    );
+    assert!(
+        server.requests.lock().unwrap().is_empty(),
+        "no provider call before sign-in"
+    );
+    let records = session.open_log_records().await.unwrap();
+    let start = records
+        .iter()
+        .position(|(_, record)| matches!(record, Record::RunStart(_)))
+        .unwrap();
+    let pause = records
+        .iter()
+        .position(|(_, record)| matches!(record, Record::Pause(_)))
+        .unwrap();
+    assert!(start < pause);
+    assert!(!records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::StepStart(_) | Record::RunEnd(_))));
+    let selection = broca_session_loop::run::admission_of_start(
+        session
+            .operations()
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .as_ref()
+            .unwrap(),
+        &parts,
+    )
+    .unwrap()
+    .auth_selection
+    .unwrap();
+    daemon.record.lock().unwrap().reported = false;
+    let finished = serve_store_run(
+        &executor,
+        &mut session,
+        &parts,
+        req,
+        broca_module::executor::StoreRunMode::Resume,
+    )
+    .await
+    .result
+    .unwrap();
+    assert!(finished.paused.is_none());
+    assert_eq!(finished.reason, RunFinishReason::Completed);
+    let records = session.open_log_records().await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunStart(_)))
+            .count(),
+        1
+    );
+    assert!(!records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::AuthRefrozen(_))));
+    assert_eq!(
+        broca_session_loop::run::admission_of_start(
+            session
+                .operations()
+                .run
+                .as_ref()
+                .unwrap()
+                .start
+                .as_ref()
+                .unwrap(),
+            &parts
+        )
+        .unwrap()
+        .auth_selection,
+        Some(selection)
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    daemon.assert_healthy();
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(root);
+}

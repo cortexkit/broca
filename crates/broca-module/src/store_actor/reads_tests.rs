@@ -529,6 +529,29 @@ impl Module {
             .expect("the session opens")
     }
 
+    /// Sends `text` as the module's caller sends it, under `key`.
+    async fn send_keyed(&self, run_id: &str, text: &str, key: SendKey) -> SendOutcome {
+        self.registry
+            .route_submission_with_order(
+                &self.key,
+                RunId(run_id.into()),
+                self.caller.shape(run_id, &key, request(text)),
+                RunKind::FreshOrResume,
+                key,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("the session opens")
+    }
+
     /// The read as the module serves it: by the actor while one is open, else from kept views.
     async fn served(&self, request: &StoreReadRequest) -> StoreReadReply {
         self.runtime()
@@ -831,6 +854,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::PlanView(reply) => format!("{reply:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
+        StoreReadReply::AuthorizationRead(admitted) => format!("{admitted:?}"),
         StoreReadReply::AuthorizationSubmissionSender(sender) => format!("{sender:?}"),
         StoreReadReply::RunResult(reply) => match reply {
             Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
@@ -1397,3 +1421,204 @@ async fn the_served_history_version_is_the_stored_one_past_the_exposure_epoch() 
         .unwrap();
     assert_eq!(head.history_version, 2);
 }
+
+/// A send queued while a run runs has its records in that run. Its open actor answers a poll of
+/// its status from memory, without reading storage, during the run the send started and after a
+/// later run started; and the latest run's status poll the same. Each answer is a fresh view's.
+#[tokio::test]
+async fn a_queued_sends_status_is_answered_from_memory() {
+    let m = module(vec![
+        text_step("a1", "one"),
+        text_step("b1", "two"),
+        text_step("c1", "three"),
+    ])
+    .await;
+    let keyed = |key: &str| SendKey::SendId(key.into());
+    active(m.send_keyed("r1", "first", keyed("k1")).await);
+    m.in_step("r1", 1).await;
+    assert!(matches!(
+        m.send_keyed("r2", "second", keyed("k2")).await,
+        SendOutcome::Pending { .. }
+    ));
+    m.gate.notify_one();
+    m.in_step("r2", 1).await;
+    let poll = StoreReadRequest::SendStatus {
+        own_run: RunId("r2".into()),
+        send_id: "k2".into(),
+        principal: None,
+    };
+    let answered = |when: &'static str, requests: Vec<StoreReadRequest>| {
+        let m = &m;
+        async move {
+            for request in requests {
+                assert!(
+                    matches!(
+                        m.ask_actor(request.clone()).await,
+                        StoreReadOutcome::Served(_)
+                    ),
+                    "{when}: {request:?} is answered from the actor's memory"
+                );
+                assert_eq!(
+                    shape(m.served(&request).await),
+                    shape(m.fresh(&request).await),
+                    "{when}: {request:?}"
+                );
+            }
+        }
+    };
+    answered(
+        "during the run the send started",
+        vec![
+            poll.clone(),
+            StoreReadRequest::RunStatusReply(RunId("r2".into())),
+        ],
+    )
+    .await;
+    m.gate.notify_one();
+    m.ended("r2", "completed").await;
+    active(m.send_keyed("r3", "third", keyed("k3")).await);
+    m.in_step("r3", 1).await;
+    answered(
+        "after a later run started",
+        vec![poll, StoreReadRequest::RunStatusReply(RunId("r3".into()))],
+    )
+    .await;
+    m.gate.notify_one();
+    m.ended("r3", "completed").await;
+}
+
+/// Every read the actor answers from memory only, on a session of three runs: the first called a
+/// tool and queued the sends the second and third started from, and a plan refresh came while
+/// the second ran; the third is in flight. A read the actor can't answer from memory comes back
+/// as the session's position (`Stored`). The reads that come back so must be exactly those that
+/// did so before the open id index kept records' places instead of the records
+/// (`BEFORE_STORED`), and every read answers as a fresh view does.
+#[tokio::test]
+async fn in_memory_reads_refuse_only_where_they_did_before() {
+    let m = module(vec![
+        read_step("a1"),
+        text_step("a2", "one"),
+        text_step("b1", "two"),
+        text_step("c1", "three"),
+    ])
+    .await;
+    let keyed = |key: &str| SendKey::SendId(key.into());
+    active(m.send_keyed("r1", "first", keyed("k1")).await);
+    m.in_step("r1", 1).await;
+    for (run, text, key) in [("r2", "second", "k2"), ("r3", "third", "k3")] {
+        assert!(matches!(
+            m.send_keyed(run, text, keyed(key)).await,
+            SendOutcome::Pending { .. }
+        ));
+    }
+    m.gate.notify_one();
+    m.in_step("r1", 2).await;
+    m.gate.notify_one();
+    m.in_step("r2", 1).await;
+    let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+        "plan": "{}", "plan_identity": "refreshed-plan", "composition_digest": "composition",
+        "tools": [], "system_text": "", "system_digest": "system",
+        "join_version": 1, "role_versions": {}, "declarations": [], "fetches": []
+    }))
+    .unwrap();
+    let refreshed = m
+        .registry
+        .route_session_refresh(&m.key, 1, "on_prefix_rebuild".into(), Box::new(manifest))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            refreshed,
+            crate::actor::SessionRefreshOutcome::Accepted { .. }
+        ),
+        "{refreshed:?}"
+    );
+    m.gate.notify_one();
+    m.in_step("r3", 1).await;
+
+    let run = |id: &str| RunId(id.into());
+    let mut requests = Vec::new();
+    for id in ["r1", "r2", "r3", "nope"] {
+        requests.extend([
+            StoreReadRequest::RunAdmission(run(id)),
+            StoreReadRequest::RunStatus(run(id)),
+            StoreReadRequest::RunStatusReply(run(id)),
+            StoreReadRequest::RunResult(run(id)),
+            StoreReadRequest::RunToolCalls(
+                cortexkit_role_llm_runner::tool_calls::ToolCallsRequest::new(id),
+            ),
+        ]);
+    }
+    for (id, key) in [("r1", "k1"), ("r2", "k2"), ("r3", "k3"), ("r9", "k9")] {
+        requests.push(StoreReadRequest::SendStatus {
+            own_run: run(id),
+            send_id: key.into(),
+            principal: None,
+        });
+    }
+    requests.extend(reads(&[]));
+    requests.extend([
+        StoreReadRequest::AuthorizationSubmissionSender("sub-r2".into()),
+        StoreReadRequest::HistoryHead { mid: None },
+        StoreReadRequest::Media {
+            sha256: "0".repeat(64),
+        },
+        StoreReadRequest::TagLocation(1),
+        StoreReadRequest::WritingView { ordinal: 1 },
+        StoreReadRequest::OutputRefNamespace,
+        StoreReadRequest::PlanChange {
+            generation: Some(1),
+            send_id: Some("policy-1".into()),
+        },
+        StoreReadRequest::PlanChange {
+            generation: None,
+            send_id: None,
+        },
+        StoreReadRequest::PlanIdentities,
+        StoreReadRequest::Baseline,
+        StoreReadRequest::Compaction {
+            key: m.key.clone(),
+            caller: Some("compactor".into()),
+            method: "session.entries".into(),
+            params: serde_json::value::RawValue::from_string(
+                r#"{"select": {"by": "after"}, "detail": "full"}"#.into(),
+            )
+            .unwrap(),
+        },
+    ]);
+    let mut stored = Vec::new();
+    for request in &requests {
+        match m.ask_actor(request.clone()).await {
+            StoreReadOutcome::Served(_) => {}
+            StoreReadOutcome::Stored { .. } => stored.push(format!("{request:?}")),
+            StoreReadOutcome::Refused(error) => panic!("{request:?}: refused {error:?}"),
+            StoreReadOutcome::Reopen => panic!("{request:?}: the actor closed"),
+        }
+        assert_eq!(
+            shape(m.served(request).await),
+            shape(m.fresh(request).await),
+            "{request:?}"
+        );
+    }
+    // The reads that came back as the session's position before the index kept positions, on
+    // the same session: those whose history isn't in memory however it's indexed.
+    let before: Vec<String> = BEFORE_STORED
+        .iter()
+        .map(|read| (*read).to_owned())
+        .collect();
+    assert_eq!(stored, before, "the reads the actor answered from storage");
+    m.gate.notify_one();
+    m.ended("r3", "completed").await;
+}
+
+/// The reads `in_memory_reads_refuse_only_where_they_did_before` saw come back as the session's
+/// position on the code before the open id index kept positions, in its order: the status and
+/// tool calls of the runs before the latest, whose records the actor keeps only for its latest
+/// run, and a medium no record names.
+const BEFORE_STORED: &[&str] = &[
+    "RunStatus(RunId(\"r1\"))",
+    "RunToolCalls(ToolCallsRequest { run_id: \"r1\", after: None, limit: None })",
+    "RunStatus(RunId(\"r2\"))",
+    "RunToolCalls(ToolCallsRequest { run_id: \"r2\", after: None, limit: None })",
+    "Media { sha256: \"0000000000000000000000000000000000000000000000000000000000000000\" }",
+];

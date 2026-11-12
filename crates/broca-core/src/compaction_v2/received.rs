@@ -114,7 +114,7 @@ impl Serialize for ReceivedView {
         #[derive(Serialize)]
         struct RawView<'a> {
             version: u64,
-            checksum: &'a str,
+            checksum: &'a cortexkit_role_compaction::Digest,
             edits: &'a [Box<RawValue>],
             #[serde(skip_serializing_if = "Option::is_none")]
             built_through: Option<&'a str>,

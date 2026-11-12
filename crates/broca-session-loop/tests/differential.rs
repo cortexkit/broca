@@ -2045,7 +2045,7 @@ impl broca_core::CompactionPlane for CompactionSpy {
                             part,
                             field: "output".into(),
                             value: json!("compacted tool output"),
-                            expect,
+                            expect: expect.into(),
                         }
                     };
                     let version = 1 + self
@@ -2705,6 +2705,7 @@ async fn new_from(
         auth_selection: account_selection(),
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
+        pause_for_auth_at_start: None,
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
     // A crash-cut comparison nests this driver several frames deep. Heap-own the loop bodies,
@@ -3869,6 +3870,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         auth_selection: account_selection(),
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         through!(writer, |w| run(
@@ -4815,6 +4817,7 @@ async fn compare_actions_in_once(
         auth_selection: account_selection(),
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -5522,6 +5525,7 @@ async fn compare_auth_pause_in_once(
         auth_selection: account_selection(),
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
+        pause_for_auth_at_start: None,
     };
     let first = through!(writer, |w| run(
         w,
@@ -5538,6 +5542,7 @@ async fn compare_auth_pause_in_once(
         auth_selection: resume_account.or(seams.auth_selection.clone()),
         // A resume waits for its requests as a new run does.
         model_call_ready: provider.model_call_ready(),
+        pause_for_auth_at_start: None,
         ..seams
     };
     let second =
@@ -9306,6 +9311,7 @@ async fn enroll_run_with(
         auth_selection: None,
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
+        pause_for_auth_at_start: None,
     };
     let mut writer = Recording {
         session,
@@ -9362,6 +9368,7 @@ async fn enroll_resume_with(
         auth_selection: None,
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
+        pause_for_auth_at_start: None,
     };
     let mut writer = Recording {
         session,

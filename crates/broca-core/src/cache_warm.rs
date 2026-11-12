@@ -723,6 +723,7 @@ fn warm_journal_error(detail: impl std::fmt::Display) -> ProviderError {
         message: format!("cache warm attempt durability failed: {detail}"),
         provider_code: Some("attempt_durability_failed".into()),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,
@@ -941,7 +942,7 @@ pub enum WarmFailure {
         served: Option<String>,
     },
     /// The warm was sent and the provider refused it.
-    Provider(ProviderError),
+    Provider(Box<ProviderError>),
 }
 
 /// The most recent model request a session's WAL records, rebuilt as the run loop assembled it.

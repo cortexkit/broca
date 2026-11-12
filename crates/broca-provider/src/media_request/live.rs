@@ -197,6 +197,7 @@ pub(super) fn refusal(code: &str, message: String) -> Box<ProviderError> {
         message,
         provider_code: Some(code.into()),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,

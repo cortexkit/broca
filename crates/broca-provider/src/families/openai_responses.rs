@@ -1845,6 +1845,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
     }
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: if billing_exhausted {

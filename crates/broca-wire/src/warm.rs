@@ -308,6 +308,7 @@ mod golden {
                 refusal(WarmRefusalDetail::WarmFailed {
                     error: broca_protocol::error::ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         class: broca_protocol::error::ErrorClass::Transient,

@@ -142,6 +142,56 @@ impl Encoded {
         encoder.written(&self);
         self.bytes
     }
+
+    /// Where each frame of this append lies once its bytes are written at offset `at`, in order:
+    /// for a batch, each record's frame. Read from each frame's own length field, so an append
+    /// carries nothing more than its bytes for it.
+    pub fn places(&self, at: u64) -> impl Iterator<Item = FramePlace> + '_ {
+        let mut offset = 0usize;
+        std::iter::from_fn(move || {
+            let length = self.bytes.get(offset..offset + 4)?;
+            let len = u32::from_le_bytes(length.try_into().expect("four bytes")).checked_add(4)?;
+            let place = FramePlace {
+                at: at + offset as u64,
+                len,
+            };
+            offset += len as usize;
+            Some(place)
+        })
+    }
+}
+
+/// Where one record's frame lies in its log: its first byte and its length, which is enough to
+/// read that one record back without reading the rest of the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FramePlace {
+    pub at: u64,
+    pub len: u32,
+}
+
+/// A frame's length as a [`FramePlace`] holds it. A frame's length field is a `u32` counting the
+/// bytes after it, and its body is bounded by [`frame::MAX_BODY`], so every frame fits.
+fn frame_len(len: usize) -> u32 {
+    u32::try_from(len).expect("a frame's length fits in 32 bits")
+}
+
+/// The length of the first frame in `bytes`, read from its own length field, when `bytes` holds
+/// at least that field. A log's first frame is its checkpoint.
+pub fn first_frame_len(bytes: &[u8]) -> Option<u32> {
+    let length = bytes.get(..4)?;
+    u32::from_le_bytes(length.try_into().expect("four bytes")).checked_add(4)
+}
+
+/// Whether a read of a log, from offset `start`, that returned `bytes` out of a log `log_len`
+/// bytes long read only the log's checkpoint frame: it started at 0, it holds exactly the length
+/// the first frame records, and the log goes on past it. A read that reaches the log's end, or
+/// holds more than the first frame, is a read of the log, so a whole-log read never counts as
+/// one. For backends that count their reads in tests and measurements.
+#[doc(hidden)]
+pub fn reads_checkpoint_frame_only(start: u64, bytes: &[u8], log_len: u64) -> bool {
+    start == 0
+        && first_frame_len(bytes).is_some_and(|len| len as usize == bytes.len())
+        && (bytes.len() as u64) < log_len
 }
 
 /// Encodes the frames of one log. It holds the log's position (frame index, length, sync claim,
@@ -198,7 +248,7 @@ impl LogEncoder {
             synced_through: log.durable_bound.min(log.complete_through),
             next_seq,
             last: log.last,
-            last_seq: log.records.last().map(|(seq, _)| *seq),
+            last_seq: log.last_seq,
         }
     }
 
@@ -498,7 +548,9 @@ pub enum LogEnd {
 #[derive(Debug)]
 pub struct ReadLog {
     pub checkpoint: Vec<u8>,
-    /// Records of complete batches only: an incomplete batch never committed.
+    /// Records of complete batches only: an incomplete batch never committed. Empty when the
+    /// log was read batch by batch with a [`LogReader`], which hands each batch on instead of
+    /// collecting it.
     pub records: Vec<(u64, Record)>,
     pub end: LogEnd,
     /// The largest sync claim among frames that authenticated, or the creation length if
@@ -512,11 +564,21 @@ pub struct ReadLog {
     /// Each stream's last record in the complete batches, or the checkpoint's base when a
     /// stream has none.
     pub last: ChainBase,
+    /// The seq of the last record in the complete batches, if any.
+    pub last_seq: Option<u64>,
     /// Each complete batch, as a range of indexes into `records`.
     pub batches: Vec<std::ops::Range<usize>>,
     /// Where each complete batch starts in the log, in the order of `batches`: a length the log
     /// can be cut back to and still end on a complete batch.
     pub batch_starts: Vec<u64>,
+}
+
+/// One complete batch, as a [`LogReader`] reads it: where it starts in the log, its records with
+/// their seqs, and where each record's frame lies.
+pub struct ReadBatch {
+    pub at: u64,
+    pub records: Vec<(u64, Record)>,
+    pub places: Vec<FramePlace>,
 }
 
 /// A batch read so far, kept apart until its last frame arrives.
@@ -526,6 +588,7 @@ struct OpenBatch {
     count: u16,
     frames: u16,
     records: Vec<(u64, Record)>,
+    places: Vec<FramePlace>,
     last: ChainBase,
 }
 
@@ -540,161 +603,258 @@ pub fn read(
     created_len: u64,
     base: impl FnOnce(&[u8]) -> Result<ChainBase, String>,
 ) -> Result<ReadLog, LogError> {
-    let mut log = ReadLog {
-        checkpoint: Vec::new(),
-        records: Vec::new(),
-        end: LogEnd::Clean,
-        durable_bound: created_len,
-        complete_through: 0,
-        frames: 0,
-        last: ChainBase::default(),
-        batches: Vec::new(),
-        batch_starts: Vec::new(),
-    };
-    let mut offset = 0usize;
-    let mut index = 0u32;
-    let mut last_seq: Option<u64> = None;
-    let mut chain = ChainBase::default();
-    let mut base = Some(base);
-    let mut open: Option<OpenBatch> = None;
-    let damaged = |log: &mut ReadLog, at: usize, damage: Damage| {
-        log.end = LogEnd::Damaged {
-            at: at as u64,
-            damage,
-        };
-    };
-    if bytes.is_empty() {
-        // A log is created by writing and syncing its checkpoint, so an empty one is that write
-        // cut short: a torn tail at 0, which the durable bound judges, never a clean log.
-        log.end = LogEnd::TornTail { at: 0 };
-        return Ok(log);
+    let mut reader = LogReader::new(bytes, key, bind, created_len, base);
+    let mut records = Vec::new();
+    let mut batches = Vec::new();
+    let mut batch_starts = Vec::new();
+    while let Some(batch) = reader.next_batch()? {
+        let start = records.len();
+        records.extend(batch.records);
+        batches.push(start..records.len());
+        batch_starts.push(batch.at);
     }
-    while offset < bytes.len() {
-        let read = frame::open(&bytes[offset..], |id| (id == key.id()).then_some(key), bind);
-        let (header, body, len) = match read {
-            Ok(FrameRead::Frame { header, body, len }) => (header, body, len),
-            Ok(FrameRead::Incomplete) => {
-                let at = open.as_ref().map_or(offset as u64, |batch| batch.at);
-                log.end = LogEnd::TornTail { at };
-                return Ok(log);
-            }
-            Err(error) => {
-                damaged(&mut log, offset, Damage::Frame(error));
-                return Ok(log);
-            }
-        };
-        if header.frame_index != index {
-            damaged(
-                &mut log,
-                offset,
-                Damage::IndexGap {
-                    expected: index,
-                    found: header.frame_index,
-                },
-            );
-            return Ok(log);
-        }
-        log.durable_bound = log.durable_bound.max(header.synced_through);
-        let at = offset as u64;
-        offset += len;
-        index += 1;
-
-        if index == 1 {
-            // The checkpoint batch: one frame with no stream and no seq.
-            if header.stream != FrameStream::None || header.flags & FLAG_CLAIM_ONLY != 0 {
-                damaged(&mut log, at as usize, Damage::NoCheckpoint);
-                return Ok(log);
-            }
-            let read_base = base.take().expect("the checkpoint is the first frame");
-            chain = read_base(&body).map_err(LogError::Checkpoint)?;
-            log.checkpoint = body;
-            log.complete_through = offset as u64;
-            log.frames = index;
-            log.last = chain;
-            continue;
-        }
-        if header.stream == FrameStream::None {
-            if header.flags & FLAG_CLAIM_ONLY == 0 || open.is_some() {
-                damaged(&mut log, at as usize, Damage::BatchMismatch);
-                return Ok(log);
-            }
-            log.complete_through = offset as u64;
-            log.frames = index;
-            continue;
-        }
-
-        let stream = match header.stream {
-            FrameStream::Transcript => Stream::Transcript,
-            _ => Stream::Ledger,
-        };
-        if let Some(previous) = last_seq.filter(|previous| header.seq <= *previous) {
-            damaged(
-                &mut log,
-                at as usize,
-                Damage::SeqOrder {
-                    previous,
-                    found: header.seq,
-                },
-            );
-            return Ok(log);
-        }
-        let batch = match open.as_mut() {
-            Some(batch) => {
-                // Seqs increase across the log, checked above; inside a copied batch they may
-                // skip.
-                if header.batch_first != batch.first || header.batch_count != batch.count {
-                    damaged(&mut log, at as usize, Damage::BatchMismatch);
-                    return Ok(log);
-                }
-                batch
-            }
-            None => {
-                if header.seq != header.batch_first || header.batch_count == 0 {
-                    damaged(&mut log, at as usize, Damage::BatchMismatch);
-                    return Ok(log);
-                }
-                open.insert(OpenBatch {
-                    at,
-                    first: header.seq,
-                    count: header.batch_count,
-                    frames: 0,
-                    records: Vec::new(),
-                    last: chain,
-                })
-            }
-        };
-        let expected_link = *batch.last.slot(stream);
-        if header.prev_in_stream != expected_link {
-            damaged(
-                &mut log,
-                at as usize,
-                Damage::BackLink {
-                    expected: expected_link,
-                    found: header.prev_in_stream,
-                },
-            );
-            return Ok(log);
-        }
-        *batch.last.slot(stream) = Some(header.seq);
-        let record = Record::decode(u32::from(header.kind), &body)
-            .map_err(|error| LogError::Undecodable { offset: at, error })?;
-        batch.records.push((header.seq, record));
-        batch.frames += 1;
-        last_seq = Some(header.seq);
-        if batch.frames == batch.count {
-            let batch = open.take().expect("the batch being read");
-            chain = batch.last;
-            let start = log.records.len();
-            log.records.extend(batch.records);
-            log.batches.push(start..log.records.len());
-            log.batch_starts.push(batch.at);
-            log.complete_through = offset as u64;
-            log.frames = index;
-            log.last = chain;
-        }
-    }
-    if let Some(batch) = open {
-        log.end = LogEnd::TornTail { at: batch.at };
-    }
+    let mut log = reader.finish();
+    log.records = records;
+    log.batches = batches;
+    log.batch_starts = batch_starts;
     Ok(log)
+}
+
+/// Reads a log from its bytes batch by batch, with the checks [`read`] makes, so a caller can
+/// fold each batch and drop it before the next is decoded, never holding the whole decoded log.
+/// A batch is handed on only once its last frame is read, so the batches handed on before the
+/// reading stops are exactly the records [`read`] returns, and [`LogReader::finish`] gives the
+/// rest of what [`read`] returns: how the log ends, its bounds and its checkpoint.
+pub struct LogReader<'a, F> {
+    bytes: &'a [u8],
+    key: &'a FrameKey,
+    bind: &'a [u8],
+    base: Option<F>,
+    log: ReadLog,
+    offset: usize,
+    index: u32,
+    last_seq: Option<u64>,
+    chain: ChainBase,
+    open: Option<OpenBatch>,
+    /// The reading stopped: at the log's end, a torn tail or damage.
+    stopped: bool,
+}
+
+impl<'a, F: FnOnce(&[u8]) -> Result<ChainBase, String>> LogReader<'a, F> {
+    /// A reader of the log `bytes`, as [`read`] reads it.
+    pub fn new(
+        bytes: &'a [u8],
+        key: &'a FrameKey,
+        bind: &'a [u8],
+        created_len: u64,
+        base: F,
+    ) -> Self {
+        let mut reader = Self {
+            bytes,
+            key,
+            bind,
+            base: Some(base),
+            log: ReadLog {
+                checkpoint: Vec::new(),
+                records: Vec::new(),
+                end: LogEnd::Clean,
+                durable_bound: created_len,
+                complete_through: 0,
+                frames: 0,
+                last: ChainBase::default(),
+                last_seq: None,
+                batches: Vec::new(),
+                batch_starts: Vec::new(),
+            },
+            offset: 0,
+            index: 0,
+            last_seq: None,
+            chain: ChainBase::default(),
+            open: None,
+            stopped: false,
+        };
+        if bytes.is_empty() {
+            // A log is created by writing and syncing its checkpoint, so an empty one is that
+            // write cut short: a torn tail at 0, which the durable bound judges, never a clean log.
+            reader.log.end = LogEnd::TornTail { at: 0 };
+            reader.stopped = true;
+        }
+        reader
+    }
+
+    /// The checkpoint's body, once read; empty before.
+    pub fn checkpoint(&self) -> &[u8] {
+        &self.log.checkpoint
+    }
+
+    /// The log's next complete batch, or `None` once the reading stopped.
+    pub fn next_batch(&mut self) -> Result<Option<ReadBatch>, LogError> {
+        let damaged = |log: &mut ReadLog, at: usize, damage: Damage| {
+            log.end = LogEnd::Damaged {
+                at: at as u64,
+                damage,
+            };
+        };
+        while !self.stopped && self.offset < self.bytes.len() {
+            let key = self.key;
+            let read = frame::open(
+                &self.bytes[self.offset..],
+                |id| (id == key.id()).then_some(key),
+                self.bind,
+            );
+            let (header, body, len) = match read {
+                Ok(FrameRead::Frame { header, body, len }) => (header, body, len),
+                Ok(FrameRead::Incomplete) => {
+                    let at = self
+                        .open
+                        .as_ref()
+                        .map_or(self.offset as u64, |batch| batch.at);
+                    self.log.end = LogEnd::TornTail { at };
+                    self.stopped = true;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    damaged(&mut self.log, self.offset, Damage::Frame(error));
+                    self.stopped = true;
+                    return Ok(None);
+                }
+            };
+            if header.frame_index != self.index {
+                damaged(
+                    &mut self.log,
+                    self.offset,
+                    Damage::IndexGap {
+                        expected: self.index,
+                        found: header.frame_index,
+                    },
+                );
+                self.stopped = true;
+                return Ok(None);
+            }
+            self.log.durable_bound = self.log.durable_bound.max(header.synced_through);
+            let at = self.offset as u64;
+            self.offset += len;
+            self.index += 1;
+
+            if self.index == 1 {
+                // The checkpoint batch: one frame with no stream and no seq.
+                if header.stream != FrameStream::None || header.flags & FLAG_CLAIM_ONLY != 0 {
+                    damaged(&mut self.log, at as usize, Damage::NoCheckpoint);
+                    self.stopped = true;
+                    return Ok(None);
+                }
+                let base = self.base.take().expect("the checkpoint is the first frame");
+                self.chain = base(&body).map_err(LogError::Checkpoint)?;
+                self.log.checkpoint = body;
+                self.log.complete_through = self.offset as u64;
+                self.log.frames = self.index;
+                self.log.last = self.chain;
+                continue;
+            }
+            if header.stream == FrameStream::None {
+                if header.flags & FLAG_CLAIM_ONLY == 0 || self.open.is_some() {
+                    damaged(&mut self.log, at as usize, Damage::BatchMismatch);
+                    self.stopped = true;
+                    return Ok(None);
+                }
+                self.log.complete_through = self.offset as u64;
+                self.log.frames = self.index;
+                continue;
+            }
+
+            let stream = match header.stream {
+                FrameStream::Transcript => Stream::Transcript,
+                _ => Stream::Ledger,
+            };
+            if let Some(previous) = self.last_seq.filter(|previous| header.seq <= *previous) {
+                damaged(
+                    &mut self.log,
+                    at as usize,
+                    Damage::SeqOrder {
+                        previous,
+                        found: header.seq,
+                    },
+                );
+                self.stopped = true;
+                return Ok(None);
+            }
+            let batch = match self.open.as_mut() {
+                Some(batch) => {
+                    // Seqs increase across the log, checked above; inside a copied batch they
+                    // may skip.
+                    if header.batch_first != batch.first || header.batch_count != batch.count {
+                        damaged(&mut self.log, at as usize, Damage::BatchMismatch);
+                        self.stopped = true;
+                        return Ok(None);
+                    }
+                    batch
+                }
+                None => {
+                    if header.seq != header.batch_first || header.batch_count == 0 {
+                        damaged(&mut self.log, at as usize, Damage::BatchMismatch);
+                        self.stopped = true;
+                        return Ok(None);
+                    }
+                    self.open.insert(OpenBatch {
+                        at,
+                        first: header.seq,
+                        count: header.batch_count,
+                        frames: 0,
+                        records: Vec::new(),
+                        places: Vec::new(),
+                        last: self.chain,
+                    })
+                }
+            };
+            let expected_link = *batch.last.slot(stream);
+            if header.prev_in_stream != expected_link {
+                damaged(
+                    &mut self.log,
+                    at as usize,
+                    Damage::BackLink {
+                        expected: expected_link,
+                        found: header.prev_in_stream,
+                    },
+                );
+                self.stopped = true;
+                return Ok(None);
+            }
+            *batch.last.slot(stream) = Some(header.seq);
+            let record = Record::decode(u32::from(header.kind), &body)
+                .map_err(|error| LogError::Undecodable { offset: at, error })?;
+            batch.records.push((header.seq, record));
+            batch.places.push(FramePlace {
+                at,
+                len: frame_len(len),
+            });
+            batch.frames += 1;
+            self.last_seq = Some(header.seq);
+            if batch.frames == batch.count {
+                let batch = self.open.take().expect("the batch being read");
+                self.chain = batch.last;
+                self.log.complete_through = self.offset as u64;
+                self.log.frames = self.index;
+                self.log.last = self.chain;
+                self.log.last_seq = Some(header.seq);
+                return Ok(Some(ReadBatch {
+                    at: batch.at,
+                    records: batch.records,
+                    places: batch.places,
+                }));
+            }
+        }
+        if !self.stopped {
+            self.stopped = true;
+            if let Some(batch) = &self.open {
+                self.log.end = LogEnd::TornTail { at: batch.at };
+            }
+        }
+        Ok(None)
+    }
+
+    /// The log as read once [`Self::next_batch`] returned `None`: how it ends, its bounds and
+    /// its checkpoint, without the records, which were handed on batch by batch.
+    pub fn finish(self) -> ReadLog {
+        self.log
+    }
 }

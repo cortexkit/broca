@@ -53,9 +53,11 @@ impl Provider for Stalling {
 /// Runs each store job through the session loop (`broca_session_loop`). The next fresh run, when
 /// `fails_next` is set, has its model call stall, and its loop stops with [`LOOP_FAILED`] once
 /// `fail` is notified: the run's start and step are written, and no end.
+/// When set for a resume, `fails_next` refuses admission instead, before the loop is called.
 struct FailingExecutor {
     script: Arc<StubProvider>,
     fails_next: AtomicBool,
+    temporarily_refuse_resume: AtomicBool,
     fail: Notify,
 }
 
@@ -82,7 +84,7 @@ impl RunExecutor for FailingExecutor {
             mode,
             ..
         } = job;
-        let fails = mode == StoreRunMode::Fresh && self.fails_next.swap(false, Ordering::SeqCst);
+        let fails = self.fails_next.swap(false, Ordering::SeqCst);
         let provider = Stalling {
             script: Arc::clone(&self.script),
             stalls: fails,
@@ -111,6 +113,7 @@ impl RunExecutor for FailingExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
+                pause_for_auth_at_start: None,
             };
             match mode {
                 StoreRunMode::Fresh => {
@@ -141,6 +144,14 @@ impl RunExecutor for FailingExecutor {
                         .map_err(StoreRunError::Loop)
                 }
                 StoreRunMode::Resume => {
+                    if self.temporarily_refuse_resume.swap(false, Ordering::SeqCst) {
+                        return Err(StoreRunError::Admission(RunError::CredentialsUnavailable));
+                    }
+                    if fails {
+                        return Err(StoreRunError::Admission(RunError::Config(
+                            "resume admission failed".into(),
+                        )));
+                    }
                     broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams)
                         .await
                         .map_err(StoreRunError::Loop)
@@ -150,6 +161,18 @@ impl RunExecutor for FailingExecutor {
         .await;
         StoreRunEnd { parts, result }
     }
+}
+
+fn scratch_dir() -> std::path::PathBuf {
+    use std::sync::atomic::AtomicU64;
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = broca_test_support::scratch_root().join(format!(
+        "store-loop-error-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 /// A module over a scratch folder whose new sessions start in the new session storage
@@ -169,14 +192,17 @@ impl Drop for Side {
 
 impl Side {
     async fn new(executor: Arc<FailingExecutor>) -> Self {
-        use std::sync::atomic::AtomicU64;
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = broca_test_support::scratch_root().join(format!(
-            "store-loop-error-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_dir();
+        let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
+        Self::at(dir, key, executor).await
+    }
+
+    /// A module over the state root `dir`, whose session is `key`.
+    async fn at(
+        dir: std::path::PathBuf,
+        key: BindIdentity,
+        executor: Arc<FailingExecutor>,
+    ) -> Self {
         let executor: Arc<dyn RunExecutor> = executor;
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let runtime = crate::store_open::StoreRuntime::open(
@@ -201,7 +227,6 @@ impl Side {
             None,
         )
         .with_store_new_sessions();
-        let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
         Self {
             dir,
             registry,
@@ -211,7 +236,10 @@ impl Side {
     }
 
     async fn send(&self, run_id: &str, text: &str) -> SendOutcome {
-        let key = SendKey::Minted;
+        self.send_keyed(run_id, text, SendKey::Minted).await
+    }
+
+    async fn send_keyed(&self, run_id: &str, text: &str, key: SendKey) -> SendOutcome {
         let request = self.caller.shape(run_id, &key, request(text));
         self.registry
             .route_submission_with_order(
@@ -271,6 +299,7 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
         ])),
         fails_next: AtomicBool::new(true),
         fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
     });
     let side = Side::new(Arc::clone(&executor)).await;
     let sent = side.send("r1", "first").await;
@@ -300,4 +329,272 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
         "a new send starts a run: {next:?}"
     );
     side.until_state("r3", "completed").await;
+}
+
+#[tokio::test]
+async fn a_failed_admission_of_an_existing_auth_pause_records_an_error() {
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![
+            super::tests::auth_failure(),
+            text_step("a2", "next answer"),
+        ])),
+        fails_next: AtomicBool::new(false),
+        fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
+    });
+    let side = Side::new(executor.clone()).await;
+    let key = || SendKey::SendId("synthetic-send".into());
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    side.until_state("r1", "paused").await;
+    executor.fails_next.store(true, Ordering::SeqCst);
+    side.send_keyed("r1", "first", key()).await;
+    let failed = side.until_state("r1", "error").await;
+    assert_eq!(failed["error"]["provider_code"], "runner_error");
+    assert!(failed["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("resume admission failed"));
+    side.send("r2", "next").await;
+    side.until_state("r2", "completed").await;
+}
+
+/// A dependency that is not ready says nothing permanent about the paused run. Keep the
+/// pause and its start intact, then continue the same run when the caller retries later.
+#[tokio::test]
+async fn a_temporary_admission_failure_keeps_the_pause_for_a_later_resume() {
+    use broca_session_store::record::Record;
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![
+            super::tests::auth_failure(),
+            text_step("a2", "recovered answer"),
+        ])),
+        fails_next: AtomicBool::new(false),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        fail: Notify::new(),
+    });
+    let side = Side::new(executor.clone()).await;
+    let key = || SendKey::SendId("temporary-admission-send".into());
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    let paused = side.until_state("r1", "paused").await;
+    let runtime = side.registry.store_runtime().unwrap();
+    let before = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    executor
+        .temporarily_refuse_resume
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("temporary admission task parks", || async {
+        match side.registry.route_status(&side.key).await.unwrap() {
+            crate::actor::LineageStatus::Idle => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert_eq!(side.run_status("r1").await, paused);
+    let after = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "temporary admission writes no end or other record"
+    );
+    assert!(!after
+        .iter()
+        .any(|(_, record)| matches!(record, Record::RunEnd(_))));
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    side.until_state("r1", "completed").await;
+    let records = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunStart(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunEnd(_)))
+            .count(),
+        1
+    );
+    assert!(side.registry.stop_and_seal().await);
+}
+
+/// Copies the state root `from` to `to` as a stopped process leaves it: every file but the
+/// leases, which name the stopped process.
+fn copy_state(from: &std::path::Path, to: &std::path::Path) {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        if std::fs::metadata(from).unwrap().is_dir() {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                copy(&entry.path(), &to.join(entry.file_name()));
+            }
+        } else {
+            std::fs::copy(from, to).unwrap();
+        }
+    }
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "leases" {
+            copy(&entry.path(), &to.join(entry.file_name()));
+        }
+    }
+}
+
+/// A run already started, with its caller's cancel recorded for its next boundary and no end:
+/// its process stopped while the run's model call ran. The session's next open resumes the run,
+/// and here the executor refuses that resume at admission, `temporary`ly or not. The run isn't
+/// paused, so either way it ends with the refusal, and only then does the send waiting behind it
+/// start its run: a session never starts a run over one that hasn't ended.
+async fn a_refused_resume_of_a_started_run_ends_it_before_the_next_run(temporary: bool) {
+    use broca_session_store::record::Record;
+    let original = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(Vec::new())),
+        fails_next: AtomicBool::new(true),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        fail: Notify::new(),
+    });
+    let mut side = Side::new(Arc::clone(&original)).await;
+    let sent = side.send("r1", "first").await;
+    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+    side.registry
+        .route_cancel_at(
+            &side.key,
+            RunId("r1".into()),
+            broca_wal::record::RunCancelAt::StepBoundary,
+        )
+        .await
+        .expect("the cancel is routed");
+    let runtime = side.registry.store_runtime().unwrap();
+    broca_test_support::wait_until("the cancel is recorded", || async {
+        let records = runtime
+            .current_view(&side.key)
+            .await
+            .unwrap()
+            .unwrap()
+            .records_from(0)
+            .await
+            .unwrap();
+        if records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::CancelRequest(_)))
+        {
+            Ok(())
+        } else {
+            Err("no cancel yet".to_owned())
+        }
+    })
+    .await;
+    // The process stops here, with r1's model call still running: its state root as it lies.
+    let stopped = scratch_dir();
+    copy_state(&side.dir, &stopped);
+    original.fail.notify_one();
+    side.until_state("r1", "error").await;
+    assert!(side.registry.stop_and_seal().await);
+
+    let resumed = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![text_step("a2", "next answer")])),
+        fails_next: AtomicBool::new(!temporary),
+        temporarily_refuse_resume: AtomicBool::new(temporary),
+        fail: Notify::new(),
+    });
+    let mut restarted = Side::at(stopped, side.key.clone(), Arc::clone(&resumed)).await;
+    // The same caller sends on: its later sends leave out the tools its first send froze into
+    // the session, which a send from a new caller would declare again and be refused for.
+    restarted.caller = std::mem::take(&mut side.caller);
+    let next = restarted.send("r2", "next").await;
+    assert!(
+        matches!(
+            next,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{next:?}"
+    );
+    let failed = restarted.until_state("r1", "error").await;
+    assert_eq!(failed["error"]["provider_code"], "runner_error", "{failed}");
+    if !temporary {
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("resume admission failed"),
+            "{failed}"
+        );
+    }
+    restarted.until_state("r2", "completed").await;
+    let runtime = restarted.registry.store_runtime().unwrap();
+    let records = runtime
+        .current_view(&restarted.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    let mut open: Option<String> = None;
+    let mut starts = 0;
+    for (seq, record) in &records {
+        match record {
+            Record::RunStart(start) => {
+                assert!(
+                    open.is_none(),
+                    "run {} starts at seq {seq} while run {open:?} hasn't ended",
+                    start.run_id
+                );
+                open = Some(start.run_id.clone());
+                starts += 1;
+            }
+            Record::RunEnd(end) => {
+                assert_eq!(open.as_deref(), Some(end.run_id.as_str()), "seq {seq}");
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((starts, open), (2, None), "r1 ended, then r2 ran and ended");
+    assert!(restarted.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn a_permanently_refused_resume_of_a_started_run_ends_it_before_the_next_run() {
+    a_refused_resume_of_a_started_run_ends_it_before_the_next_run(false).await;
+}
+
+#[tokio::test]
+async fn a_temporarily_refused_resume_of_a_started_run_ends_it_before_the_next_run() {
+    a_refused_resume_of_a_started_run_ends_it_before_the_next_run(true).await;
 }

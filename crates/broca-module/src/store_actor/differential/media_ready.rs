@@ -263,6 +263,7 @@ impl RunExecutor for ReadyExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: Some(ready),
+                pause_for_auth_at_start: None,
             };
             match mode {
                 crate::executor::StoreRunMode::Fresh => {

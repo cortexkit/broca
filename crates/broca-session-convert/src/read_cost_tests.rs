@@ -471,6 +471,7 @@ fn shared_conversion_pages_are_byte_equal_in_every_read_mode() {
                     let reads = stored.backend.take();
                     if !sealed {
                         assert_eq!(reads.log_reads, 0, "{mode} page from {from}");
+                        assert_eq!(reads.checkpoint_frame_reads, 0, "{mode} page from {from}");
                     }
                     let separate = serve_view(&view, &stored.parts, &request).await.unwrap();
                     assert!(shared.head.is_some());
@@ -534,12 +535,17 @@ fn conversion_history_walks_open_the_log_a_constant_number_of_times() {
                 );
             }
             let reads = stored.backend.take();
-            // One load of the view and one projection of its shared stream head, regardless
-            // of the number of pages or the direction and form of the four history walks.
-            assert_eq!(reads.log_reads, 2, "{messages} messages: {reads:?}");
+            // The head projection uses the view's kept records and reads back only the log's
+            // checkpoint frame, so all four walks together read the log only for the initial
+            // view load.
+            assert_eq!(reads.log_reads, 1, "{messages} messages: {reads:?}");
+            assert_eq!(
+                reads.checkpoint_frame_reads, 1,
+                "{messages} messages: {reads:?}"
+            );
             eprintln!(
-                "messages={messages} history_walks=4 log_reads={} log_bytes={}",
-                reads.log_reads, reads.log_bytes
+                "messages={messages} history_walks=4 log_reads={} log_bytes={} checkpoint_frame_reads={}",
+                reads.log_reads, reads.log_bytes, reads.checkpoint_frame_reads
             );
         });
     }

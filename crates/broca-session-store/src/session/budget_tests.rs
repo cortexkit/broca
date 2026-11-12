@@ -106,7 +106,10 @@ fn loaded() -> Measured {
     let entry_facts = freed(std::mem::take(&mut session.conversation.entries));
     let kept_spare = estimated.kept_capacity as u64;
     let kept = freed(std::mem::take(&mut session.kept));
-    let id_index = freed(std::mem::take(&mut session.open_ids));
+    let id_index = freed(std::mem::replace(
+        &mut session.open_ids,
+        crate::idindex::OpenIds::new([0; 32]),
+    ));
     let total = load.held.max(0) as u64;
     let rest = total.saturating_sub(messages + entry_facts + kept + id_index);
     drop(session);

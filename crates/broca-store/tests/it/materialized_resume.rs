@@ -2046,6 +2046,7 @@ async fn paused_budgeted_run_projects_once_at_pause() {
         ProviderControl::Error {
             error: broca_protocol::ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,

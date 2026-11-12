@@ -2359,6 +2359,8 @@ pub enum ServeError {
     ImportBusy,
     /// The owner check refused the send; nothing was written.
     ScopeRefused(broca_core::ScopeRefusal),
+    /// The attested caller is not admitted by the plan's reader policy.
+    ReadAccessRefused,
     /// The send would freeze or adopt its stamped scope while the session is busy; nothing was
     /// written and the caller retries when it is idle.
     ScopeFreezeBusy {
@@ -2522,6 +2524,7 @@ impl std::fmt::Display for ServeError {
             ServeError::ImportIdReuse => write!(f, "import_id was reused with different content"),
             ServeError::ImportBusy => write!(f, "session has an active run"),
             ServeError::ScopeRefused(refusal) => write!(f, "scope refused: {refusal:?}"),
+            ServeError::ReadAccessRefused => f.write_str("the session's read policy does not admit this caller"),
             ServeError::ScopeFreezeBusy { reason, run_id } => write!(
                 f,
                 "the send would freeze its scope but the session is busy ({reason:?}, run {run_id:?})"
@@ -2647,6 +2650,25 @@ pub trait ServeHandler: Send + Sync {
         _principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<(), ServeError> {
         Ok(())
+    }
+
+    /// Check read policy before dispatch; handlers without stored plans keep their existing rule.
+    async fn authorize_session_read(
+        &self,
+        session: &LineageKey,
+        access: &crate::reader_admission::ReadAccess,
+    ) -> Result<(), ServeError> {
+        self.authorize_session(session, access.principal.as_ref())
+            .await
+    }
+
+    /// Reader policies are served only for sessions kept, or being created, in the new storage.
+    fn plan_readers_supported(
+        &self,
+        _session: &LineageKey,
+        _class: Option<&str>,
+    ) -> Result<bool, ServeError> {
+        Ok(false)
     }
 
     /// Diagnostic ownership observation only; a cold cache is unknown, not a non-owner.
@@ -3362,6 +3384,45 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn plan_readers_supported(
+        &self,
+        session: &LineageKey,
+        class: Option<&str>,
+    ) -> Result<bool, ServeError> {
+        if self.store_holding(session)?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.store_can_create()
+            && self.wal_written(session) == Some(false)
+            && (class == Some(crate::registry::HEAD_SESSION_CLASS)
+                || self.starts_new_sessions_in_store(class)))
+    }
+    async fn authorize_session_read(
+        &self,
+        session: &LineageKey,
+        access: &crate::reader_admission::ReadAccess,
+    ) -> Result<(), ServeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        if let Some(store) = self.store_holding(session)? {
+            return match store
+                .read(
+                    self,
+                    session,
+                    StoreReadRequest::AuthorizationRead(access.clone()),
+                )
+                .await?
+            {
+                Some(StoreReadReply::AuthorizationRead(result)) => result,
+                None => {
+                    self.authorize_session(session, access.principal.as_ref())
+                        .await
+                }
+                Some(_) => Err(crate::store_reads::mismatched()),
+            };
+        }
+        self.authorize_session(session, access.principal.as_ref())
+            .await
+    }
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -5151,6 +5212,16 @@ impl ServeHandler for crate::LineageRegistry {
         generation: u64,
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
         use cortexkit_role_llm_runner::{rungs, session_change};
+        let supported = self
+            .store_holding(session)
+            .map_err(|error| SessionChangeError::Transient(error.to_string()))?
+            .is_some();
+        crate::reader_admission::check_plan(&plan, supported).map_err(|error| match error {
+            ServeError::InvalidParams { field, message } => {
+                SessionChangeError::InvalidParams { field, message }
+            }
+            error => SessionChangeError::Transient(error.to_string()),
+        })?;
         let _change_guard = self.lock_session_change(session).await;
         let read = self
             .read_change(session, Some(generation), None, |error| {

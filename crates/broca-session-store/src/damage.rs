@@ -234,7 +234,25 @@ pub fn analyse(
     base: impl Fn(&[u8]) -> Result<ChainBase, String>,
     rebuilt_base: Option<ChainBase>,
 ) -> Result<Verdict, LogError> {
-    let mut read = log::read(bytes, key, bind, created_len, &base)?;
+    let read = log::read(bytes, key, bind, created_len, &base)?;
+    verdict(read, bytes, key, bind, created_len, base, rebuilt_base)
+}
+
+/// The verdict [`analyse`] gives on a log the log reader read as `read` from `bytes`, scanning
+/// the bytes again when the reader stopped at damage. A caller that read the log batch by batch
+/// with a [`log::LogReader`] judges it with this once the reader stopped; a log that opens comes
+/// back as the reader finished it, without its records, which the caller already took. What the
+/// caller took is worth nothing unless the log opens. `base` reads the checkpoint of a damaged
+/// log, which the log reader didn't accept.
+pub fn verdict(
+    mut read: ReadLog,
+    bytes: &[u8],
+    key: &FrameKey,
+    bind: &[u8],
+    created_len: u64,
+    base: impl Fn(&[u8]) -> Result<ChainBase, String>,
+    rebuilt_base: Option<ChainBase>,
+) -> Result<Verdict, LogError> {
     let damaged_at = match read.end {
         LogEnd::Clean => return Ok(Verdict::Opens(read)),
         LogEnd::TornTail { at } => {

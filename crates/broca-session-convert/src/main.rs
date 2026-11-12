@@ -44,6 +44,11 @@
 //! log folders (`wal`, `wal-durable`, `wal-ephemeral`, `wal-archive`, `wal-archive-durable`): the
 //! report counts every log that wouldn't move by class, and times reading, staging and verifying.
 //!
+//! `session-convert store-load-check [--every N] STORE...` and `store-load-check --from-legacy
+//! --dir <scratch> [--every N] [--keep] PATH...`: whether sessions of the new storage, or legacy
+//! logs staged as plain sessions, load alike through today's load and through a reference built
+//! the way loading worked before it streamed its log (see `store_load_check`).
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 //!
@@ -79,6 +84,7 @@ mod move_check;
 mod numbering;
 mod pages;
 mod serve_check;
+mod store_load_check;
 mod subscribe_check;
 
 /// Set from `--plain` when the arguments are read: the mode everything the converter stores
@@ -216,7 +222,9 @@ fn usage() -> ! {
          session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
-         session-convert move-check --dir SCRATCH [--inventory-root ROOT] [--all-steps] [--every N] [--out FILE] PATH...\n\
+         session-convert move-check --dir SCRATCH [--inventory-root ROOT] [--all-steps] [--every N] [--out FILE] PATH...\n       \
+         session-convert store-load-check [--every N] [--out FILE] STORE...\n       \
+         session-convert store-load-check --from-legacy --dir SCRATCH [--every N] [--keep] [--out FILE] PATH...\n\
          Any command takes --plain: store in the plain mode instead of encrypted.\n\
          move-check reads an existing served-history version without writing the source.\n\
          --inventory-root resolves re-keyed addresses and history versions from ROOT read-only.\n\
@@ -243,6 +251,13 @@ struct Args {
     all_steps: bool,
     /// `move-check`: resolve re-keyed identities from this state root's read-only inventory.
     inventory_root: Option<PathBuf>,
+    /// `store-load-check`: stage the legacy logs named and check those, instead of reading
+    /// stores of the new storage.
+    from_legacy: bool,
+    /// `store-load-check --from-legacy`: keep each staged session under `--dir`.
+    keep: bool,
+    /// `store-load-check`: the stores of the new storage to check, as named.
+    roots: Vec<PathBuf>,
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -261,6 +276,9 @@ fn parse_args() -> Args {
         every: 1,
         all_steps: false,
         inventory_root: None,
+        from_legacy: false,
+        keep: false,
+        roots: Vec::new(),
         dir: None,
         files: Vec::new(),
     };
@@ -279,6 +297,8 @@ fn parse_args() -> Args {
             "--sample" => parsed.sample = number(),
             "--prefixes" => parsed.prefixes = true,
             "--all-steps" => parsed.all_steps = true,
+            "--from-legacy" => parsed.from_legacy = true,
+            "--keep" => parsed.keep = true,
             "--inventory-root" => {
                 parsed.inventory_root = Some(PathBuf::from(args.next().unwrap_or_else(|| usage())))
             }
@@ -299,6 +319,14 @@ fn parse_args() -> Args {
     if parsed.inventory_root.is_some() && parsed.command != "move-check" {
         eprintln!("--inventory-root is only supported by move-check");
         std::process::exit(2);
+    }
+    if parsed.command == "store-load-check" && !parsed.from_legacy {
+        // Stores of the new storage hold no `.wal` files to collect.
+        if paths.is_empty() {
+            usage();
+        }
+        parsed.roots = paths;
+        return parsed;
     }
     for path in &paths {
         if let Err(e) = collect(path, &mut parsed.files) {
@@ -353,6 +381,7 @@ fn main() {
         "entries-check" => entries_check::run(&args),
         "calls-check" => calls_check::run(&args),
         "move-check" => move_check::run(&args),
+        "store-load-check" => store_load_check::run(&args),
         _ => usage(),
     }
 }

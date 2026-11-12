@@ -3,6 +3,7 @@
 //! session; the temporary ledger records intents before filesystem operations begin.
 
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,9 +17,12 @@ use broca_session_convert::{
 };
 use broca_session_store::keys::DeploymentKey;
 use broca_wal::{FramedRecord, StorageClass, Wal, WalLineageId, WalRecord};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
 use crate::conversion_ledger::{Ledger, Progress, Row, Source};
+
+pub(crate) mod parallel;
 
 /// Cutover-only switches, removed with legacy storage. Deploying the converter alone does
 /// not open sources or move data; archives and the live startup window are enabled separately.
@@ -105,6 +109,7 @@ fn refusal_of(health: &Health, session: &BindIdentity) -> Option<(bool, String)>
         .map(|reason| (false, reason.clone()))
 }
 
+#[derive(Clone)]
 pub struct Engine {
     root: PathBuf,
     backup: PathBuf,
@@ -112,19 +117,23 @@ pub struct Engine {
     health: Arc<RwLock<Health>>,
     config: Config,
     stderr_warnings: bool,
-    source_index: Option<broca_store::SqliteStore>,
-    inventory: Option<broca_store::session_inventory::SessionInventory>,
-    mover: OnceLock<Arc<crate::store_move::StoreMove>>,
-    archive_inventory: Mutex<ArchiveInventory>,
-    directories: Mutex<crate::store_move::PublicationDirs>,
+    source_index: Option<Arc<broca_store::SqliteStore>>,
+    inventory: Option<Arc<broca_store::session_inventory::SessionInventory>>,
+    mover: Arc<OnceLock<Arc<crate::store_move::StoreMove>>>,
+    archive_inventory: Arc<Mutex<ArchiveInventory>>,
+    directories: Arc<Mutex<crate::store_move::PublicationDirs>>,
+    pass: Arc<tokio::sync::Mutex<()>>,
+    parallelism: usize,
     #[cfg(test)]
     pub(crate) crash: Option<&'static str>,
     #[cfg(test)]
-    pub(crate) faults: crate::store_move::Faults,
+    pub(crate) faults: Arc<crate::store_move::Faults>,
     #[cfg(test)]
     pub(crate) background_fenced: Option<Arc<BackgroundProbe>>,
     #[cfg(test)]
     pub(crate) verification_records: Option<fn(&mut Vec<FramedRecord>)>,
+    #[cfg(test)]
+    pub(crate) parallel_probe: Option<Arc<parallel::Probe>>,
 }
 
 #[cfg(test)]
@@ -228,10 +237,10 @@ impl Engine {
         }
         let index = root.join("run-index.db");
         let source_index = if index.try_exists().map_err(|error| error.to_string())? {
-            Some(
+            Some(Arc::new(
                 broca_store::SqliteStore::open_read_only(&index)
                     .map_err(|error| error.to_string())?,
-            )
+            ))
         } else {
             None
         };
@@ -239,7 +248,8 @@ impl Engine {
             .as_ref()
             .map(|_| broca_store::session_inventory::SessionInventory::open(&index))
             .transpose()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?
+            .map(Arc::new);
         Ok(Some(Self {
             root,
             backup,
@@ -248,9 +258,11 @@ impl Engine {
             config,
             stderr_warnings: false,
             source_index,
-            mover: OnceLock::new(),
-            archive_inventory: Mutex::default(),
-            directories: Mutex::default(),
+            mover: Arc::default(),
+            archive_inventory: Arc::default(),
+            directories: Arc::default(),
+            pass: Arc::default(),
+            parallelism: parallel::DAEMON_WORKERS,
             inventory,
             #[cfg(test)]
             crash: None,
@@ -260,6 +272,8 @@ impl Engine {
             background_fenced: None,
             #[cfg(test)]
             verification_records: None,
+            #[cfg(test)]
+            parallel_probe: None,
         }))
     }
 
@@ -273,6 +287,12 @@ impl Engine {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_parallelism_for_test(&mut self, workers: usize) {
+        assert!(workers > 0);
+        self.parallelism = workers;
     }
 
     /// Reuse the online move's checks for unsettled runs and held calls, and remove today's
@@ -381,7 +401,12 @@ impl Engine {
         }
         drop(health);
         #[cfg(test)]
-        if self.crash == Some(step) {
+        if self.crash == Some(step)
+            || self
+                .parallel_probe
+                .as_ref()
+                .is_some_and(|probe| probe.crash(source, step))
+        {
             return Err(Failure::failed("crash", step));
         }
         Ok(())
@@ -565,18 +590,27 @@ impl Engine {
     pub async fn run_live(
         &self,
         deployment: &DeploymentKey,
-        runtime: Option<&broca_module::store_open::StoreRuntime>,
+        runtime: Option<&Arc<broca_module::store_open::StoreRuntime>>,
         registry: Option<&broca_module::LineageRegistry>,
     ) -> Result<(), String> {
         if !self.config.live_at_startup {
             return Ok(());
         }
+        let pass = Arc::new(self.pass.clone().lock_owned().await);
         self.initialize_directories()?;
         let sources = self.enumerate_live()?;
-        for source in sources {
-            self.process(&source, deployment, runtime, registry, false)
-                .await?;
-        }
+        self.run_pass(
+            sources,
+            parallel::Pass {
+                deployment,
+                runtime,
+                registry,
+                background: false,
+                throttle: Duration::ZERO,
+                lease: pass,
+            },
+        )
+        .await?;
         self.health
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -589,13 +623,14 @@ impl Engine {
     pub async fn run_archives(
         &self,
         deployment: &DeploymentKey,
-        runtime: Option<&broca_module::store_open::StoreRuntime>,
+        runtime: Option<&Arc<broca_module::store_open::StoreRuntime>>,
         registry: Option<&broca_module::LineageRegistry>,
         throttle: Duration,
     ) -> Result<(), String> {
         if !self.config.archives {
             return Ok(());
         }
+        let pass = Arc::new(self.pass.clone().lock_owned().await);
         self.initialize_directories()?;
         let mut sources = self.enumerate_archives()?;
         // Without a registry, there is no safe serving-session idleness check.
@@ -618,51 +653,25 @@ impl Engine {
                 .count() as u64;
             sources.extend(live);
         }
-        for source in sources {
-            if registry.is_some_and(|registry| registry.stopping_signal().is_cancelled()) {
-                break;
-            }
-            let row = self
-                .ledger
-                .row(&source.id)?
-                .ok_or("conversion source is absent")?;
-            if row.step == "done" {
-                continue;
-            }
-            self.process(
-                &source,
+        self.run_pass(
+            sources,
+            parallel::Pass {
                 deployment,
                 runtime,
                 registry,
-                source.member.is_none(),
-            )
-            .await?;
-            if source.member.is_none() {
-                let row = self
-                    .ledger
-                    .row(&source.id)?
-                    .ok_or("conversion source is absent")?;
-                if row.step == "done" {
-                    let mut health = self.health.write().unwrap_or_else(|p| p.into_inner());
-                    health.live_remaining = health.live_remaining.saturating_sub(1);
-                    if row.outcome.as_deref() == Some("converted") {
-                        health.live_background_converted += 1;
-                    }
-                }
-            }
-            if !throttle.is_zero() {
-                tokio::time::sleep(throttle).await;
-            }
-            tokio::task::yield_now().await;
-        }
-        Ok(())
+                background: true,
+                throttle,
+                lease: pass,
+            },
+        )
+        .await
     }
 
     /// Revisit sessions skipped while busy, without rescanning the filesystem in a tight loop.
     pub async fn run_background(
         &self,
         deployment: &DeploymentKey,
-        runtime: &broca_module::store_open::StoreRuntime,
+        runtime: &Arc<broca_module::store_open::StoreRuntime>,
         registry: &broca_module::LineageRegistry,
         throttle: Duration,
     ) -> Result<(), String> {
@@ -688,6 +697,7 @@ impl Engine {
         runtime: Option<&broca_module::store_open::StoreRuntime>,
         registry: Option<&broca_module::LineageRegistry>,
         background: bool,
+        archive_leased: bool,
     ) -> Result<(), String> {
         let row = self
             .ledger
@@ -699,7 +709,7 @@ impl Engine {
         }
         // Container retirement needs the archive-pass lease even when this member is damaged
         // and cannot supply a session identity for the ordinary per-session fence.
-        let _archive_pass = if source.member.is_some() {
+        let _archive_pass = if source.member.is_some() && !archive_leased {
             Some(
                 broca_core::lease::acquire_archive_pass(&self.root)
                     .map_err(|error| error.to_string())?,
@@ -707,9 +717,22 @@ impl Engine {
         } else {
             None
         };
-        let result = self
-            .convert_one(&row, deployment, runtime, registry, background)
-            .await;
+        // Catch every poll, not just construction of the async future. With panic = "unwind"
+        // in dev and release, a session panic drops its fences without unwinding its worker.
+        // The panicked future is never resumed; its partial work follows the same committed
+        // ledger intents and ordinary failure path as a conversion error.
+        let result =
+            AssertUnwindSafe(self.convert_one(&row, deployment, runtime, registry, background))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    let detail = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic payload");
+                    Err(Failure::failed("panic", detail))
+                });
         match result {
             Ok(()) => Ok(()),
             Err(error) if error.class == "crash" => Err(error.message),
@@ -818,6 +841,7 @@ impl Engine {
             Some(runtime),
             Some(registry),
             false,
+            false,
         )
         .await
     }
@@ -886,7 +910,7 @@ impl Engine {
             &address,
             self.source_index
                 .as_ref()
-                .map(|index| index as &dyn broca_core::SessionRefResolver),
+                .map(|index| index.as_ref() as &dyn broca_core::SessionRefResolver),
         )
         .map_err(|error| match error {
             broca_session_convert::identity::IdentityError::Unresolved(detail) => {
@@ -1077,7 +1101,7 @@ impl Engine {
                 .ensure_parent(&self.root, staging.parent().expect("staging has a parent"))
                 .map_err(io)?;
             let history_version = source_history(
-                self.source_index.as_ref(),
+                self.source_index.as_deref(),
                 &session,
                 lineage_text.clone(),
                 registry,
@@ -1599,6 +1623,7 @@ pub async fn rehearse(root: &Path, backup: &Path) -> Result<Rehearsal, String> {
     )?
     .ok_or("conversion is disabled")?;
     engine.stderr_warnings = true;
+    engine.parallelism = parallel::clone_workers();
     let deployment = DeploymentKey::unloaded(1);
     engine.run_live(&deployment, None, None).await?;
     let live_ms = started.elapsed().as_millis();

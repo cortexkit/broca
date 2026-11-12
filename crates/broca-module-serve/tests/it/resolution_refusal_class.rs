@@ -184,6 +184,7 @@ impl RunExecutor for Refusing {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
+                pause_for_auth_at_start: None,
             };
             match mode {
                 StoreRunMode::Fresh => {

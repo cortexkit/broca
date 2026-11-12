@@ -196,6 +196,7 @@ fn an_enrolled_converted_session_pages_every_message_with_no_gap() {
                 None,
                 &[],
             )
+            .to_string()
         );
         let note = &whole[2];
         assert_eq!(note["role"], "system", "{note}");

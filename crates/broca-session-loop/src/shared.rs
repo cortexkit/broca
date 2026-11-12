@@ -71,6 +71,11 @@ pub enum Request {
     OpenLogRecords {
         reply: Reply<Vec<(u64, Record)>>,
     },
+    AcceptedSend {
+        account: String,
+        since_ms: u64,
+        reply: Reply<broca_core::provider::AcceptedSendEvidence>,
+    },
     RunStart {
         run_id: String,
         reply: Reply<Option<RunStart>>,
@@ -262,6 +267,19 @@ impl ActorWriter {
 }
 
 impl Writer for ActorWriter {
+    async fn accepted_send(
+        &self,
+        account: &str,
+        since_ms: u64,
+    ) -> Result<broca_core::provider::AcceptedSendEvidence, SessionError> {
+        self.ask(|reply| Request::AcceptedSend {
+            account: account.to_owned(),
+            since_ms,
+            reply,
+        })
+        .await
+    }
+
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         let (missed, first) = self
             .ask(|reply| Request::Append {
@@ -501,6 +519,13 @@ impl RunLink {
             }
             Request::OpenLogRecords { reply } => {
                 let _ = reply.send(session.open_log_records().await);
+            }
+            Request::AcceptedSend {
+                account,
+                since_ms,
+                reply,
+            } => {
+                let _ = reply.send(session.accepted_send(&account, since_ms).await);
             }
             Request::RunStart { run_id, reply } => {
                 let _ = reply.send(session.run_start(&run_id).await);

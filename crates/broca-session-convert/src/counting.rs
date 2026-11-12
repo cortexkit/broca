@@ -16,9 +16,14 @@ pub struct Reads {
     pub objects: Vec<String>,
     /// The bytes of those objects.
     pub object_bytes: u64,
-    /// How many times an open log was read, and how many bytes.
+    /// How many times an open log was read, and how many bytes, reads of only its checkpoint
+    /// frame aside.
     pub log_reads: u64,
     pub log_bytes: u64,
+    /// How many reads took only a log's checkpoint frame (see
+    /// [`broca_session_store::log::reads_checkpoint_frame_only`]), and how many bytes.
+    pub checkpoint_frame_reads: u64,
+    pub checkpoint_frame_bytes: u64,
 }
 
 /// `inner`, counting reads.
@@ -71,10 +76,28 @@ impl<B: SessionBackend> SessionBackend for Counting<B> {
         log: &Id128,
         range: Range<u64>,
     ) -> Result<Vec<u8>, BackendError> {
-        let bytes = self.inner.read_log(s, log, range).await?;
+        let bytes = self.inner.read_log(s, log, range.clone()).await?;
+        // Only a read of exactly the first frame asks for the log's length, to tell it from a
+        // read of a log that holds nothing else; a failure to learn it counts a log read.
+        let checkpoint_frame = range.start == 0
+            && broca_session_store::log::first_frame_len(&bytes)
+                .is_some_and(|len| len as usize == bytes.len())
+            && match self.inner.log_end(s, log).await {
+                Ok(log_len) => broca_session_store::log::reads_checkpoint_frame_only(
+                    range.start,
+                    &bytes,
+                    log_len,
+                ),
+                Err(_) => false,
+            };
         let mut reads = self.reads.lock().expect("counts lock");
-        reads.log_reads += 1;
-        reads.log_bytes += bytes.len() as u64;
+        if checkpoint_frame {
+            reads.checkpoint_frame_reads += 1;
+            reads.checkpoint_frame_bytes += bytes.len() as u64;
+        } else {
+            reads.log_reads += 1;
+            reads.log_bytes += bytes.len() as u64;
+        }
         Ok(bytes)
     }
 

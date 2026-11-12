@@ -3311,15 +3311,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .as_ref()
             .and_then(|run| run.start.as_ref())
             .is_some_and(|start| start.run_id == active.run_id.0);
-        // A run whose loop failed after its start wrote no end. Left so, the session would hold
+        // A run whose execution failed after its start wrote no end. Left so, the session would hold
         // a run nothing runs: no queued send drains behind it, and a new send's run is refused.
-        // It ends here with the error instead, unless it paused, which a later retry resumes.
+        // It ends here with the error instead. A paused run keeps waiting when admission
+        // fails temporarily: dependencies can recover before the next resume trigger. Only
+        // a permanent refusal makes an existing pause unserviceable by the same request.
         let loop_failed = match &result {
-            Err(StoreRunError::Loop(error)) if started => {
+            Err(error) if started && restart_error.is_none() && !active.account_limit_resume => {
                 let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
-                    run.run_id == active.run_id.0 && run.finished.is_none() && run.paused.is_none()
+                    run.run_id == active.run_id.0
+                        && run.finished.is_none()
+                        && (run.paused.is_none()
+                            || matches!(error, StoreRunError::Admission(error)
+                                if error.admission_error_class() == broca_protocol::ErrorClass::Permanent))
                 });
-                unfinished.then(|| format!("{error:?}"))
+                unfinished.then(|| match error {
+                    StoreRunError::Loop(error) => format!("{error:?}"),
+                    StoreRunError::Admission(error) => error.to_string(),
+                })
             }
             _ => None,
         };
@@ -3373,7 +3382,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     session = %self.key.session,
                     run_id = %active.run_id.0,
                     error = ?error,
-                    "a run on the new storage stopped without a recorded end",
+                    "run execution failed on the new storage",
                 );
             }
         }
@@ -3444,6 +3453,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             message,
             provider_code: Some("runner_error".into()),
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             status: None,
@@ -3872,10 +3882,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             selection: broca_session_loop::plan::recorded_selection(&manifest),
         });
         match self.append_own(record).await {
-            Ok(()) => SessionRefreshOutcome::Accepted {
-                run_in_progress,
-                applies_from_next_run,
-            },
+            Ok(()) => {
+                if manifest
+                    .plan
+                    .as_json_text()
+                    .parse::<serde_json::Value>()
+                    .ok()
+                    .is_some_and(|plan| plan.get("readers").is_some())
+                {
+                    if let Some(fanout) = &self.fanout {
+                        fanout.recheck_read_access();
+                    }
+                }
+                SessionRefreshOutcome::Accepted {
+                    run_in_progress,
+                    applies_from_next_run,
+                }
+            }
             Err(error) => SessionRefreshOutcome::Error(error),
         }
     }

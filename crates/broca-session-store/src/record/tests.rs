@@ -334,6 +334,46 @@ fn source_lineage_round_trips_with_a_must_understand_bit() {
 }
 
 #[test]
+fn a_fork_fact_keeps_its_kind_number_and_bytes() {
+    // A fork's facts are read back by later builds, so their kind number and encoding are
+    // pinned: field numbers in order, the event as its declared number, usage as compact JSON.
+    let record = Record::Fork(Fork {
+        fork_id: "f".into(),
+        event: ForkEvent::AskFinished,
+        at_ms: 300,
+        ask_id: Some("a".into()),
+        attempt: Some(2),
+        question: None,
+        answer: Some("x".into()),
+        finish: Some("end_turn".into()),
+        usage: Some(serde_json::json!({"input_tokens": 1})),
+        principal: None,
+        base: None,
+        admission_id: None,
+        idle_ms: None,
+        retain_ms: None,
+        detail: None,
+    });
+    assert_eq!(record.kind(), 107);
+    assert_eq!(record.stream(), Stream::Ledger);
+    let body = record.encode_body();
+    assert_eq!(
+        crate::codec::hex(&body),
+        concat!(
+            "120166",
+            "2004",
+            "30ac02",
+            "420161",
+            "5002",
+            "720178",
+            "820108656e645f7475726e",
+            "9201127b22696e7075745f746f6b656e73223a317d",
+        )
+    );
+    assert_eq!(Record::decode(107, &body).unwrap(), record);
+}
+
+#[test]
 fn every_kind_round_trips_under_its_own_number_and_stream() {
     let records = one_of_each();
     let mut kinds: Vec<u32> = records.iter().map(Record::kind).collect();

@@ -498,7 +498,7 @@ fn warm_failure(failure: broca_core::WarmFailure) -> WarmError {
         broca_core::WarmFailure::AccountChanged { frozen, served } => {
             WarmError::AccountChanged { frozen, served }
         }
-        broca_core::WarmFailure::Provider(error) => WarmError::Provider(Box::new(error)),
+        broca_core::WarmFailure::Provider(error) => WarmError::Provider(error),
     }
 }
 

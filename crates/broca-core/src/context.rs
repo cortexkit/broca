@@ -3412,6 +3412,7 @@ mod tests {
                 run_id: RunId("next-run".into()),
                 error: broca_protocol::error::ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     class: ErrorClass::Permanent,
                     message: "unknown model".into(),
@@ -3904,6 +3905,7 @@ mod tests {
         };
         let terminal_error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -4176,6 +4178,7 @@ mod tests {
         let mut wal = sample_wal();
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,

@@ -147,10 +147,19 @@ pub fn restore(
         .view_applied
         .as_ref()
         .map(|slot| (slot.view.version, slot.view.checksum.as_str()));
-    fn identity(view: Option<&cortexkit_role_compaction::view::View>) -> Option<(u64, &str)> {
-        view.map(|view| (view.version, view.checksum.as_str()))
+    fn names(
+        slot: Option<(u64, &str)>,
+        view: Option<&cortexkit_role_compaction::view::View>,
+    ) -> bool {
+        match (slot, view) {
+            (None, None) => true,
+            (Some((version, checksum)), Some(view)) => {
+                version == view.version && view.checksum == *checksum
+            }
+            _ => false,
+        }
     }
-    if accepted != identity(state.latest()) || applied != identity(state.applied()) {
+    if !names(accepted, state.latest()) || !names(applied, state.applied()) {
         return Err(
             "a compaction view the session names is missing from its open log, which every seal \
              carries it into"
@@ -206,7 +215,7 @@ impl<W: Writer> Journal for StoreJournal<'_, W> {
         self.commit(Record::ViewApplied(ViewApplied {
             step_id: step,
             version: view.version,
-            checksum: view.checksum.clone(),
+            checksum: view.checksum.to_string(),
         }))
         .await
     }
@@ -257,6 +266,7 @@ pub enum Send {
 pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
     broca_protocol::ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Permanent,
@@ -360,7 +370,7 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
             BuiltFor {
                 window_start,
                 views: [state.applied(), state.latest()]
-                    .map(|view| view.map(|view| (view.version, view.checksum.clone()))),
+                    .map(|view| view.map(|view| (view.version, view.checksum.to_string()))),
             }
         };
         if ctx.window.sealed_for().as_ref() != Some(&key) {
@@ -672,7 +682,7 @@ pub fn carried_views(state: &State, operations: &Operations) -> Result<Vec<Recor
             carry.push(Record::ViewApplied(ViewApplied {
                 step_id: slot.step_id,
                 version: applied.view().version,
-                checksum: applied.view().checksum.clone(),
+                checksum: applied.view().checksum.to_string(),
             }));
             Some(applied)
         }
@@ -705,7 +715,7 @@ pub fn view_record(
     let sealed = view.view();
     Ok(Record::View(View {
         version: sealed.version,
-        checksum: sealed.checksum.clone(),
+        checksum: sealed.checksum.to_string(),
         edits,
         built_through: sealed.built_through.clone(),
         new_signed: sealed.new_signed.clone(),

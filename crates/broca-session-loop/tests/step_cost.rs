@@ -291,6 +291,7 @@ async fn run_on(
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     let reads = Arc::new(Reads::default());
     let mut writer = Counting {
@@ -338,4 +339,54 @@ async fn window_run_starts_are_read_once_per_run() {
         long, short,
         "five more steps read the window runs' starts again"
     );
+}
+
+/// A model step looks up every id it needs in memory: a run's steps read no record back from the
+/// open log, though the runs before it, in the same open log, have records an id lookup reads
+/// back from the log once the latest run is another.
+#[tokio::test]
+async fn a_step_reads_no_record_back_from_the_open_log() {
+    use broca_session_store::idindex::{open_record_reads, IdKind};
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    for index in 0..4 {
+        run_on(
+            &mut session,
+            &mut parts,
+            &format!("h{index}"),
+            vec![
+                tool_step(&format!("h{index}-call")),
+                answer_step(&format!("a{index}")),
+            ],
+        )
+        .await;
+        // A record naming a tool call's key, as a dispatched call's intent does: once a later run
+        // starts, a lookup reads it back from the open log.
+        session
+            .append(
+                &[Record::Event(broca_session_store::record::Event {
+                    name: "tool_dispatched".into(),
+                    run_id: Some(format!("h{index}")),
+                    body: Some(json!({"call_key": format!("h{index}-key")})),
+                })],
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    let before = open_record_reads();
+    let mut steps: Vec<_> = (0..6).map(|n| tool_step(&format!("c{n}"))).collect();
+    steps.push(answer_step("last"));
+    run_on(&mut session, &mut parts, "measured", steps).await;
+    assert_eq!(
+        open_record_reads(),
+        before,
+        "the run's steps read records back from the open log"
+    );
+
+    // The counter sees a lookup that does read one back: a history run's call key.
+    let found = session.find_id(IdKind::CallKey, "h0-key").await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(open_record_reads(), before + 1);
 }

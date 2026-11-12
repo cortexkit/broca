@@ -98,7 +98,7 @@ impl Provider for TestProvider {
                     Default::default(),
                 )
                 .await
-                .map_err(broca_core::WarmFailure::Provider)?,
+                .map_err(|error| broca_core::WarmFailure::Provider(Box::new(error)))?,
             )
         } else {
             None
@@ -135,7 +135,7 @@ impl Provider for TestProvider {
                 sent.warm_body_sha256.clone(),
             )
             .await
-            .map_err(broca_core::WarmFailure::Provider)?;
+            .map_err(|error| broca_core::WarmFailure::Provider(Box::new(error)))?;
         }
         Ok(sent)
     }

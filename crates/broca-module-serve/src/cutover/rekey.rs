@@ -44,7 +44,7 @@ async fn converts_as(effective: BindIdentity, tag: &str) {
         .history_version;
     let engine = engine(&rig, false, true);
     engine
-        .run_live(&deployment(), Some(rig.runtime.as_ref()), None)
+        .run_live(&deployment(), Some(&rig.runtime), None)
         .await
         .unwrap();
     let row = engine.ledger.rows().unwrap().remove(0);
@@ -138,7 +138,7 @@ async fn unresolved_rekeys_are_refused_by_reason_not_damage() {
         let _store = inventory(&rig, &identities);
         let engine = engine(&rig, false, true);
         engine
-            .run_live(&deployment(), Some(rig.runtime.as_ref()), None)
+            .run_live(&deployment(), Some(&rig.runtime), None)
             .await
             .unwrap();
         let row = engine.ledger.rows().unwrap().remove(0);
@@ -171,7 +171,7 @@ async fn unresolved_live_rekey_is_deferred_unfenced_with_a_visible_reason() {
     engine
         .run_archives(
             &deployment(),
-            Some(rig.runtime.as_ref()),
+            Some(&rig.runtime),
             Some(&rig.registry),
             Duration::ZERO,
         )

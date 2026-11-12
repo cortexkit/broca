@@ -955,6 +955,7 @@ impl GeminiNormalizer {
             let error = crate::request_invalid::classify_request_invalid(
                 broca_protocol::ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     class,
                     message: message.to_owned(),

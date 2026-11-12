@@ -244,6 +244,9 @@ fn checked_with_inventory(
         every: 1,
         all_steps: false,
         inventory_root,
+        from_legacy: false,
+        keep: false,
+        roots: Vec::new(),
         dir: Some(root.join("scratch")),
         files,
     })

@@ -54,7 +54,7 @@ use crate::codec::{hex, Digest, Id128, Message as _};
 use crate::damage::{self, Lost, Verdict};
 use crate::fold::conversation::Conversation;
 use crate::head::{self, PendingDeletion, Residence, SessionTriple};
-use crate::idindex::OpenIds;
+use crate::idindex::{self, OpenIds};
 use crate::keys::{random_id, DeploymentKey};
 use crate::log::{ChainBase, LogEncoder};
 use crate::record::{
@@ -591,7 +591,7 @@ impl<B: SessionBackend> Session<B> {
             poisoned: false,
             conversation: checkpoint.conversation.clone(),
             operations: settled.clone(),
-            open_ids: OpenIds::default(),
+            open_ids: OpenIds::new(idindex::hash_key(&key)),
             window: OpenLogIndex::from_checkpoint(activity_ms, intent_seq + 1),
             imported: Default::default(),
             enrollment: Default::default(),
@@ -669,18 +669,25 @@ impl<B: SessionBackend> Session<B> {
             batch.extend(closing_ledger);
             let first = encoder.next_seq();
             let mut operations = settled.clone();
-            let mut open_ids = OpenIds::default();
             for (offset, record) in batch.iter().enumerate() {
                 window.note(first + offset as u64, record);
                 match record.stream() {
                     Stream::Transcript => conversation.apply(record).map_err(fold_error)?,
-                    Stream::Ledger => {
-                        operations.apply(record).map_err(fold_error)?;
-                        open_ids.add(first + offset as u64, record);
-                    }
+                    Stream::Ledger => operations.apply(record).map_err(fold_error)?,
                 }
             }
-            out.extend(encoder.batch(&batch)?.into_written(&mut encoder));
+            let encoded = encoder.batch(&batch)?;
+            let mut open_ids = OpenIds::new(idindex::hash_key(&key));
+            for ((offset, record), place) in batch
+                .iter()
+                .enumerate()
+                .zip(encoded.places(encoder.offset()))
+            {
+                if record.stream() == Stream::Ledger {
+                    open_ids.add(first + offset as u64, record, place);
+                }
+            }
+            out.extend(encoded.into_written(&mut encoder));
             session
                 .backend()
                 .append_log(&addr, &change, &out, 0, version, true)

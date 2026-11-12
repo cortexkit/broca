@@ -198,6 +198,26 @@ fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Cl
 }
 
 impl ProviderHttpClient {
+    pub fn session_accepted_send_evidence(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> broca_core::provider::AcceptedSendEvidence {
+        self.cache_sessions.evidence(session, account)
+    }
+
+    /// Seed one account before routing admission, without acquiring its WebSocket lease.
+    pub fn seed_session_accepted_send(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+        evidence: broca_core::provider::AcceptedSendEvidence,
+    ) {
+        self.cache_sessions
+            .bind(session)
+            .seed_accepted_send(account, evidence);
+    }
+
     /// Read accepted-attempt evidence without loading a session or reading its WAL.
     /// `None` means not loaded in this process; `Some(None)` means loaded with no accepted
     /// send on this account. This distinction lets admission count conservative cold starts.
@@ -1415,6 +1435,24 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         }
     }
 
+    fn seed_accepted_send(
+        &self,
+        account: &str,
+        evidence: broca_core::provider::AcceptedSendEvidence,
+    ) {
+        tracing::debug!(target: "provider", account, ?evidence, "loaded session accepted-send evidence");
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.seed_accepted_send(account, evidence);
+        }
+    }
+
+    fn accepted_send_evidence(&self, account: &str) -> broca_core::provider::AcceptedSendEvidence {
+        self.cache_session.lock().unwrap().as_ref().map_or(
+            broca_core::provider::AcceptedSendEvidence::NotLoaded,
+            |session| session.accepted_send_evidence(account),
+        )
+    }
+
     fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
         self.cache_session
             .lock()
@@ -1708,8 +1746,9 @@ async fn send_warm_legacy(
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
     let identity = Bytes::from(request.body);
     let failed = |message: String| {
-        broca_core::WarmFailure::Provider(ProviderError {
+        broca_core::WarmFailure::Provider(Box::new(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -1723,7 +1762,7 @@ async fn send_warm_legacy(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
-        })
+        }))
     };
     let exchange = async {
         let mut gzip = encode_request_gzip(client, anthropic_api_host, &identity).await;
@@ -1808,7 +1847,7 @@ async fn send_warm_legacy(
             );
             let error = opencode_payment_required(&request.url, code, error);
             let error = inception_payment_required(&request.url, code, error);
-            return Err(broca_core::WarmFailure::Provider(error));
+            return Err(broca_core::WarmFailure::Provider(Box::new(error)));
         }
         let usage = match family {
             crate::spec::WireFamilyId::OpenAiResponses
@@ -1880,8 +1919,9 @@ async fn send_warm_journaled(
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
     let identity = Bytes::from(request.body);
     let failed = |message: String| {
-        broca_core::WarmFailure::Provider(ProviderError {
+        broca_core::WarmFailure::Provider(Box::new(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -1895,7 +1935,7 @@ async fn send_warm_journaled(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
-        })
+        }))
     };
     let mut id = None;
     let mut envelope = AttemptEnvelope::default();
@@ -1940,7 +1980,7 @@ async fn send_warm_journaled(
                     )
                     .await
                     .map_err(|_| failed("warm reservation permission deadline expired".into()))?
-                    .map_err(broca_core::WarmFailure::Provider)?,
+                    .map_err(|error| broca_core::WarmFailure::Provider(Box::new(error)))?,
                 );
             }
             let sent_at_ms = now_millis();
@@ -1994,7 +2034,7 @@ async fn send_warm_journaled(
                     if let (Some(hook), Some(id)) = (&hook, id.take()) {
                         hook.warm_finished(id, envelope.clone(), None, warm_body_sha256.clone())
                             .await
-                            .map_err(broca_core::WarmFailure::Provider)?;
+                            .map_err(|error| broca_core::WarmFailure::Provider(Box::new(error)))?;
                     }
                     gzip = None;
                     continue;
@@ -2040,7 +2080,7 @@ async fn send_warm_journaled(
             );
             let error = opencode_payment_required(&request.url, code, error);
             let error = inception_payment_required(&request.url, code, error);
-            return Err(broca_core::WarmFailure::Provider(error));
+            return Err(broca_core::WarmFailure::Provider(Box::new(error)));
         }
         let usage = match family {
             crate::spec::WireFamilyId::OpenAiResponses
@@ -2087,7 +2127,7 @@ async fn send_warm_journaled(
             warm_body_sha256,
         )
         .await
-        .map_err(broca_core::WarmFailure::Provider)?;
+        .map_err(|error| broca_core::WarmFailure::Provider(Box::new(error)))?;
     }
     result
 }
@@ -2987,6 +3027,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 // of closing the receiver as an unexplained missing assistant message.
                 let error = ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
@@ -3683,7 +3724,7 @@ fn account_changed_error(frozen: Option<&str>, served: Option<&str>) -> Option<P
     if frozen == served {
         return None;
     }
-    Some(ProviderError { provider_details: None, provider_subcode: None,
+    Some(ProviderError { provider_details: None, cause: None, provider_subcode: None,
     refusal: None,
     class: ErrorClass::Auth,
     message: format!("credential account changed: frozen account {frozen}, served account {served}; re-admission required"),
@@ -4994,6 +5035,7 @@ fn tool_args_cut(events: &[NormalizedEvent]) -> bool {
 fn stream_timeout_error(activity: &str) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -5013,6 +5055,7 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
 fn content_timeout_error() -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -5053,6 +5096,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
     };
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class,
@@ -5078,6 +5122,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
 fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -5102,6 +5147,7 @@ fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> Pro
 fn transport_error(message: &str) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::ProviderUnavailable,
@@ -5121,6 +5167,7 @@ fn transport_error(message: &str) -> ProviderError {
 fn stream_limit_error(message: &str) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Transient,
@@ -5315,7 +5362,7 @@ fn classify_chatgpt_upstream_key_rejection(
     }) {
         return error;
     }
-    ProviderError { provider_details: None, provider_subcode: None,
+    ProviderError { provider_details: None, cause: None, provider_subcode: None,
     refusal: None,
     class: ErrorClass::Transient,
     message: format!(
@@ -6325,6 +6372,7 @@ fn http_error_in_family(
     let provider_code = overflow_code.map(str::to_owned).or(provider_code);
     let error = ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class,
@@ -6351,10 +6399,12 @@ fn http_error_in_family(
     };
     // Run after the context-overflow and billing classification above, so a 400 those give a
     // more specific code keeps it.
-    crate::request_invalid::classify_request_invalid(
-        error,
-        body.as_ref().and_then(|body| body.get("error")),
-    )
+    let error_object = body.as_ref().and_then(|body| body.get("error"));
+    if family == Some(WireFamilyId::AnthropicMessages) {
+        crate::request_invalid::classify_anthropic_request_invalid(error, error_object)
+    } else {
+        crate::request_invalid::classify_request_invalid(error, error_object)
+    }
 }
 
 fn truncate_error_body(text: &str) -> &str {
@@ -6892,6 +6942,7 @@ mod tests {
             Ok(vec![NormalizedEvent::Control(ProviderControl::Error {
                 error: ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Transient,
@@ -10068,6 +10119,7 @@ mod tests {
     fn in_band_retry_after_without_http_status_sets_the_delay_floor() {
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -10089,6 +10141,7 @@ mod tests {
     fn retry_after_delay_is_capped_at_one_hundred_twenty_seconds() {
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -10110,6 +10163,7 @@ mod tests {
     fn computed_backoff_doubles_from_two_seconds_to_a_thirty_second_cap() {
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
@@ -10434,7 +10488,7 @@ mod tests {
     fn a_refused_service_tier_is_not_relabelled_an_exhausted_account() {
         let now = UNIX_EPOCH + Duration::from_secs(1_790_387_965);
         let headers = crate::wire::ResponseHeaders::new(CAPTURED_EXHAUSTED_HEADERS.iter().copied());
-        let tier_refusal = ProviderError { provider_details: None, provider_subcode: None,
+        let tier_refusal = ProviderError { provider_details: None, cause: None, provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
         message: "429: provider 'anthropic' refused service_tier \"priority\" for this account: Usage credits are required for fast mode.".into(),
@@ -10741,6 +10795,7 @@ mod tests {
                         provider_code: Option<&str>,
                         resets: Option<(u64, &str)>| ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -11205,6 +11260,7 @@ mod tests {
 
             let raw_error = ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 class: ErrorClass::Permanent,
                 message: "403: forbidden".into(),

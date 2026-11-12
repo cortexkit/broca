@@ -365,6 +365,7 @@ mod tests {
     ) -> ProviderError {
         ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,

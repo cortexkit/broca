@@ -238,6 +238,7 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
         retry_after_secs,
         resets_at_ms,
         status: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         resets_at_source: None,

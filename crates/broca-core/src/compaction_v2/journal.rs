@@ -39,7 +39,7 @@ impl Journal for WalJournal<'_> {
         let view = received.view();
         self.commit(WalRecord::CompactionViewV2(CompactionViewV2 {
             version: view.version,
-            checksum: view.checksum.clone(),
+            checksum: view.checksum.to_string(),
             edits: storage::encode(previous, received),
             built_through: view.built_through.clone(),
             new_signed: view.new_signed.clone(),
@@ -52,7 +52,7 @@ impl Journal for WalJournal<'_> {
         self.commit(WalRecord::CompactionViewAppliedV2 {
             step_id: step,
             version: view.version,
-            checksum: view.checksum.clone(),
+            checksum: view.checksum.to_string(),
         })
         .await
     }

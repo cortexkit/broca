@@ -628,12 +628,120 @@ impl<B: SessionBackend> Session<B> {
     /// order. A sealed record is found through the id index, then read from its segment and
     /// checked to name the id itself, so two ids whose hashes collide never answer for each
     /// other. A seq the index names that no segment holds is damage, never "not found".
+    ///
+    /// An open-log record is found through the open log's index, and checked the same way. A
+    /// record written per tool call comes from memory while it is in the latest run, which the
+    /// session keeps, and is otherwise read back from the open log, one ranged read each, which
+    /// reading from memory only refuses. Every other open-log record comes from memory.
     pub async fn find_id(
         &self,
         kind: IdKind,
         id: &str,
     ) -> Result<Vec<(u64, Record)>, SessionError> {
-        let mut found = self.open_ids.find(kind, id);
+        let mut found = self.open_found(kind, id).await?;
+        // The sealed index's reads are boxed, so every future that looks an id up stays small.
+        if self.head.id_index.is_some() {
+            found.extend(Box::pin(self.sealed_found(kind, id)).await?);
+        }
+        found.sort_by_key(|(seq, _)| *seq);
+        Ok(found)
+    }
+
+    /// The open log's ledger records that name `id` as a `kind`, in seq order.
+    async fn open_found(&self, kind: IdKind, id: &str) -> Result<Vec<(u64, Record)>, SessionError> {
+        let mut found = Vec::new();
+        for (seq, at) in self.open_ids.find(kind, id) {
+            let record = match at {
+                idindex::OpenRecord::At(place) => match self.kept.get(seq) {
+                    Some(record) => record.clone(),
+                    // A cold read, boxed so it adds nothing to every future that looks an id up.
+                    None => Box::pin(self.open_record(seq, place)).await?,
+                },
+                _ => self.open_in_memory(seq, at)?.clone(),
+            };
+            if idindex::names(&record, kind, id) {
+                found.push((seq, record));
+            }
+        }
+        Ok(found)
+    }
+
+    /// An open-log record the id index takes from memory: held by the index, or by the kept
+    /// records.
+    fn open_in_memory<'a>(
+        &'a self,
+        seq: u64,
+        at: idindex::OpenRecord<'a>,
+    ) -> Result<&'a Record, SessionError> {
+        let record = match at {
+            idindex::OpenRecord::Held(record) => Some(record),
+            idindex::OpenRecord::Kept => self.kept.get(seq),
+            idindex::OpenRecord::At(_) | idindex::OpenRecord::Lost => None,
+        };
+        record.ok_or_else(|| {
+            SessionError::Fold(format!(
+                "the open log's id index names record {seq}, which the session doesn't hold"
+            ))
+        })
+    }
+
+    /// The ledger record at `seq` of the open log, read back from where its frame lies: one
+    /// ranged read of the log. The writer appended it, so a frame that doesn't read back as that
+    /// record is damage.
+    async fn open_record(
+        &self,
+        seq: u64,
+        place: crate::log::FramePlace,
+    ) -> Result<Record, SessionError> {
+        self.storage_read()?;
+        idindex::count_open_record_read();
+        let bytes = self
+            .backend
+            .read_log(
+                &self.addr,
+                &self.log,
+                place.at..place.at + u64::from(place.len),
+            )
+            .await?;
+        let key = self.key.frame_key();
+        let bind = super::log_bind(&self.head.session_id, &self.log);
+        let (header, body) =
+            match crate::frame::open(&bytes, |id| (id == key.id()).then_some(&key), &bind) {
+                Ok(crate::frame::FrameRead::Frame { header, body, .. }) => (header, body),
+                Ok(crate::frame::FrameRead::Incomplete) => {
+                    return Err(SessionError::Fold(format!(
+                        "the open log's frame for record {seq} at {} is cut short",
+                        place.at
+                    )))
+                }
+                Err(error) => {
+                    return Err(SessionError::Damaged(crate::log::LogEnd::Damaged {
+                        at: place.at,
+                        damage: crate::log::Damage::Frame(error),
+                    }))
+                }
+            };
+        if header.seq != seq || header.stream != crate::frame::FrameStream::Ledger {
+            return Err(SessionError::Fold(format!(
+                "the open log's frame at {} holds record {}, not ledger record {seq}",
+                place.at, header.seq
+            )));
+        }
+        Record::decode(u32::from(header.kind), &body).map_err(|error| {
+            SessionError::Log(crate::log::LogError::Undecodable {
+                offset: place.at,
+                error,
+            })
+        })
+    }
+
+    /// The sealed ledger records that name `id` as a `kind`, through the sealed id index.
+    async fn sealed_found(
+        &self,
+        kind: IdKind,
+        id: &str,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        let mut found = Vec::new();
         if let Some(root_name) = &self.head.id_index {
             self.storage_read()?;
             let key = self.key.frame_key();
@@ -644,50 +752,51 @@ impl<B: SessionBackend> Session<B> {
                 key: &key,
             };
             let root: IndexRoot = index.read(root_name).await.map_err(SessionError::Index)?;
-            let hash = idindex::id_hash(&idindex::hash_key(&self.key), kind, id);
+            let hash = self.open_ids.hash(kind, id);
             let seqs = index
                 .lookup(&root, &hash)
                 .await
                 .map_err(SessionError::Index)?;
             for (seq, record) in self.ledger_records(&seqs).await? {
-                if idindex::record_ids(&record)
-                    .iter()
-                    .any(|(named_kind, named)| *named_kind == kind && named == id)
-                {
+                if idindex::names(&record, kind, id) {
                     found.push((seq, record));
                 }
             }
         }
-        found.sort_by_key(|(seq, _)| *seq);
         Ok(found)
     }
 
     /// The start record of the session's run `run_id`, sealed or in the open log, or `None` when
     /// the session has no such run. A run has exactly one start, so a start the open log holds is
-    /// the answer and the sealed id index isn't read. Other records naming the run don't settle
-    /// it: a run that spans a seal has its start sealed and its later records (its end, say) in
-    /// the open log, so without an open start this reads the index as [`Self::find_id`] does.
+    /// the answer, from memory, and the sealed id index isn't read. Other records naming the run
+    /// don't settle it: a run that spans a seal has its start sealed and its later records (its
+    /// end, say) in the open log, so without an open start this reads the sealed index as
+    /// [`Self::find_id`] does. Every open-log run start is in memory, so that read skips the open
+    /// log's other records, which hold no start.
     pub async fn find_run_start(
         &self,
         run_id: &str,
     ) -> Result<Option<crate::record::RunStart>, SessionError> {
-        let start_of = |(_, record): (u64, Record)| match record {
-            Record::RunStart(start) => Some(*start),
-            _ => None,
-        };
-        if let Some(start) = self
-            .open_ids
-            .find(IdKind::RunId, run_id)
-            .into_iter()
-            .find_map(start_of)
-        {
-            return Ok(Some(start));
+        for (seq, at) in self.open_ids.find(IdKind::RunId, run_id) {
+            if matches!(at, idindex::OpenRecord::At(_)) {
+                continue;
+            }
+            if let Record::RunStart(start) = self.open_in_memory(seq, at)? {
+                if start.run_id == run_id {
+                    return Ok(Some((**start).clone()));
+                }
+            }
         }
-        Ok(self
-            .find_id(IdKind::RunId, run_id)
+        if self.head.id_index.is_none() {
+            return Ok(None);
+        }
+        Ok(Box::pin(self.sealed_found(IdKind::RunId, run_id))
             .await?
             .into_iter()
-            .find_map(start_of))
+            .find_map(|(_, record)| match record {
+                Record::RunStart(start) => Some(*start),
+                _ => None,
+            }))
     }
 
     /// The ledger record with `seq`, by lookup, never a scan: a sealed one from the one block of

@@ -626,6 +626,97 @@ async fn live_reply_deltas_follow_the_writing_runs_clean_flag() {
     }
 }
 
+/// A mode-3 run over a history whose earlier reply carries tag notation inside its text, so the
+/// request shows that reply cleaned.
+async fn drive_tagged_history(shared: &Shared) -> PrefixBound {
+    let writer = shared.writer();
+    let (mut request, mut control, _) = history_request();
+    let answer = request
+        .input
+        .iter_mut()
+        .find(|message| message.role == broca_protocol::content::Role::Assistant)
+        .expect("the history has a reply");
+    for block in &mut answer.content {
+        if let ContentBlock::Text { text } = block {
+            *text = TAGGED_REPLY.into();
+        }
+    }
+    request.context_limit = Some(100_000);
+    control.admitted_context_limit = request.context_limit;
+    control.new_log_compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
+    control.compaction_plane = Some(Arc::new(Plane::default()));
+    control.compaction_views = None;
+    control.compaction_cache_proven_expired = true;
+    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    writer.shutdown().await.unwrap();
+    model
+}
+
+/// A reply whose cleaning differs between plan versions 3 and 4.
+const TAGGED_REPLY: &str = "see §3§. the file §4§ holds it";
+
+/// Plan version 4 changed only reply cleaning, and broca still cleans every reply as version 3
+/// did. So a run recorded under version 3 resumes, and its request is byte for byte the one a
+/// run recorded under the current version sends, with the earlier reply cleaned as version 3
+/// cleaned it.
+#[tokio::test]
+async fn compaction_v2_run_recorded_under_plan_version_3_resumes_with_identical_request_bytes() {
+    let v3 = cortexkit_compaction_view::clean::clean_reply_for_plan(3, TAGGED_REPLY)
+        .unwrap()
+        .text;
+    let current = cortexkit_compaction_view::clean::clean_reply(TAGGED_REPLY).text;
+    assert_ne!(v3, current, "the reply must tell the two cleanings apart");
+
+    let historical = Shared::default();
+    let model = drive_tagged_history(&historical).await;
+    assert_eq!(model.0.calls().len(), 1);
+    let expected = crate::canonical_request_bytes(&model.0.calls()[0]);
+    let shown = String::from_utf8_lossy(&expected);
+    assert!(shown.contains(&v3), "the reply is cleaned as version 3 did");
+    assert!(!shown.contains(&current));
+
+    let records = historical.records();
+    let finished = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    let mut prefix = records[..finished].to_vec();
+    let mut recorded = 0;
+    for record in &mut prefix {
+        if let WalRecord::RunStarted {
+            compaction_plan_version,
+            ..
+        } = record
+        {
+            *compaction_plan_version = Some(3);
+            recorded += 1;
+        }
+    }
+    assert_eq!(recorded, 1);
+    let resumed = Shared::with_records(prefix);
+    let model = drive_tagged_history(&resumed).await;
+    assert_eq!(model.0.calls().len(), 1);
+    assert_eq!(
+        crate::canonical_request_bytes(&model.0.calls()[0]),
+        expected
+    );
+}
+
 async fn drive_frozen_legacy(shared: &Shared) -> PrefixBound {
     let writer = shared.writer();
     let (request, mut control, _) = history_request();
@@ -963,7 +1054,7 @@ async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_ren
     let newer = View::seal(2, vec![]);
     records.push(WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
         version: 2,
-        checksum: newer.checksum.clone(),
+        checksum: newer.checksum.to_string(),
         edits: v2::storage::encode(None, &newer.into()),
         built_through: None,
         new_signed: None,
@@ -1194,7 +1285,7 @@ async fn compaction_v2_crash_mid_step_does_not_adopt_a_newer_accepted_view() {
     let newer = View::seal(2, vec![]);
     prefix.push(WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
         version: 2,
-        checksum: newer.checksum.clone(),
+        checksum: newer.checksum.to_string(),
         edits: v2::storage::encode(None, &newer.into()),
         built_through: None,
         new_signed: None,
@@ -1563,8 +1654,9 @@ async fn compaction_v2_every_result_kind_carries_delivery_without_changing_store
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(tool.delivered[0].text.as_deref(), Some("module note"));
-            assert_eq!(tool.delivered[0].sender, "broca");
+            let delivered = tool.delivered().unwrap();
+            assert_eq!(delivered[0].text.as_deref(), Some("module note"));
+            assert_eq!(delivered[0].sender, "broca");
             assert!(!tool
                 .output
                 .as_deref()
@@ -1656,7 +1748,7 @@ async fn compaction_v2_recorded_request_rebuild_uses_the_applied_view_not_a_late
         attempt_at,
         WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
             version: 2,
-            checksum: newer.checksum.clone(),
+            checksum: newer.checksum.to_string(),
             edits: v2::storage::encode(None, &newer.into()),
             built_through: None,
             new_signed: None,

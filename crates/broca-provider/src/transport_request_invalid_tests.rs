@@ -67,6 +67,72 @@ fn a_provider_code_outside_the_identifier_shape_is_dropped_not_rewritten() {
 fn anthropic_invalid_request_400_is_request_invalid_without_a_detail() {
     let error = classify_both(400, ANTHROPIC_INVALID_BODY, WireFamilyId::AnthropicMessages);
     assert_request_invalid(&error, None);
+    assert_eq!(error.cause, None);
+}
+
+// Exact production refusal text from 11 November 2026, with a synthetic request path.
+const SIGNED_REASONING_MESSAGE: &str = "messages.89.content.10: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.";
+
+fn signed_reasoning_body(message: &str, error_type: &str) -> String {
+    serde_json::json!({"type": "error", "error": {"type": error_type, "message": message}})
+        .to_string()
+}
+
+#[test]
+fn anthropic_signed_reasoning_rejected_is_a_permanent_request_invalid_cause() {
+    for message in [
+        SIGNED_REASONING_MESSAGE.to_owned(),
+        SIGNED_REASONING_MESSAGE.replace("messages.89.content.10", "messages.0.content.0"),
+    ] {
+        let body = signed_reasoning_body(&message, "invalid_request_error");
+        let error = classify_both(400, &body, WireFamilyId::AnthropicMessages);
+        assert_request_invalid(&error, None);
+        assert_eq!(error.cause.as_deref(), Some("signed_reasoning_rejected"));
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["cause"], "signed_reasoning_rejected");
+        assert!(value.get("provider_subcode").is_none());
+    }
+}
+
+#[test]
+fn signed_reasoning_cause_requires_the_entire_pinned_message_and_request_path() {
+    for message in [
+        format!("{SIGNED_REASONING_MESSAGE} appended"),
+        format!("Invalid request containing {SIGNED_REASONING_MESSAGE}"),
+        SIGNED_REASONING_MESSAGE.split_once(": ").unwrap().1.to_owned(),
+        SIGNED_REASONING_MESSAGE.replace("messages.89", "messages.-1"),
+        SIGNED_REASONING_MESSAGE.replace("content.10", "content."),
+        SIGNED_REASONING_MESSAGE.replace("content.10", "content.１"),
+        "Invalid `signature` in `thinking` block".to_owned(),
+    ] {
+        let body = signed_reasoning_body(&message, "invalid_request_error");
+        let error = classify_both(400, &body, WireFamilyId::AnthropicMessages);
+        assert_request_invalid(&error, None);
+        assert_eq!(error.cause, None, "{message}");
+        assert!(serde_json::to_value(error).unwrap().get("cause").is_none());
+    }
+}
+
+#[test]
+fn signed_reasoning_cause_requires_anthropic_400_and_invalid_request_error() {
+    for (family, status, error_type) in [
+        (WireFamilyId::OpenAiChat, 400, "invalid_request_error"),
+        (WireFamilyId::OpenAiResponses, 400, "invalid_request_error"),
+        (WireFamilyId::OpenAiResponsesChatgpt, 400, "invalid_request_error"),
+        (WireFamilyId::Gemini, 400, "invalid_request_error"),
+        (WireFamilyId::GoogleCodeAssist, 400, "invalid_request_error"),
+        (WireFamilyId::BedrockConverse, 400, "invalid_request_error"),
+        (WireFamilyId::AnthropicMessages, 401, "invalid_request_error"),
+        (WireFamilyId::AnthropicMessages, 429, "invalid_request_error"),
+        (WireFamilyId::AnthropicMessages, 500, "invalid_request_error"),
+        (WireFamilyId::AnthropicMessages, 400, "validation_error"),
+    ] {
+        let body = signed_reasoning_body(SIGNED_REASONING_MESSAGE, error_type);
+        let error = super::super::classify_http_error_in_family(
+            status, &body, None, None, Some(family), None,
+        );
+        assert_eq!(error.cause, None, "{family:?} {status} {error_type}");
+    }
 }
 
 #[test]

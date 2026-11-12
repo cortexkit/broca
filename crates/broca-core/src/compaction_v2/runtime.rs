@@ -871,7 +871,7 @@ fn observe_from(
                 .as_ref()
                 .is_none_or(|(ordinal, _)| *ordinal <= entry.ordinal)
         {
-            pending.assistant = Some((entry.ordinal, entry.digest.clone()));
+            pending.assistant = Some((entry.ordinal, entry.digest.to_string()));
         }
     }
 }
@@ -895,7 +895,7 @@ mod pending_tests {
             vec![Part::new(
                 "0",
                 PartBody::Text {
-                    text: "x".repeat(1_048_577),
+                    text: "x".repeat(1_048_577).into(),
                 },
             )],
         );

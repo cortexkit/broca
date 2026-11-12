@@ -495,7 +495,14 @@ fn parts_numbering(
 /// stored. The view library owns the reply-cleaning contract.
 pub fn exposed_model_text(clean: bool, text: &str) -> std::borrow::Cow<'_, str> {
     if clean {
-        std::borrow::Cow::Owned(cortexkit_compaction_view::clean::clean_reply(text).text)
+        // Pinned to plan version 3's cleaning for every exposure that comes through here:
+        // requests, reads, history, `run.result` and live deltas. A run's requests
+        // must keep the cleaning it was recorded with, and clients hold the text already served.
+        // Moving to the newer rule is a separate change that steps `history_version` and freezes
+        // the cleaning per run.
+        let cleaned = cortexkit_compaction_view::clean::clean_reply_for_plan(3, text)
+            .expect("the view library cleans as plan version 3 did");
+        std::borrow::Cow::Owned(cleaned.text)
     } else {
         std::borrow::Cow::Borrowed(text)
     }

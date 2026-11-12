@@ -184,6 +184,7 @@ fn chatgpt_stub_provider(credential_ready: bool) -> ResolvedStubProvider {
 fn auth_required_error() -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Auth,
@@ -6016,6 +6017,9 @@ fn status_request() -> serde_json::Value {
 
 #[path = "wire_generation.rs"]
 mod generation;
+
+#[path = "wire_signed_reasoning.rs"]
+mod signed_reasoning;
 
 #[tokio::test]
 async fn run_status_frozen_auth_selection_matches_served_golden() {

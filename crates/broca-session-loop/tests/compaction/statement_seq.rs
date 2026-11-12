@@ -246,6 +246,7 @@ async fn tell(session: &Session<&MemoryBackend>, spy: &CompactionSpy) {
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     let ctx = broca_session_loop::compaction::Ctx {
         session: Arc::default(),

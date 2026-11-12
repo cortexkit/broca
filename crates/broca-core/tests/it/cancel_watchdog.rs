@@ -100,6 +100,7 @@ fn auth_error_step() -> Vec<NormalizedEvent> {
     vec![NormalizedEvent::Control(ProviderControl::Error {
         error: ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,

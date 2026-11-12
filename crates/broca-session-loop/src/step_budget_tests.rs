@@ -231,6 +231,7 @@ fn a_step_at(messages: usize) -> Step {
             auth_selection: None,
             step_progress: None,
             model_call_ready: None,
+            pause_for_auth_at_start: None,
         };
         crate::run::run(&mut session, &mut parts, admission, &seams)
             .await

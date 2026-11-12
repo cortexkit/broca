@@ -34,7 +34,7 @@ use crate::codec::{hex, Id128, Message as _};
 use crate::directory::{Pages, FANOUT};
 use crate::fold::conversation::Conversation;
 use crate::fold::operations::Resolution;
-use crate::idindex::{IdKind, IndexPages, OpenIds, Retired};
+use crate::idindex::{self, IdKind, IndexPages, OpenIds, Retired};
 use crate::keys::random_id;
 use crate::log::{ChainBase, LogEncoder};
 use crate::record::{ChangeIntent, ChangeKind, Placement, Record, Stream, TranscriptReverted};
@@ -498,14 +498,10 @@ impl<B: SessionBackend> Session<B> {
             }
         }
         let mut operations = settled;
-        let mut open_ids = OpenIds::default();
         for (offset, record) in resend.iter().enumerate() {
             let seq = first + offset as u64;
             media.fold(seq, record, &conversation, &operations);
             apply(&mut conversation, &mut operations, seq, record).map_err(SessionError::Fold)?;
-            if record.stream() == Stream::Ledger {
-                open_ids.add(seq, record);
-            }
             window.note(seq, record);
         }
         if conversation.placed != ordinal {
@@ -515,7 +511,18 @@ impl<B: SessionBackend> Session<B> {
             )));
         }
         media.flush();
-        bytes.extend(encoder.batch(resend)?.into_written(&mut encoder));
+        let encoded = encoder.batch(resend)?;
+        let mut open_ids = OpenIds::new(idindex::hash_key(&self.key));
+        for ((offset, record), place) in resend
+            .iter()
+            .enumerate()
+            .zip(encoded.places(encoder.offset()))
+        {
+            if record.stream() == Stream::Ledger {
+                open_ids.add(first + offset as u64, record, place);
+            }
+        }
+        bytes.extend(encoded.into_written(&mut encoder));
         self.backend
             .append_log(&self.addr, &change, &bytes, 0, self.version, true)
             .await?;

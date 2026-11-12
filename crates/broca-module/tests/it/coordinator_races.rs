@@ -4030,6 +4030,7 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
     usage: Usage::default(),
     error: Some(ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,

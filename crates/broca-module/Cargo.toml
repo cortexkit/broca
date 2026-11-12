@@ -76,5 +76,5 @@ broca-provider = { path = "../broca-provider", features = ["live"] }
 sha2.workspace = true
 
 [features]
-test-clock = ["broca-core/test-clock"]
+test-clock = ["broca-core/test-clock", "broca-session-store/fs-override"]
 test-attachments = ["broca-protocol/test-attachments"]

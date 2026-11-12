@@ -28,7 +28,7 @@ use broca_session_loop::parts::{DeploymentParts, SharedParts};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
-use broca_session_store::session::{Position, Session, SessionError, SessionView};
+use broca_session_store::session::{Position, Session, SessionError};
 use broca_session_store::setup::SetupStore;
 use broca_wal::StorageClass;
 use tokio::sync::mpsc;
@@ -73,7 +73,13 @@ pub struct StoreRuntime {
     /// without reading the runs' records. Shared with each store actor, which serves them too.
     settled: Arc<crate::store_status::SettledRuns>,
     /// Views of sessions no actor holds, kept by position (see `store_reads`).
-    views: crate::store_reads::ViewCache,
+    views: crate::store_reads::ViewCache<crate::store_read::StoredView<LocalBackend>>,
+    /// Reads of a log's file, but for those of only its checkpoint frame, in tests.
+    #[cfg(all(test, feature = "test-clock"))]
+    log_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reads of only a log's checkpoint frame, which a view's stream head takes, in tests.
+    #[cfg(all(test, feature = "test-clock"))]
+    checkpoint_frame_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// One class root's setup parts.
@@ -163,7 +169,14 @@ impl StoreRuntime {
                 Some(&crate::store_import::default_import_folder(state_root)),
             )),
             settled: Arc::default(),
-            views: crate::store_reads::ViewCache::default(),
+            views: crate::store_reads::ViewCache::new(
+                crate::store_reads::ViewCache::MAX_ENTRIES,
+                crate::store_reads::ViewCache::MAX_BYTES,
+            ),
+            #[cfg(all(test, feature = "test-clock"))]
+            log_reads: Arc::default(),
+            #[cfg(all(test, feature = "test-clock"))]
+            checkpoint_frame_reads: Arc::default(),
         })
     }
 
@@ -300,7 +313,9 @@ impl StoreRuntime {
     }
 
     /// The views kept of sessions no actor holds.
-    pub fn views(&self) -> &crate::store_reads::ViewCache {
+    pub fn views(
+        &self,
+    ) -> &crate::store_reads::ViewCache<crate::store_read::StoredView<LocalBackend>> {
         &self.views
     }
 
@@ -391,7 +406,24 @@ impl StoreRuntime {
 
     /// The store of the root of `class`.
     fn backend(&self, class: StorageClass) -> LocalBackend {
-        LocalBackend::new(class.store_root(&self.state_root))
+        let backend = LocalBackend::new(class.store_root(&self.state_root));
+        #[cfg(all(test, feature = "test-clock"))]
+        let backend = backend.with_log_reads_for_test(
+            Arc::clone(&self.log_reads),
+            Arc::clone(&self.checkpoint_frame_reads),
+        );
+        backend
+    }
+
+    /// Only lower the cache cap, so a small fixture can exercise an uncached read.
+    #[cfg(all(test, feature = "test-clock"))]
+    fn with_view_bytes_for_test(mut self, max_bytes: u64) -> Self {
+        assert!(max_bytes <= crate::store_reads::ViewCache::MAX_BYTES);
+        self.views = crate::store_reads::ViewCache::new(
+            crate::store_reads::ViewCache::MAX_ENTRIES,
+            max_bytes,
+        );
+        self
     }
 
     /// The session `key` as it stands now, read-only: writing nothing and taking no lease (see
@@ -402,7 +434,7 @@ impl StoreRuntime {
     pub async fn current_view(
         &self,
         key: &BindIdentity,
-    ) -> Result<Option<Arc<SessionView<LocalBackend>>>, OpenError> {
+    ) -> Result<Option<Arc<crate::store_read::StoredView<LocalBackend>>>, OpenError> {
         match self.class_of(key)? {
             Some(class) => self.current_view_in(key, class).await.map_err(view_error),
             None => Ok(None),
@@ -414,7 +446,7 @@ impl StoreRuntime {
         &self,
         key: &BindIdentity,
         class: StorageClass,
-    ) -> Result<Option<Arc<SessionView<LocalBackend>>>, SessionError> {
+    ) -> Result<Option<Arc<crate::store_read::StoredView<LocalBackend>>>, SessionError> {
         let addr = SessionAddr(broca_core::session_addr(key));
         let backend = self.backend(class);
         for _ in 0..POSITION_TRIES {
@@ -433,7 +465,12 @@ impl StoreRuntime {
         }
         // Still moving: read it as it is, without keeping the view.
         match Session::view(backend, addr, &triple(key), self.deployment()).await {
-            Ok(view) => Ok(Some(Arc::new(view))),
+            Ok(view) => {
+                let position = view.position();
+                Ok(Some(Arc::new(
+                    crate::store_read::StoredView::new(Box::new(view), position).await,
+                )))
+            }
             Err(SessionError::Missing) => Ok(None),
             Err(error) => Err(error),
         }
@@ -446,16 +483,20 @@ impl StoreRuntime {
         key: &BindIdentity,
         class: StorageClass,
         position: Position,
-    ) -> Result<Arc<SessionView<LocalBackend>>, SessionError> {
+    ) -> Result<Arc<crate::store_read::StoredView<LocalBackend>>, SessionError> {
         let addr = broca_core::session_addr(key);
         let triple = triple(key);
-        let load = Session::view_at(
-            self.backend(class),
-            SessionAddr(addr.clone()),
-            &triple,
-            self.deployment(),
-            &position,
-        );
+        let load = async {
+            let view = Session::view_at(
+                self.backend(class),
+                SessionAddr(addr.clone()),
+                &triple,
+                self.deployment(),
+                &position,
+            )
+            .await?;
+            Ok(crate::store_read::StoredView::new(Box::new(view), position).await)
+        };
         self.views.view(&addr, position, load).await
     }
 
@@ -487,7 +528,7 @@ impl StoreRuntime {
             | crate::store_reads::StoreReadRequest::RunResult(run) => Some(run.0.as_str()),
             _ => None,
         };
-        registry.check_expired(key, run).await?;
+        let mut probed = registry.check_expired_with_view(key, run).await?;
         let addr = broca_core::session_addr(key);
         // The root the session is kept in. A session never changes roots, so a read that finds
         // none finds no session.
@@ -495,8 +536,18 @@ impl StoreRuntime {
             return Ok(None);
         };
         if !request.is_authorization() && registry.open_handle(key).is_none() {
-            let needs_actor = match self.current_view_in(key, class).await {
-                Ok(Some(view)) => recovery_changes_reads(&view),
+            let current = match probed.take() {
+                Some(view) => Ok(Some(view)),
+                None => self.current_view_in(key, class).await,
+            };
+            let needs_actor = match current {
+                Ok(Some(view)) => {
+                    let needs_actor = recovery_changes_reads(&view);
+                    if !needs_actor {
+                        probed = Some(view);
+                    }
+                    needs_actor
+                }
                 Ok(None) => return Ok(None),
                 Err(SessionError::NeedsRecovery) => true,
                 Err(error) => return Err(view_error(error).into()),
@@ -508,7 +559,7 @@ impl StoreRuntime {
             }
         }
         // A read resolves setup parts in the root and mode of the session it reads.
-        let context = |view: &SessionView<LocalBackend>,
+        let context = |view: &crate::store_read::StoredView<LocalBackend>,
                        held: bool,
                        open: bool,
                        live_step,
@@ -520,7 +571,8 @@ impl StoreRuntime {
             settled: Some((self.settled_runs(), &addr)),
             session_name: &key.session,
             live_step,
-            stream_head: None,
+            // A failed projection remains the page's refusal, after its request/facts checks.
+            stream_head: view.stream_head().ok(),
             entry_speaks_for,
         };
         for _ in 0..POSITION_TRIES {
@@ -543,7 +595,13 @@ impl StoreRuntime {
                     position,
                     live_step,
                     entry_speaks_for,
-                }) => match self.view_at(key, class, position).await {
+                }) => match if let Some(view) =
+                    probed.as_ref().filter(|view| view.position() == position)
+                {
+                    Ok(Arc::clone(view))
+                } else {
+                    self.view_at(key, class, position).await
+                } {
                     Ok(view) => {
                         let counts = self.views.token_counts(&addr);
                         let mut context =
@@ -559,7 +617,27 @@ impl StoreRuntime {
                 Some(StoreReadOutcome::Reopen) | None => break,
             }
         }
-        let Some(view) = self.current_view_in(key, class).await.map_err(view_error)? else {
+        // The recovery probe already loaded this immutable position. Recheck its position,
+        // not its contents, so a view too large to cache is still loaded only once per read.
+        let probed = if let Some(view) = probed {
+            let position = Session::stored_position(
+                &self.backend(class),
+                &SessionAddr(addr.clone()),
+                self.deployment(),
+            )
+            .await
+            .map_err(view_error)?;
+            position
+                .filter(|position| *position == view.position())
+                .map(|_| view)
+        } else {
+            None
+        };
+        let current = match probed {
+            Some(view) => Some(view),
+            None => self.current_view_in(key, class).await.map_err(view_error)?,
+        };
+        let Some(view) = current else {
             return Ok(None);
         };
         if !request.is_authorization() && recovery_changes_reads(&view) {
@@ -975,7 +1053,7 @@ fn head_class(state_root: &Path, key: &BindIdentity) -> Result<Option<StorageCla
 /// an append, so a second probe nearly always holds.
 const POSITION_TRIES: usize = 3;
 
-fn recovery_changes_reads(view: &SessionView<LocalBackend>) -> bool {
+fn recovery_changes_reads(view: &Session<LocalBackend>) -> bool {
     crate::store_actor::recovery_changes_reads(&view.operations)
 }
 

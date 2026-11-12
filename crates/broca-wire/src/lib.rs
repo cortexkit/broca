@@ -4960,6 +4960,7 @@ mod tests {
     fn unavailable_error() -> ProviderError {
         ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,

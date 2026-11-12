@@ -462,7 +462,7 @@ mod tests {
         let entry = &page.entries[0];
         assert_ne!(entry.digest, before);
         assert!(
-            matches!(&entry.parts[0].body, PartBody::Tool(tool) if tool.output.as_deref() == Some("original output") && tool.delivered[0].text.as_deref() == Some("remember"))
+            matches!(&entry.parts[0].body, PartBody::Tool(tool) if tool.output.as_deref() == Some("original output") && tool.delivered().unwrap()[0].text.as_deref() == Some("remember"))
         );
         let request = ReadRequest::new(
             Select::After {
@@ -477,7 +477,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.entries[0].digest, entry.digest);
         assert!(
-            matches!(&page.entries[0].parts[0].body, PartBody::Tool(tool) if tool.delivered[0].text.is_none() && tool.delivered[0].text_bytes == 8)
+            matches!(&page.entries[0].parts[0].body, PartBody::Tool(tool) if tool.delivered().unwrap()[0].text.is_none() && tool.delivered().unwrap()[0].text_bytes == 8)
         );
     }
 

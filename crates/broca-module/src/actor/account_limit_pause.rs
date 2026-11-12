@@ -145,6 +145,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     provider_code: Some("account_limit_resume_refused".into()),
                     status: None,
                     retry_after_secs: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     resets_at_ms: None,

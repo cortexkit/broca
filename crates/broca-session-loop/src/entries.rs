@@ -268,6 +268,14 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
 }
 
 impl<W: Writer> Writer for Placed<'_, W> {
+    async fn accepted_send(
+        &self,
+        account: &str,
+        since_ms: u64,
+    ) -> Result<broca_core::provider::AcceptedSendEvidence, SessionError> {
+        self.inner.accepted_send(account, since_ms).await
+    }
+
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         if records.is_empty() {
             return self.inner.append(records, barrier).await;
