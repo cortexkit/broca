@@ -247,6 +247,9 @@ pub struct Seams<'a, P, T> {
     /// step waits for it before anything renders the step's request, its estimates included. A
     /// cancel during the wait ends the run cancelled, as a cancel during the call does.
     pub model_call_ready: Option<Arc<dyn ModelCallReady>>,
+    /// The credential source requires sign-in before another model call. A held resume first
+    /// syncs the results already supplied by its tool provider, then records the auth pause.
+    pub pause_for_auth_at_start: Option<ProviderError>,
 }
 
 /// Something a run's model calls wait for (see [`Seams::model_call_ready`]).
@@ -419,7 +422,20 @@ where
             )
             .await?
         }
-        None => drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await?,
+        None => match seams.pause_for_auth_at_start.clone() {
+            Some(error) => {
+                pause(
+                    &mut placed,
+                    seams,
+                    &admission.run_id,
+                    PauseReason::AuthRequired,
+                    Some(error),
+                    None,
+                )
+                .await?
+            }
+            None => drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await?,
+        },
     };
     // Every end a run writes is followed by a notice of the session's changes, as today's
     // loop follows each of its ends; a pause isn't an end.
@@ -563,9 +579,11 @@ where
     // run stays paused; on another account it ends interrupted, saying why.
     if resolution == Resolution::Paused(PauseReason::AccountLimit) && !cancelling_held {
         let frozen = admission.auth_selection.as_ref();
-        if seams.auth_selection.as_ref().is_some_and(|current| {
-            !broca_core::account_limit_pause::same_selection(current, frozen)
-        }) {
+        if seams.pause_for_auth_at_start.is_none()
+            && seams.auth_selection.as_ref().is_some_and(|current| {
+                !broca_core::account_limit_pause::same_selection(current, frozen)
+            })
+        {
             let error = broca_core::account_limit_pause::selection_changed_error();
             return end_with_error(
                 writer,
@@ -585,11 +603,32 @@ where
             });
         }
     }
+    // An unresolved sign-in pause stays parked without another resume record. A timed
+    // account pause that is ready changes to sign-in before checking credential-bound config.
+    if let Some(error) = seams.pause_for_auth_at_start.clone() {
+        if resolution == Resolution::Paused(PauseReason::AuthRequired) {
+            return Ok(Finished {
+                paused: Some(PauseReason::AuthRequired),
+                ..finished(writer, RunFinishReason::Interrupted)
+            });
+        }
+        if resolution == Resolution::Paused(PauseReason::AccountLimit) {
+            return pause(
+                writer,
+                seams,
+                &admission.run_id,
+                PauseReason::AuthRequired,
+                Some(error),
+                None,
+            )
+            .await;
+        }
+    }
     // A resume that will call the provider again first confirms the provider still renders the
     // run's requests byte for byte, as today's does: a changed renderer or render config would
     // bust the prompt cache, or make the conversation invalid for the provider.
     let drift = match resolution {
-        _ if cancelling_held => None,
+        _ if cancelling_held || seams.pause_for_auth_at_start.is_some() => None,
         Resolution::Resume | Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
             broca_core::provider_errors::render_identity_error(
                 seams.provider,
@@ -632,6 +671,7 @@ where
         if let Some(selection) = seams
             .auth_selection
             .as_ref()
+            .filter(|_| seams.pause_for_auth_at_start.is_none())
             .filter(|_| reason != PauseReason::AccountLimit)
             .filter(|selection| Some(*selection) != admission.auth_selection.as_ref())
         {
@@ -749,6 +789,9 @@ where
     }
     if let Some((frozen, pending)) = submit {
         return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
+    }
+    if let Some(error) = seams.pause_for_auth_at_start.clone() {
+        return pause_for_sign_in(writer, seams, &admission, error).await;
     }
     let compaction = compaction_ctx(writer, parts, &admission, seams, false).await?;
     match resolution {
@@ -6268,6 +6311,68 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
         retries_used: run.retries_used,
         paused: None,
     }
+}
+
+/// Retains only answers already deposited by held-call providers before parking for sign-in.
+/// No unsent tool or held successor is dispatched while the model account is unavailable.
+async fn pause_for_sign_in<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    error: ProviderError,
+) -> Result<Finished, LoopError> {
+    if let (Some(lifecycle), Some(batch)) = (seams.held, run_state(writer).open_batch.as_ref()) {
+        let ctx = BatchCtx {
+            batch_id: BatchId(batch.batch_id.clone()),
+            bind: seams.bind.clone(),
+            run_id: RunId(admission.run_id.clone()),
+            scope: admission.send.scope.clone(),
+            media_capture: writer.media(),
+        };
+        let mut records = Vec::new();
+        let mut delivered = Vec::new();
+        for held in known_calls(writer).into_iter().filter_map(|call| call.held) {
+            if let Some(result) = lifecycle.deposited_result(&ctx, &held) {
+                terminal_with_reason(
+                    &mut records,
+                    &admission.run_id,
+                    &ctx.batch_id.0,
+                    result,
+                    CallOutcome::Completed,
+                    None,
+                    Some((seams.now_ms)()),
+                );
+                delivered.push(held.tool_call_id);
+            }
+        }
+        // Acknowledge only after the terminal barrier, independently of the auth pause.
+        writer.append(&records, true).await?;
+        for id in delivered {
+            lifecycle.terminal_synced(&ctx, &id).await;
+        }
+        if run_state(writer).open_batch.as_ref().is_some_and(|batch| {
+            (0..batch.calls.len()).all(|position| batch.state(position) == CallState::Terminated)
+        }) {
+            writer
+                .append(
+                    &[Record::BatchEnd(BatchEnd {
+                        run_id: admission.run_id.clone(),
+                        batch_id: ctx.batch_id.0,
+                    })],
+                    true,
+                )
+                .await?;
+        }
+    }
+    pause(
+        writer,
+        seams,
+        &admission.run_id,
+        PauseReason::AuthRequired,
+        Some(error),
+        None,
+    )
+    .await
 }
 
 /// Pauses the run at a boundary, durably, before the run reports it. A caller's cancel wins

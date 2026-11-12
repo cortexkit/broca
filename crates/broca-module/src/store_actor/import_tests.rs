@@ -670,6 +670,7 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     let mut parts = MemoryParts::default();
     broca_session_loop::run::run(&mut session, &mut parts, admission, &seams)
@@ -1323,6 +1324,7 @@ async fn run_once<W: Writer>(
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     broca_session_loop::run::run(writer, parts, admission, &seams)
         .await

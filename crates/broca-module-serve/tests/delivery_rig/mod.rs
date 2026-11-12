@@ -847,6 +847,7 @@ impl RunExecutor for CoreExec {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready,
+                pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
             };
             match mode {
                 StoreRunMode::Fresh => {

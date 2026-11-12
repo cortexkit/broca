@@ -120,6 +120,7 @@ struct Executor {
     provider: Limited,
     wal: Arc<FileWalStore>,
     refuse: AtomicBool,
+    signed_out: AtomicBool,
     requests: std::sync::Mutex<Vec<FrozenRequest>>,
 }
 
@@ -145,7 +146,11 @@ impl RunExecutor for Executor {
         job.control.account_limit_pause = true;
         job.control.clock = Some(self.provider.clock.clone());
         job.control.auth_selection = Some(selection());
+        job.control.pause_for_auth_at_start = self.sign_in_error();
         let mode = match job.kind {
+            RunKind::FreshOrResume if !self.signed_out.load(Ordering::SeqCst) => {
+                StartMode::ResumeAfterAuth
+            }
             RunKind::FreshOrResume => StartMode::FreshOrResume,
             RunKind::AppendEpisode => StartMode::AppendEpisode,
             RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
@@ -228,6 +233,7 @@ impl RunExecutor for Executor {
                 auth_selection: Some(selection()),
                 step_progress: control.step_progress,
                 model_call_ready: None,
+                pause_for_auth_at_start: self.sign_in_error(),
             };
             match (admission, mode) {
                 (Some(admission), _) => {
@@ -285,6 +291,7 @@ impl Side {
             },
             wal: wal.clone(),
             refuse: AtomicBool::new(false),
+            signed_out: AtomicBool::new(false),
             requests: Default::default(),
         });
         let runtime = crate::store_open::StoreRuntime::open(
@@ -902,4 +909,55 @@ fn without_error_message(mut value: Value) -> Value {
     }
     normalize(&mut value);
     value
+}
+
+impl Executor {
+    fn sign_in_error(&self) -> Option<broca_protocol::ProviderError> {
+        self.signed_out.load(Ordering::SeqCst).then(|| {
+            serde_json::from_value(
+                json!({"class":"auth", "message":"Sign in again", "provider_code":"needs_reauth"}),
+            )
+            .unwrap()
+        })
+    }
+}
+
+#[tokio::test]
+async fn account_limit_wake_pauses_for_sign_in_alike() {
+    let mut histories = Vec::new();
+    for store in [false, true] {
+        let side = Side::new(store).await;
+        side.paused().await;
+        side.executor.signed_out.store(true, Ordering::SeqCst);
+        side.set_time(RESET);
+        broca_test_support::wait_until("account wake needs sign-in", || async {
+            let status = side.state("r1").await;
+            if status["reason"] == "auth_required" {
+                Ok(())
+            } else {
+                Err(format!("{status}"))
+            }
+        })
+        .await;
+        side.idle().await;
+        assert_eq!(side.executor.provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!side
+            .registry
+            .idle_holds(&side.key)
+            .contains(&"account_limit_pause"));
+        side.executor.signed_out.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            side.send("r1", broca_protocol::Delivery::Queue).await,
+            SendOutcome::Active { .. }
+        ));
+        side.calls(2).await;
+        let sent = side.executor.provider.sent.lock().unwrap().clone();
+        assert_eq!(sent[0], sent[1]);
+        side.executor.provider.release_success.notify_one();
+        side.wait_state("r1", "completed").await;
+        side.idle().await;
+        side.stop().await;
+        histories.push(side.records().await);
+    }
+    assert_eq!(histories[1], histories[0]);
 }

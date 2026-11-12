@@ -496,6 +496,7 @@ impl RunExecutor for LoopExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: media_wait,
+                pause_for_auth_at_start: None,
             };
             // The test's credential is always ready, so a sign-in pause resumes.
             match (admission, mode) {

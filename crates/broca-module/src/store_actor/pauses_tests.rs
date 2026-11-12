@@ -1,6 +1,6 @@
 //! The store actor's own tests for what has no comparison with today's actor: an interrupt that
 //! a process queued behind a paused run before it could end that run, a send arriving while
-//! sends wait in an idle session's queue, and the retry of a run nothing runs.
+//! sends wait in an idle session's queue, and the retry of a run whose executor failed.
 
 use std::sync::Arc;
 
@@ -16,20 +16,17 @@ use broca_session_store::session::Session;
 use tokio::sync::{mpsc, Notify};
 
 use super::tests::{
-    actor_with, auth_failure, bind, deployment, executor, idle, reopen, request, send_as,
-    send_with, text_step, triple, Commands, LoopExecutor, ADDR,
+    actor_with, auth_failure, bind, deployment, executor, idle, reopen, request, send_with,
+    text_step, triple, Commands, LoopExecutor, ADDR,
 };
 use super::StoreActor;
 use crate::actor::{SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode};
+use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob};
 
-/// Runs each store job through `inner`, with two cuts a test can ask for. With
-/// `refuse_resumes`, a resume is refused before it writes anything, as when the process stops
-/// before the resumed run starts. A run still going when `stop` is notified is dropped where it
-/// stands, without writing its end.
+/// Runs each store job through `inner`. Notifying `stop` drops the loop and returns an
+/// executor error without writing its end, so the actor must record the failure.
 struct Cutting {
     inner: LoopExecutor,
-    refuse_resumes: bool,
     stop: Arc<Notify>,
 }
 
@@ -56,9 +53,6 @@ impl RunExecutor for Cutting {
         job: StoreRunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> StoreRunEnd {
-        if self.refuse_resumes && job.mode == StoreRunMode::Resume {
-            return cut_off("the process stopped before the resume");
-        }
         tokio::select! {
             end = self.inner.execute_on_store(job, out) => end,
             () = self.stop.notified() => cut_off("the run's task was dropped"),
@@ -118,32 +112,32 @@ async fn run_story(session: &Session<&'static MemoryBackend>) -> Vec<String> {
 /// interrupt, as today's drain does.
 #[tokio::test]
 async fn an_interrupt_left_behind_a_paused_run_ends_it_on_the_next_open() {
-    let (commands, served, backend, parts) = actor_over(Cutting {
-        inner: executor(vec![auth_failure()], None),
-        refuse_resumes: true,
-        stop: Arc::default(),
-    })
-    .await;
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, backend) =
+        actor_with(executor(vec![auth_failure()], None), parts.clone()).await;
     let sent = send_with(&commands, "r1", request("first"), SendKey::Minted).await;
     assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
     idle(&commands).await;
-    let interrupt = send_as(
-        &commands,
-        "i1",
-        request("stop and do this"),
-        SendKey::Minted,
-        Delivery::Interrupt,
-    )
-    .await;
-    assert_eq!(
-        interrupt,
-        SendOutcome::Pending {
-            submission_id: SubmissionId("sub-i1".into()),
-        }
-    );
-    idle(&commands).await;
     drop(commands);
-    let session = served.await.unwrap();
+    let mut session = served.await.unwrap();
+    // Capture the crash after the interrupt's durable queue append, before any executor
+    // can finalize the paused run. A returned executor error is not a process crash.
+    let queued = queue::queued_send(
+        "sub-i1",
+        None,
+        &request("stop and do this"),
+        &queue::Receipt::default(),
+        queue::Queued {
+            delivery: Some(Delivery::Interrupt),
+            ..Default::default()
+        },
+        None,
+        &mut parts.clone(),
+    )
+    .unwrap();
+    Writer::append(&mut session, &[Record::QueuedSend(queued)], true)
+        .await
+        .unwrap();
     let run = session.operations.run.as_ref().unwrap();
     assert_eq!(run.paused, Some(PauseReason::AuthRequired), "still paused");
     assert_eq!(session.operations.queue.len(), 1, "the interrupt waits");
@@ -229,18 +223,16 @@ async fn a_send_behind_sends_queued_on_an_idle_session_is_queued() {
     );
 }
 
-/// A run whose task ended without writing its end stays unfinished with nothing running it. A
-/// retry of its send reads it as active from its records, as today's actor answers one, and
-/// starts nothing.
+/// An executor error after the start is admitted records a terminal instead of leaving an
+/// apparently active run that nothing serves. Retrying its send reads that recorded error.
 #[tokio::test]
-async fn a_retry_of_a_run_nothing_runs_reads_it_as_active() {
+async fn a_retry_of_a_run_whose_executor_failed_reads_its_recorded_end() {
     let stop = Arc::new(Notify::new());
     let (commands, served, _, _) = actor_over(Cutting {
         inner: executor(
             vec![text_step("a1", "hello")],
             Some(Arc::new(Notify::new())),
         ),
-        refuse_resumes: false,
         stop: Arc::clone(&stop),
     })
     .await;
@@ -252,14 +244,16 @@ async fn a_retry_of_a_run_nothing_runs_reads_it_as_active() {
     let retry = send_with(&commands, "r-k1", request("first"), key()).await;
     assert_eq!(
         retry,
-        SendOutcome::Active {
+        SendOutcome::Finished {
             run_id: RunId("r-k1".into()),
+            reason: broca_protocol::RunFinishReason::Error,
             delivered: None,
         }
     );
     drop(commands);
     let session = served.await.unwrap();
     let run = session.operations.run.as_ref().unwrap();
-    assert!(run.finished.is_none() && run.paused.is_none());
-    assert_eq!(run_story(&session).await, ["start r-k1"]);
+    assert_eq!(run.finished, Some(broca_protocol::RunFinishReason::Error));
+    assert!(run.paused.is_none());
+    assert_eq!(run_story(&session).await, ["start r-k1", "end r-k1 Error"]);
 }
