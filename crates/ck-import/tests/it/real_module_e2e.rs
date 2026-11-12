@@ -18,18 +18,37 @@ fn required() -> bool {
         || std::env::var("CI").is_ok_and(|value| value == "true")
 }
 
-/// A workspace binary from the same build as this test: the test executable lives in
-/// `<target>/<profile>/deps/`, and the workspace's binaries in `<target>/<profile>/`. Deriving it
-/// from the test's own path keeps working when `CARGO_TARGET_DIR` moves the target folder.
+/// A workspace binary from the same Cargo profile as this test, including when
+/// `CARGO_TARGET_DIR` moves the target folder or Cargo changes the test executable layout.
 fn target_bin(name: &str, env_name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(env_name) {
         return PathBuf::from(path);
     }
-    let exe = std::env::current_exe().expect("the test binary knows its own path");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("the test binary sits in <target>/<profile>/deps")
+    target_bin_from_exe(
+        name,
+        &std::env::current_exe().expect("the test binary knows its own path"),
+    )
+}
+
+fn target_bin_from_exe(name: &str, exe: &Path) -> PathBuf {
+    broca_test_support::cargo_profile_dir_of(exe)
+        .expect("the test binary is inside a Cargo profile")
         .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
+#[test]
+fn target_bin_finds_sibling_binary_in_cargo_build_layout() {
+    let profile = broca_test_support::scratch_root().join("import-target-bin/debug");
+    let exe = profile.join("build/ck-import/hash/out/test-exe");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, b"test").unwrap();
+    let sibling = profile.join(format!("ck-broca{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&sibling, b"broca").unwrap();
+
+    assert!(!profile.join("deps").exists());
+    let found = target_bin_from_exe("ck-broca", &exe);
+    assert_eq!(found, sibling);
+    assert_eq!(std::fs::read(found).unwrap(), b"broca");
 }
 
 fn subc_bin() -> PathBuf {
