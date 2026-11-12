@@ -1,5 +1,26 @@
 use super::*;
 
+/// The fork cases that route the head's account: the kit installs a routing peer on their head,
+/// so the head runs on its own vault-backed runner ([`routed_accounts::session_live`]).
+const ROUTED_CASES: [&str; 6] = [
+    "fork_answer_ask_id_replays",
+    "fork_answer_survives_restart",
+    "fork_answer_account_for_pins_head_credential",
+    "fork_answer_conversation_key_bounded",
+    "fork_answer_account_held_refusal",
+    "fork_answer_account_blocked_refusal",
+];
+
+/// Whether `session` is the head of a fork case that routes the head's account. The kit names
+/// a case's sessions after the case (`cf-<case>-<n>`).
+pub(super) fn routed_session(session: &str) -> bool {
+    ROUTED_CASES.iter().any(|case| session.contains(case))
+}
+
+/// Plan members the runner serves only for a head kept in the new storage. A head starts there
+/// when the send creating it names the head session class.
+pub(super) const NEW_STORAGE_PLAN_MEMBERS: [&str; 2] = ["fork_callers", "readers"];
+
 pub(super) type PendingAsks = HashMap<String, HashMap<(String, String), String>>;
 pub(super) type RawRequests = HashMap<String, Vec<(Option<String>, Vec<u8>)>>;
 
@@ -125,4 +146,34 @@ fn fork_raw_capture_preserves_bytes_and_distinguishes_concurrent_head() {
             (Some("issued-fork".into()), fork.to_vec())
         ]
     );
+}
+
+#[test]
+fn heads_whose_plan_needs_the_new_storage_are_created_as_heads() {
+    let subject = super::held_call_tests::subject(Arc::new(Shared::default()));
+    let first = |members: Value| {
+        subject
+            .send_fields_with_plan(
+                "cf-fork_answer_never_writes_head-55",
+                true,
+                members.as_object().unwrap(),
+            )
+            .unwrap()
+    };
+    for members in [
+        json!({"fork_callers":["aft"]}),
+        json!({"readers":[{"module":"magic-context"}]}),
+    ] {
+        assert_eq!(first(members.clone())["session_class"], "head", "{members}");
+    }
+    assert!(first(json!({})).get("session_class").is_none());
+    // A later send never names a class: the session already exists.
+    let later = subject
+        .send_fields_with_plan(
+            "cf-fork_answer_never_writes_head-55",
+            false,
+            json!({"fork_callers":["aft"]}).as_object().unwrap(),
+        )
+        .unwrap();
+    assert!(later.get("session_class").is_none());
 }

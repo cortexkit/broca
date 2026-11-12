@@ -1382,6 +1382,13 @@ async fn ck_broca_a_send_waits_for_unfinished_deletion_and_the_fresh_lineage_sur
     let mut stone = stone;
     stone.as_object_mut().unwrap().remove("completed_at_ms");
     std::fs::write(&stone_a, serde_json::to_vec(&stone).unwrap()).unwrap();
+    // A kill at that point also leaves A in the index's pending deletions: the runner lists a
+    // deletion there before it writes the incomplete tombstone and removes it only after the
+    // completed tombstone is synced. Boot finishes the deletions that list names.
+    broca_store::SqliteStore::open(state.join("run-index.db"))
+        .unwrap()
+        .retention_deletion_pending(&lineage_a, &key, true)
+        .unwrap();
     live = subject.start(&root).await.unwrap();
     let route = subject
         .session_route(&live, session, &subject.owner_stamp())
