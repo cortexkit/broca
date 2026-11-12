@@ -669,8 +669,12 @@ This is the exception to ordinary startup's nonblocking deployment-key load. The
 crash-orphan seal and usage-export backfill finish before conversion starts. An unexpected
 conversion failure blocks only its session: `session_unconverted`, `detail.class: "permanent"`,
 with the ledger's class in `detail.refusal_class`. Other sessions resume service after the live
-pass. With `archives` enabled, the background job converts archived members one at a time, then
-idle live logs oldest last-write first, with a pause between sessions. The registry
+pass. With `archives` enabled, the background job prioritizes archived members, then
+idle live logs oldest last-write first, with a pause outside each worker's session fence.
+Startup and background conversion use two workers; an offline `--convert-clone` rehearsal uses
+half the available cores (at least one, capped at eight). Sources sharing an archive container,
+backup path or session address run serially, including overlapping archive snapshots. Other
+sessions may finish out of selection order. The registry
 selects a live session only with no opening, open or closing actor and no durable active or
 paused run, queued send or held call, under the session's admission fence. Busy sessions are
 skipped and revisited on later passes, never waited on. During conversion that session's

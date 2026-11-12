@@ -394,6 +394,15 @@ async fn background_live_cancellation_and_panic_release_admission_and_lease() {
         }
         let error = task.await.unwrap_err();
         assert_eq!(error.is_panic(), panic);
+        // Blocking workers observe cancellation at their next await before dropping the fence.
+        broca_test_support::wait_until("conversion worker releases admission", || async {
+            if rig.registry.conversion_refusal(&key()).is_none() {
+                Ok(())
+            } else {
+                Err("conversion fence is still held".to_owned())
+            }
+        })
+        .await;
         assert_eq!(rig.registry.conversion_refusal(&key()), None);
         assert_eq!(std::fs::read(rig.wal()).unwrap(), before);
         let engine = super::engine(&rig, true, false);
@@ -628,6 +637,8 @@ async fn background_live_takes_oldest_last_write_first_and_stops_next_conversion
         .unwrap();
     let probe = background_probe();
     let mut engine = super::engine(&rig, true, false);
+    // Isolate candidate ordering from completion order with concurrent workers.
+    engine.set_parallelism_for_test(1);
     engine.background_fenced = Some(probe.clone());
     let engine = Arc::new(engine);
     let task = {
