@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use broca_core::compaction_v2::protocol::read::{Detail, Head, ReadRequest, Select};
-use broca_module::serve::{SessionReadRequest, SessionReadResponse};
+use broca_module::serve::{
+    ReplyTooLargeDetail, ServeError, SessionReadRequest, SessionReadResponse,
+};
 use broca_module::store_head::{HeadFacts, InputSource};
 use broca_module::store_read::todays::Todays;
 use broca_module::store_status::{todays, Reader};
@@ -208,11 +210,11 @@ pub async fn verify_with_progress(
     let lineage = verify.lineage.map(|id| id.to_string());
     let mut checks = Vec::new();
     runs(&verify, staged, &parts, &mut checks).await?;
-    reads(&verify, lineage.as_deref(), staged, &parts).await?;
+    let by_design = reads(&verify, lineage.as_deref(), staged, &parts).await?;
     checks.push(READ);
     history(verify.records, lineage.as_deref(), staged, &parts).await?;
     checks.push(HISTORY_RAW);
-    history_walks(&verify, lineage.as_deref(), staged, &parts).await?;
+    history_walks(&verify, lineage.as_deref(), staged, &parts, by_design).await?;
     checks.push(HISTORY_DISPLAY);
     entries(&verify, lineage.as_deref(), staged, &parts).await?;
     checks.push(ENTRIES);
@@ -488,13 +490,35 @@ fn page_members(page: &SessionReadResponse) -> Value {
     value
 }
 
-/// Every page of `session.read` in every mode, walked from the start as a client walks it.
+/// A reply's size as JSON, which a reply frame's size counts.
+fn json_bytes(reply: &impl Serialize) -> i128 {
+    serde_json::to_vec(reply).map_or(0, |bytes| bytes.len() as i128)
+}
+
+/// Whether the staged session's refusal of a page as too large (`store`) is today's (`today`):
+/// the same limit and the same message refused, with sizes that differ by exactly what the
+/// staged session's pages spend more on the members a move changes by design (`by_design`, from
+/// pages read before it). With no page read before it, that can't be told, and they must be
+/// equal.
+fn too_large_alike(
+    store: &ReplyTooLargeDetail,
+    today: &ReplyTooLargeDetail,
+    by_design: Option<i128>,
+) -> bool {
+    store.limit == today.limit
+        && serde_json::to_value(&store.subject).ok() == serde_json::to_value(&today.subject).ok()
+        && i128::from(store.bytes) - i128::from(today.bytes) == by_design.unwrap_or(0)
+}
+
+/// Every page of `session.read` in every mode, walked from the start as a client walks it. `Ok`
+/// carries how many more bytes the staged session's pages spend than today's on the members a
+/// move changes by design, when a page was served.
 async fn reads<B: SessionBackend>(
     verify: &Verify<'_>,
     lineage: Option<&str>,
     view: &Session<B>,
     parts: &MemoryParts,
-) -> Result<(), Mismatch> {
+) -> Result<Option<i128>, Mismatch> {
     // The new storage serves a reply cleaned of tag notation where its run cleans replies, which
     // today's storage doesn't: today's side is compared as this build exposes the same session.
     let todays =
@@ -502,6 +526,9 @@ async fn reads<B: SessionBackend>(
     let reader = broca_module::store_read::ViewReader::new(view, parts)
         .await
         .map_err(|error| mismatch(READ, format!("the stream head can't be read: {error:?}")))?;
+    // How many more bytes the staged session's pages spend than today's on the members a move
+    // changes by design (`page_members`), from the last two pages that agreed on everything else.
+    let mut by_design = None;
     for (mode, display_facts, tools, rich_ui) in READ_MODES {
         let mut from = 1;
         loop {
@@ -515,8 +542,15 @@ async fn reads<B: SessionBackend>(
             let at = format!("{mode} page from {from}");
             let (today, store) = match (today, store) {
                 (Ok(today), Ok(store)) => (today, store),
+                // A page too large to serve is refused with its size, which counts the members a
+                // move changes by design too.
+                (Err(ServeError::ReplyTooLarge(today)), Err(ServeError::ReplyTooLarge(store)))
+                    if too_large_alike(&store, &today, by_design) =>
+                {
+                    break
+                }
                 (today, store) => {
-                    return same(READ, &at, &reply(store), &reply(today));
+                    return same(READ, &at, &reply(store), &reply(today)).map(|()| by_design);
                 }
             };
             same(READ, &at, &page_members(&store), &page_members(&today))?;
@@ -538,13 +572,14 @@ async fn reads<B: SessionBackend>(
                     &serde_json::to_value(today).expect("messages serialize"),
                 )?;
             }
+            by_design = Some(json_bytes(&store) - json_bytes(&today));
             match today.next_from_ordinal {
                 Some(next) if next > from => from = next,
                 _ => break,
             }
         }
     }
-    Ok(())
+    Ok(by_design)
 }
 
 /// The raw history entries of every page `page` serves, walked from the start.
@@ -1368,6 +1403,7 @@ fn with_next_send(
         request_identity_digest,
         written_at_ms,
         session,
+        tags,
         ..
     } = &mut start
     {
@@ -1384,7 +1420,15 @@ fn with_next_send(
             "content": [{"type": "text", "text": "The next message after the move."}],
         }))
         .map_err(|error| format!("the next send's input: {error}"))?]);
+        // The copied run start's runner tags number the parts of the input it carried, not
+        // this one. Today's writer stamps an appended run start from the lineage's tag state,
+        // so do the same: a tagged lineage numbers the new input's parts on from its last
+        // number, and a lineage under the computed rules stores none.
+        *tags = None;
     }
+    let mut lineage_tags =
+        broca_core::tags::lineage_tags(records.iter().map(|frame| &frame.record));
+    broca_core::tags::stamp(&mut lineage_tags, &mut start);
     let mut extended = records.to_vec();
     for record in [
         start,
@@ -1599,12 +1643,23 @@ pub(crate) const HISTORY_WALKS: [(&str, bool); 4] = [
 
 /// Every page of one walk of `session.history` over `handler`, as `broca_module::history::read`
 /// serves them, ending at a refusal if one comes.
+#[cfg(test)]
 pub(crate) async fn history_pages(
     handler: &dyn broca_module::ServeHandler,
     session: &BindIdentity,
     form: &str,
     newest: bool,
 ) -> Vec<Value> {
+    history_walk(handler, session, form, newest).await.0
+}
+
+/// [`history_pages`], with the walk's refusal as too large to serve when it ends in one.
+async fn history_walk(
+    handler: &dyn broca_module::ServeHandler,
+    session: &BindIdentity,
+    form: &str,
+    newest: bool,
+) -> (Vec<Value>, Option<ReplyTooLargeDetail>) {
     let mut params = json!({ "form": form, "limit": PAGE });
     if !newest {
         params["from_ordinal"] = json!(1);
@@ -1615,21 +1670,29 @@ pub(crate) async fn history_pages(
         let page = match serde_json::from_value(params.clone()) {
             Ok(request) => broca_module::history::read(handler, session, &request)
                 .await
-                .map_err(|error| format!("{error:?}")),
-            Err(error) => Err(error.to_string()),
+                .map_err(|error| {
+                    let refused = format!("{error:?}");
+                    match error {
+                        broca_module::history::HistoryError::Serve(ServeError::ReplyTooLarge(
+                            detail,
+                        )) => (refused, Some(detail)),
+                        _ => (refused, None),
+                    }
+                }),
+            Err(error) => Err((error.to_string(), None)),
         };
         let page = match page {
             Ok(page) => page,
-            Err(error) => {
+            Err((error, too_large)) => {
                 pages.push(json!({ "refused": error }));
-                return pages;
+                return (pages, too_large);
             }
         };
         let next = page.get(follow).and_then(Value::as_str).map(str::to_owned);
         pages.push(page);
         match next {
             Some(cursor) => params = json!({ "form": form, "limit": PAGE, "cursor": cursor }),
-            None => return pages,
+            None => return (pages, None),
         }
     }
 }
@@ -1637,12 +1700,15 @@ pub(crate) async fn history_pages(
 /// `session.history` in both forms, every page of every walk, compared whole. Today's side is
 /// given the staged session's incarnation and the history version it serves, which each storage
 /// keeps for itself, so cursors compare as the positions they hold, and serves the replies the
-/// staged session cleans cleaned.
+/// staged session cleans cleaned. `by_design` is what the staged session's `session.read` pages
+/// spend more than today's on the members a move changes by design (see `reads`): a history page
+/// too large to serve is refused with the size of the read page it was built from.
 async fn history_walks(
     verify: &Verify<'_>,
     lineage: Option<&str>,
     view: &Session<LocalBackend>,
     parts: &MemoryParts,
+    by_design: Option<i128>,
 ) -> Result<(), Mismatch> {
     let head = view.head();
     let today = broca_module::store_read::history_sides::TodaysHistory::new(
@@ -1661,11 +1727,22 @@ async fn history_walks(
             "{form} from the {}",
             if newest { "newest" } else { "first" }
         );
+        let (mut store, store_too_large) =
+            history_walk(&staged, verify.session, form, newest).await;
+        let (mut todays, today_too_large) =
+            history_walk(&today, verify.session, form, newest).await;
+        if let (Some(store_refusal), Some(today_refusal)) = (&store_too_large, &today_too_large) {
+            if too_large_alike(store_refusal, today_refusal, by_design) {
+                // The same page refused alike: the pages before it are what's compared.
+                store.pop();
+                todays.pop();
+            }
+        }
         same(
             HISTORY_DISPLAY,
             &walk,
-            &Value::Array(history_pages(&staged, verify.session, form, newest).await),
-            &Value::Array(history_pages(&today, verify.session, form, newest).await),
+            &Value::Array(store),
+            &Value::Array(todays),
         )?;
     }
     Ok(())

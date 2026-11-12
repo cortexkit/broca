@@ -2293,3 +2293,58 @@ async fn an_imported_session_states_no_reading_until_its_own_step() {
         "{calls:?}"
     );
 }
+
+/// `run.result` of an import's seeded run. The run ends completed and places none of its own
+/// messages: imported messages belong to no run. Today's storage serves the last assistant message
+/// of the transcript the run left, so the new storage must serve it too, with the id the source
+/// gave it, and not refuse the run as one that placed nothing. An import holding no assistant
+/// message has no final message to serve, and the search for one stays inside the run's own
+/// messages.
+#[tokio::test]
+async fn an_imported_runs_result_serves_the_last_imported_reply() {
+    async fn result_of(source: &Source) -> Result<broca_wire::RunResultResponse, String> {
+        let backend: &'static MemoryBackend = Box::leak(Box::default());
+        let (commands, served) = serve(create(backend).await.unwrap());
+        imported(ask(&commands, source.import(source.params("imp-1"))).await);
+        drop(commands);
+        served.await.unwrap();
+        let session = load(backend).await.unwrap();
+        let run_id = session.operations.owner.first_start.clone().unwrap().run_id;
+        let parts = MemoryParts::default();
+        let reader = crate::store_status::Reader {
+            parts: &parts,
+            live: false,
+            settled: None,
+            session_name: "alfonso:head:a1",
+            live_step: None,
+        };
+        reader
+            .run_result(&session, &broca_protocol::RunId(run_id))
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    let result = result_of(&Source::new("final")).await.unwrap();
+    assert_eq!(result.state, "completed");
+    let message = result
+        .final_message
+        .expect("a completed run's final message");
+    assert_eq!(message.ordinal, 4);
+    assert_eq!(message.mid, "msg_a2");
+    assert_eq!(message.text, "Done.");
+
+    let prompt_only = serde_json::to_vec(&serde_json::json!({
+        "info": {"id": "ses_head"},
+        "messages": [
+            {"id": "msg_u1", "type": "user", "time": {"created": 1000}, "text": "Look."}
+        ]
+    }))
+    .unwrap();
+    let refused = result_of(&Source::of("prompt-only", prompt_only, None))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("the completed run has no assistant message"),
+        "{refused}"
+    );
+}

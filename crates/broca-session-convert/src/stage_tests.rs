@@ -63,19 +63,49 @@ fn record(value: serde_json::Value) -> WalRecord {
 /// Writes a WAL of two runs, each one model step answering in text, whose attempts recorded
 /// the digest of the request today's renderer builds for them, and reads it back.
 fn written(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>) {
+    written_with(root, false, &["Hello.", "Again."])
+}
+
+/// [`written`] with a run for each of `inputs`, or with `tagged` a WAL whose runner tags are
+/// stored on its records, as today's writer stamps them on a lineage that numbers its parts, each
+/// run's input one message of two text parts.
+fn written_with(
+    root: &Path,
+    tagged: bool,
+    inputs: &[&str],
+) -> (Vec<FramedRecord>, Option<WalLineageId>) {
     let path = root.join("session.wal");
-    let mut wal = broca_wal::FileWal::open(&path).unwrap();
+    // Stored runner tags are a WAL feature the log's floor must name before they're written.
+    let mut wal = broca_wal::FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME));
     let lineage = wal.lineage_id();
     let mut written: Vec<WalRecord> = Vec::new();
-    let mut append = |record: WalRecord, written: &mut Vec<WalRecord>| {
+    let mut tags = broca_core::tags::LineageTags::unstarted();
+    let mut append = |mut record: WalRecord, written: &mut Vec<WalRecord>| {
+        if tagged {
+            broca_core::tags::stamp(&mut tags, &mut record);
+        }
         wal.append(1, &record, true).unwrap();
         written.push(record);
     };
-    for (run, step, at, input, answer) in [
-        ("r1", 1u64, 1_000u64, "Hello.", "One."),
-        ("r2", 2, 2_000, "Again.", "Two."),
-    ] {
-        let start = run_started(run, at, input);
+    let answers = ["One.", "Two.", "Three.", "Four.", "Five.", "Six."];
+    for (index, (input, answer)) in inputs.iter().zip(answers).enumerate() {
+        let step = index as u64 + 1;
+        let at = step * 1_000;
+        let run = format!("r{step}");
+        let run = run.as_str();
+        let input = *input;
+        let mut start = run_started(run, at, input);
+        if tagged {
+            if let WalRecord::RunStarted { input: parts, .. } = &mut start {
+                *parts = std::sync::Arc::new(vec![serde_json::from_value(json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": input}, {"type": "text", "text": "More."}],
+                }))
+                .unwrap()]);
+            }
+        }
         let WalRecord::RunStarted { config, .. } = &start else {
             unreachable!()
         };
@@ -581,6 +611,47 @@ fn a_staged_session_agrees_with_its_wal_on_every_check() {
             assert_eq!(facts.marks, None);
         }
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A session holding a message too large to serve verifies. Today's storage and the new one both
+/// refuse the page that holds it, and each refusal counts the whole page's size. That size
+/// includes the members a move changes by design (the head, incarnation and history version), so
+/// the two refusals differ by exactly what the pages served before it differ by.
+#[test]
+fn a_message_too_large_to_serve_is_refused_alike() {
+    let root = scratch("too-large");
+    let large = "x".repeat(5 << 20);
+    let (records, lineage) = written_with(
+        &root,
+        false,
+        &["Hello.", "Again.", "Third.", "Fourth.", &large],
+    );
+    let staged = staged(&root, &records, lineage);
+    let verified = verified(&root, &records, lineage, &staged.converted, Mode::Move).unwrap();
+    assert!(verified.checks.contains(&"read"));
+    assert!(verified.checks.contains(&"history_display"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A session on a lineage whose runner tags are stored on its records verifies, the next send's
+/// request included. The next send repeats the session's last run start with a one-part input,
+/// numbered on from the lineage's last part as today's writer numbers an appended run start, not
+/// with the tags of the two-part input it repeats, which don't cover its parts.
+#[test]
+fn a_session_with_stored_runner_tags_verifies_its_next_send() {
+    let root = scratch("stored-tags");
+    let (records, lineage) = written_with(&root, true, &["Hello.", "Again."]);
+    assert!(
+        records.iter().any(|frame| matches!(
+            &frame.record,
+            WalRecord::RunStarted { tags: Some(tags), .. } if tags[0].parts.len() == 2
+        )),
+        "the run starts carry tags for their two parts"
+    );
+    let staged = staged(&root, &records, lineage);
+    let verified = verified(&root, &records, lineage, &staged.converted, Mode::Move).unwrap();
+    assert!(verified.checks.contains(&"next_request"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1149,6 +1220,90 @@ fn a_final_message_is_named_alike_on_a_log_with_a_compaction_plan() {
         );
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An imported session's seeded run: a run start that seeds a user prompt and an assistant reply
+/// from the source, ended completed with no step. Today's `run.result` serves the seeded reply as
+/// the run's final message; the converted session serves the same, not a refusal of a completed
+/// run that placed no message. A later run of the session answers from its own reply, as before.
+#[test]
+fn an_imported_runs_final_message_is_served_alike() {
+    use broca_module::store_status::{todays, Reader};
+    use broca_session_store::backend::MemoryBackend;
+    let mut seed = run_started("run-iid-import", 1_000, "Imported prompt.");
+    if let WalRecord::RunStarted { input, origin, .. } = &mut seed {
+        *input = std::sync::Arc::new(vec![
+            serde_json::from_value(json!({
+                "role": "user", "content": [{"type": "text", "text": "Imported prompt."}],
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "role": "assistant", "content": [{"type": "text", "text": "Imported reply."}],
+            }))
+            .unwrap(),
+        ]);
+        *origin = serde_json::from_value(
+            json!({"kind": "seeded_from", "origin_kind": "import", "source_ref": "src:1"}),
+        )
+        .unwrap();
+    }
+    let mut records = vec![
+        seed,
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_001,
+            "usage": {}, "retries_used": 0}),
+        ),
+        run_started("r2", 2_000, "Next."),
+    ];
+    records.extend(
+        [
+            json!({"type": "step_started", "step_id": 1}),
+            json!({"type": "model_step_finished", "step_id": 1,
+                "assistant_message": {"message_id": "m1",
+                    "content": [{"type": "text", "text": "Own reply."}]},
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "finish_reason": "stop", "retries_used": 0}),
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 2_003,
+                "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ]
+        .into_iter()
+        .map(record),
+    );
+    let framed = framed(records);
+    let converted = crate::convert(&framed, None).unwrap();
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    let backend = MemoryBackend::default();
+    let mut store = block_on(Session::create(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session())),
+        crate::stage::triple(&session()),
+        &deployment(),
+        false,
+    ))
+    .unwrap();
+    block_on(store.append(&converted.records, false)).unwrap();
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    let reader = Reader {
+        parts: &parts,
+        live: false,
+        settled: None,
+        session_name: "s",
+        live_step: None,
+    };
+    for (run, ordinal, text) in [
+        ("run-iid-import", 2, "Imported reply."),
+        ("r2", 4, "Own reply."),
+    ] {
+        let run = broca_protocol::RunId(run.into());
+        let today =
+            serde_json::to_value(todays::run_result(&framed, &run, "s", None).unwrap()).unwrap();
+        assert_eq!(today["final_message"]["ordinal"], json!(ordinal), "{today}");
+        assert_eq!(today["final_message"]["text"], json!(text), "{today}");
+        let served = block_on(reader.run_result(&store, &run)).unwrap();
+        assert_eq!(serde_json::to_value(served).unwrap(), today, "{}", run.0);
+    }
 }
 
 /// Compares today's and the new storage's `send.status` of a note delivered with a tool result,
