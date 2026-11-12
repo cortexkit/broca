@@ -768,6 +768,116 @@ fn capture_runner_display_sample(name: &str, frame: &subc_protocol::Frame) {
     }
 }
 
+async fn head_run_error_matches_status(storage: &str, move_to_store: bool) {
+    let mut rig = Rig::start_movable(&format!("head-run-error-{storage}")).await;
+    let _diagnostics = rig.failure_diagnostics();
+    *rig.script.media_frozen.lock().unwrap() =
+        Some(broca_provider::families::frozen_config_for_family(
+            broca_provider::spec::WireFamilyId::AnthropicMessages,
+            "fake",
+        ));
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    rig.script.push(&[Step::Text("ready")]);
+    let sent = rig
+        .send("bootstrap", "prepare a synthetic session", None)
+        .await;
+    assert_eq!(sent.header.ty, subc_protocol::FrameType::Response);
+    rig.wait_idle().await;
+    rig.wait_closed().await;
+    if move_to_store {
+        rig.bind_as(2, Some(subc_protocol::Principal::Direct)).await;
+        let moved = rig
+            .request(2, json!({"method":"session.move_to_store","params":{}}))
+            .await;
+        assert_eq!(
+            moved.header.ty,
+            subc_protocol::FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&moved.body)
+        );
+        assert_eq!(result(&moved)["moved"], true);
+    }
+
+    let cases = [
+        (
+            "billing_exhausted",
+            Some(json!({"class":"permanent", "provider_code":"billing_exhausted"})),
+        ),
+        (
+            "account_limit_exhausted",
+            Some(
+                json!({"class":"transient", "provider_code":"account_limit_exhausted",
+                "retry_after_secs":120.5, "resets_at_ms":1800000120500_u64}),
+            ),
+        ),
+        ("permanent_no_code", Some(json!({"class":"permanent"}))),
+        ("completed", None),
+    ];
+    let mut observed = Vec::new();
+    for (name, summary) in cases {
+        if let Some(summary) = &summary {
+            let mut error = summary.clone();
+            error["message"] = json!("synthetic provider refusal");
+            rig.script.normalized_steps.lock().unwrap().push_back(vec![
+                broca_protocol::NormalizedEvent::Control(broca_protocol::ProviderControl::Error {
+                    error: serde_json::from_value(error).unwrap(),
+                    retries_used: 0,
+                }),
+            ]);
+        } else {
+            rig.script.push(&[Step::Text("completed synthetic answer")]);
+        }
+        let sent = rig.send(name, "synthetic question", None).await;
+        assert_eq!(sent.header.ty, subc_protocol::FrameType::Response);
+        let run_id = result(&sent)["run_id"].clone();
+        rig.wait_idle().await;
+        rig.wait_closed().await;
+        let status = rig
+            .request(7, json!({"method":"run.status","params":{"run_id":run_id}}))
+            .await;
+        assert_eq!(status.header.ty, subc_protocol::FrameType::Response);
+        let head = rig
+            .request(7, json!({"method":"session.head","params":{}}))
+            .await;
+        assert_eq!(head.header.ty, subc_protocol::FrameType::Response);
+        capture_runner_display_sample(&format!("{storage}.{name}.json"), &head);
+        observed.push((name, summary, result(&head), result(&status)));
+    }
+    rig.finish().await;
+
+    for (name, summary, head, status) in observed {
+        let state = if summary.is_some() {
+            "error"
+        } else {
+            "completed"
+        };
+        assert_eq!(head["last_run_state"]["state"], state, "{storage}: {name}");
+        assert_eq!(status["state"], state, "{storage}: {name}");
+        if let Some(summary) = summary {
+            assert_eq!(head["last_run_error"], summary, "{storage}: {name}");
+            assert_eq!(
+                head["last_run_error"]["provider_code"],
+                status["error"]["provider_code"]
+            );
+        } else {
+            assert!(
+                head.get("last_run_error").is_none(),
+                "{storage}: {name}: {head}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_head_run_error_carries_provider_code_from_status() {
+    head_run_error_matches_status("legacy", false).await;
+}
+
+#[tokio::test]
+async fn store_head_run_error_carries_provider_code_from_status() {
+    head_run_error_matches_status("store", true).await;
+}
+
 #[tokio::test]
 async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and_digests() {
     let mut rig = Rig::start("synthetic-responses-summary").await;

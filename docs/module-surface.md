@@ -2996,10 +2996,12 @@ dispatch intent. `run.tool_calls` already preserved it. Ordinary keys and all `r
 bytes remain unchanged.
 
 An error `session.head` can carry `last_run_error: {class, retry_after_secs?,
-resets_at_ms?}`. Its values come from the same named run's terminal reconciliation
-as `run.status`, with the same caller-facing class mapping. Fractional retry delays
-are preserved; a missing delay remains absent. Paused, interrupted, successful and
-never-written sessions carry no error summary.
+resets_at_ms?, provider_code?}`. Its values come from the error `run.status` reports
+for the same named run, with the same caller-facing class mapping. Fractional retry
+delays are preserved; a missing delay remains absent. `provider_code` copies that
+run error's `provider_code` string verbatim, including `billing_exhausted` and
+`account_limit_exhausted`; an error without a code leaves the member absent.
+Paused, interrupted, successful and never-written sessions carry no error summary.
 
 Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
 `session_retention`: broca does not promise provider-chosen ride waits, marked
