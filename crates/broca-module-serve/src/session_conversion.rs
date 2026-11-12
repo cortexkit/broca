@@ -3,6 +3,7 @@
 //! session; the temporary ledger records intents before filesystem operations begin.
 
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,6 +17,7 @@ use broca_session_convert::{
 };
 use broca_session_store::keys::DeploymentKey;
 use broca_wal::{FramedRecord, StorageClass, Wal, WalLineageId, WalRecord};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
 use crate::conversion_ledger::{Ledger, Progress, Row, Source};
@@ -715,9 +717,22 @@ impl Engine {
         } else {
             None
         };
-        let result = self
-            .convert_one(&row, deployment, runtime, registry, background)
-            .await;
+        // Catch every poll, not just construction of the async future. With panic = "unwind"
+        // in dev and release, a session panic drops its fences without unwinding its worker.
+        // The panicked future is never resumed; its partial work follows the same committed
+        // ledger intents and ordinary failure path as a conversion error.
+        let result =
+            AssertUnwindSafe(self.convert_one(&row, deployment, runtime, registry, background))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    let detail = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic payload");
+                    Err(Failure::failed("panic", detail))
+                });
         match result {
             Ok(()) => Ok(()),
             Err(error) if error.class == "crash" => Err(error.message),

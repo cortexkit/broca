@@ -392,8 +392,16 @@ async fn background_live_cancellation_and_panic_release_admission_and_lease() {
         } else {
             task.abort();
         }
-        let error = task.await.unwrap_err();
-        assert_eq!(error.is_panic(), panic);
+        if panic {
+            task.await.unwrap().unwrap();
+            let ledger = crate::conversion_ledger::Ledger::open(&rig.dir).unwrap();
+            let row = ledger.rows().unwrap().pop().unwrap();
+            assert_eq!(row.outcome.as_deref(), Some("failed"));
+            assert_eq!(row.refusal.as_deref(), Some("panic"));
+            assert!(row.detail.as_deref().unwrap().contains("AcquireError"));
+        } else {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
         // Blocking workers observe cancellation at their next await before dropping the fence.
         broca_test_support::wait_until("conversion worker releases admission", || async {
             if rig.registry.conversion_refusal(&key()).is_none() {

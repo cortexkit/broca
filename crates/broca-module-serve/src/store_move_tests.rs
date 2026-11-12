@@ -1409,6 +1409,7 @@ mod cutover {
 
     mod background;
     mod concurrent;
+    mod panic_isolation;
     mod rekey;
 
     fn engine(rig: &Rig, archives: bool, live: bool) -> Engine {
