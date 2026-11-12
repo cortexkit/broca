@@ -2282,7 +2282,7 @@ mod executor {
         /// The credential needs re-auth (authoritative, before any provider call): admit the
         /// run then pause it for re-auth (carrying this error), making NO provider call. The
         /// run is resumable under the same id once the user re-auths.
-        PauseForReauth(ProviderError),
+        PauseForReauth(Box<ProviderError>),
         /// Fail admission permanently (no RunStarted, no ghost run) because retrying cannot
         /// repair the credential configuration.
         FailAdmission(String),
@@ -2298,8 +2298,9 @@ mod executor {
     pub fn vault_outcome_to_decision(result: Result<VaultToken, VaultError>) -> AuthDecision {
         match result {
             Ok(token) => AuthDecision::Proceed(AuthMode::Secret(token.token)),
-            Err(VaultError::NeedsReauth) => AuthDecision::PauseForReauth(ProviderError {
+            Err(VaultError::NeedsReauth) => AuthDecision::PauseForReauth(Box::new(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -2315,7 +2316,7 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
-            }),
+            })),
             Err(e @ VaultError::Transport(_)) => AuthDecision::FailAdmissionTransient(format!(
                 "credentials service unreachable (transient — retry): {e}"
             )),
@@ -5273,7 +5274,7 @@ mod executor {
                 // the ordinary strict drift guard because a call already used its config.
                 AuthDecision::PauseForReauth(err) => Ok(AuthResolution {
                     mode: AuthMode::None,
-                    pause: Some(err),
+                    pause: Some(*err),
                     selection,
                     method,
                     project_id,
@@ -6796,6 +6797,7 @@ mod executor {
                 mode: AuthMode::None,
                 pause: Some(ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Auth,
@@ -6931,6 +6933,7 @@ mod executor {
             // A pre-loop pause means no provider call — no report identity.
             let pause = Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -7402,6 +7405,7 @@ mod executor {
         fn err_with_status(status: Option<u16>) -> ProviderError {
             ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -7567,6 +7571,7 @@ mod executor {
         fn an_account_limit_refusal_is_never_reported_to_the_vault() {
             let exhausted = ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
@@ -8292,6 +8297,7 @@ mod executor {
             assert_eq!(
                 wire_auth_status(&ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,

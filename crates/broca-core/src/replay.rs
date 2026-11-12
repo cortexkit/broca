@@ -5653,6 +5653,7 @@ pub(crate) mod projection_boundary_tests {
                     run_id: RunId("r2".into()),
                     error: ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -5684,6 +5685,7 @@ pub(crate) mod projection_boundary_tests {
     fn reconciled_failed_retraction_carries_its_error() {
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,

@@ -501,6 +501,7 @@ mod tests {
     fn unavailable_error() -> ProviderError {
         ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
@@ -580,6 +581,7 @@ mod tests {
             for raw in [
                 ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class,
@@ -596,6 +598,7 @@ mod tests {
                 },
                 ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class,

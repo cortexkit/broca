@@ -3393,6 +3393,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             message,
             provider_code: Some("runner_error".into()),
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             status: None,

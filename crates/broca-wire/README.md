@@ -79,6 +79,13 @@ applies. It means the request shape was wrong, not that the provider is failing.
 provider's own short code, when it sent one, rides in `error.provider_subcode` (for example
 `invalid_json_schema`); it is limited to `[a-z0-9_]{1,64}` and is diagnostic only.
 
+An Anthropic HTTP 400 `invalid_request_error` whose entire message is the pinned
+modified-thinking refusal also carries `error.cause: "signed_reasoning_rejected"`. This is a
+broca-assigned routing reason under `request_invalid`, not provider-owned diagnostic text.
+The accepted whole-message pattern is documented in `docs/data-model.md`; other errors omit
+the member, so their existing bytes do not change. The `Invalid signature` form is not classified
+without a pinned production message.
+
 `run_status.request_invalid_openai.json` is RECONSTRUCTED, NOT CAPTURED: production recorded
 an HTTP 400 with `error.type` `invalid_request_error`, `error.code` `invalid_json_schema` and
 `error.param` `text.format.schema`, and the rig's `OPENAI_INVALID_SCHEMA_BODY` adds message

@@ -332,6 +332,7 @@ fn auth_error_step() -> Vec<NormalizedEvent> {
     vec![NormalizedEvent::Control(ProviderControl::Error {
         error: ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -963,6 +964,7 @@ async fn pause_for_auth_at_start_admits_then_pauses_then_continues() {
     let control = RunControl {
         pause_for_auth_at_start: Some(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -1163,6 +1165,7 @@ async fn auth_resume_with_the_same_selection_is_silent_and_keeps_one_segment() {
         RunControl {
             pause_for_auth_at_start: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -1241,6 +1244,7 @@ async fn pause_before_first_call_refreezes_project_on_auth_resume() {
     let control = RunControl {
         pause_for_auth_at_start: Some(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -1391,6 +1395,7 @@ async fn auth_resume_refreezes_use_run_clock() {
             clock: Some(clock.clone()),
             pause_for_auth_at_start: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -1768,6 +1773,7 @@ async fn null_blob_cannot_refreeze_an_at_start_auth_pause() {
     let pause = RunControl {
         pause_for_auth_at_start: Some(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,

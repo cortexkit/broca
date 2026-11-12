@@ -600,6 +600,7 @@ impl RunExecutor for WarmExecutor {
         if self.pause.lock().unwrap().contains(&job.req.run_id.0) {
             control.pause_for_auth_at_start = Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,

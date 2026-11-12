@@ -75,6 +75,7 @@ fn refusal(code: String) -> broca_protocol::ProviderError {
         message: code.clone(),
         provider_code: Some(code),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,

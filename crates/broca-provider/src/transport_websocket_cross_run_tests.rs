@@ -342,6 +342,7 @@ async fn codex_auth_required_pause_retires_healthy_socket() {
         let control = RunControl {
             pause_for_auth_at_start: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,

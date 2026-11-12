@@ -295,6 +295,7 @@ pub fn output_reservation_overflow(
 ) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::ContextOverflow,

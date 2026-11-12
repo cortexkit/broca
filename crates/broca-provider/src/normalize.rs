@@ -637,6 +637,7 @@ impl AnthropicNormalizer {
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
                     error: ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         // An unrecognised in-band code lands on Permanent, which is the less

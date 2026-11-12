@@ -308,6 +308,7 @@ fn auth_required_pause_is_resumable_not_sealed() {
         reason: PauseReason::AuthRequired,
         error: Some(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,

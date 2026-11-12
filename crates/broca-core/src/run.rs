@@ -9619,6 +9619,7 @@ fn attempt_hook_error(detail: impl std::fmt::Display) -> ProviderError {
         message: format!("provider attempt durability failed: {detail}"),
         provider_code: Some("attempt_durability_failed".into()),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,
@@ -10304,7 +10305,7 @@ async fn run_step<P: Provider>(
         // HTTP transports retry a missing final control; other providers fail safely here.
         _ => StepOutcome::Failed {
             retries_used: 0,
-            error: ProviderError { provider_details: None, provider_subcode: None,
+            error: ProviderError { provider_details: None, cause: None, provider_subcode: None,
             refusal: None,
             class: broca_protocol::ErrorClass::ProviderUnavailable,
             message: "provider stream ended without an assembled assistant message and Finished control"
@@ -13702,7 +13703,7 @@ mod tests {
 
     fn failed_step() -> Result<StepOutcome, RunFinishReason> {
         Ok(StepOutcome::Failed {
-            error: ProviderError { provider_details: None, provider_subcode: None,
+            error: ProviderError { provider_details: None, cause: None, provider_subcode: None,
             refusal: None,
             class: broca_protocol::ErrorClass::ProviderUnavailable,
             message: "provider stream ended without an assembled assistant message and Finished control".into(),
