@@ -32,6 +32,8 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 futures = { workspace = true, features = ["executor"] }
 
 [features]
+# Test-only observation of local filesystem reads; never enabled by shipping packages.
+fs-override = []
 # A synthetic session shaped like production ones (`synthetic`), for other crates' memory budget
 # tests. Enabled only as a dev-dependency feature, never in a shipped build.
 synthetic = []

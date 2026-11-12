@@ -539,7 +539,7 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
     .await
     .unwrap();
     let view = runtime.current_view(&store.key).await.unwrap().unwrap();
-    let clock = broca_session_loop::writer::Writer::operations(&**view)
+    let clock = broca_session_loop::writer::Writer::operations(&***view)
         .last_cache_send
         .clone()
         .expect("the cache is dated");

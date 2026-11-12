@@ -20,6 +20,17 @@ use crate::record::Record;
 
 use super::{Session, SessionError};
 
+/// Where a view's open log keeps its checkpoint. The checkpoint is always the log's first frame,
+/// so its length is enough to read it back. A frame is never empty, so its length is never zero,
+/// and the `Option` that holds this uses zero to mean `None` rather than taking more room.
+#[derive(Debug, Clone, Copy)]
+struct CheckpointFrame {
+    len: std::num::NonZeroU32,
+    /// The last ledger seq the checkpoint folds in: a read from a seq at or below it starts in
+    /// an older log.
+    covers_through: u64,
+}
+
 /// The open log's records a session holds in memory: every one from seq `from` on.
 ///
 /// The buffer is sized for what it keeps. A load hands it the log's records one by one, never
@@ -39,6 +50,10 @@ pub(crate) struct KeptRecords {
     /// Whether a new run start drops the records before it, as a writer's copy does to stay
     /// bounded by one run. A view keeps everything it read.
     per_run: bool,
+    /// Where a view's open log keeps its checkpoint, so the view can serve that log whole (see
+    /// [`Self::view_checkpoint_for`]) without holding the checkpoint a second time: its state is
+    /// already folded into the view.
+    checkpoint: Option<CheckpointFrame>,
 }
 
 impl KeptRecords {
@@ -51,6 +66,7 @@ impl KeptRecords {
             whole,
             latest_start: None,
             per_run: true,
+            checkpoint: None,
         }
     }
 
@@ -65,6 +81,7 @@ impl KeptRecords {
             whole: true,
             latest_start: None,
             per_run,
+            checkpoint: None,
         }
     }
 
@@ -173,6 +190,33 @@ impl KeptRecords {
     /// Every record of the open log, when they are all kept.
     pub(crate) fn whole(&self) -> Option<&[(u64, Record)]> {
         self.whole.then_some(self.records.as_slice())
+    }
+
+    /// Records where a view's open log keeps its checkpoint: in its first frame, `len` bytes
+    /// long, covering the ledger through seq `covers_through`. A writer records none: it keeps
+    /// one run's records, not the whole log.
+    pub(crate) fn view_checkpoint(&mut self, len: std::num::NonZeroU32, covers_through: u64) {
+        if !self.per_run {
+            self.checkpoint = Some(CheckpointFrame {
+                len,
+                covers_through,
+            });
+        }
+    }
+
+    /// For a view whose open log holds `seq` (its checkpoint covers less than `seq`), the length
+    /// of that log's checkpoint frame. The view kept every record of the log, so that one frame,
+    /// read back, is all a read from `seq` on still needs.
+    pub(crate) fn view_checkpoint_for(&self, seq: u64) -> Option<u32> {
+        self.checkpoint
+            .filter(|checkpoint| checkpoint.covers_through < seq)
+            .map(|checkpoint| checkpoint.len.get())
+    }
+
+    /// The kept records through seq `last`.
+    pub(crate) fn through(&self, last: u64) -> Vec<(u64, Record)> {
+        let end = self.records.partition_point(|(seq, _)| *seq <= last);
+        self.records[..end].to_vec()
     }
 
     /// The retained suffix, without cloning the rest of the run for a tail lookup.

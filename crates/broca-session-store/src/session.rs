@@ -243,13 +243,15 @@ fn fold_log(
             return Err(SessionError::Corrupt { at, durable_bound })
         }
     };
+    // The log opened, so its first frame is its checkpoint.
+    let checkpoint_len = crate::log::first_frame_len(&bytes).and_then(std::num::NonZeroU32::new);
     drop(bytes);
     if let Some(error) = failed {
         return Err(error);
     }
     // A log that opens with no batch read has no folds started yet: they start from its
     // checkpoint, decoded from what was read of it.
-    let folds = match folds {
+    let mut folds = match folds {
         Some(folds) => folds,
         None => Folds::start(
             Checkpoint::decode(&read.checkpoint).map_err(SessionError::Checkpoint)?,
@@ -257,6 +259,12 @@ fn fold_log(
             per_run,
         ),
     };
+    if let Some(len) = checkpoint_len {
+        // A view reads that frame back to serve its open log whole, rather than holding the
+        // checkpoint, whose state is already folded into the view.
+        let covers_through = folds.covers_through;
+        folds.kept.view_checkpoint(len, covers_through);
+    }
     Ok((read, folds))
 }
 
@@ -1006,6 +1014,7 @@ impl<B: SessionBackend> Session<B> {
             }
             self.window.note(seq, record);
         }
+        self.advance_send_ids(first, records);
         self.poisoned = false;
         drop(timing);
         self.observed(Appended::Records {
@@ -1057,10 +1066,45 @@ impl<B: SessionBackend> Session<B> {
 
     /// The log holding `seq`, from its start through `last` (see
     /// [`StoredRecords::from_log_holding`]), read over this session's own backend. It reads
-    /// storage, so a read from memory only refuses it.
+    /// storage, so a read from memory only refuses it. A view whose open log holds `seq` kept
+    /// every record of that log, so it reads only the log's checkpoint frame back, never the
+    /// whole log again.
     pub async fn from_log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, SessionError> {
         self.storage_read()?;
+        if let Some(len) = self.kept.view_checkpoint_for(seq) {
+            let checkpoint = self.open_checkpoint(len).await?;
+            return Ok(LogFrom {
+                checkpoint,
+                records: self.kept.through(last),
+            });
+        }
         stored::from_log_holding(&self.place(), seq, last).await
+    }
+
+    /// The open log's checkpoint, read back from the log's first frame, `len` bytes long: one
+    /// ranged read. A log's first frame never changes once written, so a frame that doesn't read
+    /// back as the checkpoint is damage.
+    async fn open_checkpoint(&self, len: u32) -> Result<Checkpoint, SessionError> {
+        let bytes = self
+            .backend
+            .read_log(&self.addr, &self.log, 0..u64::from(len))
+            .await?;
+        let key = self.key.frame_key();
+        let bind = log_bind(&self.head.session_id, &self.log);
+        match crate::frame::open(&bytes, |id| (id == key.id()).then_some(&key), &bind) {
+            Ok(crate::frame::FrameRead::Frame { header, body, .. })
+                if header.frame_index == 0 && header.stream == crate::frame::FrameStream::None =>
+            {
+                Checkpoint::decode(&body).map_err(SessionError::Checkpoint)
+            }
+            Ok(_) => Err(SessionError::Fold(
+                "the open log's first frame no longer reads back as its checkpoint".into(),
+            )),
+            Err(error) => Err(SessionError::Damaged(crate::log::LogEnd::Damaged {
+                at: 0,
+                damage: crate::log::Damage::Frame(error),
+            })),
+        }
     }
 
     /// Appends a claim-only frame, so the log's last barrier counts toward its durable bound.
