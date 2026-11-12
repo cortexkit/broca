@@ -303,6 +303,7 @@ fn assert_resume_replays_the_admitted_cache_policy(
             config,
             idle: false,
             moved: false,
+            records_account_change: false,
         }
     };
 

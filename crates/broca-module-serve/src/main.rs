@@ -2736,6 +2736,10 @@ mod executor {
         /// The run moved to another account at a quota wall: its config names the account it
         /// moved to. Only a run in the new storage moves.
         moved: bool,
+        /// The run is paused where its resume can durably record a change of account: for a
+        /// sign-in or for a restart. Its resume writes the account and the config that names it
+        /// before it calls the provider. Any other resume continues on the account it recorded.
+        records_account_change: bool,
     }
 
     fn prior_run_view_from_checkpoint(
@@ -2749,6 +2753,7 @@ mod executor {
                 config: episode.config.clone(),
                 idle: episode.disposition == broca_core::EpisodeDisposition::Finished,
                 moved: false,
+                records_account_change: false,
             })
     }
 
@@ -2964,8 +2969,18 @@ mod executor {
     /// with the run's original decision, the account at its wall, so the run keeps the account
     /// from its own record. `routing_serves_continuation` is true only when routing declares
     /// `account_continue_resume` and `account_continue`; unknown counts as false.
-    fn resume_asks_routing(moved: bool, routing_serves_continuation: bool) -> bool {
-        moved && routing_serves_continuation
+    ///
+    /// Only a resume that can record a change of account asks (`records_account_change`: a
+    /// sign-in or restart pause), since a resume that sent on another account without recording
+    /// it would bill and report the old one. A run waiting on a held tool call, a plain resume
+    /// after a crash, and a timed pause on its account's limit (which may only continue on its
+    /// own account) keep the account they recorded.
+    fn resume_asks_routing(
+        moved: bool,
+        records_account_change: bool,
+        routing_serves_continuation: bool,
+    ) -> bool {
+        moved && records_account_change && routing_serves_continuation
     }
 
     async fn store_history(
@@ -2997,6 +3012,8 @@ mod executor {
                     config: store_prior_config(run, start, parts)?,
                     idle: run.finished.is_some(),
                     moved,
+                    records_account_change:
+                        broca_session_loop::account_move::resume_can_record_account_change(run),
                 })
             }
             None => None,
@@ -3316,6 +3333,7 @@ mod executor {
                     config: config.clone(),
                     idle: false,
                     moved: true,
+                    records_account_change: false,
                 }),
                 last_config: Some(&config),
                 head_seq: 0,
@@ -4289,7 +4307,14 @@ mod executor {
             // A resumed run that moved to another account asks routing for its account again
             // only where routing answers that with the run's current account.
             let moved = !fresh_episode && prior_run.as_ref().is_some_and(|prior| prior.moved);
-            let resume_asks = resume_asks_routing(moved, job.routing_serves_continuation);
+            let records_account_change = prior_run
+                .as_ref()
+                .is_some_and(|prior| prior.records_account_change);
+            let resume_asks = resume_asks_routing(
+                moved,
+                records_account_change,
+                job.routing_serves_continuation,
+            );
             let chosen = match job.continue_offer {
                 Some(offer) => Ok(offer.clone()),
                 None => {
@@ -5041,11 +5066,10 @@ mod executor {
             // Whether a moved run's resume may ask routing for its account: only when routing
             // serves continuation (see `resume_asks_routing`). Routing's description is read only
             // for such a resume, so no other run waits on it.
-            let routing_serves_continuation = stored
-                .prior_run
-                .as_ref()
-                .is_some_and(|prior| prior.moved && !prior.idle)
-                && self.routing_serves_continuation().await;
+            let routing_serves_continuation =
+                stored.prior_run.as_ref().is_some_and(|prior| {
+                    prior.moved && prior.records_account_change && !prior.idle
+                }) && self.routing_serves_continuation().await;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
             if let Some(config) = &last_config {
                 if let Some(account) = config

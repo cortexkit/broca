@@ -295,6 +295,21 @@ pub fn moved_at_a_wall(run_id: &str, records: &[(u64, Record)]) -> bool {
     })
 }
 
+/// Whether a resume of `run` can durably record a change of account before it calls the
+/// provider: the run is paused for a sign-in or for a restart, whose resume writes the account
+/// and the config that names it together with its `Resumed` record. Every other resume (a run
+/// waiting on a held tool call, a crash's resume, a timed pause on the account's limit, which
+/// may only continue on its own account) records no such change, so it must continue on the
+/// account it recorded.
+pub fn resume_can_record_account_change(run: &broca_session_store::fold::operations::Run) -> bool {
+    matches!(
+        run.resolution(),
+        broca_session_store::fold::operations::Resolution::Paused(
+            broca_protocol::PauseReason::AuthRequired | broca_protocol::PauseReason::Restart
+        )
+    )
+}
+
 /// Stores routing's answer in `account_continue` on the error that ends a run whose account
 /// spent its usage window and which routing didn't move. A hold that names when an account
 /// should have room (`until_ms`) also tells the caller when to try again: `retry_after_secs`

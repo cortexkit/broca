@@ -1348,6 +1348,12 @@ async fn a_wall_today_answers_with_a_timed_pause_pauses_and_does_not_ask() {
     );
     assert!(ran.asked.is_empty());
     assert!(ran.auth_refreezes().is_empty());
+    // Its resume continues on its own account: the executor doesn't ask routing for another.
+    assert!(
+        !broca_session_loop::account_move::resume_can_record_account_change(
+            ran.operations.run.as_ref().unwrap()
+        )
+    );
 }
 
 /// Two walls in one step with three accounts: A, then B, then C, and the second question
@@ -1479,6 +1485,17 @@ async fn a_moved_run_resumes_on_the_account_it_moved_to() {
         log.lock().unwrap()
     );
     drop(first);
+    // What the executor reads before it admits the resume: the run moved at a wall, and its
+    // restart pause's resume can record another account if routing gives one.
+    assert!(broca_session_loop::account_move::moved_at_a_wall(
+        RUN,
+        &writer.session.open_log_records().await.unwrap()
+    ));
+    assert!(
+        broca_session_loop::account_move::resume_can_record_account_change(
+            writer.operations().run.as_ref().unwrap()
+        )
+    );
 
     // The runner starts again. The executor admits the resume from the run's recorded config,
     // which names B and B's render config (see `run_config_of_run`).
@@ -2149,6 +2166,10 @@ async fn a_resume_on_another_account_refreezes_the_persona_with_it() {
     assert_eq!(refreezes.len(), 2, "{refreezes:#?}");
     assert_eq!(refreezes[0].1, render_config("C"));
     assert_eq!(refreezes[1].1, json!("C"));
+    // A resume's refreeze is not a move at a wall: a later resume of this run keeps C.
+    assert!(!broca_session_loop::account_move::moved_at_a_wall(
+        RUN, &records
+    ));
     assert_eq!(
         refreezes[0].0 + 1,
         refreezes[1].0,
