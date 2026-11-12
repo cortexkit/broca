@@ -189,6 +189,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let now = (self.now_ms)();
         broca_session_loop::run::end_restart_resume_refused(

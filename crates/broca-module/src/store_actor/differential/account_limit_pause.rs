@@ -242,6 +242,7 @@ impl RunExecutor for Executor {
                 step_progress: control.step_progress,
                 model_call_ready: None,
                 pause_for_auth_at_start: self.sign_in_error(),
+                account_continue: None,
             };
             match (admission, mode) {
                 (Some(admission), _) => {

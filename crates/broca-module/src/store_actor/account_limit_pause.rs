@@ -208,6 +208,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             credential_id: None,
             affordable_max_tokens: None,
             provider_details: None,
+            account_continue: None,
         };
         let now = (self.now_ms)();
         broca_session_loop::run::end_run_with_error_and_interrupt_reason(

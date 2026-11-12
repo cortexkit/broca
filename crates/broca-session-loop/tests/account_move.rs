@@ -1743,8 +1743,8 @@ impl broca_core::CompactionPlane for Compactor {
         panic!("a session on the current compaction contract never calls the first protocol")
     }
 
-    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
-        Some(Vec::new())
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        broca_core::ProviderCapabilities::Declared(Vec::new())
     }
 
     async fn call_v2(

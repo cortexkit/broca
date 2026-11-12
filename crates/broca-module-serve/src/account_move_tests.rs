@@ -499,6 +499,7 @@ async fn a_moved_chatgpt_resume(
                 queued_service_tier: &mut queued_service_tier,
                 media_profile: &None,
                 clock: None,
+                new_storage: true,
                 continue_offer: None,
                 routing_serves_continuation: true,
             },
