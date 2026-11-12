@@ -153,8 +153,28 @@ impl Provider for Rendering {
 }
 
 /// The tool plane of both sides: `photo` answers with an image captured for its call through
-/// the batch's capture, as a tool module's image reaches the session; `read` answers text.
+/// the batch's capture, as a tool module's image reaches the session; `read` answers text;
+/// `wait` answers once the test releases the hold its input names (see [`ToolHold`]).
 struct PhotoPlane(StubToolPlane);
+
+/// A `wait` call the test holds, so it can take the state root while the call runs, as a crash
+/// finds it. A call names its hold by its input's `hold` member.
+#[derive(Default)]
+struct ToolHold {
+    /// How many calls reached the hold.
+    reached: std::sync::atomic::AtomicUsize,
+    /// Lets the waiting call answer.
+    released: tokio::sync::Notify,
+}
+
+/// The holds `wait` calls name, by name.
+static HOLDS: Mutex<std::collections::BTreeMap<String, Arc<ToolHold>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// A hold named `name`, which a `wait` call naming it waits on.
+fn tool_hold(name: &str) -> Arc<ToolHold> {
+    Arc::clone(HOLDS.lock().unwrap().entry(name.to_owned()).or_default())
+}
 
 impl PhotoPlane {
     fn new() -> Self {
@@ -174,6 +194,21 @@ impl ToolPlane for PhotoPlane {
     }
 
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        if call.tool_name == "wait" {
+            let name = call.input["hold"]
+                .as_str()
+                .expect("a wait call names its hold");
+            let hold = tool_hold(name);
+            hold.reached.fetch_add(1, Ordering::SeqCst);
+            hold.released.notified().await;
+            return DispatchResult::Completed(broca_protocol::ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "waited".into(),
+                },
+                is_error: false,
+            });
+        }
         if call.tool_name != "photo" {
             return self.0.dispatch(ctx, call).await;
         }
@@ -411,8 +446,13 @@ impl RunExecutor for RenderExecutor {
                 .transpose()
                 .map_err(StoreRunError::Loop)?
                 .and_then(|config| config.budget);
-            let ready = install_store(media, holds_media, !req.tools.is_empty(), budget, &provider)
-                .map_err(StoreRunError::Admission)?;
+            // A seal writes its records and calls no model, so, as the module's executor does,
+            // it installs no media renderer and waits for none of the session's media state.
+            let ready = match mode {
+                crate::executor::StoreRunMode::Seal(_) => None,
+                _ => install_store(media, holds_media, !req.tools.is_empty(), budget, &provider)
+                    .map_err(StoreRunError::Admission)?,
+            };
             let tools = PhotoPlane::new();
             let now = || 1;
             let seams = broca_session_loop::Seams {
@@ -1373,3 +1413,4 @@ async fn a_photo_between_numbered_messages_renders_alike(cipher: Cipher) {
 }
 
 mod import_media;
+mod tool_crash;
