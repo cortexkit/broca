@@ -296,8 +296,12 @@ pub struct MemoryBackend {
     fail_at: Mutex<Option<usize>>,
     /// How many objects were fetched (`get_object`), found or not. Tests only.
     object_reads: std::sync::atomic::AtomicUsize,
-    /// How many log reads (`read_log`) were served. Tests only.
+    /// How many log reads (`read_log`) were served, but for those of only a log's checkpoint
+    /// frame. Tests only.
     log_reads: std::sync::atomic::AtomicUsize,
+    /// How many log reads read only a log's checkpoint frame (see
+    /// [`crate::log::reads_checkpoint_frame_only`]). Tests only.
+    checkpoint_frame_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -356,9 +360,17 @@ impl MemoryBackend {
         self.object_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// How many log reads this backend has served so far. Tests only.
+    /// How many log reads this backend has served so far, but for those of only a log's
+    /// checkpoint frame. Tests only.
     pub fn log_reads(&self) -> usize {
         self.log_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many log reads this backend has served so far that read only a log's checkpoint
+    /// frame. Tests only.
+    pub fn checkpoint_frame_reads(&self) -> usize {
+        self.checkpoint_frame_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Every object name stored for `s`. Tests only.
@@ -454,17 +466,27 @@ impl SessionBackend for MemoryBackend {
         log: &Id128,
         range: Range<u64>,
     ) -> Result<Vec<u8>, BackendError> {
-        self.log_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sessions = self.sessions.lock().unwrap();
-        let bytes = sessions
-            .get(s)
-            .and_then(|session| session.logs.get(log))
-            .ok_or(BackendError::NoSuchLog)?;
-        bytes
-            .get(range.start as usize..range.end as usize)
-            .map(<[u8]>::to_vec)
-            .ok_or(BackendError::Corrupt("range past the log's end"))
+        let log = sessions.get(s).and_then(|session| session.logs.get(log));
+        let read = log.ok_or(BackendError::NoSuchLog).and_then(|bytes| {
+            bytes
+                .get(range.start as usize..range.end as usize)
+                .map(<[u8]>::to_vec)
+                .ok_or(BackendError::Corrupt("range past the log's end"))
+        });
+        let checkpoint_frame = match (&read, log) {
+            (Ok(read), Some(log)) => {
+                crate::log::reads_checkpoint_frame_only(range.start, read, log.len() as u64)
+            }
+            _ => false,
+        };
+        let counter = if checkpoint_frame {
+            &self.checkpoint_frame_reads
+        } else {
+            &self.log_reads
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        read
     }
 
     async fn log_end(&self, s: &SessionAddr, log: &Id128) -> Result<u64, BackendError> {
@@ -654,6 +676,13 @@ pub struct LocalBackend {
     root: PathBuf,
     fences: Mutex<HashMap<SessionAddr, Version>>,
     open_logs: Mutex<HashMap<(SessionAddr, Id128), File>>,
+    /// Counts of actual file reads, for tests: reads of a log, and reads of only a log's
+    /// checkpoint frame (see [`crate::log::reads_checkpoint_frame_only`]).
+    #[cfg(feature = "fs-override")]
+    log_reads: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    )>,
 }
 
 const VERSION_LEN: usize = 8;
@@ -676,7 +705,21 @@ impl LocalBackend {
             root: root.into(),
             fences: Mutex::new(HashMap::new()),
             open_logs: Mutex::new(HashMap::new()),
+            #[cfg(feature = "fs-override")]
+            log_reads: None,
         }
+    }
+
+    /// Count actual file reads across handles belonging to one test runtime: in `reads` the reads
+    /// of a log, in `checkpoint_frame_reads` those of only a log's checkpoint frame.
+    #[cfg(feature = "fs-override")]
+    pub fn with_log_reads_for_test(
+        mut self,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        checkpoint_frame_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.log_reads = Some((reads, checkpoint_frame_reads));
+        self
     }
 
     fn head_dir(&self, s: &SessionAddr) -> PathBuf {
@@ -1049,6 +1092,17 @@ impl SessionBackend for LocalBackend {
             let mut bytes = vec![0u8; (range.end - range.start) as usize];
             file.seek(SeekFrom::Start(range.start))?;
             file.read_exact(&mut bytes)?;
+            #[cfg(feature = "fs-override")]
+            if let Some((reads, checkpoint_frame_reads)) = &self.log_reads {
+                let log_len = file.metadata()?.len();
+                let counter =
+                    if crate::log::reads_checkpoint_frame_only(range.start, &bytes, log_len) {
+                        checkpoint_frame_reads
+                    } else {
+                        reads
+                    };
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(bytes)
         })
     }

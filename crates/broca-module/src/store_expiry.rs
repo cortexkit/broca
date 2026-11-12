@@ -26,28 +26,42 @@ impl StoreRuntime {
         run: Option<&str>,
         now_ms: u64,
     ) -> Result<Option<u64>, OpenError> {
+        self.expiry_with_view(key, run, now_ms)
+            .await
+            .map(|(deadline, _)| deadline)
+    }
+
+    /// The expiry decision and its loaded view, for the rest of a stored read to reuse.
+    pub(crate) async fn expiry_with_view(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(Option<u64>, Option<crate::store_read::StoredLocalView>), OpenError> {
         let markers = self.expiry_markers(key)?;
         if now_ms == 0 && markers.is_empty() {
-            return Ok(None);
+            return Ok((None, None));
         }
         if let Some(run) = run {
             if let Some(marker) = markers
                 .iter()
                 .find(|marker| marker.runs.iter().any(|id| id == run))
             {
-                return Ok(Some(marker.expired_at_ms));
+                return Ok((Some(marker.expired_at_ms), None));
             }
         }
         let Some(view) = self.current_view(key).await? else {
-            return Ok(run
-                .is_none()
-                .then(|| {
-                    markers
-                        .iter()
-                        .max_by_key(|m| m.seq)
-                        .map(|m| m.expired_at_ms)
-                })
-                .flatten());
+            return Ok((
+                run.is_none()
+                    .then(|| {
+                        markers
+                            .iter()
+                            .max_by_key(|m| m.seq)
+                            .map(|m| m.expired_at_ms)
+                    })
+                    .flatten(),
+                None,
+            ));
         };
         if view
             .operations
@@ -57,16 +71,19 @@ impl StoreRuntime {
             .and_then(|start| start.retention_secs)
             .is_none()
         {
-            return Ok(None);
+            return Ok((None, Some(view)));
         }
         let records = view.records_from(0).await.map_err(view_error)?;
         if run.is_some_and(|run| !records.iter().any(|(_, record)| {
             matches!(record, broca_session_store::record::Record::RunStart(start) if start.run_id == run)
         })) {
-            return Ok(None);
+            return Ok((None, Some(view)));
         }
-        Ok(crate::retention::store::store_policy(&records)
-            .and_then(|(_, _, deadline)| deadline)
-            .filter(|deadline| *deadline <= now_ms))
+        Ok((
+            crate::retention::store::store_policy(&records)
+                .and_then(|(_, _, deadline)| deadline)
+                .filter(|deadline| *deadline <= now_ms),
+            Some(view),
+        ))
     }
 }
