@@ -65,40 +65,48 @@ pub(crate) async fn build<B: SessionBackend>(
         .tools
         .iter()
         .map(|tool| {
-            Ok(PlanViewTool {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
-                provider: tool.module.clone().ok_or_else(|| {
-                    damaged(format!("the planned tool {:?} has no provider", tool.name))
-                })?,
-                tokens: broca_core::compaction_v2::tokens::tool_definition_tokens(
+            let provider = tool.module.clone().ok_or_else(|| {
+                damaged(format!("the planned tool {:?} has no provider", tool.name))
+            })?;
+            let planned = PlanViewTool::new(
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.input_schema.clone(),
+                provider,
+            );
+            Ok(
+                match broca_core::compaction_v2::tokens::tool_definition_tokens(
                     &model.model.model_id,
                     std::slice::from_ref(tool),
                     &serde_json::Value::Null,
-                )
-                .map(|tokens| PlanViewTokens {
-                    count: tokens.count,
-                    exact: false,
-                }),
-            })
+                ) {
+                    Some(tokens) => planned.with_tokens(PlanViewTokens::estimate(tokens.count)),
+                    None => planned,
+                },
+            )
         })
         .collect::<Result<_, Error>>()?;
-    let reply = PlanViewResponse {
-        generation: plan.applied_generation,
-        applied_at_ms,
-        newest_step,
-        system: PlanViewSystem {
-            text: manifest.system_text.clone(),
-            items,
-        },
-        tools,
-        pending: plan.pending.as_ref().map(|pending| PlanViewPending {
-            generation: pending.generation,
-            notes: None,
-        }),
-        as_planned: true,
+    let system = PlanViewSystem::new(manifest.system_text.clone());
+    let system = match items {
+        Some(items) => system.with_items(items),
+        None => system,
     };
+    let mut reply = PlanViewResponse::new(plan.applied_generation, system, tools);
+    if let Some(at_ms) = applied_at_ms {
+        reply = reply.with_applied_at_ms(at_ms);
+    }
+    if let Some(step) = newest_step {
+        reply = reply.with_newest_step(step);
+    }
+    // Broca never tells the model about a plan it hasn't applied yet, so a pending plan has no
+    // notes to show.
+    if let Some(pending) = &plan.pending {
+        reply = reply.with_pending(PlanViewPending::new(pending.generation));
+    }
+    // The contract's own check, so broca never serves a reply its readers refuse to decode.
+    reply
+        .check()
+        .map_err(|member| damaged(format!("the plan view's {member} is invalid")))?;
     if broca_wire::serialized_result_frame_bytes(&reply) > broca_wire::SUBC_MAX_FRAME_BYTES {
         return Err(Error::TooLarge);
     }
@@ -148,11 +156,14 @@ fn system_items(manifest: &broca_wal::PlanManifest) -> Option<Vec<PlanViewSystem
             let Some(range) = range else {
                 continue;
             };
-            items.push(PlanViewSystemItem {
-                provider: item.provider,
-                preset: item.preset,
-                start: u64::try_from(range.start).ok()?,
-                end: u64::try_from(range.end).ok()?,
+            let ranged = PlanViewSystemItem::new(
+                item.provider,
+                u64::try_from(range.start).ok()?,
+                u64::try_from(range.end).ok()?,
+            );
+            items.push(match item.preset {
+                Some(preset) => ranged.with_preset(preset),
+                None => ranged,
             });
         }
         Some(items)
@@ -272,11 +283,12 @@ async fn times<B: SessionBackend>(
             }
         }
     }
+    let step = PlanViewStep::new(attempt.sent_at_ms.expect("a dated attempt has a send time"));
     Ok((
         applied_at_ms,
-        Some(PlanViewStep {
-            at_ms: attempt.sent_at_ms.expect("a dated attempt has a send time"),
-            reply_mid,
+        Some(match reply_mid {
+            Some(mid) => step.with_reply_mid(mid),
+            None => step,
         }),
     ))
 }

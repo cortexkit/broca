@@ -114,6 +114,10 @@ pub struct LastRunState {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// While the run is paused for an account limit, the earliest time it resumes itself, in
+    /// Unix-epoch milliseconds, as its pause recorded it. Absent in every other state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_not_before_ms: Option<u64>,
 }
 
 /// `session.head`: snapshot identity is always present, even before the first log exists.
@@ -351,6 +355,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS,
         cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ,
         OP_SESSION_HEAD,
+        cortexkit_role_llm_runner::ops::SESSION_PLAN_VIEW,
         OP_RUN_RESULT,
         OP_RUN_TOOL_CALLS,
         "run.status",
@@ -407,6 +412,9 @@ pub fn broca_role_describe_with_writers(
         "fetch-plan-optional-tools/v1",
         SEND_TOOL_REPLY_BOUND_CAPABILITY,
         "session_class",
+        // Served on the new storage, where every head lives; a session still kept in today's
+        // storage refuses the read by name until it is converted.
+        cortexkit_role_llm_runner::capabilities::PLAN_VIEW,
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,
@@ -796,6 +804,7 @@ mod pinned_reply_bytes {
                     run_id: "run-1".into(),
                     state: "completed".into(),
                     reason: None,
+                    resume_not_before_ms: None,
                 }),
                 updated_at: Some(1_790_000_000_000),
                 cache: None,
@@ -830,6 +839,7 @@ mod pinned_reply_bytes {
                     run_id: "run-1".into(),
                     state: "completed".into(),
                     reason: None,
+                    resume_not_before_ms: None,
                 }),
                 updated_at: Some(1_790_000_000_000),
                 cache: None,
@@ -862,6 +872,7 @@ mod pinned_reply_bytes {
                 run_id: "run-1".into(),
                 state: "completed".into(),
                 reason: None,
+                resume_not_before_ms: None,
             }),
             updated_at: Some(1_790_000_000_000),
             cache: None,
@@ -1243,6 +1254,55 @@ mod pinned_reply_bytes {
         }
     }
 
+    /// Writes reader samples for llm-runner 0.8.42 from the real serializers, when
+    /// `BROCA_RUNNER_0842_SAMPLES` names a folder: the head of a run paused for an account limit
+    /// as served before and after the head's resume time, an idle head, and `role.describe`.
+    #[test]
+    fn runner_0842_reader_samples() {
+        let Some(dir) = std::env::var_os("BROCA_RUNNER_0842_SAMPLES") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = |state: &str, reason: Option<&str>, resume: Option<u64>| HeadResponse {
+            history_version: 1,
+            last_ordinal: Some(12),
+            first_ordinal: Some(1),
+            last_run_state: Some(LastRunState {
+                run_id: "run-1".into(),
+                state: state.into(),
+                reason: reason.map(str::to_owned),
+                resume_not_before_ms: resume,
+            }),
+            updated_at: Some(1_790_000_000_000),
+            ..Default::default()
+        };
+        let write = |name: &str, bytes: Vec<u8>| std::fs::write(dir.join(name), bytes).unwrap();
+        let paused = |resume| head("paused", Some("account_limit"), resume);
+        write(
+            "session-head-account-limit-before.json",
+            serde_json::to_vec(&paused(None)).unwrap(),
+        );
+        write(
+            "session-head-account-limit-after.json",
+            serde_json::to_vec(&paused(Some(1_790_000_600_000))).unwrap(),
+        );
+        write(
+            "session-head-completed.json",
+            serde_json::to_vec(&head("completed", None, None)).unwrap(),
+        );
+        write(
+            "role-describe-after.json",
+            serde_json::to_vec(&broca_role_describe_with_writers(
+                "0.0.0-writer-golden",
+                true,
+                true,
+                true,
+            ))
+            .unwrap(),
+        );
+    }
+
     #[test]
     fn role_describe_bytes_are_pinned() {
         assert_golden(
@@ -1294,7 +1354,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "e01f58d2596cbfb53f542735a69dcce131238175cbf030debf294892eef9b053",
+            "00b25d5bc6f0d15505d746539fd7db4113cd4ceffba4c22f94ed61be407f8a54",
         );
     }
 
@@ -1440,6 +1500,7 @@ mod pinned_reply_bytes {
                     run_id: "run-1".into(),
                     state: "completed".into(),
                     reason: None,
+                    resume_not_before_ms: None,
                 }),
                 updated_at: Some(1_790_000_000_000),
                 cache: Some(crate::HeadCacheWire {
@@ -1489,7 +1550,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "b0ad86ddab97d262a14dc6a04957079b4b94d81bf413f99a08766f3978bc8bfb";
+        "3fe10bba5cf1010e4a3ab272c42a593574246b23c9d1fbea30862e87dd6b311f";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

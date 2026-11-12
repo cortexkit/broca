@@ -4696,6 +4696,9 @@ impl ServeHandler for crate::LineageRegistry {
                                 .filter(|reason| reason.as_str() != "interrupted")
                                 .map(|reason| reason.as_str().to_owned())
                         }),
+                        // Today's storage holds no heads, only workers, so its head leaves the
+                        // optional resume time out; `run.status` serves it for every run.
+                        resume_not_before_ms: None,
                     }
                 }),
                 updated_at: Some(updated_at),

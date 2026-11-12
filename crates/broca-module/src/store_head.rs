@@ -148,6 +148,28 @@ pub struct HeadFacts {
     pub mode3: bool,
     /// When the session last changed.
     pub updated_at: Option<u64>,
+    /// The resume time the latest account-limit pause recorded. The reply shows it only while
+    /// the latest run is still paused for an account limit.
+    pub resume_not_before_ms: Option<u64>,
+}
+
+/// The resume time today's log `framed` recorded for its latest pause, when that pause was for
+/// an account limit. [`head_reply`] shows it only while the run is still paused for one, so
+/// the last pause is the one that counts.
+pub fn account_limit_resume_of(framed: &[broca_wal::FramedRecord]) -> Option<u64> {
+    framed.iter().rev().find_map(|frame| match &frame.record {
+        broca_wal::WalRecord::RunPaused {
+            reason,
+            account_limit,
+            ..
+        } => Some(
+            account_limit
+                .as_ref()
+                .filter(|_| *reason == broca_protocol::PauseReason::AccountLimit)
+                .map(|pause| pause.resume_not_before_ms),
+        ),
+        _ => None,
+    })?
 }
 
 /// The `session.head` reply `facts` give, as today's head assembles it, without what each
@@ -165,7 +187,13 @@ pub fn head_reply(facts: HeadFacts) -> broca_wire::HeadResponse {
         title,
         mode3,
         updated_at,
+        resume_not_before_ms,
     } = facts;
+    let paused_for_account = state.state == SessionReadStateKind::Paused
+        && state.reason
+            == Some(SessionReadReason::Pause(
+                broca_protocol::PauseReason::AccountLimit,
+            ));
     let service_tier = selection.as_ref().and_then(|selection| {
         selection
             .service_tier
@@ -201,6 +229,7 @@ pub fn head_reply(facts: HeadFacts) -> broca_wire::HeadResponse {
                     .filter(|reason| reason.as_str() != "interrupted")
                     .map(|reason| reason.as_str().to_owned())
             }),
+            resume_not_before_ms: resume_not_before_ms.filter(|_| paused_for_account),
         }),
         updated_at,
         title,
@@ -279,6 +308,10 @@ pub async fn build<B: SessionBackend>(
         // session that moved onto it serves as mode 3 from that run on.
         mode3: operations.on_contract(),
         updated_at: Some(updated_at),
+        resume_not_before_ms: latest
+            .and_then(|run| run.account_limit_pause.as_ref())
+            .and_then(|pause| pause.get("resume_not_before_ms"))
+            .and_then(serde_json::Value::as_u64),
     });
     let head = session.head();
     reply.history_version = crate::store_exposure::served_history_version(head.history_version);

@@ -397,6 +397,22 @@ impl Side {
         assert_eq!(state["reason"], "account_limit");
         assert_eq!(state["resume_not_before_ms"], RESET);
         self.idle().await;
+        // The head shows the same resume time while the run is paused, on the new storage,
+        // where heads live. Today's storage leaves the optional member out of its head.
+        let head = self
+            .registry
+            .head_for(&self.key, None, &broca_protocol::SendScope::default())
+            .await
+            .unwrap();
+        let last = head.last_run_state.expect("the paused run is the latest");
+        assert_eq!(last.state, "paused");
+        assert_eq!(last.reason.as_deref(), Some("account_limit"));
+        assert_eq!(
+            last.resume_not_before_ms,
+            self.store.then_some(RESET),
+            "store={}",
+            self.store
+        );
     }
     async fn calls(&self, expected: usize) {
         broca_test_support::wait_until("account provider entered", || async {

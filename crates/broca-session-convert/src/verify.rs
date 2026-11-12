@@ -950,6 +950,7 @@ async fn head<B: SessionBackend>(
             .map(str::to_owned),
         mode3,
         updated_at: Some(updated_at),
+        resume_not_before_ms: broca_module::store_head::account_limit_resume_of(records),
     });
     let built = broca_module::store_head::build(view, parts, true)
         .await

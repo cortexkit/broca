@@ -1,86 +1,23 @@
-//! The as-planned session inspection contract. Replace these local wire types with the
-//! llm-runner contract crate's types when upgrading to 0.8.40.
+//! The as-planned session inspection contract, `session.plan_view`, served with the llm-runner
+//! contract crate's own types under the names broca's handlers use.
 
-use serde::{Deserialize, Serialize};
+pub use cortexkit_role_llm_runner::plan_view::{
+    NewestStep as PlanViewStep, Pending as PlanViewPending, PlanView as PlanViewResponse,
+    PlanViewRequest as PlanViewParams, System as PlanViewSystem, SystemItem as PlanViewSystemItem,
+    Tool as PlanViewTool, ToolTokens as PlanViewTokens,
+};
 
-pub const OP_SESSION_PLAN_VIEW: &str = "session.plan_view";
-
-/// The session is selected by the bound route, just as it is for `session.read`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanViewParams {}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlanViewResponse {
-    pub generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_at_ms: Option<u64>,
-    /// The newest request with a recorded send time under this generation, not necessarily
-    /// the request in flight. A request without a stored time cannot displace a dated one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub newest_step: Option<PlanViewStep>,
-    pub system: PlanViewSystem,
-    pub tools: Vec<PlanViewTool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending: Option<PlanViewPending>,
-    pub as_planned: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanViewStep {
-    pub at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply_mid: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanViewSystem {
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<PlanViewSystemItem>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanViewSystemItem {
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
-    pub start: u64,
-    pub end: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlanViewTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<PlanViewTokens>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanViewTokens {
-    pub count: u64,
-    pub exact: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanViewPending {
-    pub generation: u64,
-    /// Exact pending-change texts received by the model; absent when it was not told.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notes: Option<Vec<String>>,
-}
+pub const OP_SESSION_PLAN_VIEW: &str = cortexkit_role_llm_runner::ops::SESSION_PLAN_VIEW;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The bytes broca served with its own local types before the contract crate had them.
+    /// The expected object is written out by hand, so a member the contract renames or a
+    /// default that starts serializing turns this red.
     #[test]
-    fn local_plan_view_serialization_matches_target_contract_shape() {
-        // The expected object follows the contract's plan-view example, with pending texts
-        // as an array. Keep it independent of local decoding so a changed member goes red.
+    fn plan_view_serializes_as_broca_served_it_before_the_contract_types() {
         let mut expected = serde_json::json!({
             "generation":3,
             "system":{"text":"é\n猫|ok", "items":[
@@ -93,75 +30,38 @@ mod tests {
             "pending":{"generation":4, "notes":["pending change"]},
             "as_planned":true
         });
-        let mut reply = PlanViewResponse {
-            generation: 3,
-            applied_at_ms: None,
-            newest_step: Some(PlanViewStep {
-                at_ms: 120,
-                reply_mid: Some("reply-1".into()),
-            }),
-            system: PlanViewSystem {
-                text: "é\n猫|ok".into(),
-                items: Some(vec![
-                    PlanViewSystemItem {
-                        provider: "first".into(),
-                        preset: Some("p".into()),
-                        start: 0u64,
-                        end: 2u64,
-                    },
-                    PlanViewSystemItem {
-                        provider: "second".into(),
-                        preset: None,
-                        start: 3u64,
-                        end: 6u64,
-                    },
-                    PlanViewSystemItem {
-                        provider: "third".into(),
-                        preset: None,
-                        start: 7u64,
-                        end: 9u64,
-                    },
-                ]),
-            },
-            tools: vec![PlanViewTool {
-                name: "tool".into(),
-                description: "description".into(),
-                input_schema: serde_json::json!({"type":"object"}),
-                provider: "tools".into(),
-                tokens: Some(PlanViewTokens {
-                    count: 4,
-                    exact: false,
-                }),
-            }],
-            pending: Some(PlanViewPending {
-                generation: 4,
-                notes: Some(vec!["pending change".into()]),
-            }),
-            as_planned: true,
-        };
+        let reply = PlanViewResponse::new(
+            3,
+            PlanViewSystem::new("é\n猫|ok").with_items(vec![
+                PlanViewSystemItem::new("first", 0, 2).with_preset("p"),
+                PlanViewSystemItem::new("second", 3, 6),
+                PlanViewSystemItem::new("third", 7, 9),
+            ]),
+            vec![PlanViewTool::new(
+                "tool",
+                "description",
+                serde_json::json!({"type":"object"}),
+                "tools",
+            )
+            .with_tokens(PlanViewTokens::estimate(4))],
+        )
+        .with_newest_step(PlanViewStep::new(120).with_reply_mid("reply-1"))
+        .with_pending(
+            PlanViewPending::new(4)
+                .with_notes(vec!["pending change".into()])
+                .unwrap(),
+        );
+        reply.check().unwrap();
         assert_eq!(serde_json::to_value(&reply).unwrap(), expected);
-        reply.applied_at_ms = Some(100);
+        let reply = reply.with_applied_at_ms(100);
         expected["applied_at_ms"] = serde_json::json!(100);
         assert_eq!(serde_json::to_value(&reply).unwrap(), expected);
     }
 
     #[test]
     fn plan_view_unknown_times_and_pending_notes_are_absent_not_null() {
-        let reply = PlanViewResponse {
-            generation: 0,
-            applied_at_ms: None,
-            newest_step: None,
-            system: PlanViewSystem {
-                text: "known text".into(),
-                items: None,
-            },
-            tools: vec![],
-            pending: Some(PlanViewPending {
-                generation: 1,
-                notes: None,
-            }),
-            as_planned: true,
-        };
+        let reply = PlanViewResponse::new(0, PlanViewSystem::new("known text"), vec![])
+            .with_pending(PlanViewPending::new(1));
         let value = serde_json::to_value(&reply).unwrap();
         assert_eq!(
             value,

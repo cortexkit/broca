@@ -51,7 +51,8 @@ const OPENAI_DECISIONS_SERVED: bool = false;
 /// there. These are every class core sends for its workers and seats: masons, one-shot calls,
 /// Athena consult seats and spec seats, besides sidekicks. A send naming no class still starts on
 /// today's storage until the cutover converts it.
-const NEW_STORAGE_SESSION_CLASSES: &[&str] = &["sidekick", "mason", "oneshot", "consult", "spec"];
+const NEW_STORAGE_SESSION_CLASSES: &[&str] =
+    &["sidekick", "mason", "oneshot", "consult", "spec", "summary"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
