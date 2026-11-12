@@ -1,5 +1,40 @@
 use super::*;
 
+/// The fork cases that route the head's account: the kit installs a routing peer on their head,
+/// so the head runs on its own vault-backed runner ([`routed_accounts::session_live`]).
+const ROUTED_CASES: [&str; 6] = [
+    "fork_answer_ask_id_replays",
+    "fork_answer_survives_restart",
+    "fork_answer_account_for_pins_head_credential",
+    "fork_answer_conversation_key_bounded",
+    "fork_answer_account_held_refusal",
+    "fork_answer_account_blocked_refusal",
+];
+
+/// Labels the kit opens fork-case heads under, besides the case names themselves.
+const FIXTURE_LABELS: [&str; 5] = [
+    "fork_answer_",
+    "fork-idle",
+    "fork-isolation",
+    "fork-callers",
+    "invalid-fork-plan",
+];
+
+/// Whether `session` is the head of one of the kit's fork cases (`cf-<label>-<n>`).
+pub(super) fn fixture_session(session: &str) -> bool {
+    FIXTURE_LABELS.iter().any(|label| session.contains(label))
+}
+
+/// Whether `session` is the head of a fork case that routes the head's account. The kit names
+/// a case's sessions after the case (`cf-<case>-<n>`).
+pub(super) fn routed_session(session: &str) -> bool {
+    ROUTED_CASES.iter().any(|case| session.contains(case))
+}
+
+/// Plan members the runner serves only for a head kept in the new storage. A head starts there
+/// when the send creating it names the head session class.
+pub(super) const NEW_STORAGE_PLAN_MEMBERS: [&str; 2] = ["fork_callers", "readers"];
+
 pub(super) type PendingAsks = HashMap<String, HashMap<(String, String), String>>;
 pub(super) type RawRequests = HashMap<String, Vec<(Option<String>, Vec<u8>)>>;
 
@@ -125,4 +160,55 @@ fn fork_raw_capture_preserves_bytes_and_distinguishes_concurrent_head() {
             (Some("issued-fork".into()), fork.to_vec())
         ]
     );
+}
+
+#[test]
+fn heads_whose_plan_needs_the_new_storage_are_created_as_heads() {
+    let subject = super::held_call_tests::subject(Arc::new(Shared::default()));
+    let first = |members: Value| {
+        subject
+            .send_fields_with_plan(
+                "cf-fork_answer_never_writes_head-55",
+                true,
+                members.as_object().unwrap(),
+            )
+            .unwrap()
+    };
+    for members in [
+        json!({"fork_callers":["aft"]}),
+        json!({"readers":[{"module":"magic-context"}]}),
+    ] {
+        assert_eq!(first(members.clone())["session_class"], "head", "{members}");
+    }
+    assert!(first(json!({})).get("session_class").is_none());
+    // A later send never names a class: the session already exists.
+    let later = subject
+        .send_fields_with_plan(
+            "cf-fork_answer_never_writes_head-55",
+            false,
+            json!({"fork_callers":["aft"]}).as_object().unwrap(),
+        )
+        .unwrap();
+    assert!(later.get("session_class").is_none());
+}
+
+#[test]
+fn every_fork_case_head_is_served_turns_in_request_order() {
+    for session in [
+        "cf-fork_answer_base_matches_digest-32",
+        "cf-fork_answer_survives_restart-83",
+        "cf-fork-idle-50",
+        "cf-fork-isolation-55",
+        "cf-fork-callers-60",
+        "cf-invalid-fork-plan-61",
+    ] {
+        assert!(fixture_session(session), "{session}");
+    }
+    for session in [
+        "cf-plan-view-3",
+        "conformance-default",
+        "cf-session-class-9",
+    ] {
+        assert!(!fixture_session(session), "{session}");
+    }
 }

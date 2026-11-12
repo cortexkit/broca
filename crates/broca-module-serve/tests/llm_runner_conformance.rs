@@ -437,7 +437,7 @@ struct Shared {
     service_tier_keys: Mutex<HashMap<String, String>>,
     service_tier_rides: Mutex<HashMap<String, Vec<Value>>>,
     service_tier_request_rides: Mutex<HashMap<String, Vec<u64>>>,
-    fixture_connection: Mutex<Option<PathBuf>>,
+    fixture_connections: FixtureConnections,
     default_text_module: Mutex<Option<String>>,
     default_text_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     default_text_seen:
@@ -506,6 +506,8 @@ struct Shared {
 /// rather than waiting for a wakeup that already happened.
 #[derive(Default)]
 struct HoldGate {
+    /// Taken by the one request a model hold applies to.
+    claimed: std::sync::atomic::AtomicBool,
     arrived: std::sync::atomic::AtomicBool,
     arrived_wake: Notify,
     released: std::sync::atomic::AtomicBool,
@@ -513,6 +515,13 @@ struct HoldGate {
 }
 
 impl HoldGate {
+    /// True for the first caller only. A model hold holds the next request of its session,
+    /// not every request made while it is held: a fork's ask runs while its head's step is
+    /// held, and must not wait behind it.
+    fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn set(flag: &std::sync::atomic::AtomicBool, wake: &Notify) {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
         wake.notify_waiters();
@@ -1001,8 +1010,17 @@ async fn serve_model_request(
         stream.write_all(response.as_bytes()).await?;
         return Ok(());
     }
-    let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
-    let stream_parts = shared.stream_holds.lock().unwrap().remove(&session);
+    let model_gate = shared
+        .model_holds
+        .lock()
+        .unwrap()
+        .get(&session)
+        .cloned()
+        .filter(|gate| gate.claim());
+    // A stream hold belongs to the request its model hold holds.
+    let stream_parts = model_gate
+        .as_ref()
+        .and_then(|_| shared.stream_holds.lock().unwrap().remove(&session));
     if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
@@ -1375,12 +1393,118 @@ impl subc_client_rs::ModuleHandler for DefaultTextProvider {
     }
 }
 
+/// The connection files of the rigs whose daemons fixtures build against (rich UI stamps,
+/// default system text), newest last. A case that starts its own daemon, as a restart case
+/// does, becomes the current one while its rig lives; when that rig drops, the daemon started
+/// before it is current again, so later cases never build against a stopped daemon.
+#[derive(Default)]
+struct FixtureConnections(Arc<Mutex<FixtureEntries>>);
+
+#[derive(Default)]
+struct FixtureEntries {
+    next: u64,
+    live: Vec<(u64, PathBuf)>,
+}
+
+impl FixtureConnections {
+    /// Makes `connection_file` current until the returned registration drops.
+    fn register(&self, connection_file: PathBuf) -> FixtureRegistration {
+        let mut entries = self.0.lock().unwrap();
+        let id = entries.next;
+        entries.next += 1;
+        entries.live.push((id, connection_file));
+        FixtureRegistration {
+            entries: Arc::clone(&self.0),
+            id,
+        }
+    }
+
+    /// The connection file of the newest rig still alive.
+    fn current(&self) -> Option<PathBuf> {
+        let entries = self.0.lock().unwrap();
+        entries.live.last().map(|(_, path)| path.clone())
+    }
+}
+
+/// A rig's place in [`FixtureConnections`]. Dropping it removes only this rig's entry, even when
+/// a restarted rig on the same root registered the same connection file after it.
+struct FixtureRegistration {
+    entries: Arc<Mutex<FixtureEntries>>,
+    id: u64,
+}
+
+impl Drop for FixtureRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.live.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+#[test]
+fn a_model_hold_holds_only_the_request_that_claims_it() {
+    let gate = HoldGate::default();
+    assert!(gate.claim(), "the next request is held");
+    assert!(!gate.claim(), "a request made while it is held passes");
+    assert!(!gate.claim());
+}
+
+#[test]
+fn a_dropped_rig_hands_fixtures_back_to_the_daemon_started_before_it() {
+    let connections = FixtureConnections::default();
+    assert_eq!(connections.current(), None);
+    let suite = connections.register(PathBuf::from("suite/runtime/subc-connection.json"));
+    let case_file = PathBuf::from("suite/restart-case/runtime/subc-connection.json");
+    // A restart case: its first rig, then the restarted rig on the same root, which publishes
+    // the same connection file before the first one is gone.
+    let first = connections.register(case_file.clone());
+    let restarted = connections.register(case_file.clone());
+    drop(first);
+    assert_eq!(connections.current(), Some(case_file));
+    drop(restarted);
+    assert_eq!(
+        connections.current(),
+        Some(PathBuf::from("suite/runtime/subc-connection.json"))
+    );
+    drop(suite);
+    assert_eq!(connections.current(), None);
+}
+
+/// Whether `session` is the head of one of the kit's plan_view cases (`cf-plan-view-<n>`).
+/// `session.plan_view` serves only heads kept in the new storage, and the case that sends
+/// without a plan must still reach its `no_plan` answer there, so these heads start in the new
+/// storage whatever their first send carries.
+fn plan_view_session(session: &str) -> bool {
+    session.starts_with("cf-plan-view-")
+}
+
+#[test]
+fn plan_view_heads_start_as_heads_with_or_without_a_plan() {
+    let subject = held_call_tests::subject(Arc::new(Shared::default()));
+    let session = "cf-plan-view-12";
+    let mut first = subject.send_fields(session, true);
+    assert_eq!(first["session_class"], "head");
+    assert!(first.get("plan").is_some_and(Value::is_object));
+    // The no_plan case removes the plan and keeps the class.
+    first.remove("plan");
+    assert_eq!(first["session_class"], "head");
+    assert!(subject
+        .send_fields(session, false)
+        .get("session_class")
+        .is_none());
+    assert!(subject
+        .send_fields("cf-session-class-9", true)
+        .get("session_class")
+        .is_none());
+}
+
 // ---- the harness ----------------------------------------------------------------------------------
 
 /// One live rig on one state root: the daemon (supervising `ck-broca` and the stand-in), the
 /// in-process tool provider, and the caller connections opened on it.
 struct Live {
-    daemon: Option<broca_test_support::RigChild>,
+    /// Behind a lock so a rig another owner still holds can be stopped ([`Live::shut_down`]).
+    daemon: Mutex<Option<broca_test_support::RigChild>>,
     connection_file: PathBuf,
     owner_nonce: PathBuf,
     state_root: PathBuf,
@@ -1390,12 +1514,20 @@ struct Live {
     bus_credentials: Option<tokio::task::JoinHandle<()>>,
     connections: tokio::sync::Mutex<HashMap<String, Arc<SubcConnection>>>,
     _routed_services: Option<routed_accounts::Services>,
+    /// This rig's place among the daemons fixtures build against, released when it drops.
+    _fixture: Option<FixtureRegistration>,
 }
 
 impl Live {
     /// Every process the daemon supervises, by pid and command name.
     fn children(&self) -> Vec<(i32, String)> {
-        let Some(pid) = self.daemon.as_ref().and_then(|child| child.id()) else {
+        let Some(pid) = self
+            .daemon
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|child| child.id())
+        else {
             return Vec::new();
         };
         let output = std::process::Command::new("pgrep")
@@ -1422,6 +1554,11 @@ impl Live {
     /// `SIGKILL` every supervised process, broca first, then the daemon, so nothing respawns
     /// broca and no module outlives its rig.
     fn kill_all(&mut self) -> bool {
+        self.kill_supervised()
+    }
+
+    /// [`Self::kill_all`] through a shared reference, for a rig another owner still holds.
+    fn kill_supervised(&self) -> bool {
         let children = self.children();
         let mut killed_broca = false;
         for (pid, _) in children
@@ -1436,7 +1573,8 @@ impl Live {
         {
             sigkill(*pid);
         }
-        if let Some(mut daemon) = self.daemon.take() {
+        let daemon = self.daemon.lock().unwrap().take();
+        if let Some(mut daemon) = daemon {
             // The daemon may already have respawned a module killed above. The tree kill stops
             // the daemon before listing and killing its remaining processes, so no module
             // outlives the rig and writes into the scratch directory while it is removed.
@@ -1444,27 +1582,20 @@ impl Live {
         }
         self.tools.abort();
         #[cfg(feature = "test-clock")]
-        if let Some(task) = self.bus_credentials.take() {
+        if let Some(task) = &self.bus_credentials {
             task.abort();
         }
         killed_broca
     }
-}
 
-/// Send `SIGKILL` to `pid` with the `kill` utility. True when it was delivered.
-fn sigkill(pid: i32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        // Dropping Live requests an orderly shutdown; kill_at remains the SIGKILL path.
+    /// Stops the rig as dropping it does: an orderly shutdown, then [`Self::kill_supervised`]
+    /// for anything left. Callable on a rig another owner still holds, such as a routed-account
+    /// runner a session route keeps alive; stopping it again does nothing.
+    fn shut_down(&self) {
         // Wait for the daemon's shutdown notification to let the coordinator record a planned
         // stop before fallback cleanup can leave the run for crash recovery.
-        if let Some(daemon) = self.daemon.as_mut() {
+        let mut daemon = self.daemon.lock().unwrap();
+        if let Some(daemon) = daemon.as_mut() {
             if let Some(pid) = daemon.id() {
                 let sent = std::process::Command::new("kill")
                     .args(["-TERM", &pid.to_string()])
@@ -1483,7 +1614,22 @@ impl Drop for Live {
                 }
             }
         }
-        self.kill_all();
+        drop(daemon);
+        self.kill_supervised();
+    }
+}
+
+/// Send `SIGKILL` to `pid` with the `kill` utility. True when it was delivered.
+fn sigkill(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 
@@ -1770,12 +1916,14 @@ impl BrocaSubject {
             Some(bus) => Some(bus.register(&connection_file).await),
             None => None,
         };
-        if !routed {
-            *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
-        }
+        let fixture = (!routed).then(|| {
+            self.shared
+                .fixture_connections
+                .register(connection_file.clone())
+        });
         publish_scope_fixtures(&scope_sync, &scope_events).await?;
         Ok(Live {
-            daemon: Some(daemon),
+            daemon: Mutex::new(Some(daemon)),
             connection_file,
             owner_nonce,
             state_root,
@@ -1785,6 +1933,7 @@ impl BrocaSubject {
             bus_credentials,
             connections: tokio::sync::Mutex::new(HashMap::new()),
             _routed_services: routed_services,
+            _fixture: fixture,
         })
     }
 
@@ -2154,6 +2303,9 @@ impl Harness for BrocaSubject {
     }
 
     async fn restart(&self, state_root: &Path) -> Result<Live, HarnessError> {
+        // The routed-account runners of this rig's sessions restart with it, so a case that
+        // restarts its rig restarts the runner serving its routed head too.
+        routed_accounts::stop_under(self, state_root).await;
         self.start(state_root).await
     }
 }
@@ -3044,6 +3196,12 @@ impl LlmRunnerSubject for BrocaSubject {
             // role.describe declares system_text_default (tool-provider 0.12), and the
             // adapter implements both of its hooks, so the kit runs those cases.
             Capability::SystemTextDefault,
+            // role.describe declares session_class. Its cases drive ordinary sends and need no
+            // subject hook.
+            Capability::SessionClass,
+            // role.describe declares plan_view. Its cases read session.plan_view through
+            // ordinary routes and need nothing more from the subject.
+            Capability::PlanView,
         ]
         .into_iter()
         .collect();
@@ -3252,7 +3410,8 @@ impl LlmRunnerSubject for BrocaSubject {
                 .send_fields_with_plan(session, first, &Map::new())
                 .unwrap();
         }
-        if session_change_kit_session(session)
+        // A plan_view case needs a plan in its params; the case that sends none removes it.
+        if (session_change_kit_session(session) || plan_view_session(session))
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
             return self
@@ -3407,6 +3566,13 @@ impl LlmRunnerSubject for BrocaSubject {
                 "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
                 "composition":composition,
             });
+            if plan_view_session(session)
+                || fork_answer::NEW_STORAGE_PLAN_MEMBERS
+                    .iter()
+                    .any(|member| members.contains_key(*member))
+            {
+                fields.insert("session_class".into(), json!("head"));
+            }
             plan.as_object_mut().unwrap().extend(members.clone());
             fields.insert("plan".into(), plan);
         }
@@ -3472,10 +3638,8 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Result<Option<Map<String, Value>>, HarnessError> {
         let connection = self
             .shared
-            .fixture_connection
-            .lock()
-            .unwrap()
-            .clone()
+            .fixture_connections
+            .current()
             .ok_or_else(|| HarnessError::new("no private daemon is running"))?;
         let mut fields = self
             .send_fields_with_plan(session, true, &Map::new())
@@ -3552,10 +3716,8 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Result<Map<String, Value>, HarnessError> {
         let connection = self
             .shared
-            .fixture_connection
-            .lock()
-            .unwrap()
-            .clone()
+            .fixture_connections
+            .current()
             .ok_or_else(|| HarnessError::new("no private daemon is running"))?;
         let module = format!(
             "conformance-default-text-{}",
@@ -3832,7 +3994,11 @@ impl LlmRunnerSubject for BrocaSubject {
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
         *self.shared.default_text_module.lock().unwrap() = None;
-        if script.turns.iter().any(|turn| turn.model_failure.is_some()) {
+        // Turns are otherwise matched by the assistant messages a request carries. A fork's
+        // asks all extend the head's last request, so they are matched by requests served.
+        if script.turns.iter().any(|turn| turn.model_failure.is_some())
+            || fork_answer::fixture_session(session)
+        {
             self.shared
                 .failure_turns
                 .lock()
@@ -4268,6 +4434,8 @@ impl LlmRunnerSubject for BrocaSubject {
             // treats `send.status` as a role op that serves no stored content, and this name
             // answers the same receipt, so it is classified the same way.
             "session.send_status" => Ok(None),
+            // A run's admission report: its storage, fetches and scope, never message content.
+            "run.admission" => Ok(None),
             _ => Err(HarnessError::new(format!(
                 "unclassified retention probe op: {method}"
             ))),
@@ -4844,13 +5012,22 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
     const CASE: &str = "read_display_facts_send_id_when_present";
     const REASON: &str = "send_ids guarantee is checked by read_display_facts_send_id";
+    // The case's unkeyed send reaches an idle session and starts its run at once, and a
+    // send that starts a run is answered with its run id, never a submission id (serve.rs
+    // answers a submission id only to a queued, `Pending`, send). The contract lets an admitted
+    // unkeyed send return none, and the kit then checks the id is absent from the read instead.
+    const SEND_ID: &str = "read_display_facts_send_id";
+    const UNKEYED: &str =
+        "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead";
     assert_eq!(
         expected_0821_cases()
             .into_iter()
-            .find(|(name, _)| *name == "read_display_facts_send_id")
+            .find(|(name, _)| *name == SEND_ID)
             .unwrap()
             .1,
-        CaseOutcome::Passed
+        CaseOutcome::PassedWithInapplicableRule {
+            reason: UNKEYED.into()
+        }
     );
     let mut cases: Vec<_> = expected_0821_cases()
         .into_iter()
@@ -4888,6 +5065,24 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
         let mut changed = cases.clone();
         changed[index].outcome = outcome;
         assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+    }
+    // The send-id case itself: any other outcome, or the same outcome for another reason,
+    // is a drift.
+    let send_id = cases.iter().position(|case| case.case == SEND_ID).unwrap();
+    for outcome in [
+        CaseOutcome::Passed,
+        CaseOutcome::PassedWithInapplicableRule {
+            reason:
+                "read_display_facts_send_id_unkeyed: runner does not admit unkeyed non-owner sends"
+                    .into(),
+        },
+        CaseOutcome::Inapplicable {
+            reason: UNKEYED.into(),
+        },
+    ] {
+        let mut changed = cases.clone();
+        changed[send_id].outcome = outcome;
+        assert!(check_0821_cases(&changed).unwrap_err().contains(SEND_ID));
     }
     cases.remove(index);
     assert_eq!(
@@ -5401,8 +5596,10 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .join(format!("broca-llm-conformance-{}", std::process::id()));
     broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
-    #[cfg_attr(not(feature = "test-clock"), allow(unused_mut))]
     let mut subject = BrocaSubject::new(&scratch).await;
+    // These daemons have no deployment-key vault, so a head the new storage creates is plain.
+    // Fork heads and plans naming readers are served only there.
+    subject.plain_session_storage = true;
     #[cfg(feature = "test-clock")]
     attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
@@ -6391,6 +6588,15 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
             }
             _ => {}
         }
+        // A kill at any of these cuts also leaves the deletion in the index's pending
+        // deletions: the runner lists it before writing the incomplete tombstone and removes it
+        // only once the completed tombstone is synced. Boot finishes the deletions listed there
+        // before serving; an unlisted tombstone is found only by the inventory repair that runs
+        // after the module registers.
+        broca_store::SqliteStore::open(state.join("run-index.db"))
+            .unwrap()
+            .retention_deletion_pending(&lineage.to_string(), &key, true)
+            .unwrap();
         cuts.push((key, live_path, deleting_path, stone_path));
     }
     let live = subject.start(&root).await.unwrap();
@@ -7138,7 +7344,8 @@ mod held_call_tests {
     }
     use std::sync::atomic::Ordering;
 
-    fn subject(shared: Arc<Shared>) -> BrocaSubject {
+    /// A subject that starts no daemon, for checks of what it builds.
+    pub(super) fn subject(shared: Arc<Shared>) -> BrocaSubject {
         BrocaSubject {
             shared,
             routed_instances: Default::default(),

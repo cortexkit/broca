@@ -6,6 +6,48 @@ const ROUTER: &str = "conformance-routing";
 const VAULT: &str = broca_module_serve::consumer_routes::CREDENTIALS_MODULE_ID;
 const MODEL: &str = "conformance-routed-account";
 
+#[test]
+fn only_routed_cases_get_a_runner_and_a_restart_stops_only_its_own() {
+    for session in [
+        "cf-routed-account-portable-oauth",
+        "cf-account_route_pinned-3",
+        "step_events_one_per_recorded_step",
+        "cf-fork_answer_ask_id_replays-46",
+        "cf-fork_answer_survives_restart-78",
+        "cf-fork_answer_account_for_pins_head_credential-70",
+        "cf-fork_answer_conversation_key_bounded-75",
+        "cf-fork_answer_account_held_refusal-71",
+        "cf-fork_answer_account_blocked_refusal-72",
+    ] {
+        assert!(needs_vault_runner(session), "{session}");
+    }
+    for session in [
+        "cf-fork_answer_base_matches_digest-32",
+        "cf-fork_answer_refuses_mismatched_base-35",
+        "cf-fork_answer_refuses_tool_call-39",
+        "cf-fork_answer_model_failure_finishes-42",
+        "cf-fork_answer_idle_expiry-50",
+        "cf-fork_answer_never_writes_head-55",
+        "cf-fork_answer_admits_only_fork_callers-60",
+        "conformance-default",
+    ] {
+        assert!(!needs_vault_runner(session), "{session}");
+    }
+    let rig = Path::new("/scratch/suite/fork_answer_survives_restart");
+    assert!(started_under(
+        &rig.join("routed-accounts/cf-fork_answer_survives_restart-78/broca-state"),
+        rig
+    ));
+    // The suite's own runners, and another case's, live elsewhere.
+    for other in [
+        "/scratch/routed-accounts/cf-routed-account-portable-oauth/broca-state",
+        "/scratch/suite/fork_answer_ask_id_replays/routed-accounts/cf-x/broca-state",
+        "/scratch/suite/fork_answer_survives_restart/broca-state",
+    ] {
+        assert!(!started_under(Path::new(other), rig), "{other}");
+    }
+}
+
 pub(super) fn runner_declaration() -> Value {
     json!({"follows_account_choice":true})
 }
@@ -47,11 +89,8 @@ pub(super) async fn session_live(
     main: &Live,
     session: &str,
 ) -> Result<Option<Arc<Live>>, HarnessError> {
-    // The kit names a case's sessions after the case. The routed-account cases' names carry
-    // `routed-account` and the account-route cases' (`account_route_*`) carry `account_route`;
-    // both route accounts through the vault, so both need this vault-backed runner.
     let step_fixture = step_events::fixture_session(session);
-    if !(session.contains("routed-account") || session.contains("account_route") || step_fixture) {
+    if !needs_vault_runner(session) {
         return Ok(None);
     }
     if !session
@@ -89,6 +128,49 @@ pub(super) async fn session_live(
     let live = Arc::new(subject.start_configured(&root, Some(session)).await?);
     instances.insert(session.into(), Arc::downgrade(&live));
     Ok(Some(live))
+}
+
+/// Whether `session` runs on its own vault-backed runner. The kit names a case's sessions after
+/// the case. The routed-account cases' names carry `routed-account` and the account-route cases'
+/// (`account_route_*`) carry `account_route`; both route accounts through the vault. The
+/// step-event fixtures use the native provider and its test vault, and the fork cases that route
+/// the head's account install a routing peer on their head.
+pub(super) fn needs_vault_runner(session: &str) -> bool {
+    session.contains("routed-account")
+        || session.contains("account_route")
+        || step_events::fixture_session(session)
+        || fork_answer::routed_session(session)
+}
+
+/// Whether a routed-account runner whose state root is `state_root` was started for a session of
+/// the rig at `rig_root` ([`session_live`] starts it under `<rig_root>/routed-accounts`).
+pub(super) fn started_under(state_root: &Path, rig_root: &Path) -> bool {
+    state_root.starts_with(rig_root.join("routed-accounts"))
+}
+
+/// Stops the routed-account runners started for sessions of the rig at `rig_root`, as restarting
+/// that rig stops its own daemon, and forgets them, so a session's next route starts its runner
+/// again on the same state root. A route that still holds a stopped runner keeps only a handle
+/// to it.
+pub(super) async fn stop_under(subject: &BrocaSubject, rig_root: &Path) {
+    let mut stopped = Vec::new();
+    subject
+        .routed_instances
+        .lock()
+        .await
+        .retain(|_, instance| match instance.upgrade() {
+            Some(live) if started_under(&live.state_root, rig_root) => {
+                stopped.push(live);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        });
+    for live in stopped {
+        live.shut_down();
+    }
+    // A model call held when its runner stopped is never answered; let its stand-in task end.
+    subject.shared.released.notify_waiters();
 }
 
 pub(super) fn seed_catalog(
@@ -526,7 +608,8 @@ pub(super) async fn serve_websocket(
         // ChatGPT step must see the request arrive and stay unanswered until it releases it.
         let gate = (!warm)
             .then(|| shared.model_holds.lock().unwrap().get(&session).cloned())
-            .flatten();
+            .flatten()
+            .filter(|gate| gate.claim());
         if let Some(gate) = gate {
             HoldGate::set(&gate.arrived, &gate.arrived_wake);
             tokio::select! {

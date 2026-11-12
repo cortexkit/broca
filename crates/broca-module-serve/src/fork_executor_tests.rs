@@ -503,3 +503,132 @@ async fn fork_model_error_keeps_reported_step_usage() {
     assert_eq!(error, "synthetic failure");
     assert_eq!(*reports.lock().unwrap(), vec![usage]);
 }
+
+fn fork_reply_message(blocks: Vec<broca_protocol::content::ContentBlock>) -> broca_protocol::content::AssistantMessage {
+    broca_protocol::content::AssistantMessage {
+        message_id: broca_protocol::MessageId("fork-reply".into()),
+        content: blocks,
+    }
+}
+
+fn fork_reply_text(text: &str) -> broca_protocol::content::ContentBlock {
+    broca_protocol::content::ContentBlock::Text { text: text.into() }
+}
+
+fn fork_reply_call() -> broca_protocol::content::ContentBlock {
+    broca_protocol::content::ContentBlock::ToolCall(broca_protocol::content::ToolCall {
+        tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+        tool_name: "forbidden".into(),
+        input: serde_json::json!({}),
+        thought_signature: None,
+    })
+}
+
+fn fork_reply_answer(outcome: ForkCallOutcome) -> (String, String) {
+    match outcome {
+        ForkCallOutcome::Answered { answer, finish, .. } => (answer, finish),
+        ForkCallOutcome::ModelFailed { .. } => (String::new(), "model_error".into()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_fork_reply_without_a_named_stop_reason_is_a_completed_answer() {
+    use broca_protocol::FinishReason;
+    let reply = fork_reply_message(vec![fork_reply_text("the answer")]);
+    let answer = |reason, raw: Option<&str>| {
+        fork_reply_answer(fork_reply(
+            &reply,
+            reason,
+            raw,
+            &StreamedText::default(),
+            Default::default(),
+        ))
+    };
+    // A chat stream that ended with a token the family doesn't name, or with none, as a head
+    // run would take it.
+    for raw in [Some("end_turn"), Some("pause_turn"), None] {
+        assert_eq!(
+            answer(FinishReason::Other, raw),
+            ("the answer".into(), "end_turn".into()),
+            "{raw:?}"
+        );
+    }
+    assert_eq!(answer(FinishReason::Stop, Some("stop")).1, "end_turn");
+    assert_eq!(answer(FinishReason::Length, Some("length")).1, "max_tokens");
+    // Failed and refused calls stay failures, named or riding on `Other`.
+    for (reason, raw) in [
+        (FinishReason::ContentFilter, Some("content_filter")),
+        (FinishReason::Error, None),
+        (FinishReason::ToolCalls, Some("MALFORMED_FUNCTION_CALL")),
+        (FinishReason::Other, Some("failed")),
+        (FinishReason::Other, Some("cancelled")),
+        (FinishReason::Other, Some("IMAGE_SAFETY")),
+        (FinishReason::Other, Some("IMAGE_PROHIBITED_CONTENT")),
+        (FinishReason::Other, Some("IMAGE_RECITATION")),
+    ] {
+        assert_eq!(
+            answer(reason, raw),
+            (String::new(), "model_error".into()),
+            "{reason:?} {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_tool_call_answers_with_the_text_streamed_before_it() {
+    use broca_protocol::display::DisplayEvent;
+    use broca_protocol::FinishReason;
+    let text = |delta: &str| DisplayEvent::TextDelta {
+        mid: None,
+        part: None,
+        message_id: broca_protocol::MessageId("fork-reply".into()),
+        tool_call_id: None,
+        delta: delta.into(),
+    };
+    let input = DisplayEvent::ToolInputDelta {
+        mid: None,
+        part: None,
+        tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+        delta: "{}".into(),
+    };
+    // OpenAI Chat assembles every text of the reply into one block ahead of its calls.
+    let chat = fork_reply_message(vec![fork_reply_text("before toolafter tool"), fork_reply_call()]);
+    let stream = |events: &[DisplayEvent]| {
+        let mut streamed = StreamedText::default();
+        for event in events {
+            streamed.observe(event);
+        }
+        streamed
+    };
+    let answer = |message, streamed: &StreamedText| {
+        fork_reply_answer(fork_reply(
+            message,
+            FinishReason::Other,
+            None,
+            streamed,
+            Default::default(),
+        ))
+    };
+    let ordered = stream(&[text("before tool"), input.clone(), text("after tool")]);
+    assert_eq!(
+        answer(&chat, &ordered),
+        ("before tool".into(), "tool_call_refused".into())
+    );
+    // Without the complete streamed order, the assembled text ahead of the first call.
+    let gapped = stream(&[
+        text("before tool"),
+        input.clone(),
+        DisplayEvent::DisplayGap { dropped: 1 },
+    ]);
+    assert_eq!(answer(&chat, &gapped).0, "before toolafter tool");
+    assert_eq!(answer(&chat, &StreamedText::default()).0, "before toolafter tool");
+    // Formats that keep block order answer the same either way.
+    let ordered_blocks = fork_reply_message(vec![
+        fork_reply_text("before tool"),
+        fork_reply_call(),
+        fork_reply_text("after tool"),
+    ]);
+    assert_eq!(answer(&ordered_blocks, &ordered).0, "before tool");
+    assert_eq!(answer(&ordered_blocks, &StreamedText::default()).0, "before tool");
+}
