@@ -295,6 +295,11 @@ pub enum ImportOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendOutcome {
+    /// A send asks the new storage for `feature`, which it doesn't serve: refused
+    /// `not_served_on_new_storage`, permanent, with nothing written.
+    NotServedOnNewStorage {
+        feature: &'static str,
+    },
     CredentialsUnavailable,
     CredentialAmbiguous {
         credential: String,

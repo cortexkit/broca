@@ -454,7 +454,7 @@ impl std::fmt::Display for OpenError {
             }
             OpenError::ModuleStopping => f.write_str("open failed: module is stopping"),
             OpenError::NotServedOnNewStorage { feature } => f.write_str(
-                &crate::store_actor::unserved_on_creation(feature),
+                &crate::store_actor::unserved_message(feature),
             ),
         }
     }

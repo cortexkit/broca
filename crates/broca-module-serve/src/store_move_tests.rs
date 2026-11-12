@@ -1409,6 +1409,7 @@ mod cutover {
 
     mod background;
     mod concurrent;
+    mod open_work;
     mod panic_isolation;
     mod rekey;
 

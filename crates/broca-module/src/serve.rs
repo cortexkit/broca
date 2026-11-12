@@ -2325,8 +2325,9 @@ pub enum ServeError {
         code: &'static str,
         message: String,
     },
-    /// A send creating a head asked for `feature`, which the new storage doesn't serve on a
-    /// creating send yet, and a head starts nowhere else. Refused
+    /// A send asked the new storage for `feature`, which it doesn't serve: a creating send's
+    /// feature, as a head starts nowhere else, or a send continuing a session compacted under
+    /// the first compaction protocol, which moved read-only. Refused
     /// [`crate::store_entries::NOT_SERVED_ON_NEW_STORAGE`], permanent, with nothing written.
     NotServedOnNewStorage {
         feature: &'static str,
@@ -2498,7 +2499,7 @@ impl std::fmt::Display for ServeError {
             } => write!(f, "submission '{submission_id}' ended {outcome}"),
             ServeError::DeliveryRefused { message, .. } => f.write_str(message),
             ServeError::NotServedOnNewStorage { feature } => {
-                f.write_str(&crate::store_actor::unserved_on_creation(feature))
+                f.write_str(&crate::store_actor::unserved_message(feature))
             }
             ServeError::TemplatePartGone { slot } => write!(
                 f,
@@ -3908,6 +3909,9 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::Open(reason, Some(class)))
             }
             SendOutcome::ModuleStopping(at) => Err(ServeError::ModuleStopping(at)),
+            SendOutcome::NotServedOnNewStorage { feature } => {
+                Err(ServeError::NotServedOnNewStorage { feature })
+            }
             SendOutcome::SessionTooLarge { max_bytes } => {
                 Err(ServeError::SessionTooLarge { max_bytes })
             }

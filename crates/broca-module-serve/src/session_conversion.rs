@@ -1041,12 +1041,10 @@ impl Engine {
                 })?;
         }
         if let Some(index) = &self.source_index {
-            if index
-                .session_runs(&session)
-                .map_err(io)?
-                .iter()
-                .any(|row| !row.state.is_terminal() || row.usage.is_none() || row.withdrawals_owed)
-            {
+            if !preconditions::run_rows_settled(
+                &index.session_runs(&session).map_err(io)?,
+                preconditions::paused_for_sign_in(&records).as_deref(),
+            ) {
                 return Err(Failure::failed(
                     if background {
                         "session_busy"
@@ -1065,16 +1063,10 @@ impl Engine {
         let prepared =
             broca_session_convert::stage::prepare(&records, lineage_text.as_deref(), media_bytes)
                 .map_err(stage_failure)?;
-        if preconditions::converted_refusal(&prepared)
-            .await
-            .map_err(io)?
-            .is_some()
-        {
-            return Err(Failure::refused(
-                preconditions::FIRST_PROTOCOL_COMPACTION,
-                "first-protocol compaction cannot be carried",
-            ));
-        }
+        // A session compacted under the first compaction protocol moves read-only: its reads
+        // move, and the new run loop refuses a new send to it (`converted_refusal` names it). The
+        // verifier rebuilds none of its
+        // requests and skips its first open, and the ledger says so.
         let todays_updated_at = broca_module::head_time::updated_at_of_wal(
             &records,
             broca_module::head_time::file_written_ms(&path),
@@ -1204,11 +1196,16 @@ impl Engine {
             if let Some(detail) = &replay_limit {
                 tracing::warn!(target: "session_conversion", source = %source.id, "{detail}");
             }
+            let read_only = verified.read_only.then_some(READ_ONLY_DETAIL);
+            let detail = match (replay_limit, read_only) {
+                (Some(limit), Some(read_only)) => Some(format!("{read_only}; {limit}")),
+                (limit, read_only) => limit.or(read_only.map(str::to_owned)),
+            };
             if let Some(runtime) = runtime {
                 crate::store_move::StoreMove::hold_parts(runtime, source_class, &staged.converted)
                     .map_err(|error| io(error.message))?;
             }
-            self.step_with_detail(source, "verified", None, None, replay_limit.as_deref())?;
+            self.step_with_detail(source, "verified", None, None, detail.as_deref())?;
             if let Some(inventory) = &self.inventory {
                 use broca_core::SessionRefIndex;
                 inventory.record_session(&address, &session).map_err(io)?;
@@ -1532,6 +1529,15 @@ fn source_wal(error: broca_wal::WalError) -> Failure {
 
 /// Use the actor's seal planner, not a conversion-specific interpretation of dispatched calls.
 /// A restart never dispatches tools: uncertain calls become outcome_unknown before Interrupted.
+#[cfg(test)]
+#[path = "session_conversion/recover_tests.rs"]
+mod recover_tests;
+
+/// The ledger detail of a session converted read-only.
+const READ_ONLY_DETAIL: &str =
+    "read_only: compacted under the first compaction protocol, so a new \
+send is refused; its first open, next request and recorded requests were not checked";
+
 fn recover_live(root: &Path, path: &Path, records: &[FramedRecord]) -> Result<(), Failure> {
     let raw = records
         .iter()
@@ -1541,8 +1547,11 @@ fn recover_live(root: &Path, path: &Path, records: &[FramedRecord]) -> Result<()
     let Some(run) = prior.run_id.as_ref() else {
         return Ok(());
     };
-    if broca_core::reconcile_run_state(&raw, &run.0).is_some_and(|state| state.state.is_terminal())
-    {
+    // Only a run a crash cut is sealed. A paused run stays paused, as today's open leaves it:
+    // its resume, cancel or interrupt is its caller's, and the new storage serves it paused.
+    if broca_core::reconcile_run_state(&raw, &run.0).is_some_and(|state| {
+        state.state.is_terminal() || state.state == broca_core::RunIndexState::Paused
+    }) {
         return Ok(());
     }
     let seal = broca_core::resume::interrupted_seal(

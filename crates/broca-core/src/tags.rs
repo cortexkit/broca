@@ -447,7 +447,7 @@ pub(crate) fn set_record_tags(record: &mut WalRecord, tags: Vec<MessageTags>) {
 /// Assign tags from `state` to a record about to be appended, in place. Returns the tags it
 /// assigned, one entry per message. A record that already holds tags keeps them, and the
 /// counter moves past them.
-pub(crate) fn stamp(state: &mut LineageTags, record: &mut WalRecord) -> Option<Vec<MessageTags>> {
+pub fn stamp(state: &mut LineageTags, record: &mut WalRecord) -> Option<Vec<MessageTags>> {
     // A run under the computed rules stores no number, and neither does any record after one.
     if starts_computed_run(record) || matches!(state, LineageTags::Computed { .. }) {
         state.fold(record);

@@ -332,6 +332,9 @@ struct Walk<'a> {
     last_reply: Option<ToolCallId>,
     /// The messages this run placed, by ordinal: each one's id.
     placed: std::collections::BTreeMap<u64, String>,
+    /// The messages placed while this run was the active one that belong to no run, by ordinal:
+    /// each one's id. An import's seeded run places its whole input this way.
+    unattributed: std::collections::BTreeMap<u64, String>,
 }
 
 impl<'a> Walk<'a> {
@@ -363,6 +366,7 @@ impl<'a> Walk<'a> {
             cleans_text: false,
             last_reply: None,
             placed: Default::default(),
+            unattributed: Default::default(),
         }
     }
 
@@ -500,6 +504,9 @@ impl<'a> Walk<'a> {
             }
             Record::EntryFacts(facts) if facts.run_id.as_deref() == Some(self.run_id) => {
                 self.placed.insert(facts.ordinal, facts.mid.clone());
+            }
+            Record::EntryFacts(facts) if facts.run_id.is_none() && ours => {
+                self.unattributed.insert(facts.ordinal, facts.mid.clone());
             }
             Record::RunEnd(end) => {
                 self.active_zero_step_seed = false;
@@ -710,6 +717,7 @@ impl<'a> Walk<'a> {
             wake_directive: self.wake_directive,
             cleans_text: self.cleans_text,
             placed: self.placed,
+            unattributed: self.unattributed,
         };
         if self.active_run.as_deref() == Some(self.run_id) && self.active_zero_step_seed {
             let mut state = fresh_state(RunIndexState::Interrupted);
@@ -739,6 +747,7 @@ struct WalkRest {
     wake_directive: bool,
     cleans_text: bool,
     placed: std::collections::BTreeMap<u64, String>,
+    unattributed: std::collections::BTreeMap<u64, String>,
 }
 
 /// A step's usage by model as the shared usage arithmetic takes it.
@@ -888,7 +897,7 @@ pub async fn run_facts<B: SessionBackend>(
         state.held_calls = held::calls(latest, &records);
     }
     let final_message = if state.state == RunIndexState::Completed {
-        Some(final_message(session, &rest.placed, rest.cleans_text).await)
+        Some(final_message(session, &rest.placed, &rest.unattributed, rest.cleans_text).await)
     } else {
         None
     };
@@ -1002,12 +1011,25 @@ fn close_open_batch<B: SessionBackend>(
 /// The final message of a completed run that placed the messages `placed` (ordinal to id): the
 /// last assistant message of the transcript as it stood when the run ended. `cleans_text` says
 /// whether the run's tag rules clean the text of the messages it wrote.
+///
+/// A run that placed no message of its own, as an import's seeded run, ended with the transcript
+/// as the run-less messages placed while it was active (`unattributed`) left it, and today's
+/// storage serves that transcript's last assistant message, which the run didn't write. Only
+/// those messages are searched: a run that placed messages of its own is answered from them
+/// alone, as before, and the search never reaches a message placed before the run started.
 async fn final_message<B: SessionBackend>(
     session: &Session<B>,
     placed: &std::collections::BTreeMap<u64, String>,
+    unattributed: &std::collections::BTreeMap<u64, String>,
     cleans_text: bool,
 ) -> Result<broca_wire::FinalMessage, FinalError> {
     let read = |error: SessionError| FinalError::Damaged(format!("{error:?}"));
+    // The lowest ordinal the search may read: the run's first run-less message when it placed
+    // none of its own, else the transcript's start.
+    let (placed, cleans_text, floor) = match unattributed.keys().next() {
+        Some(&first) if placed.is_empty() => (unattributed, false, first),
+        _ => (placed, cleans_text, 1),
+    };
     let Some((&last, _)) = placed.iter().next_back() else {
         return Err(FinalError::Damaged(
             "the completed run placed no message".into(),
@@ -1015,7 +1037,7 @@ async fn final_message<B: SessionBackend>(
     };
     let mut at = last;
     loop {
-        let from = at.saturating_sub(31).max(1);
+        let from = at.saturating_sub(31).max(floor);
         let entries = session
             .entries(from, usize::try_from(at - from + 1).unwrap_or(usize::MAX))
             .await
@@ -1052,7 +1074,7 @@ async fn final_message<B: SessionBackend>(
                 });
             }
         }
-        if from == 1 {
+        if from == floor {
             return Err(FinalError::Damaged(
                 "the completed run has no assistant message".into(),
             ));

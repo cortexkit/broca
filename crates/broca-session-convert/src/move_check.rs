@@ -24,9 +24,7 @@ use std::time::Instant;
 
 use broca_core::media_store::{MediaBytes, MediaReadError, MediaStoreClass, ReadOnlyMediaStore};
 use broca_protocol::{BindIdentity, MediaRef};
-use broca_session_convert::preconditions::{
-    unsupported_in_wal, FIRST_PROTOCOL_COMPACTION, UNSUPPORTED_FEATURE,
-};
+use broca_session_convert::preconditions::{unsupported_in_wal, UNSUPPORTED_FEATURE};
 use broca_session_convert::stage::{Stage, StageError};
 use broca_session_convert::verify::{MediaRoot, Mode, Verify};
 use broca_wal::{FramedRecord, WalRecord};
@@ -49,6 +47,9 @@ struct MoveCheckReport {
     /// Logs that start no run, so hold no session to move.
     no_run: u64,
     verified: u64,
+    /// Of those, the sessions verified read-only: compacted under the first compaction
+    /// protocol, so without their first open and next request.
+    verified_read_only: u64,
     verified_runs: u64,
     verified_messages: u64,
     /// The media objects the verified sessions were staged with.
@@ -68,8 +69,9 @@ struct MoveCheckReport {
     /// reason (`media_missing` among them), `conversion_lossy`, `stage_failed` and
     /// `verification_failed`, `identity_unresolved` and `io_failed`. With `verified`, they add up to `logs`.
     refused: BTreeMap<String, u64>,
-    /// The `unsupported_feature` refusals by the feature refused: `approval_questions`,
-    /// `input_token_budget` or `first_protocol_compaction`.
+    /// The `unsupported_feature` refusals by the feature refused: `approval_questions` or
+    /// `input_token_budget`. A session compacted under the first compaction protocol moves
+    /// read-only instead (`verified_read_only`).
     unsupported_features: BTreeMap<String, u64>,
     timing: Timing,
     /// Up to five log names for each full refusal or mismatch, without truncating its error text.
@@ -349,20 +351,12 @@ fn check(args: &Args) -> MoveCheckReport {
                 old.lineage.as_deref(),
                 media.as_ref().map(|media| &media.store as &dyn MediaBytes),
             )?;
-            match block_on(broca_session_convert::preconditions::converted_refusal(
+            // A session compacted under the first compaction protocol moves read-only, as the
+            // cutover moves it: verified without its first open and next request.
+            if let Err(error) = block_on(broca_session_convert::preconditions::converted_refusal(
                 &prepared,
             )) {
-                Ok(None) => {}
-                Ok(Some(refusal)) => {
-                    if refusal == UNSUPPORTED_FEATURE {
-                        MoveCheckReport::count(
-                            &mut report.unsupported_features,
-                            FIRST_PROTOCOL_COMPACTION,
-                        );
-                    }
-                    return Err(StageError::NotMovable(refusal));
-                }
-                Err(error) => return Err(StageError::Failed(error)),
+                return Err(StageError::Failed(error));
             }
             let _ = std::fs::remove_dir_all(&staging);
             // As a move records it: the last update today's head serves for the session.
@@ -427,6 +421,7 @@ fn check(args: &Args) -> MoveCheckReport {
         match verified {
             Ok(verified) => {
                 report.verified += 1;
+                report.verified_read_only += u64::from(verified.read_only);
                 report.verified_runs += verified.runs;
                 report.verified_messages += verified.messages;
                 report.verified_media += verified.media;
