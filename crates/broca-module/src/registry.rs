@@ -659,6 +659,10 @@ pub trait LineageOpener: Send + Sync {
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         None
     }
+    /// Where model calls are published as step events, when this opener publishes them.
+    fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
+        None
+    }
     /// The runtime when the new storage keeps the session `key`, which then has no WAL; `None`
     /// for a session on today's storage, or an opener without the new storage. A session the new
     /// storage keeps is refused `key_unavailable` while its deployment key hasn't loaded, never
@@ -2132,7 +2136,10 @@ impl LineageRegistry {
             None => broca_core::Clock::for_state_root(runtime.state_root()).unwrap_or_default(),
         };
         Ok(Arc::clone(self.inner.forks.get_or_init(|| {
-            Arc::new(crate::fork_answer::ForkManager::new(runtime, clock))
+            Arc::new(
+                crate::fork_answer::ForkManager::new(runtime, clock)
+                    .with_step_events(self.inner.opener.step_events()),
+            )
         })))
     }
 

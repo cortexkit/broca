@@ -115,6 +115,20 @@ fn usage(input: u64, cached: u64, output: u64) -> RunUsage {
     .unwrap()
 }
 
+/// The provider's account of a call that spent `usage`.
+fn spend_of(usage: &RunUsage) -> broca_module::executor::ForkStepSpend {
+    broca_module::executor::ForkStepSpend {
+        usage: Usage {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens,
+            ..Usage::default()
+        },
+        service_tier_used: None,
+        finish_reason: Some(FinishReason::Stop),
+    }
+}
+
 fn answered(text: &str) -> ForkCallOutcome {
     ForkCallOutcome::Answered {
         answer: text.into(),
@@ -307,8 +321,13 @@ impl RunExecutor for StoreLoop {
             base_digest: job.base.request_body_sha256.clone(),
         });
         let report = self.forks.report.lock().unwrap().clone();
-        if let (Some(report), Some(on_usage)) = (report, &job.on_usage) {
-            on_usage(report);
+        if let Some(report) = report {
+            if let Some(on_step) = &job.on_step {
+                on_step(spend_of(&report));
+            }
+            if let Some(on_usage) = &job.on_usage {
+                on_usage(report);
+            }
         }
         let hold = self.forks.hold.lock().await.take();
         if let Some(mut hold) = hold {
@@ -320,14 +339,24 @@ impl RunExecutor for StoreLoop {
                 std::future::pending::<()>().await;
             }
         }
-        self.forks
+        let outcome = self
+            .forks
             .outcomes
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| {
                 ForkCallOutcome::Refused(ForkCallRefusal::Unsupported("no scripted answer".into()))
-            })
+            });
+        // A call the model answered, or failed in, reports what it spent; a refusal made none.
+        if let (
+            ForkCallOutcome::Answered { usage, .. } | ForkCallOutcome::ModelFailed { usage, .. },
+            Some(on_step),
+        ) = (&outcome, &job.on_step)
+        {
+            on_step(spend_of(usage));
+        }
+        outcome
     }
 
     async fn fork_release(&self, job: ForkReleaseJob) -> Result<(), String> {
@@ -397,6 +426,7 @@ struct Rig {
     key: BindIdentity,
     forks: Arc<ForkScript>,
     compaction: Arc<CountingCompaction>,
+    export: Arc<broca_store::SqliteStore>,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
@@ -450,6 +480,8 @@ impl Rig {
             compaction: Arc::clone(&compaction),
             forks: Arc::clone(&forks),
         });
+        // Spend goes to the usage export the module's runs are billed into.
+        let export = Arc::new(broca_store::SqliteStore::open(dir.join("export.db")).unwrap());
         let runtime = broca_module::store_open::StoreRuntime::open(
             &dir,
             broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -457,7 +489,11 @@ impl Rig {
             Duration::from_millis(100),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_billing(broca_module::store_billing::StoreBilling {
+            index: Arc::clone(&export) as Arc<dyn broca_core::ExportIndex>,
+            resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 4)),
+        });
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             wal.clone(),
@@ -518,6 +554,7 @@ impl Rig {
             key,
             forks,
             compaction,
+            export,
             reader,
             writer,
             serve,
@@ -739,6 +776,21 @@ fn ask_params(fork: &str, ask_id: &str, question: &str) -> Value {
         "params": {"fork_id": fork, "ask_id": ask_id, "question": question}})
 }
 
+impl Rig {
+    /// The usage export's facts of every fork session, in the order they were written.
+    fn fork_facts(&self) -> Vec<broca_core::billing::SpendSegment> {
+        use broca_core::ExportIndex as _;
+        self.export
+            .read_page(None, 1000)
+            .unwrap()
+            .facts
+            .into_iter()
+            .filter_map(|fact| fact.segment.as_session().cloned())
+            .filter(|segment| segment.session.session.contains(":fork:"))
+            .collect()
+    }
+}
+
 fn code(error: &Value) -> &str {
     error["code"].as_str().unwrap()
 }
@@ -905,6 +957,19 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         broca_module::executor::fork_admission_id(&fork, "one", 1)
     );
     assert_eq!(call.run_id, call.admission_id);
+    // The call's spend is in the usage export: one fact, under the attempt's own run and the
+    // fork's own session, never the head's.
+    let fork_session = broca_module::fork_answer::fork_session(&rig.key, &fork);
+    let facts = rig.fork_facts();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert_eq!(
+        (facts[0].run_id.0.as_str(), &facts[0].session),
+        (call.run_id.as_str(), &fork_session)
+    );
+    assert_eq!(
+        (facts[0].usage.input_tokens, facts[0].usage.output_tokens),
+        (Some(17), Some(11))
+    );
     // The request is the head's last request with the question appended.
     let base = serde_json::to_value(&call.base.prompt).unwrap();
     let sent = serde_json::to_value(&call.request.prompt).unwrap();
@@ -939,6 +1004,15 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
     rig.forks.answer(answered("lib.rs"));
     rig.ask(1, &fork, "two", "Which file?").await.unwrap();
     let second = rig.forks.calls()[1].clone();
+    // A replay and a refused reuse spent nothing; the second call is billed under its own run.
+    let facts = rig.fork_facts();
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| fact.run_id.0.as_str())
+            .collect::<Vec<_>>(),
+        [call.run_id.as_str(), second.run_id.as_str()]
+    );
     assert_eq!(second.base_digest, call.base_digest);
     let asked = texts(&second.request);
     assert_eq!(
@@ -1127,6 +1201,15 @@ async fn refusals_before_a_model_call_store_nothing_and_each_retry_is_a_new_atte
     let admissions: std::collections::BTreeSet<_> =
         calls.iter().map(|call| call.admission_id.clone()).collect();
     assert_eq!(admissions.len(), 5, "every attempt gets its own admission");
+    // Only the attempt that reached the model spent anything: the refused ones record none.
+    let facts = rig.fork_facts();
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| fact.run_id.0.as_str())
+            .collect::<Vec<_>>(),
+        [calls[4].run_id.as_str()]
+    );
 }
 
 #[tokio::test]
@@ -1321,6 +1404,16 @@ async fn an_ask_cut_by_a_crash_is_stored_as_a_model_error_with_its_usage_and_rel
     assert!(!asked.iter().any(|text| text == "cut question"));
     assert_eq!(forks.calls()[0].attempt, 1);
     assert_eq!(forks.released.lock().unwrap().len(), 1, "released once");
+    // The cut attempt's spend reached the usage export on recovery, with the usage it had
+    // reported, once.
+    let cut = broca_module::executor::fork_admission_id(&fork, "cut", 1);
+    let facts: Vec<_> = restarted
+        .fork_facts()
+        .into_iter()
+        .filter(|fact| fact.run_id.0 == cut)
+        .collect();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert_eq!(facts[0].usage.input_tokens, Some(9));
 }
 
 /// Moves the daemon's test clock to `now_ms`, as the conformance kit's clock hook does.

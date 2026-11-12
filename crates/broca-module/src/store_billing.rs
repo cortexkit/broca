@@ -27,6 +27,25 @@ pub struct StoreBilling {
 }
 
 impl StoreBilling {
+    /// Inserts the spend facts `records` hold for `run_id`: records the caller built, for a
+    /// model call no run of a session's own records made (a fork attempt's, see
+    /// `crate::fork_spend`). Returns once the insert has committed.
+    pub async fn insert_records(
+        &self,
+        records: Vec<broca_wal::FramedRecord>,
+        run_id: &str,
+    ) -> Result<(), String> {
+        let index = Arc::clone(&self.index);
+        let resolver = Arc::clone(&self.resolver);
+        let run_id = RunId(run_id.to_owned());
+        spawn_blocking(JobKind::StoreWrite, move || {
+            index.emit_run(&records, &run_id, resolver.as_ref())
+        })
+        .await
+        .map_err(|error| format!("the usage export task failed: {error}"))?
+        .map_err(|error| format!("the usage export refused the facts: {error}"))
+    }
+
     /// Inserts the spend facts of `run_id`, read from `session`. Returns once the insert has
     /// committed; the caller then records the run billed.
     pub async fn insert<B: SessionBackend>(

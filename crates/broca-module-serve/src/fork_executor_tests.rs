@@ -115,6 +115,7 @@ fn fork_job(root: &std::path::Path, url: &str) -> ForkCallJob {
         }),
         request,
         on_usage: None,
+        on_step: None,
     }
 }
 
@@ -323,7 +324,17 @@ async fn fork_answer_fixture(
     let reports = Arc::new(Mutex::new(Vec::new()));
     let captured = reports.clone();
     job.on_usage = Some(Arc::new(move |usage| captured.lock().unwrap().push(usage)));
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let step_capture = steps.clone();
+    job.on_step = Some(Arc::new(move |step| step_capture.lock().unwrap().push(step)));
     let result = executor.fork_call(job).await;
+    // The provider's own account of the call came with every usage report, for the export.
+    let steps = steps.lock().unwrap().clone();
+    assert_eq!(steps.len(), reports.lock().unwrap().len());
+    assert_eq!(
+        steps.last().map(|step| step.usage.output_tokens),
+        Some(Some(if script.is_some() { 2 } else { 1 }))
+    );
     let ForkCallOutcome::Answered {
         answer,
         finish: actual_finish,

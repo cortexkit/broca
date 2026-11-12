@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 mod fork;
 pub use fork::{
     fork_admission_id, fork_conversation_key, ForkCallJob, ForkCallOutcome, ForkCallRefusal,
-    ForkReleaseJob,
+    ForkReleaseJob, ForkStepSpend,
 };
 
 /// Which start mode a run uses (the coordinator decides; the executor obeys).

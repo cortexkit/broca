@@ -269,7 +269,17 @@ async fn fork_step(
     let mut message = None;
     let mut usage = RunUsage::default();
     let mut step_usage = None;
-    let report_usage = |value: &broca_protocol::Usage| {
+    let mut step_tier: Option<String> = None;
+    let report_usage = |value: &broca_protocol::Usage,
+                        service_tier_used: Option<&String>,
+                        finish_reason: Option<FinishReason>| {
+        if let Some(report) = &job.on_step {
+            report(broca_module::executor::ForkStepSpend {
+                usage: *value,
+                service_tier_used: service_tier_used.cloned(),
+                finish_reason,
+            });
+        }
         let model = job
             .base
             .route
@@ -293,8 +303,14 @@ async fn fork_step(
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message: reply }) => {
                 message = Some(reply)
             }
-            NormalizedEvent::Control(ProviderControl::StepFinished { usage: value, .. }) => {
-                usage = report_usage(&value);
+            NormalizedEvent::Control(ProviderControl::StepFinished {
+                usage: value,
+                finish_reason,
+                service_tier_used,
+                ..
+            }) => {
+                usage = report_usage(&value, service_tier_used.as_ref(), Some(finish_reason));
+                step_tier = service_tier_used;
                 step_usage = Some(value);
             }
             NormalizedEvent::Control(ProviderControl::Finished {
@@ -306,7 +322,7 @@ async fn fork_step(
                     .as_ref()
                     .is_none_or(|usage| *usage == broca_protocol::Usage::default())
                 {
-                    usage = report_usage(&value);
+                    usage = report_usage(&value, step_tier.as_ref(), Some(finish_reason));
                 }
                 let Some(message) = message else {
                     break;

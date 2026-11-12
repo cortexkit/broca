@@ -17,6 +17,32 @@ use std::sync::{
 
 const QUEUE_CAPACITY: usize = 128;
 
+/// Whether a fork attempt's step event carries its `fork_id` (llm-runner `fork_answer.spend`).
+/// Off until the event's readers decode the member: without it a fork attempt's event is an
+/// ordinary step event of the fork's own session and run.
+pub const FORK_ID_EMITTED: bool = false;
+
+/// The bytes published for `event`: its JSON, with `fork_id` added as its last member when the
+/// event is a fork attempt's and `emit_fork_id` is set. Every other member keeps its bytes and
+/// order. `None` when the event doesn't encode.
+pub fn step_event_body(
+    event: &StepFinished,
+    fork_id: Option<&str>,
+    emit_fork_id: bool,
+) -> Option<Vec<u8>> {
+    let mut body = serde_json::to_vec(event).ok()?;
+    if let (Some(fork_id), true) = (fork_id, emit_fork_id) {
+        // The event is a JSON object, so its encoding ends with the object's closing brace.
+        if body.pop()? != b'}' {
+            return None;
+        }
+        body.extend_from_slice(b",\"fork_id\":");
+        body.extend_from_slice(&serde_json::to_vec(fork_id).ok()?);
+        body.push(b'}');
+    }
+    Some(body)
+}
+
 pub(crate) type WarmStops = Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>;
 
 /// A plain live publish, never a stream, durable outbox or billing acknowledgement.
@@ -33,6 +59,7 @@ pub trait StepEventPublisher: Send + Sync + 'static {
 pub struct StepEvents {
     tx: tokio::sync::mpsc::Sender<DurableAttempt>,
     store_tx: tokio::sync::mpsc::Sender<StepFinished>,
+    fork_tx: tokio::sync::mpsc::Sender<(StepFinished, String)>,
     dropped: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -69,20 +96,24 @@ impl StepEvents {
         let runner = runner.to_owned();
         let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
         let (store_tx, mut store_rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (fork_tx, mut fork_rx) =
+            tokio::sync::mpsc::channel::<(StepFinished, String)>(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let task_dropped = dropped.clone();
         let task = tokio::spawn(async move {
             let mut last_warning = None;
             loop {
-                let event = tokio::select! {
-                    Some(attempt) = rx.recv() => event(&runner, &attempt),
-                    Some(event) = store_rx.recv() => Some(event),
+                let body = tokio::select! {
+                    Some(attempt) = rx.recv() => event(&runner, &attempt)
+                        .and_then(|event| step_event_body(&event, None, false)),
+                    Some(event) = store_rx.recv() => step_event_body(&event, None, false),
+                    Some((event, fork_id)) = fork_rx.recv() => {
+                        step_event_body(&event, Some(&fork_id), FORK_ID_EMITTED)
+                    }
                     else => break,
                 };
                 let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    let body = event
-                        .and_then(|event| serde_json::to_vec(&event).ok())
-                        .ok_or("invalid step event evidence")?;
+                    let body = body.ok_or("invalid step event evidence")?;
                     let subject = match &subject {
                         Some(subject) => subject.clone(),
                         None => publisher.live_subject(&runner).await?,
@@ -106,8 +137,17 @@ impl StepEvents {
         Self {
             tx,
             store_tx,
+            fork_tx,
             dropped,
             task,
+        }
+    }
+
+    /// Publishes the step event of a fork attempt's model call, best effort as every step event
+    /// is: `fork_id` names the fork (see [`FORK_ID_EMITTED`]).
+    pub(crate) fn publish_fork(&self, event: StepFinished, fork_id: &str) {
+        if event.check().is_err() || self.fork_tx.try_send((event, fork_id.to_owned())).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -287,6 +327,69 @@ fn cache_report(
         None => None,
     };
     Some(report)
+}
+
+/// A fork attempt's model call, as its step event reports it (see [`fork_step_event`]).
+pub struct ForkStep<'a> {
+    /// The fork's own session, and its head's incarnation.
+    pub session: &'a broca_protocol::BindIdentity,
+    pub incarnation: [u8; 16],
+    /// The seq of the fork record that stored the attempt's end.
+    pub seq: u64,
+    /// The attempt's own run identity, which also names the event's attempt id.
+    pub run_id: &'a str,
+    /// The attempt's number for its ask, counted from 1.
+    pub attempt: u64,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub usage: broca_protocol::Usage,
+    pub finish_reason: Option<broca_protocol::content::FinishReason>,
+    pub failed: bool,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+}
+
+/// The step event of a fork attempt's model call: one step of the attempt's own run, in the
+/// fork's own session, with the usage the provider reported.
+pub fn fork_step_event(step: &ForkStep<'_>) -> Option<StepFinished> {
+    // A fork attempt's run id (`fork:` and a digest) identifies the attempt, but an attempt id
+    // holds only letters, digits, `_` and `-`.
+    let attempt_id = step.run_id.replace(':', "-");
+    let incarnation: String = step
+        .incarnation
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let event = Facts {
+        position: StepRef::new(
+            "broca",
+            broca_core::agent_session_ref(step.session),
+            &incarnation,
+            step.seq,
+        ),
+        run_id: step.run_id,
+        step_id: 1,
+        attempt: u32::try_from(step.attempt.checked_sub(1)?).ok()?,
+        status: if step.failed { "failed" } else { "completed" },
+        harness: &step.session.harness,
+        session: &step.session.session,
+        provider: step.provider,
+        model: step.model,
+        started_at_ms: step.started_at_ms,
+        finished_at_ms: step.finished_at_ms,
+        attempt_id: &attempt_id,
+    }
+    .build()?;
+    let envelope = broca_wal::record::AttemptEnvelope {
+        usage: Some(step.usage),
+        finish_reason: step.finish_reason,
+        // Usage is canonical: recorded reasoning is a subset of output, not extra output.
+        reasoning_included_in_output: step.usage.reasoning_tokens.map(|_| true),
+        ..Default::default()
+    };
+    let event = finish(event, &envelope, false);
+    event.check().ok()?;
+    Some(event)
 }
 
 /// Both storages use the same usage projection. Missing or interrupted evidence stays absent.
@@ -716,5 +819,126 @@ mod tests {
         })
         .await;
         assert!(inbox.try_recv().is_err());
+    }
+
+    /// A fork attempt's step event and an ordinary run's, as this build publishes them.
+    fn fork_and_ordinary() -> (StepFinished, StepFinished) {
+        let fork_session = broca_protocol::BindIdentity::new(
+            "/synthetic/project",
+            "runner",
+            "head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623",
+        );
+        let usage = broca_protocol::Usage {
+            input_tokens: Some(1200),
+            cached_input_tokens: Some(1000),
+            output_tokens: Some(40),
+            ..Default::default()
+        };
+        let fork = fork_step_event(&ForkStep {
+            session: &fork_session,
+            incarnation: [7; 16],
+            seq: 5,
+            run_id: "fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0",
+            attempt: 1,
+            provider: "anthropic",
+            model: "claude-opus-4-8",
+            usage,
+            finish_reason: Some(broca_protocol::content::FinishReason::Stop),
+            failed: false,
+            started_at_ms: 1_790_000_000_000,
+            finished_at_ms: 1_790_000_001_500,
+        })
+        .expect("a fork step event");
+        let head = broca_protocol::BindIdentity::new("/synthetic/project", "runner", "head");
+        let ordinary = Facts {
+            position: StepRef::new("broca", broca_core::agent_session_ref(&head), "0707", 9),
+            run_id: "run-head-1",
+            step_id: 1,
+            attempt: 0,
+            status: "completed",
+            harness: &head.harness,
+            session: &head.session,
+            provider: "anthropic",
+            model: "claude-opus-4-8",
+            started_at_ms: 1_789_999_990_000,
+            finished_at_ms: 1_789_999_991_000,
+            attempt_id: "attempt-head-1",
+        }
+        .build()
+        .unwrap();
+        let envelope = broca_wal::record::AttemptEnvelope {
+            usage: Some(usage),
+            finish_reason: Some(broca_protocol::content::FinishReason::Stop),
+            ..Default::default()
+        };
+        (fork, finish(ordinary, &envelope, false))
+    }
+
+    #[test]
+    fn a_fork_step_event_names_its_fork_only_once_its_readers_decode_it() {
+        let (fork, ordinary) = fork_and_ordinary();
+        assert_eq!(
+            fork.session,
+            "head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623"
+        );
+        assert_eq!(
+            fork.run_id,
+            "fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0"
+        );
+        assert_eq!(
+            fork.attempt_id.as_deref(),
+            Some("fork-1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0")
+        );
+        assert_eq!(fork.attempt.get(), 1);
+        assert_eq!(fork.terminal_status, "completed");
+        assert_eq!(
+            (fork.input_tokens, fork.output_tokens),
+            (Some(1200), Some(40))
+        );
+        fork.check().unwrap();
+        const { assert!(!FORK_ID_EMITTED) };
+        // As published now, a fork's event is an ordinary step event the contract's decoder
+        // reads: it carries no fork_id.
+        let published = step_event_body(
+            &fork,
+            Some("fork-72f6bdfa7eb7fb4cdf456d38c4d99623"),
+            FORK_ID_EMITTED,
+        )
+        .unwrap();
+        let decoded: StepFinished = serde_json::from_slice(&published).unwrap();
+        assert_eq!(decoded, fork);
+        // With the member, the contract's own decoder refuses the event, which is why the member
+        // waits until every reader decodes it.
+        let named =
+            step_event_body(&fork, Some("fork-72f6bdfa7eb7fb4cdf456d38c4d99623"), true).unwrap();
+        let value: Value = serde_json::from_slice(&named).unwrap();
+        assert_eq!(value["fork_id"], "fork-72f6bdfa7eb7fb4cdf456d38c4d99623");
+        // The member is appended: every other byte is what this build publishes now.
+        assert_eq!(
+            &named[..published.len() - 1],
+            &published[..published.len() - 1]
+        );
+        assert!(serde_json::from_slice::<StepFinished>(&named).is_err());
+        // An ordinary event never carries the member.
+        let ordinary_named = step_event_body(&ordinary, None, true).unwrap();
+        assert_eq!(ordinary_named, serde_json::to_vec(&ordinary).unwrap());
+        assert_eq!(
+            step_event_body(&ordinary, None, false).unwrap(),
+            ordinary_named
+        );
+
+        // `BROCA_FORK_SPEND_SAMPLES` names a folder: the step events for their readers, before
+        // and after the member is emitted.
+        if let Some(dir) = std::env::var_os("BROCA_FORK_SPEND_SAMPLES") {
+            let dir = std::path::PathBuf::from(dir).join("step-events");
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, body) in [
+                ("step-finished.ordinary.json", ordinary_named),
+                ("step-finished.fork.before.json", published),
+                ("step-finished.fork.after.json", named),
+            ] {
+                std::fs::write(dir.join(name), body).unwrap();
+            }
+        }
     }
 }

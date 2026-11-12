@@ -23,6 +23,7 @@ pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
 pub mod fork_answer;
+pub mod fork_spend;
 pub mod fork_state;
 pub mod head_time;
 pub mod held_slots;

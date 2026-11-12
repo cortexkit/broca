@@ -224,8 +224,12 @@ struct Base {
     step_id: u64,
     request_body_sha256: String,
     /// The head's config when the base was sent: what a restart releases the fork's routing
-    /// admissions under, when the base can no longer be rebuilt.
+    /// admissions under, when the base can no longer be rebuilt, and what the fork's spend is
+    /// billed under.
     config: broca_wal::RunConfig,
+    /// The refusal-fallback route the base was sent on, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route: Option<broca_wal::StepRoute>,
 }
 
 /// A fork's session, open under its lease while an operation uses it.
@@ -271,6 +275,8 @@ pub struct ForkManager {
     leases: broca_core::FileLeaseStore,
     /// The forks some operation holds open, by their session's address.
     open: tokio::sync::Mutex<HashMap<String, Entry>>,
+    /// Where each fork attempt's model call is published as a step event, when anywhere.
+    step_events: Option<Arc<crate::step_events::StepEvents>>,
 }
 
 impl ForkManager {
@@ -283,7 +289,14 @@ impl ForkManager {
             clock,
             leases,
             open: tokio::sync::Mutex::new(HashMap::new()),
+            step_events: None,
         }
+    }
+
+    /// Publishes each fork attempt's model call on `events`, as runs' steps are published.
+    pub fn with_step_events(mut self, events: Option<Arc<crate::step_events::StepEvents>>) -> Self {
+        self.step_events = events;
+        self
     }
 
     fn now_ms(&self) -> u64 {
@@ -473,6 +486,15 @@ impl ForkManager {
             finished.detail = Some(json!({"cause": "restart"}));
             fork.append(vec![finished]).await?;
         }
+        // Spend a crash kept out of the usage export: the insert keeps a fact it already holds
+        // unchanged, so billing an attempt again writes nothing new. No step event is published
+        // again; those are hints, and the export is the authority.
+        let unbilled: Vec<(String, u64)> = fork.state.unbilled.iter().cloned().collect();
+        for (ask_id, attempt) in unbilled {
+            if let Err(error) = self.bill(fork, &ask_id, attempt, None).await {
+                tracing::warn!(target: "fork", fork = %fork.state.fork_id, "{error:?}");
+            }
+        }
         let unreleased: Vec<String> = fork.state.unreleased.iter().cloned().collect();
         if unreleased.is_empty() {
             return Ok(());
@@ -620,6 +642,7 @@ impl ForkManager {
             step_id,
             request_body_sha256: request.request_body_sha256,
             config: request.config,
+            route: request.route,
         };
         let fork_id = mint_fork_id()?;
         let key = fork_session(head, &fork_id);
@@ -763,8 +786,18 @@ impl ForkManager {
         // Usage the executor reports before the call ends is recorded as it comes, so a restart
         // stores the attempt with what it spent.
         let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<RunUsage>();
+        // The provider's latest account of the call, which the usage export is written from.
+        let spent: Arc<std::sync::Mutex<Option<crate::executor::ForkStepSpend>>> = Arc::default();
+        let spend_detail = |spent: &std::sync::Mutex<Option<crate::executor::ForkStepSpend>>| {
+            spent
+                .lock()
+                .ok()
+                .and_then(|spent| spent.clone())
+                .map(|spend| json!({ SPEND: spend }))
+        };
         let usage_writer = {
             let entry = Arc::clone(entry);
+            let spent = Arc::clone(&spent);
             let fork_id = fork_id.clone();
             let ask_id = request.ask_id.clone();
             let clock = self.clock.clone();
@@ -780,6 +813,7 @@ impl ForkManager {
                     fact.ask_id = Some(ask_id.clone());
                     fact.attempt = Some(attempt);
                     fact.usage = Some(usage_value(&usage));
+                    fact.detail = spend_detail(&spent);
                     if let Err(error) = fork.append(vec![fact]).await {
                         tracing::warn!(target: "fork", fork = %fork_id, "{error:?}");
                     }
@@ -799,6 +833,14 @@ impl ForkManager {
             on_usage: Some(Arc::new(move |usage| {
                 let _ = usage_tx.send(usage);
             })),
+            on_step: Some({
+                let spent = Arc::clone(&spent);
+                Arc::new(move |step| {
+                    if let Ok(mut spent) = spent.lock() {
+                        *spent = Some(step);
+                    }
+                })
+            }),
         };
         let executor = Arc::clone(self.runtime.executor());
         let outcome =
@@ -829,6 +871,7 @@ impl ForkManager {
                 finished.answer = Some(answer.clone());
                 finished.finish = Some(finish.clone());
                 finished.usage = Some(usage_value(&usage));
+                finished.detail = spend_detail(&spent);
                 facts.push(finished);
                 // A reply that called a tool ends the fork: its answer stands as given.
                 if refused && fork.state.ended_at_ms.is_none() {
@@ -843,7 +886,11 @@ impl ForkManager {
                 finished.answer = Some(String::new());
                 finished.finish = Some(FINISH_MODEL_ERROR.into());
                 finished.usage = Some(usage_value(&usage));
-                finished.detail = Some(json!({ "error": error }));
+                let mut detail = json!({ "error": error });
+                if let Some(spend) = spend_detail(&spent) {
+                    detail[SPEND] = spend[SPEND].clone();
+                }
+                finished.detail = Some(detail);
                 facts.push(finished);
                 Ok(ForkAskReply::new("", ForkFinish::ModelError, usage))
             }
@@ -875,7 +922,18 @@ impl ForkManager {
         let mut released = record(&fork_id, ForkEvent::Released, now);
         released.admission_id = Some(admission_id);
         facts.push(released);
+        let finished = (facts[0].event == ForkEvent::AskFinished).then(|| fork.session.next_seq());
         fork.append(facts).await?;
+        // A model call's spend goes to the usage export once its end is stored. An insert that
+        // fails leaves the attempt owed, and the fork's next opening writes it.
+        if let Some(seq) = finished {
+            if let Err(error) = self
+                .bill(&mut fork, &request.ask_id, attempt, Some(seq))
+                .await
+            {
+                tracing::warn!(target: "fork", fork = %fork_id, "{error:?}");
+            }
+        }
         // A caller revoked while its ask was in flight gets no answer, though it is stored.
         self.check_caller(&mut fork, head, caller).await?;
         reply
@@ -921,3 +979,127 @@ fn stored_reply(answer: &crate::fork_state::StoredAnswer) -> Result<ForkAskReply
 #[cfg(test)]
 #[path = "fork_answer_tests.rs"]
 mod tests;
+
+/// What a fork's records say about one attempt's model call, for its spend.
+struct AttemptFacts {
+    started_at_ms: u64,
+    finished_at_ms: u64,
+    failed: bool,
+    /// The latest account of the call the provider gave, when it gave one.
+    spend: Option<crate::executor::ForkStepSpend>,
+}
+
+fn attempt_facts(records: &[Record], ask_id: &str, attempt: u64) -> Option<AttemptFacts> {
+    let mut facts: Option<AttemptFacts> = None;
+    for record in records {
+        let Record::Fork(fork) = record else {
+            continue;
+        };
+        if fork.ask_id.as_deref() != Some(ask_id) || fork.attempt != Some(attempt) {
+            continue;
+        }
+        match fork.event {
+            ForkEvent::AskStarted => {
+                facts = Some(AttemptFacts {
+                    started_at_ms: fork.at_ms,
+                    finished_at_ms: fork.at_ms,
+                    failed: false,
+                    spend: None,
+                });
+            }
+            ForkEvent::AskUsage | ForkEvent::AskFinished => {
+                let Some(facts) = facts.as_mut() else {
+                    continue;
+                };
+                if let Some(spend) = fork
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get(SPEND))
+                    .and_then(|spend| serde_json::from_value(spend.clone()).ok())
+                {
+                    facts.spend = Some(spend);
+                }
+                if fork.event == ForkEvent::AskFinished {
+                    facts.finished_at_ms = fork.at_ms;
+                    facts.failed = fork.finish.as_deref() == Some(FINISH_MODEL_ERROR);
+                }
+            }
+            _ => {}
+        }
+    }
+    facts
+}
+
+/// The member of a fork record's `detail` that holds the provider's account of the attempt's
+/// model call ([`crate::executor::ForkStepSpend`]).
+const SPEND: &str = "spend";
+
+impl ForkManager {
+    /// Writes attempt `attempt` of ask `ask_id` to the usage export, when its model call
+    /// reported what it spent, and records it billed. `published` is the seq of the record that
+    /// stored the attempt's end when its step event is to be published now.
+    async fn bill(
+        &self,
+        fork: &mut OpenFork,
+        ask_id: &str,
+        attempt: u64,
+        published: Option<u64>,
+    ) -> Result<(), ForkError> {
+        let fork_id = fork.state.fork_id.clone();
+        let facts = attempt_facts(&fork.records, ask_id, attempt)
+            .ok_or_else(|| ForkError::Transient("the fork attempt has no start".into()))?;
+        if let Some(spend) = &facts.spend {
+            let Some(billing) = self.runtime.billing() else {
+                // No usage export to write: the attempt stays owed, as a run's spend does.
+                return Ok(());
+            };
+            let base: Base = serde_json::from_value(fork.state.base.clone())
+                .map_err(|error| ForkError::Transient(format!("the fork's base: {error}")))?;
+            let run_id = fork_admission_id(&fork_id, ask_id, attempt);
+            let attempt_spend = crate::fork_spend::AttemptSpend {
+                session: &fork.key,
+                run_id: &run_id,
+                config: &base.config,
+                route: base.route.as_ref(),
+                spend,
+                started_at_ms: facts.started_at_ms,
+                finished_at_ms: facts.finished_at_ms,
+                failed: facts.failed,
+            };
+            billing
+                .insert_records(attempt_spend.records(), &run_id)
+                .await
+                .map_err(ForkError::Transient)?;
+            if let (Some(seq), Some(events)) = (published, &self.step_events) {
+                let model = base
+                    .route
+                    .as_ref()
+                    .map(|route| &route.model)
+                    .unwrap_or(&base.config.model);
+                let step = crate::step_events::ForkStep {
+                    session: &fork.key,
+                    incarnation: fork.session.head().incarnation.0,
+                    seq,
+                    run_id: &run_id,
+                    attempt,
+                    provider: &model.provider_module_id,
+                    model: &model.model_id,
+                    usage: spend.usage,
+                    finish_reason: spend.finish_reason,
+                    failed: facts.failed,
+                    started_at_ms: facts.started_at_ms,
+                    finished_at_ms: facts.finished_at_ms,
+                };
+                match crate::step_events::fork_step_event(&step) {
+                    Some(event) => events.publish_fork(event, &fork_id),
+                    None => tracing::warn!(target: "fork", fork = %fork_id,
+                        "a fork attempt's step event could not be built"),
+                }
+            }
+        }
+        let mut billed = record(&fork_id, ForkEvent::Billed, self.now_ms());
+        billed.ask_id = Some(ask_id.to_owned());
+        billed.attempt = Some(attempt);
+        fork.append(vec![billed]).await
+    }
+}

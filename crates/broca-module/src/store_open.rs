@@ -437,6 +437,11 @@ impl StoreRuntime {
         &self.executor
     }
 
+    /// Where spend facts are written, when this runtime writes them.
+    pub(crate) fn billing(&self) -> Option<&crate::store_billing::StoreBilling> {
+        self.billing.as_ref()
+    }
+
     /// The session `key` as it stands now, read-only: writing nothing and taking no lease (see
     /// `Session::view`). The view is kept, and served again while the session stays where it
     /// was read (see `store_reads::ViewCache`). A session whose creation never committed holds no

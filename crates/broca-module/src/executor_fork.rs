@@ -55,6 +55,25 @@ pub struct ForkCallJob {
     /// before the call ends, so that an attempt cut by a restart is stored with what it spent.
     /// The fork manager records each report; calling it is optional.
     pub on_usage: Option<Arc<dyn Fn(RunUsage) + Send + Sync>>,
+    /// Called with the provider's own account of the model call whenever the executor learns
+    /// it, just before the matching `on_usage` report. The fork manager keeps the latest one
+    /// durably and writes it to the usage export under [`ForkCallJob::run_id`]. An attempt that
+    /// never reports one made no model call the manager can bill.
+    pub on_step: Option<Arc<dyn Fn(ForkStepSpend) + Send + Sync>>,
+}
+
+/// What a fork attempt's model call spent, as the provider reported it: what a run's step records
+/// for its usage export fact.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ForkStepSpend {
+    pub usage: broca_protocol::Usage,
+    /// The service tier the provider says it served the call at, verbatim; absent when it said
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier_used: Option<String>,
+    /// How the provider said the reply ended, when it said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<broca_protocol::content::FinishReason>,
 }
 
 /// How an attempt ended.
