@@ -1470,6 +1470,34 @@ fn a_dropped_rig_hands_fixtures_back_to_the_daemon_started_before_it() {
     assert_eq!(connections.current(), None);
 }
 
+/// Whether `session` is the head of one of the kit's plan_view cases (`cf-plan-view-<n>`).
+/// `session.plan_view` serves only heads kept in the new storage, and the case that sends
+/// without a plan must still reach its `no_plan` answer there, so these heads start in the new
+/// storage whatever their first send carries.
+fn plan_view_session(session: &str) -> bool {
+    session.starts_with("cf-plan-view-")
+}
+
+#[test]
+fn plan_view_heads_start_as_heads_with_or_without_a_plan() {
+    let subject = held_call_tests::subject(Arc::new(Shared::default()));
+    let session = "cf-plan-view-12";
+    let mut first = subject.send_fields(session, true);
+    assert_eq!(first["session_class"], "head");
+    assert!(first.get("plan").is_some_and(Value::is_object));
+    // The no_plan case removes the plan and keeps the class.
+    first.remove("plan");
+    assert_eq!(first["session_class"], "head");
+    assert!(subject
+        .send_fields(session, false)
+        .get("session_class")
+        .is_none());
+    assert!(subject
+        .send_fields("cf-session-class-9", true)
+        .get("session_class")
+        .is_none());
+}
+
 // ---- the harness ----------------------------------------------------------------------------------
 
 /// One live rig on one state root: the daemon (supervising `ck-broca` and the stand-in), the
@@ -3382,7 +3410,8 @@ impl LlmRunnerSubject for BrocaSubject {
                 .send_fields_with_plan(session, first, &Map::new())
                 .unwrap();
         }
-        if session_change_kit_session(session)
+        // A plan_view case needs a plan in its params; the case that sends none removes it.
+        if (session_change_kit_session(session) || plan_view_session(session))
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
             return self
@@ -3537,9 +3566,10 @@ impl LlmRunnerSubject for BrocaSubject {
                 "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
                 "composition":composition,
             });
-            if fork_answer::NEW_STORAGE_PLAN_MEMBERS
-                .iter()
-                .any(|member| members.contains_key(*member))
+            if plan_view_session(session)
+                || fork_answer::NEW_STORAGE_PLAN_MEMBERS
+                    .iter()
+                    .any(|member| members.contains_key(*member))
             {
                 fields.insert("session_class".into(), json!("head"));
             }
