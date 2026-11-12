@@ -254,6 +254,36 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
 mod tests {
     use super::*;
 
+    /// A send the new storage doesn't serve is refused `not_served_on_new_storage`, permanent,
+    /// naming the feature, with a message true to its case: a creating send's feature keeps its
+    /// wording byte for byte, and a send continuing a session compacted under the first
+    /// compaction protocol, which moved read-only, says so.
+    #[test]
+    fn unserved_refusals_name_their_case() {
+        for (feature, message) in [
+            (
+                "a send carrying media",
+                "a send carrying media is not served yet on a send creating a head, which starts \
+                 only in the new storage",
+            ),
+            (
+                "first_protocol_compaction",
+                "this session was compacted under the first compaction protocol, which the new \
+                 storage reads but can't continue; start a new session",
+            ),
+        ] {
+            let error = ServeError::NotServedOnNewStorage { feature };
+            let body = serde_json::to_value(admission_refusal(&error).unwrap()).unwrap();
+            assert_eq!(body["code"], "not_served_on_new_storage", "{body}");
+            assert_eq!(
+                body["detail"],
+                json!({"class": "permanent", "feature": feature}),
+                "{body}"
+            );
+            assert_eq!(body["message"], message, "{body}");
+        }
+    }
+
     #[test]
     fn credential_row_refusals_keep_their_codes_classes_and_public_ids() {
         let ambiguous = ServeError::CredentialAmbiguous {

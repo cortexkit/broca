@@ -1685,6 +1685,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                 }
+                // A session compacted under the first compaction protocol moved read-only: its
+                // reads are served, and the new run loop can't continue it, so a new send is
+                // refused by name before anything is written.
+                if self.session.conversation().first_protocol_compaction
+                    || self.session.operations().first_protocol_compaction
+                {
+                    let _ = reply.send(SendOutcome::NotServedOnNewStorage {
+                        feature: FIRST_PROTOCOL_COMPACTION,
+                    });
+                    return false;
+                }
                 if let Some(what) = unserved_request(
                     kind,
                     retention.is_some(),
@@ -4390,6 +4401,22 @@ pub fn unserved_creating_send(
 ) -> Option<&'static str> {
     unserved_request(kind, retention, false)
         .or_else(|| carries_media(request).then_some("a send carrying media"))
+}
+
+/// The feature a send to a session compacted under the first compaction protocol is refused
+/// for: the session moved to the new storage read-only.
+pub(crate) const FIRST_PROTOCOL_COMPACTION: &str = "first_protocol_compaction";
+
+/// The message of a send refused because it asks the new storage for `feature`, which it
+/// doesn't serve: a creating send's feature ([`unserved_on_creation`]), or a send continuing a
+/// session compacted under the first compaction protocol.
+pub(crate) fn unserved_message(feature: &str) -> String {
+    if feature == FIRST_PROTOCOL_COMPACTION {
+        return "this session was compacted under the first compaction protocol, which the new \
+                storage reads but can't continue; start a new session"
+            .into();
+    }
+    unserved_on_creation(feature)
 }
 
 /// The message of a head refused because its creating send asks for `feature`, which the new

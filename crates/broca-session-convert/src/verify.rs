@@ -95,6 +95,10 @@ pub const FIRST_OPEN: &str = "first_open";
 pub const MEDIA: &str = "media";
 pub const LAST_STEP: &str = "last_step";
 pub const NEXT_REQUEST: &str = "next_request";
+/// An ordered send waiting for a tool result, delivered on the next send's first tool result.
+pub const DELIVERY: &str = "delivery";
+/// A run paused for sign-in, resumed by its own send's retry.
+pub const RESUME: &str = "resume";
 pub const ALL_STEPS: &str = "all_steps";
 /// Not a comparison: reading the staged session back failed.
 pub const STAGED: &str = "staged";
@@ -112,6 +116,10 @@ pub struct Verified {
     pub legacy_replay_limit: u64,
     /// Up to five affected steps, without request content.
     pub legacy_replay_limit_examples: Vec<ReplayLimit>,
+    /// Whether the session moves read-only: it was compacted under the first compaction
+    /// protocol, which the new run loop refuses to run, so no request of it was rebuilt (its
+    /// recorded steps' and its next one) and its first open wasn't checked.
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -232,7 +240,17 @@ pub async fn verify_with_progress(
     checks.push(BILLING);
     let media = staged_media(&verify, staged).await?;
     checks.push(MEDIA);
-    let steps = recorded_steps(verify.records);
+    // A session compacted under the first compaction protocol moves read-only: the new run loop
+    // refuses to run it, so it renders no request (neither a recorded one again nor its next
+    // one), and nothing writes to it to open it for. Its reads, history and entries are checked
+    // above as any session's are.
+    let read_only = staged.conversation.first_protocol_compaction
+        || staged.operations.first_protocol_compaction;
+    let steps = if read_only {
+        Vec::new()
+    } else {
+        recorded_steps(verify.records)
+    };
     let mut replay_limits = Vec::new();
     if let Some(last) = steps.last() {
         if step(&verify, lineage.as_deref(), last, LAST_STEP, progress).await? {
@@ -240,18 +258,20 @@ pub async fn verify_with_progress(
         }
         checks.push(LAST_STEP);
     }
-    next_request(
-        &verify,
-        lineage.as_deref(),
-        staged,
-        &addr,
-        &triple,
-        progress,
-    )
-    .await?;
-    checks.push(FIRST_OPEN);
-    checks.push(NEXT_REQUEST);
-    if verify.mode == Mode::Offline {
+    if !read_only {
+        let continued = next_request(
+            &verify,
+            lineage.as_deref(),
+            staged,
+            &addr,
+            &triple,
+            progress,
+        )
+        .await?;
+        checks.push(FIRST_OPEN);
+        checks.extend(continued);
+    }
+    if verify.mode == Mode::Offline && !read_only {
         // The last step already ran above; count each historical replay limit only once.
         for recorded in steps.iter().take(steps.len().saturating_sub(1)) {
             if step(&verify, lineage.as_deref(), recorded, ALL_STEPS, progress).await? {
@@ -261,6 +281,7 @@ pub async fn verify_with_progress(
         checks.push(ALL_STEPS);
     }
     Ok(Verified {
+        read_only,
         runs: verify.converted.runs,
         messages: broca_module::store_read::transcript_len(staged),
         media,
@@ -1372,14 +1393,35 @@ async fn media_rebuild_on<B: SessionBackend>(
 /// is deleted after the check.
 const NEXT_RUN: &str = "store-move-next-request";
 
+/// Appends `record` to `records`, after its last record and in its fence, with the runner tags
+/// today's writer stamps on an appended record from the lineage's tag state (`tags`, see
+/// `broca_core::tags::LineageTags`): a lineage that stores part numbers numbers the record's
+/// parts on from its last number, and one whose runs compute their numbers from the transcript
+/// (`runner-tags/v2`) or never had any stores none.
+fn append_record(
+    records: &mut Vec<FramedRecord>,
+    tags: &mut broca_core::tags::LineageTags,
+    mut record: WalRecord,
+) -> Result<(), String> {
+    let last = records.last().ok_or("the WAL is empty")?;
+    let (seq, fence) = (last.seq + 1, last.fence);
+    broca_core::tags::stamp(tags, &mut record);
+    records.push(FramedRecord { seq, fence, record });
+    Ok(())
+}
+
+/// The record `value` describes, in today's record form.
+fn wal_record(value: Value) -> Result<WalRecord, String> {
+    serde_json::from_value(value).map_err(|error| format!("a continuation's record: {error}"))
+}
+
 /// The WAL with one more send after it: the session's last run start again, under a new run id
 /// with a fixed input and the effective serving identity, and its first step's start, as the
 /// next send to the session would begin.
 fn with_next_send(
     records: &[FramedRecord],
     effective: &BindIdentity,
-) -> Result<Vec<FramedRecord>, String> {
-    let last = records.last().ok_or("the WAL is empty")?;
+) -> Result<Continuation, String> {
     let mut start = records
         .iter()
         .rev()
@@ -1393,7 +1435,7 @@ fn with_next_send(
         .rev()
         .find_map(|frame| broca_core::record_time_ms(&frame.record))
         .map(|at| at + 1);
-    if let WalRecord::RunStarted {
+    let WalRecord::RunStarted {
         run_id,
         ts_ms,
         input,
@@ -1404,46 +1446,182 @@ fn with_next_send(
         written_at_ms,
         session,
         tags,
+        config,
         ..
     } = &mut start
-    {
-        *run_id = RunId(NEXT_RUN.into());
-        *session = effective.clone();
-        *ts_ms = at;
-        *written_at_ms = at;
-        *origin = broca_wal::RunOrigin::Fresh;
-        *submission_id = None;
-        *send_id = None;
-        *request_identity_digest = None;
-        *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
-            "role": "user",
-            "content": [{"type": "text", "text": "The next message after the move."}],
-        }))
-        .map_err(|error| format!("the next send's input: {error}"))?]);
-        // The copied run start's runner tags number the parts of the input it carried, not
-        // this one. Today's writer stamps an appended run start from the lineage's tag state,
-        // so do the same: a tagged lineage numbers the new input's parts on from its last
-        // number, and a lineage under the computed rules stores none.
-        *tags = None;
-    }
+    else {
+        unreachable!("the record found is a run start");
+    };
+    *run_id = RunId(NEXT_RUN.into());
+    *session = effective.clone();
+    *ts_ms = at;
+    *written_at_ms = at;
+    *origin = broca_wal::RunOrigin::Fresh;
+    *submission_id = None;
+    *send_id = None;
+    *request_identity_digest = None;
+    *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
+        "role": "user",
+        "content": [{"type": "text", "text": "The next message after the move."}],
+    }))
+    .map_err(|error| format!("the next send's input: {error}"))?]);
+    // The copied run start's runner tags number the parts of the input it carried, not this
+    // one: it is stamped again as it is appended.
+    *tags = None;
+    let config = (**config).clone();
+    let mut extended = records.to_vec();
     let mut lineage_tags =
         broca_core::tags::lineage_tags(records.iter().map(|frame| &frame.record));
-    broca_core::tags::stamp(&mut lineage_tags, &mut start);
-    let mut extended = records.to_vec();
-    for record in [
-        start,
+    append_record(&mut extended, &mut lineage_tags, start)?;
+    append_record(
+        &mut extended,
+        &mut lineage_tags,
         WalRecord::StepStarted {
             step_id: broca_protocol::StepId(1),
         },
-    ] {
-        let seq = extended.last().map_or(last.seq, |frame| frame.seq) + 1;
-        extended.push(FramedRecord {
-            seq,
-            fence: last.fence,
-            record,
-        });
+    )?;
+    Ok(Continuation {
+        check: NEXT_REQUEST,
+        records: extended,
+        run: NEXT_RUN.into(),
+        step: 1,
+        config,
+        sends: Vec::new(),
+    })
+}
+
+/// The call the next send's first step makes, whose result carries the ordered sends that wait
+/// for one. No real call carries it: the copy that receives it is deleted after the check.
+const NEXT_CALL: &str = "store-move-next-call";
+
+/// The next send `next` going on to deliver every ordered send of `records` that waits for a tool
+/// result: its first step calls a tool, the tool's result carries each send's text, as today's
+/// actor records a delivery on a tool batch's carrier result
+/// (`broca_core::delivery_order::with_tool_result`), and its second step starts. `None` when no
+/// send waits for a tool result. Each delivered send's `send.status` is compared after it.
+fn with_delivery(
+    next: &Continuation,
+    records: &[FramedRecord],
+) -> Result<Option<Continuation>, String> {
+    let raw: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
+    let waiting: Vec<broca_core::PendingSubmission> = broca_core::pending_submissions(&raw)
+        .into_iter()
+        .filter(|pending| {
+            pending
+                .order
+                .as_ref()
+                .is_some_and(|order| order.modes == [broca_protocol::DeliveryMode::ToolResult])
+        })
+        .collect();
+    if waiting.is_empty() {
+        return Ok(None);
     }
-    Ok(extended)
+    let mut extended = next.records.clone();
+    let mut tags = broca_core::tags::lineage_tags(extended.iter().map(|frame| &frame.record));
+    let batch = "store-move-next-batch";
+    for record in [
+        json!({"type": "model_step_finished", "step_id": 1,
+            "assistant_message": {"message_id": "store-move-next-step", "content": [
+                {"type": "tool_call", "tool_call_id": NEXT_CALL, "tool_name": "read",
+                    "input": {}}]},
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "finish_reason": "tool_calls", "retries_used": 0}),
+        json!({"type": "tool_batch_started", "batch_id": batch, "step_id": 1,
+            "planned_calls": [NEXT_CALL]}),
+        json!({"type": "tool_dispatch_intent", "batch_id": batch, "tool_call_id": NEXT_CALL,
+            "args": {}}),
+        json!({"type": "tool_result", "batch_id": batch, "result": {
+            "tool_call_id": NEXT_CALL, "output": {"kind": "text", "text": "ok"},
+            "is_error": false}, "outcome": "completed"}),
+        json!({"type": "tool_batch_finished", "batch_id": batch}),
+    ] {
+        append_record(&mut extended, &mut tags, wal_record(record)?)?;
+    }
+    let mut sends = Vec::new();
+    for send in &waiting {
+        let text = broca_core::delivery_order::appended_text(&send.request.input)
+            .ok_or("an ordered send waiting for a tool result has no text to deliver")?;
+        append_record(
+            &mut extended,
+            &mut tags,
+            WalRecord::SendDelivered {
+                ride: None,
+                written_at_ms: send.admitted_at_ms,
+                tags: None,
+                submission_id: send.submission_id.clone(),
+                run_id: RunId(NEXT_RUN.into()),
+                mode: broca_protocol::DeliveryMode::ToolResult,
+                input: None,
+                tool_call_id: Some(broca_protocol::ToolCallId(NEXT_CALL.into())),
+                appended_text: Some(text),
+            },
+        )?;
+        if let Some(send_id) = &send.send_id {
+            let own_run = send
+                .submission_id
+                .0
+                .strip_prefix("sub-")
+                .unwrap_or(&send.submission_id.0);
+            sends.push((own_run.to_owned(), send_id.clone()));
+        }
+    }
+    for record in [
+        json!({"type": "turn_finished", "step_id": 1}),
+        json!({"type": "step_started", "step_id": 2}),
+    ] {
+        append_record(&mut extended, &mut tags, wal_record(record)?)?;
+    }
+    Ok(Some(Continuation {
+        check: DELIVERY,
+        records: extended,
+        run: NEXT_RUN.into(),
+        step: 2,
+        config: next.config.clone(),
+        sends,
+    }))
+}
+
+/// The resume of the run `run`, paused for sign-in, as today's run loop writes it when the run's
+/// own send is retried: the record that resumes it (`broca_core::resume::resume_started_record`)
+/// and the start of the step it couldn't send, which it sends again.
+fn with_resume(records: &[FramedRecord], run: &str) -> Result<Continuation, String> {
+    let raw: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
+    let prior = broca_core::replay(&raw).map_err(|error| error.to_string())?;
+    let config = records
+        .iter()
+        .rev()
+        .find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { run_id, config, .. } if run_id.0 == run => {
+                Some((**config).clone())
+            }
+            _ => None,
+        })
+        .ok_or("the paused run has no start")?;
+    let last = records.last().ok_or("the WAL is empty")?.seq;
+    let step = prior.completed_steps + 1;
+    let resumed = broca_core::resume::resume_started_record(
+        &prior,
+        last,
+        broca_core::resume::planned_redo(&prior),
+    );
+    let mut extended = records.to_vec();
+    let mut tags = broca_core::tags::lineage_tags(raw.iter());
+    append_record(&mut extended, &mut tags, resumed)?;
+    append_record(
+        &mut extended,
+        &mut tags,
+        WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(step),
+        },
+    )?;
+    Ok(Continuation {
+        check: RESUME,
+        records: extended,
+        run: run.to_owned(),
+        step,
+        config,
+        sends: Vec::new(),
+    })
 }
 
 /// Copies the staged session's own files (its head, log and objects) from the backend root
@@ -1472,10 +1650,50 @@ fn copy_session(from: &Path, to: &Path, address: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What a session goes on to do, checked on a copy of it: `records`, today's WAL with records
+/// appended after it, and the request today's renderer builds from them for step `step` of run
+/// `run`, which the copy, with the conversion of the appended records added to it, must render
+/// byte for byte. `sends` names the send ids, each with the run id its send owns, whose
+/// `send.status` must also agree once they are added. A mismatch names `check`.
+struct Continuation {
+    check: &'static str,
+    records: Vec<FramedRecord>,
+    run: String,
+    step: u64,
+    config: broca_wal::RunConfig,
+    sends: Vec<(String, String)>,
+}
+
+/// What the session goes on to do, by what it holds open:
+///
+/// - a latest run paused for sign-in: its resume, the retry of its own send, which sends the
+///   step it couldn't send again ([`RESUME`]). Today's storage answers a new send to it with the
+///   pause, so it has no next send;
+/// - otherwise its next send ([`NEXT_REQUEST`]), and, for each ordered send waiting for a tool
+///   result, its delivery on that send's first tool result ([`DELIVERY`]).
+fn continuations(verify: &Verify<'_>) -> Result<Vec<Continuation>, Mismatch> {
+    if let Some(run) = crate::preconditions::paused_for_sign_in(verify.records) {
+        return Ok(vec![
+            with_resume(verify.records, &run).map_err(|error| mismatch(RESUME, error))?
+        ]);
+    }
+    let next = with_next_send(verify.records, verify.session)
+        .map_err(|error| mismatch(NEXT_REQUEST, error))?;
+    let mut continuations = Vec::new();
+    if let Some(delivery) =
+        with_delivery(&next, verify.records).map_err(|error| mismatch(DELIVERY, error))?
+    {
+        continuations.push(delivery);
+    }
+    continuations.insert(0, next);
+    Ok(continuations)
+}
+
 /// Opens a copy of the staged session as its first writer would, and checks the open changes
 /// nothing a writer finds: no run to recover, no billing owed, the same transcript and
-/// operations. Then the session's next send, appended to the WAL and to that copy, must render
-/// to the request today's renderer builds for it.
+/// operations. Then what the session goes on to do ([`continuations`]), appended to the WAL and
+/// to that copy, must render the request today's renderer builds for it, and answer the sends
+/// it settles as today's storage does.
 async fn next_request(
     verify: &Verify<'_>,
     lineage: Option<&str>,
@@ -1483,38 +1701,48 @@ async fn next_request(
     addr: &SessionAddr,
     triple: &broca_session_store::head::SessionTriple,
     progress: broca_session_store::backend::unpublished::Progress<'_>,
-) -> Result<(), Mismatch> {
+) -> Result<Vec<&'static str>, Mismatch> {
     let scratch = verify.staging.join("next-request");
-    let result = next_request_on(
-        verify,
-        lineage,
-        view,
-        addr,
-        triple,
-        broca_session_store::backend::unpublished::UnpublishedBackend::scratch(&scratch, progress),
-        progress,
-    )
-    .await;
-    #[cfg(test)]
-    {
-        let durable = next_request_on(
+    let mut checks = Vec::new();
+    for continuation in continuations(verify)? {
+        let result = next_request_on(
             verify,
             lineage,
             view,
             addr,
             triple,
-            LocalBackend::new(&scratch),
-            None,
+            broca_session_store::backend::unpublished::UnpublishedBackend::scratch(
+                &scratch, progress,
+            ),
+            progress,
+            &continuation,
         )
         .await;
-        assert_eq!(
-            result, durable,
-            "disposable and durable next-request verification differ"
-        );
+        #[cfg(test)]
+        {
+            let durable = next_request_on(
+                verify,
+                lineage,
+                view,
+                addr,
+                triple,
+                LocalBackend::new(&scratch),
+                None,
+                &continuation,
+            )
+            .await;
+            assert_eq!(
+                result, durable,
+                "disposable and durable next-request verification differ"
+            );
+        }
+        result?;
+        checks.push(continuation.check);
     }
-    result
+    Ok(checks)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
     verify: &Verify<'_>,
     lineage: Option<&str>,
@@ -1523,7 +1751,9 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
     triple: &broca_session_store::head::SessionTriple,
     backend: B,
     progress: broca_session_store::backend::unpublished::Progress<'_>,
+    continuation: &Continuation,
 ) -> Result<(), Mismatch> {
+    let check = continuation.check;
     let scratch = verify.staging.join("next-request");
     let _ = std::fs::remove_dir_all(&scratch);
     let result = async {
@@ -1547,43 +1777,42 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
         if !session.operations.billing_owed.is_empty() {
             return Err(mismatch(FIRST_OPEN, "opening the session owes billing"));
         }
-        let extended = with_next_send(verify.records, verify.session)
-            .map_err(|error| mismatch(NEXT_REQUEST, error))?;
+        let extended = &continuation.records;
         let wal: Vec<WalRecord> = extended.iter().map(|frame| frame.record.clone()).collect();
-        let config = match &wal[wal.len() - 2] {
-            WalRecord::RunStarted { config, .. } => config,
-            _ => unreachable!("with_next_send ends with a run start and its step"),
-        };
-        let holds_media = !crate::stage::media_digests(&extended).is_empty();
+        let config = &continuation.config;
+        let holds_media = !crate::stage::media_digests(extended).is_empty();
         let today = todays_request(
             verify,
             lineage,
             &wal,
             config,
-            NEXT_RUN,
-            1,
+            &continuation.run,
+            continuation.step,
             None,
             holds_media,
         )
-        .map_err(|error| mismatch(NEXT_REQUEST, format!("today's renderer: {error}")))?;
-        let mut converted = crate::convert(&extended, lineage)
-            .map_err(|error| mismatch(NEXT_REQUEST, format!("the conversion: {}", error.0)))?;
-        crate::stage::retain_run_identities(&mut converted, &extended, verify.session)
-            .map_err(|error| mismatch(NEXT_REQUEST, error.to_string()))?;
-        // Reproduce the staged prefix at its stored origin. The synthetic next send adds only
-        // a run input and step boundary, with no Input.receipt_seq naming a new Steer or Delivery.
+        .map_err(|error| mismatch(check, format!("today's renderer: {error}")))?;
+        let mut converted = crate::convert(extended, lineage)
+            .map_err(|error| mismatch(check, format!("the conversion: {}", error.0)))?;
+        crate::stage::retain_run_identities(&mut converted, extended, verify.session)
+            .map_err(|error| mismatch(check, error.to_string()))?;
+        // Reproduce the staged prefix at its stored origin, so the appended records' seqs follow
+        // it. That is safe because no appended record places a message that names another
+        // record by its seq (`Input.receipt_seq`, which a steer's or delivered send's messages
+        // carry): the next send's message is its run's input, and a send delivered with a tool
+        // result places no message.
         converted.start_at(verify.converted.first_seq.unwrap_or(crate::FIRST_SEQ));
         let staged = &verify.converted.records;
         if !converted.records.starts_with(staged) {
             return Err(mismatch(
-                NEXT_REQUEST,
-                "converting the next send rewrites the session's earlier records",
+                check,
+                "converting what follows rewrites the session's earlier records",
             ));
         }
         session
             .append(&converted.records[staged.len()..], true)
             .await
-            .map_err(|error| mismatch(NEXT_REQUEST, format!("append the next send: {error:?}")))?;
+            .map_err(|error| mismatch(check, format!("append what follows: {error:?}")))?;
         scratch_progress(
             progress,
             broca_session_store::backend::unpublished::Step::ScratchAppended,
@@ -1596,21 +1825,45 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
             &scratch,
             &parts,
             verify.session,
-            1,
+            continuation.step,
             config,
             None,
             holds_media,
         )
         .await
-        .map_err(|error| mismatch(NEXT_REQUEST, error))?;
+        .map_err(|error| mismatch(check, error))?;
+        let reader = Reader {
+            parts: &parts,
+            live: false,
+            settled: None,
+            session_name: verify.session.session.as_str(),
+            live_step: None,
+        };
+        for (own_run, send_id) in &continuation.sends {
+            same(
+                check,
+                send_id,
+                &reply(
+                    reader
+                        .send_status(&session, RunId(own_run.clone()), send_id, None)
+                        .await,
+                ),
+                &reply(todays::send_status(
+                    extended,
+                    verify.lineage,
+                    RunId(own_run.clone()),
+                    send_id,
+                )),
+            )?;
+        }
         session
             .close()
             .await
-            .map_err(|error| mismatch(NEXT_REQUEST, format!("close the copy: {error:?}")))?;
+            .map_err(|error| mismatch(check, format!("close the copy: {error:?}")))?;
         if rebuilt != today {
             return Err(mismatch(
-                NEXT_REQUEST,
-                "the next request differs from the one today's renderer builds",
+                check,
+                "the request differs from the one today's renderer builds",
             ));
         }
         scratch_progress(

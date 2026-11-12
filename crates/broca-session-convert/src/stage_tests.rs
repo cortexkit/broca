@@ -1421,3 +1421,220 @@ fn note_status_alike(enveloped: bool) {
         }
     }
 }
+
+/// The queued send of an ordered delivery whose only mode is `mode`, under submission `sub-q`.
+fn ordered_send(mode: &str) -> [WalRecord; 2] {
+    [
+        record(json!({"type": "delivery_ordered", "submission_id": "sub-q",
+            "order": {"modes": [mode], "dedupe_key": "nudge"}})),
+        record(
+            json!({"type": "queued", "submission_id": "sub-q", "send_id": "q",
+            "request": {"model": {"provider_module_id": "p", "model_id": "m"},
+                "input": [{"role": "user", "content": [{"type": "text", "text": "note"}]}],
+                "policy_allowed": [], "tool_choice": {"type": "auto"},
+                "generation": {}, "stop_when": []},
+            "written_at_ms": 1_001}),
+        ),
+    ]
+}
+
+/// A run that queued `queued` during its step and then answered in text and completed: the
+/// queued send is still pending when the run ends.
+fn completed_with_queued(queued: Vec<WalRecord>) -> Vec<FramedRecord> {
+    let mut records = vec![
+        run_started("r1", 1_000, "Hello."),
+        record(json!({"type": "step_started", "step_id": 1})),
+    ];
+    records.extend(queued);
+    records.extend([
+        record(json!({"type": "model_step_finished", "step_id": 1,
+            "assistant_message": {"message_id": "m1",
+                "content": [{"type": "text", "text": "Done."}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0})),
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+            "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ),
+    ]);
+    framed(records)
+}
+
+/// An ordered send whose only delivery mode is `tool_result`, queued while a run that made no
+/// later tool call finished, waits for a later run's tool result: today's storage keeps it
+/// queued. It moves as it is: the staged session answers its `send.status` as today's does,
+/// and the next send's first tool result delivers it alike. Any other pending send still keeps
+/// the session from moving.
+#[test]
+fn an_ordered_send_waiting_for_a_tool_result_moves_and_delivers_alike() {
+    use crate::preconditions::{wal_refusal, SESSION_BUSY};
+    let records = completed_with_queued(ordered_send("tool_result").into());
+    assert_eq!(wal_refusal(&records, None), None);
+    let root = scratch("waiting-order");
+    let staged = staged(&root, &records, None);
+    let verified = verified(&root, &records, None, &staged.converted, Mode::Move).unwrap();
+    for check in ["send_status", "first_open", "next_request", "delivery"] {
+        assert!(
+            verified.checks.contains(&check),
+            "{check}: {:?}",
+            verified.checks
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+
+    let steer = completed_with_queued(ordered_send("steer").into());
+    assert_eq!(wal_refusal(&steer, None), Some(SESSION_BUSY));
+    let [_, plain] = ordered_send("tool_result");
+    let plain = completed_with_queued(vec![plain]);
+    assert_eq!(wal_refusal(&plain, None), Some(SESSION_BUSY));
+}
+
+/// A session whose one run started a step and paused with `reason`, under send id `k1`.
+fn paused(reason: &str) -> Vec<FramedRecord> {
+    let mut start = run_started("r1", 1_000, "Hello.");
+    if let WalRecord::RunStarted { send_id, .. } = &mut start {
+        *send_id = Some("k1".into());
+    }
+    framed(vec![
+        start,
+        record(json!({"type": "step_started", "step_id": 1})),
+        record(json!({"type": "run_paused", "run_id": "r1", "ts_ms": 1_002, "reason": reason})),
+    ])
+}
+
+/// A latest run paused for sign-in, with no call held, waits for its own send's retry: today's
+/// storage leaves it paused. It moves as it is: the staged session answers its `run.status`,
+/// `run.result` and `send.status` as today's does, and its resume sends the step it couldn't
+/// send alike. Its session has no next send, which today's storage refuses with the pause. A run
+/// paused for any other reason still keeps the session from moving.
+#[test]
+fn a_run_paused_for_sign_in_moves_and_resumes_alike() {
+    use crate::preconditions::{paused_for_sign_in, wal_refusal, SESSION_BUSY};
+    let records = paused("auth_required");
+    assert_eq!(wal_refusal(&records, None), None);
+    assert_eq!(paused_for_sign_in(&records).as_deref(), Some("r1"));
+    let root = scratch("paused-sign-in");
+    let staged = staged(&root, &records, None);
+    let verified = verified(&root, &records, None, &staged.converted, Mode::Move).unwrap();
+    for check in [
+        "run_status",
+        "run_result",
+        "send_status",
+        "first_open",
+        "resume",
+    ] {
+        assert!(
+            verified.checks.contains(&check),
+            "{check}: {:?}",
+            verified.checks
+        );
+    }
+    assert!(!verified.checks.contains(&"next_request"));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let restart = paused("restart");
+    assert_eq!(wal_refusal(&restart, None), Some(SESSION_BUSY));
+    assert_eq!(paused_for_sign_in(&restart), None);
+}
+
+/// The run-index rows that let a session move: every row terminal with its usage and no
+/// withdrawal owed, and, as the one exception, the paused row of the run the move carries paused
+/// for sign-in.
+#[test]
+fn only_the_carried_paused_runs_row_may_be_unfinished() {
+    use crate::preconditions::run_rows_settled;
+    use broca_core::{RunIndexRow, RunIndexState};
+    let row = |run: &str, state: RunIndexState, usage: bool| RunIndexRow {
+        run_id: run.into(),
+        session: session(),
+        submission_id: None,
+        request_identity_digest: None,
+        state,
+        usage: usage.then(Default::default),
+        final_step_finish_reason: None,
+        retries_used: 0,
+        title: None,
+        withdrawals_owed: false,
+    };
+    let finished = row("r0", RunIndexState::Completed, true);
+    let paused = row("r1", RunIndexState::Paused, false);
+    assert!(run_rows_settled(std::slice::from_ref(&finished), None));
+    assert!(run_rows_settled(
+        &[finished.clone(), paused.clone()],
+        Some("r1")
+    ));
+    assert!(!run_rows_settled(&[finished.clone(), paused.clone()], None));
+    assert!(!run_rows_settled(std::slice::from_ref(&paused), Some("r2")));
+    let active = row("r1", RunIndexState::Active, false);
+    assert!(!run_rows_settled(&[active], Some("r1")));
+    let owing = RunIndexRow {
+        withdrawals_owed: true,
+        ..paused
+    };
+    assert!(!run_rows_settled(&[owing], Some("r1")));
+    let unreconciled = row("r0", RunIndexState::Completed, false);
+    assert!(!run_rows_settled(&[unreconciled], Some("r1")));
+}
+
+/// A session compacted under the first compaction protocol moves read-only: it stages and
+/// verifies its reads, history and entries as any session does, without rebuilding the requests
+/// the new run loop refuses to render or opening it as a writer, and says so.
+#[test]
+fn a_session_compacted_under_the_first_protocol_moves_read_only() {
+    use crate::preconditions::{converted_refusal, wal_refusal, UNSUPPORTED_FEATURE};
+    let mut records = vec![
+        run_started("r1", 1_000, "Hello."),
+        record(
+            json!({"type": "compaction_message", "provider": "mc", "kind": "setup",
+            "compaction_id": "c", "version": 1, "range": {"from": 0, "to": 0},
+            "replacement": [],
+            "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}),
+        ),
+        record(json!({"type": "step_started", "step_id": 1})),
+    ];
+    records.extend([
+        // A recorded request, which the new run loop would refuse to rebuild.
+        record(
+            json!({"type": "model_attempt_finished", "step_id": 1, "attempt": 0,
+            "outcome": "complete", "ts_ms": 1_001, "request_body_len": 0,
+            "request_body_sha256": crate::verify::sha256_hex(b""),
+            "response_body_len": 0, "response_body_sha256": crate::verify::sha256_hex(b"")}),
+        ),
+        record(json!({"type": "model_step_finished", "step_id": 1,
+            "assistant_message": {"message_id": "m1",
+                "content": [{"type": "text", "text": "Done."}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0})),
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+            "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ),
+    ]);
+    let records = framed(records);
+    assert_eq!(wal_refusal(&records, None), None);
+    let prepared = crate::stage::prepare(&records, None, None).unwrap();
+    assert_eq!(
+        block_on(converted_refusal(&prepared)).unwrap(),
+        Some(UNSUPPORTED_FEATURE),
+        "the new run loop refuses to run it"
+    );
+    let root = scratch("first-protocol");
+    let staged = staged(&root, &records, None);
+    let verified = verified(&root, &records, None, &staged.converted, Mode::Move).unwrap();
+    assert!(verified.read_only);
+    for check in ["read", "history_raw", "history_display", "entries"] {
+        assert!(
+            verified.checks.contains(&check),
+            "{check}: {:?}",
+            verified.checks
+        );
+    }
+    for skipped in ["last_step", "first_open", "next_request"] {
+        assert!(
+            !verified.checks.contains(&skipped),
+            "{skipped}: {:?}",
+            verified.checks
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
