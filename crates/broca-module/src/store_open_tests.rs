@@ -238,6 +238,80 @@ async fn stored_read_future_stays_small() {
 
 #[cfg(feature = "test-clock")]
 #[tokio::test]
+async fn a_failed_cached_head_does_not_hide_a_stale_history_version() {
+    use crate::serve::{ServeError, ServeHandler, SessionReadRequest};
+    use broca_session_store::record::Record;
+
+    let (root, runtime, registry, key) = closed_read_fixture(
+        "failed-cached-head",
+        crate::store_reads::ViewCache::MAX_BYTES,
+    )
+    .await;
+    let mut session = Session::load(
+        LocalBackend::new(StorageClass::Ordinary.store_root(&root)),
+        SessionAddr(broca_core::session_addr(&key)),
+        &triple(&key),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let records = session.open_log_records().await.unwrap();
+    let mut start = records
+        .iter()
+        .rev()
+        .find_map(|(_, record)| match record {
+            Record::RunStart(start) => Some(start.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut end = records
+        .iter()
+        .rev()
+        .find_map(|(_, record)| match record {
+            Record::RunEnd(end) => Some(end.clone()),
+            _ => None,
+        })
+        .unwrap();
+    start.run_id = "invalid-control-error".into();
+    end.run_id = start.run_id.clone();
+    end.reason = broca_protocol::RunFinishReason::Error;
+    end.usage = None;
+    // The storage fold retains opaque error JSON, but control projection requires a
+    // ProviderError. This leaves a readable snapshot with a genuinely failing stream head.
+    end.error = Some(serde_json::json!("not a ProviderError"));
+    session
+        .append(&[Record::RunStart(start), Record::RunEnd(end)], true)
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    let view = runtime.current_view(&key).await.unwrap().unwrap();
+    assert!(matches!(
+        view.stream_head(),
+        Err(ServeError::Open(
+            _,
+            Some(broca_protocol::ErrorClass::Permanent)
+        ))
+    ));
+    let mut request = SessionReadRequest::new(key.clone(), Some(1), Some(7));
+    request.history_version = Some(0);
+    let result = registry.read(request).await;
+    assert!(
+        matches!(result, Err(ServeError::HistoryChanged)),
+        "{result:?}"
+    );
+    let valid = SessionReadRequest::new(key.clone(), Some(1), Some(7));
+    assert!(matches!(registry.read(valid).await,
+        Err(ServeError::Open(message, Some(broca_protocol::ErrorClass::Permanent)))
+            if message.contains("a run end's error")));
+    assert!(registry.slot_state(&key).is_none());
+    drop(view);
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
 async fn uncached_closed_pages_load_once_per_read() {
     use crate::serve::ServeHandler;
     use std::sync::atomic::Ordering;

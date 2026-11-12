@@ -562,7 +562,8 @@ impl StoreRuntime {
             settled: Some((self.settled_runs(), &addr)),
             session_name: &key.session,
             live_step,
-            stream_head: None,
+            // A failed projection remains the page's refusal, after its request/facts checks.
+            stream_head: view.stream_head().ok(),
             entry_speaks_for,
         };
         for _ in 0..POSITION_TRIES {
@@ -597,9 +598,6 @@ impl StoreRuntime {
                         let mut context =
                             context(&view, true, true, live_step.as_ref(), entry_speaks_for);
                         context.token_counts = Some(&counts);
-                        if matches!(&request, crate::store_reads::StoreReadRequest::Page(_)) {
-                            context.stream_head = Some(view.stream_head()?);
-                        }
                         return Ok(Some(execute(&view, &context, &request).await));
                     }
                     // The actor sealed since it answered: ask it again.
@@ -651,9 +649,6 @@ impl StoreRuntime {
             attribution,
         );
         context.token_counts = Some(&counts);
-        if matches!(&request, crate::store_reads::StoreReadRequest::Page(_)) {
-            context.stream_head = Some(view.stream_head()?);
-        }
         Ok(Some(execute(&view, &context, &request).await))
     }
 

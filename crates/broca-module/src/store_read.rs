@@ -657,8 +657,8 @@ pub(crate) async fn page<B: SessionBackend>(
     response.history_version = served_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
     // The cursor at the read's durable end, which a subscribe resumes from with nothing missed
-    // or repeated: the actor's live projection knows it; otherwise it is projected from the open
-    // log, a read of storage, so a read from memory only is then served from a view instead.
+    // or repeated. Actors provide their maintained cursor; stored views share one projection.
+    // A caller without either projects the retained log, or reads storage when needed.
     let stream_head = match stream_head {
         Some(known) => known,
         None => ViewHead::new(session).await.get()?,
