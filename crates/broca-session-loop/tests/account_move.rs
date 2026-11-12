@@ -1966,6 +1966,7 @@ async fn a_crash_at_every_point_of_a_move_resumes_on_what_the_log_holds() {
     };
     let mut crashes = 0;
     let mut resumed_sends = 0;
+    let mut attempts_on_b_checked = 0;
     for mutations in 0.. {
         let backend = MemoryBackend::default();
         let mut session = session(&backend).await;
@@ -1999,11 +2000,9 @@ async fn a_crash_at_every_point_of_a_move_resumes_on_what_the_log_holds() {
                 Record::AuthRefrozen(auth) if auth.auth_selection["account_ref"] == "B" => {
                     moved_to_b = true;
                 }
-                Record::Attempt(attempt) => {
-                    let value = serde_json::to_value(attempt).unwrap();
-                    if value["attempt"]["served_account_ref"] == "B" {
-                        assert!(moved_to_b, "{context}: an attempt on B before the move");
-                    }
+                Record::Attempt(attempt) if attempt.served_account_ref.as_deref() == Some("B") => {
+                    assert!(moved_to_b, "{context}: an attempt on B before the move");
+                    attempts_on_b_checked += 1;
                 }
                 _ => {}
             }
@@ -2090,6 +2089,10 @@ async fn a_crash_at_every_point_of_a_move_resumes_on_what_the_log_holds() {
     }
     assert!(crashes > 5, "the run was cut at {crashes} points");
     assert!(resumed_sends > 0, "some resume sent step 2 again");
+    assert!(
+        attempts_on_b_checked > 0,
+        "some cut kept an attempt on B, so check 1 ran"
+    );
 }
 /// A run on A pauses for a restart after its first step, then resumes on `account` (routing
 /// gave it that one) with a provider rendering `render`. What the resume did: its end, the log

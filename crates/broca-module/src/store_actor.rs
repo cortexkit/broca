@@ -4625,6 +4625,8 @@ mod service_tier;
 mod warm;
 
 #[cfg(test)]
+mod account_move_tests;
+#[cfg(test)]
 mod billing_tests;
 #[cfg(test)]
 mod class_tests;
