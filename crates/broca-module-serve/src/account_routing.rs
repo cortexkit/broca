@@ -792,6 +792,13 @@ fn classify_account_for_reply_at(
                     ))
                 }
             };
+            // The daemon's own answer for a route it couldn't serve, not routing's refusal.
+            if is_message_plane_code(&error.code) {
+                return AccountForOutcome::Unreachable(format!(
+                    "the route answered {}, not routing",
+                    error.code
+                ));
+            }
             // Routing's message names which of its checks refused; broca keeps no other copy.
             tracing::info!(
                 target: "accounts",
@@ -2807,6 +2814,28 @@ pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutco
             }
         },
     }
+}
+
+/// The codes a route's error frame carries when the daemon (or broca's own side of the route)
+/// answered instead of routing: the target is warming, reloading, gone or timed out, the
+/// channel or route epoch is unknown, or no single routing provider is listed. Such a reply
+/// says routing wasn't reached, never what routing decided. Any other code is routing's.
+const MESSAGE_PLANE_CODES: [&str; 11] = [
+    "module_warming",
+    "module_reloading",
+    "target_unavailable",
+    "module_timeout",
+    "unknown_channel",
+    "stale_route_epoch",
+    "unknown_module",
+    "module_removed",
+    "module_no_protocol",
+    "routing_unavailable",
+    "routing_ambiguous",
+];
+
+fn is_message_plane_code(code: &str) -> bool {
+    MESSAGE_PLANE_CODES.contains(&code)
 }
 
 /// Whether an error body's `code` is routing's own refusal: a code routing's contract names,

@@ -1410,6 +1410,31 @@ async fn two_admissions_of_the_same_send_send_the_same_admission_id() {
     );
 }
 
+/// An admission's error frame the daemon wrote (the routing target warming, gone or timed out,
+/// or no single routing provider listed) says routing wasn't reached: the send is refused
+/// routing_unavailable, never as a routing refusal under the daemon's code.
+#[tokio::test]
+async fn an_admission_error_frame_routing_did_not_write_is_unreachable() {
+    for code in [
+        "target_unavailable",
+        "module_warming",
+        "unknown_module",
+        "routing_unavailable",
+    ] {
+        let routing = FakeRouting::refusing(code, json!({}));
+        let client = client(&routing);
+        let refusal = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()),
+            "{code}"
+        );
+        assert_eq!(client.counters.get("unreachable"), 1, "{code}");
+    }
+}
+
 #[tokio::test]
 async fn undeclared_disabled_and_unsupported_codes_are_refusals_not_fallbacks() {
     for code in ["disabled", "unsupported"] {
