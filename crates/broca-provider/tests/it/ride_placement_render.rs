@@ -1,7 +1,7 @@
-//! The probe placement of rides on Anthropic Messages: ride texts held beside a tool message
+//! The retired trial placement of rides on Anthropic Messages: ride texts held beside a tool message
 //! (`TagSlot::rides_after_results`) render as their own text blocks after every tool result of
-//! the turn, and the cache marker rule treats the last of them as the turn's last block. The
-//! probe is removed or replaced once the placement question is decided, and this file with it.
+//! the turn, and the cache marker rule treats the last of them as the turn's last block. Keep
+//! this coverage until stored runs admitted during the 12 November trial no longer need rendering.
 
 use broca_protocol::content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
 use broca_protocol::request::CallOptions;

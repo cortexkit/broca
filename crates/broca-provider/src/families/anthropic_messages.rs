@@ -1147,11 +1147,9 @@ fn convert_message(
                     _ => None,
                 })
                 .collect();
-            // Probe only, for measuring where models trust a ride's text: a run frozen with
-            // `RidePlacement::AfterResults` holds its rides beside the tool message instead of
-            // inside the results, and they go out here as their own text blocks after every
-            // result of the turn, in order. Removed or replaced once the placement is decided.
-            // Any other message holds none, so its bytes are unchanged.
+            // Only runs admitted while the 12 November trial switch was on carry
+            // `after_results`; new runs never get it. Keep their text blocks after the results
+            // until those stored runs no longer need rendering. Other runs hold no such tags.
             content.extend(
                 m.tags
                     .rides_after_results()

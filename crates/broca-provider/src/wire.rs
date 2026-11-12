@@ -381,10 +381,10 @@ pub struct FrozenRenderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_fallback: Option<Box<RefusalFallbackConfig>>,
     /// Where this run's requests place a ride (text a send delivered with a tool result).
-    /// Probe only, for measuring how models treat the two placements: set at admission for an
-    /// Anthropic Messages run that a state-root `experiments.json` selects, absent on every
-    /// other config, which then serializes exactly as before the member existed. Removed or
-    /// replaced once the placement question is decided.
+    /// Only runs admitted while the 12 November trial switch was on carry `after_results`.
+    /// New runs never set it. Decoding and rendering remain supported so stored trial runs
+    /// reproduce their bytes; that compatibility can go once those runs no longer need rendering.
+    /// Absent configs serialize exactly as before the member existed.
     ///
     /// An older build decodes a config holding it without error but drops the member, so its
     /// resume of such a run is refused as `frozen_render_config_drift` rather than rendered with
