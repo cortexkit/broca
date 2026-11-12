@@ -5,6 +5,8 @@
 //! facts. The store's engine is created at the session's first capture from the scalars the fold
 //! hands over then, as the session's owner creates it.
 
+use std::sync::Arc;
+
 use broca_core::media_request::{SessionMedia, WalMediaEvents};
 use broca_core::media_store::{MediaBytes, MediaReadError};
 use broca_protocol::caller::RunFinishReason;
@@ -229,7 +231,7 @@ fn input(run: &str, placement: Placement, receipt: Option<u64>, message: Message
     Record::Input(Input {
         run_id: run.into(),
         placement,
-        message,
+        message: Arc::new(message),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -241,7 +243,7 @@ fn input(run: &str, placement: Placement, receipt: Option<u64>, message: Message
 }
 
 fn facts(ordinal: u64) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         ordinal,
@@ -267,7 +269,7 @@ fn facts(ordinal: u64) -> Record {
         notices: Vec::new(),
         runner_tag_base: None,
         legacy_view_seq: None,
-    })
+    }))
 }
 
 fn step_start(run: &str, step: u64) -> Record {
@@ -322,7 +324,7 @@ fn assistant(run: &str, step: u64, calls: &[&str]) -> Record {
         run_id: run.into(),
         step_id: step,
         provider_message_id: MessageId(format!("answer{step}")),
-        message: Message::assistant_from(content, model()),
+        message: Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,

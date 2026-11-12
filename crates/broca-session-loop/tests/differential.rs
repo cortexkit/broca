@@ -1171,14 +1171,18 @@ async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
             .zip(&new)
         {
             if stored.message.role == Role::User {
-                stored.state.facts.as_mut().unwrap().notice = if marks.is_some() && notice {
-                    None
-                } else {
-                    Some(broca_session_store::record::Notice {
-                        sender: "prefrontal-core".into(),
-                        template: None,
-                    })
-                };
+                std::sync::Arc::make_mut(stored.state.facts.as_mut().unwrap()).notice =
+                    if marks.is_some() && notice {
+                        None
+                    } else {
+                        Some(
+                            broca_session_store::record::Notice {
+                                sender: "prefrontal-core".into(),
+                                template: None,
+                            }
+                            .into(),
+                        )
+                    };
             }
             let served = broca_session_loop::entries::project(&stored).unwrap();
             assert_eq!(

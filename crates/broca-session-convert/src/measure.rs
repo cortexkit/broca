@@ -116,7 +116,7 @@ fn prune(record: &Record, ended: &HashSet<String>) -> (Record, u64) {
             text.clear();
         }
     };
-    for block in &mut assistant.message.content {
+    for block in &mut std::sync::Arc::make_mut(&mut assistant.message).content {
         match block {
             ContentBlock::RedactedReasoning { data, .. } => stub(data),
             ContentBlock::Reasoning { signature, .. } => {

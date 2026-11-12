@@ -1675,20 +1675,23 @@ fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
         }
     }
     out.push_str(
-        "\ncache                  entries  max entries  estimated MiB  counted MiB  max MiB\n",
+        "\ncache                  entries  max entries  estimated MiB  counted MiB  max MiB  over cap\n",
     );
     for (name, cache) in [
         ("closed-session views", &report.closed_session_views),
         ("settled runs", &report.settled_runs),
     ] {
         out.push_str(&format!(
-            "{:<22} {:>7} {:>12} {:>14} {:>12} {:>8}\n",
+            "{:<22} {:>7} {:>12} {:>14} {:>12} {:>8} {:>9}\n",
             name,
             cache.entries,
             cache.max_entries,
             mib(cache.estimated_bytes),
             cache.counted_bytes.map_or_else(|| "-".into(), mib),
             cache.max_bytes.map_or_else(|| "-".into(), mib),
+            cache
+                .views_over_cap
+                .map_or_else(|| "-".into(), |count| count.to_string()),
         ));
     }
     out

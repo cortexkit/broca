@@ -368,8 +368,8 @@ pub fn record(
     EntryFacts {
         send_id: display.and_then(|display| display.send_id.clone()),
         client_message_id: display.and_then(|display| display.client_message_id.clone()),
-        sender: display.and_then(|display| display.sender.clone()),
-        marks: display.and_then(|display| display.marks.clone()),
+        sender: display.and_then(|display| display.sender.as_deref().map(Into::into)),
+        marks: display.and_then(|display| display.marks.clone().map(Into::into)),
         named_speaker: broca_session_store::record::marks_name_speaker(
             display.and_then(|display| display.marks.as_ref()),
         ),
@@ -381,26 +381,32 @@ pub fn record(
         ordinal,
         written_at_ms,
         tag_base: metadata.tag_base,
-        notice: metadata.notice.as_ref().map(|notice| Notice {
-            sender: notice.sender.clone(),
-            template: notice.template.clone(),
+        notice: metadata.notice.as_ref().map(|notice| {
+            Notice {
+                sender: notice.sender.clone(),
+                template: notice.template.clone(),
+            }
+            .into()
         }),
         usage,
-        generated_under: metadata.generated_under.as_ref().map(|view| ViewRef {
-            version: view.version,
-            checksum: view.checksum.to_string(),
+        generated_under: metadata.generated_under.as_ref().map(|view| {
+            ViewRef {
+                version: view.version,
+                checksum: view.checksum.to_string(),
+            }
+            .into()
         }),
         native,
         render_tags: metadata.render_tags,
         clean_reply: metadata.clean_reply,
         mid,
-        run_id,
+        run_id: run_id.map(Into::into),
         created_at_ms,
         // The mode's wire name, as the contract spells it.
         delivery_mode: delivery.and_then(|delivery| {
             serde_json::to_value(delivery.mode)
                 .ok()
-                .and_then(|mode| mode.as_str().map(str::to_owned))
+                .and_then(|mode| mode.as_str().map(Into::into))
         }),
         delivery_tool_call_id: delivery.and_then(|delivery| delivery.tool_call_id.clone()),
         // A ride's notice is added where the ride lands, by restating these facts after it.

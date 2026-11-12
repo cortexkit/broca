@@ -177,7 +177,7 @@ fn input(run: &str, message: Message) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message,
+        message: std::sync::Arc::new(message),
         written_at_ms: None,
         submission_id: None,
         notice: None,

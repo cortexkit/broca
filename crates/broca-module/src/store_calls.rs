@@ -29,12 +29,12 @@ use broca_wire::{SessionReadResponse, SessionReadToolCall};
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnOf {
     /// A placed message, with the turn facts its writer recorded, if any.
-    Placed(Option<TurnFacts>),
+    Placed(Option<std::sync::Arc<TurnFacts>>),
     /// The assistant message whose calls are still running, served from the open batch. Once
     /// all its results are placed it has its facts, though reads serve it as running until its
     /// batch closes (`store_read::results_await_close`); those name the key of a copy the open
     /// batch can't.
-    Open(Option<TurnFacts>),
+    Open(Option<std::sync::Arc<TurnFacts>>),
 }
 
 impl TurnOf {
@@ -90,8 +90,8 @@ fn served_call(
     let mut served = unattributed(id);
     if let Some(call) = call {
         served.call_key = Some(call.call_key.clone());
-        served.call_carrier = call.carrier.clone();
-        served.dispatched_to = call.dispatched_to.clone();
+        served.call_carrier = call.carrier.as_deref().map(str::to_owned);
+        served.dispatched_to = call.dispatched_to.as_deref().map(str::to_owned);
     }
     served
 }
@@ -184,7 +184,7 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
                         if call.call_key.is_none() {
                             let names: Vec<&str> = ids.iter().map(String::as_str).collect();
                             call.call_key = turn
-                                .as_ref()
+                                .as_deref()
                                 .and_then(|turn| {
                                     crate::store_read::facts_by_call(&names, turn)[position]
                                 })
@@ -193,7 +193,7 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
                         }
                         call
                     }
-                    Some(TurnOf::Placed(turn)) => placed_turn_call(turn.as_ref(), &ids, position),
+                    Some(TurnOf::Placed(turn)) => placed_turn_call(turn.as_deref(), &ids, position),
                     None => unattributed(id),
                 });
             }
@@ -230,7 +230,7 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
                 .find(|entry| entry.ordinal == assistant && !entry.open)
                 .and_then(|entry| entry.state.turn),
         };
-        let call = placed_call(turn.as_ref(), &carrier);
+        let call = placed_call(turn.as_deref(), &carrier);
         if let Some(receipt) = &mut response.messages[index].delivered_as {
             receipt.call_key = call.call_key;
             receipt.call_carrier = call.call_carrier;

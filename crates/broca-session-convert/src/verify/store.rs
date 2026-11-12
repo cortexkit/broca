@@ -124,12 +124,12 @@ pub async fn store_snapshot(
                         Record::Input(Input {
                             run_id: NEXT_RUN.into(),
                             placement: Placement::RunInput,
-                            message: broca_protocol::content::Message::new(
+                            message: std::sync::Arc::new(broca_protocol::content::Message::new(
                                 broca_protocol::content::Role::User,
                                 vec![broca_protocol::content::ContentBlock::Text {
                                     text: "The next message after the move.".into(),
                                 }],
-                            ),
+                            )),
                             written_at_ms: Some(at),
                             submission_id: None,
                             notice: None,

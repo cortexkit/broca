@@ -66,7 +66,7 @@ pub async fn tag_location<B: SessionBackend>(
     let Some(rules) = run_rules(session, parts, run_id).await? else {
         return Ok(location);
     };
-    let mut message = entry.message.clone();
+    let mut message = broca_protocol::Message::clone(&entry.message);
     let mut high = base;
     broca_protocol::tags::number_message(&mut message, rules, &mut high)
         .map_err(|_| format!("message {}'s part numbers overflow", entry.ordinal))?;

@@ -17,6 +17,8 @@
 //! its tool results already has an ordinal reserved, one past the last placed message, and its
 //! facts are kept with it until it is placed.
 
+use std::sync::Arc;
+
 use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
@@ -67,13 +69,15 @@ crate::message! {
 
 crate::message! {
     /// What `session.entries` serves about one window message besides the message itself.
+    /// Its facts are shared with the records that carry them, and with every read that serves
+    /// them.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct EntryState {
         /// Absent for sessions written before entry facts were recorded.
-        1 opt facts: EntryFacts,
+        1 opt facts: Arc<EntryFacts>,
         2 rep delivered: Delivered,
         /// For an assistant message that made tool calls: what reads serve about each call.
-        3 opt turn: TurnFacts,
+        3 opt turn: Arc<TurnFacts>,
     }
 }
 
@@ -99,7 +103,7 @@ crate::message! {
     /// An assistant message that called tools, held until each call has its reply.
     #[derive(Debug, Clone)]
     struct ToolTurn {
-        1 req assistant: Message,
+        1 req assistant: Arc<Message>,
         /// The calls in the order the assistant made them.
         2 rep calls: ToolCallId,
         /// The replies in the order they arrived. A turn holds one step's calls, so finding
@@ -114,8 +118,10 @@ state! {
     pub struct Conversation {
         /// The messages in conversation order. An assistant message whose calls aren't all
         /// answered isn't here yet. In a stored session this starts at the open log's
-        /// checkpoint, so it holds the active window, never the whole history.
-        1 rep pub messages: Message => {
+        /// checkpoint, so it holds the active window, never the whole history. Each message is
+        /// shared with the record that placed it, where one did, and with every read and request
+        /// that takes it.
+        1 rep pub messages: Arc<Message> => {
             owner: "run loop",
             reset: "never",
             bound: Bound::Window,
@@ -294,6 +300,29 @@ impl Conversation {
     /// so far, for the memory report (see `crate::held`).
     pub fn open_heap_bytes(&self) -> usize {
         crate::held::HeldBytes::heap_bytes(&self.open)
+    }
+
+    /// The addresses of what the fold holds behind its `Arc`s: every window message, the held
+    /// assistant message, and every entry's facts and turn facts. The memory report counts each
+    /// once, here, and leaves it out of another holder that shares it.
+    pub fn shared_addresses(&self) -> std::collections::HashSet<usize> {
+        let entries = self.entries.iter().chain(&self.open_entry);
+        self.messages
+            .iter()
+            .chain(self.open.as_ref().map(|turn| &turn.assistant))
+            .map(|message| Arc::as_ptr(message) as usize)
+            .chain(
+                entries
+                    .clone()
+                    .filter_map(|entry| entry.facts.as_ref())
+                    .map(|facts| Arc::as_ptr(facts) as usize),
+            )
+            .chain(
+                entries
+                    .filter_map(|entry| entry.turn.as_ref())
+                    .map(|turn| Arc::as_ptr(turn) as usize),
+            )
+            .collect()
     }
 }
 
@@ -529,7 +558,7 @@ impl Conversation {
     }
 
     /// The window message with `ordinal` and its entry state.
-    pub fn window_entry(&self, ordinal: u64) -> Option<(&Message, &EntryState)> {
+    pub fn window_entry(&self, ordinal: u64) -> Option<(&Arc<Message>, &EntryState)> {
         let start = self.window_start();
         if ordinal < start {
             return None;
@@ -539,7 +568,7 @@ impl Conversation {
     }
 
     /// The held assistant message, its reserved ordinal and its entry state.
-    pub fn open_entry(&self) -> Option<(u64, &Message, &EntryState)> {
+    pub fn open_entry(&self) -> Option<(u64, &Arc<Message>, &EntryState)> {
         let turn = self.open.as_ref()?;
         let entry = self.open_entry.as_ref()?;
         Some((self.placed + 1, &turn.assistant, entry))
@@ -551,14 +580,14 @@ impl Conversation {
     }
 
     /// The window message with `ordinal`, if it's in the window.
-    pub fn window_message(&self, ordinal: u64) -> Option<&Message> {
+    pub fn window_message(&self, ordinal: u64) -> Option<&Arc<Message>> {
         let start = self.window_start();
         (ordinal >= start)
             .then(|| self.messages.get((ordinal - start) as usize))
             .flatten()
     }
 
-    fn place(&mut self, message: Message, entry: EntryState) {
+    fn place(&mut self, message: Arc<Message>, entry: EntryState) {
         self.messages.push(message);
         self.entries.push(entry);
         self.placed += 1;
@@ -598,7 +627,7 @@ impl Conversation {
 
     /// The assistant message still waiting for replies, if any.
     pub fn open_tool_turn(&self) -> Option<&Message> {
-        self.open.as_ref().map(|turn| &turn.assistant)
+        self.open.as_ref().map(|turn| &*turn.assistant)
     }
 
     /// A render-only view before an entry in the window. A held tool turn and everything after
@@ -640,7 +669,7 @@ impl Conversation {
                 if input.placement == Placement::RunInput {
                     self.note_run_input(input);
                 }
-                self.place(input.message.clone(), EntryState::default());
+                self.place(Arc::clone(&input.message), EntryState::default());
             }
             Record::Assistant(assistant) => {
                 if self.open.is_some() {
@@ -659,16 +688,16 @@ impl Conversation {
                     // A run's budget-finalize step is its last, and the calls a provider emits in
                     // it anyway are never run, so they have no results. Its message enters at
                     // once without them, keeping its text.
-                    let mut message = assistant.message.clone();
+                    let mut message = Message::clone(&assistant.message);
                     message
                         .content
                         .retain(|block| !matches!(block, ContentBlock::ToolCall(_)));
-                    self.place(message, EntryState::default());
+                    self.place(Arc::new(message), EntryState::default());
                 } else if calls.is_empty() {
-                    self.place(assistant.message.clone(), EntryState::default());
+                    self.place(Arc::clone(&assistant.message), EntryState::default());
                 } else {
                     self.open = Some(ToolTurn {
-                        assistant: assistant.message.clone(),
+                        assistant: Arc::clone(&assistant.message),
                         calls,
                         replies: Vec::new(),
                     });
@@ -708,7 +737,10 @@ impl Conversation {
                         .collect();
                     let entry = self.open_entry.take().unwrap_or_default();
                     self.place(turn.assistant, entry);
-                    self.place(Message::new(Role::Tool, results), EntryState::default());
+                    self.place(
+                        Arc::new(Message::new(Role::Tool, results)),
+                        EntryState::default(),
+                    );
                 }
             }
             Record::ResultAppend(append) => {
@@ -736,9 +768,9 @@ impl Conversation {
                 if self.open.is_some() && facts.ordinal == self.placed + 1 {
                     self.open_entry
                         .get_or_insert_with(EntryState::default)
-                        .facts = Some(facts.clone());
+                        .facts = Some(Arc::clone(facts));
                 } else if facts.ordinal >= start && facts.ordinal <= self.placed {
-                    self.entries[(facts.ordinal - start) as usize].facts = Some(facts.clone());
+                    self.entries[(facts.ordinal - start) as usize].facts = Some(Arc::clone(facts));
                     self.changes.state(facts.ordinal);
                 } else if facts.ordinal > self.placed {
                     return Err(FoldError::FactsWithoutEntry(facts.ordinal));
@@ -750,9 +782,9 @@ impl Conversation {
                 let start = self.window_start();
                 if self.open.is_some() && turn.ordinal == self.placed + 1 {
                     self.open_entry.get_or_insert_with(EntryState::default).turn =
-                        Some(turn.clone());
+                        Some(Arc::clone(turn));
                 } else if turn.ordinal >= start && turn.ordinal <= self.placed {
-                    self.entries[(turn.ordinal - start) as usize].turn = Some(turn.clone());
+                    self.entries[(turn.ordinal - start) as usize].turn = Some(Arc::clone(turn));
                     self.changes.state(turn.ordinal);
                 } else if turn.ordinal > self.placed {
                     return Err(FoldError::FactsWithoutEntry(turn.ordinal));
@@ -815,24 +847,36 @@ mod generate;
 
 /// Appends `text` to the named result in the newest tool message, if it holds that result, and
 /// says where that message is in `messages`. Delivered text is only ever attached to a result of
-/// the batch that just finished.
-fn append_to_newest_result(messages: &mut [Message], id: &ToolCallId, text: &str) -> Option<usize> {
+/// the batch that just finished. The message is copied first only when another holder shares it.
+fn append_to_newest_result(
+    messages: &mut [Arc<Message>],
+    id: &ToolCallId,
+    text: &str,
+) -> Option<usize> {
     use broca_protocol::content::{ToolOutput, ToolOutputPart};
     let at = messages.iter().rposition(|m| m.role == Role::Tool)?;
-    for block in &mut messages[at].content {
-        if let ContentBlock::ToolResult(result) = block {
-            if &result.tool_call_id == id {
-                match &mut result.output {
-                    ToolOutput::Text { text: output } => output.push_str(text),
-                    ToolOutput::Error { message, .. } => message.push_str(text),
-                    ToolOutput::Parts { parts } => parts.push(ToolOutputPart::Text {
-                        text: text.to_owned(),
-                    }),
-                    ToolOutput::Json { .. } | ToolOutput::Denied { .. } => return None,
-                }
-                return Some(at);
-            }
+    let block = messages[at].content.iter().position(
+        |block| matches!(block, ContentBlock::ToolResult(result) if &result.tool_call_id == id),
+    )?;
+    if let ContentBlock::ToolResult(result) = &messages[at].content[block] {
+        if matches!(
+            result.output,
+            ToolOutput::Json { .. } | ToolOutput::Denied { .. }
+        ) {
+            return None;
         }
     }
-    None
+    let ContentBlock::ToolResult(result) = &mut Arc::make_mut(&mut messages[at]).content[block]
+    else {
+        unreachable!("found above");
+    };
+    match &mut result.output {
+        ToolOutput::Text { text: output } => output.push_str(text),
+        ToolOutput::Error { message, .. } => message.push_str(text),
+        ToolOutput::Parts { parts } => parts.push(ToolOutputPart::Text {
+            text: text.to_owned(),
+        }),
+        ToolOutput::Json { .. } | ToolOutput::Denied { .. } => unreachable!("checked above"),
+    }
+    Some(at)
 }

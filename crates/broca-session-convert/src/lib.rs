@@ -103,7 +103,7 @@ impl Converted {
                     }
                 }
                 Record::EntryFacts(facts) => {
-                    if let Some(seq) = &mut facts.legacy_view_seq {
+                    if let Some(seq) = &mut std::sync::Arc::make_mut(facts).legacy_view_seq {
                         *seq = *seq - view_origin + first;
                     }
                 }
@@ -419,7 +419,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                     summaries_of.insert(
                         ordinal,
                         placed
-                            .map(broca_session_loop::entries::reasoning_summaries)
+                            .map(|message| {
+                                broca_session_loop::entries::reasoning_summaries(message)
+                            })
                             .unwrap_or_default(),
                     );
                     assistant_of.insert(
@@ -468,17 +470,20 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 if assistant_of.get(&ordinal) == Some(&true) {
                     entry.rich_ui = entry
                         .run_id
-                        .as_ref()
-                        .and_then(|run| stamps.get(run).cloned().flatten());
+                        .as_deref()
+                        .and_then(|run| stamps.get(run).cloned().flatten())
+                        .map(Into::into);
                 }
-                out.records.push(Record::EntryFacts(entry));
+                out.records
+                    .push(Record::EntryFacts(std::sync::Arc::new(entry)));
             }
             *emitted = known;
             // The facts of a tool turn these records place, written after the turn's entry
             // facts, as the run loop writes them.
             if let Some(turn) = placing.map(turn_of) {
                 last_turn = Some(turn.clone());
-                out.records.push(Record::TurnFacts(turn));
+                out.records
+                    .push(Record::TurnFacts(std::sync::Arc::new(turn)));
             } else if let Some(ordinal) = last_turn
                 .as_ref()
                 .map(|turn| turn.ordinal)
@@ -494,7 +499,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                         .iter()
                         .position(|record| matches!(record, Record::Input(_)))
                         .map_or(out.records.len(), |at| before + at);
-                    out.records.insert(at, Record::TurnFacts(turn.clone()));
+                    out.records
+                        .insert(at, Record::TurnFacts(std::sync::Arc::new(turn.clone())));
                     last_turn = Some(turn);
                 }
             }
@@ -532,7 +538,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                                 ))
                             })?;
                         let restated = broca_session_loop::entries::with_ride(placed, notice);
-                        out.records.insert(at + 1, Record::EntryFacts(restated));
+                        out.records
+                            .insert(at + 1, Record::EntryFacts(std::sync::Arc::new(restated)));
                         at += 1;
                     }
                 }
@@ -578,12 +585,12 @@ fn turn_from_display(
             Some(CallFacts {
                 tool_call_id: ToolCallId(time.tool_call_id.clone()),
                 call_key: time.call_key.clone()?,
-                schema_pin: time.schema_pin.clone().map(Value::String),
+                schema_pin: time.schema_pin.clone().map(|pin| Value::String(pin).into()),
                 carrier: None,
                 dispatched_to: dispatches
                     .and_then(|dispatches| dispatches.get(index))
                     .filter(|dispatch| dispatch.tool_call_id == time.tool_call_id)
-                    .and_then(|dispatch| dispatch.dispatched_to.clone()),
+                    .and_then(|dispatch| dispatch.dispatched_to.as_deref().map(Into::into)),
                 dispatched_at_ms: time.started_at,
                 finished_at_ms: time.finished_at,
                 unanswered: time.unanswered.as_deref().and_then(Unanswered::from_name),
@@ -928,7 +935,10 @@ fn convert_record(
                     media: Vec::new(),
                     run_id: state.run_id.clone(),
                     placement: Placement::BudgetNudge,
-                    message: Message::new(Role::User, vec![ContentBlock::Text { text }]),
+                    message: std::sync::Arc::new(Message::new(
+                        Role::User,
+                        vec![ContentBlock::Text { text }],
+                    )),
                     written_at_ms: None,
                     submission_id: None,
                     notice: None,
@@ -1302,7 +1312,7 @@ fn copies_of(
             media: Vec::new(),
             run_id: String::new(),
             placement,
-            message: message.clone(),
+            message: std::sync::Arc::new(message.clone()),
             written_at_ms: written,
             submission_id: submission.clone(),
             notice: None,
@@ -1480,7 +1490,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
             media: Vec::new(),
             run_id: run_id.clone(),
             placement: Placement::RunInput,
-            message,
+            message: std::sync::Arc::new(message),
             written_at_ms: written_at,
             submission_id: submission_id.clone(),
             notice: None,
@@ -1529,7 +1539,7 @@ fn model_step_finished(
         run_id: state.run_id.clone(),
         step_id,
         provider_message_id: message_id,
-        message: Message::assistant_from(content, model),
+        message: std::sync::Arc::new(Message::assistant_from(content, model)),
         usage,
         written_at_ms: f.u64("written_at_ms"),
         last_content_at_ms: None,
@@ -1559,7 +1569,7 @@ fn model_step_finished(
             .rev()
             .find(|record| matches!(record, Record::Assistant(_)))
         {
-            assistant.message.origin = Some(routed);
+            std::sync::Arc::make_mut(&mut assistant.message).origin = Some(routed);
         }
     }
     // A provider fallback inside the step served several model calls; `usage` holds the last

@@ -298,10 +298,14 @@ pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
 pub struct Transcript {
     pub entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
-    pub sealed: Arc<Vec<(u64, broca_protocol::Message)>>,
+    pub sealed: SealedMessages,
     /// The ride envelopes of the entries' delivered texts, for rendering each ride.
     pub rides: Arc<v2::entries::RideEnvelopes>,
 }
+
+/// Sealed messages a transcript puts in front of the window's, each with its ordinal, shared by
+/// every holder of the transcript.
+pub type SealedMessages = Arc<Vec<(u64, Arc<broca_protocol::Message>)>>;
 
 /// What the transcript keeps, for the open session, of the sealed entries its views name: the
 /// session holds it while it's open and drops it when its history version moves (see
@@ -320,7 +324,7 @@ struct SealedParts {
 /// with its calls, which give their rides' envelopes.
 struct SealedEntry {
     entry: cortexkit_role_compaction::read::Entry,
-    message: (u64, broca_protocol::Message),
+    message: (u64, Arc<broca_protocol::Message>),
     delivered: Vec<Delivered>,
 }
 
@@ -395,7 +399,7 @@ async fn sealed_entries<W: Writer>(
 ) -> Result<
     (
         Vec<cortexkit_role_compaction::read::Entry>,
-        Vec<(u64, broca_protocol::Message)>,
+        Vec<(u64, Arc<broca_protocol::Message>)>,
         Vec<(String, Vec<Delivered>)>,
     ),
     LoopError,
@@ -553,7 +557,7 @@ fn with_sealed(
         .sealed
         .iter()
         .map(|(ordinal, message)| {
-            let mut message = message.clone();
+            let mut message = broca_protocol::Message::clone(message);
             message.ordinal = Some(ordinal - 1);
             message
         })
@@ -751,7 +755,11 @@ fn spanning_repetition(
     // earlier steps are counted in the counters the window kept.
     let from = run.start.max(window_start);
     let below: Vec<_> = (from..first_kept)
-        .filter_map(|ordinal| conversation.window_message(ordinal).cloned())
+        .filter_map(|ordinal| {
+            conversation
+                .window_message(ordinal)
+                .map(|message| broca_protocol::Message::clone(message))
+        })
         .collect();
     let seed =
         match (run.start < window_start, &conversation.window_repetition) {

@@ -284,7 +284,8 @@ fn a_requested_send_id_index_stays_current_across_appends() {
         // The first run is a direct user turn, so add a sender only to the read copy to
         // request the same admission index that a module-authored input would need.
         let mut entries = entries;
-        entries[0].state.facts.as_mut().unwrap().sender = Some("sample-sender".into());
+        std::sync::Arc::make_mut(entries[0].state.facts.as_mut().unwrap()).sender =
+            Some("sample-sender".into());
         assert_eq!(
             session.entry_send_ids(&entries).await.unwrap().get(&1),
             Some(&None)
@@ -504,7 +505,7 @@ fn older_send_ids_are_exact_cached_and_do_not_change_content_digests() {
     let older = bodies(|records| {
         for record in records {
             if let Record::EntryFacts(facts) = record {
-                facts.send_id = None;
+                std::sync::Arc::make_mut(facts).send_id = None;
             }
         }
     });

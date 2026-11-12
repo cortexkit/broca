@@ -162,7 +162,10 @@ fn input(run: &str, text: &str) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -178,7 +181,7 @@ fn answer(run: &str, text: &str) -> Record {
         run_id: run.into(),
         step_id: 1,
         provider_message_id: MessageId(format!("m-{text}")),
-        message: Message::assistant_from(
+        message: std::sync::Arc::new(Message::assistant_from(
             vec![
                 ContentBlock::RedactedReasoning {
                     data: format!("opaque-{text}"),
@@ -187,7 +190,7 @@ fn answer(run: &str, text: &str) -> Record {
                 ContentBlock::Text { text: text.into() },
             ],
             model(),
-        ),
+        )),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -197,7 +200,7 @@ fn answer(run: &str, text: &str) -> Record {
     })
 }
 
-fn texts(messages: &[Message]) -> Vec<String> {
+fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
     messages
         .iter()
         .flat_map(|m| &m.content)

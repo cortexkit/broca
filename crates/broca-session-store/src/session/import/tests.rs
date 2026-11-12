@@ -109,7 +109,7 @@ fn input(run: &str, placement: Placement, role: Role, content: Vec<ContentBlock>
     Record::Input(Input {
         run_id: run.into(),
         placement,
-        message: Message::new(role, content),
+        message: std::sync::Arc::new(Message::new(role, content)),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -125,7 +125,7 @@ fn text(text: &str) -> ContentBlock {
 }
 
 fn facts(ordinal: u64, mid: &str) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         ordinal,
@@ -151,7 +151,7 @@ fn facts(ordinal: u64, mid: &str) -> Record {
         notices: Vec::new(),
         runner_tag_base: None,
         legacy_view_seq: None,
-    })
+    }))
 }
 
 fn receipt() -> ImportReceipt {
@@ -439,7 +439,7 @@ fn turn_facts_attach_to_their_message(cipher: Cipher) {
         let records = vec![
             start("seed", true),
             input("seed", Placement::Imported, Role::Assistant, vec![call]),
-            Record::TurnFacts(turn.clone()),
+            Record::TurnFacts(std::sync::Arc::new(turn.clone())),
             facts(1, "msg_a"),
             end("seed"),
         ];
@@ -447,13 +447,13 @@ fn turn_facts_attach_to_their_message(cipher: Cipher) {
             .append_import(&records, Vec::new(), vec![("msg_a".into(), 1)], &receipt())
             .await
             .unwrap();
-        assert_eq!(session.conversation.entries[0].turn, Some(turn.clone()));
+        assert_eq!(session.conversation.entries[0].turn.as_deref(), Some(&turn));
         session.close().await.unwrap();
         let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         let entry = loaded.entries(1, 1).await.unwrap().remove(0);
-        assert_eq!(entry.state.turn, Some(turn));
+        assert_eq!(entry.state.turn.as_deref(), Some(&turn));
         assert_eq!(entry.state.facts.unwrap().mid, "msg_a");
     });
 }

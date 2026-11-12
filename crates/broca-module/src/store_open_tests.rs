@@ -134,7 +134,7 @@ async fn closed_read_fixture(
         }
         if let Record::EntryFacts(facts) = record {
             if facts.native {
-                facts.sender = None;
+                Arc::make_mut(facts).sender = None;
             }
         }
     }

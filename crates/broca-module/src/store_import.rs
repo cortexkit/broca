@@ -504,7 +504,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
         records.push(Record::Input(Input {
             run_id: run_id.clone(),
             placement: Placement::Imported,
-            message: message.message.clone(),
+            message: std::sync::Arc::new(message.message.clone()),
             written_at_ms: message.written_at_ms,
             submission_id: None,
             notice: notice.clone(),
@@ -522,7 +522,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             bytes: medium.bytes.clone(),
         }));
         if !message.calls.is_empty() {
-            records.push(Record::TurnFacts(TurnFacts {
+            records.push(Record::TurnFacts(std::sync::Arc::new(TurnFacts {
                 ordinal,
                 calls: message
                     .calls
@@ -530,8 +530,11 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                     .map(|call| CallFacts {
                         tool_call_id: broca_protocol::ToolCallId(call.tool_call_id.clone()),
                         call_key: call.call_key.clone(),
-                        schema_pin: call.schema_pin.clone().map(serde_json::Value::String),
-                        carrier: Some(call.carrier.clone()),
+                        schema_pin: call
+                            .schema_pin
+                            .clone()
+                            .map(|pin| serde_json::Value::String(pin).into()),
+                        carrier: Some(call.carrier.as_str().into()),
                         dispatched_to: None,
                         dispatched_at_ms: call.started_at,
                         finished_at_ms: call.finished_at,
@@ -541,7 +544,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                             .and_then(broca_session_store::record::Unanswered::from_name),
                     })
                     .collect(),
-            }));
+            })));
         }
         for ride in &message.rides {
             records.push(Record::ResultAppend(ResultAppend {
@@ -578,12 +581,12 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             .as_ref()
             .filter(|_| message.message.role == Role::User);
         let ride = message.rides.last();
-        records.push(Record::EntryFacts(EntryFacts {
+        records.push(Record::EntryFacts(std::sync::Arc::new(EntryFacts {
             send_id: send.map(|send| send.send_id.clone()),
             ordinal,
             written_at_ms: Some(written),
             tag_base: high,
-            notice,
+            notice: notice.map(Into::into),
             usage: message.usage.map(|usage| StepUsage {
                 prompt_tokens: usage.prompt_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
@@ -602,11 +605,12 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             created_at_ms: message.created_at_ms,
             delivery_mode: send
                 .and_then(|send| send.delivery_mode.clone())
-                .or_else(|| ride.and_then(|ride| ride.delivery_mode.clone())),
+                .or_else(|| ride.and_then(|ride| ride.delivery_mode.clone()))
+                .map(Into::into),
             delivery_tool_call_id: ride.and_then(|ride| ride.delivery_tool_call_id.clone()),
             client_message_id: send.and_then(|send| send.client_message_id.clone()),
-            sender: send.map(|send| send.sender.clone()),
-            marks: send.and_then(|send| send.marks.clone()),
+            sender: send.map(|send| send.sender.as_str().into()),
+            marks: send.and_then(|send| send.marks.clone()).map(Into::into),
             named_speaker: broca_session_store::record::marks_name_speaker(
                 send.and_then(|send| send.marks.as_ref()),
             ),
@@ -617,7 +621,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             notices: Vec::new(),
             runner_tag_base: None,
             legacy_view_seq: None,
-        }));
+        })));
         high = high
             .checked_add(broca_core::compaction_v2::metadata::numbered_parts(
                 &message.message,

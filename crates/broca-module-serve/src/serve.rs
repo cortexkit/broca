@@ -2297,6 +2297,10 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            // Views of closed sessions loaded and not kept because each alone was larger than the
+            // view cache's byte cap: each read of such a session while it is closed loads it again.
+            metrics["views_over_cap"] =
+                serde_json::json!(broca_module::store_reads::views_over_cap());
             // Which deployment key the new session storage is opened with, and whether it has
             // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
             metrics["store"] = crate::store_key::health();

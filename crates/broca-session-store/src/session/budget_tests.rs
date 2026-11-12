@@ -24,28 +24,33 @@ const MESSAGES: usize = 1_000;
 
 // Limits on what a loaded session holds, in thousandths of `W` (4.56 MB here). Today's measure
 // was taken on the synthetic session at 1,000 messages.
-/// The whole session. Today: 3.063. Target: the design's idle budget, about 1,288 at this
+/// The whole session. Today: 1.634. Target: the design's idle budget, about 1,288 at this
 /// session's 4.5 KB per message (1.2 x W + 400 B x messages).
-const TOTAL: u64 = 3_370;
-/// The window's messages. Today: 1.114. Target: about 1,000, content held at its sent size.
+const TOTAL: u64 = 1_798;
+/// The window's messages, the latest run's ones the kept records share included. Today: 1.155;
+/// measure plus 10% would be above the limit of 1.226 set before, so the limit stays 1.226.
+/// Target: about 1,000, content held at its sent size.
 const HELD_MESSAGES: u64 = 1_226;
-/// The window messages' entry states. Today: 0.254 (1,160 bytes per message). Target: 250
-/// bytes per message, about 55.
-const ENTRY_FACTS: u64 = 280;
-/// The kept records' contents. Today: 0.371. Target: their own small fields only, once they
-/// share content with the folds.
-const KEPT_RECORDS: u64 = 408;
-/// The kept records' buffer beyond its records. Today: 0.992. Target: none, a buffer sized for
+/// The window messages' entry states, the facts the kept records share included. Today: 0.168
+/// (765 bytes per message). Target: 250 bytes per message, about 55.
+const ENTRY_FACTS: u64 = 185;
+/// The kept records' contents beyond what they share with the conversation. Today: 0.269, most
+/// of it the latest run's tool results: the conversation's tool message holds its own copy of
+/// each result until a message's text and JSON can be shared between holders. Target: their own
+/// small fields only.
+const KEPT_RECORDS: u64 = 296;
+/// The kept records' buffer beyond its records. Today: 0.023. Target: none, a buffer sized for
 /// the latest run.
-const KEPT_SPARE: u64 = 1_092;
-/// The id index. Today: 0.323. Target: positions only, a few bytes per id.
-const ID_INDEX: u64 = 356;
-/// Everything else. Today: 0.008 (38 KB). Target: a small share of the idle budget. Rounded up
-/// to the next thousandth.
+const KEPT_SPARE: u64 = 26;
+/// The id index. Today: 0.012. Target: positions only, a few bytes per id. Rounded up to the
+/// next thousandth.
+const ID_INDEX: u64 = 14;
+/// Everything else, the session's interned values included. Today: 0.008 (39 KB). Target: a
+/// small share of the idle budget. Rounded up to the next thousandth.
 const REST: u64 = 10;
-/// Bytes allocated while loading, freed or not. Today: 10.032. Target: none set by the design;
+/// Bytes allocated while loading, freed or not. Today: 6.916. Target: none set by the design;
 /// opening folds the log record by record and never holds it whole.
-const ALLOCATED_DURING_LOAD: u64 = 11_037;
+const ALLOCATED_DURING_LOAD: u64 = 7_608;
 
 /// How far an estimate may be from what the allocator measured for the same holder, in percent.
 const ESTIMATE_TOLERANCE: usize = 15;
@@ -82,7 +87,9 @@ fn freed<T>(value: T) -> u64 {
 }
 
 /// Writes the synthetic session, then loads it under the counting allocator and takes each
-/// holder apart, measuring what dropping it frees.
+/// holder apart, measuring what dropping it frees. The kept records go first: what they share
+/// with the conversation (its messages and their facts) is freed with the conversation's
+/// holders, which the memory report counts it under.
 fn loaded() -> Measured {
     assert!(
         installed(),
@@ -102,10 +109,10 @@ fn loaded() -> Measured {
     let mut session = Box::new(session);
     let w = window_bytes(&session.conversation);
     let estimated = session.held_bytes();
-    let messages = freed(std::mem::take(&mut session.conversation.messages));
-    let entry_facts = freed(std::mem::take(&mut session.conversation.entries));
     let kept_spare = estimated.kept_capacity as u64;
     let kept = freed(std::mem::take(&mut session.kept));
+    let messages = freed(std::mem::take(&mut session.conversation.messages));
+    let entry_facts = freed(std::mem::take(&mut session.conversation.entries));
     let id_index = freed(std::mem::replace(
         &mut session.open_ids,
         crate::idindex::OpenIds::new([0; 32]),
@@ -207,4 +214,79 @@ fn the_estimates_of_a_loaded_session_match_the_allocator() {
              {ESTIMATE_TOLERANCE}%{table}"
         );
     }
+}
+
+/// Messages of the session whose entries fill the sealed-entry cache: more than twice what the
+/// cache may keep of them.
+const SEALED_MESSAGES: usize = 4_000;
+
+/// A session keeps at most [`SEALED_ENTRIES_MAX_BYTES`] of the sealed entries it reads by id, as
+/// the allocator measures them: entries of more than twice the cap in all, each a copy of its
+/// own as an entry read back from sealed history is, leave no more than the cap kept, the most
+/// recently read ones, and the cache counts what it keeps.
+#[test]
+fn sealed_entries_read_by_id_hold_no_more_than_their_cap() {
+    use std::sync::Arc;
+
+    use broca_protocol::content::Message;
+
+    use super::read::SealedEntryCache;
+    use super::{window_entries, StoredEntry, SEALED_ENTRIES_MAX_BYTES};
+    use crate::held::held_bytes;
+
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    let backend = MemoryBackend::default();
+    // The session stays open while the cache is measured, so the values its facts intern stay
+    // held by it, as they are by the session a sealed entry is read from.
+    let session = block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        write(&mut session, &Shape::production(SEALED_MESSAGES))
+            .await
+            .unwrap();
+        session
+    });
+    let own = |message: &Arc<Message>| Arc::new(Message::clone(message));
+    let entries: Vec<(String, StoredEntry)> = window_entries(&session.conversation, 1, usize::MAX)
+        .into_iter()
+        .map(|entry| {
+            let mid = entry.state.facts.as_ref().unwrap().mid.clone();
+            let mut state = entry.state.clone();
+            state.facts = state.facts.map(|facts| Arc::new((*facts).clone()));
+            state.turn = state.turn.map(|turn| Arc::new((*turn).clone()));
+            let copy = StoredEntry {
+                ordinal: entry.ordinal,
+                message: own(&entry.message),
+                next: entry.next.as_ref().map(own),
+                state,
+                open: entry.open,
+            };
+            (mid, copy)
+        })
+        .collect();
+    let read: usize = entries.iter().map(|(_, entry)| held_bytes(entry)).sum();
+    assert!(read > 2 * SEALED_ENTRIES_MAX_BYTES, "only {read} bytes");
+    let (first, last) = (entries[0].0.clone(), entries[entries.len() - 1].0.clone());
+    let mut cache = SealedEntryCache::default();
+    for (mid, entry) in entries {
+        cache.insert(&mid, entry);
+    }
+    assert!(cache.get(&last).is_some());
+    assert!(cache.get(&first).is_none());
+    let (kept, counted) = (cache.len(), cache.held_bytes());
+    // What the cache holds is what dropping it frees.
+    let ((), counts) = measure(|| drop(cache));
+    let held = counts.held.unsigned_abs();
+    eprintln!("read {read} bytes; kept {kept} entries, counted {counted}, held {held}");
+    assert!(counted <= SEALED_ENTRIES_MAX_BYTES);
+    assert!(
+        held <= SEALED_ENTRIES_MAX_BYTES,
+        "the cache holds {held} bytes of sealed entries, over their cap of \
+         {SEALED_ENTRIES_MAX_BYTES}"
+    );
+    drop(session);
 }

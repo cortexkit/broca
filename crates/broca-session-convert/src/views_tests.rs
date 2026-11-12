@@ -573,7 +573,7 @@ fn a_session_whose_replies_carry_part_numbers_moves_and_verifies() {
         .into_iter()
         .filter(|entry| entry.message.role == broca_protocol::Role::Assistant)
         .inspect(|entry| assert!(entry.state.facts.as_ref().unwrap().clean_reply))
-        .flat_map(|entry| entry.message.content)
+        .flat_map(|entry| entry.message.content.clone())
         .filter_map(|block| match block {
             broca_protocol::ContentBlock::Text { text } => Some(text),
             _ => None,

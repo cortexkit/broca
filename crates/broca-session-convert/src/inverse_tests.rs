@@ -205,7 +205,7 @@ fn a_placed_copy_that_differs_from_its_record_refuses() {
     else {
         panic!("the placed copy");
     };
-    copy.message.content = vec![ContentBlock::Text {
+    std::sync::Arc::make_mut(&mut copy.message).content = vec![ContentBlock::Text {
         text: "changed".into(),
     }];
     let error = invert(&converted.records, &converted.parts).unwrap_err();

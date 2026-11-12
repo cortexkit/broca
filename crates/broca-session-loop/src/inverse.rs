@@ -231,7 +231,7 @@ fn check_copies(inputs: &[&Input], messages: &[Message], name: &str) -> Result<(
     expect(
         inputs.is_empty()
             || (inputs.len() == messages.len()
-                && inputs.iter().zip(messages).all(|(i, m)| &i.message == m)),
+                && inputs.iter().zip(messages).all(|(i, m)| *i.message == *m)),
         name,
     )
 }

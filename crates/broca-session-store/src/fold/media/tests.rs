@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{ContentBlock, MediaRef, Message, Role};
 use broca_protocol::ids::{MessageId, StepId, ToolCallId};
@@ -152,7 +154,7 @@ pub(crate) fn input(
     Record::Input(Input {
         run_id: run.into(),
         placement,
-        message,
+        message: Arc::new(message),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -179,7 +181,7 @@ pub(crate) fn photo(words: &str, name: &str) -> Message {
 }
 
 pub(crate) fn facts(ordinal: u64) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         ordinal,
@@ -205,7 +207,7 @@ pub(crate) fn facts(ordinal: u64) -> Record {
         notices: Vec::new(),
         runner_tag_base: None,
         legacy_view_seq: None,
-    })
+    }))
 }
 
 pub(crate) fn step_start(run: &str, step: u64) -> Record {
@@ -253,7 +255,7 @@ pub(crate) fn assistant(run: &str, step: u64, content: Vec<ContentBlock>) -> Rec
         run_id: run.into(),
         step_id: step,
         provider_message_id: MessageId(format!("p-{run}-{step}")),
-        message: Message::assistant_from(content, model()),
+        message: Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -361,10 +363,10 @@ pub(crate) fn outcome(run: &str, step: u64, id: &str) -> Record {
 }
 
 pub(crate) fn turn_facts(ordinal: u64) -> Record {
-    Record::TurnFacts(TurnFacts {
+    Record::TurnFacts(Arc::new(TurnFacts {
         ordinal,
         calls: Vec::new(),
-    })
+    }))
 }
 
 pub(crate) fn steer(messages: Vec<Message>) -> Record {

@@ -510,8 +510,8 @@ pub async fn answer_in_memory<B: SessionBackend>(
 ///
 /// **Shared loads.** Readers of the same session at the same position share one load.
 ///
-/// **Bounded** by [`ViewCache::MAX_ENTRIES`] views and [`ViewCache::MAX_BYTES`] of estimated size;
-/// the least recently used view goes first.
+/// **Bounded** by [`ViewCache::MAX_ENTRIES`] views and [`ViewCache::MAX_BYTES`] of their walked
+/// size (see [`CachedBytes`]); the least recently used view goes first.
 pub struct ViewCache<V = SessionView<LocalBackend>> {
     inner: Mutex<CacheInner<V>>,
     max_entries: usize,
@@ -522,6 +522,18 @@ struct CacheInner<V> {
     entries: HashMap<String, CacheEntry<V>>,
     bytes: u64,
     clock: u64,
+    /// Views loaded and not kept because each alone was larger than the byte cap.
+    over_cap: u64,
+}
+
+/// Views of closed sessions this process loaded and didn't keep because each alone was larger
+/// than its cache's byte cap, over every cache: `health.check` reports it as `views_over_cap`.
+static VIEWS_OVER_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many views of closed sessions were loaded and not kept since the process started,
+/// because each alone was larger than the view cache's byte cap (see [`ViewCache::MAX_BYTES`]).
+pub fn views_over_cap() -> u64 {
+    VIEWS_OVER_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl<V> Default for CacheInner<V> {
@@ -530,6 +542,7 @@ impl<V> Default for CacheInner<V> {
             entries: HashMap::new(),
             bytes: 0,
             clock: 0,
+            over_cap: 0,
         }
     }
 }
@@ -538,9 +551,47 @@ struct CacheEntry<V> {
     token_counts: Arc<Mutex<broca_core::compaction_v2::tokens::Counts>>,
     position: Position,
     cell: Arc<tokio::sync::OnceCell<Arc<V>>>,
-    /// The view's estimated size, once loaded.
+    /// The view's walked size when it loaded, once loaded.
+    loaded: u64,
+    /// What the view counts against the byte cap: its walked size when it loaded, and what its
+    /// reads have kept since, as of the last time it was served.
     bytes: u64,
     used: u64,
+}
+
+/// What a kept view holds, as [`ViewCache`] counts it against its byte cap.
+pub trait CachedBytes {
+    /// What the view holds when it has just loaded, walked once (see
+    /// `broca_session_store::held`).
+    fn loaded_bytes(&self) -> u64;
+    /// What the view's reads have kept since it loaded, read without walking the view: a view
+    /// keeps the sealed entries it reads by id (at most
+    /// `broca_session_store::session::SEALED_ENTRIES_MAX_BYTES`), and nothing else grows.
+    fn grown_bytes(&self) -> u64;
+}
+
+impl<B: broca_session_store::backend::SessionBackend> CachedBytes for SessionView<B> {
+    fn loaded_bytes(&self) -> u64 {
+        self.held_bytes().total() as u64
+    }
+
+    fn grown_bytes(&self) -> u64 {
+        self.sealed_entries_bytes() as u64
+    }
+}
+
+/// A stored view counts as the session view it boxes, with its own few fields (the probed
+/// position and the control stream's head) on top.
+impl<B: broca_session_store::backend::SessionBackend> CachedBytes
+    for crate::store_read::StoredView<B>
+{
+    fn loaded_bytes(&self) -> u64 {
+        std::mem::size_of::<SessionView<B>>() as u64 + SessionView::<B>::loaded_bytes(self)
+    }
+
+    fn grown_bytes(&self) -> u64 {
+        SessionView::<B>::grown_bytes(self)
+    }
 }
 
 impl ViewCache {
@@ -549,23 +600,15 @@ impl ViewCache {
     /// again after this many others were read reloads.
     pub const MAX_ENTRIES: usize = 64;
 
-    /// The estimated bytes of all kept views together: 1 GiB. A view holds its open log's records
-    /// and the folds built from them, about [`ViewCache::BYTES_PER_LOG_BYTE`] times the log's
-    /// length. A view of the largest live log today (a 14 MB WAL) then takes about 70 MB, so a
-    /// dozen such sessions, or dozens of ordinary ones, stay loaded. A session whose view alone
-    /// would pass the bound (an open log past about 200 MB, some 100,000 messages of tool turns)
-    /// is never kept: each of its reads while closed loads it, as every read did before views were
-    /// kept. Holding several gigabytes for sessions nobody may read again would cost more than
-    /// those occasional loads; a session that long and in use is open, and its actor answers.
-    pub const MAX_BYTES: u64 = 1024 * 1024 * 1024;
-
-    /// A loaded view's resident size per byte of its open log. The read cost bar
-    /// (`store_actor::read_cost`) measured 1.39 GB for a 275 MB log of 150,000 messages, 5.1
-    /// bytes per byte; a small session adds a few megabytes of its own on top.
-    pub const BYTES_PER_LOG_BYTE: u64 = 5;
+    /// What all kept views hold together, by their walked size (see [`CachedBytes`]): 256 MiB.
+    /// A view holds its open log's records and the folds built from them. A read of a session
+    /// whose view isn't kept loads it from storage again, as every read did before views were
+    /// kept, and a session whose view alone passes the bound is never kept. A session that long
+    /// and in use is open, and its actor answers its reads.
+    pub const MAX_BYTES: u64 = 256 * 1024 * 1024;
 }
 
-impl<V> ViewCache<V> {
+impl<V: CachedBytes> ViewCache<V> {
     pub fn new(max_entries: usize, max_bytes: u64) -> Self {
         Self {
             inner: Mutex::new(CacheInner::default()),
@@ -590,7 +633,16 @@ impl<V> ViewCache<V> {
             match inner.entries.get_mut(addr) {
                 Some(entry) if entry.position == position => {
                     entry.used = clock;
-                    Arc::clone(&entry.cell)
+                    let cell = Arc::clone(&entry.cell);
+                    // A kept view's reads may have kept sealed entries since it was last served.
+                    let recounted = cell.get().map(|view| {
+                        let bytes = entry.loaded + view.grown_bytes();
+                        (std::mem::replace(&mut entry.bytes, bytes), bytes)
+                    });
+                    if let Some((before, after)) = recounted {
+                        inner.bytes = inner.bytes - before + after;
+                    }
+                    cell
                 }
                 _ => {
                     let cell = Arc::new(tokio::sync::OnceCell::new());
@@ -605,6 +657,7 @@ impl<V> ViewCache<V> {
                             token_counts,
                             position,
                             cell: Arc::clone(&cell),
+                            loaded: 0,
                             bytes: 0,
                             used: clock,
                         },
@@ -621,14 +674,26 @@ impl<V> ViewCache<V> {
             .await?
             .clone();
         let mut inner = self.inner.lock().unwrap();
-        let size = view_bytes(&position);
         if let Some(entry) = inner.entries.get_mut(addr) {
             if Arc::ptr_eq(&entry.cell, &cell) && entry.bytes == 0 {
-                entry.bytes = size;
-                inner.bytes += size;
+                // Walked once, by the reader whose load filled the cell's entry first; at least
+                // one byte, so a counted entry is never taken for an unloaded one.
+                entry.loaded = view.loaded_bytes().max(1);
+                entry.bytes = entry.loaded + view.grown_bytes();
+                inner.bytes += entry.bytes;
             }
         }
-        inner.evict(self.max_entries, self.max_bytes);
+        for (addr, bytes) in inner.evict(self.max_entries, self.max_bytes) {
+            inner.over_cap += 1;
+            VIEWS_OVER_CAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                session = %addr,
+                counted_bytes = bytes,
+                max_bytes = self.max_bytes,
+                "a closed session's view is larger than the view cache's byte cap, so it isn't \
+                 kept: each read of the session while it is closed loads it again"
+            );
+        }
         Ok(view)
     }
 
@@ -638,9 +703,9 @@ impl<V> ViewCache<V> {
         (inner.entries.len(), inner.bytes)
     }
 
-    /// What the cache holds, with its caps: the bytes it counts against its byte cap (each
-    /// view's open-log length times [`ViewCache::BYTES_PER_LOG_BYTE`]), and the bytes each loaded
-    /// view holds as `estimate` walks it.
+    /// What the cache holds, with its caps: the bytes it counts against its byte cap (each view's
+    /// walked size when it loaded and what its reads kept since, see [`CachedBytes`]), and the
+    /// bytes each loaded view holds as `estimate` walks it now.
     pub fn memory(&self, estimate: impl Fn(&V) -> usize) -> broca_wire::MemoryCache {
         let inner = self.inner.lock().unwrap();
         let estimated = inner
@@ -655,6 +720,7 @@ impl<V> ViewCache<V> {
             counted_bytes: Some(inner.bytes),
             max_bytes: Some(self.max_bytes),
             estimated_bytes: estimated as u64,
+            views_over_cap: Some(inner.over_cap),
         }
     }
 
@@ -680,7 +746,23 @@ impl Default for ViewCache {
 
 impl<V> CacheInner<V> {
     /// Drops the least recently used views until the cache is within its bounds.
-    fn evict(&mut self, max_entries: usize, max_bytes: u64) {
+    /// Drops views until the cache fits its caps, and returns the views dropped because each
+    /// alone was larger than the byte cap, with their counted bytes. Such a view goes first, so
+    /// it never pushes the views that fit out of the cache.
+    fn evict(&mut self, max_entries: usize, max_bytes: u64) -> Vec<(String, u64)> {
+        let over: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.bytes > max_bytes)
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        let mut dropped = Vec::new();
+        for addr in over {
+            if let Some(entry) = self.entries.remove(&addr) {
+                self.bytes -= entry.bytes;
+                dropped.push((addr, entry.bytes));
+            }
+        }
         while self.entries.len() > max_entries || self.bytes > max_bytes {
             let Some(oldest) = self
                 .entries
@@ -688,22 +770,14 @@ impl<V> CacheInner<V> {
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(addr, _)| addr.clone())
             else {
-                return;
+                return dropped;
             };
             if let Some(entry) = self.entries.remove(&oldest) {
                 self.bytes -= entry.bytes;
             }
         }
+        dropped
     }
-}
-
-/// A view's estimated resident size: its open log's length times what the cost bar measured per
-/// byte. A view at a position never grows, apart from sealed entries it reads and keeps.
-fn view_bytes(position: &Position) -> u64 {
-    position
-        .len
-        .saturating_mul(ViewCache::BYTES_PER_LOG_BYTE)
-        .max(1)
 }
 
 #[cfg(test)]
@@ -714,7 +788,18 @@ mod tests {
     use broca_session_store::codec::Id128;
     use broca_session_store::session::Position;
 
-    use super::ViewCache;
+    use super::{CachedBytes, ViewCache};
+
+    /// A test view whose number is its size.
+    impl CachedBytes for u64 {
+        fn loaded_bytes(&self) -> u64 {
+            *self
+        }
+
+        fn grown_bytes(&self) -> u64 {
+            0
+        }
+    }
 
     fn at(version: u64, len: u64) -> Position {
         Position {
@@ -797,11 +882,32 @@ mod tests {
         assert_eq!(*cache.view("b", at(1, 1), load(4)).await.unwrap(), 4);
         assert_eq!(*cache.view("c", at(1, 1), load(9)).await.unwrap(), 3);
 
-        let per_view = super::view_bytes(&at(1, 100));
+        let per_view = 500;
         let cache: ViewCache<u64> = ViewCache::new(10, 2 * per_view);
         for name in ["a", "b", "c"] {
-            cache.view(name, at(1, 100), load(1)).await.unwrap();
+            cache.view(name, at(1, 100), load(per_view)).await.unwrap();
         }
         assert_eq!(cache.usage(), (2, 2 * per_view));
+    }
+
+    /// A view larger than the byte cap alone isn't kept, never pushes out the views that fit, and
+    /// is counted, by the cache and over the process.
+    #[tokio::test]
+    async fn a_view_over_the_byte_cap_is_counted_and_never_kept() {
+        let load = |value: u64| async move { Ok::<_, ()>(value) };
+        let cache: ViewCache<u64> = ViewCache::new(10, 1_000);
+        cache.view("a", at(1, 1), load(400)).await.unwrap();
+        cache.view("b", at(1, 1), load(400)).await.unwrap();
+        let before = super::views_over_cap();
+        assert_eq!(
+            *cache.view("big", at(1, 1), load(1_001)).await.unwrap(),
+            1_001
+        );
+        assert_eq!(cache.usage(), (2, 800));
+        assert_eq!(cache.memory(|_| 0).views_over_cap, Some(1));
+        assert!(super::views_over_cap() > before);
+        // The views that fit are still served without loading.
+        assert_eq!(*cache.view("a", at(1, 1), load(9)).await.unwrap(), 400);
+        assert_eq!(*cache.view("b", at(1, 1), load(9)).await.unwrap(), 400);
     }
 }

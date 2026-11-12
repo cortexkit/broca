@@ -32,6 +32,7 @@ use serde::Serialize;
 use crate::codec::{
     put_varint, DecodeError, DecodeErrorKind, Digest, Message as CodecMessage, Raw, Value, Wire,
 };
+use crate::interned::{Interned, SharedJson};
 use crate::{message, values};
 
 /// Which stream a record belongs to. Stored in every frame header.
@@ -105,7 +106,7 @@ values! {
 message! {
     /// Who delivered an entry a person didn't type: a module or the runner, and the plan template
     /// it was rendered from.
-    #[derive(Debug, Clone, PartialEq, Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
     pub struct Notice {
         1 req sender: String,
         2 opt template: String,
@@ -119,7 +120,8 @@ message! {
     pub struct Input {
         1 req run_id: String,
         2 req placement: Placement,
-        3 req message: Message,
+        /// Shared with the conversation fold, which places this message.
+        3 req message: std::sync::Arc<Message>,
         4 opt written_at_ms: u64,
         5 opt submission_id: String,
         6 opt notice: Notice,
@@ -183,7 +185,8 @@ message! {
         1 req run_id: String,
         2 req step_id: u64,
         3 req provider_message_id: MessageId,
-        4 req message: Message,
+        /// Shared with the conversation fold, which places this message.
+        4 req message: std::sync::Arc<Message>,
         /// The step's usage, which `session.entries` returns with the entry. The ledger's
         /// `StepEnd` carries it too, for run totals: each fold reads only its own stream.
         5 opt usage: Usage,
@@ -309,7 +312,7 @@ message! {
 
 message! {
     /// A compaction view, named by its version and checksum.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
     pub struct ViewRef {
         1 req version: u64,
         2 req checksum: String,
@@ -366,10 +369,12 @@ message! {
         /// The part number before this message's first numbered part: its parts take the
         /// numbers after it, in order.
         3 req tag_base: u64,
-        4 opt notice: Notice,
+        /// Held once by the session for every message that names the same (see `interned`), as
+        /// are its run, how it was delivered, its sender and its Rich UI stamp.
+        4 opt notice: Interned<Notice>,
         5 opt usage: StepUsage,
         /// The compaction view in force when the model wrote this message.
-        6 opt generated_under: ViewRef,
+        6 opt generated_under: Interned<ViewRef>,
         /// A model step wrote it, so its completion time is `written_at_ms` once every tool call
         /// it made has a result. False for an assistant message that came in as caller input.
         7 req native: bool,
@@ -383,7 +388,7 @@ message! {
         10 req mid: String,
         /// The run that placed the message. Absent when no run owns it, such as an imported
         /// seed. `session.read` names it as the message's run.
-        11 opt run_id: String,
+        11 opt run_id: Interned<str>,
         /// When the message was accepted, as `session.read` serves it. An input, steer or
         /// delivered send takes its send's acceptance time, kept across a queue. An assistant
         /// message takes the send time of its step's last complete attempt, not counting a warm
@@ -393,17 +398,17 @@ message! {
         /// message's run: `steer` or `turn_system` for the messages it placed, `idle_start` for
         /// the input of a run it started, `tool_result` for the tool result message it rode
         /// on. A steer that wasn't queued, and every other message, has none.
-        13 opt delivery_mode: String,
+        13 opt delivery_mode: Interned<str>,
         /// For a send that rode on a tool result: the call whose result carried it.
         14 opt delivery_tool_call_id: String,
         /// The `client_message_id` of the send that placed the message, as `session.read`
         /// serves it in the message's display facts.
         15 opt client_message_id: String,
         /// The attested module id of whoever sent the message, as recorded at its send.
-        16 opt sender: String,
+        16 opt sender: Interned<str>,
         /// The send's display marks, as llm-runner's `MessageMarks` JSON: `speaks_for` and a
-        /// true `notice`.
-        17 opt marks: serde_json::Value,
+        /// true `notice`. Held once per process for every message with the same marks.
+        17 opt marks: SharedJson,
         /// The message was converted from a log of today's storage that had no lineage, so
         /// today's read serves it none of what an `include_display_facts` read adds, and nor does
         /// the new storage's. Absent for every message broca places itself.
@@ -416,7 +421,7 @@ message! {
         /// For an assistant message a run placed: the Rich UI stamp the run's plan froze, which
         /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
         /// without looking up the run's start. Absent when the run's plan has none.
-        20 opt rich_ui: RichUi,
+        20 opt rich_ui: Interned<RichUi>,
         /// The highest part number the runner's own numbering (llm-runner's tags: stamped on a
         /// v1 run's records, computed by `broca_protocol::tags::number_message` from each later
         /// run's checkpoint) shows before this message. The message's numbered parts take the
@@ -451,7 +456,7 @@ message! {
 message! {
     /// A run's Rich UI stamp: which Rich UI dialect its system text taught, and against which
     /// catalog (llm-runner's `RichUiStamp`).
-    #[derive(Debug, Clone, PartialEq, Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
     pub struct RichUi {
         1 req dialect: String,
         2 req catalog_digest: String,
@@ -495,14 +500,14 @@ message! {
         2 req call_key: String,
         /// The schema pin the call ran under: for a call broca dispatched, the pin as reads
         /// serve it (llm-runner's encoded `SchemaPin`); for an imported call, as its runner
-        /// recorded it.
-        3 opt schema_pin: serde_json::Value,
+        /// recorded it. Held once per process for every call under the same pin.
+        3 opt schema_pin: SharedJson,
         /// The attested module id of the runner that minted `call_key`, when that wasn't broca:
         /// a call imported from another runner keeps its key, which is unique only within that
         /// runner.
-        4 opt carrier: String,
-        /// The module the call was dispatched to.
-        5 opt dispatched_to: String,
+        4 opt carrier: Interned<str>,
+        /// The module the call was dispatched to. Held once by the session, as `carrier` is.
+        5 opt dispatched_to: Interned<str>,
         6 opt dispatched_at_ms: u64,
         7 opt finished_at_ms: u64,
         /// Why the call has no answer from its tool, when it has none: reads serve it as the
@@ -1631,11 +1636,13 @@ message! {
     }
 }
 
-/// The type a record variant holds: the record itself, or a box for the rare large kinds, so a
-/// loaded log's records don't all pay for the largest one.
+/// The type a record variant holds: the record itself, a box for the rare large kinds, so a
+/// loaded log's records don't all pay for the largest one, or an `Arc` for the kinds whose value
+/// the conversation fold keeps too, so the fold and the kept records hold it once.
 macro_rules! variant_type {
     ($record:ident) => { $record };
     ($record:ident boxed) => { Box<$record> };
+    ($record:ident shared) => { std::sync::Arc<$record> };
 }
 
 /// Declares the record enum, its kind numbers and streams, and dispatch between them, so a
@@ -1863,8 +1870,9 @@ records! {
         5 SetupStub,
         6 Compaction,
         7 Marker,
-        8 EntryFacts,
-        9 TurnFacts,
+        // The conversation fold keeps each message's facts, and shares them with these records.
+        8 EntryFacts shared,
+        9 TurnFacts shared,
     }
     ledger {
         // One per run, and much larger than the rest.

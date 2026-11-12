@@ -411,7 +411,13 @@ impl RunExecutor for RenderExecutor {
             let holds_media = req
                 .input
                 .iter()
-                .chain(writer.conversation().messages.iter())
+                .chain(
+                    writer
+                        .conversation()
+                        .messages
+                        .iter()
+                        .map(|message| &**message),
+                )
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
             // A seal writes its records and calls no model, so, as the module's executor does,
             // it installs no media renderer and waits for none of the session's media state.

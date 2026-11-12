@@ -56,7 +56,7 @@ fn input(text: String) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text }]),
+        message: std::sync::Arc::new(Message::new(Role::User, vec![ContentBlock::Text { text }])),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -71,11 +71,11 @@ fn assistant(content: Vec<ContentBlock>) -> Record {
         run_id: "r".into(),
         step_id: 1,
         provider_message_id: MessageId("m".into()),
-        message: Message::assistant_from(
+        message: std::sync::Arc::new(Message::assistant_from(
             content,
             serde_json::from_value(serde_json::json!({"provider_module_id": "p", "model_id": "m"}))
                 .unwrap(),
-        ),
+        )),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -109,7 +109,7 @@ fn reply(id: &str, text: String) -> Record {
 /// The entry facts of the message at `ordinal`. Its tag bases are the ordinal, so a read that
 /// returns another message's facts shows it.
 fn facts(ordinal: u64) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -135,7 +135,7 @@ fn facts(ordinal: u64) -> Record {
         delivery_mode: None,
         delivery_tool_call_id: None,
         notices: Vec::new(),
-    })
+    }))
 }
 
 /// Rounds of a user input, a 2 KiB tool turn, and a text answer. Each round places four
@@ -351,7 +351,7 @@ fn message_ids_resolve_in_the_window_and_sealed_history(cipher: Cipher) {
             let Record::EntryFacts(mut facts) = facts(ordinal) else {
                 unreachable!()
             };
-            facts.mid = mid.clone();
+            std::sync::Arc::make_mut(&mut facts).mid = mid.clone();
             session
                 .append(&[message, Record::EntryFacts(facts)], true)
                 .await
@@ -438,7 +438,7 @@ fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history(ciphe
         let Record::EntryFacts(mut answer_facts) = facts(ordinal) else {
             unreachable!()
         };
-        answer_facts.mid = announced.clone();
+        std::sync::Arc::make_mut(&mut answer_facts).mid = announced.clone();
         session
             .append(
                 &[

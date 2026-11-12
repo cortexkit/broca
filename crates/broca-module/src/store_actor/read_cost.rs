@@ -178,10 +178,14 @@ fn moved(record: &Record, run: &str, ordinal_shift: i64, mid: &str) -> Record {
     let shift = |ordinal: u64| u64::try_from(ordinal as i64 + ordinal_shift).unwrap();
     match &mut record {
         Record::EntryFacts(facts) => {
+            let facts = std::sync::Arc::make_mut(facts);
             facts.ordinal = shift(facts.ordinal);
             facts.mid = mid.to_owned();
         }
-        Record::TurnFacts(turn) => turn.ordinal = shift(turn.ordinal),
+        Record::TurnFacts(turn) => {
+            let turn = std::sync::Arc::make_mut(turn);
+            turn.ordinal = shift(turn.ordinal);
+        }
         // The builder names each message by the seq of its own facts, so no step or batch start
         // announces an id.
         Record::StepStart(start) => start.mid = None,
@@ -645,7 +649,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         percentiles(loads),
         resident_view as f64 / 1e6,
         resident_view as f64 / log_len.max(1) as f64,
-        if log_len.saturating_mul(ViewCache::BYTES_PER_LOG_BYTE) <= ViewCache::MAX_BYTES {
+        if resident_view <= ViewCache::MAX_BYTES {
             "keeps"
         } else {
             "never keeps"

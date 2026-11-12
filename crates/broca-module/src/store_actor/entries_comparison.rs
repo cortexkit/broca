@@ -1525,7 +1525,7 @@ async fn every_exposure_serves_a_cleaned_reply_and_the_store_keeps_the_written_o
                 .map(|message| &message["digest"])
                 .collect();
             for (entry, digest) in replies.iter().zip(digests) {
-                let mut written = entry.message.clone();
+                let mut written = broca_protocol::Message::clone(&entry.message);
                 written.ordinal = Some(entry.ordinal - 1);
                 let served = crate::store_exposure::served_message(&written, true).into_owned();
                 let identity = |message: &broca_protocol::Message| {

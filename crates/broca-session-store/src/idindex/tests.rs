@@ -205,7 +205,10 @@ fn records_name_their_ids() {
         media: Vec::new(),
         run_id: "r1".into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: "hi".into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: "hi".into() }],
+        )),
         written_at_ms: None,
         submission_id: Some("sub-r1".into()),
         notice: None,

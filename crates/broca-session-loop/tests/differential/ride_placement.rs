@@ -179,7 +179,12 @@ async fn new_only(
             .expect("the new loop runs");
             assert_eq!(finished.paused, None, "the run ends");
             let raw = writer.records.clone();
-            let messages = writer.conversation().messages.clone();
+            let messages: Vec<Message> = writer
+                .conversation()
+                .messages
+                .iter()
+                .map(|message| Message::clone(message))
+                .collect();
             let entries = served_entries(writer.session).await;
             Run {
                 requests: sent_requests(&provider.inner),

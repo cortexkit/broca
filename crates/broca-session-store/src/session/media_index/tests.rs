@@ -763,7 +763,7 @@ fn an_undo_cuts_the_index_at_the_message_it_returns_to(cipher: Cipher) {
             let mid = writer.session.message_id(2);
             let mut placed = facts(ordinal);
             if let Record::EntryFacts(placed) = &mut placed {
-                placed.mid = mid.clone();
+                Arc::make_mut(placed).mid = mid.clone();
             }
             writer
                 .append(vec![

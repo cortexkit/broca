@@ -117,7 +117,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             records.push(Record::Input(Input {
                 run_id: run_id.clone(),
                 placement: Placement::RunInput,
-                message,
+                message: std::sync::Arc::new(message),
                 written_at_ms: None,
                 submission_id: None,
                 notice: None,
@@ -161,7 +161,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // Display attribution therefore names no producing run, including on assistant messages.
         for record in &mut records {
             if let Record::EntryFacts(facts) = record {
-                facts.run_id = None;
+                std::sync::Arc::make_mut(facts).run_id = None;
             }
         }
         self.append_own_batch_with_media(&records, &[]).await?;

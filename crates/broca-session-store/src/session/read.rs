@@ -19,6 +19,7 @@
 //! Also here: finding the ledger records that name an id (see `idindex`).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use broca_protocol::content::Message;
 
@@ -33,13 +34,14 @@ use super::{Session, SessionError};
 
 mod send_ids;
 
-/// One message as `session.entries` reads it.
+/// One message as `session.entries` reads it. A window entry shares its message and facts with
+/// the conversation, so serving it copies no content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredEntry {
     pub ordinal: u64,
-    pub message: Message,
+    pub message: Arc<Message>,
     /// For an assistant message that called tools: the tool message with their results.
-    pub next: Option<Message>,
+    pub next: Option<Arc<Message>>,
     pub state: EntryState,
     /// An assistant message still waiting for its tool results, at its reserved ordinal.
     pub open: bool,
@@ -72,7 +74,7 @@ pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
     if let Some((ordinal, message, state)) = conversation.open_entry() {
         entries.push(StoredEntry {
             ordinal,
-            message: message.clone(),
+            message: Arc::clone(message),
             next: None,
             state: state.clone(),
             open: true,
@@ -98,7 +100,7 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
                 .filter(|next| called && next.role == broca_protocol::content::Role::Tool);
             Some(StoredEntry {
                 ordinal,
-                message: message.clone(),
+                message: Arc::clone(message),
                 next: next.cloned(),
                 state: state.clone(),
                 open: false,
@@ -114,8 +116,9 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
 #[derive(Default)]
 pub(super) struct SealedCaches {
     version: u64,
-    /// Sealed entries read by message id (see `entry_by_mid`).
-    entries: std::collections::HashMap<String, StoredEntry>,
+    /// Sealed entries read by message id (see `entry_by_mid`), at most
+    /// [`SEALED_ENTRIES_MAX_BYTES`] of them.
+    entries: SealedEntryCache,
     /// A value a reader derived from sealed history and asked the session to keep (see
     /// `keep_sealed_derived`).
     derived: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -124,6 +127,84 @@ pub(super) struct SealedCaches {
 }
 
 pub(super) type SealedEntries = std::sync::Mutex<SealedCaches>;
+
+/// The most a session keeps of the sealed entries it read by message id, counted by walking them
+/// (see `crate::held`): 8 MiB. Past it the least recently read entry goes first, and reading it
+/// again reads its sealed block from storage once more.
+pub const SEALED_ENTRIES_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Sealed entries read by message id, least recently read dropped first past
+/// [`SEALED_ENTRIES_MAX_BYTES`].
+#[derive(Default)]
+pub(super) struct SealedEntryCache {
+    by_mid: std::collections::HashMap<String, CachedEntry>,
+    /// The ids by when each was last read, oldest first.
+    by_use: BTreeMap<u64, String>,
+    /// The walked size of the entries kept and their ids, without the tables holding them.
+    bytes: usize,
+    clock: u64,
+}
+
+struct CachedEntry {
+    entry: StoredEntry,
+    bytes: usize,
+    used: u64,
+}
+
+impl SealedEntryCache {
+    /// The entry kept for `mid`, which counts as read now.
+    pub(super) fn get(&mut self, mid: &str) -> Option<StoredEntry> {
+        self.clock += 1;
+        let cached = self.by_mid.get_mut(mid)?;
+        self.by_use.remove(&cached.used);
+        cached.used = self.clock;
+        self.by_use.insert(cached.used, mid.to_owned());
+        Some(cached.entry.clone())
+    }
+
+    /// What the cache holds as its cap counts it: the entries and their ids, and the tables
+    /// holding them, each slot of the table by id included whether filled or not.
+    pub(super) fn held_bytes(&self) -> usize {
+        // A slot and its control byte per bucket; an entry of the table by use and its share of
+        // the node it sits in.
+        self.bytes
+            + self.by_mid.capacity() * (std::mem::size_of::<(String, CachedEntry)>() + 1)
+            + self.by_use.len() * (std::mem::size_of::<(u64, String)>() + 16)
+    }
+
+    /// Keeps `entry` for `mid`, then drops the least recently read entries until the cache fits
+    /// its cap. An entry larger than the cap alone is not kept. The walk misses a little of what
+    /// the allocator holds (the parsed JSON's nodes past their first, the tables' nodes), about
+    /// 1% measured, so the walked size is kept a thirty-second below the cap and the real size
+    /// stays under it.
+    pub(super) fn insert(&mut self, mid: &str, entry: StoredEntry) {
+        use crate::held::HeldBytes;
+        self.clock += 1;
+        let bytes = 2 * mid.len() + entry.heap_bytes();
+        let used = self.clock;
+        if let Some(old) = self
+            .by_mid
+            .insert(mid.to_owned(), CachedEntry { entry, bytes, used })
+        {
+            self.by_use.remove(&old.used);
+            self.bytes -= old.bytes;
+        }
+        self.by_use.insert(used, mid.to_owned());
+        self.bytes += bytes;
+        while self.held_bytes() > SEALED_ENTRIES_MAX_BYTES - SEALED_ENTRIES_MAX_BYTES / 32 {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            if let Some(dropped) = self.by_mid.remove(&oldest) {
+                self.bytes -= dropped.bytes;
+            }
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.by_mid.len()
+    }
+}
 
 /// How far apart two named sealed entries may be and still be read in one pass: reading the
 /// entries between them decodes blocks that one read per entry would decode anyway.
@@ -159,7 +240,7 @@ impl<B: SessionBackend> Session<B> {
     /// message an enrollment suppressed is served with no content.
     pub async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
         if let Some(entry) = self.sealed_caches().entries.get(mid) {
-            return Ok(Some(entry.clone()));
+            return Ok(Some(entry));
         }
         let version = self.operations.history_version;
         let Some(ordinal) = self.find_message(mid).await? else {
@@ -177,7 +258,7 @@ impl<B: SessionBackend> Session<B> {
         if ordinal < self.conversation.window_start() {
             let mut caches = self.sealed_caches();
             if caches.version == version {
-                caches.entries.insert(mid.to_owned(), entry.clone());
+                caches.entries.insert(mid, entry.clone());
             }
         }
         Ok(Some(entry))
@@ -234,6 +315,12 @@ impl<B: SessionBackend> Session<B> {
     /// How many sealed entries the session keeps by message id now, for diagnostics.
     pub fn kept_sealed_entries(&self) -> usize {
         self.sealed_caches().entries.len()
+    }
+
+    /// What the sealed entries the session keeps by message id hold, as their cap counts them
+    /// (see [`SEALED_ENTRIES_MAX_BYTES`]): read without walking them.
+    pub fn sealed_entries_bytes(&self) -> usize {
+        self.sealed_caches().entries.held_bytes()
     }
 
     /// Up to `limit` entries from ordinal `from` on (counting from 1), in order, over the whole
@@ -570,13 +657,13 @@ impl<B: SessionBackend> Session<B> {
     }
 
     /// The message with `ordinal` (counting from 1 over the whole conversation), or `None` when
-    /// the conversation has placed no such message.
-    pub async fn message(&self, ordinal: u64) -> Result<Option<Message>, SessionError> {
+    /// the conversation has placed no such message. A window message is shared, not copied.
+    pub async fn message(&self, ordinal: u64) -> Result<Option<Arc<Message>>, SessionError> {
         if ordinal == 0 || ordinal > self.conversation.placed {
             return Ok(None);
         }
         if let Some(message) = self.conversation.window_message(ordinal) {
-            return Ok(Some(message.clone()));
+            return Ok(Some(Arc::clone(message)));
         }
         self.storage_read()?;
         let key = self.key.frame_key();
@@ -956,7 +1043,7 @@ impl SealedCaches {
     /// `crate::held`). A reader's derived value is opaque here, so only its pointer counts.
     pub(super) fn held_bytes(&self) -> usize {
         use crate::held::HeldBytes;
-        self.entries.heap_bytes() + self.send_ids.heap_bytes()
+        self.entries.held_bytes() + self.send_ids.heap_bytes()
     }
 }
 

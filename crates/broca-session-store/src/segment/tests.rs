@@ -36,7 +36,10 @@ fn input(text: &str) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -105,7 +108,7 @@ fn a_group_never_splits_across_blocks(cipher: Cipher) {
 
 /// Facts for `ordinal`, as a writer places them after its messages.
 fn facts(ordinal: u64) -> Record {
-    Record::EntryFacts(crate::record::EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(crate::record::EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -131,7 +134,7 @@ fn facts(ordinal: u64) -> Record {
         delivery_mode: None,
         delivery_tool_call_id: None,
         notices: Vec::new(),
-    })
+    }))
 }
 
 #[test]

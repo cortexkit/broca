@@ -97,7 +97,10 @@ fn input(run: &str, text: &str) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -112,7 +115,10 @@ fn answer(run: &str, text: &str) -> Record {
         run_id: run.into(),
         step_id: 1,
         provider_message_id: MessageId(format!("m-{text}")),
-        message: Message::assistant_from(vec![ContentBlock::Text { text: text.into() }], model()),
+        message: std::sync::Arc::new(Message::assistant_from(
+            vec![ContentBlock::Text { text: text.into() }],
+            model(),
+        )),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -123,7 +129,7 @@ fn answer(run: &str, text: &str) -> Record {
 }
 
 fn facts(ordinal: u64, mid: String) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -149,7 +155,7 @@ fn facts(ordinal: u64, mid: String) -> Record {
         delivery_mode: None,
         delivery_tool_call_id: None,
         notices: Vec::new(),
-    })
+    }))
 }
 
 /// The resend a revert carries: a new run's start with a send id, its input, and the input's
@@ -158,7 +164,7 @@ fn resend(run: &str, send: &str, text: &str) -> Vec<Record> {
     vec![start(run, send), input(run, text), facts(0, String::new())]
 }
 
-fn texts(messages: &[Message]) -> Vec<String> {
+fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
     messages
         .iter()
         .flat_map(|m| &m.content)

@@ -70,7 +70,7 @@ struct Kept {
     prompt: Vec<Message>,
     front: usize,
     /// The sealed messages in front, as the transcript gave them.
-    front_of: Option<Arc<Vec<(u64, Message)>>>,
+    front_of: Option<crate::compaction::SealedMessages>,
     /// The part numbers given so far, which the next messages continue.
     numbering: TagNumbering,
     /// The window run the newest message taken in belongs to, by its place in the list, and its
@@ -112,7 +112,11 @@ pub(crate) fn contract_prompt(
     episodes: &[EpisodeRenderInput],
     enrollment: Option<&EnrollmentOverlay>,
 ) -> Result<Vec<Message>, LoopError> {
-    let mut prompt = conversation.messages.clone();
+    let mut prompt: Vec<Message> = conversation
+        .messages
+        .iter()
+        .map(|message| Message::clone(message))
+        .collect();
     let first = conversation.window_start() - 1;
     crate::run::repetition_guidance(
         &mut prompt,
@@ -232,7 +236,7 @@ impl KeptPrompt {
         let first = conversation.window_start() - 1;
         let from = kept.taken;
         for (index, placed) in conversation.messages.iter().enumerate().skip(from) {
-            let mut message = placed.clone();
+            let mut message = Message::clone(placed);
             kept.guide(
                 index,
                 &mut message,
@@ -264,7 +268,7 @@ impl KeptPrompt {
     /// The stored prompt a request renders from: `sealed`, the sealed messages a transcript put
     /// in front of the window's entries, each stamped with its own position, then the window's
     /// messages as kept. Called after [`KeptPrompt::update`].
-    pub(crate) fn stored(&mut self, sealed: &Arc<Vec<(u64, Message)>>) -> &[Message] {
+    pub(crate) fn stored(&mut self, sealed: &crate::compaction::SealedMessages) -> &[Message] {
         let kept = self
             .0
             .as_mut()
@@ -277,7 +281,7 @@ impl KeptPrompt {
             let stamped: Vec<Message> = sealed
                 .iter()
                 .map(|(ordinal, message)| {
-                    let mut message = message.clone();
+                    let mut message = Message::clone(message);
                     message.ordinal = Some(ordinal - 1);
                     message
                 })

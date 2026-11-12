@@ -3,6 +3,8 @@
 //! without images keeps no index, and the records only the new storage has (an undo, a recovery
 //! cut) change the rendered request as their rules say.
 
+use std::sync::Arc;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{ContentBlock, MediaRef, Message, Role};
@@ -618,7 +620,7 @@ pub(crate) fn input(
     Record::Input(Input {
         run_id: run.into(),
         placement,
-        message,
+        message: Arc::new(message),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -630,7 +632,7 @@ pub(crate) fn input(
 }
 
 pub(crate) fn facts(ordinal: u64, mid: String) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         ordinal,
@@ -656,7 +658,7 @@ pub(crate) fn facts(ordinal: u64, mid: String) -> Record {
         notices: Vec::new(),
         runner_tag_base: None,
         legacy_view_seq: None,
-    })
+    }))
 }
 
 pub(crate) fn step_start(run: &str, step: u64) -> Record {
@@ -700,7 +702,7 @@ pub(crate) fn assistant(run: &str, step: u64) -> Record {
         run_id: run.into(),
         step_id: step,
         provider_message_id: MessageId(format!("answer{step}")),
-        message: Message::assistant_from(content, model()),
+        message: Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,

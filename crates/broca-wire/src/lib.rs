@@ -2332,6 +2332,11 @@ pub struct MemoryCache {
     pub max_bytes: Option<u64>,
     /// The bytes it holds, estimated by walking its entries.
     pub estimated_bytes: u64,
+    /// For the closed-session view cache: how many views this process loaded and didn't keep
+    /// because each alone was larger than the byte cap. Each read of such a session while it is
+    /// closed loads it again. Absent for other caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub views_over_cap: Option<u64>,
 }
 
 /// Non-secret authentication identity frozen for a paused run.

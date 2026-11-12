@@ -46,7 +46,7 @@ fn placed_copy(text: &str, receipt_seq: u64) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::Steer,
-        message: user(text),
+        message: std::sync::Arc::new(user(text)),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -207,7 +207,7 @@ fn input_record(run_id: &str, placement: Placement, message: Message) -> Record 
         media: Vec::new(),
         run_id: run_id.into(),
         placement,
-        message,
+        message: std::sync::Arc::new(message),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -219,33 +219,35 @@ fn input_record(run_id: &str, placement: Placement, message: Message) -> Record 
 
 /// The facts `session.import` writes after an imported message.
 fn entry_facts(ordinal: u64, mid: &str) -> Record {
-    Record::EntryFacts(broca_session_store::record::EntryFacts {
-        send_id: None,
-        ordinal,
-        written_at_ms: Some(1_000),
-        tag_base: 40,
-        notice: None,
-        usage: None,
-        generated_under: None,
-        native: false,
-        render_tags: false,
-        clean_reply: false,
-        mid: mid.into(),
-        run_id: None,
-        created_at_ms: None,
-        delivery_mode: None,
-        delivery_tool_call_id: None,
-        client_message_id: None,
-        sender: None,
-        marks: None,
-        named_speaker: broca_session_store::record::marks_name_speaker(None),
-        no_display_facts: None,
-        reasoning_summaries: Vec::new(),
-        rich_ui: None,
-        notices: Vec::new(),
-        runner_tag_base: None,
-        legacy_view_seq: None,
-    })
+    Record::EntryFacts(std::sync::Arc::new(
+        broca_session_store::record::EntryFacts {
+            send_id: None,
+            ordinal,
+            written_at_ms: Some(1_000),
+            tag_base: 40,
+            notice: None,
+            usage: None,
+            generated_under: None,
+            native: false,
+            render_tags: false,
+            clean_reply: false,
+            mid: mid.into(),
+            run_id: None,
+            created_at_ms: None,
+            delivery_mode: None,
+            delivery_tool_call_id: None,
+            client_message_id: None,
+            sender: None,
+            marks: None,
+            named_speaker: broca_session_store::record::marks_name_speaker(None),
+            no_display_facts: None,
+            reasoning_summaries: Vec::new(),
+            rich_ui: None,
+            notices: Vec::new(),
+            runner_tag_base: None,
+            legacy_view_seq: None,
+        },
+    ))
 }
 
 fn run_end(run_id: &str) -> Record {
@@ -316,19 +318,21 @@ fn import_batch(run_id: &str) -> Vec<Record> {
         let results = message.role == Role::Tool;
         records.push(input_record(run_id, Placement::Imported, message));
         if calls {
-            records.push(Record::TurnFacts(broca_session_store::record::TurnFacts {
-                ordinal,
-                calls: vec![broca_session_store::record::CallFacts {
-                    tool_call_id: broca_protocol::ToolCallId("call_1".into()),
-                    call_key: "msg_a1/call_1".into(),
-                    schema_pin: None,
-                    carrier: Some("thalamus-harness".into()),
-                    dispatched_to: None,
-                    dispatched_at_ms: None,
-                    finished_at_ms: None,
-                    unanswered: None,
-                }],
-            }));
+            records.push(Record::TurnFacts(std::sync::Arc::new(
+                broca_session_store::record::TurnFacts {
+                    ordinal,
+                    calls: vec![broca_session_store::record::CallFacts {
+                        tool_call_id: broca_protocol::ToolCallId("call_1".into()),
+                        call_key: "msg_a1/call_1".into(),
+                        schema_pin: None,
+                        carrier: Some("thalamus-harness".into()),
+                        dispatched_to: None,
+                        dispatched_at_ms: None,
+                        finished_at_ms: None,
+                        unanswered: None,
+                    }],
+                },
+            )));
         }
         if results {
             records.push(Record::ResultAppend(

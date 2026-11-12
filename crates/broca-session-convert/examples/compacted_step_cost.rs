@@ -903,6 +903,13 @@ impl Compactor {
 
 #[async_trait]
 impl broca_core::CompactionPlane for Compactor {
+    /// The scripted provider's catalog declares no optional field, as the live plane reads an
+    /// empty declaration. A plane whose catalog can't be read leaves unknown whether entries may
+    /// name the agent a send spoke for, and `session.entries` refuses until it is known.
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        broca_core::ProviderCapabilities::Declared(Vec::new())
+    }
+
     async fn setup(
         &self,
         _: &str,
@@ -1308,10 +1315,14 @@ fn moved(record: &Record, run: &str, ordinal_shift: i64, mid: &str) -> Record {
     let shift = |ordinal: u64| u64::try_from(ordinal as i64 + ordinal_shift).unwrap();
     match &mut record {
         Record::EntryFacts(facts) => {
+            let facts = std::sync::Arc::make_mut(facts);
             facts.ordinal = shift(facts.ordinal);
             facts.mid = mid.to_owned();
         }
-        Record::TurnFacts(turn) => turn.ordinal = shift(turn.ordinal),
+        Record::TurnFacts(turn) => {
+            let turn = std::sync::Arc::make_mut(turn);
+            turn.ordinal = shift(turn.ordinal);
+        }
         // Each message is named by the seq of its own facts, so no step or batch start
         // announces an id.
         Record::StepStart(start) => start.mid = None,

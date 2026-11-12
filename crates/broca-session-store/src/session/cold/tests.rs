@@ -97,7 +97,10 @@ fn input(run: &str, text: &str, at: u64) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: Some(at),
         submission_id: None,
         notice: None,
@@ -113,7 +116,7 @@ fn answer(run: &str, text: &str, at: u64) -> Record {
         run_id: run.into(),
         step_id: 1,
         provider_message_id: MessageId(format!("m-{text}")),
-        message: Message::assistant_from(
+        message: std::sync::Arc::new(Message::assistant_from(
             vec![
                 ContentBlock::RedactedReasoning {
                     data: format!("opaque-{text}"),
@@ -122,7 +125,7 @@ fn answer(run: &str, text: &str, at: u64) -> Record {
                 ContentBlock::Text { text: text.into() },
             ],
             model(),
-        ),
+        )),
         usage: None,
         written_at_ms: Some(at),
         last_content_at_ms: None,
@@ -133,7 +136,7 @@ fn answer(run: &str, text: &str, at: u64) -> Record {
 }
 
 /// The opaque payloads left in the window's messages.
-fn opaque(messages: &[Message]) -> Vec<String> {
+fn opaque(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
     messages
         .iter()
         .flat_map(|m| &m.content)
@@ -144,7 +147,7 @@ fn opaque(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-fn texts(messages: &[Message]) -> Vec<String> {
+fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
     messages
         .iter()
         .flat_map(|m| &m.content)

@@ -92,7 +92,7 @@ async fn history<'a>(
             &[Record::Input(Input {
                 run_id: "run".into(),
                 placement: Placement::RunInput,
-                message: Message::new(
+                message: std::sync::Arc::new(Message::new(
                     Role::User,
                     vec![
                         ContentBlock::Text {
@@ -100,7 +100,7 @@ async fn history<'a>(
                         },
                         ContentBlock::Media(image),
                     ],
-                ),
+                )),
                 written_at_ms: None,
                 submission_id: None,
                 notice: None,

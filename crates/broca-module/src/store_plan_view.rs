@@ -275,7 +275,7 @@ async fn times<B: SessionBackend>(
                         assistant = true
                     }
                     Record::EntryFacts(facts) if assistant => {
-                        reply_mid = Some(facts.mid);
+                        reply_mid = Some(facts.mid.clone());
                         break;
                     }
                     _ => {}

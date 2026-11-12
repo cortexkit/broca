@@ -80,7 +80,10 @@ pub fn due(
             media: Vec::new(),
             run_id: run.run_id.clone(),
             placement: Placement::BudgetNudge,
-            message: Message::new(Role::User, vec![ContentBlock::Text { text: firing.text }]),
+            message: std::sync::Arc::new(Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: firing.text }],
+            )),
             written_at_ms: None,
             submission_id: None,
             notice: None,

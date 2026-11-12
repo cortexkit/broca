@@ -850,7 +850,10 @@ pub fn with_facts_and_messages(
                         .take_while(|record| matches!(record, Record::Input(_)))
                         .count();
                     if placed_here > 0 {
-                        out.insert(out.len() - placed_here, Record::TurnFacts(turn.clone()));
+                        out.insert(
+                            out.len() - placed_here,
+                            Record::TurnFacts(turn.clone().into()),
+                        );
                     } else {
                         restated = Some(turn.clone());
                     }
@@ -925,31 +928,31 @@ pub fn with_facts_and_messages(
                 pending.push(EntryFacts {
                     send_id: facts.send.send_id,
                     client_message_id: facts.send.client_message_id,
-                    sender: facts.send.sender,
+                    sender: facts.send.sender.map(Into::into),
                     named_speaker: broca_session_store::record::marks_name_speaker(
                         facts.send.marks.as_ref(),
                     ),
-                    marks: facts.send.marks,
+                    marks: facts.send.marks.map(Into::into),
                     no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
-                    rich_ui: stamped,
+                    rich_ui: stamped.map(Into::into),
                     runner_tag_base: runner_high,
                     legacy_view_seq: None,
                     ordinal,
                     written_at_ms,
                     tag_base: high,
-                    notice: facts.notice.filter(|_| entries),
+                    notice: facts.notice.filter(|_| entries).map(Into::into),
                     usage: facts.usage.filter(|_| entries),
-                    generated_under: facts.generated_under.filter(|_| entries),
+                    generated_under: facts.generated_under.filter(|_| entries).map(Into::into),
                     native: facts.native,
                     render_tags: at.tags.render,
                     clean_reply: facts.clean_reply,
                     // Empty until `flush` mints one: only a message nothing announced takes an
                     // id from the seq of its own facts.
                     mid: announced.unwrap_or_default(),
-                    run_id: facts.run_id,
+                    run_id: facts.run_id.map(Into::into),
                     created_at_ms: facts.created_at_ms,
-                    delivery_mode,
+                    delivery_mode: delivery_mode.map(Into::into),
                     delivery_tool_call_id,
                     notices: Vec::new(),
                 });
@@ -990,10 +993,10 @@ pub fn with_facts_and_messages(
         }
         out.push(record);
         if let Some(turn) = restated.take() {
-            out.push(Record::TurnFacts(turn));
+            out.push(Record::TurnFacts(turn.into()));
         }
         if let Some(facts) = ride_facts.take() {
-            out.push(Record::EntryFacts(facts));
+            out.push(Record::EntryFacts(facts.into()));
             inserted = true;
         }
         if !continues && !pending.is_empty() {
@@ -1003,7 +1006,7 @@ pub fn with_facts_and_messages(
         if !continues {
             if let Some((ordinal, assistant)) = placed_turn.take() {
                 let turn = turn_facts(ordinal, &assistant, &events);
-                out.push(Record::TurnFacts(turn.clone()));
+                out.push(Record::TurnFacts(turn.clone().into()));
                 latest_turn = Some(turn);
                 inserted = true;
             }
@@ -1011,7 +1014,9 @@ pub fn with_facts_and_messages(
     }
     flush(&mut out, &mut pending, at);
     if let Some((ordinal, assistant)) = placed_turn.take() {
-        out.push(Record::TurnFacts(turn_facts(ordinal, &assistant, &events)));
+        out.push(Record::TurnFacts(
+            turn_facts(ordinal, &assistant, &events).into(),
+        ));
     }
     let messages = assistants
         .into_iter()
@@ -1154,9 +1159,11 @@ pub fn turn_facts(ordinal: u64, assistant: &Message, events: &[CallEvent]) -> Tu
             Some(CallFacts {
                 tool_call_id: slot.id.clone(),
                 call_key: slot.key?,
-                schema_pin: slot.schema_pin.map(serde_json::Value::String),
+                schema_pin: slot
+                    .schema_pin
+                    .map(|pin| serde_json::Value::String(pin).into()),
                 carrier: None,
-                dispatched_to: slot.dispatched_to,
+                dispatched_to: slot.dispatched_to.map(Into::into),
                 dispatched_at_ms: slot.started,
                 finished_at_ms: slot.finished,
                 unanswered: slot.unanswered,
@@ -1218,7 +1225,7 @@ fn newest_turn(conversation: &Conversation) -> Option<TurnFacts> {
         .zip(&conversation.entries)
         .rev()
         .find(|(message, _)| message.role == Role::Assistant)
-        .and_then(|(_, entry)| entry.turn.clone())
+        .and_then(|(_, entry)| entry.turn.as_deref().cloned())
 }
 
 /// `turn` with each call abandoned as interrupted restated as cancelled, as today's reads state
@@ -1439,7 +1446,7 @@ fn restate_for_ride(
         Some(calls) => calls.to_vec(),
         None => conversation
             .window_message(ordinal.saturating_sub(1))
-            .map(call_ids)
+            .map(|message| call_ids(message))
             .unwrap_or_default(),
     };
     let Some(notice) = ride_notice(append, &calls) else {
@@ -1482,13 +1489,13 @@ fn positioned(announced: &str, position: u64) -> Option<String> {
 fn newest_assistant_is(conversation: &Conversation, mid: &str) -> bool {
     let named = |facts: Option<&EntryFacts>| facts.is_some_and(|facts| facts.mid == mid);
     if let Some((_, _, state)) = conversation.open_entry() {
-        return named(state.facts.as_ref());
+        return named(state.facts.as_deref());
     }
     (conversation.window_start()..=conversation.placed)
         .rev()
         .filter_map(|ordinal| conversation.window_entry(ordinal))
         .find(|(message, _)| message.role == Role::Assistant)
-        .is_some_and(|(_, state)| named(state.facts.as_ref()))
+        .is_some_and(|(_, state)| named(state.facts.as_deref()))
 }
 
 fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>) {
@@ -1496,7 +1503,7 @@ fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>)
         if facts.mid.is_empty() {
             facts.mid = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
         }
-        out.push(Record::EntryFacts(facts));
+        out.push(Record::EntryFacts(facts.into()));
     }
 }
 
@@ -1762,11 +1769,12 @@ fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
     let all: Vec<(&Message, &EntryState)> = conversation
         .messages
         .iter()
+        .map(|message| &**message)
         .zip(conversation.entries.iter())
         .chain(held)
         .collect();
     fn facts(entry: &EntryState) -> Option<&EntryFacts> {
-        entry.facts.as_ref()
+        entry.facts.as_deref()
     }
     let ours = |entry: &EntryState| {
         facts(entry).and_then(|facts| facts.run_id.as_deref()) == Some(runner.run_id.as_str())
@@ -1813,7 +1821,7 @@ pub fn lifetime_tag_high(
             .messages
             .last()
             .zip(conversation.entries.last())
-            .map(|(message, entry)| (conversation.placed, message, entry)),
+            .map(|(message, entry)| (conversation.placed, &**message, entry)),
     };
     let high = match (newest, operations.enrolled.as_ref()) {
         (Some((ordinal, _, _)), Some(enrolled)) if ordinal <= enrolled.through_ordinal => {
@@ -1883,15 +1891,15 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         .transpose()
         .map_err(|e| e.to_string())?;
     let notice = stored_notice_origin(
-        facts.notice.as_ref(),
+        facts.notice.as_deref(),
         facts.sender.as_deref(),
-        facts.marks.as_ref(),
+        facts.marks.as_deref(),
     )?;
     // As today's projection attributes them: on the user messages of a marked send, read from
     // the marks stored with each message, so entries placed before attribution was projected
     // carry it too.
     let speaks_for = if stored.message.role == Role::User {
-        stored_speaks_for(facts.marks.as_ref())?
+        stored_speaks_for(facts.marks.as_deref())?
     } else {
         None
     };
@@ -1907,10 +1915,18 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         usage,
         generated_under,
     };
-    let mut messages = vec![stored.message.clone()];
+    // The projection reads the message and the tool message after it side by side, so an entry
+    // with a tool message takes a copy of both; one without is read where it is held.
+    let pair: Vec<Message>;
+    let messages: &[Message] = match &stored.next {
+        Some(next) => {
+            pair = vec![Message::clone(&stored.message), Message::clone(next)];
+            &pair
+        }
+        None => std::slice::from_ref(&*stored.message),
+    };
     let mut all = vec![first];
-    if let Some(next) = &stored.next {
-        messages.push(next.clone());
+    if stored.next.is_some() {
         all.push(Facts {
             mid: format!("{mid}:next"),
             ordinal: stored.ordinal + 1,
@@ -1942,7 +1958,7 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
             .or_default()
             .push(out);
     }
-    project(&messages, &all, &deliveries, true)
+    project(messages, &all, &deliveries, true)
         .into_iter()
         .next()
         .ok_or_else(|| "empty projection".into())
@@ -2090,12 +2106,12 @@ mod lifetime_tag_high_tests {
     fn two_messages(tag_base: u64) -> Conversation {
         let mut conversation = Conversation::new(false);
         for (ordinal, text) in [(1, "first"), (2, "second")] {
-            conversation.messages.push(Message::new(
+            conversation.messages.push(std::sync::Arc::new(Message::new(
                 Role::User,
                 vec![ContentBlock::Text { text: text.into() }],
-            ));
+            )));
             conversation.entries.push(EntryState {
-                facts: Some(EntryFacts {
+                facts: Some(std::sync::Arc::new(EntryFacts {
                     send_id: None,
                     named_speaker: None,
                     ordinal,
@@ -2121,7 +2137,7 @@ mod lifetime_tag_high_tests {
                     runner_tag_base: None,
                     legacy_view_seq: None,
                     notices: Vec::new(),
-                }),
+                })),
                 ..EntryState::default()
             });
         }
@@ -2199,7 +2215,7 @@ mod send_id_tests {
                 let batch = vec![Record::Input(Input {
                     run_id: "native-run".into(),
                     placement,
-                    message,
+                    message: std::sync::Arc::new(message),
                     written_at_ms: Some(10),
                     submission_id: Some("sub-native".into()),
                     notice: None,

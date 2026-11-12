@@ -328,7 +328,7 @@ async fn entry_of(session: &Session<LocalBackend>, text: &str) -> (u64, String, 
         })
         .and_then(|entry| {
             let facts = entry.state.facts?;
-            Some((entry.ordinal, facts.mid, facts.tag_base))
+            Some((entry.ordinal, facts.mid.clone(), facts.tag_base))
         })
         .expect("the message has facts")
 }
@@ -435,7 +435,7 @@ async fn numbers_before_a_cut_stay_and_a_revert_frees_none_for_reuse() {
         .iter()
         .find_map(|(_, record)| match record {
             Record::EntryFacts(facts) if facts.ordinal == target_ordinal => {
-                let mut facts = facts.clone();
+                let mut facts = (**facts).clone();
                 facts.run_id = Some("r9".into());
                 // The resent input's parts are numbered after every number shown before.
                 facts.tag_base = high;
@@ -450,7 +450,7 @@ async fn numbers_before_a_cut_stay_and_a_revert_frees_none_for_reuse() {
             vec![
                 Record::RunStart(Box::new(start)),
                 Record::Input(input),
-                Record::EntryFacts(facts),
+                Record::EntryFacts(std::sync::Arc::new(facts)),
             ],
             Some(high),
             2,

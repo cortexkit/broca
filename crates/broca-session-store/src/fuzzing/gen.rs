@@ -193,6 +193,30 @@ impl<T: Gen> Gen for Box<T> {
     }
 }
 
+impl<T: Gen> Gen for std::sync::Arc<T> {
+    fn gen(g: &mut G<'_>) -> Self {
+        std::sync::Arc::new(T::gen(g))
+    }
+}
+
+impl<T: Gen> Gen for crate::interned::Interned<T> {
+    fn gen(g: &mut G<'_>) -> Self {
+        T::gen(g).into()
+    }
+}
+
+impl Gen for crate::interned::Interned<str> {
+    fn gen(g: &mut G<'_>) -> Self {
+        String::gen(g).into()
+    }
+}
+
+impl Gen for crate::interned::SharedJson {
+    fn gen(g: &mut G<'_>) -> Self {
+        serde_json::Value::gen(g).into()
+    }
+}
+
 impl Gen for serde_json::Value {
     fn gen(g: &mut G<'_>) -> Self {
         use serde_json::Value;

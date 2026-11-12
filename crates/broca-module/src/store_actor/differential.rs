@@ -1618,7 +1618,14 @@ impl Module {
             .await
             .unwrap()
             .into_iter()
-            .map(|entry| entry.state.facts.expect("every message has facts").mid)
+            .map(|entry| {
+                entry
+                    .state
+                    .facts
+                    .expect("every message has facts")
+                    .mid
+                    .clone()
+            })
             .collect()
     }
 
@@ -1996,7 +2003,8 @@ async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
                     .as_mut()
                     .filter(|facts| facts.sender.is_some())
                 {
-                    facts.send_id = Some("older-writer-internal-id".into());
+                    std::sync::Arc::make_mut(facts).send_id =
+                        Some("older-writer-internal-id".into());
                 }
             }
             let ids = session.entry_send_ids(&entries).await.unwrap();
@@ -2105,7 +2113,7 @@ async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storage
         let mut entries = session.entries(1, 100).await.unwrap();
         for entry in &mut entries {
             if let Some(facts) = &mut entry.state.facts {
-                facts.send_id = None;
+                std::sync::Arc::make_mut(facts).send_id = None;
             }
         }
         let recovered = session.older_entry_send_ids(&entries).await.unwrap();

@@ -1283,7 +1283,7 @@ struct PromptReport {
 /// Where two prompts first differ, named by position, field and role only.
 fn prompt_difference(
     today: &[broca_protocol::content::Message],
-    rebuilt: &[broca_protocol::content::Message],
+    rebuilt: &[std::sync::Arc<broca_protocol::content::Message>],
 ) -> Option<String> {
     for (index, (a, b)) in today.iter().zip(rebuilt).enumerate() {
         let at = if index + 1 == today.len().min(rebuilt.len()) {
@@ -1455,7 +1455,12 @@ fn run_trace(args: &Args) {
             m.iter().map(|m| format!("{:?}", m.role)).collect()
         };
         println!("  today:   {}", roles(&today).join(" "));
-        println!("  rebuilt: {}", roles(&conversation.messages).join(" "));
+        let rebuilt: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|message| broca_protocol::content::Message::clone(message))
+            .collect();
+        println!("  rebuilt: {}", roles(&rebuilt).join(" "));
     });
 }
 

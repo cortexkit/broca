@@ -269,7 +269,7 @@ async fn read_page_with_facts<B: SessionBackend>(
                 withheld.insert(entry.ordinal - 1);
             }
             if let (Some(run), Some(base)) = (&facts.run_id, facts.runner_tag_base) {
-                numbering.insert(entry.ordinal - 1, (run.clone(), base));
+                numbering.insert(entry.ordinal - 1, (run.to_string(), base));
             }
             if facts.clean_reply && entry.message.role == Role::Assistant {
                 clean_replies.insert(entry.ordinal - 1);
@@ -282,7 +282,7 @@ async fn read_page_with_facts<B: SessionBackend>(
                     }))
                     .ok()
                 });
-                stamps.entry(run.clone()).or_insert(stamp);
+                stamps.entry(run.to_string()).or_insert(stamp);
             }
             summaries.insert(
                 entry.ordinal - 1,
@@ -391,7 +391,7 @@ async fn imported_notices<B: SessionBackend>(
                 &delivered.text,
             )
             .with_call_key(&call.call_key);
-            fact.call_carrier = call.carrier.clone();
+            fact.call_carrier = call.carrier.as_deref().map(str::to_owned);
             notices.push(fact);
         }
     }
@@ -861,28 +861,28 @@ fn page_message(
         ordinal: entry.ordinal,
     })?;
     let ordinal = entry.ordinal - 1;
-    let mut message = entry.message.clone();
+    let mut message = broca_protocol::Message::clone(&entry.message);
     message.ordinal = Some(ordinal);
     let completed_at = broca_core::compaction_v2::entries::project_completion(
         &message,
-        entry.next.as_ref(),
+        entry.next.as_deref(),
         facts
             .written_at_ms
             .filter(|_| facts.native && message.role == Role::Assistant),
     );
     let delivery = delivery(facts)?;
-    let run = facts.run_id.as_ref().map(|run_id| {
-        let next_run = next.and_then(|next| next.state.facts.as_ref()?.run_id.as_ref());
+    let run = facts.run_id.as_deref().map(|run_id| {
+        let next_run = next.and_then(|next| next.state.facts.as_ref()?.run_id.as_deref());
         // A run's messages are contiguous, so its last one is the one the next message doesn't
         // share. It is final once the run has ended: every run before the latest one has, since
         // a run starts only after the one before it ends.
         let ended = match latest {
-            Some(run) if &run.run_id == run_id => run.finished.is_some(),
+            Some(run) if run.run_id == run_id => run.finished.is_some(),
             _ => true,
         };
         RunAttribution {
-            run_id: run_id.clone(),
-            episode: run_id.clone(),
+            run_id: run_id.to_owned(),
+            episode: run_id.to_owned(),
             is_final: next_run != Some(run_id) && ended,
             delivery: delivery.clone(),
         }
@@ -901,15 +901,16 @@ fn page_message(
 fn delivery(
     facts: &broca_session_store::record::EntryFacts,
 ) -> Result<Option<broca_protocol::tags::DeliveryAttribution>, StoreReadError> {
-    let Some(mode) = facts.delivery_mode.clone() else {
+    let Some(mode) = facts.delivery_mode.as_deref() else {
         return Ok(None);
     };
-    let mode = serde_json::from_value(serde_json::Value::String(mode)).map_err(|_| {
-        StoreReadError::BadFact {
-            ordinal: facts.ordinal,
-            field: "delivery_mode",
-        }
-    })?;
+    let mode =
+        serde_json::from_value(serde_json::Value::String(mode.to_owned())).map_err(|_| {
+            StoreReadError::BadFact {
+                ordinal: facts.ordinal,
+                field: "delivery_mode",
+            }
+        })?;
     Ok(Some(broca_protocol::tags::DeliveryAttribution {
         mode,
         tool_call_id: facts.delivery_tool_call_id.clone(),
@@ -1076,8 +1077,8 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
         .map(|call| CallDisplay {
             tool_call_id: call.tool_call_id.0.clone(),
             call_key: call.call_key.clone(),
-            call_carrier: call.carrier.clone(),
-            schema_pin: call.schema_pin.clone(),
+            call_carrier: call.carrier.as_deref().map(str::to_owned),
+            schema_pin: call.schema_pin.as_deref().cloned(),
         })
         .collect();
     let key_at = |part: u32| {
@@ -1110,7 +1111,7 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
         client_message_id: facts
             .and_then(|facts| facts.client_message_id.clone())
             .filter(|_| user),
-        sender: facts.and_then(|facts| facts.sender.clone()),
+        sender: facts.and_then(|facts| facts.sender.as_deref().map(str::to_owned)),
         speaks_for: marks.and_then(|marks| marks.get("speaks_for").cloned()),
         notice: marks.and_then(|marks| marks.get("notice")) == Some(&serde_json::Value::Bool(true)),
         calls,
@@ -1166,11 +1167,11 @@ pub fn turn_times(
                 return ToolTime::new(*id);
             };
             let mut time = ToolTime::new(*id).with_call_key(&call.call_key);
-            time.call_carrier = call.carrier.clone();
+            time.call_carrier = call.carrier.as_deref().map(str::to_owned);
             time.started_at = call.dispatched_at_ms;
             time.finished_at = call.finished_at_ms;
             time.unanswered = call.unanswered.map(|why| why.as_str().to_owned());
-            if let Some(serde_json::Value::String(pin)) = &call.schema_pin {
+            if let Some(serde_json::Value::String(pin)) = call.schema_pin.as_deref() {
                 time = time.with_schema_pin(pin);
             }
             time
