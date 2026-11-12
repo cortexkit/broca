@@ -71,6 +71,7 @@ pub fn last_run_error(error: &broca_protocol::ProviderError) -> LastRunError {
         .retry_after_secs
         .and_then(cortexkit_role_llm_runner::read::RetryAfterSecs::new);
     summary.resets_at_ms = error.resets_at_ms;
+    summary.provider_code = shared.provider_code.clone();
     summary
 }
 
