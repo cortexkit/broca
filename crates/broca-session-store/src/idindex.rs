@@ -996,6 +996,13 @@ mod tests;
 
 impl crate::held::HeldBytes for OpenIds {
     fn heap_bytes(&self) -> usize {
-        self.ids.heap_bytes() + self.records.heap_bytes()
+        // The box, then what it holds: the ids filed, the records held in memory, the seqs the
+        // kept records hold for the index, and the places of the records found by place.
+        let filed = &self.0;
+        std::mem::size_of::<Filed>()
+            + filed.ids.heap_bytes()
+            + filed.held.heap_bytes()
+            + filed.in_kept.heap_bytes()
+            + filed.places.capacity() * std::mem::size_of::<(u64, FramePlace)>()
     }
 }
