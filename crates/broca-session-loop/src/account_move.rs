@@ -310,6 +310,25 @@ pub fn resume_can_record_account_change(run: &broca_session_store::fold::operati
     )
 }
 
+/// The account `run` sends on now: its newest `AuthRefrozen` (a move to another account at a
+/// quota wall, or a resume on the account routing gave it), else the one its start froze. A
+/// reader that checks something against the run's account, such as a steer's auth pin, reads it
+/// here rather than from the start.
+pub fn current_auth_selection(
+    run: &broca_session_store::fold::operations::Run,
+    parts: &dyn crate::parts::Parts,
+) -> Result<Option<broca_wal::AuthSelection>, LoopError> {
+    if let Some(refrozen) = &run.refrozen_auth {
+        return serde_json::from_value(refrozen.clone())
+            .map(Some)
+            .map_err(|e| LoopError::Parts(format!("the run's account refreeze: {e}")));
+    }
+    let start = run.start.as_ref().ok_or(LoopError::Unsupported(
+        "a run whose start isn't in the fold",
+    ))?;
+    Ok(crate::run::admission_of_start(start, parts)?.auth_selection)
+}
+
 /// Stores routing's answer in `account_continue` on the error that ends a run whose account
 /// spent its usage window and which routing didn't move. A hold that names when an account
 /// should have room (`until_ms`) also tells the caller when to try again: `retry_after_secs`

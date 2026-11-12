@@ -4452,12 +4452,24 @@ mod executor {
                 }
             };
             // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
-            preserve_billing_vault_snapshot(
-                &mut resolution.selection,
-                prior_run
+            // A moved run's resume that routing gave another credential is a credential change:
+            // the recorded facts belong to the old one, so it keeps what the resolve read for the
+            // new one, as an auth-recovery credential change freezes them.
+            let recorded_selection = prior_run
+                .as_ref()
+                .and_then(|prior| prior.config.auth_selection.as_ref());
+            let resumed_on_another_credential = resume_asks
+                && resolution
+                    .selection
                     .as_ref()
-                    .and_then(|prior| prior.config.auth_selection.as_ref()),
-            );
+                    .zip(recorded_selection)
+                    .is_some_and(|(now, recorded)| {
+                        now.credential_id != recorded.credential_id
+                            || now.account_ref != recorded.account_ref
+                    });
+            if !resumed_on_another_credential {
+                preserve_billing_vault_snapshot(&mut resolution.selection, recorded_selection);
+            }
             if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
                 self.provider_client
                     .chatgpt_connections()
@@ -4620,7 +4632,9 @@ mod executor {
                 quota_observer: broca_module_serve::usage_observe::observer(
                     job.req.model.provider_module_id.as_str(),
                     resolution.method.map(|method| method.as_token()),
-                    if fresh_episode {
+                    // The account the run sends on: routing's answer on a fresh run and on a
+                    // moved run's resume that asked for it, else the one the run recorded.
+                    if fresh_episode || resume_asks {
                         resolution.selection.as_ref()
                     } else {
                         prior_run

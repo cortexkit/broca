@@ -3575,6 +3575,62 @@ async fn attempt_observations_name_the_account_each_attempt_was_sent_on() {
     }
 }
 
+/// After a move, nothing the run saw on the account it left is reported as the new account's:
+/// the run's end carries no rate-limit headers from before the move, and attempts on the new
+/// account carry no listing digest from the old account's admission.
+#[tokio::test]
+async fn a_move_drops_what_the_old_account_saw_from_later_reports() {
+    let routing = Arc::new(FakeRouting::default());
+    let client = Arc::new(client(&routing));
+    let reporter = RunReporter::start(
+        Arc::clone(&client),
+        "adm-move".into(),
+        "run-move".into(),
+        Some("listing-of-a".into()),
+        Arc::new(AtomicU64::new(100)),
+    );
+    let lineage = lineage();
+    let mut on_a = continue_selection();
+    on_a.credential_id = "credential-a".into();
+    on_a.account_ref = Some("acct-a".into());
+    let exhausted = AttemptAccountObservation {
+        ratelimit_headers: BTreeMap::from([(
+            "anthropic-ratelimit-unified-status".to_owned(),
+            "rejected".to_owned(),
+        )]),
+        ..Default::default()
+    };
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        4,
+        &attempt(Some(200), exhausted),
+        Some(&on_a),
+    );
+    let mut on_b = continue_selection();
+    on_b.credential_id = "credential-b".into();
+    on_b.account_ref = Some("acct-b".into());
+    reporter.moved(Some(lineage), 6, &on_b);
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        7,
+        &attempt(Some(200), AttemptAccountObservation::default()),
+        Some(&on_b),
+    );
+    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    settle(&routing, 4).await;
+    let observed = routing.observed();
+    assert_eq!(observed[0]["view_digest"], "listing-of-a");
+    assert_eq!(
+        observed[0]["headers"]["anthropic-ratelimit-unified-status"],
+        "rejected"
+    );
+    assert_eq!(observed[2]["kind"], "attempt");
+    assert_eq!(observed[2]["served_account_id"], "acct-b");
+    assert!(observed[2].get("view_digest").is_none(), "{}", observed[2]);
+    assert_eq!(observed[3]["kind"], "run_finished");
+    assert!(observed[3].get("headers").is_none(), "{}", observed[3]);
+}
+
 /// A run moves only when routing is known to declare both `account_continue` and
 /// `account_continue_resume`. An unreadable description, or either one alone, sends nothing:
 /// no continue request, and so no move and no report of one.

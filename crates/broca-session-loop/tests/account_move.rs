@@ -1039,6 +1039,15 @@ async fn a_wall_moves_the_step_to_the_offered_account() {
         ran.operations.run.as_ref().unwrap().refrozen_auth,
         Some(serde_json::to_value(&b).unwrap())
     );
+    // What a steer's auth pin is checked against while the run goes on: B.
+    assert_eq!(
+        broca_session_loop::account_move::current_auth_selection(
+            ran.operations.run.as_ref().unwrap(),
+            &MemoryParts::default()
+        )
+        .unwrap(),
+        Some(b.clone())
+    );
     // A move that leaves the render config alone refreezes no config.
     assert!(!ran
         .records

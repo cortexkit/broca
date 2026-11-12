@@ -2102,6 +2102,7 @@ impl RunReporter {
     ) -> Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
+            let mut view_digest = view_digest;
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
             let mut last_failed_attempt_at_ms: Option<u64> = None;
             while let Some(event) = rx.recv().await {
@@ -2229,6 +2230,12 @@ impl RunReporter {
                         credential_id,
                         account,
                     } => {
+                        // What the run saw on the account it left is not the new account's: the
+                        // run's end reports only rate-limit headers seen after the move, and
+                        // attempts on the new account name no listing digest, since its
+                        // credential was offered by routing, not chosen from a listing here.
+                        latest_headers = None;
+                        view_digest = None;
                         if let Some(id) =
                             event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
                         {
