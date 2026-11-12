@@ -176,6 +176,15 @@ pub struct StoreActor<B: SessionBackend> {
     /// The authoritative folder and the opener's backup selection rule. Without placement
     /// information an unlabelled session cannot safely adopt a class.
     class_placement: Option<(broca_wal::StorageClass, Vec<String>)>,
+    /// Where an import stages the session it writes before publishing it over this one (see
+    /// `store_import_stage`). Without it an import is refused.
+    import_staging: Option<Arc<dyn crate::store_import_stage::ImportStaging<B>>>,
+    /// The most records an import appends in one batch: one log batch's limit, or fewer in tests
+    /// that cut an import between its batches.
+    import_batch: usize,
+    /// Where a test stops an import as a crash would.
+    #[cfg(test)]
+    import_cut: Option<crate::store_import_stage::ImportCut>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -434,7 +443,33 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
             retention_clock: None,
             class_placement: None,
+            import_staging: None,
+            import_batch: broca_session_store::session::MAX_BATCH_RECORDS,
+            #[cfg(test)]
+            import_cut: None,
         }
+    }
+
+    /// Stages an import in `staging` and publishes it over this session from there.
+    pub fn with_import_staging(
+        mut self,
+        staging: Arc<dyn crate::store_import_stage::ImportStaging<B>>,
+    ) -> Self {
+        self.import_staging = Some(staging);
+        self
+    }
+
+    /// Appends an import at most `records` records at a time, and stops it at `cut` as a crash
+    /// would.
+    #[cfg(test)]
+    pub(crate) fn with_import_cut(
+        mut self,
+        records: usize,
+        cut: Option<crate::store_import_stage::ImportCut>,
+    ) -> Self {
+        self.import_batch = records;
+        self.import_cut = cut;
+        self
     }
 
     pub(crate) fn with_class_placement(

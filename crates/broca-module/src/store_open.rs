@@ -53,10 +53,10 @@ pub struct StoreRuntime {
     /// The mode of the sessions this runtime creates.
     new_sessions: Cipher,
     /// The deployment key, once it has loaded.
-    deployment: OnceLock<DeploymentKey>,
+    deployment: OnceLock<Arc<DeploymentKey>>,
     /// What sessions are opened with before the key has loaded: plain sessions open, encrypted
     /// ones refuse.
-    unloaded: DeploymentKey,
+    unloaded: Arc<DeploymentKey>,
     /// Each class root's setup parts, by [`StorageClass::index`]. A root keeps its own, so a
     /// part stored in one root never counts as stored in another: a session's root holds every
     /// part its runs name.
@@ -121,6 +121,10 @@ impl StoreRuntime {
         executor: Arc<dyn RunExecutor>,
         idle_ttl: Duration,
     ) -> Result<Self, String> {
+        // What an import crashed while staging is never published; nothing is staging yet.
+        crate::store_import_stage::clear_import_staging(state_root).map_err(|error| {
+            format!("the new storage's import staging could not be cleared: {error}")
+        })?;
         let plain = broca_session_store::setup::SetupKey::plain();
         let mut roots = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
@@ -149,7 +153,7 @@ impl StoreRuntime {
             key_id,
             new_sessions,
             deployment: OnceLock::new(),
-            unloaded: DeploymentKey::unloaded(key_id).creating(new_sessions),
+            unloaded: Arc::new(DeploymentKey::unloaded(key_id).creating(new_sessions)),
             roots,
             executor,
             idle_ttl,
@@ -216,7 +220,9 @@ impl StoreRuntime {
                 .map_err(|_| "a holder of the encrypted setup parts panicked")? =
                 Box::new(DeploymentParts::loaded(parts));
         }
-        let _ = self.deployment.set(deployment.creating(self.new_sessions));
+        let _ = self
+            .deployment
+            .set(Arc::new(deployment.creating(self.new_sessions)));
         Ok(())
     }
 
@@ -240,6 +246,16 @@ impl StoreRuntime {
     /// and before that a stand-in that opens plain sessions only. Either creates sessions in
     /// the mode `session_storage.encryption` chose ([`new_sessions`](Self::new_sessions)).
     pub fn deployment(&self) -> &DeploymentKey {
+        self.deployment_shared_ref()
+    }
+
+    /// The deployment key as [`StoreRuntime::deployment`] gives it, shared, for what outlives a
+    /// borrow of the runtime (an import's staging loads the session it publishes with it).
+    pub fn deployment_shared(&self) -> Arc<DeploymentKey> {
+        Arc::clone(self.deployment_shared_ref())
+    }
+
+    fn deployment_shared_ref(&self) -> &Arc<DeploymentKey> {
         self.deployment.get().unwrap_or(&self.unloaded)
     }
 
@@ -656,6 +672,12 @@ impl StoreRuntime {
         if create.is_some() {
             actor = actor.created_here();
         }
+        actor =
+            actor.with_import_staging(Arc::new(crate::store_import_stage::FsImportStaging::new(
+                &self.state_root,
+                class.store_root(&self.state_root),
+                self.deployment_shared(),
+            )));
         let readers_root = class.store_root(&self.state_root);
         actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {

@@ -44,15 +44,14 @@ use broca_protocol::BindIdentity;
 use broca_session_convert::stage::{Stage, StageError};
 use broca_session_convert::verify::{MediaRoot, Mode, Verify};
 use broca_session_loop::parts::Parts as _;
-use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend as _};
 use broca_wal::migration::{self, Freeze, MoveRefusal as MarkerRefusal};
 use broca_wal::{
     FramedRecord, FrozenPrefix, MoveJournal, StorageClass, StoreOwnership, WalLineageId,
 };
 use serde_json::json;
 
-mod directories;
-pub(crate) use directories::PublicationDirs;
+// The publication barrier online moves and startup/archive conversion share.
+pub(crate) use broca_module::store_publish::{publish_data_at, publish_head_at, PublicationDirs};
 #[cfg(test)]
 pub(crate) use tests::Faults;
 
@@ -946,137 +945,8 @@ impl StoreMove {
 
     /// Writes the live head only after the data publication barrier.
     async fn write_head(&self, journal: &MoveJournal, paths: &Paths) -> Result<u64, Stop> {
-        publish_head_at(&paths.staging, &paths.store, &journal.address).await
+        publish_head_at(&paths.staging, &paths.store, &journal.address, None).await
     }
-}
-
-/// Shared publication barrier for online moves and startup/archive conversion. Repeating a
-/// rename after a crash accepts only the already-published directory, never a second copy.
-pub(crate) fn publish_data_at(
-    state_root: &Path,
-    staging: &Path,
-    store: &Path,
-    address: &str,
-    directories: &mut PublicationDirs,
-    mut step: impl FnMut(&'static str) -> Result<(), Stop>,
-) -> Result<(), Stop> {
-    directories
-        .ensure(state_root, store)
-        .map_err(io_failed("the class store couldn't be initialized"))?;
-    let live_logs = store.join("logs").join(address);
-    let live_objects = store.join("objects").join(address);
-    for (folder, live, boundary) in [
-        ("logs", &live_logs, "rename_logs"),
-        ("objects", &live_objects, "rename_objects"),
-    ] {
-        let staged = staging.join(folder).join(address);
-        if !staged
-            .try_exists()
-            .map_err(io_failed("the staged session couldn't be checked"))?
-        {
-            if folder == "logs"
-                && !live
-                    .try_exists()
-                    .map_err(io_failed("the published log couldn't be checked"))?
-            {
-                return Err(unavailable(
-                    "the verified session log",
-                    "absent from staging and destination",
-                )
-                .into());
-            }
-            continue;
-        }
-        std::fs::rename(&staged, live)
-            .map_err(io_failed("the staged session couldn't be published"))?;
-        // The online move's fault boundary remains immediately after the rename.
-        // Cutover recovery uses the same boundary before it publishes the head.
-        step(boundary)?;
-    }
-    for folder in ["logs", "objects"] {
-        // A visible destination on restart is not proof that its rename was synced. Replay
-        // both changed-parent barriers even when the session directory already left staging.
-        if store
-            .join(folder)
-            .join(address)
-            .try_exists()
-            .map_err(io_failed("the published data couldn't be checked"))?
-        {
-            for (parent, boundary) in [
-                (
-                    staging.join(folder),
-                    if folder == "logs" {
-                        "sync_logs_source_parent"
-                    } else {
-                        "sync_objects_source_parent"
-                    },
-                ),
-                (
-                    store.join(folder),
-                    if folder == "logs" {
-                        "sync_logs_destination_parent"
-                    } else {
-                        "sync_objects_destination_parent"
-                    },
-                ),
-            ] {
-                migration::sync_dir(&parent)
-                    .map_err(io_failed("a data rename's parent couldn't be synced"))?;
-                step(boundary)?;
-            }
-        }
-    }
-    step("sync_data")?;
-    Ok(())
-}
-
-/// Writes the staged head as the live head, through the backend's versioned head write,
-/// with no head expected, then syncs `heads/` and reads the head back.
-pub(crate) async fn publish_head_at(
-    staging: &Path,
-    store: &Path,
-    address: &str,
-) -> Result<u64, Stop> {
-    let addr = SessionAddr(address.to_owned());
-    broca_module::store_open::recovery::register_candidate(store, &addr).map_err(io_failed(
-        "the installed session's recovery couldn't be registered",
-    ))?;
-    let staged = LocalBackend::new(staging);
-    let (bytes, version) = staged
-        .read_head(&addr)
-        .await
-        .map_err(|error| unavailable("the staged head couldn't be read", format!("{error:?}")))?
-        .ok_or_else(|| unavailable("the staged head", "absent"))?;
-    let live = LocalBackend::new(store);
-    match live
-        .read_head(&addr)
-        .await
-        .map_err(|error| unavailable("the live head couldn't be read", format!("{error:?}")))?
-    {
-        None => {
-            live.write_head(&addr, &bytes, None, version)
-                .await
-                .map_err(|error| {
-                    unavailable("the head couldn't be written", format!("{error:?}"))
-                })?;
-        }
-        Some(existing) if existing == (bytes.clone(), version) => {}
-        Some(_) => {
-            return Err(
-                unavailable("the live head", "differs from the verified staged head").into(),
-            )
-        }
-    }
-    migration::sync_dir(&store.join("heads"))
-        .map_err(io_failed("the new storage's heads couldn't be synced"))?;
-    let read = live
-        .read_head(&addr)
-        .await
-        .map_err(|error| unavailable("the head couldn't be read back", format!("{error:?}")))?;
-    if read != Some((bytes, version)) {
-        return Err(unavailable("the head", "it reads back other than it was written").into());
-    }
-    Ok(version)
 }
 
 impl StoreMove {
