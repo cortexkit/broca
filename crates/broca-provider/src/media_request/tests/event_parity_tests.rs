@@ -62,14 +62,12 @@ impl Engine {
         &BTreeMap<Occurrence, (MediaCost, bool)>,
         &BTreeSet<Occurrence>,
         &BTreeSet<Occurrence>,
-        &HashMap<MediaId, BTreeSet<Occurrence>>,
         MediaCost,
     ) {
         (
             &self.aging.shown,
             &self.aging.unprotected,
             &self.aging.aged,
-            &self.aging.by_capture,
             self.aging.totals(),
         )
     }

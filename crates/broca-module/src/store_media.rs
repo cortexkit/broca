@@ -60,7 +60,77 @@ struct Slot {
 
 /// Where each medium's bytes are stored, by digest: the object the first record naming the
 /// digest names. Kept apart from the index, since the engine reads bytes through it.
-type Objects = Arc<Mutex<BTreeMap<String, MediaObject>>>;
+type Objects = Arc<Mutex<BTreeMap<Digest, MediaObject>>>;
+
+/// A digest as [`Objects`] keys it: the 32 bytes a SHA-256 in lowercase hex names, held in
+/// a quarter of its text's size, or any other text as it is. Keys order as their texts do, so
+/// the saved index lists its objects in digest order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Digest {
+    Sha256([u8; 32]),
+    Text(Box<str>),
+}
+
+impl Digest {
+    fn of(text: &str) -> Self {
+        fn nibble(digit: u8) -> Option<u8> {
+            match digit {
+                b'0'..=b'9' => Some(digit - b'0'),
+                b'a'..=b'f' => Some(digit - b'a' + 10),
+                _ => None,
+            }
+        }
+        let digits = text.as_bytes();
+        let mut bytes = [0u8; 32];
+        let parsed = digits.len() == 64
+            && bytes.iter_mut().enumerate().all(|(at, byte)| {
+                match (nibble(digits[2 * at]), nibble(digits[2 * at + 1])) {
+                    (Some(high), Some(low)) => {
+                        *byte = high << 4 | low;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        if parsed {
+            Self::Sha256(bytes)
+        } else {
+            Self::Text(text.into())
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Self::Sha256(bytes) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+            Self::Text(text) => text.to_string(),
+        }
+    }
+}
+
+impl Ord for Digest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            // Lowercase hex orders as the bytes it names.
+            (Self::Sha256(left), Self::Sha256(right)) => left.cmp(right),
+            _ => self.text().cmp(&other.text()),
+        }
+    }
+}
+
+impl PartialOrd for Digest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl broca_session_store::held::HeldBytes for Digest {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Sha256(_) => 0,
+            Self::Text(text) => text.len(),
+        }
+    }
+}
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -256,7 +326,7 @@ impl SessionIndex {
             let index = slot.index.as_ref()?;
             let objects: Vec<(String, MediaObject)> = locked(&objects)
                 .iter()
-                .map(|(digest, object)| (digest.clone(), object.clone()))
+                .map(|(digest, object)| (digest.text(), object.clone()))
                 .collect();
             Some(MediaIndexSave {
                 index: to_stored(index, &objects),
@@ -273,7 +343,7 @@ impl SessionIndex {
         let profile = stored.limits.as_ref().map(media_profile).transpose()?;
         let mut objects = locked(&self.objects);
         for (digest, object) in stored.objects {
-            objects.entry(digest).or_insert(object);
+            objects.entry(Digest::of(&digest)).or_insert(object);
         }
         Ok(MediaIndex::new(session, aging, profile, stored.step_open))
     }
@@ -301,7 +371,7 @@ impl SessionIndex {
             let mut objects = locked(&self.objects);
             for (digest, object) in &feed.objects {
                 objects
-                    .entry(digest.clone())
+                    .entry(Digest::of(digest))
                     .or_insert_with(|| object.clone());
             }
         }
@@ -345,7 +415,7 @@ impl SessionIndex {
         if cut {
             // A cut may have removed the records that named where some bytes are; a later
             // record naming the same media names them again.
-            let held: BTreeSet<String> = slot
+            let held: BTreeSet<Digest> = slot
                 .index
                 .as_ref()
                 .map(|index| {
@@ -354,7 +424,7 @@ impl SessionIndex {
                         .facts()
                         .captures
                         .into_iter()
-                        .map(|capture| capture.reference.sha256)
+                        .map(|capture| Digest::of(&capture.reference.sha256))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -497,7 +567,7 @@ impl SessionIndex {
     pub fn stored(&self) -> Option<StoredMediaIndex> {
         let objects: Vec<(String, MediaObject)> = locked(&self.objects)
             .iter()
-            .map(|(digest, object)| (digest.clone(), object.clone()))
+            .map(|(digest, object)| (digest.text(), object.clone()))
             .collect();
         self.index().map(|index| to_stored(&index, &objects))
     }
@@ -729,7 +799,7 @@ impl<R: SessionBackend + Send + Sync> MediaBytes for StoreMediaBytes<R> {
         use futures::FutureExt as _;
         let digest = || reference.sha256.clone();
         let object = locked(&self.objects)
-            .get(&reference.sha256)
+            .get(&Digest::of(&reference.sha256))
             .cloned()
             .ok_or_else(|| MediaReadError::Missing(digest()))?;
         // A render runs inside a provider call and can't wait. The storage backends answer an

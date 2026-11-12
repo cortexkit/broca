@@ -729,3 +729,37 @@ pub(crate) fn step_end(run: &str, step: u64, calls: u32) -> Record {
         by_model: Vec::new(),
     })
 }
+
+/// A digest keys the objects map in a quarter of its text and gives that text back: a
+/// lowercase hex SHA-256 as its bytes, any other text as it is. Keys order as their texts do,
+/// which is the order the saved index lists its objects in.
+#[test]
+fn a_digest_key_gives_its_text_back_and_orders_as_its_text() {
+    let texts: Vec<String> = vec![
+        "00".repeat(32),
+        "ff".repeat(32),
+        "0a".repeat(32),
+        "AB".repeat(32),
+        "g".repeat(64),
+        "short".into(),
+    ];
+    for text in &texts {
+        assert_eq!(super::Digest::of(text).text(), *text);
+    }
+    assert!(matches!(
+        super::Digest::of(&"0a".repeat(32)),
+        super::Digest::Sha256(_)
+    ));
+    assert!(matches!(
+        super::Digest::of(&"AB".repeat(32)),
+        super::Digest::Text(_)
+    ));
+    let mut keys: Vec<_> = texts.iter().map(|text| super::Digest::of(text)).collect();
+    keys.sort();
+    let mut sorted = texts.clone();
+    sorted.sort();
+    assert_eq!(
+        keys.iter().map(super::Digest::text).collect::<Vec<_>>(),
+        sorted
+    );
+}

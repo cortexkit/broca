@@ -12,7 +12,7 @@ use std::mem::size_of;
 
 use broca_protocol::{ContentBlock, MediaRef, Message, ToolOutput, ToolOutputPart};
 
-use super::{Capture, MediaBinding, MediaChange, MediaId, SessionMedia};
+use super::{Entry, MediaBinding, MediaChange, MediaId, SessionMedia};
 
 /// Entries one B-tree node holds at most (`std`'s `B` of 6).
 const BTREE_NODE_ENTRIES: usize = 11;
@@ -73,6 +73,11 @@ pub fn vec<T>(items: &Vec<T>, heap: impl Fn(&T) -> usize) -> usize {
     items.capacity() * size_of::<T>() + items.iter().map(heap).sum::<usize>()
 }
 
+/// What a boxed slice holds: exactly its items, with what each holds itself.
+pub fn boxed<T>(items: &[T], heap: impl Fn(&T) -> usize) -> usize {
+    std::mem::size_of_val(items) + items.iter().map(heap).sum::<usize>()
+}
+
 fn ids(ids: &Vec<MediaId>) -> usize {
     vec(ids, |_| 0)
 }
@@ -87,7 +92,7 @@ fn binding(binding: &MediaBinding) -> usize {
 
 /// A message skeleton: text blocks left empty, media blocks, and tool results whose parts are
 /// empty text or media. A skeleton has no origin and no tags.
-fn message(message: &Message) -> usize {
+pub(crate) fn message(message: &Message) -> usize {
     vec(&message.content, |block| match block {
         ContentBlock::Text { text } => text.capacity(),
         ContentBlock::Media(reference) => media_ref(reference),
@@ -105,12 +110,11 @@ fn message(message: &Message) -> usize {
     })
 }
 
-fn capture(capture: &Capture) -> usize {
-    media_ref(&capture.reference)
-        + capture
-            .tool_call
-            .as_ref()
-            .map_or(0, |call| call.0.capacity())
+fn capture(capture: &Entry) -> usize {
+    capture
+        .tool_call
+        .as_ref()
+        .map_or(0, |call| call.0.capacity())
 }
 
 impl SessionMedia {
@@ -124,34 +128,19 @@ impl SessionMedia {
                 .sum::<usize>()
     }
 
-    /// The heap the engine holds, by part: its captures, its lookups by digest, source,
-    /// position and tool call, the captures waiting for or holding protection, the messages it
-    /// keeps as skeletons, the references it may render, and what a converted session's first
-    /// compaction left. The bytes source it reads through is its owner's, and counted there.
-    /// The old protocol's compaction state is left out but for its captured references: on
-    /// media events it is never set.
+    /// The heap the engine holds, by part: its table of references, its captures, its lookups
+    /// by reference, position and tool call, the captures waiting for or holding protection,
+    /// the messages it keeps as skeletons, the references its compaction state may render, and
+    /// what a converted session's first compaction left. The bytes source it reads through is
+    /// its owner's, and counted there. The old protocol's compaction state is left out but for
+    /// its captured references: on media events it is never set, and those references are the
+    /// table's.
     pub fn held_parts(&self) -> Vec<(&'static str, usize)> {
         vec![
-            (
-                "captures",
-                hash_map(&self.captures, |_, value| capture(value)),
-            ),
-            (
-                "by digest",
-                hash_map(&self.digests, |key, value| key.capacity() + ids(value)),
-            ),
-            (
-                "by source",
-                hash_map(&self.sources, |key, value| key.capacity() + ids(value)),
-            ),
-            (
-                "by position",
-                hash_map(&self.positions, |(_, call, digest), value| {
-                    call.as_ref().map_or(0, |call| call.0.capacity())
-                        + digest.capacity()
-                        + ids(value)
-                }),
-            ),
+            ("references", self.refs.heap_bytes()),
+            ("captures", vec(&self.captures, capture)),
+            ("by source", vec(&self.sources, |_| 0)),
+            ("by position", vec(&self.positions, |_| 0)),
             (
                 "by tool call",
                 hash_map(&self.tools, |(call, _), value| {
@@ -172,11 +161,11 @@ impl SessionMedia {
             ),
             (
                 "placed skeletons",
-                btree_map(&self.skeleton, |_, value| message(value)),
+                btree_map(&self.skeleton, |_, copy| copy.heap_bytes()),
             ),
             (
                 "held skeletons",
-                hash_map(&self.held_messages, |_, value| message(value)),
+                hash_map(&self.held_messages, |_, copy| copy.heap_bytes()),
             ),
             (
                 "renderable references",

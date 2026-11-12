@@ -81,7 +81,6 @@ pub struct MediaAging {
     shown: BTreeMap<Occurrence, (MediaCost, bool)>,
     unprotected: BTreeSet<Occurrence>,
     aged: BTreeSet<Occurrence>,
-    by_capture: HashMap<MediaId, BTreeSet<Occurrence>>,
     bytes: u64,
     tokens: u64,
 }
@@ -99,9 +98,9 @@ impl MediaAging {
 
     /// The heap the aging state holds, by part, estimated as the engine's own state is (see
     /// `broca_core::media_request::held`): the occurrences shown with their costs, the
-    /// unprotected and aged ones, and each capture's occurrences.
+    /// unprotected and aged ones.
     pub fn held_parts(&self) -> Vec<(&'static str, usize)> {
-        use broca_core::media_request::held::{btree_bytes, hash_map};
+        use broca_core::media_request::held::btree_bytes;
         use std::mem::size_of;
         let set = |len: usize| btree_bytes(len, size_of::<Occurrence>());
         vec![
@@ -114,10 +113,6 @@ impl MediaAging {
             ),
             ("aging: unprotected", set(self.unprotected.len())),
             ("aging: aged", set(self.aged.len())),
-            (
-                "aging: by capture",
-                hash_map(&self.by_capture, |_, occurrences| set(occurrences.len())),
-            ),
         ]
     }
 
@@ -194,7 +189,7 @@ impl MediaAging {
                 MediaChange::Release(capture) => {
                     // A replacement can repeat a capture; all occurrences share its protection
                     // boundary but each keeps its own cost in the running totals.
-                    let ids = self.by_capture.get(&capture).cloned().unwrap_or_default();
+                    let ids: Vec<Occurrence> = self.occurrences(capture).collect();
                     for id in ids {
                         self.apply(profile, AgingEvent::Release { id });
                     }
@@ -354,7 +349,6 @@ impl MediaAging {
             } => {
                 self.remove(id);
                 self.shown.insert(id, (cost, protected));
-                self.by_capture.entry(id.capture).or_default().insert(id);
                 if !protected && !self.aged.contains(&id) {
                     self.add(id, cost);
                 }
@@ -403,12 +397,20 @@ impl MediaAging {
             self.tokens -= cost.tokens;
         }
         self.shown.remove(&id);
-        if let Some(ids) = self.by_capture.get_mut(&id.capture) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                self.by_capture.remove(&id.capture);
-            }
-        }
+    }
+
+    /// The shown occurrences of `capture`, in repetition order. Occurrences order by capture
+    /// first, so they are one range of the shown ones.
+    fn occurrences(&self, capture: MediaId) -> impl Iterator<Item = Occurrence> + '_ {
+        let first = Occurrence {
+            capture,
+            repetition: 0,
+        };
+        let last = Occurrence {
+            capture,
+            repetition: u32::MAX,
+        };
+        self.shown.range(first..=last).map(|(id, _)| *id)
     }
 
     pub fn is_aged(&self, id: Occurrence) -> bool {
@@ -440,7 +442,6 @@ impl MediaAging {
             if aging.shown.insert(id, (cost, protected)).is_some() {
                 return Err(format!("the occurrence {id:?} is shown twice"));
             }
-            aging.by_capture.entry(id.capture).or_default().insert(id);
         }
         aging.aged = state.aged.into_iter().collect();
         let (mut bytes, mut tokens) = (0u64, 0u64);

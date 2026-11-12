@@ -56,10 +56,14 @@ impl CapturedMedia {
 
     pub(crate) fn insert(&mut self, reference: &MediaRef) {
         if !self.contains(reference) {
-            Arc::make_mut(&mut self.0)
+            let references = Arc::make_mut(&mut self.0)
                 .entry(reference.sha256.clone())
-                .or_default()
-                .push(reference.clone());
+                .or_default();
+            // Most digests have one reference for the session's life: room for exactly that.
+            if references.capacity() == 0 {
+                references.reserve_exact(1);
+            }
+            references.push(reference.clone());
         }
     }
 
@@ -99,34 +103,40 @@ impl CapturedMedia {
     }
 
     pub(crate) fn enforce(&self, messages: &mut [Message]) {
-        for block in messages.iter_mut().flat_map(|message| &mut message.content) {
-            match block {
-                ContentBlock::Media(reference) if !self.contains(reference) => {
-                    *block = ContentBlock::Text {
-                        text: broca_protocol::content::media_not_shown_marker(
-                            reference,
-                            MediaMarkerReason::Provenance,
-                        ),
-                    };
-                }
-                ContentBlock::ToolResult(result) => {
-                    if let broca_protocol::ToolOutput::Parts { parts } = &mut result.output {
-                        for part in parts {
-                            if let broca_protocol::ToolOutputPart::Media { media } = part {
-                                if !self.contains(media) {
-                                    *part = broca_protocol::ToolOutputPart::Text {
-                                        text: broca_protocol::content::media_not_shown_marker(
-                                            media,
-                                            MediaMarkerReason::Provenance,
-                                        ),
-                                    };
-                                }
+        enforce_by(messages, |reference| self.contains(reference));
+    }
+}
+
+/// Replace each medium of `messages` that `captured` refuses with its provenance marker: a
+/// prompt may show only media the session captured.
+pub(crate) fn enforce_by(messages: &mut [Message], captured: impl Fn(&MediaRef) -> bool) {
+    for block in messages.iter_mut().flat_map(|message| &mut message.content) {
+        match block {
+            ContentBlock::Media(reference) if !captured(reference) => {
+                *block = ContentBlock::Text {
+                    text: broca_protocol::content::media_not_shown_marker(
+                        reference,
+                        MediaMarkerReason::Provenance,
+                    ),
+                };
+            }
+            ContentBlock::ToolResult(result) => {
+                if let broca_protocol::ToolOutput::Parts { parts } = &mut result.output {
+                    for part in parts {
+                        if let broca_protocol::ToolOutputPart::Media { media } = part {
+                            if !captured(media) {
+                                *part = broca_protocol::ToolOutputPart::Text {
+                                    text: broca_protocol::content::media_not_shown_marker(
+                                        media,
+                                        MediaMarkerReason::Provenance,
+                                    ),
+                                };
                             }
                         }
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 }
