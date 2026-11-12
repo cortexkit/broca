@@ -181,6 +181,7 @@ impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
                 pause_for_auth_at_start: None,
+                account_continue: None,
             };
             match mode {
                 StoreRunMode::Fresh => {

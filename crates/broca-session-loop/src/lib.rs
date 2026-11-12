@@ -36,6 +36,7 @@
 static ALLOCATOR: broca_test_support::alloc::CountingAlloc =
     broca_test_support::alloc::CountingAlloc;
 
+pub mod account_move;
 pub mod admit;
 pub mod billing;
 pub mod budget;

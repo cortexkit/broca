@@ -3244,6 +3244,129 @@ mod tests {
         }
     }
 
+    /// A conversation the account-move tests render: the caller's system text, a user turn, the
+    /// model's answer and the next user turn.
+    fn moved_run_options() -> CallOptions {
+        let text = |role, text: &str| {
+            Message::new(
+                role,
+                vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+            )
+        };
+        CallOptions::new(vec![
+            text(Role::System, "caller system"),
+            text(Role::User, "read the file"),
+            text(Role::Assistant, "it holds one function"),
+            text(Role::User, "and what does it do?"),
+        ])
+    }
+
+    /// A ChatGPT run that moved to another account renders the request it would have sent on
+    /// the old one, byte for byte: the account travels only in the request's headers.
+    #[test]
+    fn a_chatgpt_request_renders_the_same_body_on_another_account() {
+        let frozen = resolve_chatgpt("openai/gpt-5.4-mini").unwrap();
+        let clock = broca_core::clock::Clock::default();
+        let render = |token: &str, account: &str| {
+            provider_for_recorded_config(
+                "openai",
+                "gpt-5.4-mini",
+                frozen.clone(),
+                &AuthMode::Secret(token.to_owned()),
+                Some(AuthMethod::Chatgpt),
+                Some(account),
+                Some(account),
+                broca_provider::build_provider_http_client(),
+                &clock,
+            )
+            .unwrap()
+            .render_request(&moved_run_options())
+        };
+        let old = render(TOP_LEVEL, "acct-top");
+        let new = render(NESTED, "acct-nested");
+        assert!(!old.is_empty());
+        assert_eq!(old, new);
+    }
+
+    /// A Claude subscription run that moved to another account renders the same request but
+    /// for the persona: `metadata.user_id` names the new account's device and account, and the
+    /// billing block carries the new prompt id and so a new body signature (`cch`). Nothing else
+    /// differs.
+    #[test]
+    fn a_claude_subscription_request_differs_only_in_the_persona_on_another_account() {
+        let (old_frozen, _) = resolve_with_refusal_fallback(
+            "anthropic/claude-opus-5",
+            AuthMethod::Oauth,
+            None,
+            EpisodeRenderConfig::default(),
+        );
+        let old_persona = old_frozen.claude_code_persona.clone().unwrap();
+        // The persona a move refreezes (`claude_code_identity::moved_persona`): the new
+        // account's device and account ids and a new prompt id; the rest is kept.
+        let mut new_frozen = old_frozen.clone();
+        let persona = new_frozen.claude_code_persona.as_mut().unwrap();
+        persona.device_id = "b".repeat(64);
+        persona.account_uuid = Some("00000000-0000-4000-8000-00000000000b".into());
+        persona.prompt_id = Some("00000000-0000-4000-8000-0000000000bb".into());
+        let new_persona = persona.clone();
+        let clock = broca_core::clock::Clock::default();
+        let render = |frozen: &FrozenRenderConfig, token: &str, account: &str| {
+            let bytes = provider_for_recorded_config(
+                "anthropic",
+                "claude-opus-5",
+                frozen.clone(),
+                &AuthMode::Secret(token.to_owned()),
+                Some(AuthMethod::Oauth),
+                Some(account),
+                Some(account),
+                broca_provider::build_provider_http_client(),
+                &clock,
+            )
+            .unwrap()
+            .render_request(&moved_run_options());
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let mut old = render(&old_frozen, "token-a", "account");
+        let mut new = render(
+            &new_frozen,
+            "token-b",
+            "00000000-0000-4000-8000-00000000000b",
+        );
+        assert_ne!(old["metadata"]["user_id"], new["metadata"]["user_id"]);
+        assert_eq!(
+            new["metadata"]["user_id"],
+            broca_provider::claude_code_persona::metadata_user_id(
+                &new_persona.device_id,
+                new_persona.account_uuid.as_deref(),
+                &new_persona.session_id,
+            )
+        );
+        // The billing block differs in the prompt id and the signature over the body.
+        let billing =
+            |body: &serde_json::Value| body["system"][0]["text"].as_str().unwrap().to_owned();
+        let (old_billing, new_billing) = (billing(&old), billing(&new));
+        let cch = |text: &str| {
+            let at = text.find("cch=").unwrap() + 4;
+            text[at..at + 5].to_owned()
+        };
+        let unsigned = |text: &str, prompt: &str| {
+            text.replace(&cch(text), "<cch>")
+                .replace(prompt, "<prompt>")
+        };
+        assert_eq!(
+            unsigned(&old_billing, old_persona.prompt_id.as_deref().unwrap()),
+            unsigned(&new_billing, new_persona.prompt_id.as_deref().unwrap()),
+        );
+        assert!(new_billing.contains(new_persona.prompt_id.as_deref().unwrap()));
+        for body in [&mut old, &mut new] {
+            body["metadata"]["user_id"] = serde_json::Value::Null;
+            body["system"][0]["text"] = serde_json::Value::Null;
+        }
+        assert_eq!(old, new);
+    }
+
     #[test]
     fn an_eligible_oauth_episode_freezes_its_refusal_fallback_config() {
         let (source, _) = resolve_with_refusal_fallback(

@@ -1715,6 +1715,7 @@ fn bedrock_error(event_type: &str, payload: &Value, header_message: Option<&str>
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

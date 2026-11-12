@@ -29,5 +29,6 @@ pub fn crash_orphan_error() -> broca_protocol::ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }

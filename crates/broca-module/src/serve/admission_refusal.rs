@@ -246,6 +246,7 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         provider_details: None,
     }
 }

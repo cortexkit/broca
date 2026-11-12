@@ -1133,6 +1133,7 @@ mod gated {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let admitted = run_loop_with_control(
             request(&dir),

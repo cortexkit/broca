@@ -252,6 +252,7 @@ impl RunExecutor for HeldExecutor {
                 step_progress: control.step_progress,
                 model_call_ready: None,
                 pause_for_auth_at_start: control.pause_for_auth_at_start,
+                account_continue: None,
             };
             let mut finished = match (admission, mode) {
                 (Some(admission), _) => {

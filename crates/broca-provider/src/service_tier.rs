@@ -289,6 +289,7 @@ pub fn classify_tier_refusal(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -562,6 +563,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         classify_tier_refusal(
             family,
@@ -677,6 +679,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let refused = classify_tier_refusal(
             WireFamilyId::AnthropicMessages,
@@ -766,6 +769,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         assert_eq!(
             classify_tier_refusal(

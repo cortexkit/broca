@@ -589,6 +589,11 @@ struct AttemptTrace {
     wrapped_error_frame: Option<Box<responses_websocket::WrappedErrorFrame>>,
     /// The account evidence the response carried; see [`broca_protocol::AttemptAccountObservation`].
     account_observation: broca_protocol::AttemptAccountObservation,
+    /// What the newest `codex.rate_limits` frame of this response on a ChatGPT Responses socket
+    /// shows spent (see [`chatgpt_frame_window`]): `None` before any such frame, then the window
+    /// that frame shows spent, if exactly one. A usage limit the socket reports later in the same
+    /// response takes its window from here.
+    chatgpt_frame_window: Option<Option<&'static str>>,
 }
 
 impl AttemptTrace {
@@ -1780,6 +1785,7 @@ async fn send_warm_legacy(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }))
     };
     let exchange = async {
@@ -1953,6 +1959,7 @@ async fn send_warm_journaled(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }))
     };
     let mut id = None;
@@ -3059,6 +3066,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 };
                 tokio::select! {
                     biased;
@@ -3754,7 +3762,7 @@ fn account_changed_error(frozen: Option<&str>, served: Option<&str>) -> Option<P
     limit_window: None,
     account_ref: None,
     credential_id: None,
-    affordable_max_tokens: None, })
+    affordable_max_tokens: None, account_continue: None, })
 }
 
 /// ChatGPT carries an account in its headers as well as in vault metadata. Neither may
@@ -5067,6 +5075,7 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5090,6 +5099,7 @@ fn content_timeout_error() -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5128,6 +5138,7 @@ fn normalize_error(e: NormalizeError) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5159,6 +5170,7 @@ fn stream_too_slow_error(measured_bytes_per_sec: f64, floor: StreamFloor) -> Pro
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5179,6 +5191,7 @@ fn transport_error(message: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5199,6 +5212,7 @@ fn stream_limit_error(message: &str) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -5395,7 +5409,7 @@ fn classify_chatgpt_upstream_key_rejection(
     limit_window: None,
     account_ref: None,
     credential_id: None,
-    affordable_max_tokens: None, }
+    affordable_max_tokens: None, account_continue: None, }
 }
 
 /// A 429 that says one ACCOUNT has used up a usage window, rather than that the route is
@@ -5550,7 +5564,7 @@ fn classify_account_limit_exhausted_with_auth(
             }
         }
         crate::spec::WireFamilyId::OpenAiResponsesChatgpt => {
-            chatgpt_usage_limit_reached(status, body, now, error)
+            chatgpt_usage_limit_reached(status, headers, body, now, error)
         }
         crate::spec::WireFamilyId::OpenAiResponses => {
             meta_subscription_quota_exhausted(status, body, error)
@@ -5756,6 +5770,7 @@ fn meta_subscription_quota_exhausted(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -5775,12 +5790,14 @@ fn meta_subscription_quota_exhausted(
 /// The shared ChatGPT policy (`cortexkit_chatgpt_policy::classify_response_with_retry_after`)
 /// makes that decision and computes the reset: `resets_at_ms` comes from `resets_at`, else from
 /// now plus `resets_in_seconds`, else from now plus the retry-after. Both relative fallbacks are
-/// marked `retry_after`, not a stated absolute reset from the body. `limit_window` is left empty:
-/// the captured bodies name the plan but not which window ran out, and inventing a window name
-/// would mislead a router. A ChatGPT 429 with any other body (an ordinary throttle) is returned
-/// unchanged and keeps retrying.
+/// marked `retry_after`, not a stated absolute reset from the body. The body names the plan but
+/// not which window ran out, so `limit_window` comes only from the response's `x-codex-*` quota
+/// headers when they state it (see [`chatgpt_spent_window`]), else it stays empty: inventing a
+/// window name would mislead a router. A ChatGPT 429 with any other body (an ordinary throttle)
+/// is returned unchanged and keeps retrying.
 fn chatgpt_usage_limit_reached(
     status: u16,
+    headers: &crate::wire::ResponseHeaders,
     body: &str,
     now: SystemTime,
     error: ProviderError,
@@ -5803,12 +5820,88 @@ fn chatgpt_usage_limit_reached(
         provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_string()),
         resets_at_ms,
         resets_at_source: resets_at_source.map(|source| source.as_str().to_owned()),
-        limit_window: None,
+        limit_window: chatgpt_spent_window(headers)
+            .map(|window| broca_protocol::error::AccountLimitWindow::Quota(window.into())),
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
+}
+
+/// The usage window a ChatGPT/Codex response's quota headers show spent, by the name routing
+/// uses for it: `five_hour` or `seven_day`. The headers describe two windows, primary and
+/// secondary, each by its length (`x-codex-{primary,secondary}-window-minutes`) and how much of
+/// it is used (`x-codex-{primary,secondary}-used-percent`). The spent window is the one used at
+/// or above 100 percent, named by its length: 300 minutes is `five_hour`, 10080 is `seven_day`.
+/// Only what the headers state is read: when a header is missing or doesn't parse, when both or
+/// neither window is spent, or when the spent one has another length, there is no window.
+///
+/// Captured 2026-11-02 from an account past its weekly allowance, the 429 refusing it carried
+/// `x-codex-primary-used-percent: 100`, `x-codex-primary-window-minutes: 10080`,
+/// `x-codex-secondary-used-percent: 0` and `x-codex-secondary-window-minutes: 0`.
+fn chatgpt_spent_window(headers: &crate::wire::ResponseHeaders) -> Option<&'static str> {
+    use cortexkit_chatgpt_policy::QuotaHeader;
+    let read = |used: QuotaHeader, minutes: QuotaHeader| -> Option<(bool, u64)> {
+        let used: f64 = headers.get(used.name())?.trim().parse().ok()?;
+        let minutes: u64 = headers.get(minutes.name())?.trim().parse().ok()?;
+        used.is_finite().then_some((used >= 100.0, minutes))
+    };
+    let primary = read(
+        QuotaHeader::PrimaryUsedPercent,
+        QuotaHeader::PrimaryWindowMinutes,
+    )?;
+    let secondary = read(
+        QuotaHeader::SecondaryUsedPercent,
+        QuotaHeader::SecondaryWindowMinutes,
+    )?;
+    let minutes = match (primary, secondary) {
+        ((true, minutes), (false, _)) | ((false, _), (true, minutes)) => minutes,
+        _ => return None,
+    };
+    continued_window(minutes)
+}
+
+/// Routing's name for a ChatGPT usage window of `minutes`: `five_hour` for 300, `seven_day` for
+/// 10080, none for any other length.
+fn continued_window(minutes: u64) -> Option<&'static str> {
+    match minutes {
+        300 => Some("five_hour"),
+        10_080 => Some("seven_day"),
+        _ => None,
+    }
+}
+
+/// The usage window a ChatGPT/Codex `codex.rate_limits` socket frame shows spent, by the same
+/// rule as the response headers (see [`chatgpt_spent_window`]): exactly one of
+/// `rate_limits.primary` and `rate_limits.secondary` at or above 100 `used_percent`, named by its
+/// `window_minutes`. A window the frame leaves out or sends as `null` isn't spent. A window
+/// whose numbers are missing or don't parse, both or neither spent, or another length give no
+/// window. Reset times are never read.
+///
+/// Captured 2026-11-02 on a socket for an account past its weekly allowance:
+/// `{"type":"codex.rate_limits", "rate_limits":{"allowed":false,"limit_reached":true,
+/// "primary":{"used_percent":100,"window_minutes":10080,...},"secondary":null}, ...}`.
+pub(crate) fn chatgpt_frame_window(frame: &Value) -> Option<&'static str> {
+    let limits = frame.get("rate_limits")?;
+    let read = |name: &str| -> Option<Option<(bool, u64)>> {
+        match limits.get(name) {
+            None | Some(Value::Null) => Some(None),
+            Some(window) => {
+                let used = window.get("used_percent")?.as_f64()?;
+                let minutes = window.get("window_minutes")?.as_u64()?;
+                used.is_finite().then_some(Some((used >= 100.0, minutes)))
+            }
+        }
+    };
+    let spent = |window: Option<(bool, u64)>| window.filter(|(spent, _)| *spent);
+    let (primary, secondary) = (read("primary")?, read("secondary")?);
+    let minutes = match (spent(primary), spent(secondary)) {
+        (Some((_, minutes)), None) | (None, Some((_, minutes))) => minutes,
+        _ => return None,
+    };
+    continued_window(minutes)
 }
 
 /// OpenRouter's refusal of a request its credential's remaining credit cannot pay for: HTTP 402
@@ -5880,6 +5973,7 @@ fn xai_spending_limit_reached(
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
             ..error.clone()
         })
     } else {
@@ -5917,6 +6011,7 @@ fn opencode_payment_required(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -5958,6 +6053,7 @@ fn inception_payment_required(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -6011,6 +6107,7 @@ fn kimi_usage_limit_reached(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         ..error
     }
 }
@@ -6085,6 +6182,7 @@ fn google_quota_exhausted(body: &str, now: SystemTime, error: ProviderError) -> 
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
         provider_details,
         ..error
     }
@@ -6414,6 +6512,7 @@ fn http_error_in_family(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     // Run after the context-overflow and billing classification above, so a 400 those give a
     // more specific code keeps it.
@@ -6974,6 +7073,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
                 retries_used: 0,
             })])
@@ -10151,6 +10251,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         assert_eq!(retry_delay(&error, 0), Duration::from_millis(2_500));
     }
@@ -10173,6 +10274,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         assert_eq!(retry_delay(&error, 0), Duration::from_secs(120));
     }
@@ -10195,6 +10297,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         for (failed_attempt_index, nominal_secs) in [
             (0, 2.0),
@@ -10518,7 +10621,7 @@ mod tests {
         limit_window: None,
         account_ref: None,
         credential_id: None,
-        affordable_max_tokens: None, };
+        affordable_max_tokens: None, account_continue: None, };
         let error = classify_account_limit_exhausted(
             WireFamilyId::AnthropicMessages,
             429,
@@ -10689,6 +10792,134 @@ mod tests {
         assert_ne!(error.class, ErrorClass::Auth);
     }
 
+    /// The quota headers of a real ChatGPT/Codex 429 that refused an account past its weekly
+    /// allowance, captured 2026-11-02 (`broca-module-serve/tests/fixtures/usage-observe/
+    /// codex-quota-capture-2026-11-02.json`, its first entry).
+    fn captured_chatgpt_429_quota_headers() -> Vec<(String, String)> {
+        let capture: Value = serde_json::from_str(include_str!(
+            "../../broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json"
+        ))
+        .unwrap();
+        assert_eq!(capture[0]["status"], 429);
+        capture[0]["headers"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_owned()))
+            .collect()
+    }
+
+    fn classify_chatgpt_429_with(headers: &[(String, String)]) -> ProviderError {
+        let headers = crate::wire::ResponseHeaders::new(headers.iter().cloned());
+        let error = classify_http_error(429, CHATGPT_USAGE_LIMIT_BODY, None, None);
+        classify_account_limit_exhausted(
+            WireFamilyId::OpenAiResponsesChatgpt,
+            429,
+            &headers,
+            CHATGPT_USAGE_LIMIT_BODY,
+            UNIX_EPOCH + Duration::from_millis(1_789_579_322_081),
+            error,
+        )
+    }
+
+    fn with_header(
+        mut headers: Vec<(String, String)>,
+        name: &str,
+        value: Option<&str>,
+    ) -> Vec<(String, String)> {
+        headers.retain(|(candidate, _)| candidate != name);
+        if let Some(value) = value {
+            headers.push((name.to_owned(), value.to_owned()));
+        }
+        headers
+    }
+
+    /// A ChatGPT usage-limit 429 takes its window from the quota headers that came with it: the
+    /// captured weekly refusal's spent primary window is 10080 minutes long, so it is
+    /// `seven_day`. The other cases are that capture with one header changed.
+    #[test]
+    fn a_chatgpt_usage_limit_takes_the_window_its_quota_headers_show_spent() {
+        let captured = captured_chatgpt_429_quota_headers();
+        let error = classify_chatgpt_429_with(&captured);
+        assert!(error.is_account_limit_exhausted());
+        assert_eq!(error.limit_window.as_deref(), Some("seven_day"));
+        assert_eq!(error.resets_at_ms, Some(1_790_021_043_000));
+
+        // The capture with its spent window five hours long instead.
+        let five_hour = with_header(
+            captured.clone(),
+            "x-codex-primary-window-minutes",
+            Some("300"),
+        );
+        assert_eq!(
+            classify_chatgpt_429_with(&five_hour)
+                .limit_window
+                .as_deref(),
+            Some("five_hour")
+        );
+        // The spent window may be the secondary one.
+        let secondary = with_header(
+            with_header(
+                with_header(captured.clone(), "x-codex-primary-used-percent", Some("40")),
+                "x-codex-secondary-used-percent",
+                Some("100"),
+            ),
+            "x-codex-secondary-window-minutes",
+            Some("300"),
+        );
+        assert_eq!(
+            classify_chatgpt_429_with(&secondary)
+                .limit_window
+                .as_deref(),
+            Some("five_hour")
+        );
+
+        // No window when the headers don't state exactly one spent window of a known length.
+        for (case, headers) in [
+            ("no quota headers", Vec::new()),
+            (
+                "both spent",
+                with_header(
+                    with_header(
+                        captured.clone(),
+                        "x-codex-secondary-used-percent",
+                        Some("100"),
+                    ),
+                    "x-codex-secondary-window-minutes",
+                    Some("300"),
+                ),
+            ),
+            (
+                "neither spent",
+                with_header(captured.clone(), "x-codex-primary-used-percent", Some("99")),
+            ),
+            (
+                "a header missing",
+                with_header(captured.clone(), "x-codex-secondary-used-percent", None),
+            ),
+            (
+                "a header that doesn't parse",
+                with_header(
+                    captured.clone(),
+                    "x-codex-primary-window-minutes",
+                    Some("weekly"),
+                ),
+            ),
+            (
+                "another length",
+                with_header(
+                    captured.clone(),
+                    "x-codex-primary-window-minutes",
+                    Some("1440"),
+                ),
+            ),
+        ] {
+            let error = classify_chatgpt_429_with(&headers);
+            assert!(error.is_account_limit_exhausted(), "{case}");
+            assert_eq!(error.limit_window, None, "{case}");
+        }
+    }
+
     #[test]
     fn meta_429_without_resets_at_stays_rate_limited() {
         let body = r#"{"error":{"code":"rate_limit_exceeded","message":"Request rate limit reached","type":"rate_limit_error"}}"#;
@@ -10827,6 +11058,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let usage_no_reset = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#;
         let usage_string_reset = r#"{"error":{"type":"usage_limit_reached","resets_at":"1790021043","resets_in_seconds":60}}"#;
@@ -11292,6 +11524,7 @@ mod tests {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             };
             let classified = classify_account_limit_exhausted(
                 WireFamilyId::OpenAiChat,

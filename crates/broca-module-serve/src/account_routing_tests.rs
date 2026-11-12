@@ -61,6 +61,8 @@ struct FakeRouting {
     tier_probes: AtomicUsize,
     backoff: bool,
     credential_refused: bool,
+    /// The optional groups routing's description declares; `None` when it can't be read.
+    declared: Option<Vec<&'static str>>,
 }
 
 impl FakeRouting {
@@ -134,6 +136,14 @@ impl RoutingTransport for FakeRouting {
     async fn service_tier_supported(&self) -> Result<bool, String> {
         self.tier_probes.fetch_add(1, Ordering::SeqCst);
         Ok(self.tiers)
+    }
+    async fn capability(&self, name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        use crate::routing_capabilities::CapabilitySupport;
+        match &self.declared {
+            None => CapabilitySupport::Unknown,
+            Some(declared) if declared.contains(&name) => CapabilitySupport::Declared,
+            Some(_) => CapabilitySupport::NotDeclared,
+        }
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         self.request_bytes.lock().unwrap().push(body.clone());
@@ -3252,4 +3262,515 @@ async fn auth_routing_hints_are_ignored_for_unlisted_methods() {
         AccountChoice::NotApplicable
     );
     assert!(routing.requests.lock().unwrap().is_empty());
+}
+
+/// A wall on `account`, as the run loop states it, for a run routed under `decision-a`.
+fn continue_wall<'a>(
+    selection: &'a broca_wal::AuthSelection,
+    config: &'a broca_wal::RunConfig,
+    refused: &'a [String],
+    reask: bool,
+) -> broca_session_loop::account_move::Wall<'a> {
+    broca_session_loop::account_move::Wall {
+        run_id: "run-1",
+        step_id: 2,
+        selection,
+        credential_id: &selection.credential_id,
+        account: "acct-a",
+        limit_window: "seven_day",
+        resets_at_ms: Some(NOW as u64 + 3_600_000),
+        retry_after_s: None,
+        observed_at_ms: NOW as u64,
+        attempt_seq: 41,
+        refused_accounts: refused,
+        renderer_version: config.renderer_version,
+        render_config: &config.frozen_render_config,
+        run_config: config,
+        reask,
+    }
+}
+
+fn continue_selection() -> broca_wal::AuthSelection {
+    serde_json::from_value(json!({
+        "credential_id": "credential-a",
+        "account_ref": "acct-a",
+        "auth_method": "oauth",
+        "account_decision": {
+            "path": "routed",
+            "admission_id": "run-1",
+            "decision_id": "decision-a",
+            "conversation_key": "broca-session:abc",
+        },
+    }))
+    .unwrap()
+}
+
+fn continue_config() -> broca_wal::RunConfig {
+    serde_json::from_value(json!({
+        "model": {"provider_module_id": "anthropic", "model_id": "m"},
+        "tools": [],
+        "tool_choice": {"type": "auto"},
+        "generation": {},
+        "response_format": {"type": "text"},
+        "context_epoch": 0,
+        "renderer_version": 1,
+        "frozen_render_config": {},
+    }))
+    .unwrap()
+}
+
+/// The continue request names the run, its original admission and conversation key, the
+/// decision it uses now and the walled account with the refused attempt's evidence, in
+/// routing's own types and field names.
+#[test]
+fn a_continue_request_is_built_from_the_wall_and_the_runs_selection() {
+    let selection = continue_selection();
+    let config = continue_config();
+    let refused = vec!["acct-a".to_owned()];
+    let wall = continue_wall(&selection, &config, &refused, false);
+    let request = continue_request(&wall).unwrap();
+    let id = continue_selection_id(&wall);
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        json!({
+            "mode": "continue",
+            "run_id": "run-1",
+            "admission_id": "run-1",
+            "conversation_key": "broca-session:abc",
+            "previous_decision_id": "decision-a",
+            "exhausted": {
+                "credential_id": "credential-a",
+                "account": "acct-a",
+                "limit_window": "seven_day",
+                "resets_at_ms": NOW as u64 + 3_600_000,
+                "observed_at_ms": NOW as u64,
+            },
+            "selection_id": id,
+        })
+    );
+    // The id names the wall: the same for the same wall, new for a second question at it.
+    assert_eq!(continue_selection_id(&wall), id);
+    assert!(id.len() <= cortexkit_role_routing::account::ADMISSION_ID_MAX_CHARS);
+    let again = continue_wall(&selection, &config, &refused, true);
+    assert_ne!(continue_selection_id(&again), id);
+    // Routing's own parser reads the request back as the same question.
+    let describe = cortexkit_role_routing::describe::RoleDescribe::new(Vec::new(), false)
+        .with_capability(cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE);
+    let parsed = cortexkit_role_routing::account_continue::parse_continue_request(
+        &serde_json::to_value(&request).unwrap(),
+        &describe,
+    )
+    .unwrap();
+    assert!(parsed.same_question(&request));
+    // The provider's own retry-after, when the refused error gave one, goes with the evidence.
+    let mut with_retry = continue_wall(&selection, &config, &refused, false);
+    with_retry.retry_after_s = Some(604_800);
+    let request = continue_request(&with_retry).unwrap();
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["exhausted"]["retry_after_s"],
+        604_800
+    );
+}
+
+#[test]
+fn a_selection_without_a_decision_asks_nothing() {
+    let mut selection = continue_selection();
+    selection.account_decision.as_mut().unwrap().decision_id = None;
+    let config = continue_config();
+    let wall = continue_wall(&selection, &config, &[], false);
+    assert!(continue_request(&wall).is_none());
+}
+
+#[test]
+fn continue_replies_are_read_as_offer_hold_refusal_or_nothing() {
+    use cortexkit_role_routing::account_continue::ContinueAnswer;
+    let reply = |value: Value| Ok(serde_json::to_vec(&value).unwrap());
+    let offer = classify_continue_reply(reply(json!({"result": {
+        "kind": "offer", "credential_id": "credential-b", "account": "acct-b",
+        "decision_id": "decision-b", "valid_until_ms": 9,
+    }})));
+    assert!(matches!(
+        offer,
+        ContinueOutcome::Answered(ContinueAnswer::Offer(ref offer))
+            if offer.account == "acct-b" && offer.decision_id == "decision-b"
+    ));
+    let hold = classify_continue_reply(reply(json!({"result": {
+        "kind": "hold", "routing_code": "no_compatible_account", "detail": {}, "until_ms": 7,
+    }})));
+    assert!(matches!(
+        hold,
+        ContinueOutcome::Answered(ContinueAnswer::Hold(ref hold))
+            if hold.routing_code == "no_compatible_account" && hold.until_ms == Some(7)
+    ));
+    let refused = classify_continue_reply(Err(serde_json::to_vec(
+        &json!({"code": "invalid_request", "message": "no", "detail": {"field": "mode"}}),
+    )
+    .unwrap()));
+    assert!(matches!(
+        refused,
+        ContinueOutcome::Answered(ContinueAnswer::Refuse(ref refusal))
+            if refusal.routing_code == "invalid_request"
+    ));
+    assert!(matches!(
+        classify_continue_reply(reply(json!({"result": {"kind": "maybe"}}))),
+        ContinueOutcome::Unreachable(_)
+    ));
+}
+
+/// An error frame the route wrote, not routing (the target is gone or warming, or a code
+/// routing's contract doesn't name), is routing unreachable: never a refusal, so no routing
+/// code lands on the run's error.
+#[test]
+fn an_error_frame_routing_did_not_write_is_unreachable_not_a_refusal() {
+    for code in [
+        "target_unavailable",
+        "unknown_module",
+        "module_removed",
+        "module_warming",
+        "routing_unavailable",
+        "routing_ambiguous",
+        "some_future_code",
+    ] {
+        let reply = classify_continue_reply(Err(serde_json::to_vec(
+            &json!({"code": code, "message": "not routing", "detail": {}}),
+        )
+        .unwrap()));
+        assert!(
+            matches!(reply, ContinueOutcome::Unreachable(_)),
+            "{code}: {reply:?}"
+        );
+    }
+    for code in [
+        "account_hold",
+        "admission_conflict",
+        "unknown_decision",
+        "account_not_authorized",
+    ] {
+        let reply = classify_continue_reply(Err(serde_json::to_vec(
+            &json!({"code": code, "message": "routing's own", "detail": {}}),
+        )
+        .unwrap()));
+        assert!(
+            matches!(
+                reply,
+                ContinueOutcome::Answered(cortexkit_role_routing::account_continue::ContinueAnswer::Refuse(ref refusal))
+                    if refusal.routing_code == code
+            ),
+            "{code}: {reply:?}"
+        );
+    }
+}
+
+/// Without routing serving continuation (both `account_continue` and `account_continue_resume`
+/// declared), nothing is sent; with it, the request goes over the admission route as
+/// `route.account_for`.
+#[tokio::test]
+async fn a_continue_request_is_sent_only_to_a_router_that_serves_continuation() {
+    let selection = continue_selection();
+    let config = continue_config();
+    let wall = continue_wall(&selection, &config, &[], false);
+    let request = continue_request(&wall).unwrap();
+    let routing = FakeRouting::answering(Ok(Ok(b"{}".to_vec())));
+    let outcome = client(&routing)
+        .account_continue(
+            false,
+            &request,
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    assert_eq!(outcome, ContinueOutcome::NotDeclared);
+    assert!(routing.requests.lock().unwrap().is_empty());
+    // The transport checks the capabilities again on the route it sends on.
+    let serving = |routing: Arc<FakeRouting>| {
+        Arc::new(FakeRouting {
+            declared: Some(vec![
+                "account_continue",
+                crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+            ]),
+            reply: Mutex::new(routing.reply.lock().unwrap().take()),
+            hang: routing.hang,
+            ..FakeRouting::default()
+        })
+    };
+    let routing = serving(FakeRouting::answering(Ok(Ok(serde_json::to_vec(
+        &json!({"result": {
+            "kind": "refuse", "routing_code": "account_pinned", "detail": {},
+        }}),
+    )
+    .unwrap()))));
+    let outcome = client(&routing)
+        .account_continue(
+            true,
+            &request,
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    assert!(matches!(outcome, ContinueOutcome::Answered(_)));
+    assert_eq!(
+        *routing.requests.lock().unwrap(),
+        vec![json!({"method": ACCOUNT_FOR_OP, "params": serde_json::to_value(&request).unwrap()})]
+    );
+    // A router that doesn't answer within the budget is no answer.
+    let routing = serving(FakeRouting::hung());
+    let outcome = client(&routing)
+        .account_continue(
+            true,
+            &request,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await;
+    assert_eq!(outcome, ContinueOutcome::NoAnswerWithinBudget);
+}
+
+/// After a move, routing hears `admission_started` again under the run's original admission,
+/// naming the offered credential and account, after the refused attempt and before any attempt
+/// on the new account.
+#[tokio::test]
+async fn a_move_is_reported_once_in_order_under_the_original_admission() {
+    let routing = Arc::new(FakeRouting::default());
+    let client = Arc::new(client(&routing));
+    let reporter = RunReporter::start(
+        Arc::clone(&client),
+        "adm-move".into(),
+        "run-move".into(),
+        None,
+        Arc::new(AtomicU64::new(100)),
+    );
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::attempt_recorded(
+        reporter.as_ref(),
+        Some(lineage),
+        5,
+        &attempt(Some(429), AttemptAccountObservation::default()),
+    );
+    let mut moved = continue_selection();
+    moved.credential_id = "credential-b".into();
+    moved.account_ref = Some("acct-b".into());
+    reporter.moved(Some(lineage), 6, &moved);
+    broca_core::AccountReporter::attempt_recorded(
+        reporter.as_ref(),
+        Some(lineage),
+        7,
+        &attempt(Some(200), AttemptAccountObservation::default()),
+    );
+    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    settle(&routing, 5).await;
+    let observed = routing.observed();
+    let kinds: Vec<_> = observed.iter().map(|body| body["kind"].clone()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            json!("admission_started"),
+            json!("attempt"),
+            json!("admission_started"),
+            json!("attempt"),
+            json!("run_finished"),
+        ]
+    );
+    assert_eq!(
+        observed[2],
+        json!({
+            "event_id": format!("{lineage}:6"),
+            "caller": {"runner": "broca"},
+            "kind": "admission_started",
+            "admission_id": "adm-move",
+            "run_id": "run-move",
+            "credential_id": "credential-b",
+            "served_account_id": "acct-b",
+        })
+    );
+    assert!(observed
+        .iter()
+        .all(|body| body["admission_id"] == "adm-move"));
+}
+
+/// Every attempt observation of a store run names the credential it was sent on and the account
+/// that served it: the walled attempt names A, every attempt after the move names B, even when
+/// the report of the move itself never reaches routing. A limit observation names them too.
+#[tokio::test]
+async fn attempt_observations_name_the_account_each_attempt_was_sent_on() {
+    let routing = Arc::new(FakeRouting::default());
+    let client = Arc::new(client(&routing));
+    let reporter = RunReporter::start(
+        Arc::clone(&client),
+        "adm-move".into(),
+        "run-move".into(),
+        None,
+        Arc::new(AtomicU64::new(100)),
+    );
+    let lineage = lineage();
+    let mut on_a = continue_selection();
+    on_a.credential_id = "credential-a".into();
+    on_a.account_ref = Some("acct-a".into());
+    let wall = AttemptAccountObservation {
+        limit: Some(AttemptAccountLimit {
+            disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+            observed_at_ms: 1_000,
+            resets_at_ms: Some(9_000),
+            resets_at_source: None,
+            limit_window: Some("seven_day".into()),
+        }),
+        ..Default::default()
+    };
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        4,
+        &attempt(Some(200), AttemptAccountObservation::default()),
+        Some(&on_a),
+    );
+    reporter.attempt_recorded_on(Some(lineage), 5, &attempt(Some(429), wall), Some(&on_a));
+    // The move's own report is not queued here: the attempts alone must name B.
+    let mut on_b = continue_selection();
+    on_b.credential_id = "credential-b".into();
+    on_b.account_ref = Some("acct-b".into());
+    let mut served_b = attempt(Some(200), AttemptAccountObservation::default());
+    served_b.served_account_ref = Some("acct-b".into());
+    reporter.attempt_recorded_on(Some(lineage), 7, &served_b, Some(&on_b));
+    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    settle(&routing, 4).await;
+    let observed = routing.observed();
+    let named: Vec<_> = observed
+        .iter()
+        .map(|body| {
+            (
+                body["kind"].clone(),
+                body["credential_id"].clone(),
+                body["served_account_id"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            (json!("attempt"), json!("credential-a"), json!("acct-a")),
+            (
+                json!("account_limit_exhausted"),
+                json!("credential-a"),
+                json!("acct-a")
+            ),
+            (json!("attempt"), json!("credential-b"), json!("acct-b")),
+            (json!("run_finished"), Value::Null, Value::Null),
+        ]
+    );
+    // Routing's contract parses every one of them, with the account it names.
+    for body in &observed {
+        let parsed = cortexkit_role_routing::observe::parse_account_observe_request(body).unwrap();
+        assert_eq!(
+            parsed.served_account_id.as_deref(),
+            body["served_account_id"].as_str()
+        );
+        assert_eq!(
+            parsed.credential_id.as_deref(),
+            body["credential_id"].as_str()
+        );
+    }
+}
+
+/// After a move, nothing the run saw on the account it left is reported as the new account's:
+/// the run's end carries no rate-limit headers from before the move, and attempts on the new
+/// account carry no listing digest from the old account's admission.
+#[tokio::test]
+async fn a_move_drops_what_the_old_account_saw_from_later_reports() {
+    let routing = Arc::new(FakeRouting::default());
+    let client = Arc::new(client(&routing));
+    let reporter = RunReporter::start(
+        Arc::clone(&client),
+        "adm-move".into(),
+        "run-move".into(),
+        Some("listing-of-a".into()),
+        Arc::new(AtomicU64::new(100)),
+    );
+    let lineage = lineage();
+    let mut on_a = continue_selection();
+    on_a.credential_id = "credential-a".into();
+    on_a.account_ref = Some("acct-a".into());
+    let exhausted = AttemptAccountObservation {
+        ratelimit_headers: BTreeMap::from([(
+            "anthropic-ratelimit-unified-status".to_owned(),
+            "rejected".to_owned(),
+        )]),
+        ..Default::default()
+    };
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        4,
+        &attempt(Some(200), exhausted),
+        Some(&on_a),
+    );
+    let mut on_b = continue_selection();
+    on_b.credential_id = "credential-b".into();
+    on_b.account_ref = Some("acct-b".into());
+    reporter.moved(Some(lineage), 6, &on_b);
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        7,
+        &attempt(Some(200), AttemptAccountObservation::default()),
+        Some(&on_b),
+    );
+    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    settle(&routing, 4).await;
+    let observed = routing.observed();
+    assert_eq!(observed[0]["view_digest"], "listing-of-a");
+    assert_eq!(
+        observed[0]["headers"]["anthropic-ratelimit-unified-status"],
+        "rejected"
+    );
+    assert_eq!(observed[2]["kind"], "attempt");
+    assert_eq!(observed[2]["served_account_id"], "acct-b");
+    assert!(observed[2].get("view_digest").is_none(), "{}", observed[2]);
+    assert_eq!(observed[3]["kind"], "run_finished");
+    assert!(observed[3].get("headers").is_none(), "{}", observed[3]);
+}
+
+/// A run moves only when routing is known to declare both `account_continue` and
+/// `account_continue_resume`. An unreadable description, or either one alone, sends nothing:
+/// no continue request, and so no move and no report of one.
+#[tokio::test]
+async fn a_continue_request_needs_both_capabilities_declared() {
+    use crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME;
+    use cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE;
+    let selection = continue_selection();
+    let config = continue_config();
+    let wall = continue_wall(&selection, &config, &[], false);
+    let request = continue_request(&wall).unwrap();
+    let refusal = serde_json::to_vec(&json!({"result": {
+        "kind": "refuse", "routing_code": "account_pinned", "detail": {},
+    }}))
+    .unwrap();
+    for (declared, asks) in [
+        (None, false),
+        (Some(vec![]), false),
+        (Some(vec![ACCOUNT_CONTINUE]), false),
+        (Some(vec![ACCOUNT_CONTINUE_RESUME]), false),
+        (Some(vec![ACCOUNT_CONTINUE, ACCOUNT_CONTINUE_RESUME]), true),
+    ] {
+        let routing = Arc::new(FakeRouting {
+            reply: Mutex::new(Some(Ok(Ok(refusal.clone())))),
+            declared: declared.clone(),
+            ..FakeRouting::default()
+        });
+        let client = client(&routing);
+        assert_eq!(
+            client.answers_moved_runs_with_current_account().await,
+            asks,
+            "{declared:?}"
+        );
+        let outcome = client
+            .account_continue_if_served(&request, tokio::time::Instant::now() + ADMISSION_BUDGET)
+            .await;
+        if asks {
+            assert!(
+                matches!(outcome, ContinueOutcome::Answered(_)),
+                "{declared:?}"
+            );
+            assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP.to_owned()]);
+        } else {
+            assert_eq!(outcome, ContinueOutcome::NotDeclared, "{declared:?}");
+            assert!(
+                routing.requests.lock().unwrap().is_empty(),
+                "{declared:?}: nothing is sent to routing"
+            );
+        }
+    }
 }

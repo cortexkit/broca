@@ -147,6 +147,7 @@ impl RunExecutor for CutExecutor {
                 step_progress: control.step_progress.clone(),
                 model_call_ready: ready,
                 pause_for_auth_at_start: None,
+                account_continue: None,
             };
             match mode {
                 crate::executor::StoreRunMode::Fresh => {

@@ -3498,6 +3498,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let now = (self.now_ms)();
         if let Err(error) = broca_session_loop::run::end_run_with_error(
@@ -4021,11 +4022,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(run_start) = run.and_then(|run| run.start.as_ref()) else {
             return SendOutcome::Transient("the running run has no start yet".into());
         };
-        // This reads the run's start: a refreeze (`ConfigRefrozen`, `AuthRefrozen`) is written
-        // only when a paused run resumes, which this actor doesn't do.
+        // The settings a steer must match are the run's start's, except the account: a running
+        // run's `AuthRefrozen` (a move to another account at a quota wall, or a resume on the
+        // account routing gave it) replaces the start's, so a steer's auth pin is checked against
+        // the account the run sends on now.
         let frozen = match broca_session_loop::run::admission_of_start(run_start, &self.parts) {
             Ok(frozen) => frozen,
             Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        };
+        let current_auth = match run
+            .map(|run| broca_session_loop::account_move::current_auth_selection(run, &self.parts))
+        {
+            Some(Ok(selection)) => selection,
+            Some(Err(error)) => return SendOutcome::Error(format!("{error:?}")),
+            None => frozen.auth_selection.clone(),
         };
         let settings = crate::actor::SteerFrozen {
             model: &frozen.model,
@@ -4033,7 +4043,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             generation: &frozen.generation,
             stop_when: &frozen.stop_when,
             directives: frozen.directives.as_deref(),
-            auth_selection: frozen.auth_selection.as_ref(),
+            auth_selection: current_auth.as_ref(),
         };
         if let Some(field) =
             crate::actor::steer_settings_conflict(&start.request, settings, stop_sequences_named)
@@ -4715,6 +4725,8 @@ mod scopes;
 mod service_tier;
 mod warm;
 
+#[cfg(test)]
+mod account_move_tests;
 #[cfg(test)]
 mod billing_tests;
 #[cfg(test)]

@@ -51,6 +51,7 @@ pub fn render_identity_error<P: Provider + ?Sized>(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     })
 }
 
@@ -110,6 +111,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, RATE_LIMITED};
         use ErrorClass::*;

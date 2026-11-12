@@ -154,6 +154,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                     provider_details: None,
                 };
                 self.write_interrupted_seal_with_error(None, SealCause::CrashOrphan, Some(refusal))

@@ -177,6 +177,7 @@ fn error_step(class: broca_protocol::ErrorClass, message: &str) -> Vec<Normalize
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             },
             retries_used: 0,
         }),
@@ -3378,6 +3379,7 @@ async fn an_account_limit_terminal_names_the_frozen_account_on_every_surface() {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     let ordinary = broca_protocol::error::ProviderError {
         provider_code: Some("rate_limit_error".into()),
@@ -3499,6 +3501,7 @@ async fn a_billing_exhausted_terminal_names_the_frozen_account_on_every_surface(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     for (name, selection, expect_account, expect_credential) in [
         (
@@ -3652,6 +3655,7 @@ async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account()
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     let exhausted = broca_protocol::error::ProviderError {
         provider_details: None,
@@ -3669,6 +3673,7 @@ async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account()
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     };
     let failing_step = |error: &broca_protocol::error::ProviderError| {
         vec![

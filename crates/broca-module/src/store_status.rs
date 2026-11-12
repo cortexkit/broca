@@ -543,6 +543,14 @@ impl<'a> Walk<'a> {
                 state.auth_selection.clone_from(&self.auth_selection);
                 self.found = Some(state);
             }
+            // The run uses another account from here on: a resume or a move at a quota wall
+            // refroze it, and its status names that one.
+            Record::AuthRefrozen(refrozen) if refrozen.run_id == self.run_id => {
+                self.auth_selection = Some(decode(
+                    &refrozen.auth_selection,
+                    "a run's refrozen auth selection",
+                )?);
+            }
             Record::QueuedSend(send)
                 if send.submission_id == format!("sub-{}", self.run_id) && self.title.is_none() =>
             {

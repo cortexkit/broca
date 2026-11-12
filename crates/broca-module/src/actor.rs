@@ -882,6 +882,7 @@ fn permanent_queued_refusal(message: String, provider_code: &'static str) -> Pro
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -3084,6 +3085,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         account_ref: None,
                         credential_id: None,
                         affordable_max_tokens: None,
+                        account_continue: None,
                     };
                     self.write_interrupted_seal_with_error(
                         None,
@@ -3171,6 +3173,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         account_ref: None,
                         credential_id: None,
                         affordable_max_tokens: None,
+                        account_continue: None,
                     };
                     let sealed = async {
                         self.write_interrupted_seal_with_error(

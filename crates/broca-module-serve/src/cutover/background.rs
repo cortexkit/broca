@@ -134,6 +134,7 @@ impl RunExecutor for HeldBackgroundRun {
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
                 pause_for_auth_at_start: None,
+                account_continue: None,
             };
             broca_session_loop::run::run(&mut writer, parts.as_mut(), admission, &seams)
                 .await

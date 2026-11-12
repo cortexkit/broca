@@ -2706,6 +2706,7 @@ async fn new_from(
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
         pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
     // A crash-cut comparison nests this driver several frames deep. Heap-own the loop bodies,
@@ -3871,6 +3872,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         step_progress: None,
         model_call_ready: None,
         pause_for_auth_at_start: None,
+        account_continue: None,
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         through!(writer, |w| run(
@@ -4818,6 +4820,7 @@ async fn compare_actions_in_once(
         step_progress: None,
         model_call_ready: None,
         pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -5526,6 +5529,7 @@ async fn compare_auth_pause_in_once(
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
         pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let first = through!(writer, |w| run(
         w,
@@ -9312,6 +9316,7 @@ async fn enroll_run_with(
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
         pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let mut writer = Recording {
         session,
@@ -9369,6 +9374,7 @@ async fn enroll_resume_with(
         step_progress: None,
         model_call_ready: provider.model_call_ready(),
         pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let mut writer = Recording {
         session,

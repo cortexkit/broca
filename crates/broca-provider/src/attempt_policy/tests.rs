@@ -48,6 +48,7 @@ fn error(status: Option<u16>, code: Option<&str>, retry_after_secs: Option<f64>)
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

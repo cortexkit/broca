@@ -815,6 +815,7 @@ fn auth_error() -> NormalizedEvent {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         },
         retries_used: 0,
     })

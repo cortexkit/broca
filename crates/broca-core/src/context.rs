@@ -3426,6 +3426,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
             }),
         }]);
@@ -3919,6 +3920,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         *wal.last_mut().expect("sample has RunFinished") = WalRecord::RunFinished {
             interrupt_reason: None,
@@ -4192,6 +4194,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let last = wal.last_mut().expect("sample has terminal");
         *last = WalRecord::RunFinished {
