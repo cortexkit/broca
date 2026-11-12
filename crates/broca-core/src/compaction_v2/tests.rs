@@ -362,14 +362,15 @@ fn compaction_v2_entries_merge_results_without_merging_delivered_text() {
         panic!("tool part missing")
     };
     assert_eq!(tool.output.as_deref(), Some(r#"{"a":1,"z":2}"#));
-    assert_eq!(tool.delivered, [delivered]);
+    assert_eq!(tool.delivered().unwrap(), [delivered]);
     assert_eq!(tool.status, ToolStatus::Completed);
     let PartBody::Tool(compact) = part.compact().body else {
         panic!("tool part missing")
     };
     assert_eq!(compact.output, None);
-    assert_eq!(compact.delivered[0].text, None);
-    assert_eq!(compact.delivered[0].text_bytes, 8);
+    let delivered = compact.delivered().unwrap();
+    assert_eq!(delivered[0].text, None);
+    assert_eq!(delivered[0].text_bytes, 8);
     assert_eq!(part.digest, part.compact().digest);
 }
 
@@ -653,7 +654,7 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
 
     let stored = broca_wal::WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
         version: strip.version,
-        checksum: strip.checksum.clone(),
+        checksum: strip.checksum.to_string(),
         edits: super::storage::encode(None, &strip.clone().into()),
         built_through: strip.built_through.clone(),
         new_signed: strip.new_signed.clone(),
@@ -669,7 +670,7 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
         &broca_wal::WalRecord::CompactionViewAppliedV2 {
             step_id: 1,
             version: strip.version,
-            checksum: strip.checksum.clone(),
+            checksum: strip.checksum.to_string(),
         },
         &session,
     )
@@ -1684,9 +1685,12 @@ fn compaction_v2_plan_version_mismatch_refuses_by_name() {
     assert!(
         session_conditions::check_plan_version(cortexkit_compaction_view::PLAN_VERSION).is_ok()
     );
+    assert!(session_conditions::check_plan_version(3).is_ok());
     let error = session_conditions::check_plan_version(1).unwrap_err();
     assert!(error.contains("compaction_plan_version 1"));
     assert!(error.contains("version 2"));
+    let newer = cortexkit_compaction_view::PLAN_VERSION + 1;
+    assert!(session_conditions::check_plan_version(newer).is_err());
 }
 
 #[derive(Default)]
@@ -1817,7 +1821,7 @@ fn compaction_v2_received_edits_keep_unknown_members_and_exact_bytes() {
     let edits = vec![raw.clone()];
     let wire = serde_json::value::to_raw_value(&WireView {
         version: view.version,
-        checksum: &view.checksum,
+        checksum: &view.checksum.to_string(),
         edits: &edits,
     })
     .unwrap();
@@ -1826,7 +1830,7 @@ fn compaction_v2_received_edits_keep_unknown_members_and_exact_bytes() {
     assert_eq!(received.edits()[0].get(), raw.get());
     let rebuilt = ReceivedView::rebuilt(
         view.version,
-        view.checksum.clone(),
+        view.checksum.to_string(),
         received.edits().to_vec(),
         None,
         None,
@@ -1868,9 +1872,9 @@ fn compaction_v2_tool_identity_is_not_a_call_id_reused_in_a_later_turn() {
         panic!("second tool missing")
     };
     assert_eq!(first.output.as_deref(), Some("first"));
-    assert_eq!(first.delivered.len(), 1);
+    assert_eq!(first.delivered().unwrap().len(), 1);
     assert_eq!(second.output.as_deref(), Some("second"));
-    assert!(second.delivered.is_empty());
+    assert!(second.delivered().is_none());
     let rendered = render::prompt(&messages, &entries, &[], |_| panic!("no image")).unwrap();
     let ContentBlock::ToolResult(first) = &rendered[1].content[0] else {
         panic!("first result missing")
@@ -2199,9 +2203,12 @@ fn compaction_v2_storage_references_only_byte_identical_previous_edits() {
     .unwrap();
     let edit: Edit = serde_json::from_str(raw.get()).unwrap();
     let first = View::seal(1, vec![edit.clone()]);
-    let previous = ReceivedView::rebuilt(1, first.checksum, vec![raw.clone()], None, None).unwrap();
+    let previous =
+        ReceivedView::rebuilt(1, first.checksum.to_string(), vec![raw.clone()], None, None)
+            .unwrap();
     let next = View::seal(2, vec![edit.clone()]);
-    let identical = ReceivedView::rebuilt(2, next.checksum.clone(), vec![raw], None, None).unwrap();
+    let identical =
+        ReceivedView::rebuilt(2, next.checksum.to_string(), vec![raw], None, None).unwrap();
     let encoded = storage::encode(Some(&previous), &identical);
     assert!(matches!(
         encoded.as_slice(),
@@ -2211,7 +2218,7 @@ fn compaction_v2_storage_references_only_byte_identical_previous_edits() {
         storage::rebuild(
             Some(&previous),
             2,
-            next.checksum.clone(),
+            next.checksum.to_string(),
             &encoded,
             None,
             None
@@ -2221,7 +2228,7 @@ fn compaction_v2_storage_references_only_byte_identical_previous_edits() {
     );
     let normalized = serde_json::value::to_raw_value(&edit).unwrap();
     let different_bytes =
-        ReceivedView::rebuilt(2, next.checksum, vec![normalized], None, None).unwrap();
+        ReceivedView::rebuilt(2, next.checksum.to_string(), vec![normalized], None, None).unwrap();
     assert!(matches!(
         storage::encode(Some(&previous), &different_bytes).as_slice(),
         [StoredViewEdit::Full { .. }]

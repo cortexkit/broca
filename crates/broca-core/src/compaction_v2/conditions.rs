@@ -134,13 +134,16 @@ pub fn conditions(
 
 /// A version change could change provider bytes on resume, even when the view
 /// records themselves still decode. Refuse by the field's name before rendering.
+///
+/// Version 3 resumes under 4 unchanged: the two differ only in reply cleaning, and broca
+/// cleans every reply as version 3 did until it freezes the cleaning per run.
 pub fn check_plan_version(recorded: u32) -> Result<(), String> {
     let supported = cortexkit_compaction_view::PLAN_VERSION;
-    if recorded == 2 || recorded == supported {
+    if recorded == 2 || recorded == 3 || recorded == supported {
         return Ok(());
     }
     Err(format!(
-        "compaction_plan_version {recorded} cannot resume; supported compaction plan version 2 or version {supported}"
+        "compaction_plan_version {recorded} cannot resume; supported compaction plan version 2, 3 or version {supported}"
     ))
 }
 

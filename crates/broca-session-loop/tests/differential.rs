@@ -2045,7 +2045,7 @@ impl broca_core::CompactionPlane for CompactionSpy {
                             part,
                             field: "output".into(),
                             value: json!("compacted tool output"),
-                            expect,
+                            expect: expect.into(),
                         }
                     };
                     let version = 1 + self

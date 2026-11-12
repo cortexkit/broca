@@ -373,7 +373,7 @@ fn render_planned(
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         RenderedEntry {
                             mid,
-                            digest: entry.digest.clone(),
+                            digest: entry.digest.to_string(),
                             parts,
                             original: stored[position].clone(),
                             next: next.cloned(),
@@ -508,7 +508,7 @@ fn render_entry(
                         original.role == HostRole::Assistant,
                     );
                 } else {
-                    *text = clean_text.clone();
+                    *text = clean_text.as_str().to_owned();
                 }
             }
             (ContentBlock::ToolCall(call), PartBody::Tool(tool)) => {
@@ -612,16 +612,16 @@ pub fn deliveries_only_with_rides(
             let result = results
                 .get_mut(call.tool_call_id.0.as_str())
                 .and_then(VecDeque::pop_front);
-            if tool.delivered.is_empty() {
+            let Some(delivered) = tool.delivered() else {
                 continue;
-            }
+            };
             let result_index = result.ok_or("compaction delivery has no native tool result")?;
             let ContentBlock::ToolResult(result) = &mut prompt[position + 1].content[result_index]
             else {
                 unreachable!()
             };
             let mut held = Vec::new();
-            for (index, delivery) in tool.delivered.iter().enumerate() {
+            for (index, delivery) in delivered.iter().enumerate() {
                 append_delivery(
                     &mut result.output,
                     delivery,
@@ -709,7 +709,11 @@ fn remap_cache_prefix(original: &Message, kept: &[usize]) -> Option<u32> {
 
 fn numbered_reply(original: &str, neutral: &str, tag: u64, assistant: bool) -> String {
     if assistant {
-        let cleaned = clean::clean_reply(original);
+        // Pinned to plan version 3's cleaning: broca's request rendering must keep the cleaning a
+        // run was recorded with, and moving to the newer rule is a separate change that freezes the
+        // cleaning per run.
+        let cleaned = clean::clean_reply_for_plan(3, original)
+            .expect("the view library cleans as plan version 3 did");
         if cleaned.model_tag == Some(tag) {
             let after_open = original.strip_prefix('§').unwrap_or_default();
             if let Some((_, remainder)) = after_open.split_once('§') {
@@ -732,11 +736,11 @@ pub(super) fn counted_content(
             // The entry's original tag spelling has been normalized. Count the canonical
             // spelling here; a reply that originally omitted the space may differ by a token.
             Some(tag) => numbered_reply(text, text, tag, entry.role == Role::Assistant),
-            None => text.clone(),
+            None => text.as_str().to_owned(),
         }),
         PartBody::Tool(tool) => {
             let mut output = ToolOutput::Text {
-                text: tool.output.clone()?,
+                text: tool.output.as_deref()?.to_owned(),
             };
             let plan = PlanPart {
                 id: part.id.clone(),
@@ -768,9 +772,9 @@ fn render_result(
     rides: &super::entries::RideEnvelopes,
 ) -> Vec<String> {
     let mut held = Vec::new();
-    let only_new = !tool.delivered.is_empty()
-        && tool
-            .delivered
+    let delivered = tool.delivered().unwrap_or_default();
+    let only_new = !delivered.is_empty()
+        && delivered
             .iter()
             .enumerate()
             .all(|(index, _)| rides.get(mid, &plan.id, index).is_some());
@@ -858,7 +862,7 @@ fn render_result(
     set_result_text(output, text, attachment_ids.as_deref());
     // Legacy deliveries keep their original output-edit rule; frozen rides follow
     // the recorded plan's selected indices. Iterate once to preserve delivery order.
-    for (index, delivered) in tool.delivered.iter().enumerate() {
+    for (index, delivered) in tool.delivered().unwrap_or_default().iter().enumerate() {
         let ride = rides.get(mid, &plan.id, index);
         let kept = if ride.is_some() {
             plan.rides.iter().any(|ride| ride.index == index as u64)
@@ -893,7 +897,7 @@ fn append_delivery(
         return;
     };
     if let Some(held) = held {
-        held.push(text.clone());
+        held.push(text.as_str().to_owned());
         return;
     }
     match envelope.map(|envelope| envelope.form) {

@@ -388,7 +388,7 @@ pub fn record(
         usage,
         generated_under: metadata.generated_under.as_ref().map(|view| ViewRef {
             version: view.version,
-            checksum: view.checksum.clone(),
+            checksum: view.checksum.to_string(),
         }),
         native,
         render_tags: metadata.render_tags,

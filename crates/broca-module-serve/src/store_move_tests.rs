@@ -412,7 +412,7 @@ fn session_records_with_input(
             let received = broca_core::compaction_v2::received::ReceivedView::from(view.clone());
             written.push(WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
                 version: view.version,
-                checksum: view.checksum.clone(),
+                checksum: view.checksum.to_string(),
                 edits: broca_core::compaction_v2::storage::encode(None, &received),
                 built_through: view.built_through.clone(),
                 new_signed: view.new_signed.clone(),
@@ -421,7 +421,7 @@ fn session_records_with_input(
             written.push(WalRecord::CompactionViewAppliedV2 {
                 step_id: step,
                 version: view.version,
-                checksum: view.checksum.clone(),
+                checksum: view.checksum.to_string(),
             });
             written.push(WalRecord::CompactionMarker {
                 harness: "runner".into(),
