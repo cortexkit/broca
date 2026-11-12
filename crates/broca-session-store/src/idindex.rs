@@ -173,6 +173,8 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         Record::CompactionEnrolled(_) => {}
         // A move names no id a read looks a record up by.
         Record::Moved(_) => {}
+        // A fork's session is small and short-lived: its reads fold every record.
+        Record::Fork(_) => {}
         // A steer's send id is part of its receipt, which the queue owns.
         Record::Steer(steer) => push(IdKind::SendId, json_str(steer.receipt.as_ref(), "send_id")),
         // Events carry the old record's fields whole; their idempotency keys keep their names.
