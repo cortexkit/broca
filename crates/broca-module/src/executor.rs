@@ -15,6 +15,13 @@ use broca_core::{OutputEvent, RunControl, RunError, RunId, RunRequest, RunSummar
 use broca_protocol::BindIdentity;
 use tokio::sync::{mpsc, oneshot};
 
+#[path = "executor_fork.rs"]
+mod fork;
+pub use fork::{
+    fork_admission_id, fork_conversation_key, ForkCallJob, ForkCallOutcome, ForkCallRefusal,
+    ForkReleaseJob,
+};
+
 /// Which start mode a run uses (the coordinator decides; the executor obeys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunKind {
@@ -338,6 +345,26 @@ pub trait RunExecutor: Send + Sync + 'static {
         Err(WarmError::Unsupported(
             "this runner cannot warm a prompt cache".into(),
         ))
+    }
+
+    /// Make one attempt of a fork's ask (llm-runner `fork_answer`): admit it with routing when
+    /// the head's account is routed, check the account, render and check the base, send the
+    /// fork's request once, refuse any tool call, and release the admission, as the fields of
+    /// [`ForkCallJob`] and the variants of [`ForkCallOutcome`] describe. Never writes the head's
+    /// session, takes its lease or waits on its run. The default executor serves no fork.
+    async fn fork_call(&self, _job: ForkCallJob) -> ForkCallOutcome {
+        ForkCallOutcome::Refused(ForkCallRefusal::Unsupported(
+            "this runner cannot answer fork questions".into(),
+        ))
+    }
+
+    /// Release a fork attempt's routing admission that no [`RunExecutor::fork_call`] released:
+    /// one whose attempt was in flight when the module stopped. Sends `route.account_observe`
+    /// `run_finished` for it when the head's account is routed; does nothing otherwise. `Err`
+    /// means the release may not have reached routing, and the fork manager asks again the
+    /// next time it opens the fork.
+    async fn fork_release(&self, _job: ForkReleaseJob) -> Result<(), String> {
+        Ok(())
     }
 }
 
