@@ -82,6 +82,8 @@ pub(super) struct Compactor {
     read_entries: Mutex<Option<ReadEntries>>,
     /// The ordinal of the message the next ride's view drops.
     drop_at_ride: Mutex<Option<u64>>,
+    /// The ordinal of the message the next ride's view cuts the history through.
+    cut_at_ride: Mutex<Option<u64>>,
     /// The views rides were answered with.
     views: Mutex<Vec<broca_core::compaction_v2::protocol::view::View>>,
     /// The events the notices told of, such as a view's refusal.
@@ -100,6 +102,12 @@ impl Compactor {
     /// Answers the next ride with a view dropping the message at `ordinal`.
     pub(super) fn drop_at_next_ride(&self, ordinal: u64) {
         *self.drop_at_ride.lock().unwrap() = Some(ordinal);
+    }
+
+    /// Answers the next ride with a view cutting the history through the message at
+    /// `ordinal`: the session seals what comes before the message after it.
+    pub(super) fn cut_at_next_ride(&self, ordinal: u64) {
+        *self.cut_at_ride.lock().unwrap() = Some(ordinal);
     }
 
     pub(super) fn views(&self) -> usize {
@@ -309,24 +317,43 @@ impl broca_core::CompactionPlane for Compactor {
         let answer = match method {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
-            "compaction.ride" => match self.drop_at_ride.lock().unwrap().take() {
-                None => json!({"answer": "nothing"}),
-                Some(ordinal) => {
-                    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
-                    // A missing entry gives an id no message has, which the session refuses;
-                    // the scenario then finds its view unapplied.
-                    let mid = self
-                        .mids
+            "compaction.ride" => {
+                use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+                // A missing entry gives an id no message has, which the session refuses; the
+                // scenario then finds its view unapplied.
+                let mid = |ordinal: u64| {
+                    self.mids
                         .lock()
                         .unwrap()
                         .get(&ordinal)
                         .cloned()
-                        .unwrap_or_default();
-                    let view = View::seal(1, vec![Edit::new(1, EditOp::Drop { mid, part: None })]);
-                    self.views.lock().unwrap().push(view.clone());
-                    json!({"answer": "view", "view": view})
+                        .unwrap_or_default()
+                };
+                // A drop asked for answers this ride; a cut asked for waits for a ride with none.
+                let drop = self.drop_at_ride.lock().unwrap().take();
+                let op = match drop {
+                    Some(ordinal) => Some(EditOp::Drop {
+                        mid: mid(ordinal),
+                        part: None,
+                    }),
+                    None => self
+                        .cut_at_ride
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .map(|ordinal| EditOp::Cut {
+                            through: mid(ordinal),
+                        }),
+                };
+                match op {
+                    None => json!({"answer": "nothing"}),
+                    Some(op) => {
+                        let view = View::seal(1, vec![Edit::new(1, op)]);
+                        self.views.lock().unwrap().push(view.clone());
+                        json!({"answer": "view", "view": view})
+                    }
                 }
-            },
+            }
             _ => return Err(broca_core::compaction_v2::runtime::CallError::Unavailable),
         };
         Ok(serde_json::value::to_raw_value(&answer).unwrap())
