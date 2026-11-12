@@ -229,7 +229,7 @@ fn accepted(previous: Option<&View>, view: &View, applied_by: Option<&str>) -> W
     let received = ReceivedView::from(view.clone());
     WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
         version: view.version,
-        checksum: view.checksum.clone(),
+        checksum: view.checksum.to_string(),
         edits: broca_core::compaction_v2::storage::encode(previous.as_ref(), &received),
         built_through: view.built_through.clone(),
         new_signed: view.new_signed.clone(),
@@ -241,7 +241,7 @@ fn applied(step: u64, view: &View) -> WalRecord {
     WalRecord::CompactionViewAppliedV2 {
         step_id: step,
         version: view.version,
-        checksum: view.checksum.clone(),
+        checksum: view.checksum.to_string(),
     }
 }
 
@@ -399,7 +399,7 @@ fn restored_views(store: &Session<LocalBackend>) -> [Option<(u64, String)>; 2] {
     let state =
         broca_session_loop::compaction::restore(&records, &session(), &store.operations).unwrap();
     [state.applied(), state.latest()]
-        .map(|view| view.map(|view| (view.version, view.checksum.clone())))
+        .map(|view| view.map(|view| (view.version, view.checksum.to_string())))
 }
 
 /// A compacted session converts with no refusal, and its staged copy agrees with its WAL on every

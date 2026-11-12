@@ -66,7 +66,10 @@ fn served_reply_cleaners_agree() {
             cortexkit_role_llm_runner_v1::tags::TextWriter::TagRenderingRun,
             reply,
         );
-        let view = cortexkit_compaction_view::clean::clean_reply(reply).text;
+        // broca serves replies cleaned as plan version 3 did (`exposed_model_text`).
+        let view = cortexkit_compaction_view::clean::clean_reply_for_plan(3, reply)
+            .unwrap()
+            .text;
         println!("{reply:?}\t{old:?}\t{view:?}");
         assert_eq!(old, view, "input: {reply:?}");
     }

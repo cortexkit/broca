@@ -34,7 +34,7 @@ fn views_restore_with_their_build_metadata_and_applier_across_a_seal() {
             Record::ViewApplied(ViewApplied {
                 step_id: 1,
                 version: 1,
-                checksum: applied.view().checksum.clone(),
+                checksum: applied.view().checksum.to_string(),
             }),
         ),
         (
@@ -45,13 +45,13 @@ fn views_restore_with_their_build_metadata_and_applier_across_a_seal() {
     let operations = Operations {
         view_accepted: Some(ViewSlot {
             version: 2,
-            checksum: latest.view().checksum.clone(),
+            checksum: latest.view().checksum.to_string(),
         }),
         view_applied: Some(AppliedView {
             step_id: 1,
             view: ViewSlot {
                 version: 1,
-                checksum: applied.view().checksum.clone(),
+                checksum: applied.view().checksum.to_string(),
             },
         }),
         ..Default::default()

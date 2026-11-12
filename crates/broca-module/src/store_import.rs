@@ -422,7 +422,7 @@ pub(crate) fn newest_of_entry(
     Ok(ImportNewest {
         ordinal: projected.ordinal,
         mid: projected.mid,
-        digest: projected.digest,
+        digest: projected.digest.to_string(),
     })
 }
 

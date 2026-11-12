@@ -251,7 +251,7 @@ fn numbered_flags(message: &Message) -> Vec<bool> {
                     if !text.is_empty() =>
                 {
                     PartBody::Text {
-                        text: String::new(),
+                        text: Default::default(),
                     }
                 }
                 ContentBlock::ToolCall(_) => PartBody::Tool(ToolPart::new(
@@ -947,7 +947,9 @@ pub fn apply_delivery(
     let PartBody::Tool(tool) = &mut target.body else {
         return Err("compaction delivery names a non-tool native part".into());
     };
-    tool.delivered.push(delivered);
+    let mut all = tool.delivered().unwrap_or_default().to_vec();
+    all.push(delivered);
+    tool.set_delivered(all);
     target.digest = cortexkit_role_compaction::part::body_digest(target.seal.clone(), &target.body);
     entry.digest = cortexkit_role_compaction::read::entry_digest(
         entry.role.clone(),

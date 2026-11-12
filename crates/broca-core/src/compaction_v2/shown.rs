@@ -171,7 +171,7 @@ pub fn at_step(
                 ShownPart {
                     mid: entry.mid.clone(),
                     part: part.id,
-                    digest: neutral.digest.clone(),
+                    digest: neutral.digest.to_string(),
                     payload_position,
                     payload_block,
                 },

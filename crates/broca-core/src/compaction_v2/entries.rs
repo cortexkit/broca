@@ -6,13 +6,14 @@ use broca_protocol::content::{
     ContentBlock, EncryptedReasoningFormat, MediaRef, Message, Role as HostRole, ToolOutput,
     ToolOutputPart,
 };
-use cortexkit_compaction_view::{clean::clean_reply, tags};
+use cortexkit_compaction_view::{clean::clean_reply_for_plan, tags};
 use cortexkit_role_compaction::{
     part::{
         Attachment, AttachmentItem, Delivered, FileMedia, Opaque, OutputFormat, Part, PartBody,
         Seal, ToolPart, ToolStatus, Transport,
     },
     read::{Entry, NoticeOrigin, Role, SpeaksFor, StepUsage},
+    text::Text,
     view::AppliedView,
 };
 
@@ -278,15 +279,15 @@ pub fn project(
                         continue;
                     }
                     let text = if message.role == HostRole::Assistant {
-                        neutral_reply(text, accepts_empty_text)
+                        Text::from(neutral_reply(text, accepts_empty_text))
                     } else {
-                        text.clone()
+                        Text::new(text)
                     };
                     (PartBody::Text { text }, Seal::None)
                 }
                 ContentBlock::Reasoning { text, signature } => (
                     PartBody::Reasoning {
-                        text: Some(text.clone()),
+                        text: Some(Text::new(text)),
                         text_bytes: Some(text.len() as u64),
                     },
                     if signature.is_some() {
@@ -315,7 +316,7 @@ pub fn project(
                     let mut tool = ToolPart::new(
                         call.tool_call_id.0.as_str(),
                         &call.tool_name,
-                        call.input.clone(),
+                        &call.input,
                         ToolStatus::Running,
                     );
                     if let Some(result) = results
@@ -325,14 +326,16 @@ pub fn project(
                         let (status, output, format, attachments) = tool_output(&result.output);
                         tool.status = status;
                         tool.output_bytes = Some(output.len() as u64);
-                        tool.output = Some(output);
+                        tool.output = Some(output.into());
                         tool.output_format = format;
-                        tool.attachments = attachments;
+                        tool.set_attachments(attachments);
                     }
-                    tool.delivered = deliveries
-                        .get(&(facts.mid.clone(), index.to_string()))
-                        .cloned()
-                        .unwrap_or_default();
+                    tool.set_delivered(
+                        deliveries
+                            .get(&(facts.mid.clone(), index.to_string()))
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                     (
                         PartBody::Tool(tool),
                         if call.thought_signature.is_some() {
@@ -435,7 +438,11 @@ pub fn completion_times(
 }
 
 pub(super) fn neutral_reply(text: &str, accepts_empty_text: bool) -> String {
-    let cleaned = clean_reply(text);
+    // Pinned to plan version 3's cleaning: broca's request rendering must keep the cleaning a
+    // run was recorded with, and moving to the newer rule is a separate change that freezes the
+    // cleaning per run.
+    let cleaned =
+        clean_reply_for_plan(3, text).expect("the view library cleans as plan version 3 did");
     if cleaned.text.is_empty() && !accepts_empty_text {
         text.to_owned()
     } else {

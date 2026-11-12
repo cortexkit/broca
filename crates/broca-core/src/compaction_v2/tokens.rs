@@ -159,7 +159,7 @@ impl Counts {
                                 timed_count(facts.family.family, &text, &mut self.tokenizer_time)
                             });
                             let output = output.and_then(|n| {
-                                tool.attachments.iter().try_fold(n, |sum, attachment| {
+                                tool.attachments().iter().try_fold(n, |sum, attachment| {
                                     match &attachment.item {
                                         AttachmentItem::File(file) => {
                                             Some(sum.saturating_add(file_count(file, facts.image)?))
@@ -180,7 +180,7 @@ impl Counts {
                     self.parts.insert(
                         key,
                         Cached {
-                            digest: part.digest.clone(),
+                            digest: part.digest.to_string(),
                             tag: part.tag,
                             input,
                             tokens,
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(cached_input, expected("bad_name_pO2PUf{\"a\":1}"));
         tool.status = ToolStatus::Completed;
         tool.output = Some("result".into());
-        tool.delivered.push(Delivered::new("mc", "notice text"));
+        tool.set_delivered(vec![Delivered::new("mc", "notice text")]);
         let mut completed = page(vec![entry("tool", Role::Assistant, PartBody::Tool(tool))]);
         let digest = completed.entries[0].digest.clone();
         counts.page(&mut completed);

@@ -429,7 +429,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let reply = InstallViewReply {
             version: view.version,
-            checksum: view.checksum.clone(),
+            checksum: view.checksum.to_string(),
         };
         // A retry of the same install is answered as the first was.
         if let Some(applied) = &operations.view_applied {
