@@ -3215,6 +3215,32 @@ fn wrapped_chatgpt_refusals_keep_their_classes() {
     assert_eq!(trace.account_observation.limit, None);
 }
 
+/// A wrapped usage-limit refusal that carries the response's quota headers takes its window from
+/// them, as an HTTPS answer does, and the attempt's observation names it: the captured weekly
+/// refusal's headers (`broca-module-serve/tests/fixtures/usage-observe/
+/// codex-quota-capture-2026-11-02.json`) show the 10080-minute window spent.
+#[test]
+fn a_wrapped_chatgpt_usage_limit_takes_its_window_from_the_frames_headers() {
+    let capture: Value = serde_json::from_str(include_str!(
+        "../../broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json"
+    ))
+    .unwrap();
+    let usage = serde_json::json!({"type":"error","status":429,"headers":capture[0]["headers"].clone(),"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}});
+    let mut trace = AttemptTrace::default();
+    let failure = responses_websocket::wrapped_error(usage.to_string().as_bytes(), &mut trace)
+        .expect("a wrapped 429 is a refusal");
+    assert!(failure.error.is_account_limit_exhausted());
+    assert_eq!(failure.error.limit_window.as_deref(), Some("seven_day"));
+    assert_eq!(
+        trace
+            .account_observation
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.limit_window.as_deref()),
+        Some("seven_day")
+    );
+}
+
 /// The production refusal of a structured-output schema, as the ChatGPT backend wraps it in a
 /// websocket error frame. RECONSTRUCTED, NOT CAPTURED: only `status`, `error.type`, `error.code`
 /// and `error.param` were recorded; the message text is written for the test, with a bearer
