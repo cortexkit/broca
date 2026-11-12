@@ -89,7 +89,27 @@ impl Drop for Deleting<'_> {
 /// it set; a steer both in its receipt; a run's end and pause their time. A send queued or steered
 /// by the store actor, and one converted from today's log, keep these under today's names
 /// (`broca_session_loop::queue`).
+///
+/// A fork's session (see [`crate::fork_state`]) has no run: its retention seconds, last activity
+/// and deadline come from its fork's records.
 pub(crate) fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)> {
+    // A fork's session runs nothing: its own records say how long it is kept
+    // (`ForkState::retained_until_ms`). One whose records can't be folded has no deadline, so
+    // nothing a reader can't decide is deleted.
+    if !records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::RunStart(_)))
+    {
+        if let Ok(Some(fork)) =
+            crate::fork_state::ForkState::fold(records.iter().map(|(_, record)| record))
+        {
+            return Some((
+                fork.retain_ms / 1_000,
+                fork.last_at_ms(),
+                Some(fork.retained_until_ms()),
+            ));
+        }
+    }
     // Whether a session may keep content is fixed by its first run, as it is for today's.
     let first = records.iter().find_map(|(_, record)| match record {
         Record::RunStart(start) => Some(start.retention_secs),
