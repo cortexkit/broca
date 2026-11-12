@@ -2678,6 +2678,43 @@ async fn websocket_upgrade_usage_limit_body_is_reported_without_https() {
     );
 }
 
+/// A usage limit stated by the refused upgrade takes its window from the upgrade response's
+/// quota headers, here the captured weekly 429's (`broca-module-serve/tests/fixtures/
+/// usage-observe/codex-quota-capture-2026-11-02.json`), so a ChatGPT run on the WebSocket
+/// transport asks routing to continue at such a wall as an HTTPS run does.
+#[tokio::test]
+async fn websocket_upgrade_usage_limit_takes_its_window_from_the_upgrade_headers() {
+    let capture: Value = serde_json::from_str(include_str!(
+        "../../broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json"
+    ))
+    .unwrap();
+    let mut refusal = upgrade_refusal(429, USAGE_LIMIT_BODY);
+    for (name, value) in capture[0]["headers"].as_object().unwrap() {
+        let name: &'static str = Box::leak(name.clone().into_boxed_str());
+        let value: &'static str = Box::leak(value.as_str().unwrap().to_owned().into_boxed_str());
+        refusal.headers.push((name, value));
+    }
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(refusal);
+    let provider = provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(rejected_token_refresher());
+    let events = step(&provider, 1, &opts()).await;
+    let error = terminal_error(&events);
+    assert!(error.is_account_limit_exhausted(), "{error:?}");
+    assert_eq!(error.limit_window.as_deref(), Some("seven_day"));
+    let attempts = attempts(&events);
+    assert_eq!(attempts[0].transport.as_deref(), Some("websocket"));
+    assert_eq!(
+        attempts[0]
+            .account_observation
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.limit_window.as_deref()),
+        Some("seven_day")
+    );
+}
+
 fn virtual_attempts(provider: &mut LiveProvider<OpenAiResponsesChatgpt>, seconds: &[u64]) {
     provider.retry_clock.virtual_waits = Some(Arc::new(Mutex::new(Vec::new())));
     provider.retry_clock.virtual_retry_attempts = Some(Arc::new(Mutex::new(
