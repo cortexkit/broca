@@ -578,6 +578,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.fanout = Some(crate::store_fanout::StoreFanout::new(
             &mut self.session,
             readers,
+            crate::store_awaits::Labels(Some(self.executor.clone())),
         ));
         self
     }
@@ -605,6 +606,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             &mut self.session,
             readers,
             gate,
+            crate::store_awaits::Labels(Some(self.executor.clone())),
         ));
         self
     }
@@ -713,6 +715,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             });
         let entry_speaks_for = self.entry_attribution(request).await;
         let context = crate::store_reads::ReadContext {
+            labels: crate::store_awaits::Labels(Some(self.executor.clone())),
             token_counts: Some(&self.compaction_session.runtime.tokens),
             parts: &self.parts,
             held: true,
@@ -2284,7 +2287,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let (out, mut events) = mpsc::channel(256);
         match &self.fanout {
             Some(fanout) => {
-                crate::store_fanout::drain_display(events, fanout.display());
+                let display = fanout.display();
+                display.0.set_run_status_source(run_id.clone(), &step);
+                crate::store_fanout::drain_display(events, display);
             }
             // Without subscriptions the run's output is drained so it never waits on a full
             // channel.
@@ -4727,6 +4732,8 @@ mod warm;
 
 #[cfg(test)]
 mod account_move_tests;
+#[cfg(test)]
+mod awaits_tests;
 #[cfg(test)]
 mod billing_tests;
 #[cfg(test)]

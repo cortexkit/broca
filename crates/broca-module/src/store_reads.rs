@@ -232,6 +232,7 @@ pub struct LiveStep {
 
 /// What a read needs besides the session.
 pub struct ReadContext<'a> {
+    pub labels: crate::store_awaits::Labels,
     pub token_counts: Option<&'a std::sync::Mutex<broca_core::compaction_v2::tokens::Counts>>,
     /// The deployment's setup parts, which a run's start names.
     pub parts: &'a dyn Parts,
@@ -258,6 +259,7 @@ pub struct ReadContext<'a> {
 impl ReadContext<'_> {
     fn reader(&self) -> crate::store_status::Reader<'_> {
         crate::store_status::Reader {
+            labels: self.labels.clone(),
             parts: self.parts,
             live: self.held,
             settled: self.settled,
@@ -319,10 +321,18 @@ pub async fn execute<B: SessionBackend>(
                 .await,
         ),
         StoreReadRequest::Head => StoreReadReply::Head(
-            crate::store_head::build(session, ctx.parts, ctx.open)
-                .await
-                .map(Box::new)
-                .map_err(crate::store_head::head_failed),
+            crate::store_head::build_with_retry(
+                session,
+                ctx.parts,
+                ctx.open,
+                ctx.labels.clone(),
+                ctx.live_step
+                    .and_then(|live| live.step.as_ref())
+                    .and_then(|step| step.retry_awaits.as_deref()),
+            )
+            .await
+            .map(Box::new)
+            .map_err(crate::store_head::head_failed),
         ),
         StoreReadRequest::Page(page) => StoreReadReply::Page(
             crate::store_read::page(session, ctx.parts, page, ctx.stream_head).await,

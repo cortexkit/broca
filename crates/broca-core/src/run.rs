@@ -3608,6 +3608,7 @@ async fn seal_size_refusal<W: WalStore>(
         let _ = send(
             out,
             OutputEvent::Control(ControlUnit::Error {
+                awaits: None,
                 error: error.into(),
             }),
         )
@@ -3615,6 +3616,7 @@ async fn seal_size_refusal<W: WalStore>(
         let _ = send(
             out,
             OutputEvent::Control(ControlUnit::RunFinished {
+                awaits: None,
                 run_id: Some(run_id.clone()),
                 reason: RunFinishReason::Error,
                 usage: Some(prior.usage),
@@ -4506,6 +4508,7 @@ where
             let _ = send(
                 out,
                 OutputEvent::Control(ControlUnit::RunFinished {
+                    awaits: None,
                     run_id: Some(prior_run_id.clone()),
                     reason: *last_reason,
                     usage: (prior.completed_steps > 0).then_some(prior.usage),
@@ -4577,6 +4580,7 @@ where
             let _ = send(
                 out,
                 OutputEvent::Control(ControlUnit::RunFinished {
+                    awaits: None,
                     run_id: Some(resolved_run_id.clone()),
                     reason: RunFinishReason::Interrupted,
                     usage: (prior.completed_steps > 0).then_some(prior.usage),
@@ -4983,6 +4987,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::RunFinished {
+                            awaits: None,
                             run_id: Some(resolved_run_id.clone()),
                             reason,
                             usage,
@@ -5059,6 +5064,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
+                            awaits: None,
                             resume_not_before_ms: None,
                             run_id: resolved_run_id.clone(),
                             reason: PauseReason::ToolHeld,
@@ -5196,6 +5202,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Error {
+                            awaits: None,
                             error: error.clone().into(),
                         }),
                     )
@@ -5233,6 +5240,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
+                            awaits: None,
                             resume_not_before_ms: prior
                                 .account_limit_pause
                                 .as_ref()
@@ -5295,6 +5303,7 @@ where
                         let _ = send(
                             out,
                             OutputEvent::Control(ControlUnit::Error {
+                                awaits: None,
                                 error: error.clone().into(),
                             }),
                         )
@@ -5438,6 +5447,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Error {
+                            awaits: None,
                             error: error.clone().into(),
                         }),
                     )
@@ -7135,6 +7145,7 @@ where
                         let _ = send(
                             out,
                             OutputEvent::Control(ControlUnit::Error {
+                                awaits: None,
                                 error: error.clone().into(),
                             }),
                         )
@@ -7970,6 +7981,7 @@ where
                 let _ = send(
                     out,
                     OutputEvent::Control(ControlUnit::Error {
+                        awaits: None,
                         error: error.clone().into(),
                     }),
                 )
@@ -8846,6 +8858,7 @@ async fn finish_run(
     let _ = send(
         out,
         OutputEvent::Control(ControlUnit::RunFinished {
+            awaits: None,
             run_id: Some(run_id.clone()),
             reason,
             usage: (steps > 0).then_some(usage),
@@ -8969,6 +8982,7 @@ async fn pause_run_impl(
     let _ = send(
         out,
         OutputEvent::Control(ControlUnit::Paused {
+            awaits: None,
             resume_not_before_ms,
             run_id,
             reason,
@@ -10081,6 +10095,8 @@ async fn run_step_watched<P: Provider>(
             .unwrap_or_default()
             .as_millis() as u64;
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
+            retry_awaits: None,
+            report_awaits: false,
             step_id,
             started_at_ms: now,
             attempt: first_attempt,
@@ -12543,6 +12559,7 @@ async fn finalize_hard_stop(
     let _ = send(
         out,
         OutputEvent::Control(ControlUnit::RunFinished {
+            awaits: None,
             run_id: Some(resolved_run_id.clone()),
             reason,
             usage: (steps > 0).then_some(usage),
@@ -15605,6 +15622,7 @@ mod tests {
         let (projector, pending) = projection_channel();
         let (out, mut events) = mpsc::channel(1);
         out.send(OutputEvent::Control(ControlUnit::RunFinished {
+            awaits: None,
             run_id: Some(RunId("run-probe".into())),
             reason: RunFinishReason::Completed,
             usage: None,

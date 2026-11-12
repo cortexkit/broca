@@ -1,5 +1,24 @@
 use super::*;
 
+#[tokio::test]
+async fn run_awaits_restart_pause_waits_on_the_runner() {
+    for store in [false, true] {
+        let side = paused(store).await;
+        crate::store_actor::awaits_tests::prove(
+            &side.registry,
+            &side.key,
+            if store {
+                "restart.after"
+            } else {
+                "restart.before"
+            },
+            store.then_some(("paused", "runner", Some("restart"))),
+        )
+        .await;
+        assert!(side.registry.stop_and_seal().await);
+    }
+}
+
 async fn submit(side: &Side, run: &str, text: &str) -> SendOutcome {
     let mut req = request(text);
     req.on_restart = Some(broca_protocol::request::OnRestart::Resume);

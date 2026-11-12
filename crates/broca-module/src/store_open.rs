@@ -564,6 +564,7 @@ impl StoreRuntime {
                        open: bool,
                        live_step,
                        entry_speaks_for| ReadContext {
+            labels: crate::store_awaits::Labels(Some(self.executor.clone())),
             token_counts: None,
             parts: self.parts_for(class, view.head().cipher()),
             held,

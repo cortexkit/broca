@@ -686,6 +686,7 @@ fn paused_run_projects_pause_as_terminal() {
     let proj = project_control(&recs);
     match &proj.last().unwrap().1 {
         ControlUnit::Paused {
+            awaits: None,
             run_id,
             reason,
             error,
@@ -789,7 +790,7 @@ fn failed_queued_admission_projects_atomic_terminal() {
     ));
     assert!(matches!(
         &projected[1].1,
-        ControlUnit::Error { error: actual } if actual.as_inner() == &error
+        ControlUnit::Error { awaits: None, error: actual } if actual.as_inner() == &error
     ));
     assert!(matches!(
         &projected[2].1,

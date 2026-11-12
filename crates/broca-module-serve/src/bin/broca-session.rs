@@ -2141,6 +2141,7 @@ fn display_line(event: &broca_protocol::DisplayEvent) -> serde_json::Value {
         D::ReasoningDelta { delta, .. } => ("reasoning_delta", Some(delta.chars().count())),
         D::ToolInputDelta { delta, .. } => ("tool_input_delta", Some(delta.chars().count())),
         D::DisplayGap { .. } => ("display_gap", None),
+        D::RunStatus { .. } => ("run_status", None),
         D::DisplayReset => ("display_reset", None),
     };
     let at_ms = std::time::SystemTime::now()
@@ -2320,6 +2321,16 @@ fn emit_control(mode: ControlRenderMode, json: bool, wal_seq: u64, unit: &Contro
     emit_control_to(mode, json, wal_seq, unit, &mut |line| println!("{line}"));
 }
 
+fn with_awaits<T: serde::Serialize>(
+    mut value: serde_json::Value,
+    awaits: &Option<T>,
+) -> serde_json::Value {
+    if let Some(awaits) = awaits {
+        value["awaits"] = serde_json::json!(awaits);
+    }
+    value
+}
+
 fn emit_control_to(
     mode: ControlRenderMode,
     json: bool,
@@ -2482,6 +2493,7 @@ fn emit_control_to(
         // (r133), and now the terminal's usage, provider finish reason and retry count. If a
         // new field appears on a ControlUnit, name it here or decide deliberately not to.
         ControlUnit::RunFinished {
+            awaits,
             run_id,
             reason,
             usage,
@@ -2490,7 +2502,10 @@ fn emit_control_to(
             retries_used,
         } => emit_to(
             json,
-            &serde_json::json!({"event": "run_finished", "seq": wal_seq, "run_id": run_id.as_ref().map(|id| &id.0), "reason": format!("{reason:?}"), "usage": usage, "final_step_finish_reason": final_step_finish_reason.map(|r| format!("{r:?}")), "indeterminate_tool_calls": indeterminate_tool_calls, "retries_used": retries_used}),
+            &with_awaits(
+                serde_json::json!({"event": "run_finished", "seq": wal_seq, "run_id": run_id.as_ref().map(|id| &id.0), "reason": format!("{reason:?}"), "usage": usage, "final_step_finish_reason": final_step_finish_reason.map(|r| format!("{r:?}")), "indeterminate_tool_calls": indeterminate_tool_calls, "retries_used": retries_used}),
+                awaits,
+            ),
             || {
                 let totals = usage
                     .as_ref()
@@ -2533,9 +2548,12 @@ fn emit_control_to(
             },
             output,
         ),
-        ControlUnit::Error { error } => emit_to(
+        ControlUnit::Error { awaits, error } => emit_to(
             json,
-            &serde_json::json!({"event": "loop_error", "seq": wal_seq, "class": format!("{:?}", error.class), "msg": error.message}),
+            &with_awaits(
+                serde_json::json!({"event": "loop_error", "seq": wal_seq, "class": format!("{:?}", error.class), "msg": error.message}),
+                awaits,
+            ),
             || {
                 format!(
                     "LOOP_ERROR seq={wal_seq} class={:?} msg={}",
@@ -2548,6 +2566,7 @@ fn emit_control_to(
         // Non-timed pauses end the attach and must say why. Timed account pauses are displayed
         // here too, but RunTurnTracker keeps their subscription attached for the same-run resume.
         ControlUnit::Paused {
+            awaits,
             run_id,
             reason,
             error,
@@ -2560,6 +2579,7 @@ fn emit_control_to(
             if let Some(deadline) = resume_not_before_ms {
                 value["resume_not_before_ms"] = serde_json::json!(deadline);
             }
+            value = with_awaits(value, awaits);
             emit_to(
                 json,
                 &value,
@@ -3185,6 +3205,7 @@ mod tests {
     #[test]
     fn run_finished_renders_terminal_metadata_before_the_cursor_advances() {
         let unit = ControlUnit::RunFinished {
+            awaits: None,
             run_id: None,
             reason: RunFinishReason::Completed,
             usage: Some(Usage {
@@ -3227,6 +3248,39 @@ mod tests {
                 "json render dropped {needle}: {json_out}"
             );
         }
+    }
+
+    #[test]
+    fn run_awaits_cli_preserves_control_waits_and_summarizes_display_without_text() {
+        let wait = serde_json::json!({"party":"future_party", "since_ms":42});
+        for mut body in [
+            serde_json::json!({"type":"paused", "run_id":"r1", "reason":"restart"}),
+            serde_json::json!({"type":"error", "error":{"class":"permanent", "message":"invalid", "provider_code":"request_invalid"}}),
+            serde_json::json!({"type":"run_finished", "run_id":"r1", "reason":"error", "retries_used":0}),
+        ] {
+            body["awaits"] = wait.clone();
+            let unit: ControlUnit = serde_json::from_value(body.clone()).unwrap();
+            let mut lines = Vec::new();
+            emit_control_to(ControlRenderMode::Subscribe, true, 7, &unit, &mut |line| {
+                lines.push(line)
+            });
+            let rendered: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(rendered["awaits"], wait);
+            body.as_object_mut().unwrap().remove("awaits");
+            let unit: ControlUnit = serde_json::from_value(body).unwrap();
+            lines.clear();
+            emit_control_to(ControlRenderMode::Subscribe, true, 7, &unit, &mut |line| {
+                lines.push(line)
+            });
+            assert!(serde_json::from_str::<serde_json::Value>(&lines[0])
+                .unwrap()
+                .get("awaits")
+                .is_none());
+        }
+        let event = serde_json::from_value(serde_json::json!({"type":"run_status", "run_id":"r1", "state":"active", "awaits":{"party":"runner", "since_ms":42, "message":{"from":"provider", "text":"not operator-log content"}}})).unwrap();
+        let line = super::display_line(&event);
+        assert_eq!(line["type"], "run_status");
+        assert!(!line.to_string().contains("not operator-log content"));
     }
 
     /// The JSON terminal names its run, as the human line does: a resumed run writes no new
@@ -3326,6 +3380,7 @@ mod tests {
     /// A pause naming its run. `Paused` has always carried one.
     fn paused_for(run_id: &str) -> ControlUnit {
         ControlUnit::Paused {
+            awaits: None,
             resume_not_before_ms: None,
             run_id: RunId(run_id.into()),
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -3336,6 +3391,7 @@ mod tests {
     /// A terminal that names its run, which is what a current producer emits.
     fn run_finished_for(run_id: &str) -> ControlUnit {
         ControlUnit::RunFinished {
+            awaits: None,
             run_id: Some(RunId(run_id.into())),
             reason: RunFinishReason::Completed,
             usage: None,
@@ -3347,6 +3403,7 @@ mod tests {
 
     fn run_finished_with(reason: RunFinishReason) -> ControlUnit {
         ControlUnit::RunFinished {
+            awaits: None,
             run_id: None,
             reason,
             usage: None,
@@ -4167,6 +4224,7 @@ mod tests {
         );
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                awaits: None,
                 resume_not_before_ms: None,
                 run_id: RunId("foreign".into()),
                 reason: PauseReason::AuthRequired,
@@ -4176,6 +4234,7 @@ mod tests {
         );
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                awaits: None,
                 resume_not_before_ms: None,
                 run_id: RunId("ours".into()),
                 reason: PauseReason::AuthRequired,
@@ -4190,6 +4249,7 @@ mod tests {
         let mut tracker = RunTurnTracker::new("ours");
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                awaits: None,
                 resume_not_before_ms: Some(61_000),
                 run_id: RunId("ours".into()),
                 reason: PauseReason::AccountLimit,

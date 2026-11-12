@@ -175,6 +175,20 @@ fn reply<T: Serialize, E: std::fmt::Debug>(reply: Result<T, E>) -> Value {
     }
 }
 
+fn run_reply<T: Serialize, E: std::fmt::Debug>(answer: Result<T, E>) -> Value {
+    let mut value = reply(answer);
+    if let Some(body) = value.as_object_mut() {
+        // Wait visibility is a new-storage extension, not part of the converted run facts.
+        body.remove("awaits");
+        if body.get("state") == Some(&json!("active"))
+            && body.get("reason") == Some(&json!("tool_held"))
+        {
+            body.remove("reason");
+        }
+    }
+    value
+}
+
 /// Checks the staged session. `Ok` lists every check that ran.
 pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     verify_with_progress(verify, None).await
@@ -434,6 +448,7 @@ async fn runs<B: SessionBackend>(
     let records = verify.records;
     let name = verify.session.session.as_str();
     let reader = Reader {
+        labels: Default::default(),
         parts,
         live: false,
         settled: None,
@@ -446,14 +461,14 @@ async fn runs<B: SessionBackend>(
         same(
             RUN_STATUS,
             run,
-            &reply(reader.run_status_reply(view, &id).await),
-            &reply(todays::run_status_reply(records, &id)),
+            &run_reply(reader.run_status_reply(view, &id).await),
+            &run_reply(todays::run_status_reply(records, &id)),
         )?;
         same(
             RUN_RESULT,
             run,
-            &reply(reader.run_result(view, &id).await),
-            &reply(todays::run_result(records, &id, name, verify.lineage)),
+            &run_reply(reader.run_result(view, &id).await),
+            &run_reply(todays::run_result(records, &id, name, verify.lineage)),
         )?;
     }
     let unknown = RunId("store-move-no-such-run".into());
@@ -461,8 +476,8 @@ async fn runs<B: SessionBackend>(
         same(
             RUN_STATUS,
             &run.0,
-            &reply(reader.run_status_reply(view, &run).await),
-            &reply(todays::run_status_reply(records, &run)),
+            &run_reply(reader.run_status_reply(view, &run).await),
+            &run_reply(todays::run_status_reply(records, &run)),
         )?;
     }
     checks.extend([RUN_STATUS, RUN_RESULT]);
@@ -874,6 +889,15 @@ async fn entries<B: SessionBackend>(
 /// `mode3`, which isn't on the wire, under its name.
 fn head_members(reply: &impl Serialize, mode3: bool) -> Value {
     let mut value = serde_json::to_value(reply).expect("a head serializes");
+    if let Some(last) = value
+        .get_mut("last_run_state")
+        .and_then(Value::as_object_mut)
+    {
+        last.remove("awaits");
+        if last.get("reason") == Some(&json!("tool_held")) {
+            last.insert("state".into(), json!("active"));
+        }
+    }
     let members = value.as_object_mut().expect("a head is an object");
     for changed in ["incarnation", "history_version", "head"] {
         members.remove(changed);
@@ -1833,6 +1857,7 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
         .await
         .map_err(|error| mismatch(check, error))?;
         let reader = Reader {
+            labels: Default::default(),
             parts: &parts,
             live: false,
             settled: None,

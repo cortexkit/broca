@@ -32,7 +32,7 @@ async fn session() -> Session<&'static MemoryBackend> {
 
 fn fanout(session: &mut Session<&'static MemoryBackend>) -> StoreFanout<&'static MemoryBackend> {
     let backend = *session.backend();
-    StoreFanout::new(session, Arc::new(move || backend))
+    StoreFanout::new(session, Arc::new(move || backend), Default::default())
 }
 
 /// A unit as the live projection publishes it, at `seq`.
@@ -193,8 +193,12 @@ async fn queued_live_attaches_fail_when_seeding_fails_or_the_session_closes() {
         let mut session = session().await;
         let backend = *session.backend();
         let gate = Arc::new(tokio::sync::Notify::new());
-        let mut fanout =
-            StoreFanout::held(&mut session, Arc::new(move || backend), Arc::clone(&gate));
+        let mut fanout = StoreFanout::held(
+            &mut session,
+            Arc::new(move || backend),
+            Arc::clone(&gate),
+            Default::default(),
+        );
         let (sink, mut deliveries) = mpsc::channel(64);
         fanout.attach(&session, AttachFrom::Live, sink);
         if close {

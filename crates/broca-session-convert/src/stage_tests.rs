@@ -1201,6 +1201,7 @@ fn a_final_message_is_named_alike_on_a_log_with_a_compaction_plan() {
             parts: converted.parts.clone(),
         };
         let reader = Reader {
+            labels: Default::default(),
             parts: &parts,
             live: false,
             settled: None,
@@ -1282,6 +1283,7 @@ fn an_imported_runs_final_message_is_served_alike() {
         parts: converted.parts.clone(),
     };
     let reader = Reader {
+        labels: Default::default(),
         parts: &parts,
         live: false,
         settled: None,
@@ -1393,6 +1395,7 @@ fn note_status_alike(enveloped: bool) {
                 parts: converted.parts.clone(),
             };
             let reader = Reader {
+                labels: Default::default(),
                 parts: &parts,
                 live: false,
                 settled: None,

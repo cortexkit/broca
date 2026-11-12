@@ -587,6 +587,7 @@ async fn resume_through_core(
     let mut codes = Vec::new();
     while let Some(event) = rx.recv().await {
         if let broca_core::OutputEvent::Control(broca_protocol::caller::ControlUnit::Error {
+            awaits: None,
             error,
         }) = event
         {

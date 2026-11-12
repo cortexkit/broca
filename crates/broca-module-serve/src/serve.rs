@@ -8063,6 +8063,7 @@ mod tests {
     async fn a_source_less_run_result_uses_the_generic_frame_limit_error() {
         let oversized = "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize);
         let run_result = broca_wire::RunResultResponse {
+            awaits: None,
             finish: None,
             auth_selection: None,
             directives: None,

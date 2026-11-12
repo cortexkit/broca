@@ -385,6 +385,8 @@ fn masked(mut value: Value) -> Value {
                 // A message's id takes each storage's own form; an active run's live step is
                 // kept only by today's actor.
                 object.remove("mid");
+                // Waits are new-storage-only; dedicated actor tests compare every wait surface.
+                object.remove("awaits");
                 if object.get("state") == Some(&json!("active")) {
                     object.remove("step");
                 }

@@ -119,6 +119,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T
 /// What the store says about one run, as today's reconciliation reports it.
 #[derive(Debug, Clone)]
 pub struct RunFacts {
+    pub wait: crate::store_awaits::RunWait,
     pub state: ReconciledRunState,
     /// Why an interrupted run was interrupted, as its end recorded it.
     pub interrupt_reason: Option<String>,
@@ -878,8 +879,10 @@ pub async fn run_facts<B: SessionBackend>(
         }
     };
     let mut walk = Walk::new(run_id, parts);
+    let mut wait = crate::store_awaits::RunWait::default();
     for (_, record) in &records {
         walk.record(record)?;
+        wait.record(record).map_err(damaged)?;
     }
     let unfinished = latest.filter(|run| run.finished.is_none() && run.paused.is_none());
     let mut predicted = false;
@@ -894,6 +897,7 @@ pub async fn run_facts<B: SessionBackend>(
         return Ok(None);
     };
     if unfinished.is_some() && !predicted {
+        wait.resumed();
         // Running in the open actor, or waiting on calls a provider holds: the run is live, even
         // if it paused before and was resumed since.
         state.state = RunIndexState::Active;
@@ -910,6 +914,7 @@ pub async fn run_facts<B: SessionBackend>(
         None
     };
     let facts = RunFacts {
+        wait,
         state,
         interrupt_reason: rest.interrupt_reason,
         wake_directive: rest.wake_directive,
@@ -1280,8 +1285,9 @@ impl StoreRead<'_> {
 
 /// Serves run and send facts from a loaded session kept in the new storage: the module through
 /// [`StoreRead`], and the converter's check over a converted session.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Reader<'a> {
+    pub labels: crate::store_awaits::Labels,
     /// The deployment's setup parts, which a run's start names.
     pub parts: &'a dyn Parts,
     /// Whether a store actor holds the session, so an unfinished run is running (see
@@ -1331,7 +1337,11 @@ impl Reader<'_> {
         session: &Session<B>,
         run_id: &str,
     ) -> Result<Option<RunFacts>, StatusError> {
-        run_facts(session, self.parts, run_id, self.live, self.settled).await
+        let mut facts = run_facts(session, self.parts, run_id, self.live, self.settled).await?;
+        if let Some(facts) = &mut facts {
+            facts.wait.set_labels(self.labels.clone());
+        }
+        Ok(facts)
     }
 
     /// The run's `run.status` from its facts, with the actor's in-flight step when the run is
@@ -1405,6 +1415,10 @@ impl Reader<'_> {
         use crate::serve::ServeError;
         let unknown = || ServeError::UnknownRun(run_id.0.clone());
         let facts = self.facts(session, &run_id.0).await?.ok_or_else(unknown)?;
+        let awaits = facts
+            .wait
+            .snapshot(crate::store_awaits::now_ms(), None, None, None)
+            .awaits;
         let RunFacts {
             state,
             interrupt_reason,
@@ -1437,6 +1451,7 @@ impl Reader<'_> {
         };
         crate::serve::checked_run_result(
             broca_wire::RunResultResponse {
+                awaits: if state == "error" { awaits } else { None },
                 finish: if matches!(state.as_str(), "active" | "paused") {
                     None
                 } else {
@@ -1473,9 +1488,42 @@ pub(crate) fn status_response(
     if facts.state.state == RunIndexState::Active {
         facts.state.live_step = live_step;
     }
+    let wait = facts.wait.snapshot(
+        crate::store_awaits::now_ms(),
+        facts
+            .state
+            .live_step
+            .as_ref()
+            .and_then(|step| step.retry_awaits.as_deref()),
+        facts
+            .state
+            .ceiling_deadline_ms
+            .or(facts.state.ride_wait_deadline_ms),
+        None,
+    );
+    if matches!(
+        facts.state.state,
+        RunIndexState::Active | RunIndexState::Paused
+    ) && wait.reason.is_some()
+    {
+        facts.state.state = if wait.state == "paused" {
+            RunIndexState::Paused
+        } else {
+            RunIndexState::Active
+        };
+    }
     let mut response =
         crate::serve::run_status_response_with_reader_policy(Some(facts.state), false);
     match &mut response {
+        RunStatusResponse::Active { awaits, reason, .. } => {
+            *awaits = wait.awaits;
+            if wait.reason.is_some() {
+                *reason = wait.reason;
+            }
+        }
+        RunStatusResponse::Paused { awaits, .. } | RunStatusResponse::Error { awaits, .. } => {
+            *awaits = wait.awaits;
+        }
         RunStatusResponse::Interrupted { reason, .. } => *reason = facts.interrupt_reason,
         RunStatusResponse::Completed { directives, .. } if facts.wake_directive => {
             *directives = facts
@@ -2148,7 +2196,7 @@ impl Reader<'_> {
         // runs it.
         let reader = Reader {
             live: true,
-            ..*self
+            ..self.clone()
         };
         let facts = reader.facts(session, &run_id.0).await?;
         let Some(state) = facts.map(|facts| facts.state) else {

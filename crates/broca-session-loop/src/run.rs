@@ -4081,6 +4081,8 @@ async fn model_step<W: Writer, P: Provider, T>(
     if let Some(progress) = &seams.step_progress {
         let now = (seams.now_ms)();
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
+            retry_awaits: None,
+            report_awaits: true,
             step_id: StepId(step_id),
             started_at_ms: now,
             attempt: 0,

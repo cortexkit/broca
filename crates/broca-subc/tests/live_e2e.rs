@@ -525,7 +525,7 @@ fn first_step_produced_reasoning(events: &[OutputEvent]) -> bool {
 
 fn first_error(events: &[OutputEvent]) -> Option<broca_protocol::ProviderError> {
     events.iter().find_map(|e| match e {
-        OutputEvent::Control(ControlUnit::Error { error }) => Some(error.clone().into_inner()),
+        OutputEvent::Control(ControlUnit::Error { error, .. }) => Some(error.clone().into_inner()),
         _ => None,
     })
 }

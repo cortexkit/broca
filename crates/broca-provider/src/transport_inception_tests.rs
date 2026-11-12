@@ -142,7 +142,7 @@ async fn run_refusal(host: &str, status: u16, body: &'static str) -> RefusalRun 
     let live = events
         .into_iter()
         .find_map(|event| match event {
-            OutputEvent::Control(ControlUnit::Error { error }) => Some(error.as_inner().clone()),
+            OutputEvent::Control(ControlUnit::Error { error, .. }) => Some(error.as_inner().clone()),
             _ => None,
         })
         .expect("live terminal error");

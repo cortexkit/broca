@@ -2080,6 +2080,7 @@ pub(crate) fn run_status_response_with_reader_policy(
         // Deadline waits and provider-held calls are independent runner-owned waits.
         // Consumers recognize them from their fields, never from the informational reason.
         State::Active => RunStatusResponse::Active {
+            awaits: None,
             auth_selection,
             reason: match (state.ceiling_deadline_ms, state.ride_wait_deadline_ms) {
                 (Some(_), _) => Some("context_ceiling_wait".into()),
@@ -2096,6 +2097,7 @@ pub(crate) fn run_status_response_with_reader_policy(
             held_calls: state.held_calls,
         },
         State::Paused => RunStatusResponse::Paused {
+            awaits: None,
             resume_not_before_ms: state
                 .account_limit_pause
                 .as_ref()
@@ -2217,6 +2219,7 @@ pub(crate) fn run_status_response_with_reader_policy(
             structured_output: structured_output.clone(),
         },
         State::Error => RunStatusResponse::Error {
+            awaits: None,
             auth_selection,
             final_step_finish_reason,
             finish,
@@ -4754,6 +4757,7 @@ impl ServeHandler for crate::LineageRegistry {
                 head,
                 last_run_state: page.lineage_state.last_run_id.map(|run_id| {
                     broca_wire::LastRunState {
+                        awaits: None,
                         run_id: run_id.0,
                         state: page.lineage_state.state.as_str().to_owned(),
                         reason: interrupted_reason.or_else(|| {
@@ -4913,6 +4917,7 @@ impl ServeHandler for crate::LineageRegistry {
                 None
             };
             let response = broca_wire::RunResultResponse {
+                awaits: None,
                 finish: if matches!(state.as_str(), "active" | "paused") {
                     None
                 } else {

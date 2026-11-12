@@ -127,6 +127,8 @@ mod cache_runtime;
 
 #[path = "transport/content_gaps.rs"]
 mod content_gaps;
+#[path = "transport/retry_wait.rs"]
+mod retry_wait;
 use content_gaps::{ContentGaps, SseObservationGuard};
 
 pub use responses_websocket::Connections as ChatgptConnections;
@@ -3159,6 +3161,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 &cancel,
                 deadline,
                 StepSeal {
+                    progress: progress.as_ref(),
                     seal: seal.as_ref(),
                     step_id,
                     cache_ttl_ms: crate::cache_warm::marker_ttl_ms(&frozen),
@@ -3676,6 +3679,21 @@ where
                         // effect, unlike an ordinary retry whose server-advised delay is zero.
                         if !recovering {
                             let wait_started = retry_clock.mark();
+                            let mut wait = retry_wait::Wait::new(
+                                &step_seal,
+                                request.run_id.as_deref(),
+                                &failure.error,
+                                delay,
+                                step_seal
+                                    .first_attempt
+                                    .saturating_add(attempt_index as u32)
+                                    .saturating_add(2),
+                            );
+                            if delay >= Duration::from_secs(1) {
+                                if let Some(wait) = &mut wait {
+                                    wait.publish(tx).await;
+                                }
+                            }
                             tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
@@ -3685,7 +3703,22 @@ where
                                     tx.closed().await;
                                     return Ok((Vec::new(), 0));
                                 }
-                                _ = retry_clock.sleep(delay) => {}
+                                _ = async {
+                                    let sleep = retry_clock.sleep(delay);
+                                    tokio::pin!(sleep);
+                                    if delay < Duration::from_secs(1) && wait.is_some() {
+                                        tokio::select! {
+                                            _ = &mut sleep => return,
+                                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                                                if let Some(wait) = &mut wait { wait.publish(tx).await; }
+                                            }
+                                        }
+                                    }
+                                    sleep.await;
+                                } => {}
+                            }
+                            if let Some(wait) = wait {
+                                wait.finish(tx).await;
                             }
                             attempt_policy::note_waited(
                                 &mut attempts,
@@ -3853,6 +3886,7 @@ enum AttemptStop {
 /// record needs. Without a seal every method is a no-op and `tripped` never resolves.
 #[derive(Clone, Copy)]
 struct StepSeal<'a> {
+    progress: Option<&'a broca_core::provider::LiveStepProgress>,
     seal: Option<&'a ShutdownSeal>,
     step_id: StepId,
     /// The prompt-cache lifetime the frozen config's markers declare, which each send restarts.

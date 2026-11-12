@@ -291,7 +291,9 @@ impl RunOutcome {
 
     pub fn first_error(&self) -> Option<broca_protocol::ProviderError> {
         self.events.iter().find_map(|e| match e {
-            OutputEvent::Control(ControlUnit::Error { error }) => Some(error.clone().into_inner()),
+            OutputEvent::Control(ControlUnit::Error { error, .. }) => {
+                Some(error.clone().into_inner())
+            }
             _ => None,
         })
     }

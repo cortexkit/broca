@@ -59,8 +59,16 @@ struct SubscribeReport {
 type Payload = (Value, Value);
 
 fn payload(unit: &broca_protocol::caller::ControlUnit, event: &LiveEvent) -> Payload {
+    let mut unit = serde_json::to_value(unit).expect("control units serialize");
+    let body = unit.as_object_mut().expect("a control unit is an object");
+    body.remove("awaits");
+    if body.get("type") == Some(&serde_json::json!("status"))
+        && body.get("reason") == Some(&serde_json::json!("tool_held"))
+    {
+        body.remove("reason");
+    }
     (
-        serde_json::to_value(unit).expect("control units serialize"),
+        unit,
         serde_json::to_value(event).expect("live events serialize"),
     )
 }

@@ -2759,6 +2759,7 @@ async fn logged_step(
         &cancel,
         None,
         StepSeal {
+            progress: None,
             seal: None,
             step_id: StepId(1),
             cache_ttl_ms: None,
@@ -3668,6 +3669,7 @@ async fn codex_upgrade_retry_after_past_the_step_deadline_ends_the_step() {
             &CancellationToken::new(),
             Some(Instant::now() + Duration::from_secs(100)),
             StepSeal {
+                progress: None,
                 seal: None,
                 step_id: StepId(1),
                 cache_ttl_ms: None,

@@ -555,6 +555,7 @@ pub(super) fn request(url: String, policy: Policy) -> PreparedHttpRequest {
 
 pub(super) fn seal() -> StepSeal<'static> {
     StepSeal {
+        progress: None,
         seal: None,
         step_id: StepId(1),
         cache_ttl_ms: None,

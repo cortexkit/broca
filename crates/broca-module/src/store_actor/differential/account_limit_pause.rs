@@ -10,7 +10,48 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const RESET: u64 = 61_000;
 
+#[tokio::test]
+async fn run_awaits_account_pause_keeps_the_future_floor_on_all_surfaces() {
+    for store in [false, true] {
+        let side = Side::new(store).await;
+        let now = crate::store_awaits::now_ms();
+        side.set_time(now);
+        side.executor
+            .provider
+            .reset_at
+            .store(now + 60_000, Ordering::SeqCst);
+        side.executor
+            .provider
+            .accepted_at
+            .store(now, Ordering::SeqCst);
+        assert!(matches!(
+            side.send("r1", broca_protocol::Delivery::Queue).await,
+            SendOutcome::Active { .. }
+        ));
+        side.executor.provider.release_limit.notify_one();
+        side.idle().await;
+        let body = crate::store_actor::awaits_tests::prove(
+            &side.registry,
+            &side.key,
+            if store {
+                "account-limit.after"
+            } else {
+                "account-limit.before"
+            },
+            store.then_some(("paused", "runner", Some("account_limit"))),
+        )
+        .await;
+        if store {
+            assert_eq!(body["awaits"]["next_ms"], body["resume_not_before_ms"]);
+            assert!(body["awaits"]["next_ms"].as_u64().unwrap() > now);
+        }
+        side.stop().await;
+    }
+}
+
 struct Limited {
+    reset_at: std::sync::atomic::AtomicU64,
+    accepted_at: std::sync::atomic::AtomicU64,
     require_bind: AtomicBool,
     bound: AtomicBool,
     clock: Clock,
@@ -66,7 +107,7 @@ impl Provider for Limited {
             attempt.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
                 disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
                 observed_at_ms: self.clock.now_ms(),
-                resets_at_ms: Some(RESET),
+                resets_at_ms: Some(self.reset_at.load(Ordering::SeqCst)),
                 resets_at_source: Some("body".into()),
                 limit_window: None,
             });
@@ -78,7 +119,7 @@ impl Provider for Limited {
             events.push(NormalizedEvent::Control(ProviderControl::Error {
                 error: serde_json::from_value(
                     json!({"class":"transient", "message":"account window exhausted",
-                    "status":429, "provider_code":"account_limit_exhausted", "resets_at_ms":RESET}),
+                    "status":429, "provider_code":"account_limit_exhausted", "resets_at_ms":self.reset_at.load(Ordering::SeqCst)}),
                 )
                 .unwrap(),
                 retries_used: 0,
@@ -109,7 +150,7 @@ impl Provider for Limited {
         // An earlier successful request on this account left a cache that survives the reset.
         (account == "acct-a"
             && (!self.require_bind.load(Ordering::SeqCst) || self.bound.load(Ordering::SeqCst)))
-        .then_some(1000)
+        .then(|| self.accepted_at.load(Ordering::SeqCst))
     }
 }
 
@@ -292,6 +333,8 @@ impl Side {
         );
         let executor = Arc::new(Executor {
             provider: Limited {
+                reset_at: std::sync::atomic::AtomicU64::new(RESET),
+                accepted_at: std::sync::atomic::AtomicU64::new(1000),
                 require_bind: AtomicBool::new(false),
                 bound: AtomicBool::new(false),
                 clock: service.clock.clone(),
@@ -906,6 +949,7 @@ fn without_error_message(mut value: Value) -> Value {
     fn normalize(value: &mut Value) {
         match value {
             Value::Object(object) => {
+                object.remove("awaits");
                 // Each actor describes its own failed admission, but retains the same typed error.
                 if object.contains_key("class") {
                     object.remove("message");

@@ -3453,7 +3453,7 @@ async fn an_account_limit_terminal_names_the_frozen_account_on_every_surface() {
         let live = events
             .iter()
             .find_map(|event| match event {
-                OutputEvent::Control(ControlUnit::Error { error }) => Some(error.as_inner()),
+                OutputEvent::Control(ControlUnit::Error { error, .. }) => Some(error.as_inner()),
                 _ => None,
             })
             .expect("live control-lane Error unit");
@@ -3471,7 +3471,7 @@ async fn an_account_limit_terminal_names_the_frozen_account_on_every_surface() {
         let projected = broca_core::project_control(&records)
             .into_iter()
             .find_map(|(_, unit)| match unit {
-                ControlUnit::Error { error } => Some(error.into_inner()),
+                ControlUnit::Error { error, .. } => Some(error.into_inner()),
                 _ => None,
             })
             .expect("projected ControlUnit::Error");
@@ -3558,7 +3558,7 @@ async fn a_billing_exhausted_terminal_names_the_frozen_account_on_every_surface(
         let live = events
             .iter()
             .find_map(|event| match event {
-                OutputEvent::Control(ControlUnit::Error { error }) => Some(error.as_inner()),
+                OutputEvent::Control(ControlUnit::Error { error, .. }) => Some(error.as_inner()),
                 _ => None,
             })
             .expect("live control-lane Error unit");
@@ -3765,7 +3765,7 @@ async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account()
         let live = events
             .iter()
             .find_map(|event| match event {
-                OutputEvent::Control(ControlUnit::Error { error }) => Some(error.as_inner()),
+                OutputEvent::Control(ControlUnit::Error { error, .. }) => Some(error.as_inner()),
                 _ => None,
             })
             .expect("live control-lane Error unit");
@@ -3784,7 +3784,7 @@ async fn a_resumed_account_limit_terminal_names_the_frozen_or_refrozen_account()
         let projected = broca_core::project_control(&records)
             .into_iter()
             .find_map(|(_, unit)| match unit {
-                ControlUnit::Error { error } => Some(error.into_inner()),
+                ControlUnit::Error { error, .. } => Some(error.into_inner()),
                 _ => None,
             })
             .expect("projected ControlUnit::Error");

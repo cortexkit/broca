@@ -259,6 +259,8 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
     let expected_body = provider.render_request(&opts);
     let progress = Arc::new(std::sync::Mutex::new(Some(
         broca_protocol::provider::InFlightStep {
+            retry_awaits: None,
+            report_awaits: false,
             step_id: StepId(4),
             started_at_ms: 0,
             attempt: 0,

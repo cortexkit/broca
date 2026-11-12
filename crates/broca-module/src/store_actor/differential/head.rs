@@ -180,6 +180,12 @@ pub(super) async fn head_json(
         .await
         .expect("the head reads");
     let mut value = serde_json::to_value(&head).unwrap();
+    if let Some(last) = value
+        .get_mut("last_run_state")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        last.remove("awaits");
+    }
     let object = value.as_object_mut().unwrap();
     for member in ["incarnation", "history_version", "head"] {
         object.remove(member);

@@ -956,9 +956,10 @@ mod gated {
         let error = events
             .iter()
             .find_map(|event| match event {
-                broca_core::OutputEvent::Control(broca_protocol::ControlUnit::Error { error }) => {
-                    Some(error)
-                }
+                broca_core::OutputEvent::Control(broca_protocol::ControlUnit::Error {
+                    error,
+                    ..
+                }) => Some(error),
                 _ => None,
             })
             .expect("null render config should produce a clear error");

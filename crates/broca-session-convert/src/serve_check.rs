@@ -111,6 +111,14 @@ fn reply<T: Serialize>(reply: Result<T, broca_module::serve::ServeError>) -> Val
 }
 
 fn masked(mut value: Value) -> Value {
+    if let Some(body) = value.as_object_mut() {
+        body.remove("awaits");
+        if body.get("state") == Some(&json!("active"))
+            && body.get("reason") == Some(&json!("tool_held"))
+        {
+            body.remove("reason");
+        }
+    }
     fn walk(value: &mut Value) {
         match value {
             Value::Object(object) => {
@@ -255,6 +263,7 @@ pub(super) fn run(args: &Args) {
             parts: converted.parts.clone(),
         };
         let reader = Reader {
+            labels: Default::default(),
             parts: &parts,
             live: false,
             settled: None,
@@ -582,6 +591,7 @@ fn read_context<'a>(
     settled: &'a SettledRuns,
 ) -> ReadContext<'a> {
     ReadContext {
+        labels: Default::default(),
         token_counts: None,
         parts,
         held: true,

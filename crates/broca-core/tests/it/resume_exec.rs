@@ -561,7 +561,9 @@ async fn resume_v1_run_under(
     let codes = events
         .iter()
         .filter_map(|event| match event {
-            OutputEvent::Control(ControlUnit::Error { error }) => Some(error.provider_code.clone()),
+            OutputEvent::Control(ControlUnit::Error { error, .. }) => {
+                Some(error.provider_code.clone())
+            }
             _ => None,
         })
         .collect();
@@ -660,7 +662,7 @@ async fn renderer_drift_resume_seals_and_next_invocation_opens_a_new_episode() {
     assert!(matches!(
         controls.as_slice(),
         [
-            ControlUnit::Error { error },
+            ControlUnit::Error { error, .. },
             ControlUnit::RunFinished {
                 reason: RunFinishReason::Interrupted,
                 ..

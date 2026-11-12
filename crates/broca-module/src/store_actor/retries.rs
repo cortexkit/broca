@@ -135,6 +135,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let addr = broca_core::session_addr(&self.key);
         let reader = crate::store_status::Reader {
+            labels: Default::default(),
             parts: &self.parts,
             live: true,
             settled: self

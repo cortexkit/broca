@@ -468,7 +468,7 @@ fn provider_side_skip(err: &ProviderError) -> Option<String> {
 
 pub fn first_error(events: &[OutputEvent]) -> Option<ProviderError> {
     events.iter().find_map(|e| match e {
-        OutputEvent::Control(ControlUnit::Error { error }) => Some(error.clone().into_inner()),
+        OutputEvent::Control(ControlUnit::Error { error, .. }) => Some(error.clone().into_inner()),
         _ => None,
     })
 }

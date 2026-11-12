@@ -2366,6 +2366,7 @@ async fn an_imported_runs_result_serves_the_last_imported_reply() {
         let run_id = session.operations.owner.first_start.clone().unwrap().run_id;
         let parts = MemoryParts::default();
         let reader = crate::store_status::Reader {
+            labels: Default::default(),
             parts: &parts,
             live: false,
             settled: None,

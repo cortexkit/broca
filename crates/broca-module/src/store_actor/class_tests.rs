@@ -150,6 +150,7 @@ async fn class_adoption_records_only_the_later_start_and_survives_reload_and_sea
             None
         );
         let reader = crate::store_status::Reader {
+            labels: Default::default(),
             parts: &parts,
             live: false,
             settled: None,

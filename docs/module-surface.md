@@ -2029,6 +2029,41 @@ keep their existing behavior and omit this diagnostic.
   are rebuilt from the WAL (`send_delivered`, and the run's `RunStarted` beside its
   `delivery_ordered`), so a re-send after a restart never answers `pending` again.
 
+### Run waits on the new storage
+
+Sessions kept by `broca-session-store` (see "Temporary storage cutover" above) additionally
+report llm-runner's optional `awaits` object on
+`run.status`, `session.head.last_run_state` and subscribe status/paused controls. Legacy
+storage omits it, and broca does not yet declare the `run_awaits` capability. A held tool is
+`active` on all three surfaces with `party: runner`, `reason: tool_held`. The internal durable
+tool-held pause records where to continue the same held tool batch after a restart; it is
+not a caller-owned pause. Account-limit and
+restart pauses wait on the runner; sign-in pauses wait on a person. Known automatic resume
+times appear as `next_ms` only while future. The old `reason`, `deadline_ms` and
+`resume_not_before_ms` fields retain their meanings.
+
+In-step provider retry waits are actor-held memory, never durable records. They appear once
+the wait has lasted a second, or immediately when a delay of at least a second is known.
+Subscribe carries these snapshots as display events, `event.type: run_status`, so they have
+no durable cursor and are never replayed as history. A subscriber joining during a wait gets
+the current display snapshot, rebuilt from the actor-held retry slot rather than a captured
+frame; a cleared wait or a passed `next_ms` cannot reappear on replay. Older readers decode
+an unfamiliar display event as
+`DisplayReset`, clearing their buffered token text. Broca emits retry snapshots only after
+abandoning a failed generation and before another attempt produces text. An old reader's
+`DisplayReset` therefore clears only abandoned or empty text, never a live generation.
+The snapshot is cleared before the next attempt and when the step ends.
+
+Terminal errors carry the same ending `awaits` on status, head, error/run-finished controls
+and `run.result`, using the recorded run-end time. Other terminals omit it, and nonterminal
+results never carry it. An error with no provider code also omits `awaits`: its retry/final
+classification is unknown, not a reason to refuse an otherwise readable run. Its existing
+error bytes are unchanged. Terminal reason fields keep each surface's existing encoding.
+An account display name is the frozen credential key's explicit label, else a cached vault
+row's nonblank email, never an opaque account or credential ID. Quoted messages retain their
+known provider/runner origin; unknown provenance and deliberately withheld WebSocket text
+remain absent.
+
 ### Attempt content telemetry
 
 `model_attempt_finished` optionally carries `first_content_at_ms`, `last_content_at_ms`,

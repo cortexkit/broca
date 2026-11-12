@@ -340,6 +340,7 @@ fn publish(
 
 /// The subscriptions of one store session, held by its actor.
 pub(crate) struct StoreFanout<B> {
+    labels: crate::store_awaits::Labels,
     publisher: Arc<Mutex<Publisher>>,
     display: DisplaySender,
     display_mid: Arc<Mutex<Option<String>>>,
@@ -361,8 +362,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
     /// The subscriptions of `session`, whose appends it observes from now on. A catch-up reads
     /// the session's records over a backend `readers` makes. The live projection starts seeding
     /// at once, in the background (see [`StoreFanout::ensure_seeded`]).
-    pub(crate) fn new(session: &mut Session<B>, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
-        let mut fanout = Self::unseeded(session, readers);
+    pub(crate) fn new(
+        session: &mut Session<B>,
+        readers: Arc<dyn Fn() -> B + Send + Sync>,
+        labels: crate::store_awaits::Labels,
+    ) -> Self {
+        let mut fanout = Self::unseeded(session, readers, labels);
         fanout.ensure_seeded(session);
         fanout
     }
@@ -373,15 +378,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         session: &mut Session<B>,
         readers: Arc<dyn Fn() -> B + Send + Sync>,
         gate: Arc<tokio::sync::Notify>,
+        labels: crate::store_awaits::Labels,
     ) -> Self {
-        let mut fanout = Self::unseeded(session, readers);
+        let mut fanout = Self::unseeded(session, readers, labels);
         fanout.seed_gate = Some(gate);
         fanout.ensure_seeded(session);
         fanout
     }
 
     /// The subscriptions of `session` before anything seeds their live projection.
-    fn unseeded(session: &mut Session<B>, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
+    fn unseeded(
+        session: &mut Session<B>,
+        readers: Arc<dyn Fn() -> B + Send + Sync>,
+        labels: crate::store_awaits::Labels,
+    ) -> Self {
         let display = DisplaySender::new(crate::fanout::DISPLAY_RING_CAPACITY);
         let display_mid = Arc::new(Mutex::new(None));
         let publisher = Arc::new(Mutex::new(Publisher {
@@ -399,6 +409,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             hook.lock().unwrap().appended(appended);
         }));
         Self {
+            labels,
             publisher,
             display,
             display_mid,
@@ -427,6 +438,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             return;
         };
         let reader = session.stored_records((self.readers)());
+        let labels = self.labels.clone();
         let publisher = Arc::clone(&self.publisher);
         #[cfg(test)]
         let gate = self.seed_gate.clone();
@@ -437,7 +449,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             }
             let read = tokio::runtime::Handle::current();
             let seeded = spawn_blocking(JobKind::Projection, move || {
-                read.block_on(seed(&reader, head, &identity))
+                read.block_on(seed_with_labels(&reader, head, &identity, labels))
             })
             .await;
             let seed = match seeded {
@@ -506,6 +518,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         let cancel = CancellationToken::new();
         let terminal = sink.downgrade();
         let task = subscriber(Attach {
+            labels: self.labels.clone(),
             from,
             head,
             rx,
@@ -648,6 +661,7 @@ pub(crate) fn drain_display(
 
 /// One subscriber's attach.
 struct Attach<R> {
+    labels: crate::store_awaits::Labels,
     from: AttachFrom,
     /// The barrier: the session's durable end when the subscriber's receiver was registered.
     head: u64,
@@ -676,6 +690,16 @@ pub(crate) fn replay(
     head: u64,
     identity: &CursorIdentity,
 ) -> Result<Replay, String> {
+    replay_with_labels(log, from, head, identity, Default::default())
+}
+
+fn replay_with_labels(
+    log: LogFrom,
+    from: AttachFrom,
+    head: u64,
+    identity: &CursorIdentity,
+    labels: crate::store_awaits::Labels,
+) -> Result<Replay, String> {
     let LogFrom {
         checkpoint,
         records,
@@ -684,7 +708,8 @@ pub(crate) fn replay(
         &checkpoint.conversation,
         &checkpoint.operational,
         checkpoint.covers_through,
-    );
+    )
+    .with_labels(labels);
     let delivered_from = match from {
         AttachFrom::Live => None,
         AttachFrom::Cursor(cursor) => Some(cursor),
@@ -755,12 +780,21 @@ impl<R: SessionBackend> Logs for StoredRecords<R> {
 
 /// The open log projected once, retaining only the current step's visible controls.
 fn project_log(log: LogFrom, identity: &CursorIdentity) -> Result<LiveProjection, String> {
+    project_log_with_labels(log, identity, Default::default())
+}
+
+fn project_log_with_labels(
+    log: LogFrom,
+    identity: &CursorIdentity,
+    labels: crate::store_awaits::Labels,
+) -> Result<LiveProjection, String> {
     let mut projection = LiveProjection {
         control: StoreControl::at_checkpoint(
             &log.checkpoint.conversation,
             &log.checkpoint.operational,
             log.checkpoint.covers_through,
-        ),
+        )
+        .with_labels(labels),
         last: None,
         step: StepReplay::default(),
         through: log.checkpoint.covers_through,
@@ -801,9 +835,18 @@ async fn seed(
     head: u64,
     identity: &CursorIdentity,
 ) -> Result<LiveProjection, String> {
+    seed_with_labels(logs, head, identity, Default::default()).await
+}
+
+async fn seed_with_labels(
+    logs: &impl Logs,
+    head: u64,
+    identity: &CursorIdentity,
+    labels: crate::store_awaits::Labels,
+) -> Result<LiveProjection, String> {
     let log = logs.log_holding(head + 1, head).await?;
     let covers = log.checkpoint.covers_through;
-    let mut projection = project_log(log, identity)?;
+    let mut projection = project_log_with_labels(log, identity, labels)?;
     projection.last = match projection.last {
         Some(last) => Some(last),
         None if covers == 0 => None,
@@ -901,6 +944,7 @@ pub async fn catch_up_from<B: SessionBackend>(
 /// One subscriber: its catch-up through the barrier, then the live stream.
 async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>) {
     let Attach {
+        labels,
         from,
         head,
         mut rx,
@@ -952,7 +996,7 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
             let log = runtime
                 .block_on(reader.from_log_holding(start, head))
                 .map_err(|error| format!("the session's records can't be read: {error:?}"))?;
-            replay(log, from, head, &read_identity)
+            replay_with_labels(log, from, head, &read_identity, labels)
         })
         .await
         {
