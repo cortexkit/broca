@@ -27,6 +27,10 @@ use crate::store_import::{
     ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
 };
 
+// Imports staged and published on the new storage's class roots.
+#[path = "import_stage_tests.rs"]
+mod staged;
+
 const ADDR: &str = "fedcba9876543210";
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -187,12 +191,16 @@ impl Drop for Source {
 type Served = tokio::task::JoinHandle<Session<&'static MemoryBackend>>;
 
 fn serve(session: Session<&'static MemoryBackend>) -> (mpsc::UnboundedSender<LineageCmd>, Served) {
+    let backend = *session.backend();
     let actor = StoreActor::new(
         bind(),
         session,
         Arc::new(executor(Vec::new(), None)),
         Box::new(SharedParts::new(Box::new(MemoryParts::default()))),
-    );
+    )
+    .with_import_staging(Arc::new(
+        crate::store_import_stage::MemoryImportStaging::new(backend, deployment()),
+    ));
     let (commands, receiver) = mpsc::unbounded_channel();
     (commands, tokio::spawn(actor.serve(receiver)))
 }

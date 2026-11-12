@@ -1211,7 +1211,7 @@ impl Engine {
             },
         )
         .map_err(move_failure)?;
-        crate::store_move::publish_head_at(&staging, &destination, &address)
+        crate::store_move::publish_head_at(&staging, &destination, &address, None)
             .await
             .map_err(move_failure)?;
         #[cfg(test)]

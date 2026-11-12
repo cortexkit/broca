@@ -413,8 +413,10 @@ fn imports_seed(start: &RunStart, next: Option<&Record>) -> bool {
 /// Today's import seed holds every imported message in its one `run_started`, so they are all
 /// claimed by the start. Between them `session.import` writes each message's facts, a turn's
 /// call facts and the notes appended to its tool results: none of them is a record of today's
-/// log or moves a message, so they are passed over. The whole run is written in one batch, so
-/// its end must be in `rest`.
+/// log or moves a message, so they are passed over. Its end must be in `rest`: an import too
+/// large for one log batch is written in several, but only into a staged session published
+/// whole, so no reader sees the run's start before its end is written, and a reader of such a
+/// session rebuilds its history from the first record in one call (`MediaFold::catch_up`).
 fn import_seed<'a>(
     start: &RunStart,
     rest: &'a [Record],

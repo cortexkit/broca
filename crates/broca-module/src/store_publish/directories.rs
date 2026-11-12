@@ -9,7 +9,7 @@ use std::{
 use broca_wal::migration;
 
 #[derive(Default)]
-pub(crate) struct PublicationDirs {
+pub struct PublicationDirs {
     stores: BTreeMap<(PathBuf, PathBuf), Proof>,
     #[cfg(test)]
     initializations: usize,
@@ -68,11 +68,11 @@ impl Proof {
 }
 
 impl PublicationDirs {
-    pub(crate) fn ensure(&mut self, state_root: &Path, store: &Path) -> io::Result<()> {
+    pub fn ensure(&mut self, state_root: &Path, store: &Path) -> io::Result<()> {
         self.ensure_paths(state_root, store, &["logs", "objects", "heads"])
     }
 
-    pub(crate) fn ensure_parent(&mut self, state_root: &Path, parent: &Path) -> io::Result<()> {
+    pub fn ensure_parent(&mut self, state_root: &Path, parent: &Path) -> io::Result<()> {
         self.ensure_paths(state_root, parent, &[""])
     }
 
@@ -143,7 +143,7 @@ mod tests {
     fn directory_proofs_are_process_local_and_replacement_invalidates_them() {
         let root = broca_test_support::scratch_root().join(format!(
             "directory-proof-{}",
-            crate::store_move::new_move_id().unwrap()
+            broca_session_store::codec::hex(&broca_session_store::keys::random_id().0)
         ));
         std::fs::create_dir_all(&root).unwrap();
         let store = root.join("session-store");

@@ -292,7 +292,13 @@ async fn imported_records(
         session,
         Arc::new(crate::store_actor::tests::executor(Vec::new(), None)),
         Box::new(SharedParts::new(Box::new(MemoryParts::default()))),
-    );
+    )
+    .with_import_staging(Arc::new(
+        crate::store_import_stage::MemoryImportStaging::new(
+            backend,
+            broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        ),
+    ));
     let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
     let served = tokio::spawn(actor.serve(receiver));
     let dir = broca_test_support::scratch_root().join(format!(

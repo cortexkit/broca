@@ -394,20 +394,33 @@ impl<B: SessionBackend> Session<B> {
             appends_in_conversation: appends_in_conversation.then_some(true),
             cipher,
         };
+        Self::create_from_head(backend, addr, head, &key, log).await
+    }
+
+    /// Creates a session from `head`, whose residence names `log` as the log being created and
+    /// whose keys wrap `key`: writes the head, creates the log and opens the writer.
+    async fn create_from_head(
+        backend: B,
+        addr: SessionAddr,
+        head: Head,
+        key: &DataKey,
+        log: Id128,
+    ) -> Result<Self, SessionError> {
+        let appends_in_conversation = head.appends_in_conversation.unwrap_or(false);
         let version = backend
-            .write_head(&addr, &head::seal(&head, &key), None, 1)
+            .write_head(&addr, &head::seal(&head, key), None, 1)
             .await?;
         let mut session = Self::create_log(
             backend,
             addr,
-            head.clone(),
+            head,
             version,
-            &key,
+            key,
             log,
             appends_in_conversation,
         )
         .await?;
-        session.open_writer(&key).await?;
+        session.open_writer(key).await?;
         Ok(session)
     }
 
@@ -1131,7 +1144,7 @@ pub use media::{
     NamedMedium, NewMedia,
 };
 mod import;
-pub use import::{is_broca_id_form, NewInputMedia};
+pub use import::{is_broca_id_form, NewInputMedia, PreparedImport, MAX_BATCH_RECORDS};
 mod enrollment;
 pub use enrollment::EnrollmentOverlay;
 
