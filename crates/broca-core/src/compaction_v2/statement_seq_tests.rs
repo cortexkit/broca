@@ -77,6 +77,7 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
     }
     let calls = plane.inner.calls.lock().unwrap();
     assert_eq!(calls.len(), 9);
+    let mut epoch = None;
     for (index, (method, params)) in calls.iter().enumerate() {
         let bytes = serde_json::to_vec(params).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -87,11 +88,20 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
         };
         if index < 3 {
             assert_eq!(state["statement_seq"], json!(42), "{method}");
+            // The declared Setup mints the epoch, and its notice and ride repeat it.
+            let this = state["statement_epoch"].as_str().unwrap().to_owned();
+            assert!(
+                this.len() == 32 && this.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{this}"
+            );
+            assert_eq!(epoch.get_or_insert_with(|| this.clone()), &this, "{method}");
         } else {
-            assert!(!state.as_object().unwrap().contains_key("statement_seq"));
-            assert!(!String::from_utf8(bytes).unwrap().contains("statement_seq"));
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(!text.contains("statement_seq"), "{method}");
+            assert!(!text.contains("statement_epoch"), "{method}");
         }
     }
+    let epoch = epoch.unwrap();
     let vectors = [
         include_str!("test_vectors/setup-statement-seq-request.json"),
         include_str!("test_vectors/notice-statement-seq-request.json"),
@@ -125,6 +135,12 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
             expected["params"]["seq"] = json!(1);
             expected["params"]["events"] = json!([{"event":"transcript_changed","from_ordinal":1}]);
         }
+        // The contract's example epoch stands for any fresh one; this Setup minted its own.
+        if method == "compaction.setup" {
+            expected["params"]["statement_epoch"] = json!(epoch);
+        } else {
+            expected["params"]["conditions"]["statement_epoch"] = json!(epoch);
+        }
         let actual = json!({"method":method,"params":params});
         assert_eq!(
             serde_json::to_string(&actual).unwrap(),
@@ -143,4 +159,61 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
             std::fs::write(directory.join(format!("{op}-{declaration}.json")), bytes).unwrap();
         }
     }
+}
+
+/// Each Setup mints a new epoch, and the statements after it carry that one, never an earlier
+/// Setup's: a provider holding the new epoch would drop a statement under the old one.
+#[tokio::test]
+async fn compaction_v2_each_setup_mints_a_new_statement_epoch() {
+    let declared = crate::ProviderCapabilities::Declared(vec![
+        cortexkit_role_compaction::COMPACTION_PROVIDES.into(),
+        cortexkit_role_compaction::COMPACTION_STATEMENT_SEQ_PROVIDES.into(),
+    ]);
+    let plane = CatalogPlane {
+        inner: RecordingPlane::default(),
+        capabilities: std::sync::Mutex::new(vec![declared.clone(), declared].into()),
+    };
+    let bind = broca_protocol::BindIdentity::new("/synthetic", "test", "statement-epoch");
+    let bound = runtime::BoundPlane {
+        plane: Some(&plane),
+        provider: "magic",
+        bind: &bind,
+        scope: None,
+    };
+    let runtime = runtime::Runtime::default();
+    let conditions = stamped_conditions(7);
+    let setup = conditions::setup_request("example", &conditions, 1700000000200, true);
+    for _ in 0..2 {
+        plane
+            .inner
+            .answers
+            .lock()
+            .unwrap()
+            .extend([json!({"answer":"ready"}), json!({"answer":"received"})]);
+        assert!(runtime.setup(&bound, &setup).await);
+        runtime.event(Event::TranscriptChanged { from_ordinal: 1 });
+        runtime.flush(&bound, &setup, &conditions, None).await;
+    }
+    let calls = plane.inner.calls.lock().unwrap();
+    let epochs: Vec<String> = calls
+        .iter()
+        .map(|(method, params)| {
+            let state = if method == "compaction.setup" {
+                params.clone()
+            } else {
+                params["conditions"].clone()
+            };
+            state["statement_epoch"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(epochs.len(), 4);
+    assert_eq!(
+        epochs[0], epochs[1],
+        "the first Setup's notice repeats its epoch"
+    );
+    assert_eq!(
+        epochs[2], epochs[3],
+        "the second Setup's notice repeats its epoch"
+    );
+    assert_ne!(epochs[0], epochs[2], "each Setup mints a new epoch");
 }

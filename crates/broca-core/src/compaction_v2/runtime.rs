@@ -225,6 +225,12 @@ struct Lane {
     signed_floor_declared: bool,
     notes_tokens_declared: bool,
     statement_seq_declared: bool,
+    /// The epoch the latest Setup carried, which every later notice and ride repeats beside its
+    /// stamp (compaction contract W3.5). It is minted fresh at each Setup and kept only in
+    /// memory: a restarted process always sends a new Setup first. `None` when the provider
+    /// didn't declare `compaction-statement-seq/v1`, or no epoch could be minted; the lane then
+    /// sends neither the epoch nor the stamp, because a stamp alone is dropped by the provider.
+    statement_epoch: Option<String>,
 }
 
 impl Default for Lane {
@@ -237,6 +243,7 @@ impl Default for Lane {
             signed_floor_declared: false,
             notes_tokens_declared: false,
             statement_seq_declared: false,
+            statement_epoch: None,
         }
     }
 }
@@ -252,11 +259,39 @@ impl Lane {
         if !self.notes_tokens_declared {
             conditions.notes_tokens = None;
         }
-        if !self.statement_seq_declared {
-            conditions.statement_seq = None;
+        match &self.statement_epoch {
+            Some(epoch) if conditions.statement_seq.is_some() => {
+                conditions.statement_epoch = Some(epoch.clone());
+            }
+            _ => {
+                conditions.statement_epoch = None;
+                conditions.statement_seq = None;
+            }
         }
         conditions
     }
+}
+
+/// A new Setup epoch: 32 lowercase hex digits from the operating system's random source, which
+/// fits the contract's 1 to 64 visible ASCII characters. `None` if the source fails.
+fn mint_statement_epoch() -> Option<String> {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(
+            %error,
+            "no compaction statement epoch could be minted; this Setup's statements carry no stamp"
+        );
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .fold(String::with_capacity(32), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            }),
+    )
 }
 
 /// A single actor owns this object across runs. The lane lock spans each call;
@@ -626,12 +661,26 @@ async fn setup(
     lane.signed_floor_declared = declared.signed_floor;
     lane.notes_tokens_declared = declared.notes_tokens;
     lane.statement_seq_declared = declared.statement_seq;
+    lane.statement_epoch = if lane.statement_seq_declared {
+        mint_statement_epoch()
+    } else {
+        None
+    };
     let mut request = request.clone();
     if !lane.signed_floor_declared {
         request.signed_floor = None;
     }
-    if !lane.statement_seq_declared {
-        request.statement_seq = None;
+    match &lane.statement_epoch {
+        Some(epoch) if request.statement_seq.is_some() => {
+            request.statement_epoch = Some(epoch.clone());
+        }
+        _ => {
+            request.statement_epoch = None;
+            request.statement_seq = None;
+            // A Setup without the pair clears the provider's held epoch, so the statements that
+            // follow it must not carry one either.
+            lane.statement_epoch = None;
+        }
     }
     let answer: Result<SetupAnswer, _> =
         call(plane, "compaction.setup", &request, CALL_DEADLINE).await;
