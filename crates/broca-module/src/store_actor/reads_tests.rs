@@ -854,6 +854,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::PlanView(reply) => format!("{reply:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
+        StoreReadReply::AuthorizationRead(admitted) => format!("{admitted:?}"),
         StoreReadReply::AuthorizationSubmissionSender(sender) => format!("{sender:?}"),
         StoreReadReply::RunResult(reply) => match reply {
             Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
