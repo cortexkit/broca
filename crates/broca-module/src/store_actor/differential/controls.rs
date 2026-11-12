@@ -1071,8 +1071,18 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         .map(|(_, body)| body.clone())
         .collect();
     assert!(!new_notices.is_empty());
+    // Today's loop never ties its reading to a view; the new loop names the view each reading's
+    // request was rendered under, none here (`0`). Apart from that member the notices match.
+    let without_view = |notice: &Value| {
+        let mut notice = notice.clone();
+        let conditions = notice["conditions"].as_object_mut().unwrap();
+        let view = conditions.remove("last_prompt_view");
+        let expected = conditions.get("last_prompt_tokens").map(|_| json!(0));
+        assert_eq!(view, expected, "{notice:?}");
+        masked(&notice)
+    };
     assert_eq!(
-        new_notices.iter().map(masked).collect::<Vec<_>>(),
+        new_notices.iter().map(without_view).collect::<Vec<_>>(),
         old_notices.iter().map(masked).collect::<Vec<_>>()
     );
     for notice in &new_notices {

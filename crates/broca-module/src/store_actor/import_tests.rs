@@ -2221,3 +2221,68 @@ async fn a_pi_call_left_unanswered_is_listed_after_its_turn() {
         ContentBlock::ToolResult(result) if result.is_error
     ));
 }
+
+/// An imported session states no reading of its fill until its own first step is measured. The
+/// last reading it holds is the prompt size the source runner reported, for a prompt broca never
+/// built, so every compaction call before that step carries neither `last_prompt_tokens` nor
+/// `last_prompt_view`. The session's own first reading names the view its request carried, here
+/// none (`0`).
+#[tokio::test]
+async fn an_imported_session_states_no_reading_until_its_own_step() {
+    let mut export: serde_json::Value = serde_json::from_slice(&exchanges()).unwrap();
+    // The source runner reported the last answer's prompt size.
+    export["messages"][7]["tokens"] = serde_json::json!({"input": 5_000, "output": 30});
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("measured", serde_json::to_vec(&export).unwrap(), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    drop(commands);
+    let mut session = served.await.unwrap();
+    let compactor = Compactor::default();
+    let mut parts = MemoryParts::default();
+    run_once(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("r1", "m"),
+        "Question 5.",
+    )
+    .await;
+    let calls = compactor.calls.lock().unwrap();
+    let readings: Vec<(&str, Option<u64>, Option<u64>)> = calls
+        .iter()
+        .filter(|(method, _)| method != "compaction.setup")
+        .map(|(method, params)| {
+            let conditions = &params["conditions"];
+            (
+                method.as_str(),
+                conditions["last_prompt_tokens"].as_u64(),
+                conditions["last_prompt_view"].as_u64(),
+            )
+        })
+        .collect();
+    let own = readings
+        .iter()
+        .position(|(_, tokens, _)| *tokens == Some(100))
+        .unwrap_or_else(|| panic!("a call reports the session's own step: {readings:?}"));
+    assert!(own > 0, "{readings:?}");
+    assert!(
+        readings[..own]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (None, None)),
+        "{readings:?}"
+    );
+    assert!(
+        readings[own..]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (Some(100), Some(0))),
+        "{readings:?}"
+    );
+    // The source runner's number is never stated, on any call's bytes.
+    assert!(
+        calls
+            .iter()
+            .all(|(_, params)| !params.to_string().contains("\"last_prompt_tokens\":5000")),
+        "{calls:?}"
+    );
+}
