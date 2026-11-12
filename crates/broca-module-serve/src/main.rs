@@ -4572,47 +4572,20 @@ mod executor {
             if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty())
             {
                 // As `execute` installs today's renderer for a run that may carry media: the
-                // same projection, folded from the session's records turned back into today's
-                // (see `broca_module::store_media`), reading the session's own media objects.
-                // The session's first such run may still be waiting for the fold to be built;
-                // each model call waits for it first, and a request whose media can't be
-                // rendered is refused by name before anything is sent.
+                // same engine, kept by the session's actor as the session's image index (see
+                // `broca_module::store_media`), reading the session's own media objects. The
+                // session's first such run may still be waiting for the index to be built; each
+                // model call waits for it first, and a request whose media can't be rendered is
+                // refused by name before anything is sent.
                 let media = media.ok_or_else(|| {
                     StoreRunError::Admission(RunError::Wal(
-                        "store_media_unavailable: the run was started without its media fold"
+                        "store_media_unavailable: the run was started without its media index"
                             .into(),
                     ))
                 })?;
-                let frozen: broca_provider::wire::FrozenRenderConfig =
-                    serde_json::from_value(resolved.provider.render_config_blob())
-                        .expect("resolved provider has a frozen config");
-                let budget = history
-                    .prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.budget.clone());
                 let lazy = broca_module::store_media::LazyRenderer::new(
                     media,
-                    Box::new(move |bytes, checkpoint, read_tail| {
-                        let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                            bytes,
-                            checkpoint,
-                            budget,
-                            frozen.media,
-                            read_tail,
-                        )?;
-                        Ok(Arc::new(
-                            move |frozen: &serde_json::Value,
-                                  opts: &broca_protocol::request::CallOptions,
-                                  tags: bool,
-                                  commit: bool,
-                                  provenance: Option<
-                                &mut broca_protocol::render_provenance::RenderProvenance,
-                            >| {
-                                media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                            },
-                        )
-                            as Arc<broca_core::provider::MediaRequestRenderer>)
-                    }),
+                    Box::new(|media| Ok(media.renderer())),
                 );
                 resolved
                     .provider

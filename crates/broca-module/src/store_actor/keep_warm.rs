@@ -476,8 +476,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         });
         let recorded = if mode == StoreRunMode::Resume {
             Some(self.recorded_warm_request().await.and_then(|request| {
-                super::recorded_warm::media(media, &request.config)
-                    .map(|renderer| (request, renderer))
+                super::recorded_warm::media(media).map(|renderer| (request, renderer))
             }))
         } else {
             None

@@ -282,43 +282,18 @@ impl RenderExecutor {
 }
 
 /// The new storage's renderer, installed as the module's executor installs it for a store run
-/// that may carry media: ready once the session's media fold is, each model call waiting for it.
+/// that may carry media: ready once the session's image index is, each model call waiting for it.
 fn install_store(
     job_media: Option<crate::store_media::StoreRunMediaWait>,
     holds_media: bool,
     tools: bool,
-    budget: Option<broca_protocol::request::BudgetConfig>,
     provider: &Rendering,
 ) -> Result<Option<Arc<dyn broca_session_loop::run::ModelCallReady>>, RunError> {
     if !(holds_media || tools) {
         return Ok(None);
     }
     let media = job_media.ok_or_else(|| RunError::Wal("store_media_unavailable".into()))?;
-    let frozen: broca_provider::wire::FrozenRenderConfig =
-        serde_json::from_value(image_render_config()).unwrap();
-    let lazy = crate::store_media::LazyRenderer::new(
-        media,
-        Box::new(move |bytes, checkpoint, read_tail| {
-            let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                bytes,
-                checkpoint,
-                budget,
-                frozen.media,
-                read_tail,
-            )?;
-            Ok(Arc::new(
-                move |frozen: &Value,
-                      opts: &broca_protocol::request::CallOptions,
-                      tags: bool,
-                      commit: bool,
-                      provenance: Option<
-                    &mut broca_protocol::render_provenance::RenderProvenance,
-                >| {
-                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                },
-            ) as Arc<MediaRequestRenderer>)
-        }),
-    );
+    let lazy = crate::store_media::LazyRenderer::new(media, Box::new(|media| Ok(media.renderer())));
     provider.set_media_request_renderer(lazy.renderer());
     Ok(Some(lazy))
 }
@@ -400,16 +375,7 @@ impl RunExecutor for RenderExecutor {
                 .iter()
                 .chain(writer.conversation().messages.iter())
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
-            let budget = writer
-                .operations()
-                .run
-                .as_ref()
-                .and_then(|run| run.start.as_ref())
-                .map(|start| broca_session_loop::run::run_config_of_start(start, parts.as_ref()))
-                .transpose()
-                .map_err(StoreRunError::Loop)?
-                .and_then(|config| config.budget);
-            let ready = install_store(media, holds_media, !req.tools.is_empty(), budget, &provider)
+            let ready = install_store(media, holds_media, !req.tools.is_empty(), &provider)
                 .map_err(StoreRunError::Admission)?;
             let tools = PhotoPlane::new();
             let now = || 1;

@@ -429,6 +429,29 @@ fn the_events_of_a_load_continue_the_saved_index_mid_run_and_between_runs(cipher
         assert_eq!(loaded.feed.items, after_seal);
         assert!(!after_seal.is_empty());
 
+        // A one-time build from the records through the saved index's seq, across both seals,
+        // hands over what the writers were handed through it, and the load's feed continues it.
+        let (session, _) =
+            Session::load_feeding_media(&backend, addr(), &triple(), &deployment(cipher))
+                .await
+                .unwrap();
+        let history = session
+            .stored_records(&backend)
+            .media_history(between_runs)
+            .await
+            .unwrap();
+        let before: Vec<MediaItem> = handed
+            .iter()
+            .filter(|(last, _)| *last < between_runs)
+            .map(|(_, item)| item.clone())
+            .collect();
+        assert_eq!(history.items, before);
+        assert_eq!(
+            history.start.as_ref().map(|start| start.steps),
+            Some(1),
+            "the first capture follows the plain run's one step"
+        );
+
         // Every record folded from the session's start.
         let mut history = History::new();
         let mut everything = MediaFeed::default();
@@ -541,6 +564,15 @@ fn a_session_without_media_keeps_its_step_counter_across_a_seal_without_an_index
         assert_eq!(loaded.saved, SavedIndex::NoCapture);
         assert_eq!(session.media_fold().steps, 1);
         assert!(!session.media_fold().has_captured());
+        // A build from the records hands over the scalars they end with as the index's start.
+        let history = session
+            .stored_records(&backend)
+            .media_history(loaded.through)
+            .await
+            .unwrap();
+        assert!(history.items.is_empty());
+        let start = history.start.expect("a history hands over its scalars");
+        assert_eq!((start.steps, start.step_open), (1, false));
     });
 }
 

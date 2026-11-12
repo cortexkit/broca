@@ -1,298 +1,540 @@
 //! Media in the requests of a run on a session kept in the new storage.
 //!
-//! A run renders a request holding media exactly as today's runs do: through
-//! `broca_provider::media_request::LiveMedia`, over the projection `broca_core::media_request`
-//! folds from today's records. A session in the new storage has no today's records, so they are
-//! rebuilt from its own by the converter's inverse (`broca_session_loop::inverse`), which turns
-//! each record back into the record today's storage would have written. Nothing else differs:
-//! which media the session captured and where, which of them a person sent and so are kept out of
-//! aging, where each sits in the prompt, which a compaction view still shows, and how many older
-//! ones are aged out all come from the same fold. Only the bytes are read from somewhere else,
-//! the session's own media objects.
+//! **The index.** The session's actor owns its image index ([`SessionIndex`]): the engine's
+//! state for the session (`broca_provider::media_request::MediaIndex`: which media it captured
+//! and where, which a person sent and so are kept out of aging, the aging totals, the media
+//! limits in force), and where each medium's bytes are stored. The store hands the index's input
+//! over as media events (`broca_session_store::fold::media`) with every write; the actor applies
+//! each event once, in record order. A session that has captured nothing has no index: the
+//! store keeps its few scalars and hands them over at its first capture, which creates it.
 //!
-//! **The fold.** The actor keeps one [`MediaFold`] for its session's life. It is built from the
-//! session's first record when the first run that may render media starts, on a blocking thread
-//! while the actor keeps answering commands, then takes in each batch the session appends, so a
-//! later run starts from where the last one left off rather than from the start. Rebuilt records
-//! are numbered 1, 2, ... in order, which is the numbering the fold's positions use; a record the
-//! inverse leaves out (a seal's bookkeeping, a facts record) takes no number.
+//! **Opening.** A seal saves the index with the session. An open starts from the saved index and
+//! applies what the open log's records after it handed over, so it reads no record twice. When
+//! the checkpoint saves no index the session needs (it was written before indexes were saved,
+//! or after an undo, or the index is missing, damaged or of an unknown version), the index is
+//! built once from all the session's records, on a blocking thread while the actor keeps
+//! answering commands, when the first run that may render media starts. Until then what the
+//! session hands over waits, in order.
 //!
-//! **A run's view.** A run gets the fold's seed as it stood when the fold was handed to it, and
-//! reads the records rebuilt after it, numbered on from the seed, through the [`Shared`] state the
-//! actor fills before it answers each of the run's appends. So a request the run renders holds
-//! every record the run's own copy of the session holds. Until the fold is handed over, each of
-//! the run's model calls waits for it ([`LazyRenderer`]), and a cancel ends the wait.
+//! **A run's view.** A run renders from the index as it stands, behind an `Arc` ([`RunMedia`]):
+//! the actor applies a run's append before it answers it, so a request holds every record its
+//! run wrote. The actor changes the index through `Arc::make_mut`, which copies it only if a
+//! render holds the old one at that moment. A render writes nothing back. Until the index is
+//! built, each of the run's model calls waits for it ([`LazyRenderer`]), and a cancel ends the
+//! wait.
 //!
-//! **Failure.** A record the inverse or the fold can't take in breaks the fold for the rest of
-//! the actor's life, naming the record. A request holding media is then refused by name before
-//! anything is sent, as it is when the session has no way to read its media objects. It is never
-//! sent without its media.
+//! **Failure.** An event the index can't take breaks it for the rest of the actor's life,
+//! naming why. A request holding media is then refused by name before anything is sent, as it
+//! is when the session has no way to read its media objects. It is never sent without its media.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use broca_core::media_request::{MediaCheckpoint, MediaSeedFold};
+use broca_core::media_request::SessionMedia;
 use broca_core::media_store::{MediaBytes, MediaReadError};
+use broca_protocol::media_event::{MediaEvent, MediaLimits};
 use broca_protocol::{BindIdentity, MediaRef};
-use broca_session_loop::inverse::Inverse;
+use broca_provider::media_request::{media_profile, MediaAging, MediaIndex};
 use broca_session_loop::parts::Parts;
 use broca_session_store::backend::SessionBackend;
-use broca_session_store::record::{MediaObject, Record};
-use broca_session_store::session::{MediaError, MediaObjects, Session, SessionError};
-use broca_wal::{FramedRecord, WalRecord};
+use broca_session_store::fold::media::{limits_in, LimitsSource, MediaFeed, MediaItem, MediaStart};
+use broca_session_store::record::{MediaObject, PartRef, Record};
+use broca_session_store::session::{
+    LoadedMedia, MediaError, MediaIndexSave, MediaObjects, SavedIndex, Session, SessionError,
+    StoredMediaIndex,
+};
 
-/// What the actor and its running run share.
-#[derive(Debug, Default, Clone)]
-pub struct Shared {
-    /// Today's records rebuilt since the running run's seed, oldest first, from the seed's
-    /// position + 1. The run drops each once it has read past it.
-    frames: Vec<FramedRecord>,
-    /// The object each medium's bytes are, by digest: the first record that says where.
-    objects: BTreeMap<String, MediaObject>,
-    /// Why the fold stopped, once it did.
+/// What renders read of the index, and the actor changes.
+#[derive(Default)]
+struct Slot {
+    /// The index, once the session captured a medium. Absent before, and while it is built.
+    index: Option<Arc<MediaIndex>>,
+    /// Why the index can't be had, once it can't: it stays so for the actor's life.
     broken: Option<String>,
-    /// Whether a run has started since the fold was built: only then are rebuilt records kept
-    /// for a run to read. The fold built at the first run start keeps none of the history.
-    reading: bool,
+    /// The seq of the last record whose events the index applied.
+    through: u64,
+    /// Whether the index applied every record through `through`: not while it waits to be
+    /// built, so a seal meanwhile saves none.
+    current: bool,
 }
 
-/// One session's media fold, kept by its actor.
-pub struct MediaFold {
-    inverse: Inverse,
-    seed: MediaSeedFold,
-    /// Run starts need the session's identity, which today's run start carries and the new
-    /// storage keeps once per session.
-    session: BindIdentity,
-    shared: Arc<Mutex<Shared>>,
+/// Where each medium's bytes are stored, by digest: the object the first record naming the
+/// digest names. Kept apart from the index, since the engine reads bytes through it.
+type Objects = Arc<Mutex<BTreeMap<String, MediaObject>>>;
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-impl MediaFold {
-    /// A fold at the start of `session`'s log, before its first record.
-    pub fn new(session: BindIdentity) -> Self {
+/// Where the index stands in the actor's life.
+enum Phase {
+    /// The session doesn't feed its media yet: [`SessionIndex::open`] hasn't run.
+    Unopened,
+    /// The index applied everything handed over: each feed applies as it comes.
+    Current,
+    /// The index must be built once from the records through `through` first. What the
+    /// session handed over since waits in `feeds`, in order.
+    Unbuilt { through: u64, feeds: Vec<MediaFeed> },
+    /// Being built; what the session hands over meanwhile waits.
+    Building { feeds: Vec<MediaFeed> },
+}
+
+/// One session's image index, owned by its actor (see the module docs).
+pub struct SessionIndex {
+    slot: Arc<Mutex<Slot>>,
+    objects: Objects,
+    /// What the engine reads bytes through: the session's media objects over a reader of its
+    /// own, or, without one, a source that refuses every read.
+    bytes: Arc<dyn MediaBytes>,
+    /// Why no medium can be read, when the actor has no reader of its own.
+    unreadable: Option<String>,
+    phase: Phase,
+    /// The session's next seq when the actor got it: records appended before the session feeds
+    /// its media would be in no feed, so the index is then built from the records instead.
+    next_at_start: u64,
+}
+
+/// Why a run's media can't be read when the actor has no handle on the storage of its own.
+const NO_READER: &str = "the session's media objects can't be read apart from its writer, so its \
+                         media can't be rendered";
+
+impl SessionIndex {
+    /// The index of `session`, which the actor got with nothing appended since; its bytes are
+    /// read over `reader` when there is one.
+    pub fn new<B: SessionBackend, R: SessionBackend + Send + Sync + 'static>(
+        session: &Session<B>,
+        reader: Option<R>,
+    ) -> Self {
+        let objects = Objects::default();
+        let (bytes, unreadable): (Arc<dyn MediaBytes>, _) = match reader {
+            Some(reader) => (
+                Arc::new(StoreMediaBytes {
+                    objects: Arc::clone(&objects),
+                    reader: std::panic::AssertUnwindSafe(session.media_objects(reader)),
+                }),
+                None,
+            ),
+            None => (
+                Arc::new(Unavailable(NO_READER.into())),
+                Some(NO_READER.into()),
+            ),
+        };
         Self {
-            inverse: Inverse::new(),
-            seed: MediaSeedFold::default(),
-            session,
-            shared: Arc::default(),
+            slot: Arc::default(),
+            objects,
+            bytes,
+            unreadable,
+            phase: Phase::Unopened,
+            next_at_start: session.next_seq(),
         }
     }
 
-    /// The seq of the next record of the session the fold takes in.
-    pub fn next_seq(&self) -> u64 {
-        self.inverse.next_seq()
+    fn slot(&self) -> MutexGuard<'_, Slot> {
+        locked(&self.slot)
     }
 
-    fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
-        self.shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Why the fold stopped, once it did.
+    /// Why the index can't be had, once it can't.
     pub fn broken(&self) -> Option<String> {
-        self.shared().broken.clone()
+        self.slot().broken.clone()
     }
 
-    /// Stops the fold for good, naming why.
+    /// Stops the index for good, naming why.
     pub fn stop(&self, reason: String) {
-        let mut shared = self.shared();
-        shared.broken.get_or_insert(reason);
+        self.slot().broken.get_or_insert(reason);
     }
 
-    /// Takes in `records`, the session's records in seq order from the fold's next seq on. Each
-    /// batch the session appended must come whole, as the inverse reads it. Records the fold
-    /// already took are passed over; a gap stops the fold.
-    pub fn take(&mut self, records: &[(u64, Record)], parts: &dyn Parts) {
-        if self.broken().is_some() {
+    /// Whether the session feeds its media to the index yet (see [`SessionIndex::open`]).
+    pub fn opened(&self) -> bool {
+        !matches!(self.phase, Phase::Unopened)
+    }
+
+    /// Has the index built once from the session's records through `through`, dropping what it
+    /// holds, as an open that finds no saved index does: a test holds that build to hold a run's
+    /// wait for its media.
+    #[cfg(test)]
+    pub(crate) fn build_from_records(&mut self, through: u64) {
+        let mut slot = self.slot();
+        slot.index = None;
+        slot.current = false;
+        drop(slot);
+        self.phase = Phase::Unbuilt {
+            through,
+            feeds: Vec::new(),
+        };
+    }
+
+    /// Whether the index waits to be built from the session's records.
+    pub fn unbuilt(&self) -> bool {
+        matches!(self.phase, Phase::Unbuilt { .. })
+    }
+
+    /// Whether the index applied everything the session handed over, so runs can read it.
+    pub fn ready(&self) -> bool {
+        matches!(self.phase, Phase::Current)
+    }
+
+    /// Starts feeding `session`'s media to the index, from what its open hands back: the saved
+    /// index and what the open log's records after it handed over, or, when no saved index
+    /// carries the session, a build from its records still to come. A change gets the index to
+    /// save from here on. Runs once; later calls do nothing.
+    pub async fn open<B: SessionBackend>(&mut self, session: &mut Session<B>, parts: &dyn Parts) {
+        if !matches!(self.phase, Phase::Unopened) {
             return;
         }
-        if let Err(reason) = self.try_take(records, parts) {
-            self.stop(reason);
+        let unseen = session.next_seq() != self.next_at_start;
+        let loaded = session.feed_media().await;
+        self.install_source(session);
+        let last = session.next_seq().saturating_sub(1);
+        let loaded = match loaded {
+            Ok(loaded) if !unseen => loaded,
+            // A failed read of the saved index, or records appended before the session fed its
+            // media: build from every record so far.
+            _ => {
+                self.phase = Phase::Unbuilt {
+                    through: last,
+                    feeds: Vec::new(),
+                };
+                return;
+            }
+        };
+        let LoadedMedia {
+            saved,
+            through,
+            feed,
+        } = loaded;
+        let start = match saved {
+            SavedIndex::NoCapture => Some(None),
+            SavedIndex::Saved(stored) => self.index_of_stored(&stored).ok().map(Some),
+            SavedIndex::NotSaved
+            | SavedIndex::Missing(_)
+            | SavedIndex::Damaged(_)
+            | SavedIndex::UnknownVersion(_) => None,
+        };
+        match start {
+            Some(index) => {
+                self.slot().index = index.map(Arc::new);
+                self.phase = Phase::Current;
+                self.apply(feed, last, parts);
+            }
+            None => {
+                self.phase = Phase::Unbuilt {
+                    through,
+                    feeds: vec![feed],
+                }
+            }
         }
     }
 
-    fn try_take(&mut self, records: &[(u64, Record)], parts: &dyn Parts) -> Result<(), String> {
-        let next = self.inverse.next_seq();
-        let fresh: Vec<&(u64, Record)> = records.iter().filter(|(seq, _)| *seq >= next).collect();
-        let Some((first, _)) = fresh.first() else {
-            return Ok(());
-        };
-        if fresh
-            .iter()
-            .enumerate()
-            .any(|(index, (seq, _))| *seq != first + index as u64)
-            || *first != next
-        {
-            return Err(format!(
-                "the session's media fold expected record {next} and was given records from {first}"
-            ));
-        }
-        let batch: Vec<Record> = fresh.iter().map(|(_, record)| record.clone()).collect();
-        let rebuilt = self
-            .inverse
-            .push(*first, &batch, &|part| {
-                broca_session_loop::parts::value(parts, part)
-            })
-            .map_err(|error| {
-                format!("the session's media fold can't rebuild today's records: {error}")
-            })?;
-        let mut shared = self
-            .shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (_, record) in &fresh {
-            for (sha256, object) in broca_session_store::session::record_objects(record) {
-                shared.objects.entry(sha256).or_insert(object);
+    /// Gives `session`'s changes the index to save: the index as it stands, when it applied
+    /// every record the change seals.
+    fn install_source<B: SessionBackend>(&self, session: &mut Session<B>) {
+        let slot = Arc::clone(&self.slot);
+        let objects = Arc::clone(&self.objects);
+        session.set_media_index_source(Box::new(move || {
+            let slot = locked(&slot);
+            if !slot.current || slot.broken.is_some() {
+                return None;
             }
+            let index = slot.index.as_ref()?;
+            let objects: Vec<(String, MediaObject)> = locked(&objects)
+                .iter()
+                .map(|(digest, object)| (digest.clone(), object.clone()))
+                .collect();
+            Some(MediaIndexSave {
+                index: to_stored(index, &objects),
+                through: slot.through,
+            })
+        }));
+    }
+
+    /// The engine's index a saved one holds, with where its media are stored.
+    fn index_of_stored(&self, stored: &StoredMediaIndex) -> Result<MediaIndex, String> {
+        let stored = broca_session_loop::media_index::from_stored(stored)?;
+        let session = SessionMedia::from_index_state(stored.media, Arc::clone(&self.bytes))?;
+        let aging = MediaAging::from_state(stored.aging)?;
+        let profile = stored.limits.as_ref().map(media_profile).transpose()?;
+        let mut objects = locked(&self.objects);
+        for (digest, object) in stored.objects {
+            objects.entry(digest).or_insert(object);
         }
-        for mut value in rebuilt {
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("run_started") {
-                if let Some(object) = value.as_object_mut() {
-                    object.insert(
-                        "session".into(),
-                        serde_json::to_value(&self.session).map_err(|error| error.to_string())?,
-                    );
+        Ok(MediaIndex::new(session, aging, profile, stored.step_open))
+    }
+
+    /// Takes what `session`'s writes handed over since the last take, and applies it unless
+    /// the index waits to be built.
+    pub fn absorb<B: SessionBackend>(&mut self, session: &mut Session<B>, parts: &dyn Parts) {
+        let feed = session.take_media();
+        let last = session.next_seq().saturating_sub(1);
+        match &mut self.phase {
+            Phase::Unopened => {}
+            Phase::Current => self.apply(feed, last, parts),
+            Phase::Unbuilt { feeds, .. } | Phase::Building { feeds } => {
+                if !feed.is_empty() {
+                    feeds.push(feed);
                 }
             }
-            let record: WalRecord = serde_json::from_value(value).map_err(|error| {
-                format!("the session's media fold rebuilt a record today's log can't hold: {error}")
-            })?;
-            let seq = self.seed.at_seq() + 1;
-            self.seed.fold(seq, &record).map_err(|error| {
-                format!("the session's media fold refused record {seq}: {error}")
-            })?;
-            if shared.reading {
-                shared.frames.push(FramedRecord {
-                    seq,
-                    fence: 0,
-                    record,
-                });
+        }
+    }
+
+    /// Applies `feed`, which the records through `last` handed over after those the index
+    /// applied. A feed the index can't take breaks it.
+    fn apply(&mut self, feed: MediaFeed, last: u64, parts: &dyn Parts) {
+        {
+            let mut objects = locked(&self.objects);
+            for (digest, object) in &feed.objects {
+                objects
+                    .entry(digest.clone())
+                    .or_insert_with(|| object.clone());
             }
+        }
+        let mut slot = self.slot();
+        slot.through = last;
+        slot.current = true;
+        if slot.broken.is_some() {
+            return;
+        }
+        if let Err(reason) = self.apply_to(&mut slot, feed, parts) {
+            slot.broken = Some(reason);
+        }
+    }
+
+    fn apply_to(&self, slot: &mut Slot, feed: MediaFeed, parts: &dyn Parts) -> Result<(), String> {
+        if let Some(seq) = feed.needs_saved_index {
+            return Err(format!(
+                "the session's record {seq} is of the first compaction protocol, whose effect on \
+                 media only a saved media index carries, and the session has none"
+            ));
+        }
+        if let Some(start) = &feed.start {
+            // The session's first capture, or its first since its index held no media.
+            slot.index = Some(Arc::new(self.index_of_scalars(start, parts)?));
+        }
+        let mut cut = false;
+        for item in feed.items {
+            let event = match item {
+                MediaItem::Event(event) => event,
+                MediaItem::RunStart(run) => {
+                    let limits = limits_of(parts, &run.render_config)?;
+                    run.with_limits(limits)
+                }
+            };
+            let index = slot.index.as_mut().ok_or_else(|| {
+                "the session's media events came before its first capture".to_owned()
+            })?;
+            Arc::make_mut(index).apply(&event)?;
+            cut |= matches!(event, MediaEvent::Truncated { .. });
+        }
+        if cut {
+            // A cut may have removed the records that named where some bytes are; a later
+            // record naming the same media names them again.
+            let held: BTreeSet<String> = slot
+                .index
+                .as_ref()
+                .map(|index| {
+                    index
+                        .session()
+                        .facts()
+                        .captures
+                        .into_iter()
+                        .map(|capture| capture.reference.sha256)
+                        .collect()
+                })
+                .unwrap_or_default();
+            locked(&self.objects).retain(|digest, _| held.contains(digest));
         }
         Ok(())
     }
 
-    /// The records of `session` the fold hasn't taken in yet, in seq order. A read that fails
-    /// stops the fold.
-    pub async fn unread<B: SessionBackend>(&self, session: &Session<B>) -> Vec<(u64, Record)> {
-        let last = session.next_seq().saturating_sub(1);
-        let next = self.next_seq();
-        if self.broken().is_some() || next > last {
-            return Vec::new();
-        }
-        session
-            .records_between(next, last)
-            .await
-            .unwrap_or_else(|error| {
-                self.stop(format!(
-                "the session's media fold couldn't read records {next} through {last}: {error:?}"
-            ));
-                Vec::new()
-            })
-    }
-
-    /// Brings the fold up to `session`'s last record.
-    pub async fn catch_up<B: SessionBackend>(&mut self, session: &Session<B>, parts: &dyn Parts) {
-        let unread = self.unread(session).await;
-        self.take(&unread, parts);
-    }
-
-    /// Takes in `records`, which the session's writer just appended from seq `first` on, and
-    /// before them whatever the actor appended since the fold last took anything (a steer, a
-    /// queued send). Those come from the records the writer keeps in memory from its latest run's
-    /// start on, so taking an append never reads the open log. A fold behind what the writer
-    /// keeps would have missed records outside the run; it never should be, and stops, naming
-    /// the gap, rather than read the log.
-    pub fn take_appended<B: SessionBackend>(
-        &mut self,
-        session: &Session<B>,
-        first: u64,
-        records: &[Record],
+    /// The index the session's first capture creates, from the scalars it kept until then.
+    fn index_of_scalars(
+        &self,
+        start: &MediaStart,
         parts: &dyn Parts,
-    ) {
-        if self.broken().is_some() {
-            return;
+    ) -> Result<MediaIndex, String> {
+        let limits = match &start.limits {
+            LimitsSource::Known(limits) => limits.clone(),
+            LimitsSource::Part(part) => limits_of(parts, part)?,
+        };
+        let stored = StoredMediaIndex {
+            steps: start.steps,
+            last_step: start.last_step.map(|step| step.0),
+            step_open: start.step_open,
+            batch: start.batch.clone(),
+            limits: limits.map(|limits| limits.0),
+            ..StoredMediaIndex::default()
+        };
+        self.index_of_stored(&stored)
+    }
+
+    /// Starts the one-time build, when the index waits for one: what the session handed over
+    /// through the build's seq, read from its records over `records` by `build` (on a blocking
+    /// thread). Returns the seq to build through, or `None` when no build is due.
+    pub fn start_build(&mut self) -> Option<u64> {
+        if !self.unbuilt() {
+            return None;
         }
-        let next = self.next_seq();
-        if next < first {
-            match session.kept_from(next) {
-                Some(kept) => {
-                    let before: Vec<(u64, Record)> = kept
-                        .into_iter()
-                        .take_while(|(seq, _)| *seq < first)
-                        .collect();
-                    self.take(&before, parts);
-                }
-                None => {
-                    self.stop(format!(
-                        "the session's media fold expected record {next}, which its writer no                          longer keeps, before the records appended from {first}"
-                    ));
-                    return;
+        let Phase::Unbuilt { through, feeds } = std::mem::replace(&mut self.phase, Phase::Unopened)
+        else {
+            unreachable!("checked above")
+        };
+        self.phase = Phase::Building { feeds };
+        Some(through)
+    }
+
+    /// Takes in what the one-time build ended with: the index built from it, then what the
+    /// session handed over meanwhile, in order.
+    pub fn built(&mut self, history: Result<MediaFeed, String>, last: u64, parts: &dyn Parts) {
+        let feeds = match std::mem::replace(&mut self.phase, Phase::Current) {
+            Phase::Building { feeds } => feeds,
+            other => {
+                self.phase = other;
+                return;
+            }
+        };
+        match history {
+            Ok(history) => {
+                self.slot().index = None;
+                self.apply(history, last, parts);
+                for feed in feeds {
+                    self.apply(feed, last, parts);
                 }
             }
-        }
-        let appended: Vec<(u64, Record)> = (first..).zip(records.iter().cloned()).collect();
-        self.take(&appended, parts);
-    }
-
-    /// What a run starting now renders its media from: the seed through the session's records
-    /// taken so far, and from here on the records the fold takes in. `bytes` reads the session's
-    /// media objects, when the actor can read them apart from its writer.
-    pub fn for_run(&self, bytes: Option<Arc<dyn MediaBytes>>) -> StoreRunMedia {
-        let mut shared = self.shared();
-        // Records taken before this run are in its seed; a run before it read what it needed.
-        shared.frames.clear();
-        shared.reading = true;
-        StoreRunMedia {
-            seed: match &shared.broken {
-                Some(reason) => Err(reason.clone()),
-                None => Ok(self.seed.seed()),
-            },
-            shared: Arc::clone(&self.shared),
-            bytes,
+            Err(reason) => {
+                let mut slot = self.slot();
+                slot.through = last;
+                slot.current = true;
+                slot.broken.get_or_insert(reason);
+            }
         }
     }
 
-    /// The byte source a run reads this session's media through, over `reader`.
-    pub fn bytes<R: SessionBackend + Send + Sync + 'static>(
+    /// What a run renders its media from: the index as it stands at each render.
+    pub fn for_run(&self) -> RunMedia {
+        RunMedia {
+            slot: Arc::clone(&self.slot),
+            unreadable: self.unreadable.clone(),
+        }
+    }
+
+    /// The index as it stands, once the session captured a medium.
+    pub fn index(&self) -> Option<Arc<MediaIndex>> {
+        self.slot().index.clone()
+    }
+
+    /// The saved form of the index as it stands, with where its media are stored.
+    pub fn stored(&self) -> Option<StoredMediaIndex> {
+        let objects: Vec<(String, MediaObject)> = locked(&self.objects)
+            .iter()
+            .map(|(digest, object)| (digest.clone(), object.clone()))
+            .collect();
+        self.index().map(|index| to_stored(&index, &objects))
+    }
+}
+
+/// `index` as the session saves it.
+fn to_stored(index: &MediaIndex, objects: &[(String, MediaObject)]) -> StoredMediaIndex {
+    let limits = index
+        .profile()
+        .and_then(|profile| serde_json::to_value(profile).ok())
+        .map(MediaLimits);
+    broca_session_loop::media_index::to_stored(
+        index.session(),
+        index.aging(),
+        limits.as_ref(),
+        index.step_open(),
+        objects,
+    )
+}
+
+/// The media limits in the render config setup part `part` holds, read through the setup parts
+/// every holder shares, so a config already decoded isn't decoded again.
+fn limits_of(parts: &dyn Parts, part: &PartRef) -> Result<Option<MediaLimits>, String> {
+    let config = broca_session_loop::parts::shared::<serde_json::Value, _>(parts, part)
+        .map_err(|error| format!("the run's render config can't be read: {error}"))?;
+    Ok(limits_in(&config))
+}
+
+/// What a run of a session in the new storage renders its media from: the actor's index, read
+/// as it stands at each render. A cache warm that renders a recorded request again, to resend
+/// its prefix, reads the same index through a clone of this.
+#[derive(Clone)]
+pub struct RunMedia {
+    slot: Arc<Mutex<Slot>>,
+    unreadable: Option<String>,
+}
+
+impl RunMedia {
+    /// Media that can't be had, for `reason`: a request naming media is refused with it.
+    pub fn unavailable(reason: String) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(Slot {
+                broken: Some(reason),
+                ..Slot::default()
+            })),
+            unreadable: None,
+        }
+    }
+
+    /// The request body for `opts` under the frozen render config `config`. A prompt naming no
+    /// media renders as it always does. One naming media renders from the index as it stands,
+    /// or is refused by name when the index can't be had.
+    pub fn render(
         &self,
-        reader: MediaObjects<R>,
-    ) -> Arc<dyn MediaBytes> {
-        Arc::new(StoreMediaBytes {
-            shared: Arc::clone(&self.shared),
-            reader: std::panic::AssertUnwindSafe(reader),
+        config: &serde_json::Value,
+        opts: &broca_protocol::request::CallOptions,
+        render_tags: bool,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
+        let (index, broken) = {
+            let slot = locked(&self.slot);
+            (slot.index.clone(), slot.broken.clone())
+        };
+        let refused = broken.or_else(|| self.unreadable.clone()).or_else(|| {
+            index
+                .is_none()
+                .then(|| "the session has captured no media to render".to_owned())
+        });
+        match (refused, index) {
+            (None, Some(index)) => {
+                index.render_with_provenance(config, opts, render_tags, provenance)
+            }
+            (reason, _) => broca_provider::media_request::render_without_index(
+                config,
+                opts,
+                provenance,
+                "store_media_unavailable",
+                reason.as_deref().unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// [`RunMedia::render`] as the provider's media renderer. Whether the render commits its
+    /// aging doesn't matter: a render writes nothing back.
+    pub fn renderer(&self) -> Arc<broca_core::provider::MediaRequestRenderer> {
+        let media = self.clone();
+        Arc::new(move |config, opts, tags, _commit, provenance| {
+            media.render(config, opts, tags, provenance)
         })
     }
 }
 
-/// What a run of a session in the new storage renders its media from, handed to the executor
-/// with the run (see [`MediaFold::for_run`]).
-pub struct StoreRunMedia {
-    seed: Result<MediaCheckpoint, String>,
-    shared: Arc<Mutex<Shared>>,
-    bytes: Option<Arc<dyn MediaBytes>>,
-}
+/// How a run gets its [`RunMedia`]: the actor sends it once the session's index is built, which
+/// on the session's first run after an open without a saved index may take seconds. The actor
+/// keeps answering commands meanwhile.
+pub type StoreRunMediaWait = tokio::sync::oneshot::Receiver<RunMedia>;
 
-/// How a run gets its [`StoreRunMedia`]: the actor sends it once the session's media fold is
-/// ready, which on the session's first run may take seconds while the fold is built from the
-/// session's records. The actor keeps answering commands meanwhile.
-pub type StoreRunMediaWait = tokio::sync::oneshot::Receiver<StoreRunMedia>;
-
-/// Builds a run's renderer from what [`StoreRunMedia::renderer_inputs`] gives: the executor's
-/// `LiveMedia` over that byte source, seed and tail reader.
-pub type BuildRenderer = dyn FnOnce(
-        Arc<dyn MediaBytes>,
-        MediaCheckpoint,
-        Box<ReadTail>,
-    ) -> Result<Arc<broca_core::provider::MediaRequestRenderer>, String>
-    + Send;
+/// Builds a run's renderer over the run's media (see [`RunMedia::renderer`]).
+pub type BuildRenderer =
+    dyn FnOnce(RunMedia) -> Result<Arc<broca_core::provider::MediaRequestRenderer>, String> + Send;
 
 /// A store run's media renderer, installed on the provider when the run is admitted and ready
-/// once the session's media fold is: each model call first waits for it (as the run's
+/// once the session's index is: each model call first waits for it (as the run's
 /// `ModelCallReady`), so a run renders no request before its media can be rendered, and a
-/// cancel ends the wait. When the fold can't be had, the renderer is built over no captures and
-/// a record reader that fails naming why: a request holding no media renders as it always does,
-/// and one holding media is refused by name, never sent without them.
+/// cancel ends the wait. When the index can't be had, the renderer is built over media that
+/// can't: a request holding no media renders as it always does, and one holding media is
+/// refused by name, never sent without them.
 pub struct LazyRenderer {
     wait: tokio::sync::Mutex<Option<(StoreRunMediaWait, Box<BuildRenderer>)>>,
     ready: std::sync::OnceLock<Result<Arc<broca_core::provider::MediaRequestRenderer>, String>>,
@@ -349,81 +591,23 @@ impl broca_session_loop::run::ModelCallReady for LazyRenderer {
         if self.ready.get().is_none() {
             let mut wait = self.wait.lock().await;
             if let Some((media, build)) = wait.take() {
-                let inputs = match media.await {
-                    Ok(media) => media.renderer_inputs(),
-                    Err(_) => Err("the session's media fold ended before it was ready".into()),
-                };
-                let built = match inputs {
-                    Ok((bytes, seed, tail)) => build(bytes, seed, tail),
-                    Err(reason) => {
-                        let unreadable = reason.clone();
-                        build(
-                            Arc::new(Unavailable(reason.clone())),
-                            MediaCheckpoint::empty(),
-                            Box::new(move |_| Err(unreadable.clone())),
-                        )
-                    }
-                };
-                let _ = self.ready.set(built);
+                let media = media.await.unwrap_or_else(|_| {
+                    RunMedia::unavailable(
+                        "the session's media index ended before it was ready".into(),
+                    )
+                });
+                let _ = self.ready.set(build(media));
             }
         }
         match self.ready.get() {
             Some(Ok(_)) => Ok(()),
             Some(Err(reason)) => Err(refusal(reason.clone())),
-            None => Err(refusal("the session's media fold was never ready".into())),
+            None => Err(refusal("the session's media index was never ready".into())),
         }
     }
 }
 
-/// The records rebuilt after a run's seed, from the seq after the one given through the latest
-/// the actor took in: the reader `LiveMedia` folds before each request it renders.
-pub type ReadTail = dyn Fn(u64) -> Result<Vec<FramedRecord>, String> + Send + Sync;
-
-/// What a run's `LiveMedia` is built from: the byte source, the seed and the tail reader.
-pub type RendererInputs = (Arc<dyn MediaBytes>, MediaCheckpoint, Box<ReadTail>);
-
-impl StoreRunMedia {
-    /// A fixed view for rebuilding a recorded request. Its tail reader must not discard records
-    /// the live run's independent renderer still needs.
-    pub(crate) fn snapshot(&self) -> Self {
-        Self {
-            seed: self.seed.clone(),
-            shared: Arc::new(Mutex::new(self.shared.lock().unwrap().clone())),
-            bytes: self.bytes.clone(),
-        }
-    }
-
-    /// The byte source, the seed and the tail reader a run's `LiveMedia` is built from, or why
-    /// the run can't render media.
-    pub fn renderer_inputs(self) -> Result<RendererInputs, String> {
-        let seed = self.seed?;
-        let bytes = self.bytes.ok_or_else(|| {
-            "the session's media objects can't be read apart from its writer, so its media \
-             can't be rendered"
-                .to_owned()
-        })?;
-        let shared = self.shared;
-        let read_tail = Box::new(move |after: u64| -> Result<Vec<FramedRecord>, String> {
-            let mut shared = shared
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(reason) = &shared.broken {
-                return Err(reason.clone());
-            }
-            shared.frames.retain(|frame| frame.seq > after);
-            match shared.frames.first() {
-                Some(frame) if frame.seq != after + 1 => Err(format!(
-                    "the session's media records after {after} start at {}",
-                    frame.seq
-                )),
-                _ => Ok(shared.frames.clone()),
-            }
-        });
-        Ok((bytes, seed, read_tail))
-    }
-}
-
-/// The byte source of a run whose session's media fold can't be had: every read refuses.
+/// The byte source of an index whose session's media objects can't be read: every read refuses.
 #[derive(Debug)]
 struct Unavailable(String);
 
@@ -439,7 +623,7 @@ impl MediaBytes for Unavailable {
 /// A session's media objects as a render reads them: by the object the session's records name
 /// for the digest, checked against the reference.
 struct StoreMediaBytes<R> {
-    shared: Arc<Mutex<Shared>>,
+    objects: Objects,
     /// Only reads: a read that panics leaves the storage handle as it found it.
     reader: std::panic::AssertUnwindSafe<MediaObjects<R>>,
 }
@@ -454,11 +638,7 @@ impl<R: SessionBackend + Send + Sync> MediaBytes for StoreMediaBytes<R> {
     fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
         use futures::FutureExt as _;
         let digest = || reference.sha256.clone();
-        let object = self
-            .shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .objects
+        let object = locked(&self.objects)
             .get(&reference.sha256)
             .cloned()
             .ok_or_else(|| MediaReadError::Missing(digest()))?;
@@ -485,39 +665,22 @@ impl<R: SessionBackend + Send + Sync> MediaBytes for StoreMediaBytes<R> {
 
 /// The session's writer as the actor serves a run's requests with it. Each append stores the
 /// bytes of the tool media the run captured for the results it appends (see `PendingMedia`),
-/// and the session's media fold takes in everything appended before the run hears its append
-/// went through, so the run's next request can render what it appended.
+/// and the session's index applies what every write handed over before the run hears its write
+/// went through, so the run's next request can render what it wrote.
 pub struct RunAppends<'a, B: SessionBackend> {
     pub session: &'a mut Session<B>,
     /// The media the run's tool calls captured that no record stores yet.
     pub tool_media: &'a broca_session_loop::PendingMedia,
-    /// The session's media fold, once a run started that may render media.
-    pub fold: Option<&'a mut MediaFold>,
-    /// The setup parts a rebuilt run start reads its render config from.
+    /// The session's image index.
+    pub index: &'a mut SessionIndex,
+    /// The setup parts a run start's media limits are read from.
     pub parts: &'a dyn Parts,
 }
 
 impl<B: SessionBackend> RunAppends<'_, B> {
-    /// After a seal moved the ledger out of the open log: the fold reads the records it hasn't
-    /// taken in yet, which include those the seal wrote to start the new log.
-    async fn caught_up<T>(&mut self, result: Result<T, SessionError>) -> Result<T, SessionError> {
-        if result.is_ok() {
-            if let Some(fold) = self.fold.as_deref_mut() {
-                fold.catch_up(&*self.session, self.parts).await;
-            }
-        }
-        result
-    }
-
-    /// After an append: the fold takes the records as appended (see
-    /// [`MediaFold::take_appended`]).
-    fn took(
-        &mut self,
-        result: Result<(u64, Vec<Record>), SessionError>,
-    ) -> Result<(u64, Vec<Record>), SessionError> {
-        if let (Ok((first, records)), Some(fold)) = (&result, self.fold.as_deref_mut()) {
-            fold.take_appended(&*self.session, *first, records, self.parts);
-        }
+    /// After a write: the index applies what it handed over, a seal's carried records included.
+    fn took<T>(&mut self, result: Result<T, SessionError>) -> Result<T, SessionError> {
+        self.index.absorb(&mut *self.session, self.parts);
         result
     }
 }
@@ -604,7 +767,7 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         broca_session_loop::Writer::enrollment(&*self.session).await
     }
 
-    // Stores an object, not records: the media fold has nothing to catch up on.
+    // Stores an object, not records: nothing is handed over.
     async fn put_enrollment(
         &mut self,
         entries: &broca_session_store::record::EnrolledEntries,
@@ -635,7 +798,7 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         let sealed =
             broca_session_loop::Writer::seal_at_entry(&mut *self.session, ordinal, carry, now_ms)
                 .await;
-        self.caught_up(sealed).await
+        self.took(sealed)
     }
 
     async fn seal_ledger(
@@ -645,7 +808,7 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
     ) -> Result<(), SessionError> {
         let sealed =
             broca_session_loop::Writer::seal_ledger(&mut *self.session, carry, now_ms).await;
-        self.caught_up(sealed).await
+        self.took(sealed)
     }
 
     async fn entry_by_mid(
@@ -678,7 +841,7 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
 
 /// The request a run of `session` sends for its step `step_id`, built offline: the prompt as the
 /// run loop builds it for a provider that renders media (`offline_media_request`), rendered
-/// through a media fold of every record of `session` and its own media objects, read over
+/// through an index built from every record of `session` and its own media objects, read over
 /// `reader`, under `frozen` with `max_output_tokens` as the step's cap. For checking a session in
 /// the new storage against the request today's storage renders for it.
 #[allow(clippy::too_many_arguments)]
@@ -702,23 +865,24 @@ where
     if let Some(context) = opts.step_context.as_mut() {
         context.max_output_tokens = max_output_tokens;
     }
-    let mut fold = MediaFold::new(bind.clone());
-    fold.catch_up(session, parts).await;
-    let bytes = fold.bytes(session.media_objects(reader));
-    let (bytes, seed, read_tail) = fold.for_run(Some(bytes)).renderer_inputs()?;
-    let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-        bytes,
-        seed,
-        None,
-        frozen.media.clone(),
-        read_tail,
-    )?;
+    let last = session.next_seq().saturating_sub(1);
+    let history = session
+        .media_history(last)
+        .await
+        .map_err(|error| format!("fold the session's media: {error:?}"))?;
+    let mut index = SessionIndex::new(session, Some(reader));
+    index.phase = Phase::Building { feeds: Vec::new() };
+    index.built(Ok(history), last, parts);
+    if let Some(reason) = index.broken() {
+        return Err(reason);
+    }
     let config = serde_json::to_value(&*frozen.for_step(&opts))
         .map_err(|error| format!("encode the frozen render config: {error}"))?;
     // As the transport hands a request to its media renderer: the frozen config with the step's
-    // cap applied, the run's tag choice, and the render's media aging committed.
-    media
-        .render(&config, &opts, render_tags, true)
+    // cap applied, and the run's tag choice.
+    index
+        .for_run()
+        .render(&config, &opts, render_tags, None)
         .map_err(|error| {
             format!(
                 "the media renderer refused: {}",

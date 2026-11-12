@@ -239,8 +239,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             // A quota query may outlast the prefix it was meant to protect.
             self.idle_warm_due().await.map_err(unavailable)?;
             let mut media = Some(self.run_media().await);
-            let renderer =
-                super::recorded_warm::media(&mut media, &request.config).map_err(unavailable)?;
+            let renderer = super::recorded_warm::media(&mut media).map_err(unavailable)?;
             return Ok(Prepared {
                 run_id: request.run_id.0.clone(),
                 step_id: request.step_id.0,

@@ -641,7 +641,7 @@ fn delivered_messages_rebuild_after_staging(mode: &str) {
             json!({"type": "run_finished", "reason": "completed", "usage": {}, "retries_used": 0}),
         ),
     ]);
-    let staged = staged(&root, &records, None);
+    staged(&root, &records, None);
     let staging = root.join("session-store/staging/store-move-test");
     let view = block_on(Session::view(
         LocalBackend::new(&staging),
@@ -650,15 +650,11 @@ fn delivered_messages_rebuild_after_staging(mode: &str) {
         &deployment(),
     ))
     .unwrap();
-    let parts = broca_session_loop::parts::MemoryParts {
-        parts: staged.converted.parts,
-    };
-    let mut fold = broca_module::store_media::MediaFold::new(session());
-    block_on(fold.catch_up(&view, &parts));
-    assert_eq!(
-        fold.broken(),
-        None,
-        "the stored receipt must name its delivery"
+    let last = view.next_seq() - 1;
+    let history = block_on(view.media_history(last));
+    assert!(
+        history.is_ok(),
+        "the stored session must fold for media: {history:?}"
     );
     drop(view);
     std::fs::remove_dir_all(root).unwrap();

@@ -592,6 +592,70 @@ pub(super) fn recovery_commit(fold: Option<MediaFold>, intent_seq: u64) -> Media
     }
 }
 
+/// What the media fold hands over for every record of the session from its first through
+/// `through`, each folded with the store's folds as they stood before it: the input of a
+/// one-time build of the image engine's index for a session whose checkpoint saves no index
+/// that carries it to `through` (see [`SavedIndex`]). What the open log's later records handed
+/// over follows it.
+///
+/// Every record is read once and folded in seq order. The conversation folds on across seals,
+/// which gives the ordinals and the waiting assistant message the session's writers saw. A
+/// seal's intent leaves the operational fold closed: the records after it are the next log's,
+/// whose writer started from that log's checkpoint, so the operational state is taken from it.
+///
+/// When those records hold no capture, the feed's `start` is the scalars the fold ends with: a
+/// log whose checkpoint saved no fold state hands over every fact after it, as for a session
+/// that captured something, so the index those facts apply to starts from these.
+async fn media_history_in<B: SessionBackend>(
+    place: &super::stored::Place<'_, B>,
+    through: u64,
+) -> Result<MediaFeed, SessionError> {
+    let mut feed = MediaFeed::default();
+    let mut fold = MediaFold::default();
+    let mut conversation = super::stored::first_log_checkpoint(place.head).conversation;
+    let mut operations = Operations::default();
+    let records = match through {
+        0 => Vec::new(),
+        through => place.records_between(1, through).await?,
+    };
+    for (seq, record) in &records {
+        if operations.open_change.is_some() && !matches!(record, Record::ChangeAborted(_)) {
+            operations = super::stored::from_log_holding(place, *seq, *seq)
+                .await?
+                .checkpoint
+                .operational;
+        }
+        fold.apply(*seq, record, &conversation, &operations, &mut feed);
+        super::apply(&mut conversation, &mut operations, *seq, record).map_err(|error| {
+            SessionError::Fold(format!("record {seq} ({}): {error}", record.name()))
+        })?;
+    }
+    fold.flush(&mut feed);
+    if !fold.has_captured() {
+        feed.start = Some(fold.start(&operations));
+    }
+    Ok(feed)
+}
+
+impl<R: SessionBackend> super::StoredRecords<R> {
+    /// What the media fold hands over for every record of the session from its first through
+    /// `through` (see [`Session::media_history`]).
+    pub async fn media_history(&self, through: u64) -> Result<MediaFeed, SessionError> {
+        media_history_in(&self.place(), through).await
+    }
+}
+
+impl<B: SessionBackend> Session<B> {
+    /// What the media fold hands over for every record of the session from its first through
+    /// `through`, folded as the session's writers folded them: the input of a one-time build of
+    /// the image engine's index. A log whose checkpoint saved no fold state hands over every
+    /// fact after it, so when the records hold no capture the feed's `start` is the scalars the
+    /// fold ends with, for the index those facts apply to.
+    pub async fn media_history(&self, through: u64) -> Result<MediaFeed, SessionError> {
+        media_history_in(&self.place(), through).await
+    }
+}
+
 impl<B: SessionBackend> Session<B> {
     /// Loads the session as [`Session::load`] does, and starts feeding its media (see
     /// [`Session::feed_media`]).

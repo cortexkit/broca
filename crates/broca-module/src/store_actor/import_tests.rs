@@ -695,6 +695,58 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
     assert_eq!(mids.len(), all, "a message id repeats");
 }
 
+/// An import's seeded run is a run start whose inputs are the imported messages in order: the
+/// image of the imported user message is a person's, at that message's place (ordinal 0), and a
+/// later request renders it with its bytes.
+#[tokio::test]
+async fn an_imported_image_is_a_persons_at_its_place_and_renders_with_its_bytes() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::new("media");
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    drop(commands);
+    served.await.unwrap().close().await.unwrap();
+
+    let mut session = load(backend).await.unwrap();
+    let mut index = crate::store_media::SessionIndex::new(&session, Some(backend));
+    index.open(&mut session, &MemoryParts::default()).await;
+    assert!(index.ready(), "the import needs no build");
+    let captures = index
+        .index()
+        .expect("the import captured its image")
+        .session()
+        .facts()
+        .captures;
+    assert_eq!(captures.len(), 1, "{captures:?}");
+    assert!(
+        captures[0].person,
+        "an imported user message's image is a person's"
+    );
+    assert_eq!(captures[0].ordinal, Some(0));
+    assert_eq!(captures[0].tool_call, None);
+
+    let mut config = broca_provider::families::frozen_config_for_family(
+        broca_provider::spec::WireFamilyId::AnthropicMessages,
+        "m",
+    );
+    config.media = Some(broca_provider::media_profile::select_media_profile(
+        broca_provider::spec::WireFamilyId::AnthropicMessages,
+        Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+        "m",
+        broca_provider::spec::InputModalities::from_value(&serde_json::json!(["text", "image"])),
+        Some(200_000),
+    ));
+    let opts: broca_protocol::request::CallOptions =
+        serde_json::from_value(serde_json::json!({ "prompt": session.conversation.messages }))
+            .unwrap();
+    let body = index
+        .for_run()
+        .render(&serde_json::to_value(config).unwrap(), &opts, false, None)
+        .unwrap();
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains(PNG), "{body}");
+}
+
 /// Through the registry: an import creates its session in the new storage, never on today's,
 /// and a retry is answered from it; with the new storage off, an import is refused by name.
 #[tokio::test]

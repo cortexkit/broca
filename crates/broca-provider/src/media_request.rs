@@ -18,7 +18,9 @@ use broca_protocol::{
 
 use crate::media_profile::{MediaCarrier, MediaProfile};
 
+mod index;
 mod live;
+pub use index::{media_profile, render_without_index, MediaIndex};
 pub use live::LiveMedia;
 
 /// An occurrence in the assembled prompt. Replacement messages can repeat a captured reference;

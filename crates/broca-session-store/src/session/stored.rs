@@ -235,7 +235,7 @@ impl<B: SessionBackend> Session<B> {
 }
 
 impl<R: SessionBackend> StoredRecords<R> {
-    fn place(&self) -> Place<'_, R> {
+    pub(super) fn place(&self) -> Place<'_, R> {
         Place {
             backend: &self.backend,
             addr: &self.addr,

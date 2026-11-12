@@ -354,6 +354,18 @@ impl MediaFold {
         }
     }
 
+    /// The scalars this fold keeps, as the start of an index created from them, with the media
+    /// limits of the latest run in `operations`.
+    pub fn start(&self, operations: &Operations) -> MediaStart {
+        MediaStart {
+            steps: self.steps,
+            last_step: self.last_step.map(StepId),
+            step_open: self.step_open,
+            batch: self.batch.clone(),
+            limits: run_limits(operations),
+        }
+    }
+
     /// Whether the session has captured a medium, so that every fact is handed over.
     pub fn has_captured(&self) -> bool {
         self.captured.is_some()
