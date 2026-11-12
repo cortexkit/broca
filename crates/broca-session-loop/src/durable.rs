@@ -155,6 +155,10 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.message_id_prefix()
     }
 
+    fn message_ids(&self) -> Option<crate::entries::MessageIds> {
+        self.writer.message_ids()
+    }
+
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         self.writer.open_log_records().await
     }

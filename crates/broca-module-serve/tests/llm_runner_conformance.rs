@@ -4819,7 +4819,7 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 105);
+    assert_eq!(cases.len(), 109);
     check_0821_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [

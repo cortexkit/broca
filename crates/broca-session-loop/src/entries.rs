@@ -13,6 +13,10 @@
 //!   view the step rendered with.
 //! - **Time:** the message's own time, else the nearest earlier entry's.
 
+#[cfg(test)]
+#[path = "entries/message_ids_tests.rs"]
+mod message_ids_tests;
+
 use std::collections::HashMap;
 
 use broca_core::compaction_v2::metadata::{numbered_parts, step_usage};
@@ -300,6 +304,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.learn_open_calls().await?;
         let tags = self.facts;
         let prefix = self.inner.message_id_prefix();
+        let message_ids = self.inner.message_ids();
         let session = self.inner.session_id();
         let mut failure = None;
         let mut first = 0;
@@ -324,8 +329,13 @@ impl<W: Writer> Writer for Placed<'_, W> {
                         rich_ui,
                         runner,
                     };
-                    match with_facts(batch, &placing) {
-                        Ok(batch) => batch,
+                    match with_facts_and_messages(batch, &placing) {
+                        Ok((batch, messages)) => {
+                            if let Some(ids) = &message_ids {
+                                ids.note(messages);
+                            }
+                            batch
+                        }
                         Err(error) => {
                             failure = Some(error);
                             Vec::new()
@@ -366,6 +376,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
 
     fn message_id_prefix(&self) -> String {
         self.inner.message_id_prefix()
+    }
+
+    fn message_ids(&self) -> Option<MessageIds> {
+        self.inner.message_ids()
     }
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
@@ -530,6 +544,60 @@ pub struct Placing<'a> {
 /// also gets the turn's facts after them ([`turn_facts`]); a run's end as cancelled restates its
 /// last turn's facts with the calls it abandoned as cancelled, as today's reads state them.
 pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, String> {
+    with_facts_and_messages(batch, at).map(|(records, _)| records)
+}
+
+/// The final stored id of a step's assistant message, not the provider's message id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedMessage {
+    pub run_id: String,
+    pub step_id: u64,
+    pub mid: String,
+}
+
+/// A writer-to-observer handoff of placement facts. These facts are not durable evidence:
+/// the observer may publish them only after the corresponding records are synced.
+#[derive(Clone, Default)]
+pub struct MessageIds(
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(String, u64), String>>>,
+);
+
+impl MessageIds {
+    pub fn note(&self, messages: Vec<PlacedMessage>) {
+        let mut ids = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        for message in messages {
+            ids.insert((message.run_id, message.step_id), message.mid);
+        }
+    }
+
+    pub fn take(&self, run_id: &str, step_id: u64) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(run_id.to_owned(), step_id))
+    }
+
+    pub fn forget_run(&self, run_id: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(run, _), _| run != run_id);
+    }
+
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+}
+
+/// Builds exactly the same records as [`with_facts`], also reporting the assistant-to-facts
+/// pairing made while placing messages. Ids are copied after `flush` has finalized them.
+pub fn with_facts_and_messages(
+    batch: Vec<Record>,
+    at: &Placing<'_>,
+) -> Result<(Vec<Record>, Vec<PlacedMessage>), String> {
     let mut counts = at.conversation.without_window();
     let mut known = known_of(&counts);
     let mut inserted = false;
@@ -554,6 +622,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         .map(|runner| runner_high_water(at.conversation, runner));
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
+    let mut assistants = Vec::new();
     // The ids the current step and batch announced for the messages they write, which those
     // messages' facts carry: from earlier batches, then from this batch's own starts.
     let run = at.operations.run.as_ref();
@@ -795,6 +864,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             }
             let now_known = known_of(&counts);
             for ordinal in known + 1..=now_known {
+                if let Record::Assistant(assistant) = &record {
+                    assistants.push((ordinal, assistant.run_id.clone(), assistant.step_id));
+                }
                 let (message, facts) = describe(&record, at, run_sender.as_ref(), &run_send)?;
                 // The message a step or batch announced takes the id it announced: a step's
                 // assistant message, and the tool-results message a batch's last reply places.
@@ -929,7 +1001,24 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     if let Some((ordinal, assistant)) = placed_turn.take() {
         out.push(Record::TurnFacts(turn_facts(ordinal, &assistant, &events)));
     }
-    Ok(out)
+    let messages = assistants
+        .into_iter()
+        .filter_map(|(ordinal, run_id, step_id)| {
+            out.iter().rev().find_map(|record| match record {
+                Record::EntryFacts(facts)
+                    if facts.ordinal == ordinal && facts.run_id.as_deref() == Some(&run_id) =>
+                {
+                    Some(PlacedMessage {
+                        run_id: run_id.clone(),
+                        step_id,
+                        mid: facts.mid.clone(),
+                    })
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    Ok((out, messages))
 }
 
 /// One thing recorded about a call of the open turn: its dispatch intent, with the intent's seq

@@ -77,6 +77,11 @@ pub trait Writer {
     /// `EntryFacts` record takes seq `s` is `<prefix>.<s>`.
     fn message_id_prefix(&self) -> String;
 
+    /// Optional live-event handoff for the final ids assigned by entry placement.
+    fn message_ids(&self) -> Option<crate::entries::MessageIds> {
+        None
+    }
+
     /// Every record of the open log after its checkpoint, with its seq: what a reader needs
     /// whole when the folds keep only a summary of it, such as the compaction views.
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError>;

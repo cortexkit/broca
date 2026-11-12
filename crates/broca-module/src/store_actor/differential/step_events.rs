@@ -13,6 +13,8 @@ const INDEPENDENT_DURABLE_FIELDS: &[&str] = &[
     "started_at_ms",
     "finished_at_ms",
     "session_ref",
+    // Only session-store storage reports the assistant id; legacy WAL storage stays unchanged.
+    "message_id",
 ];
 
 pub(super) struct Capture {
@@ -150,6 +152,19 @@ async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool)
         }
         if new_storage {
             let session = module.load().await;
+            if !interrupted {
+                let entries = session.entries(1, 100).await.unwrap();
+                let assistant = entries
+                    .iter()
+                    .find(|entry| entry.message.role == broca_protocol::content::Role::Assistant)
+                    .unwrap();
+                assert_eq!(
+                    event.message_id.as_deref(),
+                    Some(assistant.state.facts.as_ref().unwrap().mid.as_str())
+                );
+            } else {
+                assert_eq!(event.message_id, None);
+            }
             let records = session.open_log_records().await.unwrap();
             assert!(records.iter().any(|(_, record)| matches!(record,
                 broca_session_store::record::Record::RunEnd(end) if end.reason == broca_protocol::RunFinishReason::Completed)));
@@ -172,6 +187,11 @@ async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool)
                 .collect();
             assert_eq!(event.log_incarnation, incarnation);
         } else {
+            assert_eq!(event.message_id, None);
+            assert!(serde_json::from_slice::<Value>(&body)
+                .unwrap()
+                .get("message_id")
+                .is_none());
             let records = module.wal.read_records(&module.key).unwrap();
             assert!(records.iter().any(|frame| matches!(
                 &frame.record,

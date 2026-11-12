@@ -74,15 +74,15 @@ impl broca_core::CompactionPlane for ReadyProvider {
 /// With `compaction`, both have a ready compaction provider, and a run whose plan names one
 /// starts under the current compaction contract with a context limit. With `hooks`, both have a
 /// `pre_user` provider.
-struct Loops {
+struct Loops<P = Gated> {
     today: Gated,
     wal: Arc<FileWalStore>,
-    store: Gated,
+    store: P,
     compaction: Option<Arc<ReadyProvider>>,
     hooks: Option<Arc<dyn broca_core::HookPlane>>,
 }
 
-impl Loops {
+impl<P> Loops<P> {
     fn compacts(&self, control: &broca_core::RunControl) -> bool {
         self.compaction.is_some()
             && control.manifest.as_deref().is_some_and(|manifest| {
@@ -92,7 +92,7 @@ impl Loops {
 }
 
 #[async_trait]
-impl RunExecutor for Loops {
+impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         self.hooks.clone()
     }
@@ -306,6 +306,15 @@ async fn side_with(
     steps: Vec<Vec<NormalizedEvent>>,
     deployment: broca_session_store::keys::DeploymentKey,
 ) -> Side {
+    side_with_events(build, steps, deployment, None).await
+}
+
+async fn side_with_events(
+    build: Build,
+    steps: Vec<Vec<NormalizedEvent>>,
+    deployment: broca_session_store::keys::DeploymentKey,
+    step_events: Option<Arc<crate::step_events::StepEvents>>,
+) -> Side {
     let Build {
         runtime,
         new_sessions,
@@ -343,6 +352,9 @@ async fn side_with(
         Arc::clone(&executor),
     )
     .with_idle_ttl(idle);
+    if let Some(events) = step_events {
+        opener = opener.with_step_events(events);
+    }
     if runtime {
         let runtime = crate::store_open::StoreRuntime::open(&dir, deployment, executor, idle)
             .await
@@ -2577,3 +2589,6 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
 
 /// `session.tag_map` over the sessions these scenarios build.
 mod tag_map_tests;
+
+#[path = "entries_comparison/message_ids.rs"]
+mod message_ids;
