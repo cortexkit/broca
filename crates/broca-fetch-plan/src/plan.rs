@@ -378,10 +378,7 @@ pub enum CompactionSupport {
     Supported,
 }
 
-/// Whether this build declares llm-runner `fork_answer`. Until it does, a plan's
-/// `fork_callers` stays uninterpreted and verbatim, as the contract asks of a runner without the
-/// group; `role.describe` must declare the group in the same change that sets this.
-pub const FORK_ANSWER_SERVED: bool = false;
+pub use broca_protocol::FORK_ANSWER_SERVED;
 
 /// Refuses a `fork_callers` member that is not a list of distinct non-empty strings, naming
 /// `plan.fork_callers`, when `served`. Checked at admission and at refresh, before anything is

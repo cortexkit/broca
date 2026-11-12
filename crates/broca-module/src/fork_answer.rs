@@ -50,7 +50,7 @@ use crate::store_open::StoreRuntime;
 
 /// How long a fork lives after its prepare or its last counted ask: `fork_idle_s`, 600 s, as
 /// Agent Runner's.
-pub const FORK_IDLE_MS: u64 = 600_000;
+pub const FORK_IDLE_MS: u64 = broca_protocol::FORK_IDLE_S * 1000;
 /// How long a fork's stored answers are kept after it can last be used: the contract's minimum.
 pub const FORK_RETAIN_MS: u64 = 3_600_000;
 /// What a fork's session name puts between the head's session name and the fork id.

@@ -106,6 +106,14 @@ pub mod run_events;
 #[cfg(all(feature = "test-attachments", not(debug_assertions)))]
 compile_error!("test-attachments is a non-shipping feature");
 
+/// Whether this build serves llm-runner `fork_answer` (`session.fork_prepare`, `fork_ask`,
+/// `fork_end`). `role.describe` declares the group, and admission checks a plan's
+/// `fork_callers`, exactly when it is set; without it the member stays uninterpreted.
+pub const FORK_ANSWER_SERVED: bool = true;
+
+/// `fork_idle_s`: how long a fork lives after its prepare or its last answered ask.
+pub const FORK_IDLE_S: u64 = 600;
+
 static SERVICE_TIER_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Fix service-tier admission and discovery before serving requests. Restart to change it.

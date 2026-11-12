@@ -403,6 +403,8 @@ struct Rig {
     corr: u64,
     /// Replies read while waiting for another request's.
     pending: std::collections::HashMap<u64, Frame>,
+    /// What the next call's reply is kept as, as a reader sample.
+    sample_next: Option<String>,
     /// Whether dropping the rig removes its state root.
     owns_dir: bool,
 }
@@ -521,6 +523,7 @@ impl Rig {
             serve,
             corr: 1,
             pending: Default::default(),
+            sample_next: None,
             owns_dir,
         }
     }
@@ -652,6 +655,30 @@ impl Rig {
         let reply = self
             .request(channel, json!({"method": method, "params": params}))
             .await;
+        if let Some(name) = self.sample_next.take() {
+            sample(&name, &reply);
+        }
+        outcome(&reply)
+    }
+
+    /// Names the reply to the next call as a reader sample (see [`Rig::sampled`]).
+    fn sample_next(&mut self, name: &str) {
+        self.sample_next = Some(name.to_owned());
+    }
+
+    /// [`Rig::call`], also writing the reply's wire bytes to `name` in the folder
+    /// `BROCA_FORK_ANSWER_SAMPLES` names, when it names one: samples for the replies' readers.
+    async fn sampled(
+        &mut self,
+        name: &str,
+        channel: u16,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Value> {
+        let reply = self
+            .request(channel, json!({"method": method, "params": params}))
+            .await;
+        sample(name, &reply);
         outcome(&reply)
     }
 
@@ -686,6 +713,14 @@ impl Rig {
         let head = self.call(3, "session.head", json!({})).await.unwrap();
         let read = self.call(3, "session.read", json!({})).await.unwrap();
         (head, read)
+    }
+}
+
+fn sample(name: &str, reply: &Frame) {
+    if let Some(dir) = std::env::var_os("BROCA_FORK_ANSWER_SAMPLES") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), &reply.body).unwrap();
     }
 }
 
@@ -752,7 +787,18 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
     let mut rig = Rig::head("replay", vec![text_step("a", "head reply")]).await;
     let before = rig.head_state().await;
-    let fork = rig.prepare(1).await.unwrap();
+    let fork = rig
+        .sampled(
+            "fork_prepare.reply.json",
+            1,
+            "session.fork_prepare",
+            json!({}),
+        )
+        .await
+        .unwrap()["fork_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     // Requests are strict, and name the member at fault.
     for (method, params) in [
         ("session.fork_prepare", json!({"unexpected": true})),
@@ -808,8 +854,40 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         );
     }
 
+    rig.sampled(
+        "fork_prepare.scope_owner_mismatch.json",
+        2,
+        "session.fork_prepare",
+        json!({}),
+    )
+    .await
+    .unwrap_err();
+    rig.sampled(
+        "fork_ask.unknown_fork.json",
+        2,
+        "session.fork_ask",
+        json!({"fork_id": fork, "ask_id": "one", "question": "q"}),
+    )
+    .await
+    .unwrap_err();
+    rig.sampled(
+        "fork_ask.invalid_params.json",
+        1,
+        "session.fork_ask",
+        json!({"fork_id": fork, "ask_id": "", "question": "q"}),
+    )
+    .await
+    .unwrap_err();
     rig.forks.answer(answered("The title changed."));
-    let first = rig.ask(1, &fork, "one", "What changed?").await.unwrap();
+    let first = rig
+        .sampled(
+            "fork_ask.reply.json",
+            1,
+            "session.fork_ask",
+            json!({"fork_id": fork, "ask_id": "one", "question": "What changed?"}),
+        )
+        .await
+        .unwrap();
     assert_eq!(
         first,
         json!({"answer": "The title changed.", "finish": "end_turn",
@@ -846,6 +924,7 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         rig.ask(1, &fork, "one", "What changed?").await.unwrap(),
         first
     );
+    rig.sample_next("fork_ask.ask_id_reuse.json");
     assert_eq!(
         code(
             &rig.ask(1, &fork, "one", "Something else?")
@@ -876,6 +955,7 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         0
     );
 
+    rig.sample_next("fork_end.reply.json");
     let ended = json!({"fork_id": fork, "ended": true});
     assert_eq!(rig.end(1, &fork).await.unwrap(), ended);
     assert_eq!(rig.end(1, &fork).await.unwrap(), ended);
@@ -883,6 +963,7 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         rig.ask(1, &fork, "one", "What changed?").await.unwrap(),
         first
     );
+    rig.sample_next("fork_ask.fork_ended.json");
     assert_eq!(
         code(&rig.ask(1, &fork, "three", "More?").await.unwrap_err()),
         "fork_ended"
@@ -900,6 +981,7 @@ async fn an_ask_in_flight_makes_the_fork_busy_and_an_end_lets_it_finish() {
         .send_request(1, ask_params(&fork, "held", "held question"))
         .await;
     arrival.await.unwrap();
+    rig.sample_next("fork_ask.fork_busy.json");
     for ask_id in ["held", "other"] {
         assert_eq!(
             code(&rig.ask(1, &fork, ask_id, "q").await.unwrap_err()),
@@ -931,6 +1013,7 @@ async fn a_failed_call_stores_model_error_and_a_tool_call_ends_the_fork() {
         usage: usage(5, 0, 1),
         error: "scripted model failure".into(),
     });
+    rig.sample_next("fork_ask.model_error.json");
     let failed = rig.ask(1, &fork, "fail", "failed question").await.unwrap();
     assert_eq!(
         failed,
@@ -954,6 +1037,7 @@ async fn a_failed_call_stores_model_error_and_a_tool_call_ends_the_fork() {
         finish: "tool_call_refused".into(),
         usage: usage(17, 3, 11),
     });
+    rig.sample_next("fork_ask.tool_call_refused.json");
     let refused = rig.ask(1, &fork, "tool", "try a tool").await.unwrap();
     assert_eq!(
         (refused["answer"].as_str(), refused["finish"].as_str()),
@@ -1004,6 +1088,7 @@ async fn refusals_before_a_model_call_store_nothing_and_each_retry_is_a_new_atte
     ];
     for (index, (expected_code, detail)) in expected.iter().enumerate() {
         // A refusal is never stored, so the same id may come back with another question.
+        rig.sample_next(&format!("fork_ask.refused.{index}.{expected_code}.json"));
         let error = rig
             .ask(1, &fork, "retry", &format!("question {index}"))
             .await

@@ -34,19 +34,19 @@ N/A call_yield_held_reply_never_pauses: runner does not declare call_yield
 N/A call_yield_late_result_is_notice: runner does not declare call_yield
 N/A call_yield_steer_stored_before_waiting: runner does not declare call_yield
 N/A call_yield_stop_never_withdraws: runner does not declare call_yield
-SKIP fork_answer_base_matches_digest: fork_answer
-SKIP fork_answer_refuses_mismatched_base: fork_answer
-SKIP fork_answer_refuses_tool_call: fork_answer
-SKIP fork_answer_model_failure_finishes: fork_answer
-SKIP fork_answer_ask_id_replays: fork_answer
-SKIP fork_answer_idle_expiry: fork_answer
-SKIP fork_answer_never_writes_head: fork_answer
-SKIP fork_answer_admits_only_fork_callers: fork_answer
-SKIP fork_answer_account_for_pins_head_credential: fork_answer
-SKIP fork_answer_account_held_refusal: fork_answer
-SKIP fork_answer_account_blocked_refusal: fork_answer
-SKIP fork_answer_conversation_key_bounded: fork_answer
-SKIP fork_answer_survives_restart: fork_answer
+PASS fork_answer_base_matches_digest
+N/A fork_answer_refuses_mismatched_base: fork_answer_refuses_mismatched_base requires revert_session: broca serves no transcript revert
+PASS fork_answer_refuses_tool_call
+PASS fork_answer_model_failure_finishes
+N/A fork_answer_ask_id_replays: fork_answer_ask_id_replays requires revert_session for replay after base loss: broca serves no transcript revert
+PASS fork_answer_idle_expiry
+PASS fork_answer_never_writes_head
+PASS fork_answer_admits_only_fork_callers
+PASS_WITH_INAPPLICABLE_RULE fork_answer_account_for_pins_head_credential: fork_answer.account_pin stepped-down tier requires service_tier and configure_service_tier
+N/A fork_answer_account_held_refusal: fork_answer_account_held_refusal: routing_peer_error_replies is unsupported
+N/A fork_answer_account_blocked_refusal: fork_answer_account_blocked_refusal: routing_peer_error_replies is unsupported
+PASS fork_answer_conversation_key_bounded
+PASS fork_answer_survives_restart
 N/A history_intake_growing_prefix: history_intake is not declared
 N/A history_intake_send_waits_for_history: history_intake is not declared
 N/A plan_notes_requires_session_change: plan_notes is not declared
