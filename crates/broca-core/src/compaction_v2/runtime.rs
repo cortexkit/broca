@@ -211,6 +211,32 @@ struct Pending {
     newest: Option<Cursor>,
 }
 
+impl Pending {
+    /// Drops the queued entries a ready Setup naming `newest` covers. The provider reads the
+    /// window for itself after Setup (compaction contract N6), and each entry it reads is at
+    /// least as new as the one queued here: every caller observes the entries a Setup is built
+    /// from before sending it, so nothing queued is newer. Without this, a fresh runtime (an actor
+    /// reopened, a restarted process)
+    /// would send its whole first observation, up to the notice budget, in the first notice.
+    ///
+    /// Nothing else changes. `assistant` keeps the digest last observed, which is the one Setup
+    /// was built from, so a tool result or delivery reaching that entry after Setup changes its
+    /// digest and goes in the next notice. An entry not yet observed when Setup was sent is still
+    /// sent when it is: that only repeats an entry the provider has, which costs bytes, not state.
+    fn seen_at_setup(&mut self, newest: Option<&Cursor>) {
+        let Some(newest) = newest else {
+            return;
+        };
+        self.entries.retain(|ordinal, _| *ordinal > newest.ordinal);
+        self.entry_bytes = self.entries.values().map(|(_, bytes)| *bytes).sum();
+        // Entries left out for the budget are all covered when none past `newest` was observed.
+        if self.entries_omitted && self.observed_through <= newest.ordinal {
+            self.entries_omitted = false;
+        }
+        self.changed = !self.entries.is_empty() || self.entries_omitted;
+    }
+}
+
 struct Lane {
     seq: u64,
     ready: bool,
@@ -396,7 +422,21 @@ impl Runtime {
     /// before any model I/O.
     pub async fn setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
-        setup(&mut lane, plane, request, &self.entry_speaks_for).await
+        self.setup_on(&mut lane, plane, request).await
+    }
+
+    /// Sends `request` on `lane` and, once the provider is ready, drops the queued entries that
+    /// Setup covers, so the first notice after it carries only what changed since (compaction
+    /// contract N6).
+    async fn setup_on(&self, lane: &mut Lane, plane: &dyn Plane, request: &SetupRequest) -> bool {
+        let ready = setup(lane, plane, request, &self.entry_speaks_for).await;
+        if ready {
+            self.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .seen_at_setup(request.newest.as_ref());
+        }
+        ready
     }
 
     /// Whether entries handed to the provider may carry `speaks_for`: its catalog entry declared
@@ -461,7 +501,7 @@ impl Runtime {
     pub async fn ensure_setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
         if !lane.ready && lane.setup_due {
-            setup(&mut lane, plane, request, &self.entry_speaks_for).await
+            self.setup_on(&mut lane, plane, request).await
         } else {
             lane.ready
         }
@@ -491,9 +531,7 @@ impl Runtime {
     ) {
         let mut restarted = false;
         loop {
-            if !lane.ready
-                && (!lane.setup_due
-                    || !setup(lane, plane, setup_request, &self.entry_speaks_for).await)
+            if !lane.ready && (!lane.setup_due || !self.setup_on(lane, plane, setup_request).await)
             {
                 return;
             }

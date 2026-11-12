@@ -1781,6 +1781,14 @@ tokio::task_local! {
     static LOST: Lost;
 }
 
+tokio::task_local! {
+    /// The entries a resumed run's compaction provider reads for itself after its Setup, as a
+    /// real provider does with `session.entries`. A run resumed from a cut log sends no notice
+    /// repeating the window Setup covers (compaction N6), so without this read the provider
+    /// would never learn the ids of the entries written before the cut.
+    static PROVIDER_READ: Option<Arc<Value>>;
+}
+
 /// Where a restarted compaction provider first hears from the run again.
 #[derive(Clone, Copy, Debug)]
 enum Lost {
@@ -1792,10 +1800,15 @@ enum Lost {
 
 impl CompactionSpy {
     fn new(script: &CompactionScript) -> Self {
+        let mut mids = std::collections::BTreeMap::new();
+        let mut tool_parts = std::collections::BTreeMap::new();
+        if let Ok(Some(read)) = PROVIDER_READ.try_with(Clone::clone) {
+            remember_entries(&read, &mut mids, &mut tool_parts);
+        }
         Self {
             rides: Mutex::new(script.rides.iter().copied().collect()),
-            mids: Mutex::default(),
-            tool_parts: Mutex::default(),
+            mids: Mutex::new(mids),
+            tool_parts: Mutex::new(tool_parts),
             version: Default::default(),
             calls: Mutex::default(),
             lost: Mutex::new(LOST.try_with(|lost| *lost).ok()),
@@ -3270,9 +3283,22 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
             convert_unbilled(&frames, lineage(&cut_image).as_deref()).expect("the cut converts");
         let cut_records = converted.records.clone();
         let before = converted.records.len();
-        let (today, _, _) = today_from(&scenario, Some((&name, &bytes)), steps.clone()).await;
+        // The window the cut log holds, as the resumed run's compaction provider reads it.
+        let read = lineage(&cut_image)
+            .and_then(|lineage| {
+                broca_core::compaction_v2::transcript::project(&frames, &lineage).ok()
+            })
+            .map(|transcript| Arc::new(serde_json::to_value(&transcript.entries).unwrap()));
+        let (today, _, _) = PROVIDER_READ
+            .scope(
+                read.clone(),
+                Box::pin(today_from(&scenario, Some((&name, &bytes)), steps.clone())),
+            )
+            .await;
         eprintln!("cut after record {cut} of {records}");
-        let new = new_from(&scenario, Some(converted), steps).await;
+        let new = PROVIDER_READ
+            .scope(read, Box::pin(new_from(&scenario, Some(converted), steps)))
+            .await;
         let today_appended = &today.records[before.min(today.records.len())..];
         let context = format!("cut after record {cut} of {records}");
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {

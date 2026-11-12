@@ -65,11 +65,22 @@ async fn compaction_statement_seq_survives_seal_reopen_and_daemon_state_restart(
                     let calls = spy.calls.lock().unwrap();
                     let stamps = monotonic(&calls);
                     assert_eq!(calls[0].0, "compaction.setup");
-                    assert_eq!(calls[1].0, "compaction.notice");
-                    assert_eq!(
-                        stamps[0], stamps[1],
-                        "no record is appended between Setup and its initial notice"
-                    );
+                    // Setup covers the window it names, so no notice repeats an entry Setup
+                    // already saw (compaction N6).
+                    let newest = &calls[0].1["newest"];
+                    for (method, params) in &calls[1..] {
+                        if method != "compaction.notice" {
+                            continue;
+                        }
+                        for entry in params["entries"].as_array().into_iter().flatten() {
+                            assert!(
+                                entry["ordinal"].as_u64() > newest["ordinal"].as_u64()
+                                    || (entry["ordinal"] == newest["ordinal"]
+                                        && entry["digest"] != newest["digest"]),
+                                "a notice repeated an entry Setup saw: {entry} (Setup named {newest})"
+                            );
+                        }
+                    }
                     assert!(calls.iter().any(|(method, _)| method == "compaction.ride"));
                     stamps
                 };

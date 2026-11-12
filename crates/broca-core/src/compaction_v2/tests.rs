@@ -973,6 +973,112 @@ async fn compaction_v2_setup_unknown_answer_fails_and_next_setup_restarts_notice
     );
 }
 
+/// Compaction contract N6: the first notice after Setup carries only what changed since the
+/// Setup, here on a fresh runtime, as an actor reopened or a restarted process has.
+#[tokio::test]
+async fn compaction_v2_first_notice_after_setup_sends_only_what_changed_since() {
+    let plane = RecordingPlane::default();
+    plane
+        .answers
+        .lock()
+        .unwrap()
+        .extend([json!({"answer":"ready"}), json!({"answer":"received"})]);
+    let runtime = runtime::Runtime::default();
+    // The window at Setup: a question and an assistant entry whose tool call is still running.
+    let at_setup = project(
+        &[text(Role::User, "question"), call()],
+        &facts(2),
+        &Deliveries::new(),
+        true,
+    );
+    let mut setup = setup();
+    setup.newest = views::newest(&at_setup);
+    runtime.observe(&at_setup);
+    runtime.flush(&plane, &setup, &conditions(), None).await;
+    assert_eq!(
+        plane.calls.lock().unwrap().len(),
+        1,
+        "Setup covers the window, so nothing is left to notice"
+    );
+
+    // The call's result arrives after Setup: the assistant entry's digest changes and a new
+    // entry follows it. Both go in the next notice; the question does not.
+    let after = project(
+        &[
+            text(Role::User, "question"),
+            call(),
+            result(ToolOutput::Text {
+                text: "contents".into(),
+            }),
+        ],
+        &facts(3),
+        &Deliveries::new(),
+        true,
+    );
+    assert_ne!(after[1].digest, at_setup[1].digest);
+    runtime.observe(&after);
+    runtime.flush(&plane, &setup, &conditions(), None).await;
+    let calls = plane.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .collect::<Vec<_>>(),
+        ["compaction.setup", "compaction.notice"]
+    );
+    let entries = calls[1].1["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["ordinal"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert_eq!(entries[0]["digest"], json!(after[1].digest));
+}
+
+/// A failed Setup drops nothing from the queue: the provider didn't read the window, so the
+/// entries it named are still owed. (The ready Setup here names no newest entry, so it covers
+/// nothing and the notice shows exactly what the failed one left queued.)
+#[tokio::test]
+async fn compaction_v2_a_failed_setup_drops_nothing_from_the_queue() {
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"answer":"future"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+    ]);
+    let runtime = runtime::Runtime::default();
+    let first = project(
+        &[text(Role::User, "one")],
+        &facts(1),
+        &Deliveries::new(),
+        true,
+    );
+    let mut failed = setup();
+    failed.newest = views::newest(&first);
+    runtime.observe(&first);
+    assert!(!runtime.setup(&plane, &failed).await);
+    let second = project(
+        &[text(Role::User, "one"), text(Role::User, "two")],
+        &facts(2),
+        &Deliveries::new(),
+        true,
+    );
+    runtime.observe(&second);
+    assert!(runtime.setup(&plane, &setup()).await);
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    let calls = plane.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let entries = calls[2].1["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["ordinal"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
 /// Scripted answers at the catalog boundary, including a list kept by the transport after a
 /// failed read. Calls still use the ordinary recording rig.
 struct CatalogPlane {
@@ -2348,9 +2454,9 @@ async fn compaction_v2_cache_expired_rides_only_where_setup_listed_it() {
         let messages = vec![text(Role::User, "question")];
         let entries = project(&messages, &facts(1), &Deliveries::new(), true);
         let plane = RecordingPlane::default();
+        // Setup covers the one entry, so no notice goes before the ride (compaction N6).
         plane.answers.lock().unwrap().extend([
             json!({"answer":"ready"}),
-            json!({"answer":"received"}),
             json!({"answer":"nothing"}),
             json!({"answer":"received"}),
         ]);
@@ -2465,11 +2571,11 @@ async fn compaction_v2_request_over_limit_rides_reestimates_then_refuses() {
     let messages = vec![text(Role::User, &"x".repeat(1000))];
     let entries = project(&messages, &facts(1), &Deliveries::new(), true);
     let plane = RecordingPlane::default();
-    plane.answers.lock().unwrap().extend([
-        json!({"answer":"ready"}),
-        json!({"answer":"received"}),
-        json!({"answer":"nothing"}),
-    ]);
+    plane
+        .answers
+        .lock()
+        .unwrap()
+        .extend([json!({"answer":"ready"}), json!({"answer":"nothing"})]);
     let state = tokio::sync::Mutex::new(state::State::default());
     let conditions = conditions();
     let current = send_context();
@@ -2502,10 +2608,11 @@ async fn compaction_v2_request_over_limit_rides_reestimates_then_refuses() {
             .iter()
             .map(|(method, _)| method.as_str())
             .collect::<Vec<_>>(),
-        ["compaction.setup", "compaction.notice", "compaction.ride"]
+        // Setup covers the one entry, so no notice goes before the ride (compaction N6).
+        ["compaction.setup", "compaction.ride"]
     );
-    assert_eq!(calls[2].1["causes"], json!(["over_limit"]));
-    assert!(calls[2].1["request_tokens"].as_u64().unwrap() > 900);
+    assert_eq!(calls[1].1["causes"], json!(["over_limit"]));
+    assert!(calls[1].1["request_tokens"].as_u64().unwrap() > 900);
 }
 
 #[tokio::test]
@@ -2517,7 +2624,6 @@ async fn compaction_v2_refused_ride_warns_once_without_changing_the_view() {
     let plane = RecordingPlane::default();
     plane.answers.lock().unwrap().extend([
         json!({"answer":"ready"}),
-        json!({"answer":"received"}),
         json!({"answer":"view","view":view}),
         json!({"answer":"received"}),
     ]);
@@ -2568,9 +2674,9 @@ async fn compaction_v2_request_ride_view_applies_to_that_request_before_sending(
         )],
     );
     let plane = RecordingPlane::default();
+    // Setup covers the one entry, so no notice goes before the ride (compaction N6).
     plane.answers.lock().unwrap().extend([
         json!({"answer":"ready"}),
-        json!({"answer":"received"}),
         json!({"answer":"view", "view":view}),
     ]);
     let state = tokio::sync::Mutex::new(state::State::default());
