@@ -3383,6 +3383,50 @@ fn continue_replies_are_read_as_offer_hold_refusal_or_nothing() {
     ));
 }
 
+/// An error frame the route wrote, not routing (the target is gone or warming, or a code
+/// routing's contract doesn't name), is routing unreachable: never a refusal, so no routing
+/// code lands on the run's error.
+#[test]
+fn an_error_frame_routing_did_not_write_is_unreachable_not_a_refusal() {
+    for code in [
+        "target_unavailable",
+        "unknown_module",
+        "module_removed",
+        "module_warming",
+        "routing_unavailable",
+        "routing_ambiguous",
+        "some_future_code",
+    ] {
+        let reply = classify_continue_reply(Err(serde_json::to_vec(
+            &json!({"code": code, "message": "not routing", "detail": {}}),
+        )
+        .unwrap()));
+        assert!(
+            matches!(reply, ContinueOutcome::Unreachable(_)),
+            "{code}: {reply:?}"
+        );
+    }
+    for code in [
+        "account_hold",
+        "admission_conflict",
+        "unknown_decision",
+        "account_not_authorized",
+    ] {
+        let reply = classify_continue_reply(Err(serde_json::to_vec(
+            &json!({"code": code, "message": "routing's own", "detail": {}}),
+        )
+        .unwrap()));
+        assert!(
+            matches!(
+                reply,
+                ContinueOutcome::Answered(cortexkit_role_routing::account_continue::ContinueAnswer::Refuse(ref refusal))
+                    if refusal.routing_code == code
+            ),
+            "{code}: {reply:?}"
+        );
+    }
+}
+
 /// Without routing serving continuation (both `account_continue` and `account_continue_resume`
 /// declared), nothing is sent; with it, the request goes over the admission route as
 /// `route.account_for`.

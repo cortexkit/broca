@@ -2674,8 +2674,12 @@ impl RoutingClient {
     }
 }
 
-/// Reads one continue reply: `result` is the tagged answer; an error body is routing refusing
-/// the question, read as a refusal under its code.
+/// Reads one continue reply: `result` is the tagged answer. An error body under one of the
+/// codes routing's contract names for its own refusals (`RefusalCode`) is routing refusing the
+/// question, read as a refusal under that code. Any other error body (one the message plane or
+/// broca's side of the route wrote, such as `target_unavailable`, or a code this build doesn't
+/// know) says routing wasn't reached or can't be read, so it is `Unreachable`: no move, and no
+/// routing answer on the run's error.
 pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutcome {
     use cortexkit_role_routing::account_continue::{ContinueAnswer, ContinueRefusal};
     match reply {
@@ -2692,15 +2696,28 @@ pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutco
             }
         }
         Err(body) => match serde_json::from_slice::<ErrorBodyView>(&body) {
-            Ok(error) => ContinueOutcome::Answered(ContinueAnswer::Refuse(ContinueRefusal::new(
-                error.code,
-                error.detail.unwrap_or(Value::Null),
-            ))),
+            Ok(error) if is_routing_refusal(&error.code) => {
+                ContinueOutcome::Answered(ContinueAnswer::Refuse(ContinueRefusal::new(
+                    error.code,
+                    error.detail.unwrap_or(Value::Null),
+                )))
+            }
+            Ok(error) => ContinueOutcome::Unreachable(format!(
+                "the continue question was answered {} by the route, not by routing",
+                error.code
+            )),
             Err(decode) => {
                 ContinueOutcome::Unreachable(format!("error reply is not an error body: {decode}"))
             }
         },
     }
+}
+
+/// Whether an error body's `code` is routing's own refusal: a code routing's contract names,
+/// other than the two a consumer answers for itself when it can't find routing at all.
+fn is_routing_refusal(code: &str) -> bool {
+    use cortexkit_role_routing::errors::{RefusalCode, CONSUMER_CODES};
+    RefusalCode::parse(code).is_known() && !CONSUMER_CODES.contains(&code)
 }
 
 #[cfg(test)]
