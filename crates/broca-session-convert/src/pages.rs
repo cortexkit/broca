@@ -234,19 +234,15 @@ pub(super) fn set_aside(got: &Value, expected: &Value) -> (Value, u64) {
 /// counted in `report`.
 fn store_pages<B: SessionBackend>(
     session: &Session<B>,
-    parts: &MemoryParts,
+    reader: &broca_module::store_read::ViewReader<'_, B>,
     name: &str,
     limit: u64,
     mode: (&str, bool, bool, bool),
     report: &mut PagesReport,
 ) -> Result<Vec<SessionReadResponse>, String> {
     let pages = walk(|from| {
-        block_on(broca_module::store_read::serve_view(
-            session,
-            parts,
-            &request(name, from, limit, mode),
-        ))
-        .map_err(|error| format!("{error:?}"))
+        block_on(reader.read(&request(name, from, limit, mode)))
+            .map_err(|error| format!("{error:?}"))
     })?;
     let head = session.head();
     let incarnation = broca_session_store::codec::hex(&head.incarnation.0);
@@ -521,10 +517,19 @@ pub(super) fn run(args: &Args) {
                 Ok(built) => built,
                 Err(e) => return report.fail("session", e, &name),
             };
-        for (mode, today) in MODES.iter().zip(&today) {
-            match store_pages(&session, &parts, &name, limit, *mode, &mut report) {
-                Ok(open) => compare(&mut report, &name, mode.0, false, &open, today),
-                Err(e) => return report.fail(&format!("the store's {} pages", mode.0), e, &name),
+        {
+            let reader = match block_on(broca_module::store_read::ViewReader::new(&session, &parts))
+            {
+                Ok(reader) => reader,
+                Err(e) => return report.fail("stream head", format!("{e:?}"), &name),
+            };
+            for (mode, today) in MODES.iter().zip(&today) {
+                match store_pages(&session, &reader, &name, limit, *mode, &mut report) {
+                    Ok(open) => compare(&mut report, &name, mode.0, false, &open, today),
+                    Err(e) => {
+                        return report.fail(&format!("the store's {} pages", mode.0), e, &name)
+                    }
+                }
             }
         }
         let sealed = match seal_at_newest_input(session, &run_inputs) {
@@ -539,8 +544,12 @@ pub(super) fn run(args: &Args) {
             Ok(view) => view,
             Err(e) => return report.fail("view", format!("{e:?}"), &name),
         };
+        let reader = match block_on(broca_module::store_read::ViewReader::new(&view, &parts)) {
+            Ok(reader) => reader,
+            Err(e) => return report.fail("sealed stream head", format!("{e:?}"), &name),
+        };
         for (mode, today) in MODES.iter().zip(&today) {
-            match store_pages(&*view, &parts, &name, limit, *mode, &mut report) {
+            match store_pages(&*view, &reader, &name, limit, *mode, &mut report) {
                 Ok(after) => compare(&mut report, &name, mode.0, true, &after, today),
                 Err(e) => {
                     return report.fail(&format!("the store's sealed {} pages", mode.0), e, &name)

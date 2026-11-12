@@ -409,6 +409,52 @@ pub async fn serve_view<B: SessionBackend>(
     finish(answer, req)
 }
 
+/// Repeated reads of one unchanged session, sharing its control-stream head. The borrowed
+/// session keeps the records its loader retained; sealed history may still read storage.
+pub struct ViewReader<'a, B: SessionBackend> {
+    session: &'a Session<B>,
+    parts: &'a dyn Parts,
+    stream_head: Option<broca_core::Cursor>,
+}
+
+impl<'a, B: SessionBackend> ViewReader<'a, B> {
+    /// Projects the same head as [`serve_view`] once, before walking the session's pages.
+    /// The session must remain unchanged for the lifetime of the reader.
+    pub async fn new(
+        session: &'a Session<B>,
+        parts: &'a dyn Parts,
+    ) -> Result<Self, crate::serve::ServeError> {
+        let stream_head = crate::store_fanout::last_cursor(session)
+            .await
+            .map_err(|error| {
+                crate::serve::ServeError::Open(
+                    format!("the session's control stream can't be projected: {error}"),
+                    Some(broca_protocol::ErrorClass::Permanent),
+                )
+            })?;
+        Ok(Self {
+            session,
+            parts,
+            stream_head,
+        })
+    }
+
+    /// The real page builder and reply finishing used by [`serve_view`], with the shared head.
+    pub async fn read(
+        &self,
+        req: &crate::serve::SessionReadRequest,
+    ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+        let answer = page(
+            self.session,
+            self.parts,
+            &crate::store_reads::PageRequest::of(req),
+            Some(self.stream_head),
+        )
+        .await?;
+        finish(answer, req)
+    }
+}
+
 /// What a reply takes besides the session: the media mode and the byte cap `req` asks for.
 fn finish(
     answer: crate::store_reads::PageAnswer,

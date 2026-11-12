@@ -32,7 +32,7 @@ pub struct Stored {
 /// appended in one batch, from its input to the next run's, and the session sealed at each run's
 /// input once the next run is in, as a session's runs seal it.
 pub fn store(old: &[FramedRecord], lineage: Option<&str>, name: &str) -> Result<Stored, String> {
-    stored(old, lineage, name, true)
+    stored(old, lineage, name, Sealing::AsRunsEnd)
 }
 
 /// [`store`], with every run appended before the first seal, as a converted session is stored:
@@ -43,14 +43,29 @@ pub fn store_then_seal(
     lineage: Option<&str>,
     name: &str,
 ) -> Result<Stored, String> {
-    stored(old, lineage, name, false)
+    stored(old, lineage, name, Sealing::AfterRuns)
+}
+
+/// A converted session before sealing, as the conversion verifier first reads it.
+pub fn store_unsealed(
+    old: &[FramedRecord],
+    lineage: Option<&str>,
+    name: &str,
+) -> Result<Stored, String> {
+    stored(old, lineage, name, Sealing::Never)
+}
+
+enum Sealing {
+    AsRunsEnd,
+    AfterRuns,
+    Never,
 }
 
 fn stored(
     old: &[FramedRecord],
     lineage: Option<&str>,
     name: &str,
-    seal_as_runs_end: bool,
+    sealing: Sealing,
 ) -> Result<Stored, String> {
     let converted = crate::convert(old, lineage).map_err(|error| format!("convert: {error:?}"))?;
     let backend = Counting::new(MemoryBackend::default());
@@ -88,14 +103,15 @@ fn stored(
                 .map_err(|error| format!("append: {error:?}"))?;
             // Converted records that name others by seq count on taking the seqs they were
             // numbered by; a seal between runs moves the later ones past them.
-            if !seal_as_runs_end && first != batch[0] as u64 + crate::FIRST_SEQ {
+            if !matches!(sealing, Sealing::AsRunsEnd) && first != batch[0] as u64 + crate::FIRST_SEQ
+            {
                 return Err(format!("converted record {} took seq {first}", batch[0]));
             }
             // The batch starts at a run's input (but the first): everything before it is sealed.
-            if index > 0 {
+            if index > 0 && !matches!(sealing, Sealing::Never) {
                 cuts.push(first);
             }
-            if seal_as_runs_end {
+            if matches!(sealing, Sealing::AsRunsEnd) {
                 for cut in cuts.drain(..) {
                     match session.seal(Some(cut), 0).await {
                         Ok(_) => seals += 1,
@@ -193,4 +209,72 @@ pub fn stored_objects(stored: &Stored) -> (usize, u64) {
         bytes
     });
     (names.len(), bytes)
+}
+
+/// The conversion verifier's five-mode page walk, including loading its view and projecting
+/// its head. `shared` uses one reader for the walk; otherwise every page computes its own head,
+/// as the verifier did before sharing it. Conversion and synthetic-data generation are excluded.
+pub fn page_walk_cost(
+    stored: &Stored,
+    shared: bool,
+) -> Result<(std::time::Duration, u64, Reads), String> {
+    stored.backend.take();
+    let started = std::time::Instant::now();
+    let pages = block_on(async {
+        let view = Session::view(
+            &stored.backend,
+            stored.addr.clone(),
+            &stored.triple,
+            &stored.deployment,
+        )
+        .await
+        .map_err(|error| format!("view: {error:?}"))?;
+        let reader = if shared {
+            Some(
+                broca_module::store_read::ViewReader::new(&view, &stored.parts)
+                    .await
+                    .map_err(|error| format!("stream head: {error:?}"))?,
+            )
+        } else {
+            None
+        };
+        let key = broca_protocol::BindIdentity::new(
+            "/read-cost",
+            "read-cost",
+            stored.triple.session.as_str(),
+        );
+        let mut pages = 0;
+        for (_, display, tools, rich_ui) in crate::verify::READ_MODES {
+            let mut from = 1;
+            let mut messages = 0;
+            loop {
+                let mut request =
+                    SessionReadRequest::new(key.clone(), Some(from), Some(crate::verify::PAGE));
+                request.include_display_facts = display;
+                request.include_tools = tools;
+                request.include_rich_ui = rich_ui;
+                let reply = match &reader {
+                    Some(reader) => reader.read(&request).await,
+                    None => {
+                        broca_module::store_read::serve_view(&view, &stored.parts, &request).await
+                    }
+                }
+                .map_err(|error| format!("read from {from}: {error:?}"))?;
+                pages += 1;
+                messages += reply.messages.len() as u64;
+                match reply.next_from_ordinal {
+                    Some(next) if next > from => from = next,
+                    _ => break,
+                }
+            }
+            if messages != stored.messages {
+                return Err(format!(
+                    "walk served {messages} messages, expected {}",
+                    stored.messages
+                ));
+            }
+        }
+        Ok::<_, String>(pages)
+    })?;
+    Ok((started.elapsed(), pages, stored.backend.take()))
 }
