@@ -1165,6 +1165,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves one write the active run asks for.
     async fn serve_request(&mut self, request: broca_session_loop::shared::Request) {
+        if let broca_session_loop::shared::Request::CachePredecessor { reply } = request {
+            let _ = reply.send(self.cache_predecessor().await);
+            return;
+        }
         // A seal's own deletions come due a grace period after it, but earlier ones may be due.
         let seals = matches!(request, broca_session_loop::shared::Request::Seal { .. });
         let active = self

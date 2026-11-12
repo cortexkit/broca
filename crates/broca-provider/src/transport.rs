@@ -391,6 +391,8 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     websocket: Arc<responses_websocket::Session>,
     websocket_lease: std::sync::Mutex<Option<responses_websocket::Lease>>,
     cache_session: std::sync::Mutex<Option<Arc<cache_runtime::Session>>>,
+    cache_predecessor_loader:
+        std::sync::Mutex<Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>>,
     #[cfg(test)]
     escape_client_builds: std::sync::Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-harness"))]
@@ -1145,6 +1147,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             websocket: Arc::new(responses_websocket::Session::default()),
             websocket_lease: std::sync::Mutex::new(None),
             cache_session: std::sync::Mutex::new(None),
+            cache_predecessor_loader: std::sync::Mutex::new(None),
             #[cfg(test)]
             escape_client_builds: std::sync::Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-harness"))]
@@ -1384,7 +1387,9 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
-        *self.cache_session.lock().unwrap() = Some(self.client.cache_sessions.bind(session));
+        let cache = self.client.cache_sessions.bind(session);
+        cache.set_loader(self.cache_predecessor_loader.lock().unwrap().take());
+        *self.cache_session.lock().unwrap() = Some(cache);
         if self.frozen.family_id == crate::spec::WireFamilyId::OpenAiResponsesChatgpt
             && self.frozen.chatgpt_wire.is_some()
         {
@@ -1396,6 +1401,13 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
                     .acquire(session, &self.websocket);
             }
         }
+    }
+
+    fn set_cache_predecessor_loader(
+        &self,
+        loader: Arc<dyn broca_core::provider::CachePredecessorLoader>,
+    ) {
+        *self.cache_predecessor_loader.lock().unwrap() = Some(loader);
     }
 
     fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {
@@ -1501,11 +1513,17 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         )
     }
     fn close_run_transport(&self) {
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.set_loader(None);
+        }
         self.websocket.close();
         self.websocket_lease.lock().unwrap().take();
     }
 
     fn complete_run_transport(&self) {
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.set_loader(None);
+        }
         if let Some(lease) = self.websocket_lease.lock().unwrap().take() {
             lease.complete(&self.websocket);
         }
