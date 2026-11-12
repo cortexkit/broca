@@ -1817,6 +1817,27 @@ impl CompactionSpy {
         }
     }
 
+    /// The spy as a provider that has read `session`'s entries for itself, as a real provider
+    /// reads `session.entries` after its Setup. A Setup names the newest entry, so no notice
+    /// repeats the window it covers (compaction N6); without this read a scripted view could not
+    /// name an entry written before the run's Setup. Returns the entries read.
+    async fn read_session(&self, session: &Session<&MemoryBackend>) -> Value {
+        let entries: Vec<_> = session
+            .compaction_entries(1, usize::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|stored| broca_session_loop::entries::project(stored).unwrap())
+            .collect();
+        let read = serde_json::to_value(entries).unwrap();
+        remember_entries(
+            &read,
+            &mut self.mids.lock().unwrap(),
+            &mut self.tool_parts.lock().unwrap(),
+        );
+        read
+    }
+
     /// Whether this call is the one the script answers as a provider that lost its Setup; it is
     /// answered so once.
     fn loses_setup(&self, method: &str) -> bool {
@@ -9681,6 +9702,7 @@ async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_r
                 context_limit: 1_200,
                 rides: vec![Ride::CutAndTrim(cut, big_call)],
             });
+            spy.read_session(&session).await;
             let mut enrolling = enrolling_run(vec![
                 answer(
                     "a6",
@@ -10387,9 +10409,9 @@ async fn converted_with_global_system(
 }
 
 /// The converted session of [`converted_with_global_system`] enrolls through the new loop. Its
-/// global system message is suppressed: the plan's system text takes its place. The compaction
-/// provider is still told of it, as a system entry with no parts at ordinal 1, since the contract
-/// counts every message, so a view it builds can name that entry. A view that cuts through it,
+/// global system message is suppressed: the plan's system text takes its place. The entries the
+/// compaction provider reads still hold it, as a system entry with no parts at ordinal 1, since
+/// the contract counts every message, so a view it builds can name that entry. A view that cuts through it,
 /// besides trimming the run's big output, is accepted at the step where the provider answers
 /// with it and applies; the requests, and the next run's, render byte for byte as under the same
 /// view without the cut, since an entry with no parts renders nothing.
@@ -10413,6 +10435,7 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                 context_limit: 1_200,
                 rides: vec![ride],
             });
+            spy.read_session(&session).await;
             let mut enrolling = enrolling_run(vec![
                 answer(
                     "a6",
@@ -10432,15 +10455,14 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                 spy.calls()
             );
             assert_eq!(requests.len(), 2, "{:?}", spy.calls());
-            // The provider was told of the suppressed message's entry, with no parts.
-            let told = spy
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .flat_map(|(_, params)| told_entries(params))
+            // Once the run enrolled the session, the entries the provider reads hold the
+            // suppressed message's with no parts: the contract counts every message, so a view
+            // can name it.
+            let read = spy.read_session(&session).await;
+            let told = told_entries(&read)
+                .into_iter()
                 .find(|entry| entry["ordinal"] == 1)
-                .expect("the provider was told of ordinal 1");
+                .expect("the provider read ordinal 1");
             assert_eq!(told["role"], "system", "{told}");
             assert_eq!(told["parts"], json!([]), "{told}");
             assert!(spy.rides.lock().unwrap().is_empty(), "the ride was answered");

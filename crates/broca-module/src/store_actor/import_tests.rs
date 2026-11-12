@@ -2219,8 +2219,8 @@ async fn a_pi_call_left_unanswered_is_listed_after_its_turn() {
 
 /// An imported session states no reading of its fill until its own first step is measured. The
 /// last reading it holds is the prompt size the source runner reported, for a prompt broca never
-/// built, so every compaction call before that step carries neither `last_prompt_tokens` nor
-/// `last_prompt_view`. The session's own first reading names the view its request carried, here
+/// built, so every compaction call before that step, its Setup included, carries neither
+/// `last_prompt_tokens` nor `last_prompt_view`. The session's own first reading names the view its request carried, here
 /// none (`0`).
 #[tokio::test]
 async fn an_imported_session_states_no_reading_until_its_own_step() {
@@ -2243,11 +2243,21 @@ async fn an_imported_session_states_no_reading_until_its_own_step() {
         "Question 5.",
     )
     .await;
+    // Setup counts: it comes before the step and must not carry the source's reading either. No
+    // notice goes between Setup and the step, since Setup covers the imported window
+    // (compaction N6), so Setup is the only call before it.
     let calls = compactor.calls.lock().unwrap();
     let readings: Vec<(&str, Option<u64>, Option<u64>)> = calls
         .iter()
-        .filter(|(method, _)| method != "compaction.setup")
         .map(|(method, params)| {
+            if method == "compaction.setup" {
+                assert!(
+                    !params.to_string().contains("last_prompt"),
+                    "Setup states a reading: {params}"
+                );
+            } else {
+                assert!(params["conditions"].is_object(), "{method}: {params}");
+            }
             let conditions = &params["conditions"];
             (
                 method.as_str(),
