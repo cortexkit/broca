@@ -1181,6 +1181,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves one write the active run asks for.
     async fn serve_request(&mut self, request: broca_session_loop::shared::Request) {
+        if let broca_session_loop::shared::Request::CachePredecessor { reply } = request {
+            let _ = reply.send(self.cache_predecessor().await);
+            return;
+        }
         // A seal's own deletions come due a grace period after it, but earlier ones may be due.
         let seals = matches!(request, broca_session_loop::shared::Request::Seal { .. });
         let active = self
@@ -2418,6 +2422,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// meanwhile, and sends the waiting run its media.
     async fn media_built(&mut self, built: Result<MediaHistory, tokio::task::JoinError>) {
         self.media_build = None;
+        if built.as_ref().is_err_and(|error| error.is_cancelled()) {
+            // Teardown is not a media failure. Keep the run waiting for its media rather
+            // than delivering a permanent failure that could end it or refuse its send.
+            self.stopping = true;
+            return;
+        }
         let history = built.unwrap_or_else(|error| {
             Err(format!("the session's media index build failed: {error}"))
         });
@@ -3260,6 +3270,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// the next queued send. A drained run refused at admission ends its queued send with the
     /// refusal, as today's actor ends it, and the next one is tried.
     async fn finish_run(&mut self, end: Result<StoreRunEnd, tokio::task::JoinError>) {
+        if end.as_ref().is_err_and(|error| error.is_cancelled()) {
+            // Runtime teardown can cancel the task before its actor stops polling. Leave the
+            // run and queued sends untouched for crash recovery, not permanently failed.
+            // A panic still follows the failure path below: the runner itself failed, and
+            // ending that run lets later sends proceed.
+            self.stopping = true;
+            if let Some(reply) = self.run.take().and_then(|active| active.admitting) {
+                let _ = reply.send(SendOutcome::Transient(
+                    "the run's task stopped before its start was written".into(),
+                ));
+            }
+            return;
+        }
         // A warm the run's keep-warm sent before the run ended is recorded, even when its record
         // arrived with the run's end.
         while let Some(record) = self
@@ -3276,7 +3299,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // Whatever the run's start stored of its send's media is the session's now; a run that
         // never wrote its start leaves nothing for the next one.
         self.held.clear();
-        // A run task that panicked or was aborted says nothing about whether the send could be
+        // A run task that panicked says nothing about whether the send could be
         // admitted, so its answer below stays unclassified.
         let task_failed = end.is_err();
         let result = match end {
@@ -4667,6 +4690,8 @@ mod warm;
 
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod cancellation_tests;
 #[cfg(test)]
 mod class_tests;
 #[cfg(test)]

@@ -76,6 +76,11 @@ pub enum Request {
         since_ms: u64,
         reply: Reply<broca_core::provider::AcceptedSendEvidence>,
     },
+    CachePredecessor {
+        reply: tokio::sync::oneshot::Sender<
+            Result<Option<broca_core::provider::CachePredecessor>, String>,
+        >,
+    },
     RunStart {
         run_id: String,
         reply: Reply<Option<RunStart>>,
@@ -147,7 +152,32 @@ pub struct RunLink {
     missed: Missed,
 }
 
+struct PredecessorLoader(mpsc::Sender<Request>);
+
+#[async_trait::async_trait]
+impl broca_core::provider::CachePredecessorLoader for PredecessorLoader {
+    async fn load(&self) -> Result<Option<broca_core::provider::CachePredecessor>, String> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.0
+            .send(Request::CachePredecessor { reply })
+            .await
+            .map_err(|_| {
+                "the session owner closed before reading the cache predecessor".to_owned()
+            })?;
+        receive
+            .await
+            .map_err(|_| "the session owner dropped the cache predecessor read".to_owned())?
+    }
+}
+
 impl ActorWriter {
+    /// A deferred read through the owning actor. The provider consumes it before recording
+    /// its first attempt, so the newest durable attempt is still its predecessor.
+    pub fn cache_predecessor_loader(
+        &self,
+    ) -> Arc<dyn broca_core::provider::CachePredecessorLoader> {
+        Arc::new(PredecessorLoader(self.requests.clone()))
+    }
     /// Shares final entry ids with the actor's live-event observer, without writing records.
     pub fn with_message_ids(mut self, ids: Option<crate::entries::MessageIds>) -> Self {
         self.message_ids = ids;
@@ -526,6 +556,11 @@ impl RunLink {
                 reply,
             } => {
                 let _ = reply.send(session.accepted_send(&account, since_ms).await);
+            }
+            Request::CachePredecessor { reply } => {
+                let _ = reply.send(Err(
+                    "the session owner does not rebuild recorded requests".into()
+                ));
             }
             Request::RunStart { run_id, reply } => {
                 let _ = reply.send(session.run_start(&run_id).await);

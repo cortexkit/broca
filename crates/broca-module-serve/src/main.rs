@@ -4735,6 +4735,9 @@ mod executor {
             );
             seams.model_call_ready = model_call_ready;
             seams.keep_warm = keep_warm;
+            resolved
+                .provider
+                .set_cache_predecessor_loader(writer.cache_predecessor_loader());
             let finished = if fresh_episode {
                 match broca_session_loop::admit::admission(
                     req,

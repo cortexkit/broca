@@ -4714,6 +4714,7 @@ impl ServeHandler for crate::LineageRegistry {
                                 .retry_after_secs
                                 .and_then(cortexkit_role_llm_runner::read::RetryAfterSecs::new);
                             summary.resets_at_ms = error.resets_at_ms;
+                            summary.provider_code = error.provider_code.clone();
                             Some(summary)
                         }
                         _ => None,

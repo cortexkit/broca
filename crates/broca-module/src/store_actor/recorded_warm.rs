@@ -127,6 +127,26 @@ pub(super) async fn request<W: Writer>(
 }
 
 impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> super::StoreActor<B> {
+    /// Called while the first attempt is finishing, before that attempt is appended. A
+    /// diagnostic read needs only the newest attempted run and the setup recorded for it.
+    pub(super) async fn cache_predecessor(
+        &self,
+    ) -> Result<Option<broca_core::provider::CachePredecessor>, String> {
+        let mut run_id = None;
+        let mut records = self
+            .session
+            .ledger_tail_until(|record| {
+                if let Record::Attempt(attempt) = record {
+                    run_id.get_or_insert_with(|| attempt.run_id.clone());
+                }
+                matches!(record, Record::RunStart(start) if Some(&start.run_id) == run_id.as_ref())
+            })
+            .await
+            .map_err(|error| format!("read the cache predecessor: {error:?}"))?;
+        records.reverse();
+        predecessor(&self.session, &records, &self.parts, &self.key).await
+    }
+
     pub(super) async fn recorded_warm_request(&self) -> Result<RecordedRequest, String> {
         let mut records = self
             .session
@@ -160,6 +180,51 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         }
         request(&self.session, &records, &self.parts, &self.key).await
     }
+}
+
+async fn predecessor<W: Writer>(
+    writer: &W,
+    records: &[(u64, Record)],
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+) -> Result<Option<broca_core::provider::CachePredecessor>, String> {
+    let Some((seq, attempt)) = records.iter().rev().find_map(|(seq, record)| match record {
+        Record::Attempt(attempt) => Some((*seq, attempt)),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let start = records
+        .iter()
+        .position(|(_, record)| {
+            matches!(record,
+        Record::RunStart(start) if start.run_id == attempt.run_id)
+        })
+        .ok_or("the cache predecessor's run start is outside readable history")?;
+    let mut prefix = Operations::default();
+    for (at, record) in &records[start..] {
+        if *at > seq {
+            break;
+        }
+        prefix
+            .apply_at(Some(*at), record)
+            .map_err(|error| format!("the cache predecessor's state: {error:?}"))?;
+    }
+    let mut operations = writer.operations().clone();
+    operations.run = prefix.run;
+    let snapshot = Before {
+        writer,
+        conversation: writer.conversation().clone(),
+        operations,
+    };
+    let request = request(&snapshot, &records[start..], parts, bind).await?;
+    Ok(Some(broca_core::provider::CachePredecessor {
+        request,
+        sent_at_ms: attempt.sent_at_ms,
+        account: attempt.served_account_ref.clone(),
+        locator: format!("{}:{seq}", writer.session_id()),
+        view: None,
+    }))
 }
 
 /// Share the run's media delivery with a warm that rebuilds one recorded request: both render

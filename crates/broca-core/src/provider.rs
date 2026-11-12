@@ -16,6 +16,20 @@ use tokio_util::sync::CancellationToken;
 
 pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
 
+/// A recorded model attempt and the request reconstructed from its durable inputs.
+pub struct CachePredecessor {
+    pub request: crate::RecordedRequest,
+    pub sent_at_ms: Option<u64>,
+    pub account: Option<String>,
+    pub locator: String,
+    pub view: Option<u64>,
+}
+
+#[async_trait]
+pub trait CachePredecessorLoader: Send + Sync {
+    async fn load(&self) -> Result<Option<CachePredecessor>, String>;
+}
+
 /// What a session's history proves about accepted model sends on one account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptedSendEvidence {
@@ -102,6 +116,10 @@ pub trait Provider: Send + Sync {
 
     /// Exclusively acquire any in-memory connection retained for this full session bind.
     fn bind_run_transport(&self, _session: &broca_protocol::BindIdentity) {}
+
+    /// Install a read of the last recorded request, used only when a cache diagnostic
+    /// comparison after a restart needs its predecessor. Installing it performs no history reads.
+    fn set_cache_predecessor_loader(&self, _loader: Arc<dyn CachePredecessorLoader>) {}
 
     /// Restore the bound session's diagnostic predecessor once per WAL lineage, or after
     /// an aborted in-flight attempt left its predecessor state unavailable.
@@ -401,6 +419,10 @@ impl Provider for Box<dyn Provider> {
 
     fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
         (**self).bind_run_transport(session);
+    }
+
+    fn set_cache_predecessor_loader(&self, loader: Arc<dyn CachePredecessorLoader>) {
+        (**self).set_cache_predecessor_loader(loader)
     }
 
     fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {

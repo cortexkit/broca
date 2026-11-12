@@ -757,7 +757,10 @@ async fn keyed_sends_report_their_status_alike() {
 /// no actor writes anything more.
 async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
     tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        // No task may run once block_on returns. A multi-thread runtime can cancel a run
+        // task while its actor is still polling, letting the actor record the cancellation
+        // as a run failure and drain the queue during shutdown instead of leaving a crash.
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
@@ -805,7 +808,10 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
         store.run_result("r1").await,
         store.run_status("r2").await,
     ];
-    assert!(store.registry.slot_state(&store.key).is_some());
+    assert!(
+        store.registry.slot_state(&store.key).is_some(),
+        "the recovered actor holds r2's gated model call: {before:?}"
+    );
     assert_eq!(before[0]["state"], json!("interrupted"), "{}", before[0]);
     assert_eq!(before[0]["reason"], json!("runner_crash"), "{}", before[0]);
     assert_eq!(
