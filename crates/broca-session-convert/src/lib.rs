@@ -1900,6 +1900,8 @@ mod enrolled_entries_tests;
 mod inverse_tests;
 #[cfg(test)]
 mod marks_tests;
+#[cfg(test)]
+mod media_parity_tests;
 
 #[cfg(test)]
 mod read_cost_tests;

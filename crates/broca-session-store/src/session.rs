@@ -272,6 +272,8 @@ pub struct Session<B: SessionBackend> {
     observer: Option<PositionedAppendObserver>,
     /// The open log's records kept in memory (see `kept`).
     kept: kept::KeptRecords,
+    /// The media fold, and the media index the open log's checkpoint names (see `media_index`).
+    media: media_index::MediaState,
     /// Set while reads come from memory only (see [`Session::in_memory`]).
     memory_only: std::sync::atomic::AtomicBool,
     /// Set when a read refused for needing storage while reads came from memory only.
@@ -443,6 +445,7 @@ impl<B: SessionBackend> Session<B> {
             transcript_base: None,
             ledger_base: None,
             activity_ms: None,
+            media: None,
         };
         let encoded = encoder.checkpoint(&checkpoint.encode())?;
         backend
@@ -477,6 +480,7 @@ impl<B: SessionBackend> Session<B> {
             sealed_entries: Default::default(),
             observer: None,
             kept: kept::KeptRecords::from_next(head_next_seq, true),
+            media: Default::default(),
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
@@ -681,12 +685,14 @@ impl<B: SessionBackend> Session<B> {
             .next_seq
             .max(checkpoint.next_seq)
             .max(last_seq.map_or(0, |seq| seq + 1));
+        let mut media = media_index::Loading::new(&checkpoint);
         let mut conversation = checkpoint.conversation;
         let mut operations = checkpoint.operational;
         let mut open_ids = OpenIds::default();
         let mut window = OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
         for (seq, record) in &read.records {
             window.note(*seq, record);
+            media.note(*seq, record, &conversation, &operations);
             if record.stream() == Stream::Ledger {
                 if *seq <= checkpoint.covers_through {
                     continue;
@@ -715,6 +721,7 @@ impl<B: SessionBackend> Session<B> {
             // Set by whoever takes the loaded session: a view keeps every record, a writer its
             // latest run's.
             kept: kept::KeptRecords::default(),
+            media: media.finish(),
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
@@ -828,6 +835,17 @@ impl<B: SessionBackend> Session<B> {
     /// Folds `records` into the state, then appends them as one batch, synced if `barrier`.
     /// Returns the seq of the first record.
     pub async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
+        let (first, media) = self.append_folding(records, barrier).await?;
+        self.media.handed(media);
+        Ok(first)
+    }
+
+    /// [`Session::append`], returning what the batch's records handed over to the image engine.
+    async fn append_folding(
+        &mut self,
+        records: &[Record],
+        barrier: bool,
+    ) -> Result<(u64, MediaFeed), SessionError> {
         let timing = crate::metrics::Phase::Append
             .start()
             .with_session(|| Some(self.addr.0.clone()));
@@ -843,9 +861,17 @@ impl<B: SessionBackend> Session<B> {
         let encoded = self.encoder.batch(records)?;
         let first = encoded.first_seq.expect("a batch holds records");
         self.poisoned = true;
+        let mut media = MediaFeed::default();
         for (position, record) in records.iter().enumerate() {
             check_announced_mid(&self.conversation, &self.operations, record)
                 .map_err(SessionError::Fold)?;
+            self.media.fold.apply(
+                first + position as u64,
+                record,
+                &self.conversation,
+                &self.operations,
+                &mut media,
+            );
             apply(
                 &mut self.conversation,
                 &mut self.operations,
@@ -854,6 +880,7 @@ impl<B: SessionBackend> Session<B> {
             )
             .map_err(SessionError::Fold)?;
         }
+        self.media.fold.flush(&mut media);
         self.backend
             .append_log(
                 &self.addr,
@@ -882,7 +909,7 @@ impl<B: SessionBackend> Session<B> {
             records,
             durable: barrier,
         });
-        Ok(first)
+        Ok((first, media))
     }
 
     /// Tells `observer` of every batch this writer appends from now on, right after its append
@@ -1057,6 +1084,17 @@ pub use media::{
 };
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia};
+mod media_index;
+pub use crate::fold::media::{
+    limits_in, LimitsSource, MediaFeed, MediaFold, MediaIndexRef, MediaItem, MediaStart,
+    RunStartNeedingLimits,
+};
+pub use media_index::{
+    AcceptedMessage, HeldSkeleton, LoadedMedia, MediaIndexSave, MediaIndexSource, PlacedSkeleton,
+    SavedIndex, ShownOccurrence, StoredAging, StoredBinding, StoredCapture, StoredMediaId,
+    StoredMediaIndex, StoredOccurrence, StoredReplacement, StoredSelection, StoredSkeleton,
+    StoredSlot, MEDIA_INDEX_VERSION,
+};
 mod enrollment;
 pub use enrollment::EnrollmentOverlay;
 

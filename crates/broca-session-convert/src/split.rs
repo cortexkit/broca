@@ -69,6 +69,7 @@ pub fn check_splits(
                 transcript_base: None,
                 ledger_base: None,
                 activity_ms: None,
+                media: None,
             };
             let loaded = Checkpoint::decode(&checkpoint.encode())
                 .map_err(|e| format!("checkpoint at {split} doesn't decode: {e}"))?;

@@ -196,6 +196,7 @@ pub(super) fn first_log_checkpoint(head: &Head) -> Checkpoint {
         transcript_base: None,
         ledger_base: None,
         activity_ms: None,
+        media: None,
     }
 }
 

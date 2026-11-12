@@ -1,4 +1,5 @@
 use super::conversation::Conversation;
+use super::media::{Captured, MediaFold, MediaIndexRef};
 use super::operations::{
     Budget, EffectiveChange, Enrollment, ManifestRef, ModelTotals, OpenBatch, Operations, Owner,
     PendingChange, Plan, Run, SessionUsage, SetupInForce, UsageTotals,
@@ -22,6 +23,9 @@ const STATES: &[(&str, &[FieldSpec])] = &[
     ("EffectiveChange", EffectiveChange::SCHEMA),
     ("ManifestRef", ManifestRef::SCHEMA),
     ("Enrollment", Enrollment::SCHEMA),
+    ("MediaFold", MediaFold::SCHEMA),
+    ("Captured", Captured::SCHEMA),
+    ("MediaIndexRef", MediaIndexRef::SCHEMA),
 ];
 
 /// Each field bounded as `Declared`, with the state struct whose own fields carry the bounds.
@@ -41,6 +45,8 @@ const DECLARED: &[(&str, &str, &str)] = &[
     ("SessionUsage", "totals", "UsageTotals"),
     ("ModelTotals", "totals", "UsageTotals"),
     ("Run", "budget", "Budget"),
+    ("MediaFold", "captured", "Captured"),
+    ("MediaIndexRef", "fold", "MediaFold"),
 ];
 
 #[test]

@@ -178,6 +178,7 @@ macro_rules! state {
 pub(crate) use state;
 
 pub mod conversation;
+pub mod media;
 pub mod operations;
 
 #[cfg(test)]

@@ -868,6 +868,7 @@ fn write_fuzz_seeds() {
         transcript_base: None,
         ledger_base: None,
         activity_ms: None,
+        media: None,
     };
     write(
         "head_checkpoint",
