@@ -26,7 +26,7 @@ use crate::writer::Writer;
 
 pub(crate) mod prompt;
 mod window;
-pub use window::WindowTranscript;
+pub use window::{WeakWindow, WindowTranscript};
 
 #[cfg(test)]
 thread_local! {

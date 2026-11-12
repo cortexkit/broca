@@ -226,4 +226,8 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.writer.media()
     }
+
+    fn share_window(&self, window: crate::compaction::WeakWindow) {
+        self.writer.share_window(window)
+    }
 }

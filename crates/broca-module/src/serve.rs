@@ -2605,6 +2605,11 @@ pub trait ServeHandler: Send + Sync {
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
     }
+    /// `memory.report`: what the daemon's open sessions and caches hold, estimated by walking
+    /// them now. `None` from a handler without sessions to report.
+    async fn memory_report(&self) -> Option<broca_wire::MemoryReport> {
+        None
+    }
     /// Check the move latch before authorization reads frozen session metadata.
     /// File-backed handlers enforce the durable fence even for already-bound routes.
     async fn check_migration(&self, _session: &LineageKey, _write: bool) -> Result<(), ServeError> {
@@ -3360,6 +3365,9 @@ impl ServeHandler for crate::LineageRegistry {
     }
     fn backup_classes(&self) -> Vec<String> {
         crate::LineageRegistry::backup_classes(self)
+    }
+    async fn memory_report(&self) -> Option<broca_wire::MemoryReport> {
+        Some(crate::LineageRegistry::memory_report(self).await)
     }
     async fn check_migration(&self, session: &LineageKey, write: bool) -> Result<(), ServeError> {
         self.check_move(session, write).map_err(Into::into)

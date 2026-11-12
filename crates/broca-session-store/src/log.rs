@@ -162,6 +162,13 @@ pub struct LogEncoder {
     last_seq: Option<u64>,
 }
 
+/// The encoder's key holds its cipher inline, so only its binding is on the heap.
+impl crate::held::HeldBytes for LogEncoder {
+    fn heap_bytes(&self) -> usize {
+        self.bind.capacity()
+    }
+}
+
 impl LogEncoder {
     /// An encoder for a new, empty log. `bind` names the log (the session id and the log's
     /// name); every reader must pass the same bytes. `next_seq` is the first seq a record in

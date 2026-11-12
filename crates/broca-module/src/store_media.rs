@@ -67,6 +67,29 @@ pub struct MediaFold {
 }
 
 impl MediaFold {
+    /// What the fold holds, estimated by walking it when asked (see
+    /// `broca_session_store::held`): its inverse, the records it rebuilt for a running run, and
+    /// where each medium's bytes are. Rebuilt records are today's types, sized by their
+    /// serialized walk; the seed's media checkpoint counts at its inline size.
+    pub(crate) fn held_bytes(&self) -> usize {
+        use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+        let shared = self.shared.lock().map_or(0, |shared| {
+            shared.frames.capacity() * std::mem::size_of::<FramedRecord>()
+                + shared
+                    .frames
+                    .iter()
+                    .map(|frame| serde_heap_bytes(&frame.record))
+                    .sum::<usize>()
+                + shared.objects.heap_bytes()
+                + shared.broken.heap_bytes()
+        });
+        std::mem::size_of::<Self>() - std::mem::size_of::<Inverse>()
+            + self.inverse.held_bytes()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Shared>()
+            + shared
+    }
+
     /// A fold at the start of `session`'s log, before its first record.
     pub fn new(session: BindIdentity) -> Self {
         Self {

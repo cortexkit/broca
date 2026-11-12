@@ -151,6 +151,7 @@ fn today_stopping(steps: Vec<Vec<NormalizedEvent>>) -> Today {
         provider: Gated {
             render_config: None,
             notes_sends: false,
+            hold: None,
             inner: broca_core::provider::StubProvider::new(steps),
             gate: None,
         },

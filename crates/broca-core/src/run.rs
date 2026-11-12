@@ -10051,6 +10051,7 @@ async fn run_step_watched<P: Provider>(
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
+            request: Default::default(),
         });
     }
     // The renderer gets a shared handle to the durable snapshot, never a copy of the prompt.

@@ -85,6 +85,21 @@ pub(super) struct Gated {
     pub(super) gate: Option<Arc<Notify>>,
     pub(super) render_config: Option<serde_json::Value>,
     pub(super) notes_sends: bool,
+    /// When set, each call keeps its request's bytes while it waits at the gate, as a transport
+    /// keeps a request's body for its call, and says it reached the gate.
+    pub(super) hold: Option<Arc<Hold>>,
+}
+
+/// What a gated provider keeps of the call waiting at its gate (see [`Gated::hold`]).
+#[derive(Default)]
+pub(super) struct Hold {
+    /// Notified when a call reaches the gate, holding its request's bytes.
+    pub(super) reached: Notify,
+    /// The bytes of the request waiting, while it waits.
+    pub(super) body_len: std::sync::atomic::AtomicUsize,
+    /// The options of the latest call, held weakly: a test checks they are freed after the call.
+    pub(super) options:
+        std::sync::Mutex<Option<std::sync::Weak<broca_protocol::request::CallOptions>>>,
 }
 
 #[async_trait]
@@ -95,6 +110,9 @@ impl broca_core::provider::Provider for Gated {
         opts: Arc<broca_protocol::request::CallOptions>,
         runtime: broca_core::provider::StepRuntime,
     ) -> mpsc::Receiver<NormalizedEvent> {
+        if let Some(hold) = &self.hold {
+            *hold.options.lock().unwrap() = Some(Arc::downgrade(&opts));
+        }
         let mut input = match runtime.seal {
             Some(seal) => {
                 self.step_with_shutdown_seal(
@@ -205,9 +223,19 @@ impl broca_core::provider::Provider for Gated {
         step_id: broca_protocol::StepId,
         opts: &broca_protocol::request::CallOptions,
     ) -> mpsc::Receiver<NormalizedEvent> {
+        // The request's bytes, rendered as JSON, stand in for the body a transport holds while
+        // its call is in flight.
+        let body = self.hold.as_ref().map(|hold| {
+            let body = serde_json::to_vec(opts).unwrap();
+            hold.body_len
+                .store(body.len(), std::sync::atomic::Ordering::SeqCst);
+            hold.reached.notify_one();
+            body
+        });
         if let Some(gate) = &self.gate {
             gate.notified().await;
         }
+        drop(body);
         self.inner.step(step_id, opts).await
     }
 
@@ -356,6 +384,7 @@ pub(super) fn executor(
             gate,
             render_config: None,
             notes_sends: false,
+            hold: None,
         },
         drain_gate: None,
         planes: Planes::default(),
@@ -1892,7 +1921,7 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
 
 /// A fetch plan's manifest for these tests, with `plan` as the plan the caller sent: the tools
 /// `read` and `edit`, and a system text.
-fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanManifest {
+pub(super) fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanManifest {
     broca_wal::PlanManifest {
         rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
@@ -1922,7 +1951,7 @@ fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanMani
 
 /// A send carrying a plan, as the serve layer hands it over: its identity, and the manifest it
 /// fetched when the session had no run. The session's caller sends it.
-async fn send_planned(
+pub(super) async fn send_planned(
     commands: &Commands,
     run_id: &str,
     request: SubmissionRequest,
@@ -1957,7 +1986,7 @@ async fn send_planned(
 }
 
 /// A send carrying no tools of its own, as a planned session's sends do.
-fn untooled(text: &str) -> SubmissionRequest {
+pub(super) fn untooled(text: &str) -> SubmissionRequest {
     let mut request = request(text);
     request.tools = None;
     request.policy_allowed = Default::default();

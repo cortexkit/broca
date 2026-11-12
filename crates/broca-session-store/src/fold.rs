@@ -152,6 +152,13 @@ macro_rules! state {
 
         impl $crate::codec::Message for $name {}
 
+        impl $crate::held::HeldBytes for $name {
+            fn heap_bytes(&self) -> usize {
+                0 $(+ $crate::held::HeldBytes::heap_bytes(&self.$field))*
+                $($(+ $crate::held::HeldBytes::heap_bytes(&self.$runtime))*)?
+            }
+        }
+
         impl $name {
             pub const SCHEMA: &'static [$crate::fold::FieldSpec] = &[
                 $(

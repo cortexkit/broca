@@ -447,6 +447,17 @@ impl SessionClient {
         decode_result_envelope(&response, error_context)
     }
 
+    /// `memory.report`: what the daemon's open sessions and shared caches hold in memory, for
+    /// the operator. Daemon-scoped: the bound session route is only the transport attachment.
+    pub async fn memory_report(&self) -> Result<crate::wire::MemoryReport, ConnError> {
+        self.request(
+            crate::manifest::OP_MEMORY_REPORT,
+            &crate::wire::MemoryReportParams::default(),
+            "decode memory.report",
+        )
+        .await
+    }
+
     /// Replay a unary management operation without decoding either its reply or refusal body.
     pub async fn management_raw(
         &self,
