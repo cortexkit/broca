@@ -2317,6 +2317,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "session_reads",
         "session_readers",
         "actor_opens",
+        // Views of closed sessions too large for the view cache, counted from zero.
+        "views_over_cap",
         "management_ops",
         // The liveness signal for the scheduled WAL archive. Present even when the knob
         // is unset: zero with no knob is correct, zero on a CONFIGURED daemon that has

@@ -514,6 +514,18 @@ struct CacheInner<V> {
     entries: HashMap<String, CacheEntry<V>>,
     bytes: u64,
     clock: u64,
+    /// Views loaded and not kept because each alone was larger than the byte cap.
+    over_cap: u64,
+}
+
+/// Views of closed sessions this process loaded and didn't keep because each alone was larger
+/// than its cache's byte cap, over every cache: `health.check` reports it as `views_over_cap`.
+static VIEWS_OVER_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many views of closed sessions were loaded and not kept since the process started,
+/// because each alone was larger than the view cache's byte cap (see [`ViewCache::MAX_BYTES`]).
+pub fn views_over_cap() -> u64 {
+    VIEWS_OVER_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl<V> Default for CacheInner<V> {
@@ -522,6 +534,7 @@ impl<V> Default for CacheInner<V> {
             entries: HashMap::new(),
             bytes: 0,
             clock: 0,
+            over_cap: 0,
         }
     }
 }
@@ -648,7 +661,17 @@ impl<V: CachedBytes> ViewCache<V> {
                 inner.bytes += entry.bytes;
             }
         }
-        inner.evict(self.max_entries, self.max_bytes);
+        for (addr, bytes) in inner.evict(self.max_entries, self.max_bytes) {
+            inner.over_cap += 1;
+            VIEWS_OVER_CAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                session = %addr,
+                counted_bytes = bytes,
+                max_bytes = self.max_bytes,
+                "a closed session's view is larger than the view cache's byte cap, so it isn't \
+                 kept: each read of the session while it is closed loads it again"
+            );
+        }
         Ok(view)
     }
 
@@ -675,6 +698,7 @@ impl<V: CachedBytes> ViewCache<V> {
             counted_bytes: Some(inner.bytes),
             max_bytes: Some(self.max_bytes),
             estimated_bytes: estimated as u64,
+            views_over_cap: Some(inner.over_cap),
         }
     }
 
@@ -700,7 +724,23 @@ impl Default for ViewCache {
 
 impl<V> CacheInner<V> {
     /// Drops the least recently used views until the cache is within its bounds.
-    fn evict(&mut self, max_entries: usize, max_bytes: u64) {
+    /// Drops views until the cache fits its caps, and returns the views dropped because each
+    /// alone was larger than the byte cap, with their counted bytes. Such a view goes first, so
+    /// it never pushes the views that fit out of the cache.
+    fn evict(&mut self, max_entries: usize, max_bytes: u64) -> Vec<(String, u64)> {
+        let over: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.bytes > max_bytes)
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        let mut dropped = Vec::new();
+        for addr in over {
+            if let Some(entry) = self.entries.remove(&addr) {
+                self.bytes -= entry.bytes;
+                dropped.push((addr, entry.bytes));
+            }
+        }
         while self.entries.len() > max_entries || self.bytes > max_bytes {
             let Some(oldest) = self
                 .entries
@@ -708,12 +748,13 @@ impl<V> CacheInner<V> {
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(addr, _)| addr.clone())
             else {
-                return;
+                return dropped;
             };
             if let Some(entry) = self.entries.remove(&oldest) {
                 self.bytes -= entry.bytes;
             }
         }
+        dropped
     }
 }
 
@@ -825,5 +866,26 @@ mod tests {
             cache.view(name, at(1, 100), load(per_view)).await.unwrap();
         }
         assert_eq!(cache.usage(), (2, 2 * per_view));
+    }
+
+    /// A view larger than the byte cap alone isn't kept, never pushes out the views that fit, and
+    /// is counted, by the cache and over the process.
+    #[tokio::test]
+    async fn a_view_over_the_byte_cap_is_counted_and_never_kept() {
+        let load = |value: u64| async move { Ok::<_, ()>(value) };
+        let cache: ViewCache<u64> = ViewCache::new(10, 1_000);
+        cache.view("a", at(1, 1), load(400)).await.unwrap();
+        cache.view("b", at(1, 1), load(400)).await.unwrap();
+        let before = super::views_over_cap();
+        assert_eq!(
+            *cache.view("big", at(1, 1), load(1_001)).await.unwrap(),
+            1_001
+        );
+        assert_eq!(cache.usage(), (2, 800));
+        assert_eq!(cache.memory(|_| 0).views_over_cap, Some(1));
+        assert!(super::views_over_cap() > before);
+        // The views that fit are still served without loading.
+        assert_eq!(*cache.view("a", at(1, 1), load(9)).await.unwrap(), 400);
+        assert_eq!(*cache.view("b", at(1, 1), load(9)).await.unwrap(), 400);
     }
 }

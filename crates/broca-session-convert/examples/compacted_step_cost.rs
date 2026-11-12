@@ -903,6 +903,13 @@ impl Compactor {
 
 #[async_trait]
 impl broca_core::CompactionPlane for Compactor {
+    /// The scripted provider's catalog declares no optional field, as the live plane reads an
+    /// empty declaration. A plane whose catalog can't be read leaves unknown whether entries may
+    /// name the agent a send spoke for, and `session.entries` refuses until it is known.
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        broca_core::ProviderCapabilities::Declared(Vec::new())
+    }
+
     async fn setup(
         &self,
         _: &str,
