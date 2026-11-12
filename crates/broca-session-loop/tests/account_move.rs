@@ -344,6 +344,10 @@ enum Scripted {
     Refuse(&'static str),
     /// No usable answer: routing unreachable, or not declaring the operation.
     Nothing,
+    /// The runner is asked to stop while routing is asked, and routing never answers.
+    StopWhileAsked(tokio_util::sync::CancellationToken),
+    /// An offer of `account`, with the runner asked to stop just before the move is written.
+    OfferThenStop(&'static str, tokio_util::sync::CancellationToken),
 }
 
 /// What a wall asked, as the executor saw it.
@@ -436,6 +440,20 @@ impl AccountContinue<Box<dyn Provider>> for Routing {
                 until_ms: None,
             })),
             Scripted::Nothing => Answer::Stay(None),
+            Scripted::StopWhileAsked(stop) => {
+                stop.cancel();
+                std::future::pending::<()>().await;
+                unreachable!("routing never answers")
+            }
+            Scripted::OfferThenStop(account, stop) => {
+                stop.cancel();
+                offer(
+                    account,
+                    routed(account, &format!("decision-{account}")),
+                    NOW + OFFER_VALID_MS,
+                    true,
+                )
+            }
         }
     }
 
@@ -2202,4 +2220,155 @@ async fn a_resume_whose_config_changes_beyond_the_persona_still_ends_the_run() {
             .any(|(_, record)| matches!(record, Record::ConfigRefrozen(_))));
         assert_eq!(sent.len(), 1, "only the first step was sent");
     }
+}
+
+/// Runs a run on A that walls at step 2 while `script` answers routing, with the runner's stop
+/// token handed to the script, and returns how it paused, its records and what was sent; then
+/// resumes it on `resume_on`, as the executor does from the run's recorded account, and returns
+/// how that ended.
+async fn stopped_at_a_wall(
+    script: impl FnOnce(tokio_util::sync::CancellationToken) -> Scripted,
+    resume_on: &str,
+) -> (
+    broca_session_loop::Finished,
+    Vec<(u64, Record)>,
+    broca_session_loop::Finished,
+    Vec<Sent>,
+) {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log: Log = Arc::default();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let provider: Box<dyn Provider> =
+        Box::new(Account::new("A", vec![Reply::Tool, wall()], &sent, &log));
+    let routing = Routing {
+        answers: Mutex::new(vec![script(stop.clone())].into()),
+        providers: Mutex::new(HashMap::from([(
+            "B".to_owned(),
+            Box::new(Account::new("B", vec![Reply::Answer], &sent, &log)) as Box<dyn Provider>,
+        )])),
+        asked: Default::default(),
+        adopted: Default::default(),
+    };
+    let a = routed("A", "decision-A");
+    let mut request = request();
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    let control = broca_core::RunControl {
+        cancel: Some(Default::default()),
+        auth_selection: Some(a.clone()),
+        ..Default::default()
+    };
+    let now = || NOW;
+    let admission = broca_session_loop::admit::admission(
+        &mut request,
+        &control,
+        &provider,
+        Writer::operations(&session),
+        Some(now()),
+    )
+    .unwrap();
+    let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
+    let first = seams(
+        &provider,
+        &tools,
+        &now,
+        Some(&routing),
+        &log,
+        a,
+        Default::default(),
+        stop.clone(),
+    );
+    let mut writer = Logging {
+        session: &mut session,
+        log: Arc::clone(&log),
+        refuse_moves: false,
+        stop_after_batches: None,
+    };
+    let paused = broca_session_loop::run::run(&mut writer, &mut parts, admission, &first)
+        .await
+        .unwrap();
+    drop(first);
+    let records = writer.session.open_log_records().await.unwrap();
+    let resumed_on: Box<dyn Provider> =
+        Box::new(Account::new(resume_on, vec![Reply::Answer], &sent, &log));
+    let second = seams(
+        &resumed_on,
+        &tools,
+        &now,
+        None,
+        &log,
+        routed(resume_on, &format!("decision-{resume_on}")),
+        Default::default(),
+        Default::default(),
+    );
+    let resumed = broca_session_loop::resume(&mut writer, &parts, &second)
+        .await
+        .unwrap();
+    drop(second);
+    let sent = sent.lock().unwrap().clone();
+    (paused, records, resumed, sent)
+}
+
+/// A stop while routing is asked at a wall doesn't wait for its answer: the run pauses for the
+/// restart with nothing recorded about a move, and its resume asks for the walled step again.
+#[tokio::test]
+async fn a_stop_while_routing_is_asked_pauses_the_run_for_the_restart() {
+    let (paused, records, resumed, sent) = stopped_at_a_wall(Scripted::StopWhileAsked, "A").await;
+    assert_eq!(
+        paused.paused,
+        Some(broca_protocol::caller::PauseReason::Restart),
+        "{records:#?}"
+    );
+    assert!(!records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::AuthRefrozen(_))));
+    let Some((_, Record::Pause(pause))) = records.last() else {
+        panic!("the run's last record is its pause: {records:#?}");
+    };
+    assert_eq!(pause.reason, broca_protocol::caller::PauseReason::Restart);
+    assert_eq!(resumed.reason, RunFinishReason::Completed);
+    let steps: Vec<_> = sent
+        .iter()
+        .map(|sent| (sent.account.as_str(), sent.step))
+        .collect();
+    assert_eq!(steps, vec![("A", 1), ("A", 2), ("A", 2)]);
+}
+
+/// A stop that comes while the move is written pauses the run for the restart before anything
+/// is sent on the new account. The move is durable, so the resume continues on it.
+#[tokio::test]
+async fn a_stop_while_the_move_is_written_pauses_before_the_new_account_is_sent_to() {
+    let (paused, records, resumed, sent) =
+        stopped_at_a_wall(|stop| Scripted::OfferThenStop("B", stop), "B").await;
+    assert_eq!(
+        paused.paused,
+        Some(broca_protocol::caller::PauseReason::Restart),
+        "{records:#?}"
+    );
+    let kinds: Vec<_> = records
+        .iter()
+        .rev()
+        .take(3)
+        .map(|(_, record)| kind(record))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "Pause".to_owned(),
+            "AuthRefrozen".to_owned(),
+            "ConfigRefrozen".to_owned()
+        ]
+    );
+    assert_eq!(resumed.reason, RunFinishReason::Completed);
+    let steps: Vec<_> = sent
+        .iter()
+        .map(|sent| (sent.account.as_str(), sent.step))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![("A", 1), ("A", 2), ("B", 2)],
+        "nothing went to B before the pause; the resume sends step 2 there"
+    );
 }

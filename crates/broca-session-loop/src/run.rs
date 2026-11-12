@@ -2348,7 +2348,10 @@ where
             Some(_) => Default::default(),
             None => Box::pin(ordered_sends(writer)).await?,
         };
-        let boundary = if entering.is_some() {
+        // A step entered again after a move writes no boundary, unless the run must end or
+        // pause here: a cancel or a stop that came while routing was asked or the move was
+        // written is acted on before anything is sent on the new account.
+        let boundary = if entering.is_some() && !ending {
             Vec::new()
         } else {
             writer
@@ -2891,6 +2894,32 @@ where
                                 answer,
                                 (seams.now_ms)(),
                             );
+                        }
+                        // A cancel ends the run as cancelled. A stop pauses it for the restart when
+                        // its policy is to resume, and the resume asks for this step again; without
+                        // that policy the run ends with the provider's error, as it would have had
+                        // routing not been asked.
+                        Some(crate::account_move::AtWall::Stopped) => {
+                            if seams.cancel.is_cancelled() {
+                                return finish(
+                                    writer,
+                                    seams,
+                                    &admission.run_id,
+                                    RunFinishReason::Cancelled,
+                                )
+                                .await;
+                            }
+                            if admission.on_restart == Some(OnRestart::Resume) {
+                                return pause(
+                                    writer,
+                                    seams,
+                                    &admission.run_id,
+                                    PauseReason::Restart,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                         Some(crate::account_move::AtWall::Stayed(None)) | None => {}
                     }

@@ -112,6 +112,10 @@ pub(crate) enum AtWall<P> {
     Moved(Box<Move<P>>),
     /// No move; routing's answer, if it gave one, for the run's error.
     Stayed(Option<AccountContinueAnswer>),
+    /// The run was cancelled, or the runner asked to stop, while routing was being asked:
+    /// nothing was recorded and the question was dropped. The run ends or pauses as it would
+    /// at a step's boundary.
+    Stopped,
 }
 
 /// How the loop enters a step again after a move: no boundary is written (the step started
@@ -210,7 +214,14 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     // within what is left of the wall's budget, and a second unusable answer ends the run.
     let mut wall = wall;
     let (moved, now) = loop {
-        let moved = match continuer.ask(&wall).await {
+        // A cancel or a stop does not wait for routing: an answer that arrives after either
+        // would move a run that must end or pause.
+        let answer = tokio::select! {
+            answer = continuer.ask(&wall) => answer,
+            () = seams.cancel.cancelled() => return Ok(Some(AtWall::Stopped)),
+            () = seams.stop.cancelled() => return Ok(Some(AtWall::Stopped)),
+        };
+        let moved = match answer {
             Answer::Stay(answer) => return Ok(Some(AtWall::Stayed(answer))),
             Answer::Move(moved) => moved,
         };
