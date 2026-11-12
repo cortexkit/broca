@@ -2888,6 +2888,15 @@ mod tests {
         // The record's identity across a delete and re-create under the same id (claustrum
         // 62d65d78). Unread: broca keys credentials by id and re-reads them on every listing.
         incarnation: Option<String>,
+        // Fusiform's provider id for a catalog key (claustrum a7679aa7). Unread: broca matches
+        // providers through `provider_ids` only.
+        fusiform_provider_id: Option<String>,
+        // The hosts a catalog key may be sent to (claustrum a7679aa7). Unread: broca sends to the
+        // base URL its catalog row and `credential.get` name.
+        hosts: Option<Vec<String>>,
+        // When an operator plan tier took effect, on tiers that have a start (claustrum
+        // a7679aa7). Unread for the same reason as `plan_tier`.
+        plan_tier_since_ms: Option<u64>,
     }
 
     #[derive(Deserialize)]
