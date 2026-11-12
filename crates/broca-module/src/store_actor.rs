@@ -156,6 +156,7 @@ pub struct StoreActor<B: SessionBackend> {
     /// The warm the executor is sending, if any.
     warm: Option<warm::PendingStoreWarm>,
     step_event_warm_stops: crate::step_events::WarmStops,
+    step_message_ids: Option<broca_session_loop::entries::MessageIds>,
     /// The scope the ordered send being admitted was admitted under, set only while it is: the
     /// run it starts at once, if it does, records it (see `drained_start`).
     ordered_scope: Option<broca_protocol::SessionScope>,
@@ -425,6 +426,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             registry: None,
             warm: None,
             step_event_warm_stops: Default::default(),
+            step_message_ids: None,
             ordered_scope: None,
             created: None,
             collect_due: false,
@@ -726,13 +728,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Install a content-free observer independent of transcript subscription demand.
     pub fn with_step_events(mut self, events: &crate::step_events::StepEvents) -> Self {
-        let mut observer = events.store_observer(
-            self.key.clone(),
-            self.session.head().incarnation.0,
-            self.session.next_seq(),
-            self.parts.clone(),
-            self.step_event_warm_stops.clone(),
-        );
+        let message_ids = broca_session_loop::entries::MessageIds::default();
+        self.step_message_ids = Some(message_ids.clone());
+        let mut observer = events
+            .store_observer(
+                self.key.clone(),
+                self.session.head().incarnation.0,
+                self.session.next_seq(),
+                self.parts.clone(),
+                self.step_event_warm_stops.clone(),
+            )
+            .with_message_ids(message_ids);
         if let Some(run) = self.session.operations().run.as_ref() {
             if let Some(start) = run.start.as_ref() {
                 observer.seed_run(start, run.refrozen_render.as_ref());
@@ -2203,7 +2209,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             &self.session,
             Some(Arc::clone(&tool_media) as Arc<dyn broca_core::tool_media::MediaCapture>),
         );
-        let writer = writer.sharing_window(Arc::clone(&window));
+        let writer = writer
+            .sharing_window(Arc::clone(&window))
+            .with_message_ids(self.step_message_ids.clone());
         let parts: Box<dyn Parts> = Box::new(self.parts.clone());
         let executor = Arc::clone(&self.executor);
         let (out, mut events) = mpsc::channel(256);

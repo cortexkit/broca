@@ -19,6 +19,18 @@ its own log incarnation and sequence. The new-storage writer fills its existing
 optional attempt-id field when recording a model attempt; automatic keep-warms
 record an id and observed completion metadata in the existing warm record.
 
+On session-store storage, `message_id` is the assistant message's `mid` served by
+`session.read` and `session.entries`, copied from its stored entry facts, only
+on the attempt whose reply placed that message. Failed attempts (including those
+retried), cancelled or interrupted attempts, warm-ups (idle or in a tool wait),
+and attempts that placed no message omit the member entirely, not as `null`.
+The id is opaque, with 1–256 visible ASCII bytes; it is neither a provider message
+id nor an attempt or harness step reference. Legacy WAL storage remains unchanged
+and does not emit `message_id`.
+Attempts accepted after cutting trailing whitespace from tool arguments also
+omit `message_id`: their events currently publish as `failed` before their
+assistant message is placed.
+
 Today's WAL observer is installed alongside, not instead of, transcript fanout.
 The new-storage observer buffers only attempt metadata until the append's
 durability barrier. A completed model attempt receives the usage its durable

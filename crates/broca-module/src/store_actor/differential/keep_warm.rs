@@ -437,6 +437,11 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
         let event =
             cortexkit_role_llm_runner::step_events::decode_step_finished(&subject, &body).unwrap();
         assert_eq!(event.runner, "broca");
+        assert_eq!(event.message_id, None);
+        assert!(serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap()
+            .get("message_id")
+            .is_none());
         assert_eq!(event.harness, side.key.harness);
         assert_eq!(event.session, side.key.session);
         assert_eq!(event.session_ref, broca_core::agent_session_ref(&side.key));
@@ -520,6 +525,13 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
             "encrypted"
         };
         sample(&format!("keep-warm-{storage}-{mode}.json"), &body);
+        if new_storage && cipher == Cipher::None {
+            if let Some(dir) = std::env::var_os("BROCA_STEP_MESSAGE_ID_SAMPLES_DIR") {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("warm-up.json"), &body).unwrap();
+            }
+        }
         bodies.push(body);
     }
     assert_eq!(normalized(&bodies[0]), normalized(&bodies[1]));

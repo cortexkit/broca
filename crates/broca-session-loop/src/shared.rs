@@ -113,6 +113,7 @@ pub enum Request {
 
 /// The run's writer: a client of the actor that owns the session.
 pub struct ActorWriter {
+    message_ids: Option<crate::entries::MessageIds>,
     requests: mpsc::Sender<Request>,
     conversation: Conversation,
     operations: Operations,
@@ -142,6 +143,12 @@ pub struct RunLink {
 }
 
 impl ActorWriter {
+    /// Shares final entry ids with the actor's live-event observer, without writing records.
+    pub fn with_message_ids(mut self, ids: Option<crate::entries::MessageIds>) -> Self {
+        self.message_ids = ids;
+        self
+    }
+
     /// A writer for a run, starting from the session's folds as they stand, and the actor's end
     /// of it. `media` is where a tool result's media is captured while its call runs; the actor
     /// stores those bytes when it appends the result's record.
@@ -150,6 +157,7 @@ impl ActorWriter {
         let (sender, receiver) = mpsc::channel(1);
         (
             Self {
+                message_ids: None,
                 requests: sender,
                 conversation: session.conversation().clone(),
                 operations: session.operations().clone(),
@@ -327,6 +335,10 @@ impl Writer for ActorWriter {
 
     fn message_id_prefix(&self) -> String {
         self.message_id_prefix.clone()
+    }
+
+    fn message_ids(&self) -> Option<crate::entries::MessageIds> {
+        self.message_ids.clone()
     }
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
