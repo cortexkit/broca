@@ -142,7 +142,7 @@ fn refused(report: &mut MoveCheckReport, name: &str, error: StageError) {
 
 /// Today's media store of one class, opened read only, so a check never creates one.
 #[derive(Debug)]
-struct ReadOnly(ReadOnlyMediaStore);
+pub(super) struct ReadOnly(ReadOnlyMediaStore);
 
 impl MediaBytes for ReadOnly {
     fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
@@ -151,8 +151,8 @@ impl MediaBytes for ReadOnly {
 }
 
 /// Today's media store for one session: the store, and where it lives.
-struct TodaysMedia {
-    store: ReadOnly,
+pub(super) struct TodaysMedia {
+    pub(super) store: ReadOnly,
     state_root: std::path::PathBuf,
     class: MediaStoreClass,
 }
@@ -173,7 +173,7 @@ fn class_of_folder(folder: &str) -> Option<MediaStoreClass> {
 /// log's folder chooses, in the state root that folder sits in. `None` when the session's
 /// `records` name no medium, when the log isn't in one of a state root's log folders, or when
 /// that store doesn't exist; a session naming media is then refused `media_missing`.
-fn todays_media(source: &Path, records: &[FramedRecord]) -> Option<TodaysMedia> {
+pub(super) fn todays_media(source: &Path, records: &[FramedRecord]) -> Option<TodaysMedia> {
     if broca_session_convert::stage::media_digests(records).is_empty() {
         return None;
     }
@@ -195,7 +195,7 @@ fn todays_media(source: &Path, records: &[FramedRecord]) -> Option<TodaysMedia> 
 /// The rehearsal never allocates a served-history row in its source. An existing row is
 /// authoritative; without one it uses `LineageRegistry::served_snapshot`'s no-source fallback.
 /// A publishing conversion instead calls `served_snapshot`, whose row allocation has a clock floor.
-fn source_history_version(
+pub(super) fn source_history_version(
     source: &Path,
     session: &BindIdentity,
     has_log: bool,

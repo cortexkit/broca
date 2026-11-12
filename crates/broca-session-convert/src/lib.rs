@@ -40,6 +40,7 @@ pub mod billing;
 pub mod counting;
 pub mod entry_facts;
 pub mod identity;
+pub mod load_check;
 /// The inverse lives with the new run loop, where a session's media fold reads it too.
 pub use broca_session_loop::inverse;
 pub mod measure;
