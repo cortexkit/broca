@@ -3135,17 +3135,15 @@ header and requires this order:
 4. Only then roll the Magic Context reader back. A rollback reader that itself
    tolerates the new header does not need this compatibility drain.
 
-## Experiments
+## Retired ride-placement trial
 
-`experiments.json` in the state root (the folder holding `run-index.db`) turns on probes for
-chosen project folders; today it holds one, `{"ride_placement": {"sibling_project_roots":
-["/absolute/project/folder"]}}`. It must be owner-only, is read each time a fresh run on the new
-session storage is admitted (an edit needs no restart), and a missing, unreadable or malformed
-file selects nothing and logs one warning; it never refuses a run. A selected run on an
-Anthropic Messages route freezes `ride_placement: "after_results"` into its render config: each
-ride (text a send delivered with a tool result) is then sent as its own text block after all of
-that turn's tool results, which hold only the tools' own output, and takes no part number.
-Nothing stored or read changes, and every other run's config and bytes are as before. An older
-build decodes such a config without error but drops the member, so it refuses to resume that
-run (`frozen_render_config_drift`) rather than render it with the other placement. The probe is
-removed or replaced once the placement question is decided.
+New runs always render a ride (text a send delivered with a tool result) inside its carrying
+result. The 12 November project-folder trial has ended; the state-root `experiments.json` file
+is no longer read and cannot change admissions.
+
+Runs admitted while the trial switch was on still carry `ride_placement: "after_results"` in
+their frozen render config. Decoding and rendering that value remain supported so resumes and
+rebuilt requests reproduce their recorded bytes: each ride is its own text block after all of
+the turn's tool results, which hold only the tools' own output. This compatibility can be
+removed once those stored runs no longer need rendering. An older build that drops the member
+refuses such a resume (`frozen_render_config_drift`) rather than using the other placement.

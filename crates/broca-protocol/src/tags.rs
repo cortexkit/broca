@@ -195,9 +195,11 @@ pub struct TagSlot {
     rendered: bool,
     delivery: Option<DeliveryAttribution>,
     /// Ride texts held out of this tool message's results, in the order the request shows them.
-    /// Probe only: set when a run's frozen render config asks for rides as their own text blocks
+    /// Set when a run's frozen render config asks for rides as their own text blocks
     /// after the turn's tool results (see `broca_provider::wire::RidePlacement`), and written
-    /// by the Anthropic Messages renderer. Removed or replaced once that placement is decided.
+    /// by the Anthropic Messages renderer. Only runs admitted while the 12 November trial switch
+    /// was on carry `after_results`; new runs never get it. Keep this until those stored runs no
+    /// longer need rendering.
     /// Being outside the content, the texts take no part number and are never stored.
     pub(crate) rides_after_results: Option<Arc<Vec<String>>>,
 }

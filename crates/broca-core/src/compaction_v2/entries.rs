@@ -50,9 +50,9 @@ pub struct RideEnvelopes(
 
 impl RideEnvelopes {
     /// Whether a request rendered with these envelopes shows each ride as its own text block
-    /// after the turn's tool results rather than inside its carrying result. Probe only, for a
-    /// run frozen with `ride_placement: after_results`; removed or replaced once that placement
-    /// is decided. Off by default, which renders every ride as it always rendered.
+    /// after the turn's tool results rather than inside its carrying result. Only runs admitted
+    /// while the 12 November trial switch was on carry `ride_placement: after_results`; new runs
+    /// never get it. Keep this until those stored runs no longer need rendering. Off by default.
     pub fn after_results(&self) -> bool {
         self.1
     }

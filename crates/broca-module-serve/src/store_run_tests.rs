@@ -249,6 +249,70 @@ async fn a_store_session_runs_through_the_production_executor() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A leftover trial selection file must not change fresh runs, even in the listed project.
+/// Check the config persisted by the production executor, not just the catalog's default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_trial_folder_run_ignores_the_retired_selection_file() {
+    use std::io::Write;
+
+    let server = resume_http_fixture().await;
+    let root = fresh_vault_root("retired-ride-selection");
+    let trial_project = std::path::Path::new("/Users/Shared/ck-move-scratch-broca");
+    let mut options = broca_owner_only::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    options
+        .open(root.join("experiments.json"))
+        .unwrap()
+        .write_all(
+            serde_json::to_string(&serde_json::json!({
+                "ride_placement": {"sibling_project_roots": [trial_project]}
+            }))
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+    install_drift_revision(false, 4096);
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_capturing_vault(&root, &daemon)
+        .await
+        .with_provider_overrides(runtime_overrides(&server.url));
+    let mut session = store_session().await;
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    for run in ["trial-folder-fresh", "trial-folder-next"] {
+        let mut req = drift_request(trial_project);
+        req.run_id = broca_protocol::RunId(run.into());
+        req.input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text: "hello".into() }],
+        )];
+        let end = serve_store_run(
+            &executor,
+            &mut session,
+            &parts,
+            req,
+            broca_module::executor::StoreRunMode::Fresh,
+        )
+        .await;
+        let finished = end.result.unwrap_or_else(|error| panic!("{run}: {error:?}"));
+        assert_eq!(finished.reason, RunFinishReason::Completed, "{run}");
+        let (writer, _link) = broca_session_loop::shared::ActorWriter::new(&session, None);
+        let history = store_history(&writer, &parts).await.unwrap();
+        let config = history.prior_run.unwrap().config.frozen_render_config;
+        assert_eq!(config["family_id"], "anthropic_messages");
+        assert!(
+            config.get("ride_placement").is_none(),
+            "{run} must freeze inside-the-result placement despite the retired file: {config}"
+        );
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    daemon.assert_healthy();
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Routing that refuses every decision it is asked about as unknown, as it refuses a caller's
 /// expired decision.
 struct UnknownDecision;

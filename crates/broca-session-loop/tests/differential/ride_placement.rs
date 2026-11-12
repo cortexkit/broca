@@ -1,9 +1,9 @@
-//! The probe placement of rides: a run frozen with `ride_placement: after_results` on an
+//! The retired trial placement of rides: a run frozen with `ride_placement: after_results` on an
 //! Anthropic Messages route shows each ride as its own text block after the tool turn's results,
 //! which then hold only the tools' own output. Today's loop has no such placement, so these
 //! tests run the new loop alone, each selected run beside an unselected twin of the same
-//! scenario. The probe is removed or replaced once the placement question is decided, and these
-//! tests with it.
+//! scenario. Keep this coverage until stored runs admitted during the 12 November trial no longer
+//! need rendering; new admissions never select the trial placement.
 
 use super::*;
 use broca_provider::wire::{FrozenRenderConfig, RidePlacement};

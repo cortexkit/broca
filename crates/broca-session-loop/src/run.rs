@@ -1925,9 +1925,9 @@ fn frozen_render_tags(admission: &Admission) -> bool {
 /// `ride_placement: after_results` on an Anthropic Messages route. Every other run renders each
 /// ride inside its carrying result, as before.
 ///
-/// Probe only, for measuring how models treat the two placements; removed or replaced once the
-/// placement question is decided. The member is frozen at admission, so a resumed or rebuilt
-/// step of the run decides alike.
+/// Only runs admitted while the 12 November trial switch was on carry `after_results`; new runs
+/// never get it. Keep this choice for resumed or rebuilt requests until those stored runs no
+/// longer need rendering.
 pub(crate) fn rides_after_results(admission: &Admission) -> bool {
     let config = &*admission.render_config;
     config.get("family_id").and_then(Value::as_str)
