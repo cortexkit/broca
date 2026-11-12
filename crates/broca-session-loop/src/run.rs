@@ -2871,7 +2871,11 @@ where
                             return Ok(finished(writer, RunFinishReason::Interrupted));
                         }
                         Some(crate::account_move::AtWall::Stayed(Some(answer))) => {
-                            error.account_continue = Some(Box::new(answer));
+                            crate::account_move::with_routing_answer(
+                                &mut error,
+                                answer,
+                                (seams.now_ms)(),
+                            );
                         }
                         Some(crate::account_move::AtWall::Stayed(None)) | None => {}
                     }

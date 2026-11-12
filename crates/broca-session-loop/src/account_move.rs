@@ -264,3 +264,107 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     continuer.adopted(&moved.selection);
     Ok(Some(AtWall::Moved(moved)))
 }
+
+/// Stores routing's answer in `account_continue` on the error that ends a run whose account
+/// spent its usage window and which routing didn't move. A hold that names when an account
+/// should have room (`until_ms`) also tells the caller when to try again: `retry_after_secs`
+/// becomes the whole seconds from `now_ms`, when the run ends with the error, to that time,
+/// rounded up and never below zero, unless the provider's own retry-after is already sooner.
+/// `resets_at_ms` stays the spent account's own reset. A hold without a time, and a refusal,
+/// leave `retry_after_secs` as it was.
+pub fn with_routing_answer(
+    error: &mut broca_protocol::ProviderError,
+    answer: AccountContinueAnswer,
+    now_ms: u64,
+) {
+    if let Some(until_ms) = answer.until_ms {
+        let retry = until_ms.saturating_sub(now_ms).div_ceil(1000) as f64;
+        if error.retry_after_secs.is_none_or(|own| retry < own) {
+            error.retry_after_secs = Some(retry);
+        }
+    }
+    error.account_continue = Some(Box::new(answer));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: u64 = 1_000_000;
+
+    fn limit_error(retry_after_secs: Option<f64>) -> broca_protocol::ProviderError {
+        let mut error = json!({
+            "class": "transient",
+            "message": "the account's usage window is spent",
+            "status": 429,
+            "provider_code": "account_limit_exhausted",
+            "resets_at_ms": NOW + 3 * 86_400_000,
+            "limit_window": "seven_day",
+        });
+        if let Some(secs) = retry_after_secs {
+            error["retry_after_secs"] = json!(secs);
+        }
+        serde_json::from_value(error).unwrap()
+    }
+
+    fn hold(until_ms: Option<u64>) -> AccountContinueAnswer {
+        AccountContinueAnswer {
+            routing_code: "no_compatible_account".into(),
+            until_ms,
+        }
+    }
+
+    /// A hold sooner than anything the provider said sets the retry time to it, rounded up to
+    /// whole seconds; the account's own reset is kept.
+    #[test]
+    fn a_hold_with_a_time_sets_the_retry_time() {
+        let mut error = limit_error(None);
+        with_routing_answer(&mut error, hold(Some(NOW + 90_001)), NOW);
+        assert_eq!(error.retry_after_secs, Some(91.0));
+        assert_eq!(error.resets_at_ms, Some(NOW + 3 * 86_400_000));
+        assert_eq!(
+            error.account_continue,
+            Some(Box::new(hold(Some(NOW + 90_001))))
+        );
+
+        let mut sooner = limit_error(Some(600.0));
+        with_routing_answer(&mut sooner, hold(Some(NOW + 60_000)), NOW);
+        assert_eq!(sooner.retry_after_secs, Some(60.0));
+
+        // A time already past retries at once.
+        let mut past = limit_error(None);
+        with_routing_answer(&mut past, hold(Some(NOW - 5_000)), NOW);
+        assert_eq!(past.retry_after_secs, Some(0.0));
+    }
+
+    /// The provider's own retry-after wins when it is sooner than the hold's time.
+    #[test]
+    fn a_later_hold_keeps_the_providers_sooner_retry_time() {
+        let mut error = limit_error(Some(30.0));
+        with_routing_answer(&mut error, hold(Some(NOW + 3_600_000)), NOW);
+        assert_eq!(error.retry_after_secs, Some(30.0));
+        assert!(error.account_continue.is_some());
+    }
+
+    /// A hold without a time and a refusal carry routing's answer and leave the retry time as
+    /// it was.
+    #[test]
+    fn a_hold_without_a_time_or_a_refusal_leaves_the_retry_time() {
+        for own in [None, Some(30.0)] {
+            let mut held = limit_error(own);
+            with_routing_answer(&mut held, hold(None), NOW);
+            assert_eq!(held.retry_after_secs, own);
+            assert_eq!(held.account_continue, Some(Box::new(hold(None))));
+
+            let refusal = AccountContinueAnswer {
+                routing_code: "account_pinned".into(),
+                until_ms: None,
+            };
+            let mut refused = limit_error(own);
+            with_routing_answer(&mut refused, refusal.clone(), NOW);
+            assert_eq!(refused.retry_after_secs, own);
+            assert_eq!(refused.account_continue, Some(Box::new(refusal)));
+        }
+    }
+}

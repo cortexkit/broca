@@ -1151,6 +1151,11 @@ async fn a_hold_ends_the_run_with_routings_answer() {
     .await;
     eprintln!("before: {}", serde_json::to_string(&today).unwrap());
     eprintln!("after:  {}", serde_json::to_string(&error).unwrap());
+    // A hold that names a time also says when to retry: an hour from now, as whole seconds.
+    let mut error = error;
+    assert_eq!(today.get("retry_after_secs"), None);
+    let retry = error.as_object_mut().unwrap().remove("retry_after_secs");
+    assert_eq!(retry, Some(json!(3600.0)));
     is_todays_with(
         &error,
         Some(json!({"routing_code": "no_compatible_account", "until_ms": NOW + 3_600_000})),
