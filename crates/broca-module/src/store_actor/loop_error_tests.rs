@@ -57,6 +57,7 @@ impl Provider for Stalling {
 struct FailingExecutor {
     script: Arc<StubProvider>,
     fails_next: AtomicBool,
+    temporarily_refuse_resume: AtomicBool,
     fail: Notify,
 }
 
@@ -143,6 +144,9 @@ impl RunExecutor for FailingExecutor {
                         .map_err(StoreRunError::Loop)
                 }
                 StoreRunMode::Resume => {
+                    if self.temporarily_refuse_resume.swap(false, Ordering::SeqCst) {
+                        return Err(StoreRunError::Admission(RunError::CredentialsUnavailable));
+                    }
                     if fails {
                         return Err(StoreRunError::Admission(RunError::Config(
                             "resume admission failed".into(),
@@ -281,6 +285,7 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
         ])),
         fails_next: AtomicBool::new(true),
         fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
     });
     let side = Side::new(Arc::clone(&executor)).await;
     let sent = side.send("r1", "first").await;
@@ -321,6 +326,7 @@ async fn a_failed_admission_of_an_existing_auth_pause_records_an_error() {
         ])),
         fails_next: AtomicBool::new(false),
         fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
     });
     let side = Side::new(executor.clone()).await;
     let key = || SendKey::SendId("synthetic-send".into());
@@ -339,4 +345,95 @@ async fn a_failed_admission_of_an_existing_auth_pause_records_an_error() {
         .contains("resume admission failed"));
     side.send("r2", "next").await;
     side.until_state("r2", "completed").await;
+}
+
+/// A dependency that is not ready says nothing permanent about the paused run. Keep the
+/// pause and its start intact, then continue the same run when the caller retries later.
+#[tokio::test]
+async fn a_temporary_admission_failure_keeps_the_pause_for_a_later_resume() {
+    use broca_session_store::record::Record;
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![
+            super::tests::auth_failure(),
+            text_step("a2", "recovered answer"),
+        ])),
+        fails_next: AtomicBool::new(false),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        fail: Notify::new(),
+    });
+    let side = Side::new(executor.clone()).await;
+    let key = || SendKey::SendId("temporary-admission-send".into());
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    let paused = side.until_state("r1", "paused").await;
+    let runtime = side.registry.store_runtime().unwrap();
+    let before = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    executor
+        .temporarily_refuse_resume
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("temporary admission task parks", || async {
+        match side.registry.route_status(&side.key).await.unwrap() {
+            crate::actor::LineageStatus::Idle => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert_eq!(side.run_status("r1").await, paused);
+    let after = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "temporary admission writes no end or other record"
+    );
+    assert!(!after
+        .iter()
+        .any(|(_, record)| matches!(record, Record::RunEnd(_))));
+    assert!(matches!(
+        side.send_keyed("r1", "first", key()).await,
+        SendOutcome::Active { .. }
+    ));
+    side.until_state("r1", "completed").await;
+    let records = runtime
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunStart(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|(_, record)| matches!(record, Record::RunEnd(_)))
+            .count(),
+        1
+    );
+    assert!(side.registry.stop_and_seal().await);
 }
