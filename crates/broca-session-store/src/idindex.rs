@@ -4,8 +4,9 @@
 //! so a directory can't find them by range. The index maps each one to the seqs of every sealed
 //! ledger record that names it, and the caller reads those records through the ledger directory
 //! and decides which of them answers its question. Ids in records still in the open log are
-//! found in memory (see `Session::find_id`). A seal moves a record and its ids out of the open
-//! log in the same change, so an id is always in one of the two places.
+//! found through the open log's own index in memory, [`OpenIds`] (see `Session::find_id`). A seal
+//! moves a record and its ids out of the open log in the same change, so an id is always in one
+//! of the two places.
 //!
 //! Which records name which ids is [`record_ids`]. It matches every record kind by name, so a new
 //! kind can't be added without deciding what it names.
@@ -29,11 +30,12 @@
 //! Index pages are encrypted under the session's frame key, with the session id and the page's
 //! own name in their authenticated data, as directory pages are.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::{BackendError, SessionAddr, SessionBackend, Version};
 use crate::codec::{ByteBuf, Id128};
 use crate::frame::FrameKey;
+use crate::log::FramePlace;
 use crate::record::Record;
 
 /// Entries per data page.
@@ -776,38 +778,217 @@ pub fn entries_for(key: &[u8; 32], records: &[(u64, Record)]) -> Vec<Entry> {
     entries
 }
 
-/// The open log's id-naming ledger records, by id, so a lookup finds ids not sealed yet.
-#[derive(Debug, Default, Clone)]
-pub struct OpenIds {
-    ids: BTreeMap<(IdKind, String), Vec<u64>>,
-    records: BTreeMap<u64, Record>,
+/// Whether `record` names `id` as a `kind`: what a lookup checks of every record it reads back,
+/// since two ids whose hashes collide are filed under the same key.
+pub fn names(record: &Record, kind: IdKind, id: &str) -> bool {
+    record_ids(record)
+        .iter()
+        .any(|(named_kind, named)| *named_kind == kind && named == id)
+}
+
+/// Whether a lookup reads a record that names `ids` back from the open log by its place, rather
+/// than taking it from memory: when every id it names is a tool call's key. Those records (a
+/// call's intent, a held call) are written per tool call, so they are the bulk of an open log's
+/// id-naming records and grow with every call; a read from memory only looks up the calls of
+/// the latest run, which the kept records hold. Every other record that names an id is written
+/// per run, per send or per plan change (a run's start and end, a send's records, a refresh's),
+/// so there are few, and reads from memory only look them up in any run.
+fn found_by_place(ids: &[(IdKind, String)]) -> bool {
+    ids.iter().all(|(kind, _)| *kind == IdKind::CallKey)
+}
+
+thread_local! {
+    static OPEN_RECORD_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many records id lookups on this thread have read back from an open log, one at a time.
+/// Every other lookup is answered from memory, so a test bounds with it what a step or a poll
+/// reads.
+pub fn open_record_reads() -> u64 {
+    OPEN_RECORD_READS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn count_open_record_read() {
+    OPEN_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+/// The ids the open log's ledger records name, so a lookup finds ids not sealed yet (see
+/// `Session::find_id`).
+///
+/// Each id is filed under its keyed hash, as the sealed index files it, with the seq of the
+/// record naming it, so the index holds no id's text. Where the record itself is depends on what
+/// it names (see [`found_by_place`]):
+/// - a record written per tool call is found by its seq: in the kept records while it is in the
+///   latest run, otherwise read back from the open log at the place kept for it here. These are
+///   the bulk, and each costs only its place;
+/// - any other stays in memory: in the session's kept records while they hold it, and here once
+///   they drop it, so these lookups never read storage.
+///
+/// The index is one pointer wide: a session, and every future and actor that carries one by
+/// value, holds only the box.
+#[derive(Clone)]
+pub struct OpenIds(Box<Filed>);
+
+/// What an [`OpenIds`] holds.
+#[derive(Clone)]
+struct Filed {
+    key: [u8; 32],
+    /// Every id filed, as its hash, with the seq of a record naming it.
+    ids: BTreeSet<(Id128, u64)>,
+    /// The records taken from memory that the kept records don't hold, by seq.
+    held: BTreeMap<u64, Record>,
+    /// The seqs of the records taken from memory that the kept records hold, in order.
+    in_kept: Vec<u64>,
+    /// Where the frame of each other record that names an id lies in the open log, in seq order.
+    places: Vec<(u64, FramePlace)>,
+}
+
+/// Where a record a lookup found is (see [`OpenIds::find`]).
+#[derive(Debug, Clone, Copy)]
+pub enum OpenRecord<'a> {
+    /// Held by the index.
+    Held(&'a Record),
+    /// Held by the session's kept records.
+    Kept,
+    /// In the kept records if they still hold its seq, otherwise only in the open log, here.
+    At(FramePlace),
+    /// Filed, yet neither held, kept nor placed: the index lost track of it, which a lookup
+    /// reports as damage rather than as an id not found.
+    Lost,
 }
 
 impl OpenIds {
-    pub fn add(&mut self, seq: u64, record: &Record) {
+    /// An empty index, filing ids under `key` (see [`hash_key`]).
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(Box::new(Filed {
+            key,
+            ids: BTreeSet::new(),
+            held: BTreeMap::new(),
+            in_kept: Vec::new(),
+            places: Vec::new(),
+        }))
+    }
+
+    /// The hash `id` of `kind` is filed under, here and in the sealed index.
+    pub fn hash(&self, kind: IdKind, id: &str) -> Id128 {
+        id_hash(&self.0.key, kind, id)
+    }
+
+    /// Files the ids `record`, at `seq` with its frame at `place`, names, holding a copy of the
+    /// record when a lookup takes it from memory: for a record the kept records don't hold.
+    pub fn add(&mut self, seq: u64, record: &Record, place: FramePlace) {
+        if self.file(seq, record, place) {
+            self.hold(seq, record.clone());
+        }
+    }
+
+    /// Files the ids `record`, at `seq` with its frame at `place`, names. Returns whether a
+    /// lookup takes the record from memory: the caller then either leaves it with the kept
+    /// records and says so ([`Self::kept_holds`]), or hands it over ([`Self::hold`]).
+    pub(crate) fn file(&mut self, seq: u64, record: &Record, place: FramePlace) -> bool {
         let ids = record_ids(record);
         if ids.is_empty() {
-            return;
+            return false;
         }
-        for id in ids {
-            self.ids.entry(id).or_default().push(seq);
+        for (kind, id) in &ids {
+            self.0.ids.insert((id_hash(&self.0.key, *kind, id), seq));
         }
-        self.records.insert(seq, record.clone());
+        if !found_by_place(&ids) {
+            return true;
+        }
+        match self.0.places.last() {
+            Some((last, _)) if *last >= seq => {
+                let at = self.0.places.partition_point(|(filed, _)| *filed < seq);
+                if self
+                    .0
+                    .places
+                    .get(at)
+                    .is_some_and(|(filed, _)| *filed == seq)
+                {
+                    self.0.places[at].1 = place;
+                } else {
+                    self.0.places.insert(at, (seq, place));
+                }
+            }
+            _ => self.0.places.push((seq, place)),
+        }
+        false
     }
 
-    pub fn clear(&mut self) {
-        self.ids.clear();
-        self.records.clear();
+    /// The record at `seq`, filed and taken from memory, is in the session's kept records.
+    pub(crate) fn kept_holds(&mut self, seq: u64) {
+        match self.0.in_kept.last() {
+            Some(last) if *last >= seq => {
+                if let Err(at) = self.0.in_kept.binary_search(&seq) {
+                    self.0.in_kept.insert(at, seq);
+                }
+            }
+            _ => self.0.in_kept.push(seq),
+        }
     }
 
-    pub fn find(&self, kind: IdKind, id: &str) -> Vec<(u64, Record)> {
-        self.ids
-            .get(&(kind, id.to_owned()))
-            .into_iter()
-            .flatten()
-            .map(|seq| (*seq, self.records[seq].clone()))
+    /// Holds the record at `seq`, filed and taken from memory, which the kept records don't hold.
+    pub(crate) fn hold(&mut self, seq: u64, record: Record) {
+        self.0.held.insert(seq, record);
+    }
+
+    /// Takes over `record`, at `seq`, which the kept records just dropped, if they held it for
+    /// this index, so it stays in memory with no second copy. Any other record is dropped.
+    pub(crate) fn adopt(&mut self, seq: u64, record: Record) {
+        if let Ok(at) = self.0.in_kept.binary_search(&seq) {
+            self.0.in_kept.remove(at);
+            self.0.held.insert(seq, record);
+        }
+    }
+
+    /// Every record filed under the hash of `id` as a `kind`, in seq order, with where it is.
+    /// Another id with the same hash finds the same records, so the caller checks each one names
+    /// `id` ([`names`]).
+    pub fn find(&self, kind: IdKind, id: &str) -> Vec<(u64, OpenRecord<'_>)> {
+        let hash = self.hash(kind, id);
+        self.0
+            .ids
+            .range((hash, 0)..=(hash, u64::MAX))
+            .map(|(_, seq)| {
+                let at = if let Some(record) = self.0.held.get(seq) {
+                    OpenRecord::Held(record)
+                } else if self.0.in_kept.binary_search(seq).is_ok() {
+                    OpenRecord::Kept
+                } else {
+                    let at = self.0.places.partition_point(|(filed, _)| filed < seq);
+                    match self.0.places.get(at) {
+                        Some((filed, place)) if filed == seq => OpenRecord::At(*place),
+                        _ => OpenRecord::Lost,
+                    }
+                };
+                (*seq, at)
+            })
             .collect()
     }
+
+    /// What the index holds, for tests that measure it.
+    #[cfg(test)]
+    pub(crate) fn parts(&mut self) -> OpenIdsParts<'_> {
+        OpenIdsParts {
+            ids: &mut self.0.ids,
+            held: &mut self.0.held,
+            in_kept: &mut self.0.in_kept,
+            places: &mut self.0.places,
+        }
+    }
+}
+
+/// What an [`OpenIds`] holds, for tests that measure it.
+#[cfg(test)]
+pub(crate) struct OpenIdsParts<'a> {
+    /// The ids filed.
+    pub ids: &'a mut BTreeSet<(Id128, u64)>,
+    /// The records held in memory.
+    pub held: &'a mut BTreeMap<u64, Record>,
+    /// The seqs of the records the kept records hold for the index.
+    pub in_kept: &'a mut Vec<u64>,
+    /// The places of the records read back from the log.
+    pub places: &'a mut Vec<(u64, FramePlace)>,
 }
 
 #[cfg(test)]

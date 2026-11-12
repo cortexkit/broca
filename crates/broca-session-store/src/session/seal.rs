@@ -143,6 +143,19 @@ impl<B: SessionBackend> Session<B> {
         carry: &Carry<'_>,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
+        // A seal holds the open log's records and the state it builds across its writes, tens of
+        // kilobytes in a debug build. Boxed, so every future that awaits a seal (a store actor's,
+        // a run's) carries one pointer for it.
+        Box::pin(self.seal_carrying_boxed(cut, carry, now_ms)).await
+    }
+
+    /// The work of [`Session::seal_carrying`], which boxes it.
+    async fn seal_carrying_boxed(
+        &mut self,
+        cut: Option<u64>,
+        carry: &Carry<'_>,
+        now_ms: u64,
+    ) -> Result<Sealed, SessionError> {
         if self.poisoned {
             return Err(SessionError::Poisoned);
         }
@@ -183,8 +196,11 @@ impl<B: SessionBackend> Session<B> {
         carry: &Carry<'_>,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
-        let (records, _, checkpoint) = self.read_open_log().await?;
-        let cut = placing_seq(&checkpoint, &records, ordinal)?;
+        let cut = {
+            // Dropped before the seal, which reads the open log again itself.
+            let (records, _, checkpoint) = self.read_open_log().await?;
+            placing_seq(&checkpoint, &records, ordinal)?
+        };
         self.seal_carrying(Some(cut), carry, now_ms).await
     }
 
@@ -549,15 +565,17 @@ impl<B: SessionBackend> Session<B> {
         // The carried ledger records follow as one batch with fresh seqs, above every record the
         // seal read, and fold into the state the change installs.
         let mut settled_after = settled_after;
-        let mut open_ids = OpenIds::default();
+        let mut open_ids = OpenIds::new(idindex::hash_key(&self.key));
         let carried = carry.records;
         if !carried.is_empty() {
             let first = encoder.next_seq();
-            bytes.extend(encoder.batch(carried)?.into_written(&mut encoder));
-            for (offset, record) in carried.iter().enumerate() {
+            let encoded = encoder.batch(carried)?;
+            let places: Vec<_> = encoded.places(encoder.offset()).collect();
+            bytes.extend(encoded.into_written(&mut encoder));
+            for ((offset, record), place) in carried.iter().enumerate().zip(places) {
                 let seq = first + offset as u64;
                 window.note(seq, record);
-                open_ids.add(seq, record);
+                open_ids.add(seq, record, place);
                 super::apply(&mut conversation, &mut settled_after, seq, record)
                     .map_err(SessionError::Fold)?;
             }

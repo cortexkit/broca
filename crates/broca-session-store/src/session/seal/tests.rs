@@ -29,6 +29,47 @@ cipher_tests!(
     a_moved_namespace_survives_a_sealed_history_checkpoint,
 );
 
+/// What a future that awaits a seal or a revert may carry for it, at most. Their work holds the
+/// open log's records and the state they build across their writes, tens of kilobytes in a debug
+/// build, and lives on the heap: the futures awaiting them (a store actor's, a run's, a test's)
+/// carry them by value, and a debug build's stack holds those futures.
+const CHANGE_FUTURE_BYTES: usize = 1024;
+
+/// A seal's and a revert's futures stay small: their work is boxed.
+#[test]
+fn seal_and_revert_futures_keep_their_work_on_the_heap() {
+    fn size<'a, T: 'a, Fut>(_: impl FnOnce(&'a mut T) -> Fut) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+    const NO_CARRY: Carry<'static> = Carry {
+        records: &[],
+        window_repetition: None,
+    };
+    type S = Session<MemoryBackend>;
+    let sizes = [
+        ("seal", size(|s: &mut S| s.seal(None, 0))),
+        (
+            "seal_carrying",
+            size(|s: &mut S| s.seal_carrying(None, &NO_CARRY, 0)),
+        ),
+        (
+            "seal_at_entry",
+            size(|s: &mut S| s.seal_at_entry(1, &NO_CARRY, 0)),
+        ),
+        (
+            "revert",
+            size(|s: &mut S| s.revert("m", Vec::new(), None, 0)),
+        ),
+    ];
+    println!("{sizes:?}");
+    for (name, bytes) in sizes {
+        assert!(
+            bytes <= CHANGE_FUTURE_BYTES,
+            "a {name} future carries {bytes} bytes; keep its work boxed"
+        );
+    }
+}
+
 fn triple() -> SessionTriple {
     SessionTriple {
         project_root: "/project".into(),

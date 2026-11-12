@@ -21,6 +21,11 @@ use crate::record::Record;
 use super::{Session, SessionError};
 
 /// The open log's records a session holds in memory: every one from seq `from` on.
+///
+/// The buffer is sized for what it keeps. A load hands it the log's records one by one, never
+/// the whole log, and leaves a writer's buffer no larger than the records it kept; a new run
+/// start drops the buffer that held the run before with its records, rather than clearing it and
+/// keeping its capacity.
 #[derive(Debug, Default)]
 pub(crate) struct KeptRecords {
     /// Every record of the open log with a seq at or past this one is in `records`.
@@ -49,53 +54,104 @@ impl KeptRecords {
         }
     }
 
-    /// The records a view read: all of the open log's.
-    pub(crate) fn whole_log(records: Vec<(u64, Record)>) -> Self {
-        let latest_start = latest_start(&records);
+    /// The records a session keeps of the log it is loading, taken in one by one with
+    /// [`Self::load`] and finished with [`Self::loaded`]: a view keeps every record it reads
+    /// (`per_run` false); a writer keeps those from the latest run start on, or none when the log
+    /// holds no run start.
+    pub(crate) fn loading(per_run: bool) -> Self {
         Self {
             from: 0,
-            records,
+            records: Vec::new(),
             whole: true,
-            latest_start,
-            per_run: false,
+            latest_start: None,
+            per_run,
         }
     }
 
-    /// The records a writer keeps of the log it loaded: those from the latest run start on, or
-    /// none when the log holds no run start.
-    pub(crate) fn writer_of(mut records: Vec<(u64, Record)>, next_seq: u64) -> Self {
-        match records
-            .iter()
-            .rposition(|(_, record)| matches!(record, Record::RunStart(_)))
-        {
-            Some(at) => {
-                let whole = at == 0;
-                records.drain(..at);
-                let latest_start = latest_start(&records);
-                Self {
-                    from: records[0].0,
-                    records,
-                    whole,
-                    latest_start,
-                    per_run: true,
+    /// Takes in the loaded log's next record, at `seq`, and returns it when it isn't kept. A
+    /// writer's copy keeps the records of the run it reads, from its start on, and at the next run
+    /// start hands them to `dropped`; it keeps nothing before the first run start. While loading,
+    /// the buffer is reused from run to run, and [`Self::loaded`] sizes it for the run it keeps.
+    pub(crate) fn load(
+        &mut self,
+        seq: u64,
+        record: Record,
+        mut dropped: impl FnMut(u64, Record),
+    ) -> Option<Record> {
+        if !self.per_run {
+            if let Record::RunStart(start) = &record {
+                self.latest_start = Some((seq, start.run_id.clone()));
+            }
+            self.records.push((seq, record));
+            return None;
+        }
+        match &record {
+            Record::RunStart(start) => {
+                // Only a run start that the log opens with leaves no record before it.
+                self.whole &= self.records.is_empty();
+                self.from = seq;
+                self.latest_start = Some((seq, start.run_id.clone()));
+                for (seq, record) in self.records.drain(..) {
+                    dropped(seq, record);
                 }
             }
-            None => Self::from_next(next_seq, records.is_empty()),
+            _ if self.latest_start.is_some() => {}
+            _ => {
+                self.whole = false;
+                return Some(record);
+            }
+        }
+        self.records.push((seq, record));
+        None
+    }
+
+    /// Ends a load whose log's next record takes seq `next_seq`, leaving a writer's buffer no
+    /// larger than the records it keeps.
+    pub(crate) fn loaded(&mut self, next_seq: u64) {
+        if self.per_run {
+            if self.latest_start.is_none() {
+                // No run start: the writer keeps the records it appends from here on.
+                self.from = next_seq;
+            }
+            self.records.shrink_to_fit();
         }
     }
 
-    /// Takes in one appended record at `seq`.
-    pub(crate) fn note(&mut self, seq: u64, record: &Record) {
+    /// Takes in one appended record at `seq`. Returns the records a run start dropped, the run's
+    /// before, which the caller may take over.
+    pub(crate) fn note(&mut self, seq: u64, record: &Record) -> Vec<(u64, Record)> {
+        let mut dropped = Vec::new();
         if let Record::RunStart(start) = record {
             if self.per_run {
                 // The records before the new run belong to runs a caller reads from storage.
                 self.whole &= self.records.is_empty() && self.from == seq;
-                self.records.clear();
+                // The buffer goes with them: one sized for a long run must not outlive it.
+                dropped = std::mem::take(&mut self.records);
                 self.from = seq;
             }
             self.latest_start = Some((seq, start.run_id.clone()));
         }
-        self.records.push((seq, record.clone()));
+        self.push(seq, record.clone());
+        dropped
+    }
+
+    /// Keeps the appended `record` at `seq`. A full buffer grows by a quarter of its length, not
+    /// by doubling as a vector does by default, so it never holds much more room than records:
+    /// each slot costs a whole record's size, and a writer keeps its buffer for as long as the
+    /// session is open.
+    fn push(&mut self, seq: u64, record: Record) {
+        if self.records.len() == self.records.capacity() {
+            self.records.reserve_exact((self.records.len() / 4).max(4));
+        }
+        self.records.push((seq, record));
+    }
+
+    /// The kept record at `seq`, if one is kept.
+    pub(crate) fn get(&self, seq: u64) -> Option<&Record> {
+        self.records
+            .binary_search_by_key(&seq, |(kept, _)| *kept)
+            .ok()
+            .map(|at| &self.records[at].1)
     }
 
     /// Every kept record from `first` through `last`, or `None` when records from `first` on
@@ -136,13 +192,6 @@ impl KeptRecords {
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }
-}
-
-fn latest_start(records: &[(u64, Record)]) -> Option<(u64, String)> {
-    records.iter().rev().find_map(|(seq, record)| match record {
-        Record::RunStart(start) => Some((*seq, start.run_id.clone())),
-        _ => None,
-    })
 }
 
 /// Reads from memory only while it lives (see [`Session::in_memory`]).

@@ -26,9 +26,9 @@ use crate::codec::{ByteBuf, DecodeError, Id128, Message as _};
 use crate::fold::conversation::Conversation;
 use crate::fold::operations::Operations;
 use crate::head::{self, Head, HeadError, OpenLog, Residence, SessionTriple, WrappedKey};
-use crate::idindex::OpenIds;
+use crate::idindex::{self, OpenIds};
 use crate::keys::{self, random_id, Cipher, DataKey, DeploymentKey};
-use crate::log::{ChainBase, LogEncoder, LogEnd, LogError, ReadLog};
+use crate::log::{ChainBase, FramePlace, LogEncoder, LogEnd, LogError, ReadLog};
 use crate::record::{ChangeAborted, Record, Stream, WriterOpened};
 
 /// The id of every session's first data key. The data key never rotates.
@@ -131,6 +131,133 @@ fn log_bind(session: &Id128, log: &Id128) -> Vec<u8> {
     let mut bind = session.0.to_vec();
     bind.extend_from_slice(&log.0);
     bind
+}
+
+/// The folds a load starts from its open log's checkpoint, and what it keeps of the log's
+/// records, as it takes them in one by one (see [`Session::read`]).
+struct Folds {
+    /// The last ledger record the checkpoint already folds in.
+    covers_through: u64,
+    /// The checkpoint's next seq.
+    next_seq: u64,
+    conversation: Conversation,
+    operations: Operations,
+    open_ids: OpenIds,
+    window: OpenLogIndex,
+    kept: kept::KeptRecords,
+}
+
+impl Folds {
+    /// Folds starting from `checkpoint`, filing ids under `hash_key`, keeping records as a writer
+    /// (`per_run`) or as a view does.
+    fn start(checkpoint: Checkpoint, hash_key: [u8; 32], per_run: bool) -> Box<Self> {
+        Box::new(Self {
+            covers_through: checkpoint.covers_through,
+            next_seq: checkpoint.next_seq,
+            window: OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq),
+            conversation: checkpoint.conversation,
+            operations: checkpoint.operational,
+            open_ids: OpenIds::new(hash_key),
+            kept: kept::KeptRecords::loading(per_run),
+        })
+    }
+
+    /// Folds the log's next record, at `seq` with its frame at `place`, and keeps it if the
+    /// session keeps it. A ledger record the checkpoint already covers is only kept.
+    fn fold(&mut self, seq: u64, record: Record, place: FramePlace) -> Result<(), String> {
+        self.window.note(seq, &record);
+        let ledger = record.stream() == Stream::Ledger;
+        let mut from_memory = false;
+        if !(ledger && seq <= self.covers_through) {
+            if ledger {
+                from_memory = self.open_ids.file(seq, &record, place);
+            }
+            apply(&mut self.conversation, &mut self.operations, seq, &record)?;
+        }
+        // A run start drops the kept records of the run before it; the id index takes over those
+        // it reads from memory.
+        let open_ids = &mut self.open_ids;
+        let returned = self
+            .kept
+            .load(seq, record, |seq, record| open_ids.adopt(seq, record));
+        if from_memory {
+            match returned {
+                Some(record) => self.open_ids.hold(seq, record),
+                None => self.open_ids.kept_holds(seq),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reads an open log from its `bytes` batch by batch and folds each batch as it is read, so a load
+/// never holds the whole decoded log: each batch is folded and then dropped, but for what the
+/// session keeps. Returns the log as read, and the folds. A clean log, or one ending in a torn
+/// tail (a write cut short, or zero-filled blocks), opens; debris needs a recovery first, and
+/// damage to acknowledged bytes refuses. Errors come in the order a read of the whole log
+/// followed by its fold gives them: the log's, then its verdict, then the first record that
+/// doesn't fold. It runs outside the async read that calls it, so the folds it builds take no
+/// room in that read's future or its stack frame.
+#[inline(never)]
+fn fold_log(
+    bytes: Vec<u8>,
+    frame_key: &crate::frame::FrameKey,
+    bind: &[u8],
+    synced_len: u64,
+    hash_key: [u8; 32],
+    per_run: bool,
+) -> Result<(ReadLog, Box<Folds>), SessionError> {
+    let mut reader = crate::log::LogReader::new(&bytes, frame_key, bind, synced_len, chain_base);
+    let mut folds: Option<Box<Folds>> = None;
+    // Why the first record that didn't fold didn't, or the checkpoint didn't decode; nothing
+    // after it is folded.
+    let mut failed = None;
+    while let Some(batch) = reader.next_batch()? {
+        if failed.is_some() {
+            continue;
+        }
+        if folds.is_none() {
+            match Checkpoint::decode(reader.checkpoint()) {
+                Ok(checkpoint) => folds = Some(Folds::start(checkpoint, hash_key, per_run)),
+                Err(error) => {
+                    failed = Some(SessionError::Checkpoint(error));
+                    continue;
+                }
+            }
+        }
+        let started = folds.as_mut().expect("the folds start at the first batch");
+        for ((seq, record), place) in batch.records.into_iter().zip(batch.places) {
+            if let Err(error) = started.fold(seq, record, place) {
+                failed = Some(SessionError::Fold(error));
+                break;
+            }
+        }
+    }
+    let read = reader.finish();
+    let read = match crate::damage::verdict(
+        read, &bytes, frame_key, bind, synced_len, chain_base, None,
+    )? {
+        crate::damage::Verdict::Opens(read) => read,
+        crate::damage::Verdict::Debris(_) => return Err(SessionError::NeedsRecovery),
+        crate::damage::Verdict::Corrupt { at, durable_bound } => {
+            return Err(SessionError::Corrupt { at, durable_bound })
+        }
+    };
+    drop(bytes);
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    // A log that opens with no batch read has no folds started yet: they start from its
+    // checkpoint, decoded from what was read of it.
+    let folds = match folds {
+        Some(folds) => folds,
+        None => Folds::start(
+            Checkpoint::decode(&read.checkpoint).map_err(SessionError::Checkpoint)?,
+            hash_key,
+            per_run,
+        ),
+    };
+    Ok((read, folds))
 }
 
 /// Folds one record, at `seq`, into whichever fold its stream belongs to. Appending uses it, and
@@ -256,7 +383,8 @@ pub struct Session<B: SessionBackend> {
     poisoned: bool,
     pub conversation: Conversation,
     pub operations: Operations,
-    /// The open log's ledger records that name ids, so `find_id` finds ids not sealed yet.
+    /// The ids the open log's ledger records name, so `find_id` finds ids not sealed yet (see
+    /// [`OpenIds`]).
     open_ids: OpenIds,
     /// What the open log's records name: each new message's ordinal, so `find_message` finds
     /// its id before it's sealed, and where each media digest's bytes are stored.
@@ -483,7 +611,7 @@ impl<B: SessionBackend> Session<B> {
             poisoned: false,
             conversation,
             operations,
-            open_ids: OpenIds::default(),
+            open_ids: OpenIds::new(idindex::hash_key(key)),
             window: OpenLogIndex::default(),
             imported: Default::default(),
             enrollment: Default::default(),
@@ -504,7 +632,7 @@ impl<B: SessionBackend> Session<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<Self, SessionError> {
-        match Self::read(backend, addr, triple, deployment, None).await? {
+        match Self::read(backend, addr, triple, deployment, None, true).await? {
             Loaded::Creating {
                 backend,
                 addr,
@@ -522,7 +650,7 @@ impl<B: SessionBackend> Session<B> {
             }
             Loaded::Open {
                 mut session,
-                mut read,
+                read,
                 end,
             } => {
                 if let Residence::Moving(cut_id) = &session.head.residence {
@@ -531,10 +659,6 @@ impl<B: SessionBackend> Session<B> {
                     });
                 }
                 let key = session.key.clone();
-                session.kept = kept::KeptRecords::writer_of(
-                    std::mem::take(&mut read.records),
-                    session.encoder.next_seq(),
-                );
                 session.open_writer_over(&key, &read, end).await?;
                 Ok(*session)
             }
@@ -552,7 +676,7 @@ impl<B: SessionBackend> Session<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<SessionView<B>, SessionError> {
-        Self::loaded_view(Self::read(backend, addr, triple, deployment, None).await?)
+        Self::loaded_view(Self::read(backend, addr, triple, deployment, None, false).await?)
     }
 
     /// Where the session at `addr` stands now (see [`Position`]), read from its head and its open
@@ -599,20 +723,17 @@ impl<B: SessionBackend> Session<B> {
         deployment: &DeploymentKey,
         position: &Position,
     ) -> Result<SessionView<B>, SessionError> {
-        Self::loaded_view(Self::read(backend, addr, triple, deployment, Some(position)).await?)
+        Self::loaded_view(
+            Self::read(backend, addr, triple, deployment, Some(position), false).await?,
+        )
     }
 
     fn loaded_view(loaded: Loaded<B>) -> Result<SessionView<B>, SessionError> {
         match loaded {
             Loaded::Creating { .. } => Err(SessionError::Missing),
-            Loaded::Open {
-                mut session,
-                mut read,
-                ..
-            } => {
+            Loaded::Open { mut session, .. } => {
                 // No writer was opened, so nothing may be appended: every write checks this.
                 session.poisoned = true;
-                session.kept = kept::KeptRecords::whole_log(std::mem::take(&mut read.records));
                 Ok(SessionView(*session))
             }
         }
@@ -620,13 +741,16 @@ impl<B: SessionBackend> Session<B> {
 
     /// Reads the session's head, checkpoint and open log and folds them, writing nothing. With
     /// `at`, the head must be at that version and its open log the one named, and only the log's
-    /// first `at.len` bytes are read.
+    /// first `at.len` bytes are read. The records are folded as they are read, and only what the
+    /// session keeps is held: a writer's (`per_run`) records from its latest run start on, a
+    /// view's every record.
     async fn read(
         backend: B,
         addr: SessionAddr,
         triple: &SessionTriple,
         deployment: &DeploymentKey,
         at: Option<&Position>,
+        per_run: bool,
     ) -> Result<Loaded<B>, SessionError> {
         let (stored, version) = backend
             .read_head(&addr)
@@ -671,43 +795,28 @@ impl<B: SessionBackend> Session<B> {
         let bytes = backend.read_log(&addr, &open.change, 0..end).await?;
         let bind = log_bind(&head.session_id, &open.change);
         let frame_key = key.frame_key();
-        // A clean log, or one ending in a torn tail (a write cut short, or zero-filled blocks),
-        // opens; debris needs a recovery first, and damage to acknowledged bytes refuses.
-        let read = match crate::damage::analyse(
-            &bytes,
+        let (read, folds) = fold_log(
+            bytes,
             &frame_key,
             &bind,
             open.synced_len,
-            chain_base,
-            None,
-        )? {
-            crate::damage::Verdict::Opens(read) => read,
-            crate::damage::Verdict::Debris(_) => return Err(SessionError::NeedsRecovery),
-            crate::damage::Verdict::Corrupt { at, durable_bound } => {
-                return Err(SessionError::Corrupt { at, durable_bound })
-            }
-        };
-        let checkpoint = Checkpoint::decode(&read.checkpoint).map_err(SessionError::Checkpoint)?;
-
-        let last_seq = read.records.last().map(|(seq, _)| *seq);
+            idindex::hash_key(&key),
+            per_run,
+        )?;
+        let Folds {
+            next_seq: checkpoint_next_seq,
+            conversation,
+            operations,
+            open_ids,
+            window,
+            mut kept,
+            ..
+        } = *folds;
         let next_seq = head
             .next_seq
-            .max(checkpoint.next_seq)
-            .max(last_seq.map_or(0, |seq| seq + 1));
-        let mut conversation = checkpoint.conversation;
-        let mut operations = checkpoint.operational;
-        let mut open_ids = OpenIds::default();
-        let mut window = OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
-        for (seq, record) in &read.records {
-            window.note(*seq, record);
-            if record.stream() == Stream::Ledger {
-                if *seq <= checkpoint.covers_through {
-                    continue;
-                }
-                open_ids.add(*seq, record);
-            }
-            apply(&mut conversation, &mut operations, *seq, record).map_err(SessionError::Fold)?;
-        }
+            .max(checkpoint_next_seq)
+            .max(read.last_seq.map_or(0, |seq| seq + 1));
+        kept.loaded(next_seq);
         let session = Self {
             backend,
             addr,
@@ -725,9 +834,7 @@ impl<B: SessionBackend> Session<B> {
             enrollment: Default::default(),
             sealed_entries: Default::default(),
             observer: None,
-            // Set by whoever takes the loaded session: a view keeps every record, a writer its
-            // latest run's.
-            kept: kept::KeptRecords::default(),
+            kept,
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
@@ -777,6 +884,7 @@ impl<B: SessionBackend> Session<B> {
             complete_through: end,
             frames: 1,
             last: self.encoder.last(),
+            last_seq: None,
             batches: Vec::new(),
             batch_starts: Vec::new(),
         };
@@ -877,16 +985,26 @@ impl<B: SessionBackend> Session<B> {
                 barrier,
             )
             .await?;
+        // Where the batch landed: the log's end before it. Read here, after the write, rather than
+        // held across it, which would grow every future that awaits an append.
+        let batch_at = self.encoder.offset();
         self.encoder.written(&encoded);
         if barrier {
             self.encoder.synced();
         }
-        for (position, record) in records.iter().enumerate() {
-            if record.stream() == Stream::Ledger {
-                self.open_ids.add(first + position as u64, record);
+        for ((position, record), place) in records.iter().enumerate().zip(encoded.places(batch_at))
+        {
+            let seq = first + position as u64;
+            // A run start drops the kept records of the run before it; the id index takes over
+            // those it reads from memory.
+            let dropped = self.kept.note(seq, record);
+            for (seq, record) in dropped {
+                self.open_ids.adopt(seq, record);
             }
-            self.window.note(first + position as u64, record);
-            self.kept.note(first + position as u64, record);
+            if record.stream() == Stream::Ledger && self.open_ids.file(seq, record, place) {
+                self.open_ids.kept_holds(seq);
+            }
+            self.window.note(seq, record);
         }
         self.poisoned = false;
         drop(timing);
