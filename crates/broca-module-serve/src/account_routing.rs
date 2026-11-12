@@ -2556,6 +2556,21 @@ pub fn continue_selection_id(wall: &broca_session_loop::account_move::Wall<'_>) 
 }
 
 impl RoutingClient {
+    /// [`Self::account_continue`], asked only when routing serves continuation: it is known to
+    /// declare both `account_continue` and `account_continue_resume`. An unknown description,
+    /// or one that doesn't arrive by `deadline`, counts as no, and then nothing is sent.
+    pub async fn account_continue_if_served(
+        &self,
+        request: &cortexkit_role_routing::account_continue::ContinueRequest,
+        deadline: tokio::time::Instant,
+    ) -> ContinueOutcome {
+        let serves =
+            tokio::time::timeout_at(deadline, self.answers_moved_runs_with_current_account())
+                .await
+                .unwrap_or(false);
+        self.account_continue(serves, request, deadline).await
+    }
+
     /// Asks routing for another account for a run whose account spent its usage window, by
     /// `route.account_for` with `mode: "continue"`, over the same route as an admission, giving up
     /// at `deadline`. `routing_serves_continuation` is true only when routing declares both

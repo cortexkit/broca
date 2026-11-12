@@ -3079,10 +3079,6 @@ mod executor {
         req: &'a broca_core::RunRequest,
         auth: &'a Option<broca_protocol::AuthRequest>,
         clock: Option<&'a broca_core::Clock>,
-        /// Whether routing serves continuation: true only when it declares both
-        /// `account_continue` and `account_continue_resume`; unknown counts as false. Without
-        /// it the run is never asked to move, and ends or pauses at a wall as before.
-        routing_serves_continuation: bool,
         /// The media renderer the run's provider was given, which the new provider needs too.
         media: Option<Arc<broca_module::store_media::LazyRenderer>>,
         /// The end of each wall's budget, by the refused attempt's seq: a second question at the
@@ -3099,7 +3095,6 @@ mod executor {
             req: &'a broca_core::RunRequest,
             auth: &'a Option<broca_protocol::AuthRequest>,
             clock: Option<&'a broca_core::Clock>,
-            routing_serves_continuation: bool,
             media: Option<Arc<broca_module::store_media::LazyRenderer>>,
         ) -> Self {
             Self {
@@ -3107,7 +3102,6 @@ mod executor {
                 req,
                 auth,
                 clock,
-                routing_serves_continuation,
                 media,
                 deadlines: Default::default(),
                 prepared: Default::default(),
@@ -3149,10 +3143,7 @@ mod executor {
                 .unwrap()
                 .entry(wall.attempt_seq)
                 .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
-            let answer = match routing
-                .account_continue(self.routing_serves_continuation, &request, deadline)
-                .await
-            {
+            let answer = match routing.account_continue_if_served(&request, deadline).await {
                 ContinueOutcome::Answered(answer) => answer,
                 ContinueOutcome::NotDeclared => return Err(None),
                 outcome => {
@@ -3328,7 +3319,9 @@ mod executor {
                         // Only a run in the new session storage moves.
                         new_storage: true,
                         continue_offer: Some(&choice),
-                        routing_serves_continuation: self.routing_serves_continuation,
+                        // The offer is the account: the moved config already names it, so
+                        // the resume rule that would ask routing again doesn't apply.
+                        routing_serves_continuation: false,
                     },
                     &history,
                 )
@@ -4968,13 +4961,15 @@ mod executor {
                     .await
                     .map_err(StoreRunError::Loop);
             }
-            // Whether routing serves continuation, so a run may move to another account at a
-            // quota wall and a moved run's resume may ask routing for its account: true only
-            // when routing declares `account_continue` and `account_continue_resume`; unknown
-            // counts as false. No reader of routing's `role.describe` is installed here yet, so
-            // runs neither move nor ask on resume.
-            let routing_serves_continuation = false;
             let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
+            // Whether a moved run's resume may ask routing for its account: only when routing
+            // serves continuation (see `resume_asks_routing`). Routing's description is read only
+            // for such a resume, so no other run waits on it.
+            let routing_serves_continuation = stored
+                .prior_run
+                .as_ref()
+                .is_some_and(|prior| prior.moved && !prior.idle)
+                && self.routing_serves_continuation().await;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
             if let Some(config) = &last_config {
                 if let Some(account) = config
@@ -5157,14 +5152,7 @@ mod executor {
             } else {
                 None
             };
-            let moves = AccountMoves::new(
-                self,
-                req,
-                auth,
-                clock.as_ref(),
-                routing_serves_continuation,
-                media_renderer,
-            );
+            let moves = AccountMoves::new(self, req, auth, clock.as_ref(), media_renderer);
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -5293,6 +5281,16 @@ mod executor {
             )
             .await
             .map_err(RunError::from)
+        }
+
+        /// Whether routing serves continuation: it is known to declare both `account_continue`
+        /// and `account_continue_resume`. No routing, or a description that can't be read,
+        /// counts as no.
+        async fn routing_serves_continuation(&self) -> bool {
+            match self.routing.as_ref() {
+                Some(routing) => routing.answers_moved_runs_with_current_account().await,
+                None => false,
+            }
         }
 
         /// Install the credential vault required for real provider calls.

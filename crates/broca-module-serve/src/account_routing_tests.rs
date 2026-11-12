@@ -61,6 +61,8 @@ struct FakeRouting {
     tier_probes: AtomicUsize,
     backoff: bool,
     credential_refused: bool,
+    /// The optional groups routing's description declares; `None` when it can't be read.
+    declared: Option<Vec<&'static str>>,
 }
 
 impl FakeRouting {
@@ -134,6 +136,14 @@ impl RoutingTransport for FakeRouting {
     async fn service_tier_supported(&self) -> Result<bool, String> {
         self.tier_probes.fetch_add(1, Ordering::SeqCst);
         Ok(self.tiers)
+    }
+    async fn capability(&self, name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        use crate::routing_capabilities::CapabilitySupport;
+        match &self.declared {
+            None => CapabilitySupport::Unknown,
+            Some(declared) if declared.contains(&name) => CapabilitySupport::Declared,
+            Some(_) => CapabilitySupport::NotDeclared,
+        }
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         self.request_bytes.lock().unwrap().push(body.clone());
@@ -3481,4 +3491,56 @@ async fn a_move_is_reported_once_in_order_under_the_original_admission() {
     assert!(observed
         .iter()
         .all(|body| body["admission_id"] == "adm-move"));
+}
+
+/// A run moves only when routing is known to declare both `account_continue` and
+/// `account_continue_resume`. An unreadable description, or either one alone, sends nothing:
+/// no continue request, and so no move and no report of one.
+#[tokio::test]
+async fn a_continue_request_needs_both_capabilities_declared() {
+    use crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME;
+    use cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE;
+    let selection = continue_selection();
+    let config = continue_config();
+    let wall = continue_wall(&selection, &config, &[], false);
+    let request = continue_request(&wall).unwrap();
+    let refusal = serde_json::to_vec(&json!({"result": {
+        "kind": "refuse", "routing_code": "account_pinned", "detail": {},
+    }}))
+    .unwrap();
+    for (declared, asks) in [
+        (None, false),
+        (Some(vec![]), false),
+        (Some(vec![ACCOUNT_CONTINUE]), false),
+        (Some(vec![ACCOUNT_CONTINUE_RESUME]), false),
+        (Some(vec![ACCOUNT_CONTINUE, ACCOUNT_CONTINUE_RESUME]), true),
+    ] {
+        let routing = Arc::new(FakeRouting {
+            reply: Mutex::new(Some(Ok(Ok(refusal.clone())))),
+            declared: declared.clone(),
+            ..FakeRouting::default()
+        });
+        let client = client(&routing);
+        assert_eq!(
+            client.answers_moved_runs_with_current_account().await,
+            asks,
+            "{declared:?}"
+        );
+        let outcome = client
+            .account_continue_if_served(&request, tokio::time::Instant::now() + ADMISSION_BUDGET)
+            .await;
+        if asks {
+            assert!(
+                matches!(outcome, ContinueOutcome::Answered(_)),
+                "{declared:?}"
+            );
+            assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP.to_owned()]);
+        } else {
+            assert_eq!(outcome, ContinueOutcome::NotDeclared, "{declared:?}");
+            assert!(
+                routing.requests.lock().unwrap().is_empty(),
+                "{declared:?}: nothing is sent to routing"
+            );
+        }
+    }
 }

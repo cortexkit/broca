@@ -1376,3 +1376,47 @@ async fn cache_evidence_captures_model_change_through_the_run_loop() {
 mod compaction_signals {
     include!("transport_compaction_signals_tests.rs");
 }
+
+/// A run that moves to another account inside the run closes the old account's transport and
+/// sends its next request through a provider for the new account: that request opens a new
+/// socket and carries no `previous_response_id`, so nothing from the old account's chain or
+/// connection reaches the new one.
+#[tokio::test]
+async fn codex_move_to_another_account_inside_a_run_opens_a_new_socket_without_a_chain() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let client = build_provider_http_client();
+    let first = run_provider(&mock, &client, "one");
+    first.bind_run_transport(&bind("session"));
+    let events = step(&first, 1, &opts()).await;
+    // What the run loop does when it leaves an account at a quota wall.
+    first.close_run_transport();
+    let second = run_provider(&mock, &client, "one");
+    {
+        let mut auth = second.auth.write().unwrap();
+        let AuthHandle::Headers(mut headers) = (*auth.auth).clone() else {
+            panic!("header auth")
+        };
+        headers
+            .iter_mut()
+            .find(|(key, _)| key == "chatgpt-account-id")
+            .unwrap()
+            .1 = "other-account".into();
+        headers
+            .iter_mut()
+            .find(|(key, _)| key == "authorization")
+            .unwrap()
+            .1 = "Bearer other-account-token".into();
+        auth.auth = Arc::new(AuthHandle::Headers(headers));
+    }
+    second.bind_run_transport(&bind("session"));
+    let next = follow_up(opts(), &events, "Next");
+    let events = step(&second, 2, &next).await;
+    assert!(!codex_trace(&events, 0).continuation);
+    let canonical: Value = serde_json::from_slice(&second.render_request(&next)).unwrap();
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2, "the new account opens its own socket");
+    assert_eq!(seen.requests.len(), 2);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(frame["input"], canonical["input"]);
+}

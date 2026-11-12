@@ -123,6 +123,8 @@ struct Account {
     render_config: Value,
     /// When the account last accepted a request, which a timed pause on it weighs.
     accepted_at_ms: Option<u64>,
+    /// The output caps the provider allows, which let the loop lower a step's cap.
+    output_limits: Option<broca_core::output_reservation::OutputLimits>,
 }
 
 impl Account {
@@ -134,6 +136,7 @@ impl Account {
             log: Arc::clone(log),
             render_config: render_config(name),
             accepted_at_ms: None,
+            output_limits: None,
         }
     }
 }
@@ -311,6 +314,10 @@ impl Provider for Account {
 
     fn render_config_blob(&self) -> Value {
         self.render_config.clone()
+    }
+
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        self.output_limits
     }
 
     fn last_accepted_at_ms(&self, _account: &str) -> Option<u64> {
@@ -669,6 +676,11 @@ struct Case {
     wait: broca_core::SameAccountWait,
     accepted_at_ms: Option<u64>,
     refuse_moves: bool,
+    /// Every account's output limits, and the run's context limit, so a step's cap is lowered.
+    output_limits: Option<broca_core::output_reservation::OutputLimits>,
+    context_limit: Option<u64>,
+    /// The session's compaction provider: the run is admitted under a plan that names it.
+    compaction: Option<Arc<Compactor>>,
 }
 
 impl Case {
@@ -682,6 +694,9 @@ impl Case {
             wait: Default::default(),
             accepted_at_ms: None,
             refuse_moves: false,
+            output_limits: None,
+            context_limit: None,
+            compaction: None,
         }
     }
 }
@@ -780,6 +795,8 @@ async fn run_case(case: Case) -> Ran {
     let (first, replies) = accounts.next().expect("a first account");
     let mut first_account = Account::new(first, replies, &sent, &log);
     first_account.accepted_at_ms = case.accepted_at_ms;
+    first_account.output_limits = case.output_limits;
+    let output_limits = case.output_limits;
     let provider: Box<dyn Provider> = Box::new(first_account);
     let routing = Routing {
         answers: Mutex::new(case.answers.into()),
@@ -788,7 +805,10 @@ async fn run_case(case: Case) -> Ran {
                 .map(|(name, replies)| {
                     (
                         name.to_owned(),
-                        Box::new(Account::new(name, replies, &sent, &log)) as Box<dyn Provider>,
+                        Box::new(Account {
+                            output_limits,
+                            ..Account::new(name, replies, &sent, &log)
+                        }) as Box<dyn Provider>,
                     )
                 })
                 .collect(),
@@ -800,10 +820,17 @@ async fn run_case(case: Case) -> Ran {
         .selection
         .unwrap_or_else(|| routed(first, &format!("decision-{first}")));
     let mut request = request();
+    let compacted = case.compaction.is_some();
+    let context_limit = case.context_limit.or(compacted.then_some(COMPACTED_LIMIT));
+    request.context_limit = context_limit;
     let control = broca_core::RunControl {
         cancel: Some(Default::default()),
         auth_selection: Some(selection.clone()),
         account_limit_pause: case.account_limit_pause,
+        admitted_context_limit: context_limit,
+        manifest: compacted.then(|| compacted_manifest(&request.tools)),
+        new_log_compaction_plan_version: compacted
+            .then_some(cortexkit_compaction_view::PLAN_VERSION),
         ..Default::default()
     };
     let now = || NOW;
@@ -816,7 +843,7 @@ async fn run_case(case: Case) -> Ran {
     )
     .unwrap();
     let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
-    let seams = seams(
+    let mut seams = seams(
         &provider,
         &tools,
         &now,
@@ -826,6 +853,10 @@ async fn run_case(case: Case) -> Ran {
         case.wait,
         Default::default(),
     );
+    if let Some(compactor) = &case.compaction {
+        seams.session_address = Some(broca_core::wal_writer::session_addr(&bind()));
+        seams.compaction_plane = Some(&**compactor as &dyn broca_core::CompactionPlane);
+    }
     let mut writer = Logging {
         session: &mut session,
         log: Arc::clone(&log),
@@ -1083,6 +1114,11 @@ async fn ends_without_moving(answers: Vec<Scripted>) -> (Ran, Value) {
     assert!(ran.auth_refreezes().is_empty());
     assert!(ran.adopted.is_empty());
     assert_eq!(ran.sent.len(), 2, "only A's two requests went out");
+    assert!(
+        !ran.log.iter().any(|line| line.starts_with("report moved")),
+        "no move is reported to routing: {:#?}",
+        ran.log
+    );
     let error = ran.end_error();
     (ran, error)
 }
@@ -1509,4 +1545,483 @@ fn the_ride_after_a_move_compares_the_old_account_with_the_new_one() {
     assert_ne!(before.account, after.account);
     assert_eq!(before.model, after.model);
     assert_eq!(before.surface, after.surface);
+}
+
+/// The step entered again on the new account keeps the output cap its refused attempt recorded:
+/// the cap is lowered once, before the first request of the step, and the re-sent request
+/// carries the same cap, with no second record.
+#[tokio::test]
+async fn the_re_sent_step_keeps_its_recorded_output_cap() {
+    let mut case = Case::new(
+        vec![("A", vec![Reply::Tool, wall()]), ("B", vec![Reply::Answer])],
+        vec![offer("B")],
+    );
+    // A cap far above what the context leaves beside the measured input, so step 2's cap is
+    // lowered before its first request.
+    case.output_limits = Some(broca_core::output_reservation::OutputLimits {
+        max: 4_000_000_000,
+        floor: 1,
+    });
+    case.context_limit = Some(2_000_000_000);
+    let ran = run_case(case).await;
+    assert_eq!(ran.reason(), RunFinishReason::Completed, "{:#?}", ran.log);
+    let cap = |sent: &Sent| sent.opts.step_context.as_ref().unwrap().max_output_tokens;
+    let (refused, resent) = (ran.sent_on("A")[1], ran.sent_on("B")[0]);
+    assert!(cap(refused).is_some(), "the step's cap was lowered");
+    assert!(cap(refused) < Some(4_000_000_000));
+    assert_eq!(cap(resent), cap(refused));
+    let lowered: Vec<_> = ran
+        .records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::OutputCapLowered(lowered) if lowered.step_id == 2 => {
+                Some(lowered.max_output_tokens)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lowered.len(), 1, "{lowered:?}");
+    assert_eq!(Some(lowered[0]), cap(resent));
+}
+
+/// The context limit a compacted run freezes.
+const COMPACTED_LIMIT: u64 = 200_000;
+
+/// A plan that names a compaction provider, for a run with `tools`.
+fn compacted_manifest(tools: &[broca_protocol::Tool]) -> Arc<broca_wal::PlanManifest> {
+    let tools = Arc::new(tools.to_vec());
+    Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(
+            json!({
+                "tool_items": [{"provider": "provider"}],
+                "compaction_item": {"provider": "compactor", "preset": "head", "params": {}},
+                "composition": {},
+                "render_tags": true,
+            })
+            .to_string(),
+        )
+        .unwrap(),
+        plan_identity: "plan-compacted".into(),
+        composition_digest: "composition-1".into(),
+        fetches: vec![broca_wal::ProviderFetch {
+            provider: "provider".into(),
+            outcome: broca_wal::FetchOutcome::Answered {
+                catalog_digest: "catalog-1".into(),
+                tools: Arc::clone(&tools),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: None,
+                reference_slots: None,
+            },
+        }],
+        tools,
+        system_text: "You compact.".into(),
+        system_digest: "system-1".into(),
+        join_version: 1,
+        role_versions: [("tool-provider".to_string(), "v1".to_string())].into(),
+        declarations: Vec::new(),
+    })
+}
+
+/// A compaction provider that records every ride and answers it from a script: `nothing`, or
+/// a view that shortens the tool output it was told about.
+#[derive(Default)]
+struct Compactor {
+    /// Whether rides are answered with a view.
+    view: bool,
+    rides: Mutex<Vec<Value>>,
+    /// The tool part the notices named last: its entry id, part id and digest. The run has one.
+    tool_part: Mutex<Option<(String, String, String)>>,
+}
+
+impl Compactor {
+    fn remember(&self, value: &Value) {
+        match value {
+            Value::Object(members) => {
+                if let (Some(mid), Some(parts)) = (
+                    members.get("mid").and_then(Value::as_str),
+                    members.get("parts").and_then(Value::as_array),
+                ) {
+                    if let Some(tool) = parts.iter().find(|part| part["kind"] == "tool") {
+                        // The newest digest wins: a replacement names the completed output,
+                        // not the running call an earlier notice described.
+                        *self.tool_part.lock().unwrap() = Some((
+                            mid.to_owned(),
+                            tool["id"].as_str().unwrap().to_owned(),
+                            tool["digest"].as_str().unwrap().to_owned(),
+                        ));
+                    }
+                }
+                members.values().for_each(|member| self.remember(member));
+            }
+            Value::Array(items) => items.iter().for_each(|item| self.remember(item)),
+            _ => {}
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl broca_core::CompactionPlane for Compactor {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::CompactionUnavailable,
+    > {
+        panic!("a session on the current compaction contract never calls the first protocol")
+    }
+
+    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
+        Some(Vec::new())
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        params: Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        self.remember(&params);
+        let answer = match method {
+            "compaction.setup" => json!({"answer": "ready"}),
+            "compaction.notice" => json!({"answer": "received"}),
+            "compaction.ride" => {
+                self.rides.lock().unwrap().push(params);
+                let part = self.tool_part.lock().unwrap().clone();
+                match part.filter(|_| self.view) {
+                    None => json!({"answer": "nothing"}),
+                    Some((mid, part, expect)) => {
+                        use cortexkit_role_compaction::view::{Edit, EditOp, View};
+                        let view = View::seal(
+                            1,
+                            vec![Edit::new(
+                                1,
+                                EditOp::Replace {
+                                    mid,
+                                    part,
+                                    field: "output".into(),
+                                    value: json!("compacted tool output"),
+                                    expect,
+                                },
+                            )],
+                        );
+                        json!({"answer": "view", "view": view})
+                    }
+                }
+            }
+            other => panic!("unexpected compaction method {other}"),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).unwrap())
+    }
+}
+
+/// On a compacted session, the step entered again on the new account rides first, naming the
+/// account change, and with no view to apply sends the refused request's bytes.
+#[tokio::test]
+async fn a_move_on_a_compacted_session_rides_with_account_change() {
+    let compactor = Arc::new(Compactor::default());
+    let mut case = Case::new(
+        vec![("A", vec![Reply::Tool, wall()]), ("B", vec![Reply::Answer])],
+        vec![offer("B")],
+    );
+    case.compaction = Some(Arc::clone(&compactor));
+    let ran = run_case(case).await;
+    assert_eq!(ran.reason(), RunFinishReason::Completed, "{:#?}", ran.log);
+    let rides = compactor.rides.lock().unwrap().clone();
+    assert_eq!(
+        rides.len(),
+        1,
+        "one ride, before the re-sent request: {rides:#?}"
+    );
+    assert_eq!(
+        rides[0]["causes"],
+        json!(["account_change"]),
+        "{:#}",
+        rides[0]
+    );
+    let (refused, resent) = (ran.sent_on("A")[1], ran.sent_on("B")[0]);
+    assert_eq!(rendered(&refused.opts), rendered(&resent.opts));
+    assert!(!ran
+        .records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::ViewApplied(_))));
+}
+
+/// On a compacted session whose provider answers the move's ride with a newer view, the re-sent
+/// request renders under it, and the step records the view it applied.
+#[tokio::test]
+async fn a_move_applies_the_view_its_ride_brings_to_the_re_sent_request() {
+    let compactor = Arc::new(Compactor {
+        view: true,
+        ..Compactor::default()
+    });
+    let mut case = Case::new(
+        vec![("A", vec![Reply::Tool, wall()]), ("B", vec![Reply::Answer])],
+        vec![offer("B")],
+    );
+    case.compaction = Some(Arc::clone(&compactor));
+    let ran = run_case(case).await;
+    assert_eq!(ran.reason(), RunFinishReason::Completed, "{:#?}", ran.log);
+    let rides = compactor.rides.lock().unwrap().clone();
+    assert_eq!(rides.len(), 1, "{rides:#?}");
+    assert_eq!(rides[0]["causes"], json!(["account_change"]));
+    let applied: Vec<_> = ran
+        .records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ViewApplied(applied) => Some((applied.step_id, applied.version)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        applied,
+        vec![(2, 1)],
+        "tool part {:?}\nride {:#}\nlog {:#?}",
+        compactor.tool_part.lock().unwrap(),
+        rides[0],
+        ran.log
+    );
+    let (refused, resent) = (ran.sent_on("A")[1], ran.sent_on("B")[0]);
+    let text = |sent: &Sent| String::from_utf8(rendered(&sent.opts)).unwrap();
+    // The step-1 tool result the view replaces: what the refused request carried, and what the
+    // re-sent one no longer does.
+    let original = "not in this run's capability manifest";
+    assert!(text(refused).contains(original), "{}", text(refused));
+    assert!(!text(refused).contains("compacted tool output"));
+    assert!(!text(resent).contains(original), "{}", text(resent));
+    assert!(text(resent).contains("compacted tool output"));
+}
+
+/// The run of the first test, on `session`, as a session's store actor runs it: a wall on A at
+/// step 2, routing offering B with a persona to refreeze, step 2 answered on B. Its outcome and
+/// the requests it sent.
+async fn moving_run(
+    session: &mut Session<&MemoryBackend>,
+    parts: &mut MemoryParts,
+) -> (
+    Result<broca_session_loop::Finished, broca_session_loop::LoopError>,
+    Vec<Sent>,
+) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log: Log = Arc::default();
+    let provider: Box<dyn Provider> =
+        Box::new(Account::new("A", vec![Reply::Tool, wall()], &sent, &log));
+    let routing = moving_routing(&sent, &log);
+    let a = routed("A", "decision-A");
+    let mut request = request();
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    let control = broca_core::RunControl {
+        cancel: Some(Default::default()),
+        auth_selection: Some(a.clone()),
+        ..Default::default()
+    };
+    let now = || NOW;
+    let admission = broca_session_loop::admit::admission(
+        &mut request,
+        &control,
+        &provider,
+        Writer::operations(&*session),
+        Some(now()),
+    )
+    .unwrap();
+    let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
+    let seams = seams(
+        &provider,
+        &tools,
+        &now,
+        Some(&routing),
+        &log,
+        a,
+        Default::default(),
+        Default::default(),
+    );
+    let finished = broca_session_loop::run::run(session, parts, admission, &seams).await;
+    drop(seams);
+    let sent = sent.lock().unwrap().clone();
+    (finished, sent)
+}
+
+/// Routing that offers B, whose provider answers the step it is given.
+fn moving_routing(sent: &Arc<Mutex<Vec<Sent>>>, log: &Log) -> Routing {
+    Routing {
+        answers: Mutex::new(
+            vec![Scripted::Offer {
+                account: "B",
+                valid_until_ms: NOW + OFFER_VALID_MS,
+                persona: true,
+            }]
+            .into(),
+        ),
+        providers: Mutex::new(HashMap::from([(
+            "B".to_owned(),
+            Box::new(Account::new("B", vec![Reply::Answer], sent, log)) as Box<dyn Provider>,
+        )])),
+        asked: Default::default(),
+        adopted: Default::default(),
+    }
+}
+
+/// A crash at every point of the move, then a restart: the store reopened from what it holds,
+/// and the run resumed through the real loop.
+///
+/// This lives here rather than in broca-crash-harness because the move exists only on the
+/// session store, whose appends are atomic: a crash falls between appends (the store fails
+/// every write after the `n`th), never inside the batch that holds the config and account
+/// refreezes. The crash harness drives only the older storage's log.
+///
+/// At every crash point: no attempt names B unless the record moving the run to B precedes it;
+/// the config and account refreezes are both there or both absent; the run's fold names the
+/// account of the newest refreeze; and a resume renders the run's request from the log, on the
+/// account and with the persona `run_config_of_run` reads, the same bytes the run sends without
+/// a crash, with no drift refusal.
+#[tokio::test]
+async fn a_crash_at_every_point_of_a_move_resumes_on_what_the_log_holds() {
+    // The step-2 request the run sends without a crash, on either account.
+    let reference = {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let mut parts = MemoryParts::default();
+        let (finished, sent) = moving_run(&mut session, &mut parts).await;
+        assert_eq!(finished.unwrap().reason, RunFinishReason::Completed);
+        let step2: Vec<_> = sent.iter().filter(|sent| sent.step == 2).collect();
+        assert_eq!(step2.len(), 2);
+        assert_eq!(rendered(&step2[0].opts), rendered(&step2[1].opts));
+        rendered(&step2[0].opts)
+    };
+    let mut crashes = 0;
+    let mut resumed_sends = 0;
+    for mutations in 0.. {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let mut parts = MemoryParts::default();
+        backend.crash_after(Some(mutations));
+        let (outcome, _) = moving_run(&mut session, &mut parts).await;
+        backend.crash_after(None);
+        if outcome.is_ok() {
+            break;
+        }
+        crashes += 1;
+        drop(session);
+        let mut loaded = Session::load(
+            &backend,
+            SessionAddr("0123456789abcdef".into()),
+            &SessionTriple {
+                project_root: "/project".into(),
+                harness: "account-move".into(),
+                session: "s1".into(),
+            },
+            &DeploymentKey::new(1, &[7; 32]),
+        )
+        .await
+        .unwrap();
+        let context = format!("crash after {mutations} writes");
+        let records = loaded.open_log_records().await.unwrap();
+        // 1. No attempt on B before the record that moves the run to B.
+        let mut moved_to_b = false;
+        for (_, record) in &records {
+            match record {
+                Record::AuthRefrozen(auth) if auth.auth_selection["account_ref"] == "B" => {
+                    moved_to_b = true;
+                }
+                Record::Attempt(attempt) => {
+                    let value = serde_json::to_value(attempt).unwrap();
+                    if value["attempt"]["served_account_ref"] == "B" {
+                        assert!(moved_to_b, "{context}: an attempt on B before the move");
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 2. The config and account refreezes are written together or not at all.
+        let count = |is: fn(&Record) -> bool| records.iter().filter(|(_, r)| is(r)).count();
+        let configs = count(|record| matches!(record, Record::ConfigRefrozen(_)));
+        let auths = count(|record| matches!(record, Record::AuthRefrozen(_)));
+        assert_eq!(configs, auths, "{context}");
+        let Some(run) = loaded.operations.run.clone() else {
+            continue;
+        };
+        // 3. The fold names the newest refreeze's account.
+        let newest = records.iter().rev().find_map(|(_, record)| match record {
+            Record::AuthRefrozen(auth) => Some(auth.auth_selection.clone()),
+            _ => None,
+        });
+        assert_eq!(run.refrozen_auth, newest, "{context}");
+        if run.finished.is_some() {
+            continue;
+        }
+        // 4. The restart resumes the run on what the log holds.
+        let recorded = broca_session_loop::run::run_config_of_run(&run, &parts).unwrap();
+        let selection = recorded.auth_selection.clone().unwrap();
+        let account = selection.account_ref.clone().unwrap();
+        assert_eq!(account, if moved_to_b { "B" } else { "A" }, "{context}");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let log: Log = Arc::default();
+        // A answers the steps the log has no answer for yet: step 1's tool call, then the wall.
+        let step_one_ended = records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::StepEnd(end) if end.step_id == 1));
+        let replies = if account == "A" && step_one_ended {
+            vec![wall()]
+        } else if account == "A" {
+            vec![Reply::Tool, wall()]
+        } else {
+            vec![Reply::Answer]
+        };
+        let mut resumed_on = Account::new(&account, replies, &sent, &log);
+        resumed_on.render_config = recorded.frozen_render_config.clone();
+        let resumed_on: Box<dyn Provider> = Box::new(resumed_on);
+        let routing = moving_routing(&sent, &log);
+        let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
+        let now = || NOW;
+        let seams = seams(
+            &resumed_on,
+            &tools,
+            &now,
+            Some(&routing),
+            &log,
+            selection,
+            Default::default(),
+            Default::default(),
+        );
+        let finished = broca_session_loop::resume(&mut loaded, &parts, &seams)
+            .await
+            .unwrap_or_else(|error| panic!("{context}: {error:?}"));
+        drop(seams);
+        assert_eq!(finished.reason, RunFinishReason::Completed, "{context}");
+        let sent = sent.lock().unwrap().clone();
+        for request in sent.iter().filter(|sent| sent.step == 2) {
+            resumed_sends += 1;
+            assert_eq!(rendered(&request.opts), reference, "{context}");
+            assert_eq!(
+                request
+                    .opts
+                    .step_context
+                    .as_ref()
+                    .unwrap()
+                    .account_ref
+                    .as_deref(),
+                Some(request.account.as_str()),
+                "{context}"
+            );
+        }
+        let after = loaded.open_log_records().await.unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|(_, record)| matches!(record, Record::RunEnd(end) if end.error.is_some())),
+            "{context}: no drift refusal"
+        );
+    }
+    assert!(crashes > 5, "the run was cut at {crashes} points");
+    assert!(resumed_sends > 0, "some resume sent step 2 again");
 }
