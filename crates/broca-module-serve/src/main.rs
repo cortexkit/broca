@@ -5135,9 +5135,42 @@ mod executor {
                     None,
                     self.max_same_account_wait,
                 );
-                return broca_session_loop::seal(writer, parts, &seams, cause)
+                // Routing holds a lease for a run it admitted until it hears the run end, so a
+                // sealed run reports its end under the account it ran on, as any run does.
+                let reporter = {
+                    use broca_session_loop::writer::Writer as _;
+                    let selection = writer.operations().run.as_ref().and_then(|run| {
+                        broca_session_loop::account_move::current_auth_selection(run, parts)
+                            .ok()
+                            .flatten()
+                    });
+                    match (
+                        self.routing.as_ref(),
+                        selection
+                            .as_ref()
+                            .and_then(|selection| selection.account_decision.as_ref()),
+                    ) {
+                        (Some(routing), Some(decision)) => {
+                            broca_module_serve::account_routing::RunReporter::start_for_decision(
+                                Arc::clone(routing),
+                                decision,
+                                req.run_id.0.clone(),
+                                None,
+                                writer.durable_head(),
+                                Some(writer.session_id()),
+                            )
+                        }
+                        _ => None,
+                    }
+                };
+                let durable_head = writer.durable_head();
+                let sealed = broca_session_loop::seal(writer, parts, &seams, cause)
                     .await
-                    .map_err(StoreRunError::Loop);
+                    .map_err(StoreRunError::Loop)?;
+                if let Some(reporter) = reporter.filter(|_| sealed.paused.is_none()) {
+                    reporter.finish(None, durable_head.load(Ordering::Acquire), sealed.reason);
+                }
+                return Ok(sealed);
             }
             if mode == StoreRunMode::Resume
                 && control

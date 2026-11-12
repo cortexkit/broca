@@ -810,3 +810,155 @@ async fn a_resume_after_a_relogin_to_another_account_pauses_as_account_changed()
     assert_eq!(error.class, broca_protocol::ErrorClass::Auth);
 }
 
+/// A model call that never answers, so the run it belongs to is cut off mid-step.
+struct NeverAnswers;
+
+#[async_trait::async_trait]
+impl broca_core::provider::Provider for NeverAnswers {
+    async fn step(
+        &self,
+        _step_id: broca_protocol::StepId,
+        _opts: &broca_protocol::request::CallOptions,
+    ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        std::future::pending().await
+    }
+}
+
+/// Routing that keeps every observation it is sent.
+#[derive(Default)]
+struct KeepsObservations(std::sync::Mutex<Vec<serde_json::Value>>);
+
+#[async_trait::async_trait]
+impl broca_module_serve::account_routing::RoutingTransport for KeepsObservations {
+    async fn request(&self, body: Vec<u8>) -> broca_module_serve::account_routing::RoutingReply {
+        self.0
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&body).unwrap());
+        Ok(Ok(serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap()))
+    }
+}
+
+/// A routed run a crash cut off mid-step is sealed when its session opens, and its end reaches
+/// routing as `run_finished` under the run's admission, so routing's lease on the account
+/// ends as it does for a run that ends any other way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealed_routed_run_reports_its_end_to_routing() {
+    let root = fresh_vault_root("sealed-run-finished");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let mut executor = executor_with_capturing_vault(&root, &daemon).await;
+    let routing = Arc::new(KeepsObservations::default());
+    executor.routing = Some(Arc::new(
+        broca_module_serve::account_routing::RoutingClient::new(
+            routing.clone(),
+            broca_module_serve::account_routing::AccountSelectionConfig::default(),
+        ),
+    ));
+    let mut session = store_session().await;
+    let mut parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let mut req = drift_request(&root);
+    req.run_id = broca_protocol::RunId("sealed-run".into());
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "hello".into(),
+        }],
+    )];
+    // The run starts under routing's decision and is cut off inside its first model call.
+    let control = broca_core::RunControl {
+        auth_selection: Some(
+            serde_json::from_value(serde_json::json!({
+                "credential_id": "oauth:anthropic",
+                "account_ref": "acct-a",
+                "account_decision": {
+                    "path": "routed",
+                    "admission_id": "sealed-run",
+                    "decision_id": "decision-a",
+                    "conversation_key": "broca-session:sealed",
+                },
+            }))
+            .unwrap(),
+        ),
+        ..Default::default()
+    };
+    {
+        let provider = NeverAnswers;
+        let tools = broca_core::StubToolPlane::new();
+        let now = || 1_000;
+        let seams = broca_session_loop::Seams {
+            provider: &provider,
+            tools: &tools,
+            bind: req.session.clone(),
+            out: None,
+            cancel: Default::default(),
+            stop: Default::default(),
+            held: None,
+            approval: &broca_core::AllowAll,
+            hook_plane: None,
+            now_ms: &now,
+            session_address: None,
+            compaction_plane: None,
+            compaction_session: None,
+            compaction_changes: false,
+            keep_warm: None,
+            account_reports: None,
+            max_same_account_wait: Default::default(),
+            auth_selection: control.auth_selection.clone(),
+            step_progress: None,
+            model_call_ready: None,
+            account_continue: None,
+        };
+        let mut started = req.clone();
+        let admission = broca_session_loop::admit::admission(
+            &mut started,
+            &control,
+            &provider,
+            broca_session_loop::writer::Writer::operations(&session),
+            Some(1_000),
+        )
+        .unwrap();
+        let cut = tokio::time::timeout(
+            Duration::from_millis(200),
+            broca_session_loop::run(&mut session, &mut parts, admission, &seams),
+        )
+        .await;
+        assert!(cut.is_err(), "the run is cut off inside its model call");
+    }
+    let end = serve_store_run(
+        &executor,
+        &mut session,
+        &parts,
+        req,
+        broca_module::executor::StoreRunMode::Seal(broca_core::seal::SealCause::CrashOrphan),
+    )
+    .await;
+    let finished = end.result.expect("the run is sealed");
+    assert_eq!(finished.reason, RunFinishReason::Interrupted);
+    let observed = broca_test_support::wait_until("routing hears the run end", || {
+        let routing = Arc::clone(&routing);
+        async move {
+        let observed = routing.0.lock().unwrap().clone();
+        if observed
+            .iter()
+            .any(|request| request["params"]["kind"] == "run_finished")
+        {
+            Ok(observed)
+        } else {
+            Err(format!("{observed:?}"))
+        }
+        }
+    })
+    .await;
+    let finished: Vec<_> = observed
+        .iter()
+        .filter(|request| request["params"]["kind"] == "run_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["method"], "route.account_observe");
+    assert_eq!(finished[0]["params"]["admission_id"], "sealed-run");
+    assert_eq!(finished[0]["params"]["run_id"], "sealed-run");
+    drop(executor);
+    drop(daemon);
+}
