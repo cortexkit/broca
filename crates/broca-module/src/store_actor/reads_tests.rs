@@ -1259,3 +1259,141 @@ async fn a_session_created_again_is_read_fresh() {
     m.compare(&reads(&["r1"]), "the session created again")
         .await;
 }
+
+/// Every llm-runner surface serves a store session's history version one above the version its
+/// head stores (`store_exposure::EXPOSURE_EPOCH`), from the session's first read on, and takes a
+/// caller's version back the same way: a page asked for at the served version is served, and one
+/// asked for at the stored version, which an earlier build served, is refused as after any
+/// rewrite. A revert raises both by one.
+#[tokio::test]
+async fn the_served_history_version_is_the_stored_one_past_the_exposure_epoch() {
+    use crate::serve::{ServeError, ServeHandler, SessionReadRequest};
+    use crate::store_exposure::{served_history_version, EXPOSURE_EPOCH};
+    assert_eq!(EXPOSURE_EPOCH, 1);
+    let m = module(vec![text_step("a1", "one"), text_step("b1", "two")]).await;
+    active(m.send("r1", "first").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    active(m.send("r2", "second").await);
+    m.gate.notify_one();
+    m.ended("r2", "completed").await;
+
+    let read = m
+        .registry
+        .read(SessionReadRequest::new(m.key.clone(), Some(1), None))
+        .await
+        .unwrap();
+    assert_eq!(read.history_version, 1, "a new session serves version 1");
+    let head = m.registry.head(&m.key).await.unwrap();
+    assert_eq!(head.history_version, 1);
+    let history = crate::history::read(
+        &m.registry,
+        &m.key,
+        &serde_json::from_value(serde_json::json!({"from_ordinal": 1})).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history["history_version"], 1);
+
+    // `after_mid` at the served version pages on; at the stored one it is refused.
+    let after = |version| {
+        let mut request = SessionReadRequest::new(m.key.clone(), None, None);
+        request.after_mid = Some(read.messages[0].mid.clone());
+        request.history_version = Some(version);
+        request
+    };
+    let next = m.registry.read(after(1)).await.unwrap();
+    assert_eq!(next.messages[0].ordinal, 2);
+    assert!(matches!(
+        m.registry.read(after(0)).await,
+        Err(ServeError::HistoryChanged)
+    ));
+
+    // A revert to r2's input raises the stored version, and the served one with it.
+    m.close().await;
+    let mut writer = m.writer().await;
+    assert_eq!(writer.head().history_version, 0);
+    let (ordinal, target) = entry_of(&writer, "second").await;
+    let records = writer.records_from(1).await.unwrap();
+    let mut start = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::RunStart(start) if start.run_id == "r2" => Some(start.clone()),
+            _ => None,
+        })
+        .expect("r2's start");
+    start.run_id = "r9".into();
+    start.send_id = Some("s9".into());
+    let input = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::Input(input) if input.run_id == "r2" => {
+                let mut input = input.clone();
+                input.run_id = "r9".into();
+                Some(input)
+            }
+            _ => None,
+        })
+        .expect("r2's input");
+    let facts = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::EntryFacts(facts) if facts.ordinal == ordinal => {
+                let mut facts = facts.clone();
+                facts.run_id = Some("r9".into());
+                Some(facts)
+            }
+            _ => None,
+        })
+        .expect("the input's entry facts");
+    writer
+        .revert(
+            &target,
+            vec![
+                Record::RunStart(start),
+                Record::Input(input),
+                Record::EntryFacts(facts),
+            ],
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    let stored = writer.head().history_version;
+    assert_eq!(stored, 1, "the revert raised the stored version");
+    writer.close().await.unwrap();
+    let view = Session::view(m.backend(), m.addr(), &m.triple(), &deployment_key())
+        .await
+        .unwrap();
+    let runtime = m.runtime();
+    let parts = runtime.parts_for(
+        broca_wal::StorageClass::Ordinary,
+        broca_session_store::keys::Cipher::XChaCha20Poly1305,
+    );
+    let page = |version: Option<u64>| {
+        let mut request = SessionReadRequest::new(m.key.clone(), Some(1), None);
+        request.history_version = version;
+        request
+    };
+    let reverted = crate::store_read::serve_view(&*view, parts, &page(None))
+        .await
+        .unwrap();
+    assert_eq!(reverted.history_version, served_history_version(stored));
+    assert_eq!(
+        reverted.history_version, 2,
+        "the served version rose by one"
+    );
+    assert!(crate::store_read::serve_view(&*view, parts, &page(Some(2)))
+        .await
+        .is_ok());
+    for stale in [0, 1] {
+        assert!(matches!(
+            crate::store_read::serve_view(&*view, parts, &page(Some(stale))).await,
+            Err(ServeError::HistoryChanged)
+        ));
+    }
+    let head = crate::store_entries::history_head_of(&*view, None)
+        .await
+        .unwrap();
+    assert_eq!(head.history_version, 2);
+}

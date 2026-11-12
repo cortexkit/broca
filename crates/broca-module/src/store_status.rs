@@ -1040,13 +1040,15 @@ async fn final_message<B: SessionBackend>(
                 // current compaction contract; on a session converted from an older one, the
                 // writing run's frozen rules say it.
                 let ours = placed.contains_key(&entry.ordinal);
+                let served = crate::store_exposure::served_message(
+                    &entry.message,
+                    facts.clean_reply || (ours && cleans_text),
+                );
                 return Ok(broca_wire::FinalMessage {
                     ordinal: entry.ordinal,
                     mid: facts.mid.clone(),
-                    text: crate::serve::joined_text(
-                        &entry.message,
-                        facts.clean_reply || (ours && cleans_text),
-                    ),
+                    // `served` is already cleaned where its reply is, so the join adds no cleaning.
+                    text: crate::serve::joined_text(&served, false),
                 });
             }
         }

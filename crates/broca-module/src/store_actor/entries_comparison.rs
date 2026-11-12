@@ -1277,12 +1277,15 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
     }
 }
 
-/// A store session's reads clean part-number notation out of a reply exactly where today's
-/// reads do: under a run whose plan renders part numbers, and not under one whose plan only
-/// names a compaction provider (today's read follows the run's own `render_tags`, not the
-/// compaction view's numbering). The stored message always keeps the text the model wrote.
+/// A store session's reads clean part-number notation out of a reply wherever its entry facts
+/// say its run cleans replies (`EntryFacts::clean_reply`): under a run whose plan renders part
+/// numbers, and under one whose plan only names a compaction provider, whose compaction view
+/// shows the model numbers too. Today's storage cleans only under the first: its read follows
+/// the run's own `render_tags`, so its pages under the second keep the tags, which the new
+/// storage stopped serving (`store_exposure`). The stored message always keeps the text the
+/// model wrote.
 #[tokio::test]
-async fn reads_clean_replies_where_todays_reads_clean_them() {
+async fn reads_clean_replies_where_their_facts_say_their_run_cleans_them() {
     use crate::serve::{ServeHandler, SessionReadRequest};
     let raw = ["§2§ Done.", "let me look", "§5§ §6§ It says file contents."];
     let cleaned: Vec<String> = raw
@@ -1298,7 +1301,7 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             .filter_map(|block| block["text"].as_str().map(str::to_owned))
             .collect()
     };
-    for (renders, expected) in [
+    for (renders, today_expected) in [
         (true, cleaned.clone()),
         (false, raw.map(str::to_owned).to_vec()),
     ] {
@@ -1306,13 +1309,13 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
         let old = today.history(json!({"from_ordinal": 1})).await.unwrap();
         assert_eq!(
             texts(old["messages"].as_array().unwrap()),
-            expected,
+            today_expected,
             "today's history, renders {renders}"
         );
         let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
         assert_eq!(
             texts(new["messages"].as_array().unwrap()),
-            expected,
+            cleaned,
             "the store's history, renders {renders}"
         );
         let read = store
@@ -1323,7 +1326,7 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
         let read = serde_json::to_value(&read).unwrap();
         assert_eq!(
             texts(read["messages"].as_array().unwrap()),
-            expected,
+            cleaned,
             "the store's session.read, renders {renders}"
         );
         // The stored replies keep the model's own text.
@@ -1348,6 +1351,362 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             .collect();
         assert_eq!(stored, raw, "renders {renders}");
     }
+}
+
+/// The text parts of each assistant message of `messages`, in order, in whichever form holds
+/// them: a read entry's `message.content`, a display entry's `row.parts` or a compaction entry's
+/// `parts`.
+fn assistant_texts(messages: &[Value]) -> Vec<Vec<String>> {
+    messages
+        .iter()
+        .map(|message| match &message["row"] {
+            Value::Object(_) => &message["row"],
+            _ => message,
+        })
+        .filter(|message| {
+            message["message"]["role"] == "assistant" || message["role"] == "assistant"
+        })
+        .map(|message| {
+            let parts = message["message"]["content"]
+                .as_array()
+                .or_else(|| message["parts"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            parts
+                .iter()
+                .filter(|part| part["type"] == "text" || part["kind"] == "text")
+                .filter_map(|part| part["text"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .collect()
+}
+
+/// The replies of [`served_session`]'s three runs as the model wrote them: one starting with its
+/// own part number, one tool-calling step, one starting with two numbers, and one naming
+/// numbers mid-text.
+const WRITTEN: [&str; 4] = [
+    "§2§ Done.",
+    "let me look",
+    "§5§ §6§ It says file contents.",
+    "As §3§ shows, the file §4§ holds it.",
+];
+
+/// A store session on the current compaction contract whose plan names `ck-mc` without asking
+/// for rendered numbers, after three runs replying [`WRITTEN`], with a subscriber attached live
+/// before the third run and the deliveries it received.
+async fn served_session() -> (Side, Vec<crate::Delivery>) {
+    use crate::serve::{ServeHandler, SubscribeFrom};
+    let (_today, store) = contract_sessions_with(
+        false,
+        vec![text_step("a4", WRITTEN[3])],
+        Duration::from_secs(600),
+    )
+    .await;
+    let (sink, mut deliveries) = mpsc::channel(4096);
+    store
+        .registry
+        .subscribe(&store.key, SubscribeFrom::Live, sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .send_request("r3", untooled("and"), Some(planned("plan-1", None)))
+            .await,
+        SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+    ));
+    store.settled("r3").await;
+    store.assert_completed("r3").await;
+    let mut live = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(Duration::from_millis(300), deliveries.recv()).await
+    {
+        live.push(delivery);
+    }
+    (store, live)
+}
+
+/// The `assistant_message` control units of `deliveries`, each as its cursor and unit serialize.
+fn assistant_units(deliveries: &[crate::Delivery]) -> Vec<Value> {
+    deliveries
+        .iter()
+        .filter_map(|delivery| match delivery {
+            crate::Delivery::Control(event)
+                if matches!(
+                    event.1,
+                    broca_protocol::caller::ControlUnit::AssistantMessage { .. }
+                ) =>
+            {
+                Some(json!({
+                    "cursor": broca_wire::CursorWire::from(event.0),
+                    "unit": event.1,
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every llm-runner exposure of a store session's replies serves a reply whose entry facts say
+/// its run cleans replies cleaned of part-number notation, and the same cleaned text on each:
+/// `session.read` in every media mode, `session.history` raw and display, and `run.result`,
+/// each equal to the text the compaction entry for that message carries. A served digest is the
+/// cleaned body's. The stored message keeps what the model wrote, and the next request renders
+/// it with exactly one number in front. The control lane's `assistant_message` unit carries the
+/// stored text, live and replayed alike.
+#[tokio::test]
+async fn every_exposure_serves_a_cleaned_reply_and_the_store_keeps_the_written_one() {
+    use crate::serve::{ServeHandler, SessionReadRequest, SubscribeFrom};
+    use cortexkit_role_llm_runner::read::MediaMode;
+    let (store, live) = served_session().await;
+    let cleaned: Vec<String> = WRITTEN
+        .iter()
+        .map(|text| broca_protocol::tags::exposed_model_text(true, text).into_owned())
+        .collect();
+    assert_eq!(cleaned[0], "Done.");
+    assert_eq!(cleaned[2], "It says file contents.");
+    assert!(!cleaned[3].contains('§'), "{}", cleaned[3]);
+    let expected: Vec<Vec<String>> = cleaned.iter().map(|text| vec![text.clone()]).collect();
+
+    // What the store keeps: the text the model wrote, under a run whose facts say it cleans.
+    let session = store
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&store.key)
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = session.entries(1, 64).await.unwrap();
+    let replies: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.message.role == broca_protocol::Role::Assistant)
+        .collect();
+    let stored: Vec<Vec<String>> = replies
+        .iter()
+        .map(|entry| {
+            entry
+                .message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        stored,
+        WRITTEN.map(|text| vec![text.to_owned()]).to_vec(),
+        "the store keeps the written replies"
+    );
+    assert!(replies
+        .iter()
+        .all(|entry| entry.state.facts.as_ref().unwrap().clean_reply));
+
+    // `session.read`, in every media mode, and its digests.
+    for media in [
+        MediaMode::Inline,
+        MediaMode::Blocks,
+        MediaMode::MediaRefs,
+        MediaMode::Descriptors,
+    ] {
+        let mut request = SessionReadRequest::new(store.key.clone(), Some(1), None);
+        request.media = media;
+        let read = store.registry.read(request).await.unwrap();
+        let read = serde_json::to_value(&read).unwrap();
+        let messages = read["messages"].as_array().unwrap();
+        if media == MediaMode::Descriptors {
+            let digests: Vec<&Value> = messages
+                .iter()
+                .filter(|message| message["message"]["role"] == "assistant")
+                .map(|message| &message["digest"])
+                .collect();
+            for (entry, digest) in replies.iter().zip(digests) {
+                let mut written = entry.message.clone();
+                written.ordinal = Some(entry.ordinal - 1);
+                let served = crate::store_exposure::served_message(&written, true).into_owned();
+                let identity = |message: &broca_protocol::Message| {
+                    json!(broca_protocol::caller_message::message_content_identity(message).digest)
+                };
+                assert_eq!(digest, &identity(&served), "message {}", entry.ordinal);
+                if served.content != written.content {
+                    assert_ne!(digest, &identity(&written), "message {}", entry.ordinal);
+                }
+            }
+        } else {
+            assert_eq!(
+                assistant_texts(messages),
+                expected,
+                "session.read {media:?}"
+            );
+        }
+    }
+
+    // `session.history`, raw and display.
+    for form in ["raw", "display"] {
+        let history = store
+            .history(json!({"form": form, "from_ordinal": 1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            assistant_texts(history["messages"].as_array().unwrap()),
+            expected,
+            "session.history {form}: {history}"
+        );
+    }
+
+    // `run.result`: each run's final reply.
+    for (run, at) in [("r1", 0), ("r2", 2), ("r3", 3)] {
+        let result = store
+            .registry
+            .run_result(&store.key, RunId(run.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.final_message.map(|message| message.text),
+            Some(cleaned[at].clone()),
+            "run.result {run}"
+        );
+    }
+
+    // The compaction entries carry the same text, message by message.
+    let page = store
+        .compaction(
+            Some("ck-mc"),
+            "session.entries",
+            json!({"select": {"by": "after"}, "detail": "full"}),
+        )
+        .await
+        .unwrap();
+    let by_mid = |messages: &[Value]| -> std::collections::BTreeMap<String, Vec<String>> {
+        messages
+            .iter()
+            .filter_map(|message| {
+                let texts = assistant_texts(std::slice::from_ref(message)).pop()?;
+                Some((message["mid"].as_str()?.to_owned(), texts))
+            })
+            .collect()
+    };
+    let entries = by_mid(page["entries"].as_array().unwrap());
+    let read = store
+        .registry
+        .read(SessionReadRequest::new(store.key.clone(), Some(1), None))
+        .await
+        .unwrap();
+    let read = by_mid(
+        serde_json::to_value(&read).unwrap()["messages"]
+            .as_array()
+            .unwrap(),
+    );
+    assert_eq!(read.len(), WRITTEN.len());
+    for (mid, texts) in &read {
+        assert_eq!(Some(texts), entries.get(mid), "session.entries {mid}");
+    }
+
+    // The next request renders the first reply with exactly one number in front. r2's first
+    // step is the provider's second request.
+    let prompt = serde_json::to_value(&store.provider.calls()[1].prompt).unwrap();
+    let mut shown = Vec::new();
+    let mut stack = vec![&prompt];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(text) if text.contains("Done.") => shown.push(text.clone()),
+            Value::Array(items) => stack.extend(items),
+            Value::Object(members) => stack.extend(members.values()),
+            _ => {}
+        }
+    }
+    assert!(
+        !shown.is_empty(),
+        "the request shows the first reply: {prompt}"
+    );
+    for text in &shown {
+        let number = text
+            .strip_prefix('§')
+            .and_then(|rest| rest.strip_suffix("§ Done."))
+            .unwrap_or_else(|| panic!("one number in front of the reply: {text:?}"));
+        assert!(
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()),
+            "one number in front of the reply: {text:?}"
+        );
+    }
+
+    // The control lane: a subscriber replaying the third run gets the units the live one got,
+    // byte for byte, carrying the stored text.
+    let live = assistant_units(&live);
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(
+        live[0]["unit"]["message"]["content"][0]["text"],
+        json!(WRITTEN[3])
+    );
+    let (sink, mut deliveries) = mpsc::channel(4096);
+    store
+        .registry
+        .subscribe(&store.key, SubscribeFrom::Start, sink)
+        .await
+        .unwrap();
+    let mut replayed = Vec::new();
+    while let Ok(Some(delivery)) =
+        tokio::time::timeout(Duration::from_millis(300), deliveries.recv()).await
+    {
+        replayed.push(delivery);
+    }
+    let replayed = assistant_units(&replayed);
+    assert_eq!(
+        replayed.last(),
+        live.last(),
+        "the replayed unit is the live one"
+    );
+    assert_eq!(
+        serde_json::to_string(&replayed.last()).unwrap(),
+        serde_json::to_string(&live.last()).unwrap()
+    );
+}
+
+/// A reply whose entry facts say its run doesn't clean replies (a session no compaction
+/// provider runs) is served byte for byte as stored, tags and all, on every exposure.
+#[tokio::test]
+async fn a_reply_its_run_doesnt_clean_is_served_as_stored() {
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    let store = side(true, vec![text_step("a1", WRITTEN[0])], false, false).await;
+    assert!(matches!(
+        store.send_request("r1", untooled("first"), None).await,
+        SendOutcome::Active { .. }
+    ));
+    store.settled("r1").await;
+    store.assert_completed("r1").await;
+    let written = vec![vec![WRITTEN[0].to_owned()]];
+    let read = store
+        .registry
+        .read(SessionReadRequest::new(store.key.clone(), Some(1), None))
+        .await
+        .unwrap();
+    let read = serde_json::to_value(&read).unwrap();
+    assert_eq!(
+        assistant_texts(read["messages"].as_array().unwrap()),
+        written
+    );
+    for form in ["raw", "display"] {
+        let history = store
+            .history(json!({"form": form, "from_ordinal": 1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            assistant_texts(history["messages"].as_array().unwrap()),
+            written,
+            "session.history {form}"
+        );
+    }
+    let result = store
+        .registry
+        .run_result(&store.key, RunId("r1".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.final_message.map(|message| message.text),
+        Some(WRITTEN[0].to_owned())
+    );
 }
 
 /// The input folder of [`dump_head_import_entries`]: `HEAD_IMPORT_EXPORT_DIR`, else Thalamus's

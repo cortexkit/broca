@@ -138,6 +138,16 @@ fn mismatch(check: &'static str, detail: impl Into<String>) -> Mismatch {
     }
 }
 
+/// The zero-based ordinals of the staged session's replies its reads serve cleaned of tag
+/// notation (`broca_module::store_read::clean_reply_ordinals`).
+async fn clean_replies<B: SessionBackend>(
+    view: &Session<B>,
+) -> Result<std::collections::BTreeSet<u64>, Mismatch> {
+    broca_module::store_read::clean_reply_ordinals(view)
+        .await
+        .map_err(|error| mismatch(READ, format!("the staged entry facts: {error:?}")))
+}
+
 /// Fails `check` where `store` first differs from `today`, naming `what` was compared.
 fn same(check: &'static str, what: &str, store: &Value, today: &Value) -> Result<(), Mismatch> {
     if store == today {
@@ -485,7 +495,10 @@ async fn reads<B: SessionBackend>(
     view: &Session<B>,
     parts: &MemoryParts,
 ) -> Result<(), Mismatch> {
-    let todays = Todays::new(verify.records, lineage);
+    // The new storage serves a reply cleaned of tag notation where its run cleans replies, which
+    // today's storage doesn't: today's side is compared as this build exposes the same session.
+    let todays =
+        Todays::new(verify.records, lineage).with_clean_replies(clean_replies(view).await?);
     let reader = broca_module::store_read::ViewReader::new(view, parts)
         .await
         .map_err(|error| mismatch(READ, format!("the stream head can't be read: {error:?}")))?;
@@ -1621,8 +1634,9 @@ async fn history_pages(
 }
 
 /// `session.history` in both forms, every page of every walk, compared whole. Today's side is
-/// given the staged session's incarnation and history version, which each storage keeps for
-/// itself, so cursors compare as the positions they hold.
+/// given the staged session's incarnation and the history version it serves, which each storage
+/// keeps for itself, so cursors compare as the positions they hold, and serves the replies the
+/// staged session cleans cleaned.
 async fn history_walks(
     verify: &Verify<'_>,
     lineage: Option<&str>,
@@ -1634,9 +1648,10 @@ async fn history_walks(
         verify.records,
         lineage,
         broca_session_store::codec::hex(&head.incarnation.0),
-        head.history_version,
+        broca_module::store_exposure::served_history_version(head.history_version),
     )
-    .map_err(|error| mismatch(HISTORY_DISPLAY, format!("today's history: {error:?}")))?;
+    .map_err(|error| mismatch(HISTORY_DISPLAY, format!("today's history: {error:?}")))?
+    .with_clean_replies(clean_replies(view).await?);
     let staged = crate::stored_history::StoredHistory {
         session: view,
         parts,

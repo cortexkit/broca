@@ -258,7 +258,7 @@ fn history_cost(
         &old,
         Some(lineage),
         broca_session_store::codec::hex(&head.incarnation.0),
-        head.history_version,
+        broca_module::store_exposure::served_history_version(head.history_version),
     )
     .unwrap();
     let handler = StoredHistory {

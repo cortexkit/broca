@@ -2095,6 +2095,12 @@ address-keyed high-water row survives log retention and recreation. An absent lo
 `unwritten`, without creating a log, lease or history row. Destructive same-lineage recovery
 fences reads with retryable `history_rewriting` until its writer has durably finished.
 `session.resolve`, tag rows and model-view read pages are not served in llm-runner 0.8.
+On the new storage, every llm-runner surface serves `history_version` one above the head's
+stored version (`store_exposure::EXPOSURE_EPOCH`), because this build serves replies cleaned of
+tag notation where their run cleans them (`EntryFacts::clean_reply`), which earlier builds
+served with their tags; nothing stored changes, so an older build opens every session and
+serves the raw text at the stored version again, which is what that version meant. The
+compaction provider's route carries no history version and is unchanged.
 
 **Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
 `include_display_facts: true` also exposes the recorded assistant `completed_at` and readable Responses `reasoning_summaries` indexed by stored content part, never opaque or encrypted reasoning; default message bytes and digests are unchanged.

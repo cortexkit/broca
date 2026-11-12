@@ -91,6 +91,15 @@ macro_rules! stored_history_handler {
                     .map(Some)
             }
 
+            async fn output_ref_history_version(
+                &self,
+                _: &LineageKey,
+                served: u64,
+            ) -> Result<u64, ServeError> {
+                broca_module::store_exposure::stored_history_version(served)
+                    .ok_or(ServeError::HistoryChanged)
+            }
+
             async fn tag_location(
                 &self,
                 _: &LineageKey,

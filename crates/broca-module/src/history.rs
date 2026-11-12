@@ -51,6 +51,11 @@ struct Cursor {
     backward: bool,
 }
 
+/// A `session.history` page cursor, bound to `history_version` as the page serves it. On the new
+/// storage that is the served version (`store_exposure::served_history_version`), never the
+/// stored one: a cursor taken before replies were served cleaned, used after, would join a page
+/// of uncleaned text to a page of cleaned text, so it expires (`cursor_expired`) and the client
+/// starts its paged read again, as the raised version asks of its cache.
 fn cursor(incarnation: &str, history_version: u64, boundary: u64, backward: bool) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(

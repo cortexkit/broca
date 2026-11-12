@@ -532,7 +532,7 @@ pub async fn history_head_of<B: SessionBackend>(
     let head = session.head();
     Ok(HistoryHead {
         incarnation: broca_session_store::codec::hex(&head.incarnation.0),
-        history_version: head.history_version,
+        history_version: crate::store_exposure::served_history_version(head.history_version),
         last_ordinal: (len > 0).then_some(len),
         mid_ordinal,
     })

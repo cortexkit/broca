@@ -52,6 +52,7 @@ pub mod store_calls;
 pub mod store_collect;
 pub mod store_control;
 pub mod store_entries;
+pub mod store_exposure;
 pub mod store_fanout;
 pub mod store_head;
 pub mod store_import;
