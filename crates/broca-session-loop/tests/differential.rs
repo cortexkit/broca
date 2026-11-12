@@ -160,6 +160,11 @@ const GRAMMAR_REFUSED: &str = "scripted_grammar_too_large";
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        temperature::POLICY
+            .try_with(|policy| policy.apply(requested))
+            .unwrap_or_else(|_| broca_core::provider::TemperaturePolicy::default().apply(requested))
+    }
     /// Whether the route takes a turn-scoped system message here, by the provider's own rules for
     /// the route the comparison names; a comparison naming none takes none, as the stub route.
     fn turn_system_possible(&self, preceding: Option<&Message>, followed_by_user: bool) -> bool {
@@ -2263,7 +2268,12 @@ impl Scenario {
             policy_allowed: tools.iter().map(|t| t.name.clone()).collect(),
             tools,
             tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
+            generation: GenerationConfig {
+                temperature: temperature::REQUESTED
+                    .try_with(|value| *value)
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
             cache: None,
             stop_when: self.stop_when.clone(),
             submission_id: None,
@@ -3648,6 +3658,9 @@ async fn every_cut_of_a_text_answer_resumes_alike() {
     .await;
 }
 
+#[path = "differential/temperature.rs"]
+mod temperature;
+
 #[tokio::test]
 async fn every_cut_of_a_step_limit_resumes_alike() {
     compare_every_cut(Scenario {
@@ -4419,6 +4432,9 @@ fn cancels_mid_stream(steers: &[(usize, Action)]) -> bool {
 
 #[async_trait]
 impl Provider for SteeringProvider {
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        self.inner.admit_temperature(requested)
+    }
     fn turn_system_possible(&self, preceding: Option<&Message>, followed_by_user: bool) -> bool {
         self.inner.turn_system_possible(preceding, followed_by_user)
     }

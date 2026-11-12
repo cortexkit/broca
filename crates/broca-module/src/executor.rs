@@ -125,6 +125,18 @@ impl RunJob {
 /// fake.
 #[async_trait]
 pub trait RunExecutor: Send + Sync + 'static {
+    /// Normalize an explicit joining temperature only for compatibility comparison. The outer
+    /// `None` means model facts are unavailable and the actor must compare the value literally;
+    /// `Some(None)` means this model omits temperature. This never changes the running request.
+    fn joining_temperature(
+        &self,
+        _model: &broca_protocol::request::ModelHandle,
+        _frozen_render_config: &serde_json::Value,
+        _requested: f64,
+    ) -> Option<Option<f64>> {
+        None
+    }
+
     /// Resolve a selectable model without admitting a run or changing routing state.
     fn head_selection_wire(
         &self,

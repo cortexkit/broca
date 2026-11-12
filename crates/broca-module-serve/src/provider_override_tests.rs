@@ -484,6 +484,9 @@ struct NoNetworkProvider {
 }
 #[async_trait]
 impl broca_core::Provider for NoNetworkProvider {
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        self.inner.admit_temperature(requested)
+    }
     async fn step(
         &self,
         _id: broca_protocol::StepId,

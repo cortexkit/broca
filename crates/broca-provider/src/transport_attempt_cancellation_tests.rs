@@ -121,6 +121,9 @@ struct ObserveStep<P> {
 
 #[async_trait::async_trait]
 impl<P: Provider> Provider for ObserveStep<P> {
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        self.inner.admit_temperature(requested)
+    }
     async fn step(&self, _: StepId, _: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         unreachable!("the run loop supplies runtime state")
     }

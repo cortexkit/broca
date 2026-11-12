@@ -229,10 +229,10 @@ pub(crate) fn apply_generation_controls(
 
 /// Explain request conflicts introduced by Anthropic OAuth's resolved manual-thinking policy.
 /// API-key resolution replaces this policy with `ReasoningPolicy::None`, so the OAuth-only
-/// temperature, output-cap and forced-tool conflicts do not reject API-key requests.
+/// output-cap and forced-tool conflicts do not reject API-key requests.
 pub fn fresh_admission_config_error(
     frozen: &FrozenRenderConfig,
-    generation: &GenerationConfig,
+    _generation: &GenerationConfig,
     tool_choice: &ToolChoice,
 ) -> Option<String> {
     if !matches!(
@@ -240,18 +240,6 @@ pub fn fresh_admission_config_error(
         ReasoningPolicy::AnthropicInterleaved { .. }
     ) {
         return None;
-    }
-
-    if let Some(temperature) = generation
-        .temperature
-        .filter(|temperature| *temperature != 1.0)
-    {
-        return Some(format!(
-            "generation.temperature={temperature} conflicts with \
-             reasoning.mode='anthropic_interleaved': the caller set generation.temperature, \
-             while the resolved Anthropic OAuth auth method enabled thinking; Anthropic requires \
-             generation.temperature=1 when thinking is enabled"
-        ));
     }
 
     // The policy's default budget is sent unless a reasoning variant replaces the `thinking`
@@ -287,6 +275,23 @@ pub fn fresh_admission_config_error(
          Anthropic OAuth auth method enabled thinking; Anthropic rejects this combination: \
          \"Thinking may not be enabled when tool_choice forces tool use.\""
     ))
+}
+
+/// Resolve a new run's sampling setting without changing how recorded runs render.
+pub fn admit_temperature(
+    frozen: &FrozenRenderConfig,
+    policy: broca_core::provider::TemperaturePolicy,
+    requested: Option<f64>,
+) -> Option<f64> {
+    if frozen.family_id == WireFamilyId::OpenAiResponsesChatgpt
+        || matches!(
+            frozen.reasoning,
+            ReasoningPolicy::AnthropicInterleaved { .. }
+        )
+    {
+        return None;
+    }
+    policy.apply(requested)
 }
 
 /// The current render ABI version for a wire family. The catalog-resolve path needs

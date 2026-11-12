@@ -328,6 +328,12 @@ pub trait Provider: Send + Sync {
         serde_json::json!({ "render_config": "stateless" })
     }
 
+    /// Resolve a fresh run's temperature before its generation settings are recorded.
+    /// Resumes use the recorded value and must not call this admission hook again.
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        TemperaturePolicy::default().apply(requested)
+    }
+
     /// Return a permanent configuration error when a fresh episode cannot be rendered with the
     /// provider state selected during resolution. The run loop calls this only before writing a
     /// new `RunStarted`; resumes keep using their previously admitted frozen configuration.
@@ -381,6 +387,29 @@ pub trait Provider: Send + Sync {
             ));
         }
         self.warm(base).await
+    }
+}
+
+/// Catalog facts used only while admitting a new run, never while rendering a recorded one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TemperaturePolicy {
+    pub supported: Option<bool>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+impl TemperaturePolicy {
+    pub fn apply(self, requested: Option<f64>) -> Option<f64> {
+        if self.supported == Some(false) {
+            return None;
+        }
+        let (min, max) = match (self.min, self.max) {
+            (Some(min), Some(max)) if min.is_finite() && max.is_finite() && min <= max => {
+                (min, max)
+            }
+            _ => (0.0, 1.0),
+        };
+        requested.map(|value| value.clamp(min, max))
     }
 }
 
@@ -583,6 +612,10 @@ impl Provider for Box<dyn Provider> {
         tool_choice: &ToolChoice,
     ) -> Option<String> {
         (**self).fresh_admission_config_error(generation, tool_choice)
+    }
+
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        (**self).admit_temperature(requested)
     }
 
     fn reports_attempt_evidence(&self) -> bool {

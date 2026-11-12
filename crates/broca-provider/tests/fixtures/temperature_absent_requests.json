@@ -1,0 +1,10 @@
+{
+  "anthropic_api_key": "{\"max_tokens\":2048,\"messages\":[{\"content\":[{\"text\":\"Say hi.\",\"type\":\"text\"}],\"role\":\"user\"}],\"model\":\"claude-opus-4-8\",\"stream\":true,\"system\":[{\"text\":\"Be concise.\",\"type\":\"text\"}]}",
+  "anthropic_subscription": "{\"max_tokens\":2048,\"messages\":[{\"content\":[{\"text\":\"Say hi.\",\"type\":\"text\"}],\"role\":\"user\"}],\"model\":\"claude-opus-4-8\",\"stream\":true,\"system\":[{\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"type\":\"text\"},{\"text\":\"Be concise.\",\"type\":\"text\"}],\"thinking\":{\"budget_tokens\":1024,\"type\":\"enabled\"}}",
+  "bedrock": "{\"inferenceConfig\":{\"maxTokens\":2048},\"messages\":[{\"content\":[{\"text\":\"Say hi.\"}],\"role\":\"user\"}],\"system\":[{\"text\":\"Be concise.\"}]}",
+  "chatgpt": "{\"input\":[{\"content\":\"Say hi.\",\"role\":\"user\",\"type\":\"message\"}],\"instructions\":\"Be concise.\",\"model\":\"gpt-5-codex\",\"store\":false,\"stream\":true}",
+  "codeassist": "{\"model\":\"gemini-2.5-flash\",\"project\":\"proj-generation\",\"request\":{\"contents\":[{\"parts\":[{\"text\":\"Say hi.\"}],\"role\":\"user\"}],\"generationConfig\":{\"maxOutputTokens\":2048},\"systemInstruction\":{\"parts\":[{\"text\":\"Be concise.\"}]}},\"requestId\":\"agent/856300e4-d07c-3ef1-9abd-c0d97bcbf004/2/6502e67c-0c77-235f-9f4f-75328ad3d36e/2\",\"requestType\":\"agent\",\"userAgent\":\"antigravity\"}",
+  "gemini": "{\"contents\":[{\"parts\":[{\"text\":\"Say hi.\"}],\"role\":\"user\"}],\"generationConfig\":{\"maxOutputTokens\":2048},\"systemInstruction\":{\"parts\":[{\"text\":\"Be concise.\"}]}}",
+  "openai_chat": "{\"max_tokens\":2048,\"messages\":[{\"content\":\"Be concise.\",\"role\":\"system\"},{\"content\":\"Say hi.\",\"role\":\"user\"}],\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":{\"include_usage\":true}}",
+  "openai_responses": "{\"input\":[{\"content\":\"Say hi.\",\"role\":\"user\",\"type\":\"message\"}],\"instructions\":\"Be concise.\",\"max_output_tokens\":2048,\"model\":\"gpt-4.1\",\"stream\":true}"
+}

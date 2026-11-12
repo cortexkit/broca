@@ -1203,10 +1203,19 @@ session actor. An unrecorded key for the caller is refused `unknown_send` (termi
 its pending, delivered or ended fate as described in §14; callers can migrate to `send.status`
 without losing that compatibility path.
 
-Broca declares `send_status`, `max_steps` and `no_tools`. The role's positive-u64
+Broca declares `send_status`, `max_steps`, `temperature` and `no_tools`. The role's positive-u64
 `stop_when.max_steps` object is accepted beside the legacy stop-condition list. Zero or
 malformed limits are refused `invalid_params` naming `stop_when.max_steps` or
-`generation.max_output_tokens`. Explicit output caps on supporting routes are bounded by
+`generation.max_output_tokens`. A temperature must be a finite number in `[0, 2]`, otherwise
+it is refused `invalid_params` naming `generation.temperature`. At admission, temperature is
+omitted for an unsupported model or an Anthropic subscription route with interleaved thinking,
+clamped to the model's known
+range, or clamped to `[0, 1]` when no complete range is known. Only the effective value or its
+absence is recorded; resume never re-applies current catalog facts. A joining send's explicit
+temperature is normalized using the run's frozen model and current catalog facts only to check
+compatibility with that recorded setting; no rendered setting changes. If the model row is
+unavailable, the join compares temperatures literally. An omitted temperature still inherits
+the run's setting without re-normalizing it. Explicit output caps on supporting routes are bounded by
 the catalog's model maximum. Broca does **not** declare `max_output_tokens`: ChatGPT routes
 cannot enforce an output cap because their backend rejects the field, so they continue to
 accept explicit caps without rendering them. `tools: []` offers no tools; on a plan session

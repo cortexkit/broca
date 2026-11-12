@@ -4041,6 +4041,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             model: &frozen.model,
             variant: frozen.variant.as_deref(),
             generation: &frozen.generation,
+            joining_temperature: start
+                .request
+                .generation
+                .temperature
+                .filter(|_| {
+                    !start
+                        .request
+                        .inherit_frozen
+                        .contains(&broca_protocol::request::InheritedParam::Generation)
+                })
+                .and_then(|requested| {
+                    self.executor.joining_temperature(
+                        &frozen.model,
+                        &frozen.render_config,
+                        requested,
+                    )
+                }),
             stop_when: &frozen.stop_when,
             directives: frozen.directives.as_deref(),
             auth_selection: current_auth.as_ref(),

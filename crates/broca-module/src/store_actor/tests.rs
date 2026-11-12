@@ -104,6 +104,16 @@ pub(super) struct Hold {
 
 #[async_trait]
 impl broca_core::provider::Provider for Gated {
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        match self.render_config.as_ref().and_then(|value| {
+            serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(value.clone()).ok()
+        }) {
+            Some(frozen) => {
+                broca_provider::families::admit_temperature(&frozen, Default::default(), requested)
+            }
+            None => broca_core::provider::Provider::admit_temperature(&self.inner, requested),
+        }
+    }
     async fn step_with_runtime(
         &self,
         step_id: broca_protocol::StepId,
@@ -399,6 +409,14 @@ pub(super) fn executor(
 
 #[async_trait]
 impl RunExecutor for LoopExecutor {
+    fn joining_temperature(
+        &self,
+        model: &broca_protocol::request::ModelHandle,
+        frozen: &serde_json::Value,
+        requested: f64,
+    ) -> Option<Option<f64>> {
+        super::differential::temperature::current_temperature(model, frozen, requested)
+    }
     async fn execute(
         &self,
         _job: RunJob,

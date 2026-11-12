@@ -33,8 +33,8 @@ compile_error!("catalog test-support cannot be enabled in a release build");
 /// populate Broca's typed capabilities. `capability.reasoning_options` lists the settings used
 /// to resolve the caller's `model.variant`. Fetching the `capability.reasoning` prefix also
 /// fetches `capability.reasoning_options`, but listing both keeps the options requested if the
-/// flag's prefix is later removed or renamed. Fusiform serves neither temperature nor
-/// interleaving fields, so requesting them would add no information.
+/// flag's prefix is later removed or renamed. Temperature support and numeric bounds are
+/// admission inputs; their effective setting is recorded in the run's generation config.
 ///
 /// The rate prefixes fetch base and context-bracket input, output, cache-read, and cache-write
 /// prices for cache maintenance, plus input/output mode prices for accepting sends. A missing
@@ -57,6 +57,8 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "provider.",
     "limit.context",
     "limit.output",
+    "limit.temperature_min",
+    "limit.temperature_max",
     "limit.images_per_request",
     "limit.image_long_edge_px",
     "capability.attachment",
@@ -66,6 +68,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "capability.reasoning_options",
     "capability.server_side_fallback",
     "capability.tool_call",
+    "capability.temperature",
     "capability.structured_output",
     "rate.input",
     "rate.output",
@@ -128,6 +131,7 @@ impl CatalogSource {
 }
 
 struct LoadedCatalog {
+    carries_temperature_facts: [bool; 3],
     carries_routing_facts: bool,
     // Arc-wrapped so an equal-version refresh can republish the existing index with fresh
     // metadata instead of rebuilding ~6,300 models to produce the same answer.
@@ -176,6 +180,21 @@ struct LoadedCatalog {
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
     excluded_rows: Arc<[RowExclusion]>,
+}
+
+const TEMPERATURE_FACTS: [&str; 3] = [
+    "capability.temperature",
+    "limit.temperature_min",
+    "limit.temperature_max",
+];
+
+fn response_carries_temperature_facts(response: &FusiformCatalogResponse) -> [bool; 3] {
+    TEMPERATURE_FACTS.map(|key| {
+        response
+            .models
+            .values()
+            .any(|facts| facts.contains_key(key))
+    })
 }
 
 /// Whether a response's model rows carry `model.kind`. Stops at the first row that has it.
@@ -287,6 +306,7 @@ struct DraftServingProvider {
 /// `optional_capability_fact`).
 #[derive(Clone)]
 struct ServingModel {
+    temperature: broca_core::provider::TemperaturePolicy,
     display_name: String,
     base_url: Option<String>,
     cost: CostSchedule,
@@ -331,6 +351,7 @@ struct ServingModel {
 impl Default for ServingModel {
     fn default() -> Self {
         Self {
+            temperature: Default::default(),
             display_name: String::new(),
             base_url: None,
             cost: CostSchedule::default(),
@@ -363,6 +384,14 @@ impl ServingModel {
         base_url: Option<String>,
     ) -> Self {
         Self {
+            temperature: broca_core::provider::TemperaturePolicy {
+                supported: match model.capabilities.temperature {
+                    CapabilityFlag::Known(value) => Some(value),
+                    _ => None,
+                },
+                min: None,
+                max: None,
+            },
             display_name: model.display_name.clone(),
             base_url,
             cost: model.cost.clone(),
@@ -396,7 +425,10 @@ impl ServingModel {
             capabilities: Capabilities {
                 attachment: self.attachment,
                 reasoning: self.reasoning,
-                temperature: CapabilityFlag::Absent,
+                temperature: self
+                    .temperature
+                    .supported
+                    .map_or(CapabilityFlag::Absent, CapabilityFlag::Known),
                 tool_call: self.tool_call,
                 interleaved: CapabilityFlag::Absent,
                 structured_output: self.structured_output,
@@ -589,6 +621,17 @@ impl RowExclusion {
 pub struct CatalogSnapshot(Arc<LoadedCatalog>);
 
 impl CatalogSnapshot {
+    pub(crate) fn temperature_policy(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> broca_core::provider::TemperaturePolicy {
+        self.0
+            .catalog
+            .provider_and_model(provider, model)
+            .map(|(_, model)| model.temperature)
+            .unwrap_or_default()
+    }
     pub fn routing_facts(
         &self,
         provider: &str,
@@ -1485,6 +1528,7 @@ fn serving_model_from_facts(
     facts: &BTreeMap<String, Value>,
 ) -> Result<ServingModel, CatalogError> {
     Ok(ServingModel {
+        temperature: temperature_facts(identity, facts),
         display_name: display_name_fact(facts, "model.name").unwrap_or_default(),
         base_url: None,
         cost: warm_cost_fact(facts),
@@ -1514,6 +1558,40 @@ fn serving_model_from_facts(
         wire_family: None,
         kind: model_kind_fact(identity, facts)?,
     })
+}
+
+fn temperature_facts(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+) -> broca_core::provider::TemperaturePolicy {
+    let malformed = |key: &str| {
+        tracing::warn!(
+            model = identity,
+            fact = key,
+            "ignoring malformed temperature fact"
+        )
+    };
+    let supported = facts.get(TEMPERATURE_FACTS[0]).and_then(|value| {
+        let result = value.as_bool();
+        if result.is_none() {
+            malformed(TEMPERATURE_FACTS[0]);
+        }
+        result
+    });
+    let bound = |key: &str| {
+        facts.get(key).and_then(|value| {
+            let result = value.as_f64().filter(|value| value.is_finite());
+            if result.is_none() {
+                malformed(key);
+            }
+            result
+        })
+    };
+    broca_core::provider::TemperaturePolicy {
+        supported,
+        min: bound(TEMPERATURE_FACTS[1]),
+        max: bound(TEMPERATURE_FACTS[2]),
+    }
 }
 
 /// Read one capability fact that is present: a boolean is known, an explicit null is the
@@ -2273,6 +2351,8 @@ impl CatalogCache {
                         != current.carries_server_side_fallback
                     || response_carries_mid_conversation_system(&response)
                         != current.carries_mid_conversation_system
+                    || response_carries_temperature_facts(&response)
+                        != current.carries_temperature_facts
                 {
                     let rebuilt = Arc::new(loaded(
                         &response,
@@ -2308,6 +2388,7 @@ impl CatalogCache {
                     carries_display_names: current.carries_display_names,
                     carries_server_side_fallback: current.carries_server_side_fallback,
                     carries_mid_conversation_system: current.carries_mid_conversation_system,
+                    carries_temperature_facts: current.carries_temperature_facts,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
                 self.install(refreshed);
@@ -2404,6 +2485,7 @@ impl CatalogCache {
             // The vendored snapshot serves no `capability.server_side_fallback`.
             carries_server_side_fallback: false,
             carries_mid_conversation_system: false,
+            carries_temperature_facts: [false; 3],
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -2479,6 +2561,7 @@ fn loaded(
         carries_display_names: response_carries_display_names(response),
         carries_server_side_fallback: response_carries_server_side_fallback(response),
         carries_mid_conversation_system: response_carries_mid_conversation_system(response),
+        carries_temperature_facts: response_carries_temperature_facts(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -2832,6 +2915,180 @@ fn warm_cost_fact(facts: &BTreeMap<String, Value>) -> CostSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temperature_fusiform_real_shaped_facts_decode_without_other_fields() {
+        use broca_core::provider::TemperaturePolicy;
+        for (identity, facts, expected) in [
+            (
+                "anthropic/claude-opus-5-5",
+                serde_json::json!({"capability.temperature": false}),
+                TemperaturePolicy {
+                    supported: Some(false),
+                    min: None,
+                    max: None,
+                },
+            ),
+            (
+                "google/antigravity-claude-opus-5-5",
+                serde_json::json!({"capability.temperature": false}),
+                TemperaturePolicy {
+                    supported: Some(false),
+                    min: None,
+                    max: None,
+                },
+            ),
+            (
+                "google/gemini-4-carbon",
+                serde_json::json!({"capability.temperature": false}),
+                TemperaturePolicy {
+                    supported: Some(false),
+                    min: None,
+                    max: None,
+                },
+            ),
+            (
+                "google/antigravity-gemini-4-carbon",
+                serde_json::json!({"capability.temperature": false}),
+                TemperaturePolicy {
+                    supported: Some(false),
+                    min: None,
+                    max: None,
+                },
+            ),
+            (
+                "openai/gpt-4.1",
+                serde_json::json!({"capability.temperature": true, "limit.temperature_min": 0, "limit.temperature_max": 2}),
+                TemperaturePolicy {
+                    supported: Some(true),
+                    min: Some(0.0),
+                    max: Some(2.0),
+                },
+            ),
+            (
+                "deepseek/deepseek-v4-flash",
+                serde_json::json!({"capability.temperature": true, "limit.temperature_min": 0, "limit.temperature_max": 2}),
+                TemperaturePolicy {
+                    supported: Some(true),
+                    min: Some(0.0),
+                    max: Some(2.0),
+                },
+            ),
+            (
+                "xai/grok-4.7",
+                serde_json::json!({"capability.temperature": true, "limit.temperature_min": 0, "limit.temperature_max": 2}),
+                TemperaturePolicy {
+                    supported: Some(true),
+                    min: Some(0.0),
+                    max: Some(2.0),
+                },
+            ),
+            (
+                "google/gemini-range",
+                serde_json::json!({"capability.temperature": true, "limit.temperature_min": 0.0, "limit.temperature_max": 2.0}),
+                TemperaturePolicy {
+                    supported: Some(true),
+                    min: Some(0.0),
+                    max: Some(2.0),
+                },
+            ),
+            (
+                "anthropic/claude-range",
+                serde_json::json!({"limit.temperature_min": 0.0, "limit.temperature_max": 1.0}),
+                TemperaturePolicy {
+                    supported: None,
+                    min: Some(0.0),
+                    max: Some(1.0),
+                },
+            ),
+        ] {
+            let facts = serde_json::from_value(facts).unwrap();
+            let model = serving_model_from_facts(identity, &facts).unwrap();
+            assert_eq!(model.temperature, expected, "{identity}");
+            assert_eq!(
+                model.to_spec("model").capabilities.temperature,
+                expected
+                    .supported
+                    .map_or(CapabilityFlag::Absent, CapabilityFlag::Known)
+            );
+        }
+        assert_eq!(
+            serving_model_from_facts("openai/unknown", &BTreeMap::new())
+                .unwrap()
+                .temperature,
+            TemperaturePolicy::default()
+        );
+    }
+
+    #[test]
+    fn temperature_malformed_fact_does_not_exclude_other_facts_or_the_model() {
+        use broca_core::provider::TemperaturePolicy;
+        let facts = serde_json::from_value(serde_json::json!({
+            "capability.temperature": "false", "limit.temperature_min": 0.0,
+            "limit.temperature_max": "2.0"
+        }))
+        .unwrap();
+        assert_eq!(
+            serving_model_from_facts("openai/gpt-4.1", &facts)
+                .unwrap()
+                .temperature,
+            TemperaturePolicy {
+                supported: None,
+                min: Some(0.0),
+                max: None
+            }
+        );
+    }
+
+    #[test]
+    fn temperature_newly_requested_facts_rebuild_an_equal_version_catalog() {
+        for key in TEMPERATURE_FACTS {
+            assert!(FUSIFORM_FACT_PREFIXES.contains(&key));
+        }
+        let cache = CatalogCache::empty();
+        let mut page = response(100);
+        cache.refresh(page.clone()).unwrap();
+        let identity = "anthropic/claude-sonnet-4-5".to_owned();
+        let (provider, model) = identity.split_once('/').unwrap();
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .temperature_policy(provider, model)
+                .supported,
+            None
+        );
+        page.models
+            .get_mut(&identity)
+            .unwrap()
+            .insert("capability.temperature".into(), Value::Bool(true));
+        cache.refresh(page.clone()).unwrap();
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .temperature_policy(provider, model)
+                .supported,
+            Some(true)
+        );
+        page.models
+            .get_mut(&identity)
+            .unwrap()
+            .insert("limit.temperature_min".into(), serde_json::json!(0.0));
+        page.models
+            .get_mut(&identity)
+            .unwrap()
+            .insert("limit.temperature_max".into(), serde_json::json!(2.0));
+        cache.refresh(page).unwrap();
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .temperature_policy(provider, model)
+                .max,
+            Some(2.0)
+        );
+    }
     use broca_provider::families::{renderer_version_for, resolve_frozen};
     use std::time::{SystemTime, UNIX_EPOCH};
 

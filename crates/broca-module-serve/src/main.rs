@@ -6007,6 +6007,14 @@ mod executor {
 
     #[async_trait]
     impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        fn joining_temperature(
+            &self,
+            model: &broca_protocol::request::ModelHandle,
+            frozen_render_config: &serde_json::Value,
+            requested: f64,
+        ) -> Option<Option<f64>> {
+            broca_catalog::live::joining_temperature(model, frozen_render_config, requested)
+        }
         fn head_selection_wire(
             &self,
             model: &cortexkit_role_llm_runner::head_selection::PlanModel,

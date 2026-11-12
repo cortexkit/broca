@@ -615,6 +615,14 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         row
     };
     let mut models = Map::new();
+    let mut temperature = row(None);
+    temperature["capability.temperature"] = json!(true);
+    temperature["limit.temperature_min"] = json!(0.0);
+    temperature["limit.temperature_max"] = json!(2.0);
+    models.insert(
+        format!("{STRUCTURED_OUTPUT_PROVIDER}/conformance-temperature"),
+        temperature,
+    );
     for support in [Some(true), Some(false), None] {
         models.insert(
             format!(
@@ -745,6 +753,9 @@ fn observe_model_request(
         .collect();
     let mut observation =
         cortexkit_role_llm_runner_conformance::ModelRequestObservation::new(names);
+    if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
+        observation = observation.with_temperature(temperature);
+    }
     if let Some(cap) = request
         .get("max_tokens")
         .or_else(|| request.get("max_completion_tokens"))
@@ -2964,6 +2975,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::StructuredOutput,
             Capability::SendStatus,
             Capability::MaxSteps,
+            Capability::Temperature,
             Capability::NoTools,
             Capability::RunStatus,
             Capability::FinishReason,
@@ -3278,6 +3290,8 @@ impl LlmRunnerSubject for BrocaSubject {
         // sessions use the Messages stream, whose content blocks keep each scripted part.
         let model = if media_fixture_session(session) {
             json!({"provider": output_refs::PROVIDER, "model": MEDIA_FIXTURE_MODEL})
+        } else if session.starts_with("cf-temperature-") {
+            json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": "conformance-temperature"})
         } else if markerless {
             json!({"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")})
         } else {
@@ -7595,6 +7609,33 @@ mod held_call_tests {
         );
     }
 
+    #[test]
+    fn temperature_kit_fixture_declares_full_range_and_observes_the_actual_request() {
+        let subject = subject(Arc::new(Shared::default()));
+        assert!(subject.capabilities().contains(&Capability::Temperature));
+        let fields = subject.send_fields("cf-temperature-1", true);
+        assert_eq!(
+            fields["model"],
+            json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": "conformance-temperature"})
+        );
+        let root = broca_test_support::scratch_root()
+            .join(format!("temperature-kit-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        seed_structured_output_catalog(&root).unwrap();
+        let response: Value =
+            serde_json::from_slice(&std::fs::read(root.join("catalog/fusiform-lkg.json")).unwrap())
+                .unwrap();
+        let row =
+            &response["models"][format!("{STRUCTURED_OUTPUT_PROVIDER}/conformance-temperature")];
+        assert_eq!(row["capability.temperature"], true);
+        assert_eq!(row["limit.temperature_min"], 0.0);
+        assert_eq!(row["limit.temperature_max"], 2.0);
+        let observation = observe_model_request(&json!({"temperature": 2.0, "max_tokens": 16}));
+        assert_eq!(observation.temperature, Some(2.0));
+        assert_eq!(observation.max_output_tokens, Some(16));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn only_registered_history_and_display_fixture_names_use_model_routing() {
         let subject = subject(Arc::new(Shared::default()));
@@ -8244,6 +8285,9 @@ fn conformance_describe_golden_matches_enabled_boot_switch() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../broca-wire/tests/golden")
             .join(writer_describe_golden_name(enabled));
+        if std::env::var_os("BROCA_REGENERATE_ROLE_REPLIES").is_some() {
+            std::fs::write(&path, serde_json::to_vec(&actual).unwrap()).unwrap();
+        }
         let expected = std::fs::read(path).unwrap();
         assert_eq!(
             serde_json::to_vec(&actual).unwrap(),
