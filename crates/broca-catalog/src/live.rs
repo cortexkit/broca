@@ -987,10 +987,14 @@ fn resolve_provider_inner(
         apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
         // The provider represents today's code. Core checks the family's compatibility table
         // before comparing a blob restamped to the recorded version.
-        frozen.renderer_version = if family == WireFamilyId::AnthropicMessages {
-            broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
-        } else {
-            renderer_version_for(family)
+        frozen.renderer_version = match family {
+            WireFamilyId::AnthropicMessages => {
+                broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
+            }
+            WireFamilyId::OpenAiChat => {
+                broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types)
+            }
+            _ => renderer_version_for(family),
         };
         let base_url = frozen
             .base_url
@@ -1038,6 +1042,11 @@ fn resolve_provider_inner(
         frozen.reasoning_content_required =
             episode_render.reasoning_content_required.unwrap_or(false);
         frozen.reasoning_echo = crate::reasoning_echo_for_route("", base_url);
+        // An endpoint on Moonshot's API needs its tool schemas typed, like the catalog's Kimi
+        // routes.
+        frozen.moonshot_schema_types = crate::is_moonshot_route("", base_url);
+        frozen.renderer_version =
+            broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types);
         frozen.max_output_tokens = max_tokens;
         frozen.cache = opts.cache_policy.clone();
         frozen.prompt_cache_key = opts
@@ -1427,6 +1436,12 @@ fn resolve_provider_inner(
     if family == WireFamilyId::AnthropicMessages {
         frozen.renderer_version =
             broca_provider::families::anthropic_renderer_version(server_side_fallback);
+    }
+    // Likewise an OpenAI Chat config freezes v6 only when it types tool schemas for Moonshot's
+    // API, so every other OpenAI Chat run keeps recording v5.
+    if family == WireFamilyId::OpenAiChat {
+        frozen.renderer_version =
+            broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types);
     }
     apply_auth_method_quirks(provider_id, auth_method, &mut frozen);
     frozen.max_output_tokens = max_tokens;
@@ -2480,6 +2495,98 @@ mod tests {
         apply_auth_method_quirks("opencode-go", None, &mut frozen);
         assert_eq!(frozen.system_prompt, SystemPromptPolicy::TopLevelField);
         assert_eq!(frozen.reasoning, ReasoningPolicy::None);
+    }
+
+    /// A run on a Moonshot route freezes the schema-typing flag and OpenAI Chat v6; a run on any
+    /// other OpenAI Chat route, including one that serves a Kimi model through its own API,
+    /// freezes neither and records exactly the v5 config it did before. A resume keeps what the
+    /// run recorded.
+    #[test]
+    fn moonshot_routes_freeze_schema_typing_and_v6_and_other_chat_routes_stay_v5() {
+        seed_catalog_for_resolution();
+        let options = ResolveOptions::default();
+        let fresh = |model: &str| {
+            resolve_catalog_episode_with_client(
+                model,
+                Some(2_048),
+                &AuthMode::None,
+                &options,
+                broca_provider::build_provider_http_client(),
+                EpisodeRenderConfig::default(),
+            )
+            .unwrap_or_else(|error| panic!("{model} resolves: {error}"))
+        };
+
+        let kimi = fresh("kimi-code-plan-global/k3");
+        assert_eq!(kimi.family_id, WireFamilyId::OpenAiChat);
+        let kimi_blob = kimi.provider.render_config_blob();
+        assert_eq!(kimi_blob["moonshot_schema_types"], true);
+        assert_eq!(kimi_blob["renderer_version"], 6);
+        assert_eq!(kimi.provider.renderer_version(), 6);
+
+        let other = fresh("302ai/kimi-k3");
+        assert_eq!(other.family_id, WireFamilyId::OpenAiChat);
+        let other_blob = other.provider.render_config_blob();
+        assert!(other_blob.get("moonshot_schema_types").is_none());
+        assert_eq!(other_blob["renderer_version"], 5);
+
+        let explicit = resolve_provider(
+            "kimi-k3",
+            Some("https://api.moonshot.ai/v1"),
+            2_048,
+            &AuthMode::None,
+            &options,
+        )
+        .expect("an explicit Moonshot endpoint resolves");
+        assert_eq!(
+            explicit.provider.render_config_blob()["moonshot_schema_types"],
+            true
+        );
+        assert_eq!(explicit.provider.renderer_version(), 6);
+        let explicit_other = resolve_provider(
+            "some-model",
+            Some("https://llm.example.test/v1"),
+            2_048,
+            &AuthMode::None,
+            &options,
+        )
+        .expect("an explicit endpoint resolves");
+        assert!(explicit_other
+            .provider
+            .render_config_blob()
+            .get("moonshot_schema_types")
+            .is_none());
+        assert_eq!(explicit_other.provider.renderer_version(), 5);
+
+        // A Kimi run recorded before the flag existed resumes without it, at v5.
+        let mut recorded: FrozenRenderConfig =
+            serde_json::from_value(kimi_blob.clone()).expect("the blob decodes");
+        recorded.moonshot_schema_types = false;
+        recorded.renderer_version = 5;
+        let resumed = |recorded: &FrozenRenderConfig| {
+            resolve_catalog_episode_with_client(
+                "kimi-code-plan-global/k3",
+                Some(2_048),
+                &AuthMode::None,
+                &options,
+                broca_provider::build_provider_http_client(),
+                EpisodeRenderConfig {
+                    recorded_config: Some(recorded),
+                    ..Default::default()
+                },
+            )
+            .expect("the recorded Kimi run resumes")
+        };
+        let old = resumed(&recorded);
+        assert!(old
+            .provider
+            .render_config_blob()
+            .get("moonshot_schema_types")
+            .is_none());
+        assert_eq!(old.provider.renderer_version(), 5);
+        recorded.moonshot_schema_types = true;
+        recorded.renderer_version = 6;
+        assert_eq!(resumed(&recorded).provider.renderer_version(), 6);
     }
 
     #[test]

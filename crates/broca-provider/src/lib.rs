@@ -44,6 +44,7 @@ pub mod sse;
 pub mod structured_output;
 pub mod tool_id_alias;
 pub mod tool_name_alias;
+mod tool_schema_enum_types;
 pub mod turn_system;
 pub mod variant;
 pub mod wire;

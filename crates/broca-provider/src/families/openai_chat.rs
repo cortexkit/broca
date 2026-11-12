@@ -225,7 +225,7 @@ fn build_request_body_with_media_and_provenance(
         body["tools"] = Value::Array(
             opts.tools
                 .iter()
-                .map(|tool| convert_tool(tool, &name_map))
+                .map(|tool| convert_tool(tool, &name_map, frozen.moonshot_schema_types))
                 .collect(),
         );
         body["tool_choice"] = convert_tool_choice(&opts.tool_choice, &name_map);
@@ -608,13 +608,26 @@ fn text_content(blocks: &[ContentBlock]) -> String {
     s
 }
 
-fn convert_tool(t: &Tool, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {
+/// `type_enums` adds a `type` to each typeless `enum` node of the schema, for providers whose
+/// validator refuses such a node (see `crate::tool_schema_enum_types`).
+fn convert_tool(
+    t: &Tool,
+    name_map: &crate::tool_name_alias::ToolNameMap,
+    type_enums: bool,
+) -> Value {
+    let typed;
+    let parameters = if type_enums {
+        typed = crate::tool_schema_enum_types::with_enum_types(&t.input_schema);
+        &typed
+    } else {
+        &t.input_schema
+    };
     json!({
         "type": "function",
         "function": {
             "name": name_map.wire_name(&t.name),
             "description": t.description,
-            "parameters": t.input_schema,
+            "parameters": parameters,
         },
     })
 }

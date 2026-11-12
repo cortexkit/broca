@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role},
+    request::Tool,
     CallOptions,
 };
 use broca_provider::{
@@ -115,7 +116,7 @@ fn golden(family: WireFamilyId) -> Option<Golden> {
     })
 }
 
-fn openai_chat_v4_call_options() -> CallOptions {
+pub(crate) fn openai_chat_v4_call_options() -> CallOptions {
     CallOptions::new(vec![
         Message::new(
             Role::User,
@@ -203,6 +204,16 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         ))
         .expect("OpenAI Chat v4 pins are JSON"),
     );
+    // OpenAI Chat v6 adds a `type` to typeless enum schema nodes only under the
+    // `moonshot_schema_types` flag, which v5 configs lack. These v5 pins carry a tool whose
+    // schema has such nodes, on a Kimi route and on another route, and so prove both keep their
+    // v5 bytes.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!(
+            "../fixtures/openai_chat_v5_enum_schemas.json"
+        ))
+        .expect("OpenAI Chat v5 pins are JSON"),
+    );
     // Anthropic v3's server-side fallback opt-in is a flag a config frozen at v2 does not carry,
     // so these v2 pins keep their bytes; they are also the v2 proof for the declaration above.
     pins.extend(
@@ -235,6 +246,19 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
             for case in cases {
                 let frozen: FrozenRenderConfig =
                     serde_json::from_value(case["frozen"].clone()).unwrap();
+                // A pin that names tools renders the family's prompt with those tools offered.
+                let with_tools;
+                let opts = match case.get("tools") {
+                    Some(tools) => {
+                        let mut tooled = opts.clone();
+                        tooled.tools = serde_json::from_value::<Vec<Tool>>(tools.clone())
+                            .expect("pinned tools decode")
+                            .into();
+                        with_tools = tooled;
+                        &with_tools
+                    }
+                    None => opts,
+                };
                 // Read back and written again by the current code, the recorded config gains no
                 // field, so the resume's blob comparison sees the recorded blob unchanged.
                 assert_eq!(serde_json::to_value(&frozen).unwrap(), case["frozen"]);

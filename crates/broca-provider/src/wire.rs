@@ -356,6 +356,13 @@ pub struct FrozenRenderConfig {
     /// Whether Go's Kimi K2.6 route rejects 24-hour OpenAI prompt-cache hints.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub opencode_go_long_cache_retention_unsupported: bool,
+    /// Whether rendered tool schemas get a `type` on every `enum` node that lacks one (see
+    /// `crate::tool_schema_enum_types`). Moonshot's API refuses a tool schema with a typeless
+    /// `enum`, so this is set at admission on routes it serves. Only the request body changes;
+    /// the stored tools keep their declared schemas. Older frozen configs omit this flag and
+    /// keep their prior bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moonshot_schema_types: bool,
     /// The media profile frozen at admission (see `crate::media_profile::freeze_media_profile`)
     /// and refrozen when a model switch refreezes the run config. It gates media rendering: a
     /// config without one renders exactly as before media existed. Optional and omitted when

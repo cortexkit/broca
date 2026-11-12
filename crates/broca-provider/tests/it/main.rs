@@ -59,6 +59,7 @@ mod google_codeassist_render_golden;
 mod media_profile_frozen;
 #[cfg(feature = "live")]
 mod mixed_family_concurrency_e2e;
+mod moonshot_schema_types;
 mod native_media_render;
 mod normalize_fixture;
 #[cfg(feature = "live")]

@@ -1,0 +1,181 @@
+[
+  {
+    "frozen": {
+      "family_id": "openai_chat",
+      "renderer_version": 5,
+      "max_output_tokens": 2048,
+      "reasoning": {
+        "mode": "none"
+      },
+      "tool_id": "passthrough",
+      "system_prompt": {
+        "mode": "system_message"
+      },
+      "usage": "open_ai_usage",
+      "token_limit_field": "max_tokens",
+      "wire_model_id": "gpt-4o"
+    },
+    "tools": [
+      {
+        "name": "federation_call_when_online",
+        "description": "Queue one call to a paired computer.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "machine_fingerprint": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "surface": {
+              "enum": [
+                "tool",
+                "management"
+              ]
+            },
+            "op": {
+              "enum": [
+                "call",
+                "status",
+                "cancel"
+              ]
+            },
+            "module": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expires_in": {
+              "type": "integer",
+              "minimum": 61,
+              "maximum": 86400
+            },
+            "targets": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "linux",
+                  "macos"
+                ]
+              }
+            },
+            "priority": {
+              "anyOf": [
+                {
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ]
+                },
+                {
+                  "enum": [
+                    "low",
+                    "high"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "machine_fingerprint",
+            "surface",
+            "module"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "body": "{\"max_tokens\":2048,\"messages\":[{\"content\":\"question\",\"role\":\"user\"},{\"content\":\"answer\",\"role\":\"assistant\"},{\"content\":\"again\",\"role\":\"user\"}],\"model\":\"gpt-4o\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tool_choice\":\"auto\",\"tools\":[{\"function\":{\"description\":\"Queue one call to a paired computer.\",\"name\":\"federation_call_when_online\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"expires_in\":{\"maximum\":86400,\"minimum\":61,\"type\":\"integer\"},\"machine_fingerprint\":{\"pattern\":\"^[0-9a-f]{32}$\",\"type\":\"string\"},\"module\":{\"minLength\":1,\"type\":\"string\"},\"op\":{\"enum\":[\"call\",\"status\",\"cancel\"]},\"priority\":{\"anyOf\":[{\"enum\":[1,2,3]},{\"enum\":[\"low\",\"high\"]}]},\"surface\":{\"enum\":[\"tool\",\"management\"]},\"targets\":{\"items\":{\"enum\":[\"linux\",\"macos\"]},\"type\":\"array\"}},\"required\":[\"machine_fingerprint\",\"surface\",\"module\"],\"type\":\"object\"}},\"type\":\"function\"}]}"
+  },
+  {
+    "frozen": {
+      "family_id": "openai_chat",
+      "renderer_version": 5,
+      "max_output_tokens": 2048,
+      "reasoning": {
+        "mode": "none"
+      },
+      "tool_id": "passthrough",
+      "system_prompt": {
+        "mode": "system_message"
+      },
+      "usage": "open_ai_usage",
+      "token_limit_field": "max_tokens",
+      "wire_model_id": "k3.1-pro",
+      "base_url": "https://api.kimi.ai/coding/v1",
+      "reasoning_echo": {
+        "format": "reasoning_content",
+        "turns": "every_assistant"
+      }
+    },
+    "tools": [
+      {
+        "name": "federation_call_when_online",
+        "description": "Queue one call to a paired computer.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "machine_fingerprint": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "surface": {
+              "enum": [
+                "tool",
+                "management"
+              ]
+            },
+            "op": {
+              "enum": [
+                "call",
+                "status",
+                "cancel"
+              ]
+            },
+            "module": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expires_in": {
+              "type": "integer",
+              "minimum": 61,
+              "maximum": 86400
+            },
+            "targets": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "linux",
+                  "macos"
+                ]
+              }
+            },
+            "priority": {
+              "anyOf": [
+                {
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ]
+                },
+                {
+                  "enum": [
+                    "low",
+                    "high"
+                  ]
+                }
+              ]
+            }
+          },
+          "required": [
+            "machine_fingerprint",
+            "surface",
+            "module"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "body": "{\"max_tokens\":2048,\"messages\":[{\"content\":\"question\",\"role\":\"user\"},{\"content\":\"answer\",\"reasoning_content\":\"earlier thinking\",\"role\":\"assistant\"},{\"content\":\"again\",\"role\":\"user\"}],\"model\":\"k3.1-pro\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tool_choice\":\"auto\",\"tools\":[{\"function\":{\"description\":\"Queue one call to a paired computer.\",\"name\":\"federation_call_when_online\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"expires_in\":{\"maximum\":86400,\"minimum\":61,\"type\":\"integer\"},\"machine_fingerprint\":{\"pattern\":\"^[0-9a-f]{32}$\",\"type\":\"string\"},\"module\":{\"minLength\":1,\"type\":\"string\"},\"op\":{\"enum\":[\"call\",\"status\",\"cancel\"]},\"priority\":{\"anyOf\":[{\"enum\":[1,2,3]},{\"enum\":[\"low\",\"high\"]}]},\"surface\":{\"enum\":[\"tool\",\"management\"]},\"targets\":{\"items\":{\"enum\":[\"linux\",\"macos\"]},\"type\":\"array\"}},\"required\":[\"machine_fingerprint\",\"surface\",\"module\"],\"type\":\"object\"}},\"type\":\"function\"}]}"
+  }
+]
