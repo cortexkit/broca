@@ -1032,6 +1032,23 @@ async fn a_failed_call_stores_model_error_and_a_tool_call_ends_the_fork() {
         "{asked:?}"
     );
 
+    // A reply cut at its output limit is an answer like any other.
+    rig.forks.answer(ForkCallOutcome::Answered {
+        answer: "cut sho".into(),
+        finish: "max_tokens".into(),
+        usage: usage(17, 3, 64),
+    });
+    rig.sample_next("fork_ask.max_tokens.json");
+    let cut = rig.ask(1, &fork, "long", "a long answer").await.unwrap();
+    assert_eq!(
+        (cut["answer"].as_str(), cut["finish"].as_str()),
+        (Some("cut sho"), Some("max_tokens"))
+    );
+    rig.sample_next("fork_ask.replay.max_tokens.json");
+    assert_eq!(
+        rig.ask(1, &fork, "long", "a long answer").await.unwrap(),
+        cut
+    );
     rig.forks.answer(ForkCallOutcome::Answered {
         answer: "before tool".into(),
         finish: "tool_call_refused".into(),
@@ -1051,7 +1068,7 @@ async fn a_failed_call_stores_model_error_and_a_tool_call_ends_the_fork() {
         code(&rig.ask(1, &fork, "new", "new question").await.unwrap_err()),
         "fork_ended"
     );
-    assert_eq!(rig.forks.calls().len(), 3);
+    assert_eq!(rig.forks.calls().len(), 4);
 }
 
 #[tokio::test]
