@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const RESET: u64 = 61_000;
 
 struct Limited {
+    require_bind: AtomicBool,
+    bound: AtomicBool,
     clock: Clock,
     calls: AtomicUsize,
     release_limit: Arc<Notify>,
@@ -20,6 +22,10 @@ struct Limited {
 
 #[async_trait]
 impl Provider for Limited {
+    fn bind_run_transport(&self, _: &BindIdentity) {
+        self.bound.store(true, Ordering::SeqCst);
+    }
+
     async fn step(
         &self,
         step: StepId,
@@ -101,7 +107,9 @@ impl Provider for Limited {
     }
     fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
         // An earlier successful request on this account left a cache that survives the reset.
-        (account == "acct-a").then_some(1000)
+        (account == "acct-a"
+            && (!self.require_bind.load(Ordering::SeqCst) || self.bound.load(Ordering::SeqCst)))
+        .then_some(1000)
     }
 }
 
@@ -277,6 +285,8 @@ impl Side {
         );
         let executor = Arc::new(Executor {
             provider: Limited {
+                require_bind: AtomicBool::new(false),
+                bound: AtomicBool::new(false),
                 clock: service.clock.clone(),
                 calls: AtomicUsize::new(first_call),
                 release_limit: Arc::default(),
@@ -902,4 +912,39 @@ fn without_error_message(mut value: Value) -> Value {
     }
     normalize(&mut value);
     value
+}
+
+#[tokio::test]
+async fn account_limit_pause_uses_bound_session_evidence_on_both_storages() {
+    let mut pauses = Vec::new();
+    for store in [false, true] {
+        let side = Side::new(store).await;
+        side.executor
+            .provider
+            .require_bind
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            side.send("r1", broca_protocol::Delivery::Queue).await,
+            SendOutcome::Active { .. }
+        ));
+        side.executor.provider.release_limit.notify_one();
+        let state = broca_test_support::wait_until("account limit outcome", || async {
+            let state = side.state("r1").await;
+            if state["state"] == "active" {
+                Err("run is still active".to_owned())
+            } else {
+                Ok(state)
+            }
+        })
+        .await;
+        assert_eq!(state["state"], "paused", "store={store}: {state}");
+        assert_eq!(state["reason"], "account_limit");
+        assert_eq!(state["resume_not_before_ms"], RESET);
+        pauses.push((
+            state["reason"].clone(),
+            state["resume_not_before_ms"].clone(),
+        ));
+        side.stop().await;
+    }
+    assert_eq!(pauses[0], pauses[1]);
 }

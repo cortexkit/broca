@@ -94,6 +94,14 @@ pub struct Durable<'a, W, S> {
 }
 
 impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
+    async fn accepted_send(
+        &self,
+        account: &str,
+        since_ms: u64,
+    ) -> Result<broca_core::provider::AcceptedSendEvidence, SessionError> {
+        self.writer.accepted_send(account, since_ms).await
+    }
+
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         store_unstored(self.parts, self.store).await?;
         match self.media.as_deref_mut() {

@@ -113,6 +113,7 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::Held { .. } => "held",
         Request::SendRecords { .. } => "send records",
         Request::OpenLogRecords { .. } => "open log records",
+        Request::AcceptedSend { .. } => "accepted send",
         Request::RunStart { .. } => "run start",
         Request::ToolIntent { .. } => "tool intent",
         Request::EntryByMid { .. } => "entry by mid",

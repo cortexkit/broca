@@ -4582,6 +4582,24 @@ mod executor {
             }
             let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
+            if let Some(config) = &last_config {
+                if let Some(account) = config
+                    .auth_selection
+                    .as_ref()
+                    .and_then(|auth| auth.account_ref.as_deref())
+                {
+                    seed_store_accepted_send(
+                        &self.provider_client,
+                        writer,
+                        &req.session,
+                        account,
+                        &config.frozen_render_config,
+                        now(),
+                    )
+                    .await
+                    .map_err(|error| StoreRunError::Loop(error.into()))?;
+                }
+            }
             let history = EpisodeHistory {
                 prior_run: stored.prior_run,
                 last_config: last_config.as_ref(),
@@ -6226,12 +6244,15 @@ mod executor {
         }
     }
 
+    include!("store_cache_evidence.rs");
+
     #[cfg(test)]
     mod tests {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("store_run_tests.rs");
+        include!("store_cache_evidence_tests.rs");
         include!("store_run_cancel_tests.rs");
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");

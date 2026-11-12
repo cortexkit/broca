@@ -198,6 +198,26 @@ fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Cl
 }
 
 impl ProviderHttpClient {
+    pub fn session_accepted_send_evidence(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> broca_core::provider::AcceptedSendEvidence {
+        self.cache_sessions.evidence(session, account)
+    }
+
+    /// Seed one account before routing admission, without acquiring its WebSocket lease.
+    pub fn seed_session_accepted_send(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+        evidence: broca_core::provider::AcceptedSendEvidence,
+    ) {
+        self.cache_sessions
+            .bind(session)
+            .seed_accepted_send(account, evidence);
+    }
+
     /// Read accepted-attempt evidence without loading a session or reading its WAL.
     /// `None` means not loaded in this process; `Some(None)` means loaded with no accepted
     /// send on this account. This distinction lets admission count conservative cold starts.
@@ -1413,6 +1433,24 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
             session.recorded(locator);
         }
+    }
+
+    fn seed_accepted_send(
+        &self,
+        account: &str,
+        evidence: broca_core::provider::AcceptedSendEvidence,
+    ) {
+        tracing::debug!(target: "provider", account, ?evidence, "loaded session accepted-send evidence");
+        if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
+            session.seed_accepted_send(account, evidence);
+        }
+    }
+
+    fn accepted_send_evidence(&self, account: &str) -> broca_core::provider::AcceptedSendEvidence {
+        self.cache_session.lock().unwrap().as_ref().map_or(
+            broca_core::provider::AcceptedSendEvidence::NotLoaded,
+            |session| session.accepted_send_evidence(account),
+        )
     }
 
     fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {

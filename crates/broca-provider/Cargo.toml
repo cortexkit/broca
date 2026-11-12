@@ -81,6 +81,8 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+broca-session-loop = { path = "../broca-session-loop" }
+broca-session-store = { path = "../broca-session-store" }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 broca-wal-reader = { path = "../broca-wal-reader" }
 broca-module-serve = { path = "../broca-module-serve" }

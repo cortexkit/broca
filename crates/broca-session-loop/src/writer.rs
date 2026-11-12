@@ -43,6 +43,16 @@ pub trait Writer {
     /// open log or sealed history: what the loop reads to deliver the send at a boundary.
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError>;
 
+    /// Load only the account's newest accepted send, stopping at the cache lifetime boundary.
+    /// Writers without a readable ledger leave the evidence unknown rather than claiming none.
+    async fn accepted_send(
+        &self,
+        _account: &str,
+        _since_ms: u64,
+    ) -> Result<broca_core::provider::AcceptedSendEvidence, SessionError> {
+        Ok(broca_core::provider::AcceptedSendEvidence::NotLoaded)
+    }
+
     /// Appends the batch `build` makes from the folds as they stand at that moment, and returns
     /// it. A writer shared with other appenders (the session actor appends steers and queued
     /// sends during a run) calls `build` and appends its batch with nothing in between, so the
@@ -188,6 +198,38 @@ pub trait Writer {
 }
 
 impl<B: SessionBackend> Writer for Session<B> {
+    async fn accepted_send(
+        &self,
+        account: &str,
+        since_ms: u64,
+    ) -> Result<broca_core::provider::AcceptedSendEvidence, SessionError> {
+        use broca_core::provider::AcceptedSendEvidence;
+        let mut evidence = AcceptedSendEvidence::None;
+        self.ledger_tail_until(|record| {
+            let Record::Attempt(attempt) = record else {
+                return false;
+            };
+            let sent = attempt.sent_at_ms.unwrap_or(attempt.ts_ms);
+            if sent < since_ms {
+                evidence = AcceptedSendEvidence::NoneWithinWindow;
+                return true;
+            }
+            if attempt.served_account_ref.as_deref() == Some(account)
+                && attempt
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status))
+            {
+                if let Some(sent) = attempt.sent_at_ms {
+                    evidence = AcceptedSendEvidence::At(sent);
+                    return true;
+                }
+            }
+            false
+        })
+        .await?;
+        Ok(evidence)
+    }
+
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         Session::append(self, records, barrier).await
     }
