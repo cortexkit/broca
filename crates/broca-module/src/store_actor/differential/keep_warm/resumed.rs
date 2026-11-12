@@ -35,6 +35,8 @@ mod idle;
 #[derive(Default)]
 struct Warming {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    warm_configs: Mutex<Vec<broca_wal::RunConfig>>,
+    quota_configs: Mutex<Vec<broca_wal::RunConfig>>,
     clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     no_cache: bool,
     fail: bool,
@@ -136,6 +138,7 @@ impl RunExecutor for Warming {
     }
 
     async fn warm(&self, job: WarmJob) -> Result<broca_core::WarmSent, WarmError> {
+        self.warm_configs.lock().unwrap().push(job.config.clone());
         if self.fail {
             return Err(WarmError::Unavailable("test refusal".into()));
         }
@@ -156,6 +159,15 @@ impl RunExecutor for Warming {
             sent.usage.cached_input_tokens = Some(0);
         }
         Ok(sent)
+    }
+
+    async fn warm_quota(
+        &self,
+        config: &broca_wal::RunConfig,
+        _: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.quota_configs.lock().unwrap().push(config.clone());
+        Ok(())
     }
 }
 
@@ -249,6 +261,15 @@ async fn reopened(
         .collect();
     let converted = broca_session_convert::convert(&frames, None).unwrap();
     assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    reopened_converted(side, converted, cipher, executor).await
+}
+
+async fn reopened_converted(
+    side: &super::Side,
+    converted: broca_session_convert::Converted,
+    cipher: Cipher,
+    executor: Arc<Warming>,
+) -> StoreActor<LocalBackend> {
     let root = side.dir.join("resumed-store");
     let addr = SessionAddr(broca_core::session_addr(&bind()));
     let triple = SessionTriple {

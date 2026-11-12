@@ -4,6 +4,7 @@ use super::*;
 use broca_session_loop::writer::Writer as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod account_move;
 mod billing_recovery;
 
 cipher_tests!(

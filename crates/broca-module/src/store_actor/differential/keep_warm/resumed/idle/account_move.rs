@@ -1,0 +1,254 @@
+//! Rebuilt warm requests retain the config and account of the attempt being replayed.
+
+use super::*;
+
+cipher_tests!(
+    idle_warm_uses_moved_account_and_recorded_bytes,
+    recorded_request_uses_config_at_its_attempt,
+    recorded_request_without_refreezes_keeps_pinned_bytes,
+);
+
+fn selection(account: &str) -> broca_wal::AuthSelection {
+    serde_json::from_value(json!({
+        "credential_id": format!("cred-{account}"),
+        "resolved_credential_id": format!("cred-{account}"),
+        "account_ref": account,
+        "auth_method": "oauth",
+        "account_decision": {
+            "path": "routed", "admission_id": "r1",
+            "decision_id": format!("decision-{account}"),
+            "conversation_key": "broca-session:conversation",
+        },
+    }))
+    .unwrap()
+}
+
+fn frozen(account: &str) -> broca_provider::wire::FrozenRenderConfig {
+    let mut frozen = warmable();
+    frozen.claude_code_persona = Some(broca_provider::wire::ClaudeCodePersona {
+        version: "2.1.280".into(),
+        device_id: "0".repeat(64),
+        account_uuid: Some(account.into()),
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        prompt_id: Some("33333333-3333-4333-8333-333333333333".into()),
+        cc_version_suffix: Some("e29".into()),
+        prompt_ordinal: Some(1),
+    });
+    frozen
+}
+
+fn render(request: &broca_core::RecordedRequest) -> Vec<u8> {
+    let provider = broca_provider::LiveProvider::new(
+        broca_provider::families::AnthropicMessages,
+        serde_json::from_value(request.config.frozen_render_config.clone()).unwrap(),
+        broca_provider::wire::AuthHandle::Bearer("test-token".into()),
+    );
+    broca_core::provider::Provider::render_request(&provider, &request.opts)
+}
+
+/// Render each fixture attempt from its explicit live config rather than deriving it from
+/// the store's recorded requests. The second step hits A's quota wall before succeeding on B.
+fn moved_history() -> (broca_session_convert::Converted, Vec<Vec<u8>>) {
+    let mut history = finished_head();
+    let WalRecord::RunStarted { config, .. } = &mut history[0] else {
+        unreachable!()
+    };
+    config.auth_selection = Some(selection("A"));
+    config.frozen_render_config = serde_json::to_value(frozen("A")).unwrap();
+    let original = config.clone();
+    let mut moved = original.clone();
+    moved.auth_selection = Some(selection("B"));
+    moved.frozen_render_config = serde_json::to_value(frozen("B")).unwrap();
+    let mut records = Vec::new();
+    let mut bodies = Vec::new();
+    for item in history {
+        let WalRecord::ModelAttemptFinished { step_id, .. } = &item else {
+            records.push(item);
+            continue;
+        };
+        let step = step_id.0;
+        let render_attempt = |config: &broca_wal::RunConfig, records: &[WalRecord]| {
+            crate::wal_render::render_step_with_lineage(
+                None,
+                records,
+                config,
+                "r1",
+                step,
+                (step == 2).then_some(256),
+                None,
+            )
+            .unwrap()
+            .2
+        };
+        let body = render_attempt(if step == 1 { &original } else { &moved }, &records);
+        if step == 2 {
+            let body = render_attempt(&original, &records);
+            records.push(record(json!({
+                "type":"model_attempt_finished", "step_id":step, "attempt":0,
+                "outcome":"http_error", "http_status":429,
+                "ts_ms":crate::actor::epoch_ms(), "sent_at_ms":crate::actor::epoch_ms(),
+                "request_body_len":body.len(),
+                "request_body_sha256":broca_core::render::request_digest_hex(&body),
+                "response_body_len":0,
+                "response_body_sha256":broca_core::render::request_digest_hex(b""),
+                "telemetry":{"account_observation":{
+                    "account_ref":"A", "limit":{
+                        "kind":"account_limit_exhausted", "limit_window":"five_hour",
+                        "observed_at_ms":crate::actor::epoch_ms(),
+                        "resets_at_ms":crate::actor::epoch_ms() + 3_600_000,
+                    },
+                }},
+            })));
+            bodies.push(body);
+        }
+        let mut attempt = serde_json::to_value(item).unwrap();
+        attempt["attempt"] = json!(if step == 1 { 0 } else { 1 });
+        attempt["request_body_len"] = json!(body.len());
+        attempt["request_body_sha256"] = json!(broca_core::render::request_digest_hex(&body));
+        records.push(record(attempt));
+        bodies.push(body);
+    }
+    let frames: Vec<_> = records
+        .into_iter()
+        .enumerate()
+        .map(|(at, record)| FramedRecord {
+            seq: at as u64 + 1,
+            fence: 0,
+            record,
+        })
+        .collect();
+    let mut converted = broca_session_convert::convert(&frames, None).unwrap();
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    let moved_at = converted
+        .records
+        .iter()
+        .rposition(|record| matches!(record, Record::Attempt(_)))
+        .unwrap();
+    // Account moves belong to the store format. The legacy fixture converter only accepts
+    // config refreezes before the first call, so insert the move into the converted history.
+    converted.records.splice(
+        moved_at..moved_at,
+        [
+            Record::ConfigRefrozen(broca_session_store::record::ConfigRefrozen {
+                run_id: "r1".into(),
+                ts_ms: None,
+                renderer_version: moved.renderer_version,
+                render_config: moved.frozen_render_config.clone(),
+            }),
+            Record::AuthRefrozen(broca_session_store::record::AuthRefrozen {
+                run_id: "r1".into(),
+                ts_ms: None,
+                auth_selection: serde_json::to_value(moved.auth_selection.as_ref().unwrap())
+                    .unwrap(),
+            }),
+        ],
+    );
+    (converted, bodies)
+}
+
+async fn idle_warm_uses_moved_account_and_recorded_bytes(cipher: Cipher) {
+    let side = super::super::super::side(false, cipher).await;
+    let (converted, bodies) = moved_history();
+    let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
+    let executor = Arc::new(Warming {
+        clock: Some(clock.clone()),
+        ..Default::default()
+    });
+    let read_clock = clock.clone();
+    let mut actor = reopened_converted(&side, converted, cipher, executor.clone())
+        .await
+        .with_clock(Arc::new(move || read_clock.load(Ordering::SeqCst)));
+    let rebuilt = actor.recorded_warm_request().await.unwrap();
+    assert_eq!(rebuilt.step_id.0, 2);
+    assert_eq!(render(&rebuilt), bodies[2]);
+    assert_eq!(
+        rebuilt.request_body_sha256,
+        broca_core::render::request_digest_hex(&bodies[2])
+    );
+    assert_ne!(bodies[1], bodies[2], "the account changes request identity");
+    clock.store(actor.idle_warm_due().await.unwrap(), Ordering::SeqCst);
+    assert!(matches!(
+        warm(&mut actor).await,
+        crate::actor::WarmOutcome::Warmed(_)
+    ));
+    assert_eq!(*executor.sent.lock().unwrap(), vec![bodies[2].clone()]);
+    for configs in [&executor.quota_configs, &executor.warm_configs] {
+        let configs = configs.lock().unwrap();
+        assert_eq!(configs.len(), 1);
+        let config = &configs[0];
+        assert_eq!(config.auth_selection.as_ref().unwrap(), &selection("B"));
+        assert_eq!(
+            config.frozen_render_config,
+            serde_json::to_value(frozen("B")).unwrap()
+        );
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
+    let identity: serde_json::Value =
+        serde_json::from_str(body["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    assert_eq!(identity["account_uuid"], "B");
+    side.registry.stop_and_seal().await;
+}
+
+async fn recorded_request_uses_config_at_its_attempt(cipher: Cipher) {
+    let side = super::super::super::side(false, cipher).await;
+    let (converted, bodies) = moved_history();
+    let actor = reopened_converted(&side, converted, cipher, Arc::new(Warming::default())).await;
+    // The current account selection reflects the later move. Rebuilding an older attempt must
+    // not borrow that account.
+    let stored = actor.session.open_log_records().await.unwrap();
+    let attempts: Vec<_> = stored
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (_, record))| matches!(record, Record::Attempt(_)).then_some(at))
+        .collect();
+    assert_eq!(attempts.len(), 3);
+    for (index, at) in attempts.into_iter().enumerate() {
+        let rebuilt = crate::store_actor::recorded_warm::request(
+            &actor.session,
+            &stored[..=at],
+            &actor.parts,
+            &bind(),
+        )
+        .await
+        .unwrap();
+        let account = if index < 2 { "A" } else { "B" };
+        assert_eq!(
+            rebuilt.config.auth_selection.as_ref().unwrap(),
+            &selection(account)
+        );
+        assert_eq!(
+            rebuilt.config.frozen_render_config,
+            serde_json::to_value(frozen(account)).unwrap()
+        );
+        assert_eq!(render(&rebuilt), bodies[index]);
+        assert_eq!(
+            rebuilt.request_body_sha256,
+            broca_core::render::request_digest_hex(&bodies[index])
+        );
+    }
+    side.registry.stop_and_seal().await;
+}
+
+async fn recorded_request_without_refreezes_keeps_pinned_bytes(cipher: Cipher) {
+    let side = super::super::super::side(false, cipher).await;
+    let records = finished_head();
+    let actor = head(
+        &side,
+        cipher,
+        Arc::new(Warming::default()),
+        &records,
+        Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
+    )
+    .await;
+    let rebuilt = actor.recorded_warm_request().await.unwrap();
+    let bytes = render(&rebuilt);
+    assert_eq!(
+        broca_core::render::request_digest_hex(&bytes),
+        "be64e9208c5939f55503d36ecc0a1e421c4098cf3e26121961fd29847ad2ef5a"
+    );
+    assert_eq!(
+        broca_core::render::request_digest_hex(&bytes),
+        rebuilt.request_body_sha256
+    );
+    side.registry.stop_and_seal().await;
+}
