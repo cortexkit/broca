@@ -107,6 +107,7 @@ pub fn setup_request(
     setup.accepts_images = conditions.accepts_images;
     // The runtime leaves the floor out for a provider that doesn't declare it reads one.
     setup.signed_floor = conditions.signed_floor.clone();
+    setup.statement_seq = conditions.statement_seq;
     enable_metadata_writer_view_anchor(&mut setup);
     setup
 }

@@ -58,6 +58,10 @@ pub trait Plane: Send + Sync {
     async fn provides_notes_tokens(&self) -> bool {
         false
     }
+    /// Whether the provider can order runner state by the session's log position.
+    async fn provides_statement_seq(&self) -> bool {
+        false
+    }
     /// Declarations read together when the runner sends Setup. A catalog-backed plane answers
     /// them from one read.
     async fn declarations(&self) -> Declarations {
@@ -65,6 +69,7 @@ pub trait Plane: Send + Sync {
             entry_speaks_for: AttributionDeclaration::known(self.provides_entry_speaks_for().await),
             signed_floor: self.provides_signed_floor().await,
             notes_tokens: self.provides_notes_tokens().await,
+            statement_seq: self.provides_statement_seq().await,
         }
     }
 }
@@ -106,6 +111,8 @@ pub struct Declarations {
     pub signed_floor: bool,
     /// `compaction-notes-tokens/v1`: notice conditions separate persistent note counts.
     pub notes_tokens: bool,
+    /// `compaction-statement-seq/v1`: Setup and conditions carry the state stamp.
+    pub statement_seq: bool,
 }
 
 impl Declarations {
@@ -116,6 +123,7 @@ impl Declarations {
             ),
             signed_floor: cortexkit_role_compaction::provides_signed_floor(provides),
             notes_tokens: cortexkit_role_compaction::provides_notes_tokens(provides),
+            statement_seq: cortexkit_role_compaction::provides_statement_seq(provides),
         }
     }
 }
@@ -170,6 +178,10 @@ impl Plane for BoundPlane<'_> {
         self.declarations().await.notes_tokens
     }
 
+    async fn provides_statement_seq(&self) -> bool {
+        self.declarations().await.statement_seq
+    }
+
     async fn declarations(&self) -> Declarations {
         let Some(plane) = self.plane else {
             return Declarations::default();
@@ -212,6 +224,7 @@ struct Lane {
     /// (compaction contract W3.5); the declaration holds until the next Setup.
     signed_floor_declared: bool,
     notes_tokens_declared: bool,
+    statement_seq_declared: bool,
 }
 
 impl Default for Lane {
@@ -223,13 +236,14 @@ impl Default for Lane {
             detects_cache_expired: false,
             signed_floor_declared: false,
             notes_tokens_declared: false,
+            statement_seq_declared: false,
         }
     }
 }
 
 impl Lane {
-    /// `conditions` as this lane's provider may receive them: without the signed floor unless
-    /// it declared that it reads one.
+    /// `conditions` as this lane's provider may receive them, omitting optional state whose
+    /// capability the provider did not declare at Setup.
     fn conditions(&self, conditions: &Conditions) -> Conditions {
         let mut conditions = conditions.clone();
         if !self.signed_floor_declared {
@@ -237,6 +251,9 @@ impl Lane {
         }
         if !self.notes_tokens_declared {
             conditions.notes_tokens = None;
+        }
+        if !self.statement_seq_declared {
+            conditions.statement_seq = None;
         }
         conditions
     }
@@ -608,9 +625,13 @@ async fn setup(
     );
     lane.signed_floor_declared = declared.signed_floor;
     lane.notes_tokens_declared = declared.notes_tokens;
+    lane.statement_seq_declared = declared.statement_seq;
     let mut request = request.clone();
     if !lane.signed_floor_declared {
         request.signed_floor = None;
+    }
+    if !lane.statement_seq_declared {
+        request.statement_seq = None;
     }
     let answer: Result<SetupAnswer, _> =
         call(plane, "compaction.setup", &request, CALL_DEADLINE).await;

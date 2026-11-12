@@ -6333,12 +6333,16 @@ where
                 == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend);
             // A missing frozen limit ends the run as `compaction_unavailable` before any model
             // I/O, the same way the step boundary does; it is never a WAL error.
-            let conditions = match crate::compaction_v2::host::conditions(
-                &config,
+            // The snapshot was synced before reading; WAL reopen continues after its last seq
+            // (FileWal::open), so statements keep their order across writer and daemon restarts.
+            let conditions = match crate::compaction_v2::host::conditions_of(
+                &crate::compaction_v2::host::Frozen::of(&config),
                 &transcript.entries,
                 chained,
                 transcript.newest_step_fill(),
                 transcript.signed_floor,
+                &|_| None,
+                frames.last().map(|frame| frame.seq),
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {
