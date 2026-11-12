@@ -40,9 +40,27 @@ pub type Deliveries = HashMap<(String, String), Vec<Delivered>>;
 /// Render-only metadata absent from the public compaction part. It stays aligned
 /// with each part's delivered list and is recovered from the durable source frame.
 #[derive(Clone, Debug, Default)]
-pub struct RideEnvelopes(HashMap<(String, String), Vec<Option<broca_wal::record::RideMetadata>>>);
+pub struct RideEnvelopes(
+    HashMap<(String, String), Vec<Option<broca_wal::record::RideMetadata>>>,
+    /// Whether the render holds each ride out of its result, beside the tool message (see
+    /// [`RideEnvelopes::after_results`]).
+    bool,
+);
 
 impl RideEnvelopes {
+    /// Whether a request rendered with these envelopes shows each ride as its own text block
+    /// after the turn's tool results rather than inside its carrying result. Probe only, for a
+    /// run frozen with `ride_placement: after_results`; removed or replaced once that placement
+    /// is decided. Off by default, which renders every ride as it always rendered.
+    pub fn after_results(&self) -> bool {
+        self.1
+    }
+
+    /// Show the rides of requests rendered with these envelopes after the turn's results.
+    pub fn set_after_results(&mut self, after_results: bool) {
+        self.1 = after_results;
+    }
+
     pub fn get(
         &self,
         mid: &str,

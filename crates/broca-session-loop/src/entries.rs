@@ -1914,8 +1914,13 @@ pub fn forget_rides(
 /// (`broca_core::delivery_order::append_ride`), never joined here. `prompt` holds the window's
 /// messages in order. Text delivered without an envelope was joined into its result when it was
 /// recorded, on the layout that stores it there, and is left alone.
-pub fn render_rides(prompt: &mut [Message], conversation: &Conversation) {
+///
+/// With `after_results` (a probe placement, see `crate::run::rides_after_results`), each ride's
+/// text is held beside its tool message instead, for the renderer to show as its own text block
+/// after the turn's results, and the results keep only the tools' own output.
+pub fn render_rides(prompt: &mut [Message], conversation: &Conversation, after_results: bool) {
     for (index, entry) in conversation.entries.iter().enumerate() {
+        let mut held = Vec::new();
         for delivered in &entry.delivered {
             let Some(ride) = ride_metadata(delivered) else {
                 continue;
@@ -1938,18 +1943,38 @@ pub fn render_rides(prompt: &mut [Message], conversation: &Conversation) {
             let carrier = results
                 .content
                 .iter_mut()
+                .enumerate()
                 .rev()
-                .find_map(|block| match block {
+                .find_map(|(at, block)| match block {
                     ContentBlock::ToolResult(result)
                         if result.tool_call_id == call.tool_call_id =>
                     {
-                        Some(result)
+                        Some((at, result))
                     }
                     _ => None,
                 });
-            if let Some(result) = carrier {
-                broca_core::delivery_order::append_ride(result, &ride, &delivered.text);
+            match carrier {
+                Some((at, _)) if after_results => held.push((
+                    at,
+                    delivered
+                        .text
+                        .strip_prefix("\n\n")
+                        .unwrap_or(&delivered.text)
+                        .to_owned(),
+                )),
+                Some((_, result)) => {
+                    broca_core::delivery_order::append_ride(result, &ride, &delivered.text)
+                }
+                None => {}
             }
+        }
+        if !held.is_empty() {
+            // In the order of the results that carry them, each result's rides in delivery
+            // order, as the compacted render orders them.
+            held.sort_by_key(|(at, _)| *at);
+            prompt[index + 1]
+                .tags
+                .set_rides_after_results(held.into_iter().map(|(_, text)| text).collect());
         }
     }
 }

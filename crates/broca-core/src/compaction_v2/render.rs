@@ -186,6 +186,22 @@ struct RenderedEntry {
     rides: Vec<Option<Vec<Option<broca_wal::record::RideMetadata>>>>,
     message: Message,
     results: Vec<(usize, ContentBlock)>,
+    held: Vec<(usize, String)>,
+    after_results: bool,
+}
+
+/// One entry's rendered message, the tool-message blocks that answer its kept calls (each with
+/// its index in that message), and the ride texts the render held out of those results (each
+/// with the index of the result that carries it; empty unless the rides render after results).
+type RenderedParts = (Message, Vec<(usize, ContentBlock)>, Vec<(usize, String)>);
+
+/// The ride texts a tool message holds out of its results, in the order the request shows them:
+/// by the carrying result's place in the message, and each result's rides in delivery order.
+/// That is delivery order: a batch's rides ride on its last carrying result, and batches commit
+/// in result order. Probe only (see `RideEnvelopes::after_results`).
+fn held_in_order(mut held: Vec<(usize, String)>) -> Vec<String> {
+    held.sort_by_key(|(index, _)| *index);
+    held.into_iter().map(|(_, text)| text).collect()
 }
 
 /// The inputs entry `position` renders from beyond itself: the tool message after its stored
@@ -259,6 +275,7 @@ fn render_planned(
         kept.map(|kept| std::mem::take(&mut *kept.kept.lock().expect("render cache")));
     let mut kept_now = HashMap::new();
     let mut result_blocks: HashMap<usize, Vec<(usize, ContentBlock)>> = HashMap::new();
+    let mut held_rides: HashMap<usize, Vec<(usize, String)>> = HashMap::new();
     let mut output = Vec::new();
     for (order, item) in plan.items.into_iter().enumerate() {
         match item {
@@ -305,13 +322,16 @@ fn render_planned(
                     .ok_or("compaction render plan names an entry the transcript doesn't hold")?;
                 let entry = &entries[position];
                 let Some(kept) = kept else {
-                    let (message, results) =
+                    let (message, results, held) =
                         render_entry(stored, entries, rides, position, &mid, &parts)?;
                     if !results.is_empty() {
                         result_blocks
                             .entry(position + 1)
                             .or_default()
                             .extend(results);
+                    }
+                    if !held.is_empty() {
+                        held_rides.entry(position + 1).or_default().extend(held);
                     }
                     output.push((position, 1, order, message));
                     continue;
@@ -324,6 +344,7 @@ fn render_planned(
                         was.mid == entry.mid
                             && was.digest == entry.digest
                             && was.parts == parts
+                            && was.after_results == rides.after_results()
                             && was.original == stored[position]
                             && was.next.as_ref() == next
                             && was.rides.len() == entry_rides.len()
@@ -340,13 +361,13 @@ fn render_planned(
                         #[cfg(debug_assertions)]
                         assert!(
                             render_entry(stored, entries, rides, position, &mid, &parts)?
-                                == (was.message.clone(), was.results.clone()),
+                                == (was.message.clone(), was.results.clone(), was.held.clone()),
                             "a kept rendered entry differs from the entry rendered again"
                         );
                         was
                     }
                     None => {
-                        let (message, results) =
+                        let (message, results, held) =
                             render_entry(stored, entries, rides, position, &mid, &parts)?;
                         kept.rendered
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -362,6 +383,8 @@ fn render_planned(
                                 .collect(),
                             message,
                             results,
+                            held,
+                            after_results: rides.after_results(),
                         }
                     }
                 };
@@ -370,6 +393,12 @@ fn render_planned(
                         .entry(position + 1)
                         .or_default()
                         .extend(entry_now.results.iter().cloned());
+                }
+                if !entry_now.held.is_empty() {
+                    held_rides
+                        .entry(position + 1)
+                        .or_default()
+                        .extend(entry_now.held.iter().cloned());
                 }
                 output.push((position, 1, order, entry_now.message.clone()));
                 kept_now.insert(ordinal, entry_now);
@@ -389,6 +418,9 @@ fn render_planned(
             &blocks.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
         );
         message.content = blocks.into_iter().map(|(_, block)| block).collect();
+        if let Some(held) = held_rides.remove(&position) {
+            message.tags.set_rides_after_results(held_in_order(held));
+        }
         output.push((position, 1, 0, message));
     }
     output.sort_by_key(|(position, phase, order, _)| (*position, *phase, *order));
@@ -400,7 +432,6 @@ fn render_planned(
 
 /// Entry `position`'s message as the plan keeps it, with the parts `parts`, and the blocks of
 /// the tool message after it that answer its kept calls, each with its index in that message.
-#[allow(clippy::type_complexity)]
 fn render_entry(
     stored: &[Message],
     entries: &[Entry],
@@ -408,8 +439,9 @@ fn render_entry(
     position: usize,
     mid: &str,
     parts: &[PlanPart],
-) -> Result<(Message, Vec<(usize, ContentBlock)>), String> {
+) -> Result<RenderedParts, String> {
     let mut results = Vec::new();
+    let mut held = Vec::new();
     let original = &stored[position];
     let entry = &entries[position];
     let mut result_queues: HashMap<&str, VecDeque<usize>> = HashMap::new();
@@ -492,7 +524,9 @@ fn render_entry(
                     else {
                         unreachable!()
                     };
-                    render_result(&mut result.output, tool, &part, mid, rides);
+                    for text in render_result(&mut result.output, tool, &part, mid, rides) {
+                        held.push((result_index, text));
+                    }
                     if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
                         result.is_error = true;
                     }
@@ -528,7 +562,7 @@ fn render_entry(
         }
     }
     message.cache_prefix_blocks = remap_cache_prefix(original, &kept_indices);
-    Ok((message, results))
+    Ok((message, results, held))
 }
 
 /// Keep episode boundaries in native coordinates while translating explicit
@@ -548,6 +582,7 @@ pub fn deliveries_only_with_rides(
         return Err("compaction delivery projection does not match native message count".into());
     }
     let mut prompt = stored.to_vec();
+    let mut held_rides: HashMap<usize, Vec<(usize, String)>> = HashMap::new();
     for (position, entry) in entries.iter().enumerate() {
         let mut results: HashMap<&str, VecDeque<usize>> = HashMap::new();
         if let Some(next) = stored
@@ -580,21 +615,35 @@ pub fn deliveries_only_with_rides(
             if tool.delivered.is_empty() {
                 continue;
             }
-            let result = result.ok_or("compaction delivery has no native tool result")?;
-            let ContentBlock::ToolResult(result) = &mut prompt[position + 1].content[result] else {
+            let result_index = result.ok_or("compaction delivery has no native tool result")?;
+            let ContentBlock::ToolResult(result) = &mut prompt[position + 1].content[result_index]
+            else {
                 unreachable!()
             };
+            let mut held = Vec::new();
             for (index, delivery) in tool.delivered.iter().enumerate() {
                 append_delivery(
                     &mut result.output,
                     delivery,
                     rides.get(&entry.mid, &part.id, index),
+                    rides.after_results().then_some(&mut held),
                 );
+            }
+            if !held.is_empty() {
+                held_rides
+                    .entry(position + 1)
+                    .or_default()
+                    .extend(held.into_iter().map(|text| (result_index, text)));
             }
             if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
                 result.is_error = true;
             }
         }
+    }
+    for (position, held) in held_rides {
+        prompt[position]
+            .tags
+            .set_rides_after_results(held_in_order(held));
     }
     Ok(prompt)
 }
@@ -697,6 +746,7 @@ pub(super) fn counted_content(
                 replace: Vec::new(),
                 rides: Vec::new(),
             };
+            // Default envelopes render rides in their result, so nothing is held out here.
             render_result(&mut output, tool, &plan, &entry.mid, &Default::default());
             let ToolOutput::Text { text } = output else {
                 return None;
@@ -707,13 +757,17 @@ pub(super) fn counted_content(
     }
 }
 
+/// Renders a tool part's result into `output`, with its kept rides. Returns the ride texts held
+/// out of the result, in delivery order, when `rides` renders them after the turn's results;
+/// otherwise they are appended to `output` and none are returned.
 fn render_result(
     output: &mut ToolOutput,
     tool: &ToolPart,
     plan: &PlanPart,
     mid: &str,
     rides: &super::entries::RideEnvelopes,
-) {
+) -> Vec<String> {
+    let mut held = Vec::new();
     let only_new = !tool.delivered.is_empty()
         && tool
             .delivered
@@ -766,9 +820,10 @@ fn render_result(
                 output,
                 &ride.delivered,
                 rides.get(mid, &plan.id, ride.index as usize),
+                rides.after_results().then_some(&mut held),
             );
         }
-        return;
+        return held;
     }
     // The native request may carry frozen model-only guidance. Keep it unless
     // the view explicitly replaces output; validation still used the stored part.
@@ -813,19 +868,34 @@ fn render_result(
                 .is_none_or(|indexes| indexes.contains(&(index as u64)))
         };
         if kept {
-            append_delivery(output, delivered, ride);
+            append_delivery(
+                output,
+                delivered,
+                ride,
+                rides.after_results().then_some(&mut held),
+            );
         }
     }
+    held
 }
 
+/// Adds one delivered text to the result `output` carries, by the ride rule its envelope names.
+/// With `held`, the text is pushed there exactly as stored instead and `output` is left as the
+/// tool returned it: the request shows it after the turn's results (probe only, see
+/// `RideEnvelopes::after_results`).
 fn append_delivery(
     output: &mut ToolOutput,
     delivery: &cortexkit_role_compaction::part::Delivered,
     envelope: Option<&broca_wal::record::RideMetadata>,
+    held: Option<&mut Vec<String>>,
 ) {
     let Some(text) = &delivery.text else {
         return;
     };
+    if let Some(held) = held {
+        held.push(text.clone());
+        return;
+    }
     match envelope.map(|envelope| envelope.form) {
         Some(broca_wal::record::RideForm::Append) => {
             let envelope = envelope.unwrap();

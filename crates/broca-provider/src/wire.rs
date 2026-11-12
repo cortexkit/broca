@@ -373,6 +373,32 @@ pub struct FrozenRenderConfig {
     /// fallback. The fallback config itself never carries one, so a fallback cannot chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_fallback: Option<Box<RefusalFallbackConfig>>,
+    /// Where this run's requests place a ride (text a send delivered with a tool result).
+    /// Probe only, for measuring how models treat the two placements: set at admission for an
+    /// Anthropic Messages run that a state-root `experiments.json` selects, absent on every
+    /// other config, which then serializes exactly as before the member existed. Removed or
+    /// replaced once the placement question is decided.
+    ///
+    /// An older build decodes a config holding it without error but drops the member, so its
+    /// resume of such a run is refused as `frozen_render_config_drift` rather than rendered with
+    /// the other placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ride_placement: Option<RidePlacement>,
+}
+
+/// Where a ride's text goes in a request (see [`FrozenRenderConfig::ride_placement`]). Without
+/// one it is appended to its carrying result's own output, after a blank line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RidePlacement {
+    /// Each ride is its own text block in the tool turn's user message, after all of the turn's
+    /// tool results, which then hold only the tools' own output.
+    AfterResults,
+}
+
+impl RidePlacement {
+    /// The frozen render config member that names a placement.
+    pub const MEMBER: &'static str = "ride_placement";
 }
 
 /// The client-side refusal fallback an episode froze: which model a refused step goes to, that

@@ -164,6 +164,89 @@ fn frozen_and_legacy_deliveries_keep_record_order_and_error_status() {
     assert!(matches!(&rendered[2].content[0], ContentBlock::ToolResult(result) if result.is_error));
 }
 
+/// A probe placement: with rides rendered after the results, each result keeps only the tool's
+/// own output (its part number included), and the tool message holds the ride texts beside it,
+/// by the carrying result's place and then delivery order, on both the deliveries-only and the
+/// planned render. Without it, each ride is appended to its result as before.
+#[test]
+fn rides_after_results_are_held_beside_the_tool_message() {
+    let call = |id: &str, path: &str| {
+        ContentBlock::ToolCall(ToolCall {
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: "read".into(),
+            input: json!({ "path": path }),
+            thought_signature: None,
+        })
+    };
+    let answer = |id: &str, text: &str| {
+        ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId(id.into()),
+            output: ToolOutput::Text { text: text.into() },
+            is_error: false,
+        })
+    };
+    let messages = vec![
+        text(Role::User, "question"),
+        Message::new(Role::Assistant, vec![call("c1", "a"), call("c2", "b")]),
+        Message::new(Role::Tool, vec![answer("c1", "one"), answer("c2", "two")]),
+    ];
+    let deliveries = Deliveries::from([
+        (
+            ("m12345678.1".into(), "1".into()),
+            vec![
+                Delivered::new("ck-mc", "third").with_send_id("third"),
+                Delivered::new("ck-mc", "fourth").with_send_id("fourth"),
+            ],
+        ),
+        (
+            ("m12345678.1".into(), "0".into()),
+            vec![Delivered::new("ck-mc", "first").with_send_id("first")],
+        ),
+    ]);
+    let entries = project(&messages, &facts(3), &deliveries, true);
+    let mut rides = super::entries::RideEnvelopes::default();
+    rides.push(&entries[1].mid, "0", Some(frozen_ride("first")));
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("third")));
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("fourth")));
+    let outputs = |message: &Message| -> Vec<String> {
+        message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult(result) => super::entries::tool_output(&result.output).1,
+                _ => panic!("a tool message holds results"),
+            })
+            .collect()
+    };
+    let renders = |rides: &super::entries::RideEnvelopes| {
+        [
+            render::deliveries_only_with_rides(&messages, &entries, rides).unwrap(),
+            render::prompt_with_rides(&messages, &entries, rides, &[], |_| panic!("no image"))
+                .unwrap(),
+        ]
+    };
+    let today = renders(&rides);
+    rides.set_after_results(true);
+    let after = renders(&rides);
+    for (today, after) in today.iter().zip(&after) {
+        let (today, after) = (&today[2], &after[2]);
+        assert!(today.tags.rides_after_results().is_empty());
+        let own: Vec<String> = outputs(today)
+            .into_iter()
+            .zip(["\n\nfirst", "\n\nthird\n\nfourth"])
+            .map(|(text, rides)| text.strip_suffix(rides).unwrap().to_owned())
+            .collect();
+        assert_eq!(outputs(after), own);
+        assert_eq!(
+            after.tags.rides_after_results(),
+            ["first", "third", "fourth"]
+        );
+        assert_eq!(after.content.len(), today.content.len());
+    }
+    // The planned render shows each result's part number in both placements.
+    assert!(outputs(&after[1][2])[0].starts_with('\u{a7}'));
+}
+
 #[test]
 fn keyed_legacy_delivery_is_not_a_frozen_ride_and_parts_honor_delivered_edits() {
     use broca_protocol::ToolOutputPart;

@@ -126,6 +126,10 @@ impl ScriptedProvider {
         if cache() {
             return serde_json::to_value(cached_config()).expect("a frozen config serializes");
         }
+        // The ride placement probe's tests freeze a real route, with or without the placement.
+        if let Some(route) = ride_placement::frozen_route() {
+            return serde_json::to_value(route).expect("a frozen config serializes");
+        }
         let mut blob = json!({ "render_config": "stateless" });
         if let Some(structured) = structured() {
             blob["structured_output"] = structured;
@@ -4367,6 +4371,16 @@ impl Provider for SteeringProvider {
     /// does, so both loops read a cancelled call's stream for its attempt in flight.
     fn reports_attempt_evidence(&self) -> bool {
         self.reports_attempts
+    }
+
+    /// In a ride placement test, the config the inner provider froze, which a resume there
+    /// checks against the run's. Every other comparison keeps the default stateless config
+    /// here, as it always has.
+    fn render_config_blob(&self) -> Value {
+        match ride_placement::frozen_route() {
+            Some(_) => self.inner.render_config_blob(),
+            None => json!({ "render_config": "stateless" }),
+        }
     }
 
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -11031,3 +11045,7 @@ async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
         "{seen:?}"
     );
 }
+
+/// The probe placement of rides after a tool turn's results, run on the new loop alone.
+#[path = "differential/ride_placement.rs"]
+mod ride_placement;

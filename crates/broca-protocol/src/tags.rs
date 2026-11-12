@@ -194,6 +194,12 @@ pub struct TagSlot {
     /// the same prompt again leaves it unchanged.
     rendered: bool,
     delivery: Option<DeliveryAttribution>,
+    /// Ride texts held out of this tool message's results, in the order the request shows them.
+    /// Probe only: set when a run's frozen render config asks for rides as their own text blocks
+    /// after the turn's tool results (see `broca_provider::wire::RidePlacement`), and written
+    /// by the Anthropic Messages renderer. Removed or replaced once that placement is decided.
+    /// Being outside the content, the texts take no part number and are never stored.
+    pub(crate) rides_after_results: Option<Arc<Vec<String>>>,
 }
 
 /// Delivery metadata projected beside a message, never into its stored content. The
@@ -219,7 +225,22 @@ impl TagSlot {
             tags,
             rendered: false,
             delivery: None,
+            rides_after_results: None,
         }
+    }
+
+    /// The ride texts a request shows as their own text blocks after this tool message's
+    /// results; empty for every message of a run that doesn't place rides that way.
+    pub fn rides_after_results(&self) -> &[String] {
+        self.rides_after_results
+            .as_deref()
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Hold `rides` beside this tool message, replacing any held before. An empty list holds
+    /// none.
+    pub fn set_rides_after_results(&mut self, rides: Vec<String>) {
+        self.rides_after_results = (!rides.is_empty()).then(|| Arc::new(rides));
     }
 
     pub fn delivery(&self) -> Option<&DeliveryAttribution> {
