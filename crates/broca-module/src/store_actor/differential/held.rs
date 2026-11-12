@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "held/intake.rs"]
 mod intake;
+mod sign_in;
 
 #[derive(Default)]
 struct HoldingTools(AtomicUsize, std::sync::atomic::AtomicBool);
@@ -89,6 +90,8 @@ struct HeldExecutor {
     /// loop records the time of a restart pause, so the fixture does too; `0` is now.
     pause_age_ms: std::sync::atomic::AtomicU64,
     refuse_restart: std::sync::atomic::AtomicBool,
+    signed_out: std::sync::atomic::AtomicBool,
+    sign_in_fixture: std::sync::atomic::AtomicBool,
 }
 
 impl HeldExecutor {
@@ -134,12 +137,23 @@ impl RunExecutor for HeldExecutor {
         }
         job.control.admitted_context_limit =
             job.control.admitted_context_limit.or(job.req.context_limit);
+        job.control.pause_for_auth_at_start = self.sign_in_error();
+        if self.sign_in_fixture.load(Ordering::SeqCst) {
+            job.control.auth_selection = Some(sign_in::selection());
+        }
+        let mode = if self.sign_in_fixture.load(Ordering::SeqCst)
+            && job.control.pause_for_auth_at_start.is_none()
+        {
+            StartMode::ResumeAfterAuth
+        } else {
+            StartMode::FreshOrResume
+        };
         let writer = job.writer.clone();
         let run_id = job.req.run_id.clone();
         let mut result = run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
-            StartMode::FreshOrResume,
+            mode,
             &self.provider,
             self.tools.as_ref(),
             &AllowAll,
@@ -196,6 +210,10 @@ impl RunExecutor for HeldExecutor {
             };
         }
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
+        control.pause_for_auth_at_start = self.sign_in_error();
+        if self.sign_in_fixture.load(Ordering::SeqCst) {
+            control.auth_selection = Some(sign_in::selection());
+        }
         let result = async {
             let admission = if mode == StoreRunMode::Fresh {
                 Some(
@@ -230,9 +248,11 @@ impl RunExecutor for HeldExecutor {
                 keep_warm: None,
                 account_reports: None,
                 max_same_account_wait: Default::default(),
-                auth_selection: None,
+                auth_selection: control.auth_selection,
                 step_progress: control.step_progress,
                 model_call_ready: None,
+                pause_for_auth_at_start: control.pause_for_auth_at_start,
+                account_continue: None,
             };
             let mut finished = match (admission, mode) {
                 (Some(admission), _) => {
@@ -314,6 +334,8 @@ impl Side {
             pause_as: Default::default(),
             pause_age_ms: Default::default(),
             refuse_restart: false.into(),
+            signed_out: false.into(),
+            sign_in_fixture: false.into(),
         });
         let runtime = crate::store_open::StoreRuntime::open(
             &dir,
@@ -1212,6 +1234,8 @@ async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
             pause_as: Default::default(),
             pause_age_ms: Default::default(),
             refuse_restart: false.into(),
+            signed_out: false.into(),
+            sign_in_fixture: false.into(),
         });
         let actor = super::super::StoreActor::new(
             source.key.clone(),

@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::media_store::{MediaBytes, MediaReadError, MediaStoreClass, ReadOnlyMediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
+use compact::{MessageCopy, RefId, References};
 
+mod compact;
+pub mod held;
 mod initialization;
 mod seed;
 mod wal_events;
@@ -127,7 +130,42 @@ struct Capture {
     person: bool,
 }
 
+/// A capture as the engine keeps it: a [`Capture`] whose reference is its position in the
+/// session's [`References`].
+#[derive(Debug, Clone)]
+struct Entry {
+    id: MediaId,
+    reference: RefId,
+    ordinal: Option<u64>,
+    tool_call: Option<ToolCallId>,
+    first_step: Option<u64>,
+    person: bool,
+}
+
+/// What an engine is fed: nothing yet, the old records (see [`SessionMedia::fold`]) or
+/// content-free events (see [`SessionMedia::apply`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Feed {
+    Nothing,
+    Records,
+    /// The compaction state is never set, the engine's [`References`] is the set of references
+    /// the session may render, and message copies are kept as shapes.
+    Events,
+}
+
+/// Where a placed medium sits: its message's ordinal, for a tool's medium the call whose
+/// result holds it, and its digest.
 type Position = (u64, Option<ToolCallId>, String);
+
+/// Adds `id` to a list of capture ids. A list starts with room for exactly one: most hold one
+/// capture for the session's whole life, and a vector's first push otherwise makes room for
+/// four.
+fn push_id(ids: &mut Vec<MediaId>, id: MediaId) {
+    if ids.capacity() == 0 {
+        ids.reserve_exact(1);
+    }
+    ids.push(id);
+}
 
 /// Metadata deltas for an aging fold. A selected view changes rarely; its snapshot replaces
 /// the selected set. All other records emit only new captures and protection releases.
@@ -191,6 +229,47 @@ pub struct MediaFacts {
 /// ids it holds in their own order.
 pub type FactsLookup<K> = Vec<(K, Vec<MediaId>)>;
 
+/// The engine's whole state as content-free data, for saving it with a session and restoring it
+/// later ([`SessionMedia::index_state`], [`SessionMedia::from_index_state`]). The lookups that
+/// answer `bindings` are left out: a restore rebuilds them from the captures, in id order, as the
+/// old storage's media checkpoint does. So are the old placement state and the record counter,
+/// which only `fold` reads, and the compaction state, which a saved selection stands for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MediaIndexState {
+    /// The step counter.
+    pub boundary: u64,
+    /// The latest step started in the current run, whose repeated start is a retry.
+    pub last_step: Option<StepId>,
+    /// The latest tool batch's calls in planned order. A call planned twice holds its last
+    /// position; the position its earlier plan held holds a call planned later.
+    pub batch: Vec<ToolCallId>,
+    /// Every capture, in id order.
+    pub captures: Vec<CaptureFacts>,
+    /// Captures waiting for their first step.
+    pub pending: Vec<MediaId>,
+    /// Accepted messages not placed yet, one entry of capture ids per message, in the order
+    /// accepted.
+    pub held: Vec<Vec<MediaId>>,
+    /// Captures protected from aging for the current step.
+    pub protected: Vec<MediaId>,
+    /// The text-free copies of placed messages, by ordinal.
+    pub skeleton: Vec<(u64, MediaMessage)>,
+    /// Accepted messages not placed yet that hold media, by (record, position in the record).
+    pub held_messages: Vec<((u64, usize), MediaMessage)>,
+    /// Media a first-protocol compaction put in its replacement messages, with the ordinals
+    /// the replacement covers.
+    pub replacements: Vec<(Vec<MediaRef>, u64, u64)>,
+    /// The media shown, when a first-protocol compaction decided them: such a selection can't
+    /// be computed again without that compaction's records, so it is saved as it stands and
+    /// grows with each medium shown after it. `None` when the selection follows from the
+    /// skeletons alone.
+    pub selection: Option<Vec<MediaBinding>>,
+    /// The last ordinal a first-protocol compaction covers.
+    pub covered: Option<u64>,
+    /// A first-protocol compaction view was in force.
+    pub has_view: bool,
+}
+
 /// Metadata-only projection paired with one session's media store. Live callers retain
 /// the session lease; offline readers verify afresh and refuse objects reclaimed meanwhile.
 #[derive(Debug, Clone)]
@@ -201,17 +280,25 @@ pub struct SessionMedia {
     records: u64,
     boundary: u64,
     last_step: Option<StepId>,
-    captures: HashMap<MediaId, Capture>,
-    digests: HashMap<String, Vec<MediaId>>,
-    sources: HashMap<String, Vec<MediaId>>,
-    positions: HashMap<Position, Vec<MediaId>>,
+    feed: Feed,
+    /// Every reference captured, each kept once.
+    refs: References,
+    /// Every capture, in id order.
+    captures: Vec<Entry>,
+    /// Each capture beside its reference, in order: a reference's captures in the order
+    /// captured. A digest's captures are those of its references, and a reference is read
+    /// through the oldest capture of it.
+    sources: Vec<(RefId, MediaId)>,
+    /// Each placed capture beside its ordinal, in order. The captures of a [`Position`] are
+    /// those at its ordinal with its call and digest, in the order they took it.
+    positions: Vec<(u64, MediaId)>,
     tools: HashMap<(ToolCallId, Option<usize>), Vec<MediaId>>,
     pending: Vec<MediaId>,
     steers: Vec<Vec<MediaId>>,
     protected: Vec<MediaId>,
     changes: Vec<MediaChange>,
-    skeleton: BTreeMap<u64, Message>,
-    held_messages: HashMap<(u64, usize), Message>,
+    skeleton: BTreeMap<u64, MessageCopy>,
+    held_messages: HashMap<(u64, usize), MessageCopy>,
     compaction: crate::compaction::CompactionState,
     batch_order: HashMap<ToolCallId, usize>,
     replacements: Vec<(Vec<MediaRef>, u64, u64)>,
@@ -241,10 +328,11 @@ impl SessionMedia {
             records: 0,
             boundary: 0,
             last_step: None,
-            captures: HashMap::new(),
-            digests: HashMap::new(),
-            sources: HashMap::new(),
-            positions: HashMap::new(),
+            feed: Feed::Nothing,
+            refs: References::default(),
+            captures: Vec::new(),
+            sources: Vec::new(),
+            positions: Vec::new(),
             tools: HashMap::new(),
             pending: Vec::new(),
             steers: Vec::new(),
@@ -264,6 +352,7 @@ impl SessionMedia {
     /// Fold in durable WAL order, including records with no media. The positional placement
     /// kernel is shared with replay so held steers cannot acquire a premature ordinal.
     pub fn fold(&mut self, record: &WalRecord) -> Result<(), String> {
+        self.feed_records();
         let tool_ordinal = self.placement.held_tool_result_ordinal();
         let actions = self.placement.observe(record)?;
         self.compaction.fold(record);
@@ -365,7 +454,12 @@ impl SessionMedia {
     /// Every reference the event captures also joins the set of references the session may
     /// render. `fold` adds those from the records themselves, including a queued send's
     /// before it is delivered; on events, a delivered send's media join when it is accepted.
+    /// An engine fed only events keeps that set as its table of captured references; one
+    /// that was fed records keeps adding them to its compaction state.
     pub fn apply(&mut self, event: &MediaEvent) -> Result<(), String> {
+        if self.feed == Feed::Nothing {
+            self.feed = Feed::Events;
+        }
         match event {
             MediaEvent::RunStart { record, inputs, .. } => {
                 let messages = inputs
@@ -405,8 +499,10 @@ impl SessionMedia {
                 media,
             } => {
                 self.records = *record;
-                for part in media {
-                    self.compaction.captured.insert(&part.reference);
+                if self.feed == Feed::Records {
+                    for part in media {
+                        self.compaction.captured.insert(&part.reference);
+                    }
                 }
                 self.capture_tool_result(
                     call,
@@ -449,11 +545,26 @@ impl SessionMedia {
     }
 
     /// Add a message's references to the set the session may render. On events this is the
-    /// only way in; `fold` adds them from the records it reads.
+    /// only way in; `fold` adds them from the records it reads. An engine fed only events
+    /// has them in its table of references once their captures join it.
     fn admit_references(&mut self, message: &Message) {
-        for reference in crate::compaction::media_refs(&message.content) {
-            self.compaction.captured.insert(reference);
+        if self.feed == Feed::Records {
+            for reference in crate::compaction::media_refs(&message.content) {
+                self.compaction.captured.insert(reference);
+            }
         }
+    }
+
+    /// The engine is fed a record. An engine fed only events until now gives its compaction
+    /// state every reference it captured, which is what that state would hold had the
+    /// events added them as they came.
+    fn feed_records(&mut self) {
+        if self.feed == Feed::Events {
+            for reference in self.refs.iter() {
+                self.compaction.captured.insert(reference);
+            }
+        }
+        self.feed = Feed::Records;
     }
 
     /// Remember each planned call's position in the batch: its result takes that position
@@ -478,11 +589,14 @@ impl SessionMedia {
         let block_index = self.batch_order.get(call).copied().unwrap_or(0);
         if let Some(ordinal) = ordinal.filter(|_| shown) {
             let result = skeleton();
-            let message = self.skeleton.entry(ordinal).or_insert_with(|| {
-                let mut message = Message::new(broca_protocol::Role::Tool, Vec::new());
-                message.ordinal = Some(ordinal);
-                message
-            });
+            let mut message = match self.skeleton.remove(&ordinal) {
+                Some(copy) => copy.message(&self.refs, Some(ordinal)),
+                None => {
+                    let mut message = Message::new(broca_protocol::Role::Tool, Vec::new());
+                    message.ordinal = Some(ordinal);
+                    message
+                }
+            };
             if message.content.len() <= block_index {
                 message
                     .content
@@ -491,6 +605,8 @@ impl SessionMedia {
                     });
             }
             message.content[block_index] = ContentBlock::ToolResult(result);
+            let copy = self.keep_copy(message, Some(ordinal));
+            self.skeleton.insert(ordinal, copy);
         }
         for (part, media) in media {
             self.insert(
@@ -518,12 +634,12 @@ impl SessionMedia {
         let steers = std::mem::take(&mut self.steers);
         for (i, ids) in steers.into_iter().enumerate() {
             for id in ids {
-                self.captures.get_mut(&id).expect("capture id").ordinal = Some(first + i as u64);
+                self.capture_mut(&id).ordinal = Some(first + i as u64);
                 self.index_position(id);
                 self.show(id);
-                if let Some(mut message) = self.held_messages.remove(&(id.record, id.message)) {
-                    message.ordinal = Some(first + i as u64);
-                    self.skeleton.insert(first + i as u64, message);
+                if let Some(mut copy) = self.held_messages.remove(&(id.record, id.message)) {
+                    copy.place(first + i as u64);
+                    self.skeleton.insert(first + i as u64, copy);
                 }
             }
         }
@@ -537,7 +653,7 @@ impl SessionMedia {
             self.end_step();
             self.last_step = Some(step_id);
             for id in std::mem::take(&mut self.pending) {
-                self.captures.get_mut(&id).expect("capture id").first_step = Some(self.boundary);
+                self.capture_mut(&id).first_step = Some(self.boundary);
                 self.protected.push(id);
             }
         }
@@ -572,7 +688,7 @@ impl SessionMedia {
         self.held_messages.clear();
         let removed: std::collections::HashSet<MediaId> = self
             .captures
-            .values()
+            .iter()
             .filter(|capture| {
                 held.contains(&capture.id) || capture.ordinal.is_some_and(|ordinal| ordinal >= len)
             })
@@ -583,31 +699,18 @@ impl SessionMedia {
                 ids.retain(|id| !removed.contains(id));
                 !ids.is_empty()
             };
-            self.sources.retain(|_, ids| kept(ids));
-            self.positions.retain(|_, ids| kept(ids));
+            self.sources.retain(|(_, id)| !removed.contains(id));
+            self.positions.retain(|(_, id)| !removed.contains(id));
             self.tools.retain(|_, ids| kept(ids));
             self.pending.retain(|id| !removed.contains(id));
             self.protected.retain(|id| !removed.contains(id));
             if let Some(selected) = &mut self.restored_selection {
                 selected.retain(|binding| !removed.contains(&binding.id));
             }
-            self.captures.retain(|id, _| !removed.contains(id));
-            // A reference is read through the oldest capture of it (see `insert`). Rebuild
-            // from the captures that remain, so a reference the cut leaves in the transcript
-            // stays readable when its oldest capture was cut.
-            self.digests.clear();
-            for (digest, ids) in &self.sources {
-                let entries = self.digests.entry(digest.clone()).or_default();
-                for id in ids {
-                    let reference = &self.captures[id].reference;
-                    if !entries
-                        .iter()
-                        .any(|entry| self.captures[entry].reference == *reference)
-                    {
-                        entries.push(*id);
-                    }
-                }
-            }
+            // A reference the cut leaves in the transcript stays readable through the oldest
+            // capture of it that remains (see `sources`).
+            self.captures
+                .retain(|capture| !removed.contains(&capture.id));
         }
         drop(self.skeleton.split_off(&len));
         // A converted session's compaction covered a prefix of the old transcript. Messages
@@ -623,7 +726,43 @@ impl SessionMedia {
 
     /// Whether the engine still holds the capture `id`; only a transcript cut removes one.
     pub fn holds(&self, id: MediaId) -> bool {
-        self.captures.contains_key(&id)
+        self.find_capture(&id).is_some()
+    }
+
+    /// The capture `id`, if the engine holds it.
+    fn find_capture(&self, id: &MediaId) -> Option<&Entry> {
+        let at = self
+            .captures
+            .binary_search_by_key(id, |capture| capture.id)
+            .ok()?;
+        Some(&self.captures[at])
+    }
+
+    /// The capture `id`, which the engine holds: every id it hands out or keeps names one.
+    fn capture(&self, id: &MediaId) -> &Entry {
+        self.find_capture(id).expect("capture id")
+    }
+
+    fn capture_mut(&mut self, id: &MediaId) -> &mut Entry {
+        let at = self
+            .captures
+            .binary_search_by_key(id, |capture| capture.id)
+            .expect("capture id");
+        &mut self.captures[at]
+    }
+
+    /// The copy to keep of a message at `ordinal` (none for one not placed yet): its shape
+    /// on an engine fed only events, where a copy holds nothing else.
+    fn keep_copy(&mut self, message: Message, ordinal: Option<u64>) -> MessageCopy {
+        MessageCopy::keep(message, ordinal, &mut self.refs, self.feed == Feed::Events)
+    }
+
+    /// The engine's message copies as messages, in order.
+    fn copies(&self) -> Vec<Message> {
+        self.skeleton
+            .iter()
+            .map(|(ordinal, copy)| copy.message(&self.refs, Some(*ordinal)))
+            .collect()
     }
 
     fn index_replacements(&mut self) {
@@ -672,8 +811,14 @@ impl SessionMedia {
         if let Some(selected) = &self.restored_selection {
             return selected.clone();
         }
-        let prompt: Vec<_> = self.skeleton.values().cloned().collect();
-        let selected = crate::compaction::view::rendered_history(&self.compaction, &prompt);
+        let prompt = self.copies();
+        let selected = if self.feed == Feed::Events {
+            crate::compaction::view::uncompacted_history(&prompt, |reference| {
+                self.refs.find(reference).is_some()
+            })
+        } else {
+            crate::compaction::view::rendered_history(&self.compaction, &prompt)
+        };
         self.bindings(&selected)
     }
 
@@ -685,19 +830,18 @@ impl SessionMedia {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries
         }
-        let mut captures: Vec<_> = self
+        let captures: Vec<_> = self
             .captures
-            .values()
+            .iter()
             .map(|capture| CaptureFacts {
                 id: capture.id,
-                reference: capture.reference.clone(),
+                reference: self.refs.get(capture.reference).clone(),
                 ordinal: capture.ordinal,
                 tool_call: capture.tool_call.clone(),
                 first_step: capture.first_step,
                 person: capture.person,
             })
             .collect();
-        captures.sort_by_key(|capture| capture.id);
         let mut batch_order: Vec<_> = self
             .batch_order
             .iter()
@@ -714,43 +858,131 @@ impl SessionMedia {
             skeleton: self
                 .skeleton
                 .iter()
-                .map(|(ordinal, message)| (*ordinal, MediaMessage::of(message)))
+                .map(|(ordinal, copy)| {
+                    (
+                        *ordinal,
+                        MediaMessage::of(&copy.message(&self.refs, Some(*ordinal))),
+                    )
+                })
                 .collect(),
             held_messages: sorted(
                 self.held_messages
                     .iter()
-                    .map(|(key, message)| (*key, MediaMessage::of(message))),
+                    .map(|(key, copy)| (*key, MediaMessage::of(&copy.message(&self.refs, None)))),
             ),
             batch_order,
             selected: self.selected_bindings(),
             covered: self.covered(),
             replacements: self.replacements.clone(),
-            positions: sorted(self.positions.iter().map(|((ordinal, call, digest), ids)| {
-                (
-                    (
-                        *ordinal,
-                        call.as_ref().map(|call| call.0.clone()),
-                        digest.clone(),
-                    ),
-                    ids.clone(),
-                )
-            })),
-            digests: sorted(
-                self.digests
-                    .iter()
-                    .map(|(digest, ids)| (digest.clone(), ids.clone())),
-            ),
-            sources: sorted(
-                self.sources
-                    .iter()
-                    .map(|(digest, ids)| (digest.clone(), ids.clone())),
-            ),
+            positions: self.positions_by_key().into_iter().collect(),
+            digests: self.digests().into_iter().collect(),
+            sources: self.sources_by_digest().into_iter().collect(),
             tools: sorted(
                 self.tools
                     .iter()
                     .map(|((call, part), ids)| ((call.0.clone(), *part), ids.clone())),
             ),
         }
+    }
+
+    /// The engine's state as data, to save with the session (see [`MediaIndexState`]).
+    pub fn index_state(&self) -> MediaIndexState {
+        let facts = self.facts();
+        // A call planned twice holds only its last position, so a position before it can be
+        // empty: it takes a call whose own position comes later, which that position then
+        // overwrites when the batch is ordered again.
+        let mut batch: Vec<Option<ToolCallId>> = Vec::new();
+        for (call, position) in &facts.batch_order {
+            if batch.len() <= *position {
+                batch.resize(position + 1, None);
+            }
+            batch[*position] = Some(call.clone());
+        }
+        let mut later = None;
+        for slot in batch.iter_mut().rev() {
+            match slot {
+                Some(call) => later = Some(call.clone()),
+                None => slot.clone_from(&later),
+            }
+        }
+        let decided = self.restored_selection.is_some()
+            || self.compaction.view.is_some()
+            || self.compaction.applied.is_some();
+        MediaIndexState {
+            boundary: facts.boundary,
+            last_step: facts.last_step,
+            batch: batch.into_iter().flatten().collect(),
+            captures: facts.captures,
+            pending: facts.pending,
+            held: facts.held,
+            protected: facts.protected,
+            skeleton: facts.skeleton,
+            held_messages: facts.held_messages,
+            replacements: facts.replacements,
+            selection: decided.then_some(facts.selected),
+            covered: facts.covered,
+            has_view: self.compaction.view.is_some() || self.restored_view,
+        }
+    }
+
+    /// An engine holding a saved state (see [`MediaIndexState`]), reading media bytes from
+    /// `store`. It continues from that state through either entry point; a saved selection is
+    /// used as it stands until a first-protocol compaction record arrives through `fold`.
+    /// Refused when a skeleton names a block past its message's last, or an id names no capture.
+    pub fn from_index_state(
+        state: MediaIndexState,
+        store: impl MediaBytes + 'static,
+    ) -> Result<Self, String> {
+        let mut session = Self::new(store);
+        session.boundary = state.boundary;
+        session.last_step = state.last_step;
+        session.order_batch(state.batch.into_iter());
+        session.feed = Feed::Events;
+        for capture in state.captures {
+            if session.holds(capture.id) {
+                return Err(format!("the capture {:?} repeats", capture.id));
+            }
+            session.insert(
+                Capture {
+                    id: capture.id,
+                    reference: capture.reference,
+                    ordinal: capture.ordinal,
+                    tool_call: capture.tool_call,
+                    first_step: capture.first_step,
+                    person: capture.person,
+                },
+                false,
+            );
+        }
+        let named = state
+            .pending
+            .iter()
+            .chain(&state.protected)
+            .chain(state.held.iter().flatten())
+            .chain(state.selection.iter().flatten().map(|binding| &binding.id));
+        for id in named {
+            if !session.holds(*id) {
+                return Err(format!("{id:?} names no capture"));
+            }
+        }
+        session.pending = state.pending;
+        session.steers = state.held;
+        session.protected = state.protected;
+        for (ordinal, skeleton) in state.skeleton {
+            let mut message = skeleton.to_message()?;
+            message.ordinal = Some(ordinal);
+            let copy = session.keep_copy(message, Some(ordinal));
+            session.skeleton.insert(ordinal, copy);
+        }
+        for (key, skeleton) in state.held_messages {
+            let copy = session.keep_copy(skeleton.to_message()?, None);
+            session.held_messages.insert(key, copy);
+        }
+        session.replacements = state.replacements;
+        session.restored_selection = state.selection;
+        session.restored_covered = state.covered;
+        session.restored_view = state.has_view;
+        Ok(session)
     }
 
     fn covered(&self) -> Option<u64> {
@@ -769,7 +1001,7 @@ impl SessionMedia {
     }
 
     fn show(&mut self, id: MediaId) {
-        let capture = &self.captures[&id];
+        let capture = self.capture(&id);
         let covered = self.covered();
         if capture
             .ordinal
@@ -784,7 +1016,7 @@ impl SessionMedia {
                 block: id.block,
                 part: id.part,
             },
-            reference: capture.reference.clone(),
+            reference: self.refs.get(capture.reference).clone(),
             tool: capture.tool_call.is_some(),
             protected: capture.person
                 && capture.first_step.is_none_or(|step| step == self.boundary),
@@ -795,46 +1027,46 @@ impl SessionMedia {
         self.changes.push(MediaChange::Show(binding));
     }
 
+    /// Keep `capture`, and show it when `announce` asks and it is shown at once: when it is
+    /// placed, or is a tool's.
     fn insert(&mut self, capture: Capture, announce: bool) {
         let id = capture.id;
-        self.sources
-            .entry(capture.reference.sha256.clone())
-            .or_default()
-            .push(id);
-        let entries = self
-            .digests
-            .entry(capture.reference.sha256.clone())
-            .or_default();
-        if !entries
-            .iter()
-            .any(|id| self.captures[id].reference == capture.reference)
-        {
-            entries.push(id);
-        }
+        let reference = self.refs.intern(&capture.reference);
+        let at = self
+            .sources
+            .partition_point(|source| *source < (reference, id));
+        self.sources.insert(at, (reference, id));
         if let Some(call) = &capture.tool_call {
-            self.tools
-                .entry((call.clone(), id.part))
-                .or_default()
-                .push(id);
+            push_id(self.tools.entry((call.clone(), id.part)).or_default(), id);
         }
-        self.captures.insert(id, capture);
+        let shown = capture.ordinal.is_some() || !capture.person;
+        let entry = Entry {
+            id,
+            reference,
+            ordinal: capture.ordinal,
+            tool_call: capture.tool_call,
+            first_step: capture.first_step,
+            person: capture.person,
+        };
+        match self
+            .captures
+            .binary_search_by_key(&id, |capture| capture.id)
+        {
+            Ok(at) => self.captures[at] = entry,
+            Err(at) => self.captures.insert(at, entry),
+        }
         self.index_position(id);
-        if announce && (self.captures[&id].ordinal.is_some() || !self.captures[&id].person) {
+        if announce && shown {
             self.show(id);
         }
     }
 
     fn index_position(&mut self, id: MediaId) {
-        let capture = &self.captures[&id];
-        if let Some(ordinal) = capture.ordinal {
-            self.positions
-                .entry((
-                    ordinal,
-                    capture.tool_call.clone(),
-                    capture.reference.sha256.clone(),
-                ))
-                .or_default()
-                .push(id);
+        if let Some(ordinal) = self.capture(&id).ordinal {
+            let at = self
+                .positions
+                .partition_point(|position| *position < (ordinal, id));
+            self.positions.insert(at, (ordinal, id));
         }
     }
 
@@ -871,10 +1103,11 @@ impl SessionMedia {
                     }
                 }
             }
+            let copy = self.keep_copy(metadata, ordinal);
             if let Some(ordinal) = ordinal {
-                self.skeleton.insert(ordinal, metadata);
+                self.skeleton.insert(ordinal, copy);
             } else {
-                self.held_messages.insert((self.records, index), metadata);
+                self.held_messages.insert((self.records, index), copy);
             }
         }
         for (block, value) in message.content.iter().enumerate() {
@@ -960,23 +1193,25 @@ impl SessionMedia {
                     let position = message
                         .ordinal
                         .map(|ordinal| (ordinal, tool_call.cloned(), reference.sha256.clone()));
-                    let ids = if let Some(position) = &position {
-                        self.positions.get(position)
+                    // Without a place or a call, the reference binds to its oldest capture:
+                    // the first of its digest's captures that is of this reference.
+                    let ids: Option<Vec<MediaId>> = if let Some(position) = &position {
+                        self.position(position)
                     } else if carried.is_some() {
-                        self.sources.get(&reference.sha256)
+                        self.of_digest(&reference.sha256)
                     } else if let Some(call) = tool_call {
-                        self.tools.get(&(call.clone(), part))
+                        self.tools.get(&(call.clone(), part)).cloned()
                     } else {
-                        self.digests.get(&reference.sha256)
+                        self.of_digest(&reference.sha256)
                     };
                     let cursor = position.map(|position| cursors.entry(position).or_default());
                     let capture = ids.and_then(|ids| {
                         if let Some((from, to)) = carried {
                             return ids
                                 .iter()
-                                .map(|id| &self.captures[id])
+                                .map(|id| self.capture(id))
                                 .filter(|capture| {
-                                    capture.reference == *reference
+                                    self.refs.get(capture.reference) == reference
                                         && capture
                                             .ordinal
                                             .is_some_and(|ordinal| from <= ordinal && ordinal < to)
@@ -986,15 +1221,15 @@ impl SessionMedia {
                         let start = cursor.as_deref().copied().unwrap_or(0);
                         let found = ids[start.min(ids.len())..]
                             .iter()
-                            .map(|id| &self.captures[id])
-                            .find(|capture| capture.reference == *reference);
+                            .map(|id| self.capture(id))
+                            .find(|capture| self.refs.get(capture.reference) == reference);
                         if let Some(cursor) = cursor {
                             *cursor += 1;
                         }
                         found.or_else(|| {
                             ids.iter()
-                                .map(|id| &self.captures[id])
-                                .find(|capture| capture.reference == *reference)
+                                .map(|id| self.capture(id))
+                                .find(|capture| self.refs.get(capture.reference) == reference)
                         })
                     });
                     if let Some(capture) = capture {
@@ -1029,16 +1264,103 @@ impl SessionMedia {
         out
     }
 
-    fn is_protected(&self, capture: &Capture) -> bool {
+    /// The captures at `position`, in the order they took it; `None` when there are none.
+    fn position(&self, (ordinal, call, digest): &Position) -> Option<Vec<MediaId>> {
+        let start = self.positions.partition_point(|(at, _)| at < ordinal);
+        let ids: Vec<MediaId> = self.positions[start..]
+            .iter()
+            .take_while(|(at, _)| at == ordinal)
+            .map(|(_, id)| *id)
+            .filter(|id| {
+                let capture = self.capture(id);
+                capture.tool_call == *call && self.refs.get(capture.reference).sha256 == *digest
+            })
+            .collect();
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    /// The captures of `reference`, in the order captured.
+    fn of_reference(&self, reference: RefId) -> &[(RefId, MediaId)] {
+        let start = self.sources.partition_point(|(at, _)| *at < reference);
+        let len = self.sources[start..].partition_point(|(at, _)| *at == reference);
+        &self.sources[start..start + len]
+    }
+
+    /// The captures of `digest`, in the order captured; `None` when there are none.
+    fn of_digest(&self, digest: &str) -> Option<Vec<MediaId>> {
+        let mut ids: Vec<MediaId> = self
+            .refs
+            .of_digest(digest)
+            .iter()
+            .flat_map(|reference| self.of_reference(*reference))
+            .map(|(_, id)| *id)
+            .collect();
+        ids.sort_unstable();
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    /// The captures of each position, by position.
+    fn positions_by_key(&self) -> BTreeMap<(u64, Option<String>, String), Vec<MediaId>> {
+        let mut positions: BTreeMap<_, Vec<MediaId>> = BTreeMap::new();
+        for (ordinal, id) in &self.positions {
+            let capture = self.capture(id);
+            let key = (
+                *ordinal,
+                capture.tool_call.as_ref().map(|call| call.0.clone()),
+                self.refs.get(capture.reference).sha256.clone(),
+            );
+            positions.entry(key).or_default().push(*id);
+        }
+        positions
+    }
+
+    /// The captures of each digest, in the order captured.
+    fn sources_by_digest(&self) -> BTreeMap<String, Vec<MediaId>> {
+        let mut sources: BTreeMap<String, Vec<MediaId>> = BTreeMap::new();
+        for (reference, id) in &self.sources {
+            sources
+                .entry(self.refs.get(*reference).sha256.clone())
+                .or_default()
+                .push(*id);
+        }
+        for ids in sources.values_mut() {
+            ids.sort_unstable();
+        }
+        sources
+    }
+
+    /// For each digest, the oldest capture of each of its references, in the order captured:
+    /// the captures its references are read through.
+    fn digests(&self) -> BTreeMap<String, Vec<MediaId>> {
+        let mut digests: BTreeMap<String, Vec<MediaId>> = BTreeMap::new();
+        for (reference, id) in &self.sources {
+            let digest = &self.refs.get(*reference).sha256;
+            let ids = digests.entry(digest.clone()).or_default();
+            // A reference's captures are in order, so its oldest comes first.
+            if !ids
+                .iter()
+                .any(|seen| self.capture(seen).reference == *reference)
+            {
+                ids.push(*id);
+            }
+        }
+        for ids in digests.values_mut() {
+            ids.sort_unstable();
+        }
+        digests
+    }
+
+    fn is_protected(&self, capture: &Entry) -> bool {
         capture.person && capture.first_step.is_none_or(|step| step == self.boundary)
     }
 
     /// Read and verify afresh. Exact metadata equality is required as well as a digest match.
     pub fn read(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
-        if !self.digests.get(&reference.sha256).is_some_and(|ids| {
-            ids.iter()
-                .any(|id| self.captures[id].reference == *reference)
-        }) {
+        if !self
+            .refs
+            .find(reference)
+            .is_some_and(|reference| !self.of_reference(reference).is_empty())
+        {
             return Err(MediaReadError::Corrupt(reference.sha256.clone()));
         }
         let bytes = if let Some((state_root, class)) = &self.read_only {

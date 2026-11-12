@@ -61,6 +61,8 @@ pub enum StoreReadRequest {
     Entries { from: u64, limit: usize },
     /// Internal authorization only: ownership without forcing pending records durable.
     AuthorizationOwnership,
+    /// Internal reader-policy admission, without page work or an actor recovery.
+    AuthorizationRead(crate::reader_admission::ReadAccess),
     /// Internal authorization only: the immutable sender of a queued submission.
     AuthorizationSubmissionSender(String),
     /// One `compaction-runner/v1` operation (see `store_entries::serve_compaction`), for the
@@ -106,7 +108,9 @@ impl StoreReadRequest {
     pub(crate) fn is_authorization(&self) -> bool {
         matches!(
             self,
-            Self::AuthorizationOwnership | Self::AuthorizationSubmissionSender(_)
+            Self::AuthorizationOwnership
+                | Self::AuthorizationSubmissionSender(_)
+                | Self::AuthorizationRead(_)
         )
     }
 }
@@ -163,6 +167,7 @@ pub enum StoreReadReply {
     Page(Result<PageAnswer, ServeError>),
     Entries(Result<Vec<StoredEntry>, ServeError>),
     AuthorizationOwnership(Result<broca_core::SessionOwnershipV1, String>),
+    AuthorizationRead(Result<(), ServeError>),
     AuthorizationSubmissionSender(Result<Option<BindPrincipal>, ServeError>),
     Compaction(
         Result<
@@ -330,6 +335,9 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::AuthorizationOwnership => StoreReadReply::AuthorizationOwnership(
             broca_session_loop::owner::ownership_with_plan(&session.operations, ctx.parts)
                 .map_err(|error| format!("the session's stored owner can't be read: {error}")),
+        ),
+        StoreReadRequest::AuthorizationRead(access) => StoreReadReply::AuthorizationRead(
+            crate::reader_admission::admit(session, ctx.parts, access).await,
         ),
         StoreReadRequest::AuthorizationSubmissionSender(id) => {
             StoreReadReply::AuthorizationSubmissionSender(
@@ -569,6 +577,20 @@ impl<B: broca_session_store::backend::SessionBackend> CachedBytes for SessionVie
 
     fn grown_bytes(&self) -> u64 {
         self.sealed_entries_bytes() as u64
+    }
+}
+
+/// A stored view counts as the session view it boxes, with its own few fields (the probed
+/// position and the control stream's head) on top.
+impl<B: broca_session_store::backend::SessionBackend> CachedBytes
+    for crate::store_read::StoredView<B>
+{
+    fn loaded_bytes(&self) -> u64 {
+        std::mem::size_of::<SessionView<B>>() as u64 + SessionView::<B>::loaded_bytes(self)
+    }
+
+    fn grown_bytes(&self) -> u64 {
+        SessionView::<B>::grown_bytes(self)
     }
 }
 

@@ -111,6 +111,7 @@ fn anthropic_spec() -> (ProviderSpec, ModelSpec) {
             reasoning_echo: None,
             tool_call_content_empty_string: false,
             media: None,
+            moonshot_schema_types: false,
         },
         raw: serde_json::Value::Null,
     };

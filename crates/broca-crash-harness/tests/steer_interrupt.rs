@@ -243,6 +243,7 @@ impl RunExecutor for CoreExec {
         if std::mem::take(&mut *self.script.pause_next_run.lock().unwrap()) {
             control.pause_for_auth_at_start = Some(broca_protocol::ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,
@@ -256,6 +257,7 @@ impl RunExecutor for CoreExec {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
         }
         run_loop_on_writer_admitted(

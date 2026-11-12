@@ -585,3 +585,81 @@ async fn unexpired_and_leased_sessions_in_the_new_storage_are_kept() {
         assert!(rig.holds(key), "{} long after", key.session);
     }
 }
+
+/// A fork's session in the ephemeral root, which holds only its fork's records, is kept until
+/// its retention time past the fork's idle time after its newest record, and then deleted by the
+/// same sweep, with no deletion deferred for want of a reading.
+#[tokio::test]
+async fn a_forks_session_is_deleted_once_its_records_say_it_may_be() {
+    use broca_session_store::record::{Fork, ForkEvent};
+    let rig = Rig::new("fork", Duration::from_secs(600)).await;
+    let key = rig.key("head:fork:fork-1");
+    let fact = |event, at_ms| Fork {
+        fork_id: "fork-1".into(),
+        event,
+        at_ms,
+        ask_id: None,
+        attempt: None,
+        question: None,
+        answer: None,
+        finish: None,
+        usage: None,
+        principal: None,
+        base: None,
+        admission_id: None,
+        idle_ms: None,
+        retain_ms: None,
+        detail: None,
+    };
+    const IDLE_MS: u64 = 600_000;
+    const RETAIN_MS: u64 = 3_600_000;
+    rig.seed(
+        &key,
+        &[
+            Record::Fork(Fork {
+                principal: Some("colliculus".into()),
+                base: Some(serde_json::json!({"run_id": "r1"})),
+                idle_ms: Some(IDLE_MS),
+                retain_ms: Some(RETAIN_MS),
+                ..fact(ForkEvent::Prepared, STARTED_MS)
+            }),
+            Record::Fork(fact(ForkEvent::Ended, ENDED_MS)),
+        ],
+        false,
+    )
+    .await;
+    let deadline = ENDED_MS + IDLE_MS + RETAIN_MS;
+    let records = LocalBackend::new(rig.ephemeral());
+    let position = Session::stored_position(&records, &addr(&key), &deployment())
+        .await
+        .unwrap()
+        .unwrap();
+    let view = Session::view_at(
+        &records,
+        addr(&key),
+        &triple(&key),
+        &deployment(),
+        &position,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store_policy(&view.records_from(0).await.unwrap()),
+        Some((RETAIN_MS / 1_000, ENDED_MS, Some(deadline)))
+    );
+    drop(view);
+
+    assert_eq!(rig.registry.sweep_once(deadline - 1).await.unwrap(), 0);
+    assert!(
+        rig.holds(&key),
+        "the fork's answers are kept until its deadline"
+    );
+    assert_eq!(rig.registry.sweep_once(deadline).await.unwrap(), 1);
+    assert!(
+        !rig.holds(&key),
+        "the fork's session is deleted at its deadline"
+    );
+    for path in rig.folders(&key) {
+        assert!(!path.exists(), "{} is left", path.display());
+    }
+}

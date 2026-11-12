@@ -155,6 +155,161 @@ fn sends() -> Vec<FramedRecord> {
         .collect()
 }
 
+#[test]
+fn paged_raw_history_keeps_one_sealed_send_id_index() {
+    let old = sends();
+    let mut converted = crate::convert(&old, Some(LINEAGE)).unwrap();
+    converted.start_at(crate::FIRST_SEQ);
+    let backend = Counting::new(MemoryBackend::default());
+    block_on(async {
+        let addr = SessionAddr("paged-send-ids".into());
+        let triple = SessionTriple {
+            project_root: "/synthetic".into(),
+            harness: "send-ids".into(),
+            session: "sample".into(),
+        };
+        let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+        let mut session =
+            Session::create(&backend, addr.clone(), triple.clone(), &deployment, false)
+                .await
+                .unwrap();
+        session.append(&converted.records, false).await.unwrap();
+        session.seal(None, 0).await.unwrap();
+        session.close().await.unwrap();
+        let view = Session::view(&backend, addr, &triple, &deployment)
+            .await
+            .unwrap();
+        let entries = view.entries(1, 100).await.unwrap();
+        assert!(entries.iter().any(|entry| entry
+            .state
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.sender.is_some())));
+        backend.take();
+        let mut all_ids = std::collections::BTreeMap::new();
+        for entry in &entries {
+            all_ids.extend(
+                view.entry_send_ids(std::slice::from_ref(entry))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let first = backend.take();
+        assert!(
+            !first.objects.is_empty(),
+            "the first sender page must reach sealed history"
+        );
+        for entry in &entries {
+            let ids = view
+                .entry_send_ids(std::slice::from_ref(entry))
+                .await
+                .unwrap();
+            for (ordinal, id) in ids {
+                assert_eq!(all_ids.get(&ordinal), Some(&id));
+            }
+        }
+        let repeated = backend.take();
+        assert_eq!(repeated.log_reads, 0, "{repeated:?}");
+        assert!(
+            repeated.objects.is_empty(),
+            "later pages must reuse the send index: {repeated:?}"
+        );
+        eprintln!(
+            "sealed send index: first log_reads={} objects={}, later log_reads={} objects={}",
+            first.log_reads,
+            first.objects.len(),
+            repeated.log_reads,
+            repeated.objects.len()
+        );
+
+        let parts = MemoryParts {
+            parts: converted.parts,
+        };
+        let store = crate::stored_history::StoredHistoryWalk::new(&view, &parts)
+            .await
+            .unwrap();
+        let head = view.head();
+        let today = TodaysHistory::new(
+            &old,
+            Some(LINEAGE),
+            broca_session_store::codec::hex(&head.incarnation.0),
+            broca_module::store_exposure::served_history_version(head.history_version),
+        )
+        .unwrap();
+        let key = broca_protocol::BindIdentity::new("/synthetic", "send-ids", "sample");
+        for newest in [false, true] {
+            let pages = crate::verify::history_pages(&store, &key, "raw", newest).await;
+            assert!(pages.len() > 1);
+            assert!(pages.iter().all(|page| page.get("refused").is_none()));
+            assert_eq!(
+                pages,
+                crate::verify::history_pages(&today, &key, "raw", newest).await
+            );
+        }
+    });
+}
+
+#[test]
+fn a_requested_send_id_index_stays_current_across_appends() {
+    let mut converted = crate::convert(&sends(), Some(LINEAGE)).unwrap();
+    converted.start_at(crate::FIRST_SEQ);
+    let backend = Counting::new(MemoryBackend::default());
+    block_on(async {
+        let mut session = Session::create(
+            &backend,
+            SessionAddr("appended-send-ids".into()),
+            SessionTriple {
+                project_root: "/synthetic".into(),
+                harness: "send-ids".into(),
+                session: "sample".into(),
+            },
+            &DeploymentKey::new(1, &[0x5a; 32]),
+            false,
+        )
+        .await
+        .unwrap();
+        // Start with one complete run, then request the index before later starts discard
+        // that run's records from the writer's retained suffix.
+        let split = converted
+            .records
+            .iter()
+            .position(|record| matches!(record, Record::RunEnd(_)))
+            .unwrap()
+            + 1;
+        session
+            .append(&converted.records[..split], true)
+            .await
+            .unwrap();
+        let entries = session.entries(1, 100).await.unwrap();
+        // The first run is a direct user turn, so add a sender only to the read copy to
+        // request the same admission index that a module-authored input would need.
+        let mut entries = entries;
+        std::sync::Arc::make_mut(entries[0].state.facts.as_mut().unwrap()).sender =
+            Some("sample-sender".into());
+        assert_eq!(
+            session.entry_send_ids(&entries).await.unwrap().get(&1),
+            Some(&None)
+        );
+        session
+            .append(&converted.records[split..], true)
+            .await
+            .unwrap();
+        let entries = session.entries(1, 100).await.unwrap();
+        backend.take();
+        let memory = session.in_memory();
+        let ids = session.entry_send_ids(&entries).await.unwrap();
+        assert!(!memory.refused());
+        assert!(ids.values().any(|id| id.as_deref() == Some("queued-send")));
+        assert!(
+            ids.values().any(Option::is_none),
+            "known absence must survive append"
+        );
+        let reads = backend.take();
+        assert_eq!(reads.log_reads, 0, "{reads:?}");
+        assert!(reads.objects.is_empty(), "{reads:?}");
+    });
+}
+
 struct Bodies {
     wal_read: Value,
     store_read: Value,

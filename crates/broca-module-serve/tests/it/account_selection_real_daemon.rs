@@ -9,6 +9,10 @@
 
 use crate::delivery_rig as usage_compat;
 
+#[path = "../common/account_continue.rs"]
+mod account_continue;
+use account_continue::{Continuations, ContinuePlan};
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -53,11 +57,12 @@ enum RoutingMode {
 }
 
 struct Routing {
+    continuations: Continuations,
     mode: Mutex<RoutingMode>,
     /// Every request, as `{method, params}`.
     requests: Mutex<Vec<Value>>,
     /// Each admission routing chose an account for: its identity and the reply it got.
-    admissions: Mutex<std::collections::HashMap<String, (Value, Value)>>,
+    admissions: Mutex<std::collections::HashMap<String, (Value, Vec<u8>)>>,
 }
 
 /// What makes two `route.account_for` requests the same admission to routing, as its deployed
@@ -153,6 +158,25 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
     ) -> subc_client_rs::HandlerOutcome {
         let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         self.requests.lock().unwrap().push(request.clone());
+        if request["method"] == "role.describe" {
+            return subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&json!({"result": self.continuations.describe()})).unwrap(),
+            );
+        }
+        if request["method"] == "route.report" || request["method"] == "route.account_observe" {
+            self.continuations.record_report(body.clone());
+        }
+        if request["method"] == "route.report" {
+            return subc_client_rs::HandlerOutcome::Response(br#"{"result":{}}"#.to_vec());
+        }
+        if request["method"] == "route.account_observe" && self.continuations.started() {
+            // Re-announcing a started admission for the offered account is a no-op, not a
+            // conflict. Keep it in the capture so tests can verify its ordering.
+            return subc_client_rs::HandlerOutcome::Response(br#"{"result":{}}"#.to_vec());
+        }
+        if request["method"] == "route.account_for" && request["params"]["mode"] == "continue" {
+            return self.continuations.handle(body).await;
+        }
         if request["method"] != "route.account_for" {
             // Serving is off: reports are refused, as routing refuses them today.
             return disabled();
@@ -175,7 +199,9 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
                 let key = admission.as_str().unwrap_or_default().to_string();
                 if let Some((stored, reply)) = self.admissions.lock().unwrap().get(&key) {
                     return if *stored == identity {
-                        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(reply).unwrap())
+                        subc_client_rs::HandlerOutcome::Response(
+                            self.continuations.admit_replay(&key, reply),
+                        )
                     } else {
                         subc_client_rs::HandlerOutcome::ErrorWithDetail {
                             code: "admission_conflict".into(),
@@ -197,11 +223,12 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
                     "pin": { "id": "pin-e2e", "generation": 1, "mode": "run_frozen" },
                     "reason": { "code": "cold_best", "decision_id": "acd-e2e", "policy_version": 2 },
                 }});
+                let reply = serde_json::to_vec(&reply).unwrap();
                 self.admissions
                     .lock()
                     .unwrap()
                     .insert(key, (identity, reply.clone()));
-                subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&reply).unwrap())
+                subc_client_rs::HandlerOutcome::Response(reply)
             }
             RoutingMode::Refuse {
                 code,
@@ -240,6 +267,7 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
 // ---- the stand-in credentials vault -----------------------------------------------------------
 
 struct Vault {
+    continuation_accounts: std::sync::atomic::AtomicBool,
     requests: Mutex<Vec<(String, Value)>>,
     /// Credential ids whose scoped reads answer `not_found`.
     not_found: Mutex<HashSet<String>>,
@@ -392,6 +420,15 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "account_id": "acct-g",
                     }),
                 ];
+                if self
+                    .continuation_accounts
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    rows.extend([
+                        listed("oauth:anthropic:acct1", "acct1"),
+                        listed("oauth:anthropic:acct2", "acct2"),
+                    ]);
+                }
                 if self
                     .openai_apikey_listed
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -591,6 +628,8 @@ fn output_ceiling_sse() -> Vec<u8> {
 
 #[derive(Default)]
 struct Upstream {
+    /// Refuse this credential with a weekly quota wall; other credentials still complete.
+    quota_wall_credential: Mutex<Option<String>>,
     /// Whether each request's authorization carried the token of each credential, by id.
     /// Booleans only: a token is never kept or printed.
     authorized_as: Mutex<Vec<String>>,
@@ -618,6 +657,8 @@ struct Upstream {
 }
 
 const CREDENTIALS: &[&str] = &[
+    "oauth:anthropic:acct1",
+    "oauth:anthropic:acct2",
     "oauth:anthropic",
     "oauth:anthropic:acct-b",
     "oauth:meta",
@@ -693,7 +734,17 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                     })
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "unknown".into());
+                let quota_wall = upstream.quota_wall_credential.lock().unwrap().as_deref()
+                    == Some(as_credential.as_str());
                 upstream.authorized_as.lock().unwrap().push(as_credential);
+                if quota_wall {
+                    let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}"#;
+                    let reply = format!("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nanthropic-ratelimit-unified-status: rejected\r\nanthropic-ratelimit-unified-representative-claim: seven_day\r\nanthropic-ratelimit-unified-reset: 4102444800\r\nretry-after: 604800\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    return;
+                }
                 if upstream
                     .grammar_limit_anthropic
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -1106,6 +1157,7 @@ impl Rig {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let routing = Arc::new(Routing {
+            continuations: Default::default(),
             mode: Mutex::new(RoutingMode::Choose {
                 account_id: "acct-a",
                 credential_id: "oauth:anthropic",
@@ -1114,6 +1166,7 @@ impl Rig {
             admissions: Mutex::new(Default::default()),
         });
         let vault = Arc::new(Vault {
+            continuation_accounts: Default::default(),
             requests: Mutex::new(Vec::new()),
             not_found: Mutex::new(HashSet::new()),
             needs_reauth: Mutex::new(HashSet::new()),
@@ -1130,7 +1183,12 @@ impl Rig {
         let routing_task = register(
             &connection_file,
             routing_id,
-            &["route.account_for", "route.account_observe"],
+            &[
+                "role.describe",
+                "route.account_for",
+                "route.account_observe",
+                "route.report",
+            ],
             RoutingModule(Arc::clone(&routing)),
         )
         .await;
@@ -1618,6 +1676,57 @@ impl Rig {
         }
     }
 
+    fn script_continuation_wall(&self, answer: ContinuePlan, resume_current_account: bool) {
+        self.routing.continuations.declare(true);
+        self.routing
+            .continuations
+            .declare_resume(resume_current_account);
+        self.routing.continuations.script_next(answer);
+        self.routing.set(RoutingMode::Choose {
+            account_id: "acct1",
+            credential_id: "oauth:anthropic:acct1",
+        });
+        self.vault
+            .continuation_accounts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.vault.account_ids.lock().unwrap().extend([
+            ("oauth:anthropic:acct1".into(), "acct1".into()),
+            ("oauth:anthropic:acct2".into(), "acct2".into()),
+        ]);
+        *self.upstream.quota_wall_credential.lock().unwrap() = Some("oauth:anthropic:acct1".into());
+    }
+
+    async fn continue_requests(&self) -> Vec<Vec<u8>> {
+        broca_test_support::wait_until("routing received a continue request", || async {
+            let requests = self.routing.continuations.requests();
+            if requests.is_empty() {
+                Err("no continue request".to_owned())
+            } else {
+                Ok(requests)
+            }
+        })
+        .await
+    }
+
+    async fn continuation_observations(&self) -> Vec<Vec<u8>> {
+        broca_test_support::wait_until(
+            "routing received the continued run's terminal observation",
+            || async {
+                let reports = self.routing.continuations.reports();
+                if reports.iter().any(|bytes| {
+                    let report: Value = serde_json::from_slice(bytes).unwrap();
+                    report["method"] == "route.account_observe"
+                        && report["params"]["kind"] == "run_finished"
+                }) {
+                    Ok(reports)
+                } else {
+                    Err("no run_finished observation".to_owned())
+                }
+            },
+        )
+        .await
+    }
+
     /// The records of the WAL whose `RunStarted` names session `name`, found by scanning the WAL
     /// directory rather than computing the WAL's address. The address hashes the bind triple as
     /// the module received it, after the daemon normalised the project root, and that spelling
@@ -1795,6 +1904,150 @@ async fn send(
         SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. } => run_id,
         other => panic!("unexpected send outcome {other:?}"),
     }
+}
+
+/// A real routed run must bind the continue question to the admission already chosen for
+/// that run, and observe the offered account after moving credentials. The exhausted reset is
+/// deliberately distant, so this run cannot take a same-account timed pause instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_continue_request_bytes_and_offered_account_observations_through_real_daemon() {
+    use cortexkit_role_routing::account_continue::{
+        parse_continue_request, ContinueAnswer, ContinueOffer, ContinueRequest, ExhaustedAccount,
+    };
+
+    let rig = Rig::start_with(json!({"session_storage":{"encryption":"off"}}))
+        .await
+        .expect("account continuation requires the real daemon");
+    let valid_until_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 300_000;
+    rig.script_continuation_wall(
+        ContinuePlan::Answer(ContinueAnswer::Offer(ContinueOffer::new(
+            "oauth:anthropic:acct2",
+            "acct2",
+            "decision-acct2",
+            valid_until_ms,
+        ))),
+        true,
+    );
+    let name = "continue-wire-contract";
+    let identity = rig.served_identity(name).await;
+    let plain = broca_session_store::keys::DeploymentKey::unloaded(1);
+    rig.create_held(&identity, &plain).await;
+    let client = rig.client(name).await;
+    let sent = rig
+        .raw_send(
+            name,
+            "continue-send",
+            json!({"conversation_key":"continue:wire-contract"}),
+        )
+        .await
+        .unwrap();
+    let run_id = sent["run_id"].as_str().unwrap();
+    let raw = rig.continue_requests().await;
+    assert_eq!(raw.len(), 1, "one selection question at this wall");
+    let envelope: Value = serde_json::from_slice(&raw[0]).unwrap();
+    assert_eq!(envelope["method"], "route.account_for");
+    let question =
+        parse_continue_request(&envelope["params"], &rig.routing.continuations.describe()).unwrap();
+    assert!(!question.selection_id.is_empty());
+    assert_ne!(
+        question.selection_id, run_id,
+        "selection ids belong to walls, not runs"
+    );
+    let wall_reports = rig.reports(run_id, &["account_limit_exhausted"]).await;
+    let wall = wall_reports
+        .iter()
+        .find(|(_, kind, _)| kind == "account_limit_exhausted")
+        .unwrap();
+    let exhausted = ExhaustedAccount::new(
+        "oauth:anthropic:acct1",
+        "acct1",
+        "seven_day",
+        wall.2["observed_at_ms"].as_u64().unwrap(),
+    )
+    .with_resets_at_ms(4_102_444_800_000)
+    .with_retry_after_s(604_800);
+    assert_eq!(envelope["params"], serde_json::to_value(ContinueRequest::new(
+        run_id, run_id, "continue:wire-contract", "acd-e2e", exhausted, &question.selection_id,
+    )).unwrap(), "continue carries the original admission and the failed attempt's own quota evidence, not fresh selection hints");
+    let status = broca_test_support::wait_until("continued run completed", || async {
+        let status = client.run_status(run_id).await.unwrap();
+        if matches!(status, broca_wire::RunStatusResponse::Completed { .. }) {
+            Ok(status)
+        } else {
+            Err(format!("{status:?}"))
+        }
+    })
+    .await;
+    assert_eq!(serde_json::to_value(status).unwrap()["state"], "completed");
+    assert!(!rig.has_todays_wal(&identity), "the run used new storage");
+    assert_eq!(
+        rig.upstream.authorized_as.lock().unwrap().as_slice(),
+        ["oauth:anthropic:acct1", "oauth:anthropic:acct2"]
+    );
+    let reports = rig.continuation_observations().await;
+    let reports: Vec<Value> = reports
+        .iter()
+        .map(|bytes| serde_json::from_slice(bytes).unwrap())
+        .collect();
+    assert!(
+        rig.routing
+            .continuations
+            .reports_after_continue()
+            .iter()
+            .all(|bytes| {
+                serde_json::from_slice::<Value>(bytes).unwrap()["method"] != "route.report"
+            }),
+        "runs observe their admission; only decision models send route.report"
+    );
+    let wall_index = reports
+        .iter()
+        .position(|r| r["params"]["kind"] == "account_limit_exhausted")
+        .unwrap();
+    let offered_start = reports
+        .iter()
+        .position(|r| {
+            r["method"] == "route.account_observe"
+                && r["params"]["kind"] == "admission_started"
+                && r["params"]["credential_id"] == "oauth:anthropic:acct2"
+        })
+        .unwrap();
+    let start = &reports[offered_start]["params"];
+    assert_eq!(start["admission_id"], run_id);
+    assert_eq!(start["run_id"], run_id);
+    assert_eq!(start["served_account_id"], "acct2");
+    assert!(
+        wall_index < offered_start,
+        "the failed observation precedes use of the offer"
+    );
+    let attempts: Vec<_> = reports
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["method"] == "route.account_observe" && r["params"]["kind"] == "attempt")
+        .collect();
+    assert!(
+        !attempts.is_empty(),
+        "the offered account completed an attempt"
+    );
+    for (index, attempt) in attempts {
+        assert!(
+            offered_start < index,
+            "admission_started marks the offer used before its first attempt"
+        );
+        assert_eq!(attempt["params"]["admission_id"], run_id);
+        assert_eq!(attempt["params"]["credential_id"], "oauth:anthropic:acct2");
+        assert_eq!(attempt["params"]["served_account_id"], "acct2");
+    }
+    let finished: Vec<_> = reports
+        .iter()
+        .filter(|r| r["params"]["kind"] == "run_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["params"]["admission_id"], run_id);
+    assert_eq!(rig.routing.continuations.requests().len(), 1);
 }
 
 fn selection(frames: &[FramedRecord]) -> Value {

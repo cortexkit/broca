@@ -342,6 +342,7 @@ async fn codex_auth_required_pause_retires_healthy_socket() {
         let control = RunControl {
             pause_for_auth_at_start: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -355,6 +356,7 @@ async fn codex_auth_required_pause_retires_healthy_socket() {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             }),
             ..Default::default()
         };
@@ -410,6 +412,51 @@ fn run_provider(
 
 fn bind(session: &str) -> BindIdentity {
     BindIdentity::new("/project", "harness", session)
+}
+
+#[tokio::test]
+async fn codex_store_two_completed_runs_reuse_the_websocket_lease() {
+    use broca_session_loop::{parts::MemoryParts, writer::Writer};
+    use broca_session_store::{backend::{MemoryBackend, SessionAddr}, head::SessionTriple, keys::DeploymentKey, session::Session};
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let client = build_provider_http_client();
+    let bind = bind("store-pool");
+    let backend = MemoryBackend::default();
+    let mut session = Session::create(&backend, SessionAddr("0123456789abcdef".into()),
+        SessionTriple { project_root: "/project".into(), harness: "harness".into(), session: "store-pool".into() },
+        &DeploymentKey::new(1, &[7; 32]), false).await.unwrap();
+    let mut parts = MemoryParts::default();
+    let tools = StubToolPlane::new();
+    let (out, mut events) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+    for turn in ["one", "two"] {
+        let provider = run_provider(&mock, &client, turn);
+        let mut request = tool_run_request(&bind);
+        request.run_id = RunId(format!("store-{turn}"));
+        request.tools.clear();
+        request.policy_allowed.clear();
+        request.input[0].content = vec![ContentBlock::Text { text: format!("question {turn}") }];
+        let control = broca_core::RunControl::default();
+        let admission = broca_session_loop::admit::admission(&mut request, &control, &provider, session.operations(), Some(1)).unwrap();
+        let seams = broca_session_loop::Seams {
+            provider: &provider, tools: &tools, bind: bind.clone(), out: Some(&out),
+            cancel: Default::default(), stop: Default::default(), held: None, approval: &AllowAll,
+            hook_plane: None, now_ms: &|| 1000, session_address: None, compaction_plane: None,
+            compaction_session: None, compaction_changes: false, keep_warm: None, account_reports: None,
+            max_same_account_wait: Default::default(), auth_selection: None, step_progress: None,
+            model_call_ready: None, pause_for_auth_at_start: None, account_continue: None,
+        };
+        let finished = broca_session_loop::run(&mut session, &mut parts, admission, &seams).await.unwrap();
+        assert_eq!(finished.reason, RunFinishReason::Completed);
+    }
+    drop(out);
+    drain.await.unwrap();
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1, "the store loop must return the first run's lease to the session pool");
+    assert_eq!(seen.requests.len(), 2);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["previous_response_id"], "r");
+    assert_eq!(frame["client_metadata"]["turn_id"], "two");
 }
 
 #[tokio::test]
@@ -1328,4 +1375,48 @@ async fn cache_evidence_captures_model_change_through_the_run_loop() {
 
 mod compaction_signals {
     include!("transport_compaction_signals_tests.rs");
+}
+
+/// A run that moves to another account inside the run closes the old account's transport and
+/// sends its next request through a provider for the new account: that request opens a new
+/// socket and carries no `previous_response_id`, so nothing from the old account's chain or
+/// connection reaches the new one.
+#[tokio::test]
+async fn codex_move_to_another_account_inside_a_run_opens_a_new_socket_without_a_chain() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let client = build_provider_http_client();
+    let first = run_provider(&mock, &client, "one");
+    first.bind_run_transport(&bind("session"));
+    let events = step(&first, 1, &opts()).await;
+    // What the run loop does when it leaves an account at a quota wall.
+    first.close_run_transport();
+    let second = run_provider(&mock, &client, "one");
+    {
+        let mut auth = second.auth.write().unwrap();
+        let AuthHandle::Headers(mut headers) = (*auth.auth).clone() else {
+            panic!("header auth")
+        };
+        headers
+            .iter_mut()
+            .find(|(key, _)| key == "chatgpt-account-id")
+            .unwrap()
+            .1 = "other-account".into();
+        headers
+            .iter_mut()
+            .find(|(key, _)| key == "authorization")
+            .unwrap()
+            .1 = "Bearer other-account-token".into();
+        auth.auth = Arc::new(AuthHandle::Headers(headers));
+    }
+    second.bind_run_transport(&bind("session"));
+    let next = follow_up(opts(), &events, "Next");
+    let events = step(&second, 2, &next).await;
+    assert!(!codex_trace(&events, 0).continuation);
+    let canonical: Value = serde_json::from_slice(&second.render_request(&next)).unwrap();
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 2, "the new account opens its own socket");
+    assert_eq!(seen.requests.len(), 2);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(frame["input"], canonical["input"]);
 }

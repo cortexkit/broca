@@ -308,6 +308,7 @@ fn auth_required_pause_is_resumable_not_sealed() {
         reason: PauseReason::AuthRequired,
         error: Some(ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -321,6 +322,7 @@ fn auth_required_pause_is_resumable_not_sealed() {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }),
     });
 

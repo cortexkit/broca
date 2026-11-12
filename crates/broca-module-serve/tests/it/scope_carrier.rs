@@ -69,6 +69,7 @@ fn stamp_ref(owner: Principal, scope_ref: &str, epoch: u64) -> ScopeStamp {
 fn auth_required_error() -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Auth,
@@ -82,6 +83,7 @@ fn auth_required_error() -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

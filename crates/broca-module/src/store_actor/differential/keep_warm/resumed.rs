@@ -26,7 +26,8 @@ use crate::store_actor::StoreActor;
 cipher_tests!(
     first_resumed_wait_matches_todays_recorded_base,
     resumed_warm_waits_for_the_media_fold,
-    mismatched_recorded_digest_never_warms
+    mismatched_recorded_digest_never_warms,
+    cold_cache_predecessor_rebuilds_the_previous_run_lazily
 );
 
 mod idle;
@@ -38,6 +39,68 @@ struct Warming {
     no_cache: bool,
     fail: bool,
     store: Option<crate::store_actor::tests::LoopExecutor>,
+}
+
+async fn cold_cache_predecessor_rebuilds_the_previous_run_lazily(cipher: Cipher) {
+    let side = super::side(false, cipher).await;
+    let mut records = history(true);
+    let expected =
+        broca_core::cache_warm::last_recorded_request_with_lineage(&records, None).unwrap();
+    records.push(record(
+        json!({"type":"run_finished", "reason":"completed", "usage":{}}),
+    ));
+    let mut next = records[0].clone();
+    if let WalRecord::RunStarted { run_id, .. } = &mut next {
+        *run_id = RunId("r2".into());
+    }
+    records.push(next);
+    let actor = reopened(&side, &records, cipher, Arc::new(Warming::default())).await;
+    let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(&actor.session, None);
+    let loader = writer.cache_predecessor_loader();
+    assert!(
+        futures::poll!(Box::pin(link.next())).is_pending(),
+        "installing a loader sends no read"
+    );
+    let loaded = loader.load();
+    tokio::pin!(loaded);
+    assert!(futures::poll!(&mut loaded).is_pending());
+    let broca_session_loop::shared::Request::CachePredecessor { reply } =
+        link.next().await.unwrap()
+    else {
+        panic!("the comparison asks its owner for a predecessor");
+    };
+    let _ = reply.send(actor.cache_predecessor().await);
+    let recovered = loaded.await.unwrap().unwrap();
+    assert_eq!(
+        recovered.request.run_id.0, "r1",
+        "the new run has no durable attempt yet"
+    );
+    assert_eq!(recovered.request.step_id.0, 2);
+    assert_eq!(
+        recovered.request.request_body_sha256,
+        expected.request_body_sha256
+    );
+    let live = broca_provider::LiveProvider::new(
+        broca_provider::families::AnthropicMessages,
+        serde_json::from_value(recovered.request.config.frozen_render_config).unwrap(),
+        broca_provider::wire::AuthHandle::None,
+    );
+    let bytes = broca_core::provider::Provider::render_request(&live, &recovered.request.opts);
+    assert_eq!(
+        broca_core::render::request_digest_hex(&bytes),
+        expected.request_body_sha256
+    );
+    assert!(recovered.locator.ends_with(&format!(
+        ":{}",
+        actor
+            .session
+            .ledger_tail_until(|r| matches!(r, Record::Attempt(_)))
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+    )));
 }
 
 #[async_trait]

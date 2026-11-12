@@ -113,6 +113,8 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::Held { .. } => "held",
         Request::SendRecords { .. } => "send records",
         Request::OpenLogRecords { .. } => "open log records",
+        Request::AcceptedSend { .. } => "accepted send",
+        Request::CachePredecessor { .. } => "cache predecessor",
         Request::RunStart { .. } => "run start",
         Request::ToolIntent { .. } => "tool intent",
         Request::EntryByMid { .. } => "entry by mid",
@@ -215,7 +217,7 @@ async fn a_store_session_runs_through_the_production_executor() {
         // What the next run's admission reads: the run that just ended, idle, with the config
         // its start froze, rebuilt from the start record and its setup parts.
         let (writer, _link) = broca_session_loop::shared::ActorWriter::new(&session, None);
-        let history = store_history(&writer, &parts).unwrap();
+        let history = store_history(&writer, &parts).await.unwrap();
         let prior = history.prior_run.expect("the session's latest run");
         assert_eq!(prior.run_id.0, run);
         assert!(prior.idle, "{run} has ended");

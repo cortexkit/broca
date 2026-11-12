@@ -987,10 +987,14 @@ fn resolve_provider_inner(
         apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
         // The provider represents today's code. Core checks the family's compatibility table
         // before comparing a blob restamped to the recorded version.
-        frozen.renderer_version = if family == WireFamilyId::AnthropicMessages {
-            broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
-        } else {
-            renderer_version_for(family)
+        frozen.renderer_version = match family {
+            WireFamilyId::AnthropicMessages => {
+                broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
+            }
+            WireFamilyId::OpenAiChat => {
+                broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types)
+            }
+            _ => renderer_version_for(family),
         };
         let base_url = frozen
             .base_url
@@ -1038,6 +1042,11 @@ fn resolve_provider_inner(
         frozen.reasoning_content_required =
             episode_render.reasoning_content_required.unwrap_or(false);
         frozen.reasoning_echo = crate::reasoning_echo_for_route("", base_url);
+        // An endpoint on Moonshot's API needs its tool schemas typed, like the catalog's Kimi
+        // routes.
+        frozen.moonshot_schema_types = crate::is_moonshot_route("", base_url);
+        frozen.renderer_version =
+            broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types);
         frozen.max_output_tokens = max_tokens;
         frozen.cache = opts.cache_policy.clone();
         frozen.prompt_cache_key = opts
@@ -1427,6 +1436,12 @@ fn resolve_provider_inner(
     if family == WireFamilyId::AnthropicMessages {
         frozen.renderer_version =
             broca_provider::families::anthropic_renderer_version(server_side_fallback);
+    }
+    // Likewise an OpenAI Chat config freezes v6 only when it types tool schemas for Moonshot's
+    // API, so every other OpenAI Chat run keeps recording v5.
+    if family == WireFamilyId::OpenAiChat {
+        frozen.renderer_version =
+            broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types);
     }
     apply_auth_method_quirks(provider_id, auth_method, &mut frozen);
     frozen.max_output_tokens = max_tokens;
@@ -2482,6 +2497,98 @@ mod tests {
         assert_eq!(frozen.reasoning, ReasoningPolicy::None);
     }
 
+    /// A run on a Moonshot route freezes the schema-typing flag and OpenAI Chat v6; a run on any
+    /// other OpenAI Chat route, including one that serves a Kimi model through its own API,
+    /// freezes neither and records exactly the v5 config it did before. A resume keeps what the
+    /// run recorded.
+    #[test]
+    fn moonshot_routes_freeze_schema_typing_and_v6_and_other_chat_routes_stay_v5() {
+        seed_catalog_for_resolution();
+        let options = ResolveOptions::default();
+        let fresh = |model: &str| {
+            resolve_catalog_episode_with_client(
+                model,
+                Some(2_048),
+                &AuthMode::None,
+                &options,
+                broca_provider::build_provider_http_client(),
+                EpisodeRenderConfig::default(),
+            )
+            .unwrap_or_else(|error| panic!("{model} resolves: {error}"))
+        };
+
+        let kimi = fresh("kimi-code-plan-global/k3");
+        assert_eq!(kimi.family_id, WireFamilyId::OpenAiChat);
+        let kimi_blob = kimi.provider.render_config_blob();
+        assert_eq!(kimi_blob["moonshot_schema_types"], true);
+        assert_eq!(kimi_blob["renderer_version"], 6);
+        assert_eq!(kimi.provider.renderer_version(), 6);
+
+        let other = fresh("302ai/kimi-k3");
+        assert_eq!(other.family_id, WireFamilyId::OpenAiChat);
+        let other_blob = other.provider.render_config_blob();
+        assert!(other_blob.get("moonshot_schema_types").is_none());
+        assert_eq!(other_blob["renderer_version"], 5);
+
+        let explicit = resolve_provider(
+            "kimi-k3",
+            Some("https://api.moonshot.ai/v1"),
+            2_048,
+            &AuthMode::None,
+            &options,
+        )
+        .expect("an explicit Moonshot endpoint resolves");
+        assert_eq!(
+            explicit.provider.render_config_blob()["moonshot_schema_types"],
+            true
+        );
+        assert_eq!(explicit.provider.renderer_version(), 6);
+        let explicit_other = resolve_provider(
+            "some-model",
+            Some("https://llm.example.test/v1"),
+            2_048,
+            &AuthMode::None,
+            &options,
+        )
+        .expect("an explicit endpoint resolves");
+        assert!(explicit_other
+            .provider
+            .render_config_blob()
+            .get("moonshot_schema_types")
+            .is_none());
+        assert_eq!(explicit_other.provider.renderer_version(), 5);
+
+        // A Kimi run recorded before the flag existed resumes without it, at v5.
+        let mut recorded: FrozenRenderConfig =
+            serde_json::from_value(kimi_blob.clone()).expect("the blob decodes");
+        recorded.moonshot_schema_types = false;
+        recorded.renderer_version = 5;
+        let resumed = |recorded: &FrozenRenderConfig| {
+            resolve_catalog_episode_with_client(
+                "kimi-code-plan-global/k3",
+                Some(2_048),
+                &AuthMode::None,
+                &options,
+                broca_provider::build_provider_http_client(),
+                EpisodeRenderConfig {
+                    recorded_config: Some(recorded),
+                    ..Default::default()
+                },
+            )
+            .expect("the recorded Kimi run resumes")
+        };
+        let old = resumed(&recorded);
+        assert!(old
+            .provider
+            .render_config_blob()
+            .get("moonshot_schema_types")
+            .is_none());
+        assert_eq!(old.provider.renderer_version(), 5);
+        recorded.moonshot_schema_types = true;
+        recorded.renderer_version = 6;
+        assert_eq!(resumed(&recorded).provider.renderer_version(), 6);
+    }
+
     #[test]
     fn opencode_go_resume_restores_recorded_family_and_base_url() {
         seed_catalog_for_resolution();
@@ -3242,6 +3349,129 @@ mod tests {
                 "{case}: only an opaque endpoint has no limit"
             );
         }
+    }
+
+    /// A conversation the account-move tests render: the caller's system text, a user turn, the
+    /// model's answer and the next user turn.
+    fn moved_run_options() -> CallOptions {
+        let text = |role, text: &str| {
+            Message::new(
+                role,
+                vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+            )
+        };
+        CallOptions::new(vec![
+            text(Role::System, "caller system"),
+            text(Role::User, "read the file"),
+            text(Role::Assistant, "it holds one function"),
+            text(Role::User, "and what does it do?"),
+        ])
+    }
+
+    /// A ChatGPT run that moved to another account renders the request it would have sent on
+    /// the old one, byte for byte: the account travels only in the request's headers.
+    #[test]
+    fn a_chatgpt_request_renders_the_same_body_on_another_account() {
+        let frozen = resolve_chatgpt("openai/gpt-5.4-mini").unwrap();
+        let clock = broca_core::clock::Clock::default();
+        let render = |token: &str, account: &str| {
+            provider_for_recorded_config(
+                "openai",
+                "gpt-5.4-mini",
+                frozen.clone(),
+                &AuthMode::Secret(token.to_owned()),
+                Some(AuthMethod::Chatgpt),
+                Some(account),
+                Some(account),
+                broca_provider::build_provider_http_client(),
+                &clock,
+            )
+            .unwrap()
+            .render_request(&moved_run_options())
+        };
+        let old = render(TOP_LEVEL, "acct-top");
+        let new = render(NESTED, "acct-nested");
+        assert!(!old.is_empty());
+        assert_eq!(old, new);
+    }
+
+    /// A Claude subscription run that moved to another account renders the same request but
+    /// for the persona: `metadata.user_id` names the new account's device and account, and the
+    /// billing block carries the new prompt id and so a new body signature (`cch`). Nothing else
+    /// differs.
+    #[test]
+    fn a_claude_subscription_request_differs_only_in_the_persona_on_another_account() {
+        let (old_frozen, _) = resolve_with_refusal_fallback(
+            "anthropic/claude-opus-5",
+            AuthMethod::Oauth,
+            None,
+            EpisodeRenderConfig::default(),
+        );
+        let old_persona = old_frozen.claude_code_persona.clone().unwrap();
+        // The persona a move refreezes (`claude_code_identity::moved_persona`): the new
+        // account's device and account ids and a new prompt id; the rest is kept.
+        let mut new_frozen = old_frozen.clone();
+        let persona = new_frozen.claude_code_persona.as_mut().unwrap();
+        persona.device_id = "b".repeat(64);
+        persona.account_uuid = Some("00000000-0000-4000-8000-00000000000b".into());
+        persona.prompt_id = Some("00000000-0000-4000-8000-0000000000bb".into());
+        let new_persona = persona.clone();
+        let clock = broca_core::clock::Clock::default();
+        let render = |frozen: &FrozenRenderConfig, token: &str, account: &str| {
+            let bytes = provider_for_recorded_config(
+                "anthropic",
+                "claude-opus-5",
+                frozen.clone(),
+                &AuthMode::Secret(token.to_owned()),
+                Some(AuthMethod::Oauth),
+                Some(account),
+                Some(account),
+                broca_provider::build_provider_http_client(),
+                &clock,
+            )
+            .unwrap()
+            .render_request(&moved_run_options());
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let mut old = render(&old_frozen, "token-a", "account");
+        let mut new = render(
+            &new_frozen,
+            "token-b",
+            "00000000-0000-4000-8000-00000000000b",
+        );
+        assert_ne!(old["metadata"]["user_id"], new["metadata"]["user_id"]);
+        assert_eq!(
+            new["metadata"]["user_id"],
+            broca_provider::claude_code_persona::metadata_user_id(
+                &new_persona.device_id,
+                new_persona.account_uuid.as_deref(),
+                &new_persona.session_id,
+            )
+        );
+        // The billing block differs in the prompt id and the signature over the body.
+        let billing =
+            |body: &serde_json::Value| body["system"][0]["text"].as_str().unwrap().to_owned();
+        let (old_billing, new_billing) = (billing(&old), billing(&new));
+        let cch = |text: &str| {
+            let at = text.find("cch=").unwrap() + 4;
+            text[at..at + 5].to_owned()
+        };
+        let unsigned = |text: &str, prompt: &str| {
+            text.replace(&cch(text), "<cch>")
+                .replace(prompt, "<prompt>")
+        };
+        assert_eq!(
+            unsigned(&old_billing, old_persona.prompt_id.as_deref().unwrap()),
+            unsigned(&new_billing, new_persona.prompt_id.as_deref().unwrap()),
+        );
+        assert!(new_billing.contains(new_persona.prompt_id.as_deref().unwrap()));
+        for body in [&mut old, &mut new] {
+            body["metadata"]["user_id"] = serde_json::Value::Null;
+            body["system"][0]["text"] = serde_json::Value::Null;
+        }
+        assert_eq!(old, new);
     }
 
     #[test]

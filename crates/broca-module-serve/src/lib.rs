@@ -46,6 +46,7 @@ pub mod manifest;
 pub mod opencode_go_identity;
 pub mod provider_overrides;
 pub mod refusal_fallback_config;
+pub mod routing_capabilities;
 pub mod run_routing;
 mod scope_workdir;
 pub mod send_audit;

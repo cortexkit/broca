@@ -175,6 +175,25 @@ fn frame_len(len: usize) -> u32 {
     u32::try_from(len).expect("a frame's length fits in 32 bits")
 }
 
+/// The length of the first frame in `bytes`, read from its own length field, when `bytes` holds
+/// at least that field. A log's first frame is its checkpoint.
+pub fn first_frame_len(bytes: &[u8]) -> Option<u32> {
+    let length = bytes.get(..4)?;
+    u32::from_le_bytes(length.try_into().expect("four bytes")).checked_add(4)
+}
+
+/// Whether a read of a log, from offset `start`, that returned `bytes` out of a log `log_len`
+/// bytes long read only the log's checkpoint frame: it started at 0, it holds exactly the length
+/// the first frame records, and the log goes on past it. A read that reaches the log's end, or
+/// holds more than the first frame, is a read of the log, so a whole-log read never counts as
+/// one. For backends that count their reads in tests and measurements.
+#[doc(hidden)]
+pub fn reads_checkpoint_frame_only(start: u64, bytes: &[u8], log_len: u64) -> bool {
+    start == 0
+        && first_frame_len(bytes).is_some_and(|len| len as usize == bytes.len())
+        && (bytes.len() as u64) < log_len
+}
+
 /// Encodes the frames of one log. It holds the log's position (frame index, length, sync claim,
 /// next seq and each stream's last record) but does no I/O, so any backend can write what it
 /// encodes. An encoded append changes nothing until [`written`](Self::written) reports that it

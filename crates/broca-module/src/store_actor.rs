@@ -136,18 +136,21 @@ pub struct StoreActor<B: SessionBackend> {
     /// The media of the send whose run is starting, held until the run's start that places its
     /// messages is appended, which stores them first (see `HeldInputMedia`).
     held: broca_session_loop::HeldInputMedia,
-    /// The session's media fold, built when its first run starts and kept for the actor's life,
-    /// so each run renders its media from where the last one left off (see `store_media`).
-    media_fold: Option<crate::store_media::MediaFold>,
+    /// The session's image index, kept for the actor's life: every write's media events are
+    /// applied to it before the write is answered, and each run renders its media from it (see
+    /// `store_media`).
+    media: crate::store_media::SessionIndex,
     /// Handles on the session's storage that only read, which a run reads its media objects
     /// through while the actor writes. Without them a run that renders media refuses.
     readers: Option<Arc<dyn Fn() -> B + Send + Sync>>,
-    /// The media fold being built from the session's records, off the actor, which keeps
-    /// answering commands meanwhile.
-    media_build: Option<JoinHandle<Box<crate::store_media::MediaFold>>>,
-    /// The run waiting for the media fold, which gets its media once the fold is ready.
-    media_waiting: Option<oneshot::Sender<crate::store_media::StoreRunMedia>>,
-    /// Holds each media fold build until notified, so a test can act while one is building.
+    /// The one-time build of the session's image index from its records, off the actor, which
+    /// keeps answering commands meanwhile: what the records handed over, or why they can't be
+    /// read.
+    media_build: Option<JoinHandle<MediaHistory>>,
+    /// The run waiting for the image index, which gets its media once the index is built.
+    media_waiting: Option<oneshot::Sender<crate::store_media::RunMedia>>,
+    /// Holds each build of the image index until notified, so a test can act while one is
+    /// building.
     #[cfg(test)]
     media_build_gate: Option<Arc<tokio::sync::Notify>>,
     /// The module's registry, once the actor serves in one: what a warm reads the session's
@@ -357,7 +360,7 @@ enum Event {
     Command(Option<LineageCmd>),
     Request(Option<broca_session_loop::shared::Request>),
     Done(Result<StoreRunEnd, tokio::task::JoinError>),
-    MediaBuilt(Result<Box<crate::store_media::MediaFold>, tokio::task::JoinError>),
+    MediaBuilt(Result<MediaHistory, tokio::task::JoinError>),
     /// A warm's task ended.
     Warmed(
         Result<Result<broca_core::WarmSent, crate::executor::WarmError>, tokio::task::JoinError>,
@@ -384,10 +387,14 @@ async fn kept_warm(warming: &mut Option<keep_warm::RunWarming>) -> Box<keep_warm
     }
 }
 
-/// The media fold build's end, or never when none is building.
+/// What a build of the session's image index read from its records: everything they handed over
+/// through the build's seq, or why they couldn't be read.
+type MediaHistory = Result<broca_session_store::fold::media::MediaFeed, String>;
+
+/// The image index build's end, or never when none is building.
 async fn media_built(
-    build: &mut Option<JoinHandle<Box<crate::store_media::MediaFold>>>,
-) -> Result<Box<crate::store_media::MediaFold>, tokio::task::JoinError> {
+    build: &mut Option<JoinHandle<MediaHistory>>,
+) -> Result<MediaHistory, tokio::task::JoinError> {
     match build {
         Some(build) => build.await,
         None => std::future::pending().await,
@@ -401,6 +408,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         executor: Arc<dyn RunExecutor>,
         parts: Box<dyn Parts>,
     ) -> Self {
+        let media = crate::store_media::SessionIndex::new::<B, B>(&session, None);
         Self {
             key,
             session,
@@ -426,7 +434,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             settled: None,
             uploads: None,
             held: broca_session_loop::HeldInputMedia::default(),
-            media_fold: None,
+            media,
             readers: None,
             media_build: None,
             media_waiting: None,
@@ -566,6 +574,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// makes: handles on the session's storage that only read.
     pub fn with_readers(mut self, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
         self.readers = Some(Arc::clone(&readers));
+        self.media = self.fresh_media_index();
         self.fanout = Some(crate::store_fanout::StoreFanout::new(
             &mut self.session,
             readers,
@@ -573,7 +582,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self
     }
 
-    /// Holds each build of the session's media fold until `gate` is notified.
+    /// Holds each build of the session's image index until `gate` is notified, and has the open
+    /// build the index from the session's records, as one finding no saved index does, so a test
+    /// can act while a run waits for its media.
     #[cfg(test)]
     pub(crate) fn with_media_build_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
         self.media_build_gate = Some(gate);
@@ -589,6 +600,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         gate: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.readers = Some(Arc::clone(&readers));
+        self.media = self.fresh_media_index();
         self.fanout = Some(crate::store_fanout::StoreFanout::held(
             &mut self.session,
             readers,
@@ -981,6 +993,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let never = CancellationToken::new();
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
+        // The session feeds its media from before its first write here.
+        self.media_open().await;
         self.recover().await;
         self.retire_recovery();
         if !self
@@ -1002,6 +1016,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let clock = self.retention_clock.clone().unwrap_or_default();
         let mut clock_changes = clock.subscribe();
         loop {
+            // What the last event's writes handed over, before anything else reads the index.
+            self.absorb_media();
             let expiry_deadline = retention
                 .deadline(
                     &self.session,
@@ -1165,6 +1181,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves one write the active run asks for.
     async fn serve_request(&mut self, request: broca_session_loop::shared::Request) {
+        if let broca_session_loop::shared::Request::CachePredecessor { reply } = request {
+            let _ = reply.send(self.cache_predecessor().await);
+            return;
+        }
         // A seal's own deletions come due a grace period after it, but earlier ones may be due.
         let seals = matches!(request, broca_session_loop::shared::Request::Seal { .. });
         let active = self
@@ -1176,7 +1196,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             session: &mut self.session,
             // A result's media is stored with the result that names it.
             tool_media: &active.tool_media,
-            fold: self.media_fold.as_mut(),
+            index: &mut self.media,
             parts: &parts,
         };
         let mut writer = broca_session_loop::durable::Durable {
@@ -1241,6 +1261,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// queue then starts is left for the command loop.
     async fn run_current_to_end(&mut self) {
         loop {
+            self.absorb_media();
             let Some(active) = self.run.as_mut() else {
                 return;
             };
@@ -1684,6 +1705,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             return false;
                         }
                     }
+                }
+                // A session compacted under the first compaction protocol moved read-only: its
+                // reads are served, and the new run loop can't continue it, so a new send is
+                // refused by name before anything is written.
+                if self.session.conversation().first_protocol_compaction
+                    || self.session.operations().first_protocol_compaction
+                {
+                    let _ = reply.send(SendOutcome::NotServedOnNewStorage {
+                        feature: FIRST_PROTOCOL_COMPACTION,
+                    });
+                    return false;
                 }
                 if let Some(what) = unserved_request(
                     kind,
@@ -2300,38 +2332,87 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         });
     }
 
-    /// Where a run starting now gets what it renders its media from (see `store_media`). Once
-    /// the session's media fold exists, it is brought up to the session's last record and sent
-    /// at once. The first time, it is built from the session's first record, off the actor: the
-    /// run waits for it before its first model call, while the actor keeps answering commands.
+    /// Where a run starting now gets what it renders its media from (see `store_media`): the
+    /// session's image index, sent at once when it applied everything the session handed over.
+    /// When the open found no saved index to start from, it is built once from the session's
+    /// records, off the actor: the run waits for it before its first model call, while the
+    /// actor keeps answering commands.
     async fn run_media(&mut self) -> crate::store_media::StoreRunMediaWait {
+        self.media_open().await;
+        self.absorb_media();
         let (sender, wait) = oneshot::channel();
         // Only the starting run waits: an earlier run that waited has ended.
         self.media_waiting = Some(sender);
-        if self.media_fold.is_none() && self.media_build.is_none() {
+        if self.media_build.is_none() {
             self.build_media();
         }
-        self.deliver_media().await;
+        self.deliver_media();
         wait
     }
 
-    /// Starts building the session's media fold from its records, read over a handle of its
-    /// own, on a blocking thread.
+    /// Starts feeding the session's media to its index, once: from the saved index and what the
+    /// open log's records after it handed over (see `SessionIndex::open`).
+    async fn media_open(&mut self) {
+        if self.media.opened() {
+            return;
+        }
+        let timing = broca_session_store::metrics::Phase::MediaFold.start();
+        let parts = self.parts.clone();
+        self.media.open(&mut self.session, &parts).await;
+        #[cfg(test)]
+        if self.media_build_gate.is_some() {
+            let last = self.session.next_seq().saturating_sub(1);
+            self.media.build_from_records(last);
+        }
+        let addr = broca_core::session_addr(&self.key);
+        timing.finish_with(move || Some(addr));
+    }
+
+    /// A new image index for the session as it stands, reading media objects over the actor's
+    /// readers when it has them; not yet fed (see [`StoreActor::media_open`]).
+    fn fresh_media_index(&self) -> crate::store_media::SessionIndex {
+        match &self.readers {
+            Some(readers) => crate::store_media::SessionIndex::new(&self.session, Some(readers())),
+            None => crate::store_media::SessionIndex::new::<B, B>(&self.session, None),
+        }
+    }
+
+    /// Starts the session's image index again, after the session was replaced by another
+    /// history (an import published over it): what the old one held or was building is dropped.
+    pub(super) async fn reopen_media(&mut self) {
+        self.media_build = None;
+        self.media = self.fresh_media_index();
+        self.media_open().await;
+    }
+
+    /// Applies to the session's index what the session's writes handed over since it last did.
+    fn absorb_media(&mut self) {
+        let parts = self.parts.clone();
+        self.media.absorb(&mut self.session, &parts);
+    }
+
+    /// Starts building the session's image index from its records, read over a handle of its
+    /// own, on a blocking thread, when it waits for that build.
     fn build_media(&mut self) {
-        let key = self.key.clone();
+        let Some(through) = self.media.start_build() else {
+            return;
+        };
         let Some(readers) = &self.readers else {
-            let fold = crate::store_media::MediaFold::new(key);
-            fold.stop(
-                "the session's records can't be read apart from its writer, so its media fold \
-                 can't be built"
-                    .into(),
+            let last = self.session.next_seq().saturating_sub(1);
+            let parts = self.parts.clone();
+            self.media.built(
+                Err(
+                    "the session's records can't be read apart from its writer, so its media \
+                     index can't be built"
+                        .into(),
+                ),
+                last,
+                &parts,
             );
-            self.media_fold = Some(fold);
             return;
         };
         let records = self.session.stored_records(readers());
-        let last = self.session.next_seq().saturating_sub(1);
-        let parts = self.parts.clone();
+        let key = self.key.clone();
         #[cfg(test)]
         let gate = self.media_build_gate.clone();
         self.media_build = Some(tokio::task::spawn_blocking(move || {
@@ -2342,50 +2423,41 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             if let Some(gate) = gate {
                 futures::executor::block_on(gate.notified());
             }
-            let mut fold = crate::store_media::MediaFold::new(key);
-            if last > 0 {
-                match futures::executor::block_on(records.records_between(1, last)) {
-                    Ok(records) => fold.take(&records, &parts),
-                    Err(error) => fold.stop(format!(
-                        "the session's media fold couldn't read its records: {error:?}"
-                    )),
-                }
-            }
-            Box::new(fold)
+            futures::executor::block_on(records.media_history(through)).map_err(|error| {
+                format!("the session's media index couldn't be built from its records: {error:?}")
+            })
         }));
     }
 
-    /// Takes in the media fold a build ended with, and sends the waiting run its media.
-    async fn media_built(
-        &mut self,
-        built: Result<Box<crate::store_media::MediaFold>, tokio::task::JoinError>,
-    ) {
+    /// Takes in what a build of the image index read, then what the session handed over
+    /// meanwhile, and sends the waiting run its media.
+    async fn media_built(&mut self, built: Result<MediaHistory, tokio::task::JoinError>) {
         self.media_build = None;
-        let fold = built.map(|fold| *fold).unwrap_or_else(|error| {
-            let fold = crate::store_media::MediaFold::new(self.key.clone());
-            fold.stop(format!("the session's media fold failed: {error}"));
-            fold
+        if built.as_ref().is_err_and(|error| error.is_cancelled()) {
+            // Teardown is not a media failure. Keep the run waiting for its media rather
+            // than delivering a permanent failure that could end it or refuse its send.
+            self.stopping = true;
+            return;
+        }
+        let history = built.unwrap_or_else(|error| {
+            Err(format!("the session's media index build failed: {error}"))
         });
-        self.media_fold = Some(fold);
-        self.deliver_media().await;
+        let last = self.session.next_seq().saturating_sub(1);
+        let parts = self.parts.clone();
+        self.media.built(history, last, &parts);
+        self.absorb_media();
+        self.deliver_media();
     }
 
-    /// Sends the waiting run its media, once the session's media fold exists: brought up to the
-    /// session's last record, including what the run appended while the fold was building.
-    async fn deliver_media(&mut self) {
-        let Some(fold) = self.media_fold.as_mut() else {
+    /// Sends the waiting run its media, once the session's index applied everything the
+    /// session handed over.
+    fn deliver_media(&mut self) {
+        if !self.media.ready() {
             return;
-        };
-        let Some(waiting) = self.media_waiting.take() else {
-            return;
-        };
-        let parts = self.parts.clone();
-        fold.catch_up(&self.session, &parts).await;
-        let bytes = self
-            .readers
-            .as_ref()
-            .map(|readers| fold.bytes(self.session.media_objects(readers())));
-        let _ = waiting.send(fold.for_run(bytes));
+        }
+        if let Some(waiting) = self.media_waiting.take() {
+            let _ = waiting.send(self.media.for_run());
+        }
     }
 
     /// Recovers the session's unfinished work on opening it, before any command, as today's
@@ -3209,6 +3281,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// the next queued send. A drained run refused at admission ends its queued send with the
     /// refusal, as today's actor ends it, and the next one is tried.
     async fn finish_run(&mut self, end: Result<StoreRunEnd, tokio::task::JoinError>) {
+        if end.as_ref().is_err_and(|error| error.is_cancelled()) {
+            // Runtime teardown can cancel the task before its actor stops polling. Leave the
+            // run and queued sends untouched for crash recovery, not permanently failed.
+            // A panic still follows the failure path below: the runner itself failed, and
+            // ending that run lets later sends proceed.
+            self.stopping = true;
+            if let Some(reply) = self.run.take().and_then(|active| active.admitting) {
+                let _ = reply.send(SendOutcome::Transient(
+                    "the run's task stopped before its start was written".into(),
+                ));
+            }
+            return;
+        }
         // A warm the run's keep-warm sent before the run ended is recorded, even when its record
         // arrived with the run's end.
         while let Some(record) = self
@@ -3225,7 +3310,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // Whatever the run's start stored of its send's media is the session's now; a run that
         // never wrote its start leaves nothing for the next one.
         self.held.clear();
-        // A run task that panicked or was aborted says nothing about whether the send could be
+        // A run task that panicked says nothing about whether the send could be
         // admitted, so its answer below stays unclassified.
         let task_failed = end.is_err();
         let result = match end {
@@ -3260,15 +3345,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .as_ref()
             .and_then(|run| run.start.as_ref())
             .is_some_and(|start| start.run_id == active.run_id.0);
-        // A run whose loop failed after its start wrote no end. Left so, the session would hold
+        // A run whose execution failed after its start wrote no end. Left so, the session would hold
         // a run nothing runs: no queued send drains behind it, and a new send's run is refused.
-        // It ends here with the error instead, unless it paused, which a later retry resumes.
+        // It ends here with the error instead. A paused run keeps waiting when admission
+        // fails temporarily: dependencies can recover before the next resume trigger. Only
+        // a permanent refusal makes an existing pause unserviceable by the same request.
         let loop_failed = match &result {
-            Err(StoreRunError::Loop(error)) if started => {
+            Err(error) if started && restart_error.is_none() && !active.account_limit_resume => {
                 let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
-                    run.run_id == active.run_id.0 && run.finished.is_none() && run.paused.is_none()
+                    run.run_id == active.run_id.0
+                        && run.finished.is_none()
+                        && (run.paused.is_none()
+                            || matches!(error, StoreRunError::Admission(error)
+                                if error.admission_error_class() == broca_protocol::ErrorClass::Permanent))
                 });
-                unfinished.then(|| format!("{error:?}"))
+                unfinished.then(|| match error {
+                    StoreRunError::Loop(error) => format!("{error:?}"),
+                    StoreRunError::Admission(error) => error.to_string(),
+                })
             }
             _ => None,
         };
@@ -3322,7 +3416,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     session = %self.key.session,
                     run_id = %active.run_id.0,
                     error = ?error,
-                    "a run on the new storage stopped without a recorded end",
+                    "run execution failed on the new storage",
                 );
             }
         }
@@ -3393,6 +3487,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             message,
             provider_code: Some("runner_error".into()),
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             status: None,
@@ -3403,6 +3498,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let now = (self.now_ms)();
         if let Err(error) = broca_session_loop::run::end_run_with_error(
@@ -3821,10 +3917,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             selection: broca_session_loop::plan::recorded_selection(&manifest),
         });
         match self.append_own(record).await {
-            Ok(()) => SessionRefreshOutcome::Accepted {
-                run_in_progress,
-                applies_from_next_run,
-            },
+            Ok(()) => {
+                if manifest
+                    .plan
+                    .as_json_text()
+                    .parse::<serde_json::Value>()
+                    .ok()
+                    .is_some_and(|plan| plan.get("readers").is_some())
+                {
+                    if let Some(fanout) = &self.fanout {
+                        fanout.recheck_read_access();
+                    }
+                }
+                SessionRefreshOutcome::Accepted {
+                    run_in_progress,
+                    applies_from_next_run,
+                }
+            }
             Err(error) => SessionRefreshOutcome::Error(error),
         }
     }
@@ -3913,11 +4022,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(run_start) = run.and_then(|run| run.start.as_ref()) else {
             return SendOutcome::Transient("the running run has no start yet".into());
         };
-        // This reads the run's start: a refreeze (`ConfigRefrozen`, `AuthRefrozen`) is written
-        // only when a paused run resumes, which this actor doesn't do.
+        // The settings a steer must match are the run's start's, except the account: a running
+        // run's `AuthRefrozen` (a move to another account at a quota wall, or a resume on the
+        // account routing gave it) replaces the start's, so a steer's auth pin is checked against
+        // the account the run sends on now.
         let frozen = match broca_session_loop::run::admission_of_start(run_start, &self.parts) {
             Ok(frozen) => frozen,
             Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        };
+        let current_auth = match run
+            .map(|run| broca_session_loop::account_move::current_auth_selection(run, &self.parts))
+        {
+            Some(Ok(selection)) => selection,
+            Some(Err(error)) => return SendOutcome::Error(format!("{error:?}")),
+            None => frozen.auth_selection.clone(),
         };
         let settings = crate::actor::SteerFrozen {
             model: &frozen.model,
@@ -3925,7 +4043,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             generation: &frozen.generation,
             stop_when: &frozen.stop_when,
             directives: frozen.directives.as_deref(),
-            auth_selection: frozen.auth_selection.as_ref(),
+            auth_selection: current_auth.as_ref(),
         };
         if let Some(field) =
             crate::actor::steer_settings_conflict(&start.request, settings, stop_sequences_named)
@@ -4369,6 +4487,22 @@ pub fn unserved_creating_send(
         .or_else(|| carries_media(request).then_some("a send carrying media"))
 }
 
+/// The feature a send to a session compacted under the first compaction protocol is refused
+/// for: the session moved to the new storage read-only.
+pub(crate) const FIRST_PROTOCOL_COMPACTION: &str = "first_protocol_compaction";
+
+/// The message of a send refused because it asks the new storage for `feature`, which it
+/// doesn't serve: a creating send's feature ([`unserved_on_creation`]), or a send continuing a
+/// session compacted under the first compaction protocol.
+pub(crate) fn unserved_message(feature: &str) -> String {
+    if feature == FIRST_PROTOCOL_COMPACTION {
+        return "this session was compacted under the first compaction protocol, which the new \
+                storage reads but can't continue; start a new session"
+            .into();
+    }
+    unserved_on_creation(feature)
+}
+
 /// The message of a head refused because its creating send asks for `feature`, which the new
 /// storage doesn't serve on a creating send (see [`unserved_creating_send`]).
 pub(crate) fn unserved_on_creation(feature: &str) -> String {
@@ -4592,7 +4726,11 @@ mod service_tier;
 mod warm;
 
 #[cfg(test)]
+mod account_move_tests;
+#[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod cancellation_tests;
 #[cfg(test)]
 mod class_tests;
 #[cfg(test)]

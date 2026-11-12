@@ -16,6 +16,7 @@ pub fn scoped_error(max_bytes: u64, scope: SizeScope) -> ProviderError {
     };
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         class: ErrorClass::Permanent,
         message: format!("{subject} log cannot exceed {max_bytes} bytes"),
@@ -29,6 +30,7 @@ pub fn scoped_error(max_bytes: u64, scope: SizeScope) -> ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

@@ -5653,6 +5653,7 @@ pub(crate) mod projection_boundary_tests {
                     run_id: RunId("r2".into()),
                     error: ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -5666,6 +5667,7 @@ pub(crate) mod projection_boundary_tests {
                         account_ref: None,
                         credential_id: None,
                         affordable_max_tokens: None,
+                        account_continue: None,
                     },
                 }),
             },
@@ -5684,6 +5686,7 @@ pub(crate) mod projection_boundary_tests {
     fn reconciled_failed_retraction_carries_its_error() {
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -5697,6 +5700,7 @@ pub(crate) mod projection_boundary_tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let records = [WalRecord::Retracted {
             submission_id: SubmissionId("sub-r2".into()),

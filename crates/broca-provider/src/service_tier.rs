@@ -272,6 +272,7 @@ pub fn classify_tier_refusal(
     };
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -288,6 +289,7 @@ pub fn classify_tier_refusal(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -547,6 +549,7 @@ mod tests {
     ) -> ProviderError {
         let original = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -560,6 +563,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         classify_tier_refusal(
             family,
@@ -661,6 +665,7 @@ mod tests {
         const CAPTURED: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode."},"request_id":"req_011CfQqPwHCYLA9161tYEBSn"}"#;
         let busy = |body: &str| ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -674,6 +679,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let refused = classify_tier_refusal(
             WireFamilyId::AnthropicMessages,
@@ -749,6 +755,7 @@ mod tests {
         }
         let untouched = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -762,6 +769,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         assert_eq!(
             classify_tier_refusal(

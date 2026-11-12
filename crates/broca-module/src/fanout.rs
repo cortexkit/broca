@@ -146,6 +146,8 @@ fn project_control(records: &[broca_wal::FramedRecord]) -> Vec<ControlEvent> {
 /// Display lag is signalled in-band by a `DisplayGap` event, not a detach.
 #[derive(Debug, Clone)]
 pub enum Delivery {
+    /// Internal wake-up: recheck this subscriber's admission without emitting a wire event.
+    AdmissionChanged,
     CursorExpired,
     Expired {
         expired_at_ms: u64,
@@ -2129,6 +2131,7 @@ mod tests {
                 run_id: RunId("r2".into()),
                 error: ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
@@ -2142,6 +2145,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
             }),
         }
@@ -3251,7 +3255,7 @@ mod tests {
                 {
                     break
                 }
-                Delivery::Control(_) | Delivery::Display(_) => {}
+                Delivery::Control(_) | Delivery::Display(_) | Delivery::AdmissionChanged => {}
                 Delivery::Error(error) => panic!("replay failed: {error}"),
                 Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
@@ -3288,7 +3292,7 @@ mod tests {
                         break *final_step_finish_reason;
                     }
                 }
-                Delivery::Display(_) => {}
+                Delivery::Display(_) | Delivery::AdmissionChanged => {}
                 Delivery::Error(error) => panic!("live delivery failed: {error}"),
                 Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),

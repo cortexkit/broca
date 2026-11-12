@@ -145,6 +145,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     provider_code: Some("account_limit_resume_refused".into()),
                     status: None,
                     retry_after_secs: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     resets_at_ms: None,
@@ -153,6 +154,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                     provider_details: None,
                 };
                 self.write_interrupted_seal_with_error(None, SealCause::CrashOrphan, Some(refusal))

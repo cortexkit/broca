@@ -266,6 +266,7 @@ pub enum Send {
 pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
     broca_protocol::ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Permanent,
@@ -279,6 +280,7 @@ pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -968,6 +970,10 @@ pub async fn apply_boundary<W: Writer, P, T>(
 /// renders from the run's stored prompt, `stored`, brought up to date for the step. `opts`
 /// carries the request's settings; its own prompt is left empty. `rendered` keeps what the
 /// run's renders rendered of each entry, for the next to reuse.
+///
+/// `moved_from` is set when the step is prepared again after the run moved to another account
+/// inside it: the run's last accepted request was sent under that admission, so the ride
+/// compares the current account with its account, and names the change.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     writer: &mut W,
@@ -978,6 +984,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     opts: broca_protocol::request::CallOptions,
     stored: &mut prompt::KeptPrompt,
     rendered: &v2::render::RenderCache,
+    moved_from: Option<&Admission>,
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
     let stored = stored.stored(&transcript.sealed);
@@ -999,7 +1006,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         Err(message) => return Ok(Send::Unavailable(message)),
     };
     let current = v2::host::context_of(&frozen(admission), admission.manifest.as_deref());
-    let previous = previous(writer, admission, ctx)?;
+    let previous = previous(writer, moved_from.unwrap_or(admission), ctx)?;
     let history = writer
         .operations()
         .estimate

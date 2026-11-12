@@ -191,12 +191,13 @@ impl LiveMedia {
     }
 }
 
-fn refusal(code: &str, message: String) -> Box<ProviderError> {
+pub(super) fn refusal(code: &str, message: String) -> Box<ProviderError> {
     Box::new(ProviderError {
         class: ErrorClass::Permanent,
         message,
         provider_code: Some(code.into()),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,
@@ -207,5 +208,6 @@ fn refusal(code: &str, message: String) -> Box<ProviderError> {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     })
 }

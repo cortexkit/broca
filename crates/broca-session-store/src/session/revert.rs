@@ -373,6 +373,12 @@ impl<B: SessionBackend> Session<B> {
         ledger.push((reverted_seq, reverted.clone()));
         let mut settled = self.operations.clone();
         settled.open_change = None;
+        // The undo's cut, folded into the media fold the new log starts from. It names no saved
+        // index: the engine's state after the cut isn't the store's to compute.
+        let (mut media, media_replaced) = self.media_commit();
+        media.fold(reverted_seq, &reverted, &self.conversation, &settled);
+        media.flush();
+        media.after_revert(reverted_seq);
         settled
             .apply(&reverted)
             .map_err(|e| SessionError::Fold(format!("operations: {e:?}")))?;
@@ -434,12 +440,14 @@ impl<B: SessionBackend> Session<B> {
             transcript_base: base,
             ledger_base: Some(reverted_seq),
             activity_ms: None,
+            media: media.member(),
         }
         .encode();
         let ledger_sealed = self
             .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
             .await?;
-        let replaced = ledger_sealed.replaced;
+        let mut replaced = ledger_sealed.replaced;
+        replaced.extend(media_replaced);
 
         let mut encoder = LogEncoder::new(
             key.clone(),
@@ -493,6 +501,7 @@ impl<B: SessionBackend> Session<B> {
         let mut operations = settled;
         for (offset, record) in resend.iter().enumerate() {
             let seq = first + offset as u64;
+            media.fold(seq, record, &conversation, &operations);
             apply(&mut conversation, &mut operations, seq, record).map_err(SessionError::Fold)?;
             window.note(seq, record);
         }
@@ -502,6 +511,7 @@ impl<B: SessionBackend> Session<B> {
                 conversation.placed
             )));
         }
+        media.flush();
         let encoded = encoder.batch(resend)?;
         let mut open_ids = OpenIds::new(idindex::hash_key(&self.key));
         for ((offset, record), place) in resend
@@ -546,6 +556,7 @@ impl<B: SessionBackend> Session<B> {
             history_version: Some(history_version),
             abandoned,
             cold_since_ms: None,
+            media: Some(media),
         })
     }
 }

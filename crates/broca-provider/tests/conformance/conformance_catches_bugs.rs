@@ -56,6 +56,7 @@ fn frozen() -> FrozenRenderConfig {
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
+        moonshot_schema_types: false,
         media: None,
         refusal_fallback: None,
         ride_placement: None,

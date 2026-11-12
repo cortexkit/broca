@@ -13,6 +13,7 @@ fn an_empty_checkpoint_round_trips() {
         transcript_base: None,
         ledger_base: None,
         activity_ms: None,
+        media: None,
     };
     let bytes = checkpoint.encode();
     let decoded = Checkpoint::decode(&bytes).unwrap();

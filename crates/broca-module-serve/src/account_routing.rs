@@ -289,6 +289,9 @@ pub type RoutingReply = Result<Result<Vec<u8>, Vec<u8>>, String>;
 /// Error frame's body, and `Err(cause)` means no reply arrived.
 #[async_trait::async_trait]
 pub trait RoutingTransport: Send + Sync {
+    async fn capability(&self, _name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        crate::routing_capabilities::CapabilitySupport::Unknown
+    }
     async fn service_tier_supported(&self) -> Result<bool, String> {
         Ok(false)
     }
@@ -299,6 +302,20 @@ pub trait RoutingTransport: Send + Sync {
         Ok(false)
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply;
+    /// [`Self::request`], sent only to a routing module known to declare every capability in
+    /// `names`; `None` when it doesn't, and then nothing was sent. A transport that can reach
+    /// another registration of routing between the check and the send checks again against the
+    /// route the request actually goes out on.
+    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+        for name in names {
+            if self.capability(name).await
+                != crate::routing_capabilities::CapabilitySupport::Declared
+            {
+                return None;
+            }
+        }
+        Some(self.request(body).await)
+    }
 }
 
 enum RouteSlot {
@@ -403,9 +420,13 @@ pub struct SubcRoutingTransport {
     resolved_module: Arc<Mutex<Option<String>>>,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
-    capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
+    capability_reader: crate::routing_capabilities::RoutingCapabilities,
     #[cfg(test)]
     stale_opens_for_test: std::sync::atomic::AtomicUsize,
+    /// Closes the route a capability-checked request is about to go out on, so a test can make
+    /// it stale between the check and the send.
+    #[cfg(test)]
+    stale_before_checked_send_for_test: std::sync::atomic::AtomicBool,
 }
 
 impl SubcRoutingTransport {
@@ -420,9 +441,11 @@ impl SubcRoutingTransport {
             resolved_module: Arc::new(Mutex::new(None)),
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
-            capabilities: tokio::sync::Mutex::new(None),
+            capability_reader: Default::default(),
             #[cfg(test)]
             stale_opens_for_test: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            stale_before_checked_send_for_test: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -491,6 +514,25 @@ impl SubcRoutingTransport {
         }
     }
 
+    pub(crate) fn capability_route_is_open(&self, route: broca_subc::RouteHandle) -> bool {
+        self.conn.route_is_open(&route)
+    }
+
+    pub(crate) async fn describe_for_capabilities(
+        &self,
+    ) -> Result<(broca_subc::RouteHandle, Result<Vec<u8>, Vec<u8>>), String> {
+        let route = self.route().await?;
+        if !self.conn.route_is_open(&route) {
+            self.forget(route);
+        }
+        self.request_on_cached_route(
+            serde_json::to_vec(&json!({"method":"role.describe","params":{}}))
+                .expect("describe JSON"),
+            |error| error.to_string(),
+        )
+        .await
+    }
+
     async fn request_on_cached_route(
         &self,
         body: Vec<u8>,
@@ -520,60 +562,102 @@ impl SubcRoutingTransport {
             })?;
         Ok((route, reply))
     }
-
-    async fn supports(&self, capability: &str) -> Result<bool, String> {
-        let route = self.route().await?;
-        let mut cached = self.capabilities.lock().await;
-        if let Some((known, capabilities)) = cached.as_ref() {
-            if *known == route {
-                return Ok(capabilities.iter().any(|name| name == capability));
-            }
-        }
-        let (route, response) = self
-            .request_on_cached_route(
-                serde_json::to_vec(&json!({"method":"role.describe","params":{}}))
-                    .expect("describe JSON"),
-                |error| error.to_string(),
-            )
-            .await?;
-        let capabilities = match response {
-            Ok(body) => serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|value| value["result"]["capabilities"].as_array().cloned())
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|name| name.as_str().map(str::to_owned))
-                .collect::<Vec<_>>(),
-            Err(_) => vec![],
-        };
-        let supported = capabilities.iter().any(|name| name == capability);
-        *cached = Some((route, capabilities));
-        Ok(supported)
-    }
 }
 
 #[async_trait::async_trait]
 impl RoutingTransport for SubcRoutingTransport {
+    async fn capability(&self, name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        self.capability_reader.read(self, name).await
+    }
     async fn service_tier_supported(&self) -> Result<bool, String> {
-        self.supports("service_tier").await
+        self.capability("service_tier")
+            .await
+            .into_result("service_tier")
     }
     async fn observe_backoff_supported(&self) -> Result<bool, String> {
-        self.supports("observe_backoff").await
+        self.capability("observe_backoff")
+            .await
+            .into_result("observe_backoff")
     }
     async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
-        self.supports("observe_credential_refused").await
+        self.capability("observe_credential_refused")
+            .await
+            .into_result("observe_credential_refused")
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
-        self.request_on_cached_route(body, |error| {
-            format!(
-                "routing module '{}': {error}",
-                self.module_id
-                    .as_deref()
-                    .unwrap_or(cortexkit_role_routing::PROVIDES)
-            )
-        })
-        .await
-        .map(|(_, reply)| reply)
+        self.request_on_cached_route(body, |error| self.request_error(error))
+            .await
+            .map(|(_, reply)| reply)
+    }
+
+    /// A stale route is reopened once, as for any request, and the reopened route may reach a
+    /// re-registered routing module that declares other capabilities. Its description is read
+    /// again (a closed route drops the cached one) before the request is sent there.
+    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+        let declared = || async {
+            for name in names {
+                if self.capability(name).await
+                    != crate::routing_capabilities::CapabilitySupport::Declared
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        if !declared().await {
+            return None;
+        }
+        let route = match self.route().await {
+            Ok(route) => route,
+            Err(error) => return Some(Err(error)),
+        };
+        #[cfg(test)]
+        if self
+            .stale_before_checked_send_for_test
+            .swap(false, Ordering::SeqCst)
+        {
+            self.conn
+                .route_close(&route)
+                .await
+                .expect("close test route");
+        }
+        match self.conn.route_request_terminal(&route, body.clone()).await {
+            Ok(reply) => return Some(Ok(reply)),
+            Err(error) => {
+                self.forget(route);
+                if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
+                    return Some(Err(self.request_error(error)));
+                }
+            }
+        }
+        // A stale handle fails before the request frame is built, so nothing was delivered.
+        if !declared().await {
+            return None;
+        }
+        let route = match self.route().await {
+            Ok(route) => route,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(
+            self.conn
+                .route_request_terminal(&route, body)
+                .await
+                .map_err(|error| {
+                    self.forget(route);
+                    self.request_error(error)
+                }),
+        )
+    }
+}
+
+impl SubcRoutingTransport {
+    fn request_error(&self, error: broca_subc::ConnError) -> String {
+        format!(
+            "routing module '{}': {error}",
+            self.module_id
+                .as_deref()
+                .unwrap_or(cortexkit_role_routing::PROVIDES)
+        )
     }
 }
 
@@ -708,6 +792,13 @@ fn classify_account_for_reply_at(
                     ))
                 }
             };
+            // The daemon's own answer for a route it couldn't serve, not routing's refusal.
+            if is_message_plane_code(&error.code) {
+                return AccountForOutcome::Unreachable(format!(
+                    "the route answered {}, not routing",
+                    error.code
+                ));
+            }
             // Routing's message names which of its checks refused; broca keeps no other copy.
             tracing::info!(
                 target: "accounts",
@@ -1264,6 +1355,11 @@ impl RoutingClient {
 
     pub fn config(&self) -> &AccountSelectionConfig {
         &self.config
+    }
+
+    /// Read an optional routing group without treating discovery failure as absence.
+    pub async fn capability(&self, name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        self.transport.capability(name).await
     }
 
     /// Ask routing for an account, giving up at `deadline`.
@@ -1841,6 +1937,25 @@ pub fn admission_started_body(event_id: &str, admission_id: &str, run_id: &str) 
     Value::Object(body)
 }
 
+/// `admission_started` again, after the run moved to another account at a quota wall: the same
+/// admission and run, now on the offered credential and account. Routing takes it as the offer
+/// being used.
+pub fn admission_moved_body(
+    event_id: &str,
+    admission_id: &str,
+    run_id: &str,
+    credential_id: &str,
+    served_account_id: Option<&str>,
+) -> Value {
+    let mut body = report("admission_started", event_id, admission_id);
+    body.insert("run_id".into(), json!(run_id));
+    body.insert("credential_id".into(), json!(credential_id));
+    if let Some(account) = served_account_id {
+        body.insert("served_account_id".into(), json!(account));
+    }
+    Value::Object(body)
+}
+
 /// Whether an attempt ended before any status line arrived.
 fn attempt_reached_no_upstream(attempt: &ModelAttempt) -> bool {
     attempt.http_status.is_none()
@@ -1856,6 +1971,36 @@ pub fn attempt_body(
     attempt: &ModelAttempt,
     view_digest: Option<&str>,
 ) -> Value {
+    attempt_body_on(event_id, admission_id, attempt, view_digest, None)
+}
+
+/// The credential and account an attempt was sent on, as an attempt observation names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedOn {
+    pub credential_id: String,
+    pub account: Option<String>,
+}
+
+/// [`attempt_body`], naming the credential and account the attempt was sent on when `served`
+/// gives them. Routing reads them as the account that served the attempt. After a move at a
+/// quota wall that is how it learns which account the run uses even when the report of the move
+/// itself was lost.
+pub fn attempt_body_on(
+    event_id: &str,
+    admission_id: &str,
+    attempt: &ModelAttempt,
+    view_digest: Option<&str>,
+    served: Option<&ServedOn>,
+) -> Value {
+    let named = |mut body: serde_json::Map<String, Value>| {
+        if let Some(served) = served {
+            body.insert("credential_id".into(), json!(served.credential_id));
+            if let Some(account) = &served.account {
+                body.insert("served_account_id".into(), json!(account));
+            }
+        }
+        Value::Object(body)
+    };
     let observation = &attempt.account_observation;
     let headers = &observation.ratelimit_headers;
     if let Some(limit) = &observation.limit {
@@ -1874,13 +2019,13 @@ pub fn attempt_body(
             body.insert("upstream_origin".into(), json!("upstream"));
             body.insert("headers".into(), json!(headers));
         }
-        return Value::Object(body);
+        return named(body);
     }
     let mut body = report("attempt", event_id, admission_id);
     body.insert("upstream_origin".into(), json!("upstream"));
     if attempt_reached_no_upstream(attempt) {
         body.insert("terminal_reason".into(), json!("transport_failure"));
-        return Value::Object(body);
+        return named(body);
     }
     body.insert("observed_at_ms".into(), json!(attempt.ts_ms));
     if let Some(view_digest) = view_digest {
@@ -1889,7 +2034,7 @@ pub fn attempt_body(
     if !headers.is_empty() {
         body.insert("headers".into(), json!(headers));
     }
-    Value::Object(body)
+    named(body)
 }
 
 /// `run_finished`: the run's terminal is durable. Carries the latest rate-limit headers the
@@ -1954,6 +2099,7 @@ enum ReportEvent {
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         attempt: Box<ModelAttempt>,
+        served: Option<ServedOn>,
     },
     Finished {
         lineage: Option<WalLineageId>,
@@ -1970,6 +2116,12 @@ enum ReportEvent {
         wal_seq: u64,
         credential_id: Option<String>,
         provider_code: Option<String>,
+    },
+    Moved {
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        credential_id: String,
+        account: Option<String>,
     },
 }
 
@@ -2040,6 +2192,7 @@ impl RunReporter {
     ) -> Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
+            let mut view_digest = view_digest;
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
             let mut last_failed_attempt_at_ms: Option<u64> = None;
             while let Some(event) = rx.recv().await {
@@ -2104,6 +2257,7 @@ impl RunReporter {
                         lineage,
                         wal_seq,
                         attempt,
+                        served,
                     } => {
                         last_failed_attempt_at_ms = None;
                         if !attempt.account_observation.ratelimit_headers.is_empty() {
@@ -2151,13 +2305,40 @@ impl RunReporter {
                         .then_some(attempt.account_observation.failure_received_at_ms)
                         .flatten();
                         client
-                            .observe(attempt_body(
+                            .observe(attempt_body_on(
                                 &id,
                                 &admission_id,
                                 &attempt,
                                 view_digest.as_deref(),
+                                served.as_ref(),
                             ))
                             .await;
+                    }
+                    ReportEvent::Moved {
+                        lineage,
+                        wal_seq,
+                        credential_id,
+                        account,
+                    } => {
+                        // What the run saw on the account it left is not the new account's: the
+                        // run's end reports only rate-limit headers seen after the move, and
+                        // attempts on the new account name no listing digest, since its
+                        // credential was offered by routing, not chosen from a listing here.
+                        latest_headers = None;
+                        view_digest = None;
+                        if let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        {
+                            client
+                                .observe(admission_moved_body(
+                                    &id,
+                                    &admission_id,
+                                    &run_id,
+                                    &credential_id,
+                                    account.as_deref(),
+                                ))
+                                .await;
+                        }
                     }
                     ReportEvent::Finished {
                         lineage,
@@ -2191,6 +2372,23 @@ impl RunReporter {
             lineage,
             wal_seq,
             reason,
+        });
+    }
+
+    /// The run moved, at a quota wall, to the account routing offered; the record naming it, at
+    /// `wal_seq`, is durable. Queued once, behind the refused attempt's report and ahead of any
+    /// attempt on the new account, and sent once: routing counts it as the offer being used.
+    pub fn moved(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        selection: &broca_wal::AuthSelection,
+    ) {
+        let _ = self.tx.send(ReportEvent::Moved {
+            lineage,
+            wal_seq,
+            credential_id: selection.credential_id.clone(),
+            account: selection.account_ref.clone(),
         });
     }
 
@@ -2265,6 +2463,34 @@ impl broca_core::AccountReporter for RunReporter {
             lineage,
             wal_seq,
             attempt: Box::new(attempt.clone()),
+            served: None,
+        });
+    }
+}
+
+impl RunReporter {
+    /// An attempt's record, at `wal_seq`, sent on the credential `selection` names. The report
+    /// names that credential and the account that served the attempt: the one the attempt's own
+    /// record names, else the selection's.
+    pub fn attempt_recorded_on(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        attempt: &ModelAttempt,
+        selection: Option<&broca_wal::AuthSelection>,
+    ) {
+        let served = selection.map(|selection| ServedOn {
+            credential_id: selection.credential_id.clone(),
+            account: attempt
+                .served_account_ref
+                .clone()
+                .or_else(|| selection.account_ref.clone()),
+        });
+        let _ = self.tx.send(ReportEvent::Attempt {
+            lineage,
+            wal_seq,
+            attempt: Box::new(attempt.clone()),
+            served,
         });
     }
 }
@@ -2420,6 +2646,204 @@ impl ListingCache {
             .as_ref()
             .map(|(listing, at)| (Arc::clone(listing), at.elapsed() >= LISTING_MAX_AGE))
     }
+}
+
+/// What a continue request came to, as the run acts on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContinueOutcome {
+    /// Routing answered with an offer, a hold or a refusal. A routing error body (an
+    /// `invalid_request`, say) reads as a refusal under the error's code.
+    Answered(cortexkit_role_routing::account_continue::ContinueAnswer),
+    /// Routing doesn't serve continuation, or that couldn't be told: nothing was sent.
+    NotDeclared,
+    /// No usable answer: a failed route or a reply broca can't read.
+    Unreachable(String),
+    /// No answer before the budget ran out.
+    NoAnswerWithinBudget,
+}
+
+/// The continue request for a wall, in routing's types: the run, its original admission and
+/// conversation key, the decision the run uses now, and the exhausted account with the evidence
+/// of the refused attempt's own record. `None` when the run's selection lacks what routing needs
+/// to find the run (an admission id, a conversation key, a decision id).
+pub fn continue_request(
+    wall: &broca_session_loop::account_move::Wall<'_>,
+) -> Option<cortexkit_role_routing::account_continue::ContinueRequest> {
+    use cortexkit_role_routing::account_continue::{ContinueRequest, ExhaustedAccount};
+    let decision = wall.selection.account_decision.as_ref()?;
+    let mut exhausted = ExhaustedAccount::new(
+        wall.credential_id,
+        wall.account,
+        wall.limit_window,
+        wall.observed_at_ms,
+    );
+    if let Some(resets_at_ms) = wall.resets_at_ms {
+        exhausted = exhausted.with_resets_at_ms(resets_at_ms);
+    }
+    if let Some(retry_after_s) = wall.retry_after_s {
+        exhausted = exhausted.with_retry_after_s(retry_after_s);
+    }
+    Some(ContinueRequest::new(
+        wall.run_id,
+        decision.admission_id.as_deref()?,
+        decision.conversation_key.as_deref()?,
+        decision.decision_id.as_deref()?,
+        exhausted,
+        continue_selection_id(wall),
+    ))
+}
+
+/// The `selection_id` of a continue request: derived from the run, the step and the refused
+/// attempt's record, so it names this wall and is the same for every transport retry of one
+/// question, and from whether this is the wall's second question (asked after an offer lapsed),
+/// which routing must check afresh. 32 hex digits keep it far inside routing's length bound.
+pub fn continue_selection_id(wall: &broca_session_loop::account_move::Wall<'_>) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(
+        format!(
+            "broca-account-continue-v1\0{}\0{}\0{}\0{}",
+            wall.run_id,
+            wall.step_id,
+            wall.attempt_seq,
+            u8::from(wall.reask)
+        )
+        .as_bytes(),
+    );
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("wall-{hex}")
+}
+
+impl RoutingClient {
+    /// [`Self::account_continue`], asked only when routing serves continuation: it is known to
+    /// declare both `account_continue` and `account_continue_resume`. An unknown description,
+    /// or one that doesn't arrive by `deadline`, counts as no, and then nothing is sent.
+    pub async fn account_continue_if_served(
+        &self,
+        request: &cortexkit_role_routing::account_continue::ContinueRequest,
+        deadline: tokio::time::Instant,
+    ) -> ContinueOutcome {
+        let serves =
+            tokio::time::timeout_at(deadline, self.answers_moved_runs_with_current_account())
+                .await
+                .unwrap_or(false);
+        self.account_continue(serves, request, deadline).await
+    }
+
+    /// Asks routing for another account for a run whose account spent its usage window, by
+    /// `route.account_for` with `mode: "continue"`, over the same route as an admission, giving up
+    /// at `deadline`. `routing_serves_continuation` is true only when routing declares both
+    /// `account_continue` and `account_continue_resume` (unknown counts as false); otherwise
+    /// nothing is sent.
+    pub async fn account_continue(
+        &self,
+        routing_serves_continuation: bool,
+        request: &cortexkit_role_routing::account_continue::ContinueRequest,
+        deadline: tokio::time::Instant,
+    ) -> ContinueOutcome {
+        if !routing_serves_continuation {
+            self.counters.bump("continue_not_declared");
+            return ContinueOutcome::NotDeclared;
+        }
+        let body = match serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": request }))
+        {
+            Ok(body) => body,
+            Err(error) => return ContinueOutcome::Unreachable(format!("encode request: {error}")),
+        };
+        // Sent only where routing declares both capabilities, checked again on the route the
+        // request goes out on.
+        let sent = self.transport.request_where_declared(
+            body,
+            &[
+                cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
+                crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+            ],
+        );
+        let outcome = match tokio::time::timeout_at(deadline, sent).await {
+            Err(_) => ContinueOutcome::NoAnswerWithinBudget,
+            Ok(None) => ContinueOutcome::NotDeclared,
+            Ok(Some(Err(cause))) => ContinueOutcome::Unreachable(cause),
+            Ok(Some(Ok(reply))) => classify_continue_reply(reply),
+        };
+        self.counters.bump(match &outcome {
+            ContinueOutcome::Answered(_) => "continue_answered",
+            ContinueOutcome::NotDeclared => "continue_not_declared",
+            ContinueOutcome::Unreachable(_) => "continue_unreachable",
+            ContinueOutcome::NoAnswerWithinBudget => "continue_no_answer_within_budget",
+        });
+        outcome
+    }
+}
+
+/// Reads one continue reply: `result` is the tagged answer. An error body under one of the
+/// codes routing's contract names for its own refusals (`RefusalCode`) is routing refusing the
+/// question, read as a refusal under that code. Any other error body says routing wasn't reached
+/// or can't be read, so it is `Unreachable`: no move, and no routing answer on the run's error.
+/// Such bodies are written by the daemon for a route it couldn't serve (`target_unavailable`,
+/// `module_warming`, `unknown_module`), by broca when it finds no single routing provider
+/// (`routing_unavailable`, `routing_ambiguous`), or carry a code this build doesn't know.
+pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutcome {
+    use cortexkit_role_routing::account_continue::{ContinueAnswer, ContinueRefusal};
+    match reply {
+        Ok(body) => {
+            #[derive(Deserialize)]
+            struct Response {
+                result: ContinueAnswer,
+            }
+            match serde_json::from_slice::<Response>(&body) {
+                Ok(response) => ContinueOutcome::Answered(response.result),
+                Err(error) => {
+                    ContinueOutcome::Unreachable(format!("continue answer did not decode: {error}"))
+                }
+            }
+        }
+        Err(body) => match serde_json::from_slice::<ErrorBodyView>(&body) {
+            Ok(error) if is_routing_refusal(&error.code) => {
+                ContinueOutcome::Answered(ContinueAnswer::Refuse(ContinueRefusal::new(
+                    error.code,
+                    error.detail.unwrap_or(Value::Null),
+                )))
+            }
+            Ok(error) => ContinueOutcome::Unreachable(format!(
+                "the continue question was answered {} by the route, not by routing",
+                error.code
+            )),
+            Err(decode) => {
+                ContinueOutcome::Unreachable(format!("error reply is not an error body: {decode}"))
+            }
+        },
+    }
+}
+
+/// The codes a route's error frame carries when the daemon (or broca's own side of the route)
+/// answered instead of routing: the target is warming, reloading, gone or timed out, the
+/// channel or route epoch is unknown, or no single routing provider is listed. Such a reply
+/// says routing wasn't reached, never what routing decided. Any other code is routing's.
+const MESSAGE_PLANE_CODES: [&str; 11] = [
+    "module_warming",
+    "module_reloading",
+    "target_unavailable",
+    "module_timeout",
+    "unknown_channel",
+    "stale_route_epoch",
+    "unknown_module",
+    "module_removed",
+    "module_no_protocol",
+    "routing_unavailable",
+    "routing_ambiguous",
+];
+
+fn is_message_plane_code(code: &str) -> bool {
+    MESSAGE_PLANE_CODES.contains(&code)
+}
+
+/// Whether an error body's `code` is routing's own refusal: a code routing's contract names,
+/// other than the two a consumer answers for itself when it can't find routing at all.
+fn is_routing_refusal(code: &str) -> bool {
+    use cortexkit_role_routing::errors::{RefusalCode, CONSUMER_CODES};
+    RefusalCode::parse(code).is_known() && !CONSUMER_CODES.contains(&code)
 }
 
 #[cfg(test)]

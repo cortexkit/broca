@@ -501,6 +501,7 @@ mod tests {
     fn unavailable_error() -> ProviderError {
         ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::ProviderUnavailable,
@@ -514,6 +515,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }
     }
 
@@ -580,6 +582,7 @@ mod tests {
             for raw in [
                 ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class,
@@ -593,9 +596,11 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
                 ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class,
@@ -609,6 +614,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
             ] {
                 assert_eq!(

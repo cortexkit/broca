@@ -196,6 +196,7 @@ pub(super) fn first_log_checkpoint(head: &Head) -> Checkpoint {
         transcript_base: None,
         ledger_base: None,
         activity_ms: None,
+        media: None,
     }
 }
 
@@ -234,7 +235,7 @@ impl<B: SessionBackend> Session<B> {
 }
 
 impl<R: SessionBackend> StoredRecords<R> {
-    fn place(&self) -> Place<'_, R> {
+    pub(super) fn place(&self) -> Place<'_, R> {
         Place {
             backend: &self.backend,
             addr: &self.addr,

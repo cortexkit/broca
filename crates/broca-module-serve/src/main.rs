@@ -1354,14 +1354,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                     engine
                         .run_live(
                             runtime.deployment(),
-                            Some(runtime.as_ref()),
+                            Some(&runtime),
                             Some(registry.as_ref()),
                         )
                         .await?;
                     engine
                         .run_background(
                             runtime.deployment(),
-                            runtime.as_ref(),
+                            &runtime,
                             registry.as_ref(),
                             Duration::from_millis(250),
                         )
@@ -2282,7 +2282,7 @@ mod executor {
         /// The credential needs re-auth (authoritative, before any provider call): admit the
         /// run then pause it for re-auth (carrying this error), making NO provider call. The
         /// run is resumable under the same id once the user re-auths.
-        PauseForReauth(ProviderError),
+        PauseForReauth(Box<ProviderError>),
         /// Fail admission permanently (no RunStarted, no ghost run) because retrying cannot
         /// repair the credential configuration.
         FailAdmission(String),
@@ -2298,8 +2298,9 @@ mod executor {
     pub fn vault_outcome_to_decision(result: Result<VaultToken, VaultError>) -> AuthDecision {
         match result {
             Ok(token) => AuthDecision::Proceed(AuthMode::Secret(token.token)),
-            Err(VaultError::NeedsReauth) => AuthDecision::PauseForReauth(ProviderError {
+            Err(VaultError::NeedsReauth) => AuthDecision::PauseForReauth(Box::new(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -2315,7 +2316,8 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
-            }),
+                account_continue: None,
+            })),
             Err(e @ VaultError::Transport(_)) => AuthDecision::FailAdmissionTransient(format!(
                 "credentials service unreachable (transient — retry): {e}"
             )),
@@ -2731,6 +2733,13 @@ mod executor {
         run_id: broca_protocol::RunId,
         config: broca_wal::RunConfig,
         idle: bool,
+        /// The run moved to another account at a quota wall: its config names the account it
+        /// moved to. Only a run in the new storage moves.
+        moved: bool,
+        /// The run is paused where its resume can durably record a change of account: for a
+        /// sign-in or for a restart. Its resume writes the account and the config that names it
+        /// before it calls the provider. Any other resume continues on the account it recorded.
+        records_account_change: bool,
     }
 
     fn prior_run_view_from_checkpoint(
@@ -2743,6 +2752,8 @@ mod executor {
                 run_id: episode.run_id.clone(),
                 config: episode.config.clone(),
                 idle: episode.disposition == broca_core::EpisodeDisposition::Finished,
+                moved: false,
+                records_account_change: false,
             })
     }
 
@@ -2761,6 +2772,11 @@ mod executor {
         /// Whether the session is kept in the new session storage, whose fresh runs may be
         /// selected for a probe placement of rides (see `broca_module_serve::experiments`).
         new_storage: bool,
+        /// For a run moving to another account at a quota wall: the account routing offered,
+        /// which the run is admitted to in place of asking routing (see `AccountMoves`).
+        continue_offer: Option<&'a AccountChoice>,
+        /// Whether routing serves continuation (see `resume_asks_routing`).
+        routing_serves_continuation: bool,
     }
 
     /// What a run's admission reads from the session's history.
@@ -2911,6 +2927,8 @@ mod executor {
             // The actor's in-flight step, which `run.status` serves for its active run.
             step_progress: control.step_progress.clone(),
             model_call_ready: None,
+            pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
+            account_continue: None,
         }
     }
 
@@ -2923,11 +2941,100 @@ mod executor {
         head_seq: u64,
     }
 
-    fn store_history(
+    /// The config a store session's latest run is read with for the next admission.
+    ///
+    /// An unfinished run is resumed under what it froze, refreezes included: in particular a
+    /// run that moved to another account at a quota wall resumes on the account it moved to,
+    /// with that account's render config. A resume never asks routing (only a fresh run does,
+    /// see `choose_account_for_episode`), and routing would today answer a moved run's admission
+    /// with its original decision, the account at its wall; so the recorded selection is the
+    /// one to resume on. A finished run is read from its start, as before, because a fresh
+    /// run inherits from it.
+    fn store_prior_config(
+        run: &broca_session_store::fold::operations::Run,
+        start: &broca_session_store::record::RunStart,
+        parts: &dyn broca_session_loop::parts::Parts,
+    ) -> Result<broca_wal::RunConfig, broca_session_loop::LoopError> {
+        if run.finished.is_none() {
+            broca_session_loop::run::run_config_of_run(run, parts)
+        } else {
+            broca_session_loop::run::run_config_of_start(start, parts)
+        }
+    }
+
+    /// Whether a resumed run asks routing for its account again. A run that never moved resumes
+    /// on the account it froze without asking, as every resume does. A run that moved to another
+    /// account at a quota wall asks only when routing serves continuation: then routing answers a
+    /// moved run's repeated admission with the run's current account. Any other router answers
+    /// with the run's original decision, the account at its wall, so the run keeps the account
+    /// from its own record. `routing_serves_continuation` is true only when routing declares
+    /// `account_continue_resume` and `account_continue`; unknown counts as false.
+    ///
+    /// Only a resume that can record a change of account asks (`records_account_change`: a
+    /// sign-in or restart pause), since a resume that sent on another account without recording
+    /// it would bill and report the old one. A run waiting on a held tool call, a plain resume
+    /// after a crash, and a timed pause on its account's limit (which may only continue on its
+    /// own account) keep the account they recorded.
+    fn resume_asks_routing(
+        moved: bool,
+        records_account_change: bool,
+        routing_serves_continuation: bool,
+    ) -> bool {
+        moved && records_account_change && routing_serves_continuation
+    }
+
+    /// What a resume that asked routing for its account goes on with. Only an account routing
+    /// chose (`AccountChoice::Routed`) is a usable answer. Anything else (no answer in the
+    /// budget, routing unreachable, a hold, a refusal, a conflict, every candidate needing a
+    /// sign-in, or a static pick when selection is off or one candidate is listed) leaves a moved
+    /// run's resume on the account and decision it recorded, as a resume that doesn't ask:
+    /// when broca can't tell which account routing holds the run on, it keeps the one it wrote
+    /// down. The usual sign-in and account checks then apply to that account. `resume_asks` is
+    /// cleared then, so nothing after this follows an account routing didn't give. A choice no
+    /// resume asked for passes unchanged.
+    fn resumed_choice(
+        chosen: Result<AccountChoice, RunError>,
+        resume_asks: &mut bool,
+        run_id: &broca_protocol::RunId,
+    ) -> Result<AccountChoice, RunError> {
+        match chosen {
+            Ok(routed @ AccountChoice::Routed { .. }) => Ok(routed),
+            unusable if *resume_asks => {
+                let answer = match &unusable {
+                    Ok(AccountChoice::AuthRequired(_)) => "every candidate needs a sign-in".into(),
+                    Ok(AccountChoice::Static(_)) => "a static pick, not routing's choice".into(),
+                    Ok(_) => "no choice".into(),
+                    Err(error) => error.to_string(),
+                };
+                tracing::warn!(
+                    target: "accounts",
+                    run_id = %run_id.0,
+                    answer = %answer,
+                    "routing gave the resumed run no account; it keeps the account it recorded"
+                );
+                *resume_asks = false;
+                Ok(AccountChoice::NotApplicable)
+            }
+            chosen => chosen,
+        }
+    }
+
+    async fn store_history(
         writer: &broca_session_loop::shared::ActorWriter,
         parts: &dyn broca_session_loop::parts::Parts,
     ) -> Result<StoreHistory, broca_session_loop::LoopError> {
         use broca_session_loop::writer::Writer as _;
+        // A refreeze of the account marks a move at a quota wall only when no resume wrote it
+        // (see `moved_at_a_wall`). An unfinished run's records are all in the open log; one that
+        // can't be read counts as no move, so the run keeps the account it recorded.
+        let moved = match writer.operations().run.as_ref() {
+            Some(run) if run.refrozen_auth.is_some() && run.finished.is_none() => {
+                writer.open_log_records().await.is_ok_and(|records| {
+                    broca_session_loop::account_move::moved_at_a_wall(&run.run_id, &records)
+                })
+            }
+            _ => false,
+        };
         let prior_run = match writer.operations().run.as_ref() {
             Some(run) => {
                 let start = run.start.as_ref().ok_or_else(|| {
@@ -2938,8 +3045,11 @@ mod executor {
                 })?;
                 Some(PriorRunView {
                     run_id: broca_protocol::RunId(run.run_id.clone()),
-                    config: broca_session_loop::run::run_config_of_start(start, parts)?,
+                    config: store_prior_config(run, start, parts)?,
                     idle: run.finished.is_some(),
+                    moved,
+                    records_account_change:
+                        broca_session_loop::account_move::resume_can_record_account_change(run),
                 })
             }
             None => None,
@@ -3011,6 +3121,344 @@ mod executor {
         ) {
             broca_core::AccountReporter::attempt_recorded(&*self.0, None, seq, attempt);
         }
+
+        fn attempt_recorded_on(
+            &self,
+            _event_id: &str,
+            seq: u64,
+            attempt: &broca_protocol::ModelAttempt,
+            selection: Option<&broca_core::AuthSelection>,
+        ) {
+            self.0.attempt_recorded_on(None, seq, attempt, selection);
+        }
+
+        fn account_moved(&self, _event_id: &str, seq: u64, selection: &broca_core::AuthSelection) {
+            self.0.moved(None, seq, selection);
+        }
+    }
+
+    /// What a run that moved reports at its end in place of what it was admitted with: the
+    /// credential it sends on now and the token version and refresher the vault served for it.
+    struct MovedCredential {
+        selection: broca_core::AuthSelection,
+        record_version: Option<u64>,
+        in_run_refresh: Option<InRunRefresh>,
+    }
+
+    /// A store run's moves to another account at a quota wall (see
+    /// `broca_session_loop::account_move`). It asks routing with `mode: "continue"`, and admits
+    /// the offered account the way a resume of the run on that account would be admitted: the
+    /// offered credential read from the vault and checked to belong to the offered account, and
+    /// a provider built from the run's recorded render config, with the Claude Code persona, when
+    /// the config has one, refrozen for the new account.
+    struct AccountMoves<'a, W> {
+        executor: &'a LiveLoopExecutor<W>,
+        req: &'a broca_core::RunRequest,
+        auth: &'a Option<broca_protocol::AuthRequest>,
+        clock: Option<&'a broca_core::Clock>,
+        /// The media renderer the run's provider was given, which the new provider needs too.
+        media: Option<Arc<broca_module::store_media::LazyRenderer>>,
+        /// The end of each wall's budget, by the refused attempt's seq: a second question at the
+        /// same wall shares the first one's budget.
+        deadlines: std::sync::Mutex<HashMap<u64, tokio::time::Instant>>,
+        /// The credentials of moves prepared but not yet durable, and of the newest durable one.
+        prepared: std::sync::Mutex<Vec<MovedCredential>>,
+        adopted: std::sync::Mutex<Option<MovedCredential>>,
+    }
+
+    impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
+        fn new(
+            executor: &'a LiveLoopExecutor<W>,
+            req: &'a broca_core::RunRequest,
+            auth: &'a Option<broca_protocol::AuthRequest>,
+            clock: Option<&'a broca_core::Clock>,
+            media: Option<Arc<broca_module::store_media::LazyRenderer>>,
+        ) -> Self {
+            Self {
+                executor,
+                req,
+                auth,
+                clock,
+                media,
+                deadlines: Default::default(),
+                prepared: Default::default(),
+                adopted: Default::default(),
+            }
+        }
+
+        /// The credential of the run's newest durable move, if it moved.
+        fn moved(&self) -> Option<MovedCredential> {
+            self.adopted.lock().unwrap().take()
+        }
+
+        /// Routing's answer at `wall`, read as the loop acts on it, and the offer if there is
+        /// one to admit.
+        async fn offer(
+            &self,
+            wall: &broca_session_loop::account_move::Wall<'_>,
+        ) -> Result<
+            cortexkit_role_routing::account_continue::ContinueOffer,
+            Option<broca_protocol::error::AccountContinueAnswer>,
+        > {
+            use broca_module_serve::account_routing::{ContinueOutcome, ADMISSION_BUDGET};
+            use cortexkit_role_routing::account_continue::ContinueAnswer;
+            let Some(routing) = self.executor.routing.as_ref() else {
+                return Err(None);
+            };
+            let Some(request) = broca_module_serve::account_routing::continue_request(wall) else {
+                tracing::warn!(
+                    target: "accounts",
+                    run_id = wall.run_id,
+                    "the run's selection lacks the admission, conversation key or decision \
+                     routing knows it by; it does not ask to move at its quota wall"
+                );
+                return Err(None);
+            };
+            let deadline = *self
+                .deadlines
+                .lock()
+                .unwrap()
+                .entry(wall.attempt_seq)
+                .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
+            let answer = match routing.account_continue_if_served(&request, deadline).await {
+                ContinueOutcome::Answered(answer) => answer,
+                ContinueOutcome::NotDeclared => return Err(None),
+                outcome => {
+                    tracing::warn!(
+                        target: "accounts",
+                        run_id = wall.run_id,
+                        ?outcome,
+                        "routing gave no answer to the run's continue request at its quota wall"
+                    );
+                    return Err(None);
+                }
+            };
+            match answer {
+                ContinueAnswer::Offer(offer) => Ok(offer),
+                ContinueAnswer::Hold(hold) => {
+                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                        routing_code: hold.routing_code,
+                        until_ms: hold.until_ms,
+                    }))
+                }
+                ContinueAnswer::Refuse(refusal) => {
+                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                        routing_code: refusal.routing_code,
+                        until_ms: None,
+                    }))
+                }
+                _ => Err(None),
+            }
+        }
+
+        /// The run's recorded config with the offered account in place of the walled one: the
+        /// selection names the offered credential and account under the offer's decision, and a
+        /// Claude Code persona, which the request body carries, is refrozen for that account.
+        /// The persona keeps its version, session id, pinned `cc_version` suffix and prompt
+        /// ordinal; its device id and account id are the new account's, and its prompt id is
+        /// new, as a fresh run on that account would freeze them.
+        fn moved_config(
+            &self,
+            wall: &broca_session_loop::account_move::Wall<'_>,
+            offer: &cortexkit_role_routing::account_continue::ContinueOffer,
+            decision: &broca_core::AccountDecision,
+        ) -> Result<broca_wal::RunConfig, String> {
+            let mut config = wall.run_config.clone();
+            config.auth_selection = Some(broca_core::AuthSelection {
+                credential_id: offer.credential_id.clone(),
+                account_ref: Some(offer.account.clone()),
+                resolved_credential_id: Some(offer.credential_id.clone()),
+                vault_request: None,
+                account_decision: Some(decision.clone()),
+                auth_method: wall.selection.auth_method.clone(),
+                billing_vault_facts: None,
+            });
+            let recorded = config
+                .frozen_render_config
+                .get("claude_code_persona")
+                .filter(|persona| !persona.is_null())
+                .cloned();
+            if let Some(recorded) = recorded {
+                let persona: broca_provider::wire::ClaudeCodePersona =
+                    serde_json::from_value(recorded)
+                        .map_err(|error| format!("the recorded persona doesn't decode: {error}"))?;
+                let install_id = self
+                    .executor
+                    .claude_code_install_id
+                    .as_deref()
+                    .ok_or("no installation id to derive the new account's persona from")?;
+                let persona = broca_module_serve::claude_code_identity::moved_persona(
+                    &persona,
+                    install_id,
+                    Some(&offer.account),
+                    &offer.credential_id,
+                    &self.req.session,
+                )
+                .map_err(|error| format!("the new account's persona: {error}"))?;
+                refreeze_persona(
+                    &mut config.frozen_render_config,
+                    serde_json::to_value(&persona)
+                        .map_err(|error| format!("the new account's persona: {error}"))?,
+                );
+            }
+            Ok(config)
+        }
+    }
+
+    #[async_trait]
+    impl<W: ExecutorWalStore + 'static>
+        broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provider::Provider>>
+        for AccountMoves<'_, W>
+    {
+        async fn ask(
+            &self,
+            wall: &broca_session_loop::account_move::Wall<'_>,
+        ) -> broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>
+        {
+            use broca_session_loop::account_move::{Answer, Move};
+            let offer = match self.offer(wall).await {
+                Ok(offer) => offer,
+                Err(answer) => return Answer::Stay(answer),
+            };
+            let refuse = |reason: &str| {
+                tracing::warn!(
+                    target: "accounts",
+                    run_id = wall.run_id,
+                    step_id = wall.step_id,
+                    offered = %offer.account,
+                    "routing offered an account at a quota wall, and the run does not take it: \
+                     {reason}"
+                );
+                Answer::Stay(None)
+            };
+            // The loop checks the reservation just before it writes the move, and asks again
+            // once if it lapsed; an account that refused this step is never offered usefully.
+            if wall.refused_accounts.contains(&offer.account) {
+                return refuse("the offered account already refused this step");
+            }
+            let method = wall
+                .selection
+                .auth_method
+                .as_deref()
+                .and_then(AuthMethod::from_token)
+                .or_else(|| {
+                    broca_module_serve::auth_routing::CredentialId::parse(
+                        &wall.selection.credential_id,
+                    )
+                    .map(|id| id.method)
+                });
+            let (Some(method), Some(previous)) = (method, wall.selection.account_decision.as_ref())
+            else {
+                return refuse("the run's credential names no auth method");
+            };
+            let decision = broca_core::AccountDecision {
+                decision_id: Some(offer.decision_id.clone()),
+                ..previous.clone()
+            };
+            let config = match self.moved_config(wall, &offer, &decision) {
+                Ok(config) => config,
+                Err(error) => return refuse(&error),
+            };
+            let choice = AccountChoice::Routed {
+                account_id: offer.account.clone(),
+                credential_id: offer.credential_id.clone(),
+                method,
+                decision,
+                // The listing digest of the run's first choice isn't kept; routing names the
+                // offer by its decision instead.
+                view_digest: String::new(),
+                service_tier_chosen: None,
+            };
+            let history = EpisodeHistory {
+                prior_run: Some(PriorRunView {
+                    run_id: self.req.run_id.clone(),
+                    config: config.clone(),
+                    idle: false,
+                    moved: true,
+                    records_account_change: false,
+                }),
+                last_config: Some(&config),
+                head_seq: 0,
+                persona: PersonaHistory::Store {
+                    first_user: None,
+                    first_user_sealed: false,
+                    human_prompts: 0,
+                },
+            };
+            let mut queued_service_tier = None;
+            let admitted = self
+                .executor
+                .admit_episode(
+                    EpisodeJob {
+                        req: self.req,
+                        kind: RunKind::FreshOrResume,
+                        auth: self.auth,
+                        conversation_key: &None,
+                        queued_service_tier: &mut queued_service_tier,
+                        media_profile: &None,
+                        clock: self.clock,
+                        // Only a run in the new session storage moves.
+                        new_storage: true,
+                        continue_offer: Some(&choice),
+                        // The offer is the account: the moved config already names it, so
+                        // the resume rule that would ask routing again doesn't apply.
+                        routing_serves_continuation: false,
+                    },
+                    &history,
+                )
+                .await;
+            // The vault refusing the credential, or serving it for another account than the
+            // offer names, ends here: nothing is sent on an account routing didn't offer.
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(error) => return refuse(&format!("its credential wasn't admitted: {error}")),
+            };
+            let selection = match admitted.resolution.selection.clone() {
+                Some(selection)
+                    if !admitted.fresh_episode
+                        && admitted.resolution.pause.is_none()
+                        && admitted.routing_decision_error.is_none()
+                        && selection.account_ref.as_deref() == Some(offer.account.as_str()) =>
+                {
+                    selection
+                }
+                _ => return refuse("its credential isn't usable for the offered account"),
+            };
+            let provider = admitted.resolved.provider;
+            provider
+                .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
+            if let Some(media) = &self.media {
+                provider.set_media_request_renderer(media.renderer());
+            }
+            let blob = provider.render_config_blob();
+            let renderer_version = provider.renderer_version();
+            let render = (blob != wall.run_config.frozen_render_config
+                || renderer_version != wall.run_config.renderer_version)
+                .then_some((renderer_version, blob));
+            self.prepared.lock().unwrap().push(MovedCredential {
+                selection: selection.clone(),
+                record_version: admitted.resolution.record_version,
+                in_run_refresh: admitted.resolution.in_run_refresh,
+            });
+            Answer::Move(Box::new(Move {
+                selection,
+                account: offer.account,
+                valid_until_ms: offer.valid_until_ms,
+                render,
+                provider,
+            }))
+        }
+
+        fn adopted(&self, selection: &broca_core::AuthSelection) {
+            let mut prepared = self.prepared.lock().unwrap();
+            if let Some(position) = prepared
+                .iter()
+                .position(|moved| moved.selection == *selection)
+            {
+                *self.adopted.lock().unwrap() = Some(prepared.swap_remove(position));
+            }
+            prepared.clear();
+        }
     }
 
     fn frozen_render_config(
@@ -3045,6 +3493,67 @@ mod executor {
     }
 
     /// Decode the whole admission bundle so upstream routing changes cannot move a resumed run.
+    /// Refreezes `frozen`'s Claude Code persona for the account `selection` names, when that
+    /// differs from `previous_account`, the account the run last ran on (see
+    /// `claude_code_identity::moved_persona`). A config without a persona, or a selection on the
+    /// same account, is left as it is.
+    fn persona_for_resumed_account(
+        frozen: &mut broca_provider::wire::FrozenRenderConfig,
+        install_id: Option<&str>,
+        previous_account: Option<&str>,
+        selection: Option<&broca_core::AuthSelection>,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<(), String> {
+        let (Some(persona), Some(selection)) = (frozen.claude_code_persona.as_ref(), selection)
+        else {
+            return Ok(());
+        };
+        let account = selection.account_ref.as_deref();
+        if account.is_none() || account == previous_account {
+            return Ok(());
+        }
+        let install_id =
+            install_id.ok_or("no installation id to derive the new account's persona from")?;
+        let moved = broca_module_serve::claude_code_identity::moved_persona(
+            persona,
+            install_id,
+            account,
+            &selection.credential_id,
+            session,
+        )
+        .map_err(|error| format!("the resumed account's persona: {error}"))?;
+        // The refusal-fallback model's config carries the same persona as the source, so a step
+        // re-sent there after the change names the new account too.
+        if let Some(fallback) = frozen.refusal_fallback.as_mut() {
+            if fallback.frozen.claude_code_persona.is_some() {
+                fallback.frozen.claude_code_persona = Some(moved.clone());
+            }
+        }
+        frozen.claude_code_persona = Some(moved);
+        Ok(())
+    }
+
+    /// Puts `persona`, refrozen for another account, in a recorded render config: the config's
+    /// own `claude_code_persona`, and its refusal-fallback model's
+    /// (`refusal_fallback.frozen.claude_code_persona`) when that carries one, since the fallback
+    /// renders with the same persona as the source. Every other byte of the config is kept.
+    fn refreeze_persona(render_config: &mut serde_json::Value, persona: serde_json::Value) {
+        const PERSONA: &str = "claude_code_persona";
+        if let Some(fallback) = render_config
+            .get_mut("refusal_fallback")
+            .and_then(|fallback| fallback.get_mut("frozen"))
+            .and_then(serde_json::Value::as_object_mut)
+            .filter(|fallback| {
+                fallback
+                    .get(PERSONA)
+                    .is_some_and(|persona| !persona.is_null())
+            })
+        {
+            fallback.insert(PERSONA.into(), persona.clone());
+        }
+        render_config[PERSONA] = persona;
+    }
+
     fn decode_recorded_render_config(
         config: &broca_wal::RunConfig,
     ) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
@@ -3864,33 +4373,52 @@ mod executor {
                 .and_then(|selection| selection.account_decision.as_ref())
                 .and_then(|decision| decision.conversation_key.as_deref());
             let mut routing_decision_error = None;
-            let account_choice = match self
-                .choose_account_for_episode(
-                    job.req,
-                    fresh_episode,
-                    EpisodeAccountPreference {
-                        pin: (pinned_method, pinned_account),
-                        pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
-                        credential_id: job
-                            .auth
-                            .as_ref()
-                            .and_then(|auth| auth.credential_id.as_deref()),
-                    },
-                    (job.conversation_key.as_deref(), inherited_key),
-                    broca_module_serve::account_routing::account_hold_cap(
-                        self.max_same_account_wait,
-                        history.last_config,
-                        job.clock
-                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
-                        |account| {
-                            self.provider_client
-                                .session_last_accepted_at_ms(&job.req.session, account)
+            // A run moving at a quota wall takes the account routing already offered it.
+            // A resumed run that moved to another account asks routing for its account again
+            // only where routing answers that with the run's current account.
+            let moved = !fresh_episode && prior_run.as_ref().is_some_and(|prior| prior.moved);
+            let records_account_change = prior_run
+                .as_ref()
+                .is_some_and(|prior| prior.records_account_change);
+            let mut resume_asks = resume_asks_routing(
+                moved,
+                records_account_change,
+                job.routing_serves_continuation,
+            );
+            let chosen = match job.continue_offer {
+                Some(offer) => Ok(offer.clone()),
+                None => {
+                    self.choose_account_for_episode(
+                        job.req,
+                        fresh_episode || resume_asks,
+                        EpisodeAccountPreference {
+                            pin: (pinned_method, pinned_account),
+                            pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
+                            credential_id: job
+                                .auth
+                                .as_ref()
+                                .and_then(|auth| auth.credential_id.as_deref()),
                         },
-                    ),
-                    job.queued_service_tier.as_deref(),
-                )
-                .await
-            {
+                        (job.conversation_key.as_deref(), inherited_key),
+                        broca_module_serve::account_routing::account_hold_cap(
+                            self.max_same_account_wait,
+                            history.last_config,
+                            job.clock.map_or_else(
+                                || epoch_millis().max(0) as u64,
+                                |clock| clock.now_ms(),
+                            ),
+                            |account| {
+                                self.provider_client
+                                    .session_last_accepted_at_ms(&job.req.session, account)
+                            },
+                        ),
+                        job.queued_service_tier.as_deref(),
+                    )
+                    .await
+                }
+            };
+            let chosen = resumed_choice(chosen, &mut resume_asks, &job.req.run_id);
+            let mut account_choice = match chosen {
                 Ok(choice) => choice,
                 Err(RunError::AccountSelectionRefused(refusal))
                     if job.req.route_decision_id.is_some()
@@ -3937,27 +4465,50 @@ mod executor {
                     in_run_refresh: None,
                 }
             } else {
-                match self
-                    .decide_auth_with_account(
-                        job.req.model.provider_module_id.as_str(),
-                        frozen_credential_id.as_deref(),
-                        frozen_auth_method.as_deref(),
-                        if fresh_episode {
-                            None
-                        } else {
-                            prior_run
-                                .as_ref()
-                                .and_then(|prior| prior.config.auth_selection.as_ref())
-                                .and_then(|selection| selection.resolved_credential_id.as_deref())
-                        },
-                        fresh_episode,
-                        pinned_method,
-                        pinned_account,
-                        &account_choice,
-                        frozen_decision.as_ref(),
-                    )
-                    .await
-                {
+                let recorded_resolved_id = if fresh_episode {
+                    None
+                } else {
+                    prior_run
+                        .as_ref()
+                        .and_then(|prior| prior.config.auth_selection.as_ref())
+                        .and_then(|selection| selection.resolved_credential_id.as_deref())
+                };
+                macro_rules! decide_auth {
+                    ($choice:expr) => {
+                        self.decide_auth_with_account(
+                            job.req.model.provider_module_id.as_str(),
+                            frozen_credential_id.as_deref(),
+                            frozen_auth_method.as_deref(),
+                            recorded_resolved_id,
+                            fresh_episode,
+                            pinned_method,
+                            pinned_account,
+                            $choice,
+                            frozen_decision.as_ref(),
+                        )
+                        .await
+                    };
+                }
+                let mut decided = decide_auth!(&account_choice);
+                // A moved run's resume whose routed account can't be admitted (the vault doesn't
+                // serve its credential here, or serves it for another account than routing
+                // named) keeps the account it recorded, as for any other unusable answer (see
+                // `resumed_choice`).
+                if resume_asks && matches!(account_choice, AccountChoice::Routed { .. }) {
+                    if let Err(error) = &decided {
+                        tracing::warn!(
+                            target: "accounts",
+                            run_id = %job.req.run_id.0,
+                            %error,
+                            "the account routing gave the resumed run can't be admitted; it keeps \
+                             the account it recorded"
+                        );
+                        resume_asks = false;
+                        account_choice = AccountChoice::NotApplicable;
+                        decided = decide_auth!(&account_choice);
+                    }
+                }
+                match decided {
                     Ok(v) => v,
                     Err(e) => {
                         self.provider_client
@@ -3968,12 +4519,26 @@ mod executor {
                 }
             };
             // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
-            preserve_billing_vault_snapshot(
-                &mut resolution.selection,
-                prior_run
+            // A moved run's resume that routing gave another credential is a credential change:
+            // the recorded `billing_vault_facts` (the vault's billing metadata for the credential,
+            // which usage export bills by) describe the old credential, so the selection keeps the
+            // facts this resolve read from the vault for the new one. A credential changed after a
+            // sign-in is handled the same way: its facts are taken fresh, not copied.
+            let recorded_selection = prior_run
+                .as_ref()
+                .and_then(|prior| prior.config.auth_selection.as_ref());
+            let resumed_on_another_credential = resume_asks
+                && resolution
+                    .selection
                     .as_ref()
-                    .and_then(|prior| prior.config.auth_selection.as_ref()),
-            );
+                    .zip(recorded_selection)
+                    .is_some_and(|(now, recorded)| {
+                        now.credential_id != recorded.credential_id
+                            || now.account_ref != recorded.account_ref
+                    });
+            if !resumed_on_another_credential {
+                preserve_billing_vault_snapshot(&mut resolution.selection, recorded_selection);
+            }
             if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
                 self.provider_client
                     .chatgpt_connections()
@@ -4136,7 +4701,9 @@ mod executor {
                 quota_observer: broca_module_serve::usage_observe::observer(
                     job.req.model.provider_module_id.as_str(),
                     resolution.method.map(|method| method.as_token()),
-                    if fresh_episode {
+                    // The account the run sends on: routing's answer on a fresh run and on a
+                    // moved run's resume that asked for it, else the one the run recorded.
+                    if fresh_episode || resume_asks {
                         resolution.selection.as_ref()
                     } else {
                         prior_run
@@ -4161,7 +4728,7 @@ mod executor {
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
                 queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
                 clock: Some(&self.clock),
-                frozen_account_ref: if fresh_episode {
+                frozen_account_ref: if fresh_episode || resume_asks {
                     resolution
                         .selection
                         .as_ref()
@@ -4246,6 +4813,26 @@ mod executor {
                 .as_ref()
                 .filter(|_| !fresh_episode)
                 .map(|prior| decode_recorded_render_config(&prior.config));
+            // A moved run whose resume asked routing again may be given another account than
+            // the one it ran on. The recorded Claude Code persona names that account in the
+            // request body, so it is refrozen for the account routing gave, as a move inside the
+            // run refreezes it; the loop records the config with the account.
+            let recorded_render_config = match recorded_render_config {
+                Some(Ok(mut frozen)) if resume_asks => match persona_for_resumed_account(
+                    &mut frozen,
+                    self.claude_code_install_id.as_deref(),
+                    prior_run
+                        .as_ref()
+                        .and_then(|prior| prior.config.auth_selection.as_ref())
+                        .and_then(|selection| selection.account_ref.as_deref()),
+                    resolution.selection.as_ref(),
+                    &job.req.session,
+                ) {
+                    Ok(()) => Some(Ok(frozen)),
+                    Err(error) => return Err(RunError::Config(error)),
+                },
+                other => other,
+            };
             // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
             // core's provider type until resume rebuilds real credentials and runs the pre-call
             // refreeze check. The core durably writes RunStarted and RunPaused without rendering or
@@ -4553,9 +5140,42 @@ mod executor {
                     None,
                     self.max_same_account_wait,
                 );
-                return broca_session_loop::seal(writer, parts, &seams, cause)
+                // Routing holds a lease for a run it admitted until it hears the run end, so a
+                // sealed run reports its end under the account it ran on, as any run does.
+                let reporter = {
+                    use broca_session_loop::writer::Writer as _;
+                    let selection = writer.operations().run.as_ref().and_then(|run| {
+                        broca_session_loop::account_move::current_auth_selection(run, parts)
+                            .ok()
+                            .flatten()
+                    });
+                    match (
+                        self.routing.as_ref(),
+                        selection
+                            .as_ref()
+                            .and_then(|selection| selection.account_decision.as_ref()),
+                    ) {
+                        (Some(routing), Some(decision)) => {
+                            broca_module_serve::account_routing::RunReporter::start_for_decision(
+                                Arc::clone(routing),
+                                decision,
+                                req.run_id.0.clone(),
+                                None,
+                                writer.durable_head(),
+                                Some(writer.session_id()),
+                            )
+                        }
+                        _ => None,
+                    }
+                };
+                let durable_head = writer.durable_head();
+                let sealed = broca_session_loop::seal(writer, parts, &seams, cause)
                     .await
-                    .map_err(StoreRunError::Loop);
+                    .map_err(StoreRunError::Loop)?;
+                if let Some(reporter) = reporter.filter(|_| sealed.paused.is_none()) {
+                    reporter.finish(None, durable_head.load(Ordering::Acquire), sealed.reason);
+                }
+                return Ok(sealed);
             }
             if mode == StoreRunMode::Resume
                 && control
@@ -4583,8 +5203,35 @@ mod executor {
                     .await
                     .map_err(StoreRunError::Loop);
             }
-            let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
+            let stored = store_history(writer, parts)
+                .await
+                .map_err(StoreRunError::Loop)?;
+            // Whether a moved run's resume may ask routing for its account: only when routing
+            // serves continuation (see `resume_asks_routing`). Routing's description is read only
+            // for such a resume, so no other run waits on it.
+            let routing_serves_continuation =
+                stored.prior_run.as_ref().is_some_and(|prior| {
+                    prior.moved && prior.records_account_change && !prior.idle
+                }) && self.routing_serves_continuation().await;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
+            if let Some(config) = &last_config {
+                if let Some(account) = config
+                    .auth_selection
+                    .as_ref()
+                    .and_then(|auth| auth.account_ref.as_deref())
+                {
+                    seed_store_accepted_send(
+                        &self.provider_client,
+                        writer,
+                        &req.session,
+                        account,
+                        &config.frozen_render_config,
+                        now(),
+                    )
+                    .await
+                    .map_err(|error| StoreRunError::Loop(error.into()))?;
+                }
+            }
             let history = EpisodeHistory {
                 prior_run: stored.prior_run,
                 last_config: last_config.as_ref(),
@@ -4602,6 +5249,8 @@ mod executor {
                         media_profile: &None,
                         clock: control.clock.as_ref(),
                         new_storage: true,
+                        continue_offer: None,
+                        routing_serves_continuation,
                     },
                     &history,
                 )
@@ -4616,23 +5265,11 @@ mod executor {
                 mode: _,
                 resolved,
             } = admitted;
-            // The new run loop doesn't yet start a run paused for sign-in; today's loop writes
-            // such a run's start and its pause before any model call. A session in the new
-            // storage refuses that run by name until it does. A routing refusal of the caller's
-            // decision goes to the loop as the run's pre-model error, as `episode_control` hands
-            // it to today's loop: the run's start is written, then the run ends with that error.
             if fresh_episode != (mode == StoreRunMode::Fresh) {
                 return Err(StoreRunError::Admission(RunError::Config(format!(
                     "the store actor asked for a {mode:?} run, but the session's latest run says \
                      otherwise"
                 ))));
-            }
-            if routing_decision_error.is_none() && resolution.pause.is_some() {
-                return Err(StoreRunError::Admission(RunError::Config(
-                    "a run that starts paused for sign-in isn't served on the new session \
-                     storage yet"
-                        .into(),
-                )));
             }
             let holds_media = req
                 .input
@@ -4646,54 +5283,29 @@ mod executor {
                 )
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
             let mut model_call_ready = None;
+            let mut media_renderer = None;
             if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty())
             {
                 // As `execute` installs today's renderer for a run that may carry media: the
-                // same projection, folded from the session's records turned back into today's
-                // (see `broca_module::store_media`), reading the session's own media objects.
-                // The session's first such run may still be waiting for the fold to be built;
-                // each model call waits for it first, and a request whose media can't be
-                // rendered is refused by name before anything is sent.
+                // same engine, kept by the session's actor as the session's image index (see
+                // `broca_module::store_media`), reading the session's own media objects. The
+                // session's first such run may still be waiting for the index to be built; each
+                // model call waits for it first, and a request whose media can't be rendered is
+                // refused by name before anything is sent.
                 let media = media.ok_or_else(|| {
                     StoreRunError::Admission(RunError::Wal(
-                        "store_media_unavailable: the run was started without its media fold"
+                        "store_media_unavailable: the run was started without its media index"
                             .into(),
                     ))
                 })?;
-                let frozen: broca_provider::wire::FrozenRenderConfig =
-                    serde_json::from_value(resolved.provider.render_config_blob())
-                        .expect("resolved provider has a frozen config");
-                let budget = history
-                    .prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.budget.clone());
                 let lazy = broca_module::store_media::LazyRenderer::new(
                     media,
-                    Box::new(move |bytes, checkpoint, read_tail| {
-                        let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                            bytes,
-                            checkpoint,
-                            budget,
-                            frozen.media,
-                            read_tail,
-                        )?;
-                        Ok(Arc::new(
-                            move |frozen: &serde_json::Value,
-                                  opts: &broca_protocol::request::CallOptions,
-                                  tags: bool,
-                                  commit: bool,
-                                  provenance: Option<
-                                &mut broca_protocol::render_provenance::RenderProvenance,
-                            >| {
-                                media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                            },
-                        )
-                            as Arc<broca_core::provider::MediaRequestRenderer>)
-                    }),
+                    Box::new(|media| Ok(media.renderer())),
                 );
                 resolved
                     .provider
                     .set_media_request_renderer(lazy.renderer());
+                media_renderer = Some(Arc::clone(&lazy));
                 model_call_ready = Some(lazy as Arc<dyn broca_session_loop::run::ModelCallReady>);
             }
             if broca_provider::person_media::references(&req.input)
@@ -4748,6 +5360,21 @@ mod executor {
                 Arc::new(StoreAccountReports(reporter))
                     as Arc<dyn broca_session_loop::AccountReports>
             });
+            let fresh_admission = if fresh_episode {
+                match broca_session_loop::admit::admission(
+                    req,
+                    &control,
+                    &resolved.provider,
+                    writer.operations(),
+                    Some(now()),
+                ) {
+                    Ok(admission) => Some(admission),
+                    Err(error) => return Err(StoreRunError::Admission(error)),
+                }
+            } else {
+                None
+            };
+            let moves = AccountMoves::new(self, req, auth, clock.as_ref(), media_renderer);
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -4763,23 +5390,36 @@ mod executor {
             );
             seams.model_call_ready = model_call_ready;
             seams.keep_warm = keep_warm;
-            let finished = if fresh_episode {
-                match broca_session_loop::admit::admission(
-                    req,
-                    &control,
-                    &resolved.provider,
-                    writer.operations(),
-                    Some(now()),
-                ) {
-                    Ok(admission) => {
-                        // Keep the loop body off the executor's poll frame, as the legacy
-                        // loop does, even though async_trait already boxes the outer executor.
-                        Box::pin(broca_session_loop::run(writer, parts, admission, &seams)).await
-                    }
-                    Err(error) => return Err(StoreRunError::Admission(error)),
+            resolved
+                .provider
+                .set_cache_predecessor_loader(writer.cache_predecessor_loader());
+            seams.account_continue = Some(&moves);
+            let finished = match fresh_admission {
+                Some(admission) => {
+                    // Keep the loop body off the executor's poll frame, as the legacy loop
+                    // does, even though async_trait already boxes the outer executor.
+                    Box::pin(broca_session_loop::run(writer, parts, admission, &seams)).await
                 }
-            } else {
-                Box::pin(broca_session_loop::resume(writer, parts, &seams)).await
+                None => Box::pin(broca_session_loop::resume(writer, parts, &seams)).await,
+            };
+            // A run that moved to another account at a quota wall reports its end under the
+            // credential it moved to.
+            let moved = moves.moved();
+            let (report_selection, used_credential, in_run_refresh) = match &moved {
+                Some(moved) => (
+                    Some(moved.selection.clone()),
+                    used_credential_for_report(
+                        &None,
+                        Some(moved.selection.clone()),
+                        moved.record_version,
+                    ),
+                    moved.in_run_refresh.as_ref(),
+                ),
+                None => (
+                    report_selection,
+                    used_credential,
+                    resolution.in_run_refresh.as_ref(),
+                ),
             };
             // The run's end, for routing and the vault, as `execute` reports it. The reports
             // read only how the run ended or paused.
@@ -4800,7 +5440,7 @@ mod executor {
                 account_reporter.as_deref(),
                 report_selection,
                 used_credential,
-                resolution.in_run_refresh.as_ref(),
+                in_run_refresh,
                 || store_terminal_error(reader),
                 None,
                 &durable_head,
@@ -4866,6 +5506,16 @@ mod executor {
             )
             .await
             .map_err(RunError::from)
+        }
+
+        /// Whether routing serves continuation: it is known to declare both `account_continue`
+        /// and `account_continue_resume`. No routing, or a description that can't be read,
+        /// counts as no.
+        async fn routing_serves_continuation(&self) -> bool {
+            match self.routing.as_ref() {
+                Some(routing) => routing.answers_moved_runs_with_current_account().await,
+                None => false,
+            }
         }
 
         /// Install the credential vault required for real provider calls.
@@ -5282,7 +5932,7 @@ mod executor {
                 // the ordinary strict drift guard because a call already used its config.
                 AuthDecision::PauseForReauth(err) => Ok(AuthResolution {
                     mode: AuthMode::None,
-                    pause: Some(err),
+                    pause: Some(*err),
                     selection,
                     method,
                     project_id,
@@ -5885,6 +6535,8 @@ mod executor {
                         media_profile: &job.media_profile,
                         clock: job.control.clock.as_ref(),
                         new_storage: false,
+                        continue_offer: None,
+                        routing_serves_continuation: false,
                     },
                     &history,
                 )
@@ -6235,12 +6887,15 @@ mod executor {
         }
     }
 
+    include!("store_cache_evidence.rs");
+
     #[cfg(test)]
     mod tests {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("store_run_tests.rs");
+        include!("store_cache_evidence_tests.rs");
         include!("store_run_cancel_tests.rs");
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
@@ -6254,6 +6909,7 @@ mod executor {
 
         include!("credential_source_guard_tests.rs");
         include!("frozen_auth_method_resume_tests.rs");
+        include!("account_move_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
         /// that omitted `cache`) takes the cache policy and caller cache key frozen in the
@@ -6805,6 +7461,7 @@ mod executor {
                 mode: AuthMode::None,
                 pause: Some(ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Auth,
@@ -6818,6 +7475,7 @@ mod executor {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 }),
                 selection: Some(broca_core::AuthSelection {
                     billing_vault_facts: None,
@@ -6940,6 +7598,7 @@ mod executor {
             // A pre-loop pause means no provider call — no report identity.
             let pause = Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -6953,6 +7612,7 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
             assert_eq!(
                 used_credential_for_report(&pause, selection(), Some(7)),
@@ -7411,6 +8071,7 @@ mod executor {
         fn err_with_status(status: Option<u16>) -> ProviderError {
             ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -7424,6 +8085,7 @@ mod executor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             }
         }
 
@@ -7576,6 +8238,7 @@ mod executor {
         fn an_account_limit_refusal_is_never_reported_to_the_vault() {
             let exhausted = ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
@@ -7589,6 +8252,7 @@ mod executor {
                 account_ref: Some("d4bc9dbc".into()),
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             };
             assert_eq!(wire_auth_status(&exhausted), None);
             let mut records = vec![run_started(1, "limit-run")];
@@ -8301,6 +8965,7 @@ mod executor {
             assert_eq!(
                 wire_auth_status(&ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     refusal: None,
                     class: ErrorClass::Permanent,
@@ -8314,6 +8979,7 @@ mod executor {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 }),
                 None
             );

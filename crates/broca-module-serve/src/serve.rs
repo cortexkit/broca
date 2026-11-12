@@ -3024,6 +3024,7 @@ where
                             handler,
                             cancel.clone(),
                             caller_module(&bind).map(str::to_owned),
+                            read_access(&session, &bind, OP_SUBSCRIBE, &params),
                         ) => result,
                     }
                 }
@@ -3042,7 +3043,11 @@ async fn authorize_route_request<H: ServeHandler>(
     method: &str,
     params: &serde_json::Value,
 ) -> Result<(), ServeError> {
-    if method == OP_RETRACT {
+    if broca_module::reader_admission::governs(method) {
+        handler
+            .authorize_session_read(session, &read_access(session, bind, method, params))
+            .await
+    } else if method == OP_RETRACT {
         handler
             .authorize_session_retract(
                 session,
@@ -3069,6 +3074,23 @@ async fn authorize_route_request<H: ServeHandler>(
         handler
             .authorize_session(session, bind.principal.as_ref())
             .await
+    }
+}
+
+fn read_access(
+    session: &BrocaBindIdentity,
+    bind: &BindObservation,
+    method: &str,
+    params: &serde_json::Value,
+) -> broca_module::reader_admission::ReadAccess {
+    let send = matches!(method, OP_SEND_STATUS | OP_SESSION_SEND_STATUS)
+        .then(|| params.get("send_id").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(|id| (run_id_for_send(session, Some(id)), id.to_owned()));
+    broca_module::reader_admission::ReadAccess {
+        principal: bind.principal.clone(),
+        op: method.into(),
+        send,
     }
 }
 
@@ -3432,6 +3454,23 @@ where
                     message,
                 )
                 .await;
+            }
+            if let Some(plan) = req
+                .params
+                .get("plan")
+                .and_then(serde_json::Value::as_object)
+            {
+                let supported = match handler
+                    .plan_readers_supported(session, params.session_class.as_deref())
+                {
+                    Ok(supported) => supported,
+                    Err(error) => {
+                        return send_serve_error(writer, ver, channel, epoch, corr, &error).await
+                    }
+                };
+                if let Err(error) = broca_module::reader_admission::check_plan(plan, supported) {
+                    return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
+                }
             }
             let plan_selection =
                 if let Some(plan) = req.params.get("plan").filter(|plan| !plan.is_null()) {
@@ -4773,6 +4812,7 @@ async fn start_subscribe_stream<H>(
     handler: Arc<H>,
     cancel: CancellationToken,
     caller_module_id: Option<String>,
+    read_access: broca_module::reader_admission::ReadAccess,
 ) -> Result<(), ServeIoError>
 where
     H: ServeHandler + 'static,
@@ -4819,6 +4859,24 @@ where
                             None => break, // the coordinator's subscriber task ended (sink closed)
                         },
                     };
+                    // Today's storage never accepts reader policies; its stream behavior is unchanged.
+                    let admission = match handler.kept_in_new_storage(&session) {
+                        Ok(true) => handler.authorize_session_read(&session, &read_access).await,
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = admission {
+                        if matches!(error, ServeError::ReadAccessRefused | ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. }) {
+                            let _ = send_subscribe_scope_error(&writer, (ver, channel, epoch, corr), next_seq, &error).await;
+                        } else {
+                            let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
+                                ErrorBody::new(refused_send_code(&error), error.to_string())).await;
+                        }
+                        return;
+                    }
+                    if matches!(delivery, Delivery::AdmissionChanged) {
+                        continue;
+                    }
                     if matches!(delivery, Delivery::CursorExpired) {
                         let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
                             ErrorBody::new("cursor_expired", "the subscribe cursor is not held in this session log")).await;
@@ -5148,6 +5206,7 @@ fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
         | Delivery::Expired { .. }
         | Delivery::Error(_)
         | Delivery::AccessEnded(_)
+        | Delivery::AdmissionChanged
         | Delivery::Detached => return EncodedDelivery::Detached,
     };
     match encoded {
@@ -5417,13 +5476,13 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::CursorExpired => "cursor_expired".into(),
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID.into(),
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN.into(),
-        ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. } => {
-            scope_error_bytes(error)
-                .ok()
-                .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-                .and_then(|body| body.get("code")?.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "scope_refused".into())
-        }
+        ServeError::ScopeRefused(_)
+        | ServeError::ScopeFreezeBusy { .. }
+        | ServeError::ReadAccessRefused => scope_error_bytes(error)
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|body| body.get("code")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "scope_refused".into()),
         ServeError::PlanRefused(refusal) => refusal.code().into(),
         ServeError::AccountSelectionRefused(refusal) => refusal.routing_code.clone(),
         ServeError::RoutingUnavailable(_) => broca_wire::ROUTING_UNAVAILABLE.into(),
@@ -5784,9 +5843,10 @@ async fn send_serve_error(
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND,
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN,
-        ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. } => {
-            // Callers branch on these bodies, so they are sent exactly as the broca-wire types
-            // serialize, the bytes their golden files pin.
+        ServeError::ScopeRefused(_)
+        | ServeError::ScopeFreezeBusy { .. }
+        | ServeError::ReadAccessRefused => {
+            // Callers branch on these bodies, so shared wire serializers produce them directly.
             let body = scope_error_bytes(err)?;
             return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
         }
@@ -6472,9 +6532,13 @@ async fn send_subscribe_scope_error(
     send_error_bytes(writer, ver, channel, epoch, corr, body).await
 }
 
-/// The wire body of a scope refusal, serialized from its broca-wire type.
+/// The wire body of a scope or reader-policy refusal.
 fn scope_error_bytes(err: &ServeError) -> Result<Vec<u8>, ServeIoError> {
     let encoded = match err {
+        ServeError::ReadAccessRefused => serde_json::to_vec(&ErrorBody::new(
+            "scope_owner_mismatch",
+            "the session's read policy does not admit this caller",
+        )),
         ServeError::ScopeRefused(broca_core::ScopeRefusal::FlowScopeRequired) => {
             serde_json::to_vec(&broca_wire::FlowPrincipalRefusal::new(
                 true,
@@ -7160,6 +7224,7 @@ mod tests {
                 handler,
                 cancel.clone(),
                 Some("reader".into()),
+                broca_module::reader_admission::ReadAccess::default(),
             ),
         )
         .with_subscriber(subscriber)
@@ -8366,6 +8431,7 @@ mod tests {
                 handler,
                 CancellationToken::new(),
                 None,
+                broca_module::reader_admission::ReadAccess::default(),
             )
             .await
             .unwrap();
@@ -8430,6 +8496,7 @@ mod tests {
             handler,
             cancel.clone(),
             None,
+            broca_module::reader_admission::ReadAccess::default(),
         )
         .await;
         assert!(start_res.is_ok());

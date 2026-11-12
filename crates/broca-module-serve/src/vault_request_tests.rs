@@ -257,6 +257,9 @@ struct ExpiryScript {
     chatgpt_jwt: bool,
     refreshed_account_id: Option<&'static str>,
     refreshed_jwt_other_account: bool,
+    /// A credential id the stand-in answers `not_found` for, as the vault does for a credential
+    /// this principal holds no grant for. Every other credential is served.
+    missing_credential: Option<&'static str>,
 }
 
 /// The life a token served by a refresh has left.
@@ -492,7 +495,14 @@ async fn serve_capturing_vault(
                             None => not_found,
                         }
                     }
-                    "credential.get_scoped" if scoped_not_found => not_found,
+                    "credential.get_scoped"
+                        if scoped_not_found
+                            || expiry.missing_credential.is_some_and(|missing| {
+                                request["params"]["credential_id"] == missing
+                            }) =>
+                    {
+                        not_found
+                    }
                     "credential.get_scoped" => {
                         let mut record = record.lock().unwrap();
                         record.scoped_reads += 1;

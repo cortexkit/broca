@@ -165,6 +165,7 @@ fn session_class_adoption_is_first_label_only_and_checkpoint_compatible() {
         transcript_base: None,
         ledger_base: None,
         activity_ms: None,
+        media: None,
     };
     let decoded = crate::checkpoint::Checkpoint::decode(&checkpoint.encode()).unwrap();
     assert_eq!(

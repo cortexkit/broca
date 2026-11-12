@@ -670,6 +670,8 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let mut parts = MemoryParts::default();
     broca_session_loop::run::run(&mut session, &mut parts, admission, &seams)
@@ -719,6 +721,58 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
     mids.sort();
     mids.dedup();
     assert_eq!(mids.len(), all, "a message id repeats");
+}
+
+/// An import's seeded run is a run start whose inputs are the imported messages in order: the
+/// image of the imported user message is a person's, at that message's place (ordinal 0), and a
+/// later request renders it with its bytes.
+#[tokio::test]
+async fn an_imported_image_is_a_persons_at_its_place_and_renders_with_its_bytes() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::new("media");
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    drop(commands);
+    served.await.unwrap().close().await.unwrap();
+
+    let mut session = load(backend).await.unwrap();
+    let mut index = crate::store_media::SessionIndex::new(&session, Some(backend));
+    index.open(&mut session, &MemoryParts::default()).await;
+    assert!(index.ready(), "the import needs no build");
+    let captures = index
+        .index()
+        .expect("the import captured its image")
+        .session()
+        .facts()
+        .captures;
+    assert_eq!(captures.len(), 1, "{captures:?}");
+    assert!(
+        captures[0].person,
+        "an imported user message's image is a person's"
+    );
+    assert_eq!(captures[0].ordinal, Some(0));
+    assert_eq!(captures[0].tool_call, None);
+
+    let mut config = broca_provider::families::frozen_config_for_family(
+        broca_provider::spec::WireFamilyId::AnthropicMessages,
+        "m",
+    );
+    config.media = Some(broca_provider::media_profile::select_media_profile(
+        broca_provider::spec::WireFamilyId::AnthropicMessages,
+        Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+        "m",
+        broca_provider::spec::InputModalities::from_value(&serde_json::json!(["text", "image"])),
+        Some(200_000),
+    ));
+    let opts: broca_protocol::request::CallOptions =
+        serde_json::from_value(serde_json::json!({ "prompt": session.conversation.messages }))
+            .unwrap();
+    let body = index
+        .for_run()
+        .render(&serde_json::to_value(config).unwrap(), &opts, false, None)
+        .unwrap();
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains(PNG), "{body}");
 }
 
 /// Through the registry: an import creates its session in the new storage, never on today's,
@@ -1323,6 +1377,8 @@ async fn run_once<W: Writer>(
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
+        account_continue: None,
     };
     broca_session_loop::run::run(writer, parts, admission, &seams)
         .await
@@ -2289,5 +2345,60 @@ async fn an_imported_session_states_no_reading_until_its_own_step() {
             .iter()
             .all(|(_, params)| !params.to_string().contains("\"last_prompt_tokens\":5000")),
         "{calls:?}"
+    );
+}
+
+/// `run.result` of an import's seeded run. The run ends completed and places none of its own
+/// messages: imported messages belong to no run. Today's storage serves the last assistant message
+/// of the transcript the run left, so the new storage must serve it too, with the id the source
+/// gave it, and not refuse the run as one that placed nothing. An import holding no assistant
+/// message has no final message to serve, and the search for one stays inside the run's own
+/// messages.
+#[tokio::test]
+async fn an_imported_runs_result_serves_the_last_imported_reply() {
+    async fn result_of(source: &Source) -> Result<broca_wire::RunResultResponse, String> {
+        let backend: &'static MemoryBackend = Box::leak(Box::default());
+        let (commands, served) = serve(create(backend).await.unwrap());
+        imported(ask(&commands, source.import(source.params("imp-1"))).await);
+        drop(commands);
+        served.await.unwrap();
+        let session = load(backend).await.unwrap();
+        let run_id = session.operations.owner.first_start.clone().unwrap().run_id;
+        let parts = MemoryParts::default();
+        let reader = crate::store_status::Reader {
+            parts: &parts,
+            live: false,
+            settled: None,
+            session_name: "alfonso:head:a1",
+            live_step: None,
+        };
+        reader
+            .run_result(&session, &broca_protocol::RunId(run_id))
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    let result = result_of(&Source::new("final")).await.unwrap();
+    assert_eq!(result.state, "completed");
+    let message = result
+        .final_message
+        .expect("a completed run's final message");
+    assert_eq!(message.ordinal, 4);
+    assert_eq!(message.mid, "msg_a2");
+    assert_eq!(message.text, "Done.");
+
+    let prompt_only = serde_json::to_vec(&serde_json::json!({
+        "info": {"id": "ses_head"},
+        "messages": [
+            {"id": "msg_u1", "type": "user", "time": {"created": 1000}, "text": "Look."}
+        ]
+    }))
+    .unwrap();
+    let refused = result_of(&Source::of("prompt-only", prompt_only, None))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("the completed run has no assistant message"),
+        "{refused}"
     );
 }

@@ -161,6 +161,16 @@ impl DeploymentKey {
         }
     }
 
+    /// An owned copy for one conversion worker, dropped when that worker ends. This is
+    /// explicit rather than `Clone` so ordinary callers do not copy key material by accident.
+    pub fn duplicate_for_worker(&self) -> Self {
+        match &self.loaded {
+            Some(loaded) => Self::new(self.id, &loaded.bytes),
+            None => Self::unloaded(self.id),
+        }
+        .creating(self.new_sessions)
+    }
+
     /// This key, creating new sessions in mode `cipher`. An unloaded key can't create encrypted
     /// sessions: creating one refuses.
     pub fn creating(mut self, cipher: Cipher) -> Self {
@@ -424,6 +434,35 @@ pub fn verify(key: &DataKey, context: &[u8], data: &[u8], tag: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_key_copy_keeps_identity_mode_and_wrapping_material() {
+        for loaded in [false, true] {
+            for mode in [Cipher::None, Cipher::XChaCha20Poly1305] {
+                let original = if loaded {
+                    DeploymentKey::new(7, &[42; 32])
+                } else {
+                    DeploymentKey::unloaded(7)
+                }
+                .creating(mode);
+                let copy = original.duplicate_for_worker();
+                drop(original);
+                assert_eq!(copy.id(), 7);
+                assert_eq!(copy.is_loaded(), loaded);
+                assert_eq!(copy.new_sessions(), mode);
+                let data = DataKey::from_bytes(7, [13; 32]);
+                let session = Id128([11; 16]);
+                if loaded {
+                    let wrapped = wrap(&copy, &session, &data).unwrap();
+                    let independent = DeploymentKey::new(7, &[42; 32]);
+                    let opened = unwrap(&independent, &session, 7, &wrapped).unwrap();
+                    assert_eq!(opened.derive(b"worker-copy"), data.derive(b"worker-copy"));
+                } else {
+                    assert!(wrap(&copy, &session, &data).is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_wrapped_key_unwraps_only_for_its_session_and_id() {

@@ -675,6 +675,7 @@ impl RunExecutor for CoreExec {
             // credential needs it does.
             control.pause_for_auth_at_start = Some(broca_protocol::ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,
@@ -688,6 +689,7 @@ impl RunExecutor for CoreExec {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
         }
         // A resume keeps the decision its episode froze; a fresh episode decides from its send,
@@ -769,8 +771,8 @@ impl RunExecutor for CoreExec {
             let now = || 1;
             // As the module's executor installs it for a store run that may carry media, when
             // the scripted model takes media: a renderer reading the session's own media
-            // objects, which each model call waits for until the media the session names have
-            // been read from its records (`StoreRunMediaWait`).
+            // objects through its actor's image index, which each model call waits for until the
+            // index is built (`StoreRunMediaWait`).
             let holds_media = req
                 .input
                 .iter()
@@ -784,49 +786,19 @@ impl RunExecutor for CoreExec {
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
             let frozen = self.script.media_frozen.lock().unwrap().clone();
             let mut model_call_ready = None;
-            if let Some(frozen) = frozen.filter(|_| {
-                !matches!(mode, StoreRunMode::Seal(_)) && (holds_media || !req.tools.is_empty())
-            }) {
+            if frozen.is_some()
+                && !matches!(mode, StoreRunMode::Seal(_))
+                && (holds_media || !req.tools.is_empty())
+            {
                 let media = media.ok_or_else(|| {
                     StoreRunError::Admission(broca_core::RunError::Wal(
-                        "store_media_unavailable: the run was started without its media fold"
+                        "store_media_unavailable: the run was started without its media index"
                             .into(),
                     ))
                 })?;
-                let budget = writer
-                    .operations()
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.start.as_ref())
-                    .map(|start| {
-                        broca_session_loop::run::run_config_of_start(start, parts.as_ref())
-                    })
-                    .transpose()
-                    .map_err(StoreRunError::Loop)?
-                    .and_then(|config| config.budget);
                 let lazy = broca_module::store_media::LazyRenderer::new(
                     media,
-                    Box::new(move |bytes, checkpoint, read_tail| {
-                        let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                            bytes,
-                            checkpoint,
-                            budget,
-                            frozen.media,
-                            read_tail,
-                        )?;
-                        Ok(Arc::new(
-                            move |frozen: &serde_json::Value,
-                                  opts: &CallOptions,
-                                  tags: bool,
-                                  commit: bool,
-                                  provenance: Option<
-                                &mut broca_protocol::render_provenance::RenderProvenance,
-                            >| {
-                                media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                            },
-                        )
-                            as Arc<broca_core::provider::MediaRequestRenderer>)
-                    }),
+                    Box::new(|media| Ok(media.renderer())),
                 );
                 provider.set_media_request_renderer(lazy.renderer());
                 model_call_ready = Some(lazy as Arc<dyn broca_session_loop::run::ModelCallReady>);
@@ -852,6 +824,8 @@ impl RunExecutor for CoreExec {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready,
+                pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
+                account_continue: None,
             };
             match mode {
                 StoreRunMode::Fresh => {

@@ -16,6 +16,17 @@ impl std::fmt::Debug for Sessions {
 }
 
 impl Sessions {
+    pub(super) fn evidence(
+        &self,
+        bind: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> broca_core::provider::AcceptedSendEvidence {
+        self.0.lock().unwrap().get(bind).map_or(
+            broca_core::provider::AcceptedSendEvidence::NotLoaded,
+            |session| session.0.lock().unwrap().accepted_evidence(account),
+        )
+    }
+
     pub(super) fn accepted_at_ms(
         &self,
         bind: &broca_protocol::BindIdentity,
@@ -24,9 +35,7 @@ impl Sessions {
         let sessions = self.0.lock().unwrap();
         let session = sessions.get(bind)?;
         let state = session.0.lock().unwrap();
-        state
-            .accepted_loaded
-            .then(|| state.accepted_by_account.get(account).copied())
+        state.accepted_evidence(account).loaded_at_ms()
     }
 
     pub(super) fn bind(&self, bind: &broca_protocol::BindIdentity) -> Arc<Session> {
@@ -75,6 +84,7 @@ impl Gate {
 
 #[derive(Default)]
 struct State {
+    loader: Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>,
     lineage: Option<String>,
     seeded: bool,
     locator: Option<String>,
@@ -82,6 +92,22 @@ struct State {
     previous: Option<Previous>,
     accepted_by_account: HashMap<String, u64>,
     accepted_loaded: bool,
+    accepted_evidence: HashMap<String, broca_core::provider::AcceptedSendEvidence>,
+}
+
+impl State {
+    fn accepted_evidence(&self, account: &str) -> broca_core::provider::AcceptedSendEvidence {
+        use broca_core::provider::AcceptedSendEvidence;
+        if let Some(sent) = self.accepted_by_account.get(account) {
+            AcceptedSendEvidence::At(*sent)
+        } else if let Some(evidence) = self.accepted_evidence.get(account) {
+            *evidence
+        } else if self.accepted_loaded {
+            AcceptedSendEvidence::None
+        } else {
+            AcceptedSendEvidence::NotLoaded
+        }
+    }
 }
 
 struct Previous {
@@ -126,6 +152,35 @@ fn ttl(frozen: &FrozenRenderConfig) -> (Option<u64>, TtlKind) {
 }
 
 impl Session {
+    pub(super) fn set_loader(
+        &self,
+        loader: Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>,
+    ) {
+        self.0.lock().unwrap().loader = loader;
+    }
+    pub(super) fn accepted_send_evidence(
+        &self,
+        account: &str,
+    ) -> broca_core::provider::AcceptedSendEvidence {
+        self.0.lock().unwrap().accepted_evidence(account)
+    }
+
+    pub(super) fn seed_accepted_send(
+        &self,
+        account: &str,
+        evidence: broca_core::provider::AcceptedSendEvidence,
+    ) {
+        let mut state = self.0.lock().unwrap();
+        if let broca_core::provider::AcceptedSendEvidence::At(sent) = evidence {
+            let previous = state
+                .accepted_by_account
+                .entry(account.to_owned())
+                .or_insert(sent);
+            *previous = (*previous).max(sent);
+        }
+        state.accepted_evidence.insert(account.to_owned(), evidence);
+    }
+
     pub(super) fn needs_seed(&self, lineage: Option<&str>) -> bool {
         let state = self.0.lock().unwrap();
         !state.seeded || state.lineage.as_deref() != lineage
@@ -231,6 +286,7 @@ impl Session {
             }
         }
         *self.0.lock().unwrap() = State {
+            loader: None,
             lineage,
             seeded: true,
             locator,
@@ -238,6 +294,7 @@ impl Session {
             previous,
             accepted_by_account,
             accepted_loaded: true,
+            accepted_evidence: HashMap::new(),
         };
     }
 
@@ -246,7 +303,6 @@ impl Session {
     }
     pub(super) fn annotate(&self, attempt: &mut ModelAttempt) {
         let mut state = self.0.lock().unwrap();
-        state.accepted_loaded = true;
         note_accepted(
             &mut state.accepted_by_account,
             attempt.http_status,
@@ -345,6 +401,7 @@ fn note_accepted(
 type Work = tokio::task::JoinHandle<Result<RequestFingerprint, String>>;
 #[derive(Default)]
 struct InFlight {
+    loader: Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>,
     work: Option<Work>,
     previous: Option<Previous>,
     prepared: bool,
@@ -362,6 +419,9 @@ impl Pending {
             // Remove the predecessor while a request is in flight. An aborted task must not
             // let a later run silently skip over it; that run reconstructs the WAL instead.
             let mut state = session.0.lock().unwrap();
+            if !state.seeded && state.previous.is_none() {
+                pending.loader = state.loader.take();
+            }
             pending.previous = state.previous.take();
             state.seeded = false;
             pending.prepared = true;
@@ -403,12 +463,30 @@ impl Pending {
     ) -> Option<Box<Value>> {
         let (session, frozen) = request.cache_session.as_ref()?;
         self.start(request);
-        let (work, previous) = {
+        let (work, mut previous, loader) = {
             let mut pending = self.0.lock().unwrap();
             let work = pending.work.take()?;
             pending.prepared = false;
-            (work, pending.previous.take())
+            (work, pending.previous.take(), pending.loader.take())
         };
+        if let Some(loader) = loader {
+            match loader.load().await {
+                Ok(Some(recorded)) => {
+                    let locator = recorded.locator.clone();
+                    previous = tokio::task::spawn_blocking(move || rebuild_predecessor(recorded))
+                        .await
+                        .ok()
+                        .flatten();
+                    if previous.is_some() {
+                        session.recorded(Some(locator));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(target: "provider", error, "cold cache predecessor is unknown")
+                }
+            }
+        }
         let result = work
             .await
             .unwrap_or_else(|_| Err("fingerprint worker failed".into()));
@@ -426,10 +504,184 @@ impl Pending {
     }
 }
 
+fn rebuild_predecessor(recorded: broca_core::provider::CachePredecessor) -> Option<Previous> {
+    let request = recorded.request;
+    let provider = request
+        .route
+        .as_ref()
+        .map_or(&request.config.model, |route| &route.model)
+        .provider_module_id
+        .clone();
+    let frozen: FrozenRenderConfig =
+        serde_json::from_value(request.config.frozen_render_config).ok()?;
+    let frozen = if request.route.is_some() {
+        frozen.refusal_fallback?.frozen
+    } else {
+        frozen
+    };
+    let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+    let body = crate::registry::wire_family(frozen.family_id)?.render_with_provenance(
+        &frozen,
+        &request.opts,
+        Some(&mut provenance),
+    );
+    if RequestDigest::of(&body).sha256 != request.request_body_sha256 {
+        tracing::debug!(target: "provider", "cold cache predecessor digest mismatch; comparison is unknown");
+        return None;
+    }
+    Some(Previous {
+        fingerprint: fingerprint(frozen.family_id, &body)
+            .ok()?
+            .with_provenance(&provenance),
+        family: frozen.family_id,
+        sent: recorded.sent_at_ms,
+        model: format!("{provider}/{}", frozen.wire_model_id),
+        account: recorded.account,
+        ttl: ttl(&frozen),
+        view: recorded.view,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct ColdLoader {
+        calls: std::sync::atomic::AtomicUsize,
+        request: Mutex<Option<broca_core::provider::CachePredecessor>>,
+    }
+
+    #[async_trait::async_trait]
+    impl broca_core::provider::CachePredecessorLoader for ColdLoader {
+        async fn load(&self) -> Result<Option<broca_core::provider::CachePredecessor>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.request.lock().unwrap().take())
+        }
+    }
+
+    async fn cold_comparison(valid_digest: bool) -> Option<Box<Value>> {
+        let frozen = Arc::new(crate::families::openai_responses_frozen_config(
+            "cold-model",
+        ));
+        let opts = serde_json::from_value(
+            json!({"prompt":[{"role":"user", "content":[{"type":"text","text":"stable prefix"}]}]}),
+        )
+        .unwrap();
+        let body = crate::registry::wire_family(frozen.family_id)
+            .unwrap()
+            .render(&frozen, &opts);
+        let config = broca_wal::RunConfig {
+            account_route: None,
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: broca_protocol::request::ModelHandle {
+                provider_module_id: "openai".into(),
+                model_id: "cold-model".into(),
+            },
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: Value::Null,
+            cache_tiers: Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::to_value(&*frozen).unwrap(),
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: vec![],
+            context_management: None,
+        };
+        let loader = Arc::new(ColdLoader {
+            calls: Default::default(),
+            request: Mutex::new(Some(broca_core::provider::CachePredecessor {
+                request: broca_core::RecordedRequest {
+                    run_id: broca_protocol::RunId("previous".into()),
+                    step_id: broca_protocol::StepId(1),
+                    config,
+                    opts,
+                    request_body_sha256: if valid_digest {
+                        RequestDigest::of(&body).sha256
+                    } else {
+                        "0".repeat(64)
+                    },
+                    route: None,
+                },
+                sent_at_ms: Some(100),
+                account: Some("account".into()),
+                locator: "lineage:42".into(),
+                view: None,
+            })),
+        });
+        let session = Arc::new(Session::default());
+        session.seed_accepted_send(
+            "account",
+            broca_core::provider::AcceptedSendEvidence::At(100),
+        );
+        session.set_loader(Some(loader.clone()));
+        let mut request = PreparedHttpRequest::from(HttpRequest {
+            method: crate::wire::HttpMethod::Post,
+            url: "http://synthetic.invalid".into(),
+            headers: vec![],
+            body,
+        });
+        request.cache_session = Some((session.clone(), frozen));
+        let pending = Pending::default();
+        pending.prepare(&request);
+        assert_eq!(
+            loader.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no read during preparation"
+        );
+        pending.start(&request);
+        assert_eq!(
+            loader.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no read until the comparison"
+        );
+        let evidence = pending
+            .finish(&request, Some(200), Some("account".into()))
+            .await;
+        assert_eq!(loader.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            session.last_accepted_at_ms("account"),
+            Some(100),
+            "diagnostic recovery preserves accepted-send evidence"
+        );
+        let again = Pending::default()
+            .finish(&request, Some(300), Some("account".into()))
+            .await
+            .unwrap();
+        assert_eq!(again["extends_previous"], true);
+        assert_eq!(
+            loader.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the cold comparison loads history"
+        );
+        evidence
+    }
+
+    #[tokio::test]
+    async fn cold_cache_predecessor_is_loaded_only_for_the_first_comparison() {
+        let evidence = cold_comparison(true).await.unwrap();
+        assert_eq!(evidence["extends_previous"], true);
+        assert_eq!(evidence["idle_gap_ms"], 100);
+    }
+
+    #[tokio::test]
+    async fn cold_cache_predecessor_digest_mismatch_is_unknown() {
+        assert!(cold_comparison(false).await.is_none());
+    }
 
     #[test]
     fn accepted_account_clock_distinguishes_unloaded_from_known_empty_without_a_read() {

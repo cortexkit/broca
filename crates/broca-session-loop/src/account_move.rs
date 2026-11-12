@@ -1,0 +1,571 @@
+//! Moving a run to another provider account inside a step, when the provider refuses the step's
+//! request because the run's account has spent its usage window (a quota wall).
+//!
+//! The loop can't reach routing or the credential vault; the session's executor can. So the
+//! executor answers one question through [`AccountContinue`]: given this wall, which account may
+//! the run move to, with a provider already built for it. The loop decides whether to ask,
+//! checks the answer, makes the move durable, and only then sends anything on the new account:
+//!
+//! 1. The refused attempt is already durable: a failed attempt's record is appended with a
+//!    barrier as it ends.
+//! 2. The executor is asked. Nothing it prepares is used yet.
+//! 3. `AuthRefrozen` naming the new account is appended with a barrier, after `ConfigRefrozen`
+//!    when the render config names the account too (the Claude Code persona does).
+//! 4. Only then does the loop switch to the new provider and prepare the step's request again,
+//!    as the next attempt of the same step.
+//!
+//! If the records of step 3 can't be written, the prepared provider is dropped with the error,
+//! so nothing is left that would send on the new account.
+//!
+//! A run asks only where it would otherwise end: a wall that today's rule answers with a timed
+//! pause on the same account keeps that pause, and a hold, a refusal, an answer that doesn't
+//! arrive or an offer the loop can't accept all end the run as before, with routing's answer on
+//! the error where there was one.
+
+use broca_core::account_limit_pause::FailedAccountLimitAttempt;
+use broca_protocol::error::AccountContinueAnswer;
+use broca_session_store::record::{AuthRefrozen, ConfigRefrozen, Record};
+use serde_json::Value;
+
+use crate::run::{Admission, LoopError, Seams};
+use crate::writer::Writer;
+
+/// The quota windows routing's continue request takes. A credit wall (the account has no money
+/// left) and any other window are never continued.
+const CONTINUED_WINDOWS: [&str; 2] = ["five_hour", "seven_day"];
+
+/// One wall, as the refused attempt's own record and the run's current selection state it.
+pub struct Wall<'a> {
+    pub run_id: &'a str,
+    pub step_id: u64,
+    /// The selection the refused attempt was sent under. Its decision is the one routing knows
+    /// the run by now.
+    pub selection: &'a broca_wal::AuthSelection,
+    /// The credential and account that hit the wall.
+    pub credential_id: &'a str,
+    pub account: &'a str,
+    /// `five_hour` or `seven_day`.
+    pub limit_window: &'a str,
+    pub resets_at_ms: Option<u64>,
+    /// The provider's own retry-after on the refused attempt's error, in whole seconds rounded
+    /// up, when it gave one.
+    pub retry_after_s: Option<u64>,
+    pub observed_at_ms: u64,
+    /// The seq of the refused attempt's record: it names this wall, so an id derived from it is
+    /// the same however often the question is sent.
+    pub attempt_seq: u64,
+    /// Every account that already refused this step, the one above included. An offer of any of
+    /// them is not taken.
+    pub refused_accounts: &'a [String],
+    /// The render config the run renders under now, for a provider that must render the same
+    /// request on the new account.
+    pub renderer_version: u32,
+    pub render_config: &'a Value,
+    /// The run's frozen config as a resume would read it now (see
+    /// [`crate::run::run_config_of_run`]): what the executor admits the new account's provider
+    /// from.
+    pub run_config: &'a broca_wal::RunConfig,
+    /// Set when routing is asked a second time at this wall because the account it offered
+    /// first was no longer reserved when the run could take it. The question is the same, under
+    /// a new selection id, and shares the first ask's budget.
+    pub reask: bool,
+}
+
+/// What the executor answers.
+pub enum Answer<P> {
+    /// Routing offered an account, and the executor resolved its credential and built the
+    /// provider that sends on it.
+    Move(Box<Move<P>>),
+    /// No move. `Some` carries routing's hold or refusal, which goes on the run's error; `None`
+    /// when the executor didn't ask (routing doesn't declare the operation, or that couldn't be
+    /// told) or had no usable answer (routing unreachable within the budget, or an offer the
+    /// executor refused).
+    Stay(Option<AccountContinueAnswer>),
+}
+
+/// An account the run may move to, ready to use once the move is durable.
+pub struct Move<P> {
+    /// The selection the run renders and bills under from the move on, with the offer's
+    /// decision id.
+    pub selection: broca_wal::AuthSelection,
+    /// The account routing offered, which the selection names.
+    pub account: String,
+    /// When routing's reservation of the account ends.
+    pub valid_until_ms: u64,
+    /// The render config the run renders with on the new account, when it differs from the
+    /// current one: a Claude Code persona names its account in the request body.
+    pub render: Option<(u32, Value)>,
+    /// The provider that sends on the new account.
+    pub provider: P,
+}
+
+/// The executor's side of a move at a wall (see the module docs).
+#[async_trait::async_trait]
+pub trait AccountContinue<P>: Send + Sync {
+    /// Asks routing for another account at `wall`, within the same budget an admission has.
+    async fn ask(&self, wall: &Wall<'_>) -> Answer<P>;
+    /// The move to `selection` is durable and the run sends on it from now on. Called once per
+    /// move, after the records and before any request on the new account.
+    fn adopted(&self, selection: &broca_wal::AuthSelection);
+}
+
+/// What the loop did at a wall it asked about.
+pub(crate) enum AtWall<P> {
+    /// The move is durable: the step is prepared again on `Move::provider`.
+    Moved(Box<Move<P>>),
+    /// No move; routing's answer, if it gave one, for the run's error.
+    Stayed(Option<AccountContinueAnswer>),
+    /// The run was cancelled, or the runner asked to stop, while routing was being asked:
+    /// nothing was recorded and the question was dropped. The run ends or pauses as it would
+    /// at a step's boundary.
+    Stopped,
+}
+
+/// How the loop enters a step again after a move: no boundary is written (the step started
+/// already, and messages steered since wait for the next boundary), and the step's request is
+/// prepared again on the new account.
+pub(crate) struct Reentry {
+    pub step_id: u64,
+    /// The accounts that refused this step so far.
+    pub refused: Vec<String>,
+    /// The retries the step's refused attempts used, which the step's count includes.
+    pub retries: u32,
+    /// The ordinal the next attempt is recorded with, after the refused one.
+    pub first_attempt: u32,
+    /// The run's admission before this step's first move. The run's last request the provider
+    /// accepted was sent under it, so the compaction provider compares the new account with
+    /// its account.
+    pub accepted_under: Box<Admission>,
+}
+
+/// A move the loop made, for the driver to continue on.
+pub(crate) struct Moving<P> {
+    pub moved: Box<Move<P>>,
+    pub reentry: Reentry,
+}
+
+/// Asks at a wall when the run may: the refused attempt is a quota wall on a window routing
+/// continues, the run's selection came from routing (a fixed key or a single candidate has no
+/// decision to continue), and the session's executor can ask. `None` when it may not, so the
+/// run ends exactly as before. `refused` gains the walled account; an offer of any account in
+/// it is refused here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn at_wall<W: Writer, P, T>(
+    writer: &mut W,
+    parts: &dyn crate::parts::Parts,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    step_id: u64,
+    limited: &FailedAccountLimitAttempt,
+    retry_after_secs: Option<f64>,
+    refused: &mut Vec<String>,
+) -> Result<Option<AtWall<P>>, LoopError> {
+    let Some(continuer) = seams.account_continue else {
+        return Ok(None);
+    };
+    let Some(limit) = limited.attempt.account_observation.limit.as_ref() else {
+        return Ok(None);
+    };
+    let Some(window) = limit
+        .limit_window
+        .as_deref()
+        .filter(|window| CONTINUED_WINDOWS.contains(window))
+    else {
+        return Ok(None);
+    };
+    let Some(selection) = crate::run::run_selection(seams, admission) else {
+        return Ok(None);
+    };
+    let routed = selection.account_decision.as_ref().is_some_and(|decision| {
+        decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+            && decision.decision_id.is_some()
+            && decision.admission_id.is_some()
+    });
+    if !routed {
+        return Ok(None);
+    }
+    // The account the refused attempt was served by, as its own record names it.
+    let Some(account) = limited
+        .attempt
+        .served_account_ref
+        .as_deref()
+        .or(selection.account_ref.as_deref())
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    if !refused.contains(&account) {
+        refused.push(account.clone());
+    }
+    let run_config = crate::run::run_config_of_run(crate::run::run_state(writer), parts)?;
+    let wall = Wall {
+        run_id: &admission.run_id,
+        step_id,
+        selection,
+        credential_id: &selection.credential_id,
+        account: &account,
+        limit_window: window,
+        resets_at_ms: limit.resets_at_ms,
+        retry_after_s: retry_after_seconds(retry_after_secs),
+        observed_at_ms: limit.observed_at_ms,
+        attempt_seq: limited.seq,
+        refused_accounts: refused,
+        renderer_version: admission.renderer_version,
+        render_config: &admission.render_config,
+        run_config: &run_config,
+        reask: false,
+    };
+    // An offer is taken only while routing still reserves its account. One that lapsed before
+    // the move could be written is dead: routing is asked once more, under a new selection id,
+    // within what is left of the wall's budget, and a second unusable answer ends the run.
+    let mut wall = wall;
+    let (moved, now) = loop {
+        // A cancel or a stop does not wait for routing: an answer that arrives after either
+        // would move a run that must end or pause.
+        let answer = tokio::select! {
+            answer = continuer.ask(&wall) => answer,
+            () = seams.cancel.cancelled() => return Ok(Some(AtWall::Stopped)),
+            () = seams.stop.cancelled() => return Ok(Some(AtWall::Stopped)),
+        };
+        let moved = match answer {
+            Answer::Stay(answer) => return Ok(Some(AtWall::Stayed(answer))),
+            Answer::Move(moved) => moved,
+        };
+        // The executor checks these too, before it reads the offered credential, and logs what
+        // it refuses; they are checked again here because the loop is what must never send on
+        // such an account: one that refused this step already (the walled one included), or a
+        // selection that names another account than the offer.
+        if refused.contains(&moved.account)
+            || moved.selection.account_ref.as_deref() != Some(moved.account.as_str())
+        {
+            return Ok(Some(AtWall::Stayed(None)));
+        }
+        let now = (seams.now_ms)();
+        if now < moved.valid_until_ms {
+            break (moved, now);
+        }
+        if wall.reask {
+            return Ok(Some(AtWall::Stayed(None)));
+        }
+        wall.reask = true;
+    };
+    let ts_ms = Some(now);
+    let mut records = Vec::with_capacity(2);
+    if let Some((renderer_version, render_config)) = &moved.render {
+        records.push(Record::ConfigRefrozen(ConfigRefrozen {
+            run_id: admission.run_id.clone(),
+            ts_ms,
+            renderer_version: *renderer_version,
+            render_config: render_config.clone(),
+        }));
+    }
+    records.push(Record::AuthRefrozen(AuthRefrozen {
+        run_id: admission.run_id.clone(),
+        ts_ms,
+        auth_selection: serde_json::to_value(&moved.selection)
+            .map_err(|e| LoopError::Parts(e.to_string()))?,
+    }));
+    // Durable before anything is sent on the new account. On an error the move, and the
+    // provider built for it, are dropped here.
+    let first_seq = writer.append(&records, true).await?;
+    // Routing hears of the move, after the refused attempt's report and before any attempt on
+    // the new account: the account refreeze names it.
+    if let Some(reports) = &seams.account_reports {
+        let seq = first_seq + records.len() as u64 - 1;
+        reports.account_moved(
+            &format!("{}:{seq}", writer.session_id()),
+            seq,
+            &moved.selection,
+        );
+    }
+    continuer.adopted(&moved.selection);
+    Ok(Some(AtWall::Moved(moved)))
+}
+
+/// A provider's retry-after in whole seconds, rounded up, as routing's continue request takes
+/// it. A value that isn't a finite, non-negative number of seconds is left out.
+fn retry_after_seconds(secs: Option<f64>) -> Option<u64> {
+    let secs = secs?.ceil();
+    (secs.is_finite() && secs >= 0.0 && secs < u64::MAX as f64).then_some(secs as u64)
+}
+
+/// Whether run `run_id` moved to another account at a quota wall, read from its records.
+///
+/// Two writers record `AuthRefrozen` for a run: a move at a wall, and the resume of a paused
+/// run that routing gave another account than the one it froze. A resume writes its refreezes
+/// in one append together with its `Resumed` record, whose `resumed_from_seq` is the seq just
+/// before that append, so a refreeze inside a resume's append lies after some `Resumed`'s
+/// `resumed_from_seq` and before that `Resumed`. A move writes no `Resumed`. So an
+/// `AuthRefrozen` of the run that no `Resumed` encloses this way is a move at a wall.
+///
+/// `records` must hold the run's records, as the open log of a session holds an unfinished
+/// run's. A move that is not among them reads as no move: the run then keeps the account it
+/// recorded rather than asking routing again.
+pub fn moved_at_a_wall(run_id: &str, records: &[(u64, Record)]) -> bool {
+    let resumes: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|(seq, record)| match record {
+            Record::Resumed(resumed) if resumed.run_id == run_id => {
+                Some((resumed.resumed_from_seq, *seq))
+            }
+            _ => None,
+        })
+        .collect();
+    records.iter().any(|(seq, record)| {
+        matches!(record, Record::AuthRefrozen(refrozen) if refrozen.run_id == run_id)
+            && !resumes
+                .iter()
+                .any(|(from, resumed)| from < seq && seq < resumed)
+    })
+}
+
+/// The accounts that refused step `step_id` of run `run_id` at a quota wall and that the run
+/// moved away from, read from its records: for each move at a wall (an `AuthRefrozen` no
+/// resume wrote, see [`moved_at_a_wall`]), the account that served the run's latest attempt
+/// before it, when that attempt belongs to the step. The wall being handled is added by the
+/// caller.
+pub fn refused_in_step(records: &[(u64, Record)], run_id: &str, step_id: u64) -> Vec<String> {
+    let resumes: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|(seq, record)| match record {
+            Record::Resumed(resumed) if resumed.run_id == run_id => {
+                Some((resumed.resumed_from_seq, *seq))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut refused = Vec::new();
+    let mut latest: Option<(u64, Option<String>)> = None;
+    for (seq, record) in records {
+        match record {
+            Record::Attempt(attempt) if attempt.run_id == run_id => {
+                latest = Some((attempt.step_id, attempt.served_account_ref.clone()));
+            }
+            Record::AuthRefrozen(refrozen)
+                if refrozen.run_id == run_id
+                    && !resumes
+                        .iter()
+                        .any(|(from, resumed)| from < seq && seq < resumed) =>
+            {
+                if let Some((step, Some(account))) = &latest {
+                    if *step == step_id && !refused.contains(account) {
+                        refused.push(account.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refused
+}
+
+/// Whether a resume of `run` can durably record a change of account before it calls the
+/// provider: the run is paused for a sign-in or for a restart, whose resume writes the account
+/// and the config that names it together with its `Resumed` record. Every other resume (a run
+/// waiting on a held tool call, a crash's resume, a timed pause on the account's limit, which
+/// may only continue on its own account) records no such change, so it must continue on the
+/// account it recorded.
+pub fn resume_can_record_account_change(run: &broca_session_store::fold::operations::Run) -> bool {
+    matches!(
+        run.resolution(),
+        broca_session_store::fold::operations::Resolution::Paused(
+            broca_protocol::PauseReason::AuthRequired | broca_protocol::PauseReason::Restart
+        )
+    )
+}
+
+/// The account `run` sends on now: its newest `AuthRefrozen` (a move to another account at a
+/// quota wall, or a resume on the account routing gave it), else the one its start froze. A
+/// reader that checks something against the run's account, such as a steer's auth pin, reads it
+/// here rather than from the start.
+pub fn current_auth_selection(
+    run: &broca_session_store::fold::operations::Run,
+    parts: &dyn crate::parts::Parts,
+) -> Result<Option<broca_wal::AuthSelection>, LoopError> {
+    if let Some(refrozen) = &run.refrozen_auth {
+        return serde_json::from_value(refrozen.clone())
+            .map(Some)
+            .map_err(|e| LoopError::Parts(format!("the run's account refreeze: {e}")));
+    }
+    let start = run.start.as_ref().ok_or(LoopError::Unsupported(
+        "a run whose start isn't in the fold",
+    ))?;
+    Ok(crate::run::admission_of_start(start, parts)?.auth_selection)
+}
+
+/// Stores routing's answer in `account_continue` on the error that ends a run whose account
+/// spent its usage window and which routing didn't move. A hold that names when an account
+/// should have room (`until_ms`) also tells the caller when to try again: `retry_after_secs`
+/// becomes the whole seconds from `now_ms`, when the run ends with the error, to that time,
+/// rounded up and never below zero, unless the provider's own retry-after is already sooner.
+/// `resets_at_ms` stays the spent account's own reset. A hold without a time, and a refusal,
+/// leave `retry_after_secs` as it was.
+pub fn with_routing_answer(
+    error: &mut broca_protocol::ProviderError,
+    answer: AccountContinueAnswer,
+    now_ms: u64,
+) {
+    if let Some(until_ms) = answer.until_ms {
+        let retry = until_ms.saturating_sub(now_ms).div_ceil(1000) as f64;
+        if error.retry_after_secs.is_none_or(|own| retry < own) {
+            error.retry_after_secs = Some(retry);
+        }
+    }
+    error.account_continue = Some(Box::new(answer));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: u64 = 1_000_000;
+
+    fn refrozen(run_id: &str) -> Record {
+        Record::AuthRefrozen(AuthRefrozen {
+            run_id: run_id.into(),
+            ts_ms: None,
+            auth_selection: json!({"credential_id": "c"}),
+        })
+    }
+
+    fn resumed(run_id: &str, resumed_from_seq: u64) -> Record {
+        Record::Resumed(broca_session_store::record::Resumed {
+            run_id: run_id.into(),
+            resumed_from_seq,
+            messages: 0,
+            model_steps: 0,
+            tool_results: 0,
+            redone: Vec::new(),
+            indeterminate: Vec::new(),
+        })
+    }
+
+    fn config_refrozen(run_id: &str) -> Record {
+        Record::ConfigRefrozen(ConfigRefrozen {
+            run_id: run_id.into(),
+            ts_ms: None,
+            renderer_version: 1,
+            render_config: json!({}),
+        })
+    }
+
+    /// The provider's retry-after goes to routing in whole seconds, rounded up; an unusable
+    /// value is left out.
+    #[test]
+    fn a_retry_after_is_sent_in_whole_seconds_rounded_up() {
+        assert_eq!(retry_after_seconds(None), None);
+        assert_eq!(retry_after_seconds(Some(604_800.0)), Some(604_800));
+        assert_eq!(retry_after_seconds(Some(1.2)), Some(2));
+        assert_eq!(retry_after_seconds(Some(0.0)), Some(0));
+        assert_eq!(retry_after_seconds(Some(-1.0)), None);
+        assert_eq!(retry_after_seconds(Some(f64::NAN)), None);
+        assert_eq!(retry_after_seconds(Some(f64::INFINITY)), None);
+    }
+
+    /// A refreeze a resume wrote with its `Resumed` is not a move; one written on its own, as
+    /// a move at a wall writes it, is, also when a later resume of the moved run follows it.
+    #[test]
+    fn only_a_refreeze_outside_a_resume_is_a_move_at_a_wall() {
+        // A sign-in pause's resume on another account: the refreezes ride the resume's append.
+        let resumed_on_another = vec![
+            (10, config_refrozen("run")),
+            (11, refrozen("run")),
+            (12, resumed("run", 9)),
+        ];
+        assert!(!moved_at_a_wall("run", &resumed_on_another));
+        // A move at a wall, then a restart pause's resume with no refreeze, its batch starting
+        // right after the move.
+        let moved_then_resumed = vec![
+            (20, config_refrozen("run")),
+            (21, refrozen("run")),
+            (22, resumed("run", 21)),
+        ];
+        assert!(moved_at_a_wall("run", &moved_then_resumed));
+        // A move followed by a resume that refroze again: the run did move at a wall.
+        let moved_then_refrozen = vec![
+            (30, refrozen("run")),
+            (40, refrozen("run")),
+            (41, resumed("run", 39)),
+        ];
+        assert!(moved_at_a_wall("run", &moved_then_refrozen));
+        // Another run's records say nothing about this one.
+        assert!(!moved_at_a_wall("other", &moved_then_resumed));
+        assert!(!moved_at_a_wall("run", &[]));
+    }
+
+    fn limit_error(retry_after_secs: Option<f64>) -> broca_protocol::ProviderError {
+        let mut error = json!({
+            "class": "transient",
+            "message": "the account's usage window is spent",
+            "status": 429,
+            "provider_code": "account_limit_exhausted",
+            "resets_at_ms": NOW + 3 * 86_400_000,
+            "limit_window": "seven_day",
+        });
+        if let Some(secs) = retry_after_secs {
+            error["retry_after_secs"] = json!(secs);
+        }
+        serde_json::from_value(error).unwrap()
+    }
+
+    fn hold(until_ms: Option<u64>) -> AccountContinueAnswer {
+        AccountContinueAnswer {
+            routing_code: "no_compatible_account".into(),
+            until_ms,
+        }
+    }
+
+    /// A hold sooner than anything the provider said sets the retry time to it, rounded up to
+    /// whole seconds; the account's own reset is kept.
+    #[test]
+    fn a_hold_with_a_time_sets_the_retry_time() {
+        let mut error = limit_error(None);
+        with_routing_answer(&mut error, hold(Some(NOW + 90_001)), NOW);
+        assert_eq!(error.retry_after_secs, Some(91.0));
+        assert_eq!(error.resets_at_ms, Some(NOW + 3 * 86_400_000));
+        assert_eq!(
+            error.account_continue,
+            Some(Box::new(hold(Some(NOW + 90_001))))
+        );
+
+        let mut sooner = limit_error(Some(600.0));
+        with_routing_answer(&mut sooner, hold(Some(NOW + 60_000)), NOW);
+        assert_eq!(sooner.retry_after_secs, Some(60.0));
+
+        // A time already past retries at once.
+        let mut past = limit_error(None);
+        with_routing_answer(&mut past, hold(Some(NOW - 5_000)), NOW);
+        assert_eq!(past.retry_after_secs, Some(0.0));
+    }
+
+    /// The provider's own retry-after wins when it is sooner than the hold's time.
+    #[test]
+    fn a_later_hold_keeps_the_providers_sooner_retry_time() {
+        let mut error = limit_error(Some(30.0));
+        with_routing_answer(&mut error, hold(Some(NOW + 3_600_000)), NOW);
+        assert_eq!(error.retry_after_secs, Some(30.0));
+        assert!(error.account_continue.is_some());
+    }
+
+    /// A hold without a time and a refusal carry routing's answer and leave the retry time as
+    /// it was.
+    #[test]
+    fn a_hold_without_a_time_or_a_refusal_leaves_the_retry_time() {
+        for own in [None, Some(30.0)] {
+            let mut held = limit_error(own);
+            with_routing_answer(&mut held, hold(None), NOW);
+            assert_eq!(held.retry_after_secs, own);
+            assert_eq!(held.account_continue, Some(Box::new(hold(None))));
+
+            let refusal = AccountContinueAnswer {
+                routing_code: "account_pinned".into(),
+                until_ms: None,
+            };
+            let mut refused = limit_error(own);
+            with_routing_answer(&mut refused, refusal.clone(), NOW);
+            assert_eq!(refused.retry_after_secs, own);
+            assert_eq!(refused.account_continue, Some(Box::new(refusal)));
+        }
+    }
+}

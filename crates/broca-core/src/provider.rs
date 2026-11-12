@@ -16,6 +16,41 @@ use tokio_util::sync::CancellationToken;
 
 pub type LiveStepProgress = Arc<Mutex<Option<broca_protocol::provider::InFlightStep>>>;
 
+/// A recorded model attempt and the request reconstructed from its durable inputs.
+pub struct CachePredecessor {
+    pub request: crate::RecordedRequest,
+    pub sent_at_ms: Option<u64>,
+    pub account: Option<String>,
+    pub locator: String,
+    pub view: Option<u64>,
+}
+
+#[async_trait]
+pub trait CachePredecessorLoader: Send + Sync {
+    async fn load(&self) -> Result<Option<CachePredecessor>, String>;
+}
+
+/// What a session's history proves about accepted model sends on one account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedSendEvidence {
+    NotLoaded,
+    At(u64),
+    /// No accepted send was found before crossing the frozen cache policy's lifetime.
+    NoneWithinWindow,
+    /// The entire available ledger was searched without an accepted send.
+    None,
+}
+
+impl AcceptedSendEvidence {
+    pub fn loaded_at_ms(self) -> Option<Option<u64>> {
+        match self {
+            Self::NotLoaded => None,
+            Self::At(sent) => Some(Some(sent)),
+            Self::NoneWithinWindow | Self::None => Some(None),
+        }
+    }
+}
+
 /// Session-owned media rendering, installed when media is enabled at boot.
 /// The booleans select tag rendering and commit the durable step boundary to aging,
 /// respectively. That commit is not physical-send permission.
@@ -82,6 +117,10 @@ pub trait Provider: Send + Sync {
     /// Exclusively acquire any in-memory connection retained for this full session bind.
     fn bind_run_transport(&self, _session: &broca_protocol::BindIdentity) {}
 
+    /// Install a read of the last recorded request, used only when a cache diagnostic
+    /// comparison after a restart needs its predecessor. Installing it performs no history reads.
+    fn set_cache_predecessor_loader(&self, _loader: Arc<dyn CachePredecessorLoader>) {}
+
     /// Restore the bound session's diagnostic predecessor once per WAL lineage, or after
     /// an aborted in-flight attempt left its predecessor state unavailable.
     fn cache_evidence_needs_seed(&self, _lineage: Option<&str>) -> bool {
@@ -97,6 +136,15 @@ pub trait Provider: Send + Sync {
     fn set_cache_evidence_view(&self, _view: Option<u64>) {}
     fn annotate_cache_evidence(&self, _attempt: &mut broca_protocol::ModelAttempt) {}
     fn cache_attempt_recorded(&self, _locator: Option<String>) {}
+
+    /// Restore accepted-send evidence read from a bounded session-store tail. Other accounts
+    /// remain unloaded until their own history is read.
+    fn seed_accepted_send(&self, _account: &str, _evidence: AcceptedSendEvidence) {}
+
+    fn accepted_send_evidence(&self, account: &str) -> AcceptedSendEvidence {
+        self.last_accepted_at_ms(account)
+            .map_or(AcceptedSendEvidence::NotLoaded, AcceptedSendEvidence::At)
+    }
 
     /// Latest 2xx model-attempt send for this account in the bound session. Refusals do
     /// not refresh this clock, even though cache diagnostics compare against the latest
@@ -373,6 +421,10 @@ impl Provider for Box<dyn Provider> {
         (**self).bind_run_transport(session);
     }
 
+    fn set_cache_predecessor_loader(&self, loader: Arc<dyn CachePredecessorLoader>) {
+        (**self).set_cache_predecessor_loader(loader)
+    }
+
     fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {
         (**self).cache_evidence_needs_seed(lineage)
     }
@@ -391,6 +443,14 @@ impl Provider for Box<dyn Provider> {
     }
     fn cache_attempt_recorded(&self, locator: Option<String>) {
         (**self).cache_attempt_recorded(locator)
+    }
+
+    fn seed_accepted_send(&self, account: &str, evidence: AcceptedSendEvidence) {
+        (**self).seed_accepted_send(account, evidence)
+    }
+
+    fn accepted_send_evidence(&self, account: &str) -> AcceptedSendEvidence {
+        (**self).accepted_send_evidence(account)
     }
 
     fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {

@@ -180,6 +180,8 @@ impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
+                pause_for_auth_at_start: None,
+                account_continue: None,
             };
             match mode {
                 StoreRunMode::Fresh => {
@@ -2339,13 +2341,13 @@ async fn send_keyed(
         .expect("the session opens")
 }
 
-/// Core's creating send to a new head starts the head in the new storage's durable root, on a
-/// module that creates no other session there, and on today's storage, on a module without the
-/// new storage, in today's durable folder; both on the current compaction contract. Core's retry
-/// of that send is answered as a retry, writing nothing, and core's next send runs as the
-/// session's next turn in the same storage. A view Magic Context applies while the head is idle
-/// is accepted alike, the turn after applies it at its first step alike, and the two histories
-/// read the same.
+/// Core's reader-bearing creating send starts a head in broca-session-store's durable root,
+/// even when the module creates no other session there. Legacy WAL storage refuses that plan
+/// without writing; the equivalent plan omitting readers still starts in its durable folder.
+/// Both admitted heads use compaction-provider/v2. Core's keyed retry writes nothing, and its
+/// next send runs as the next turn in the same storage. A view the synthetic compaction
+/// provider submits while the head is idle is accepted on both storages and applies at the
+/// next turn's first step; the two histories read the same.
 #[tokio::test]
 async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
@@ -2384,13 +2386,47 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     };
     let today = side(false).await;
     let store = side(true).await;
+    let refused = send_keyed(
+        &today,
+        &first_id,
+        core_head_request(&first, true),
+        Some(core_head_plan(&first)),
+        class,
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field: "plan.readers",
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(today.registry.slot_state(&today.key).is_none());
+    assert!(
+        !StorageClass::ALL.into_iter().any(|class| {
+            FileWalStore::new(today.dir.join("wal"))
+                .class_wal_path(class, &today.key)
+                .exists()
+        }),
+        "the refused reader plan created no legacy WAL"
+    );
+    let mut legacy_first = first.clone();
+    assert!(legacy_first["plan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("readers")
+        .is_some());
     let mut replies = Vec::new();
-    for side in [&today, &store] {
+    for (side, first) in [(&today, &legacy_first), (&store, &first)] {
         let reply = send_keyed(
             side,
             &first_id,
-            core_head_request(&first, true),
-            Some(core_head_plan(&first)),
+            core_head_request(first, true),
+            Some(core_head_plan(first)),
             class,
         )
         .await;
@@ -2434,13 +2470,13 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     // serve layer then fetches nothing and hands over the plan's identity alone.
     let written = current().await.open_log_records().await.unwrap().len();
     let mut retries = Vec::new();
-    for side in [&today, &store] {
-        let identity = core_head_plan(&first).identity;
+    for (side, first) in [(&today, &legacy_first), (&store, &first)] {
+        let identity = core_head_plan(first).identity;
         retries.push(
             send_keyed(
                 side,
                 &first_id,
-                core_head_request(&first, false),
+                core_head_request(first, false),
                 Some(planned(&identity, None)),
                 class,
             )

@@ -868,6 +868,7 @@ pub(crate) fn admission_refusal_outcome(error: RunError) -> SendOutcome {
 fn permanent_queued_refusal(message: String, provider_code: &'static str) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -881,6 +882,7 @@ fn permanent_queued_refusal(message: String, provider_code: &'static str) -> Pro
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -3072,6 +3074,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         message: error.to_string(),
                         provider_code: Some("held_resume_refused".into()),
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         status: None,
@@ -3082,6 +3085,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         account_ref: None,
                         credential_id: None,
                         affordable_max_tokens: None,
+                        account_continue: None,
                     };
                     self.write_interrupted_seal_with_error(
                         None,
@@ -3155,6 +3159,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => {
                     let refusal = ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -3168,6 +3173,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         account_ref: None,
                         credential_id: None,
                         affordable_max_tokens: None,
+                        account_continue: None,
                     };
                     let sealed = async {
                         self.write_interrupted_seal_with_error(

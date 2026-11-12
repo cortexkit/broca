@@ -675,8 +675,12 @@ This is the exception to ordinary startup's nonblocking deployment-key load. The
 crash-orphan seal and usage-export backfill finish before conversion starts. An unexpected
 conversion failure blocks only its session: `session_unconverted`, `detail.class: "permanent"`,
 with the ledger's class in `detail.refusal_class`. Other sessions resume service after the live
-pass. With `archives` enabled, the background job converts archived members one at a time, then
-idle live logs oldest last-write first, with a pause between sessions. The registry
+pass. With `archives` enabled, the background job prioritizes archived members, then
+idle live logs oldest last-write first, with a pause outside each worker's session fence.
+Startup and background conversion use two workers; an offline `--convert-clone` rehearsal uses
+half the available cores (at least one, capped at eight). Sources sharing an archive container,
+backup path or session address run serially, including overlapping archive snapshots. Other
+sessions may finish out of selection order. The registry
 selects a live session only with no opening, open or closing actor and no durable active or
 paused run, queued send or held call, under the session's admission fence. Busy sessions are
 skipped and revisited on later passes, never waited on. During conversion that session's
@@ -715,7 +719,10 @@ reports `live_background_converted` and `live_skipped_busy` since process start,
 `live_remaining` as of the latest pass (including deferred or failed live sources), and
 `deferred_no_identity` counting identity-less live files deferred across passes. Failed and
 refused ledger rows retain the error message; verification details name the mismatched check
-and first differing response field or message ordinal. Each failed attempt logs a WARN with source path, class
+and first differing response field or message ordinal. A session conversion panic uses the same
+failure path, with refusal class `panic` and its panic message in the detail; the other workers
+continue. Failed sessions are retried on later passes or restart, while final rows are skipped.
+Each failed attempt logs a WARN with source path, class
 and detail. The standalone `--convert-clone` command, which tests conversion on an
 operator-supplied state-root copy without starting the daemon, writes these warnings to stderr.
 
@@ -2251,6 +2258,38 @@ reply that would exceed the read frame limit refuses with `too_large`; it is
 never truncated.
 Sessions kept on the old storage refuse with `not_served_on_old_storage`.
 
+## 15b. Plan-named readers
+
+Broca declares `app_readers` for sessions kept in the new storage. A plan's optional
+`readers` array contains distinct principal strings, matched exactly against the route's
+attested module identity, never a request parameter. A malformed or duplicate entry refuses
+`invalid_params` with `detail.field: "plan.readers"` before writing. A session kept on today's
+storage refuses any plan carrying the member, including an empty list, by that same field.
+Omitting `readers` preserves existing read admission.
+
+When `readers` is present, `session.head`, `session.read`, `session.plan_view`,
+`session.history`, `run.status`, `role.describe` and `session.subscribe` admit only named
+readers, the session owner, the effective plan's compaction provider, and direct local
+operator connections. Missing, unverified and unknown caller identities do not match a
+reader string. Everyone else gets `scope_owner_mismatch` before operation dispatch; a cold
+session obtains its stored view through the shared view cache to read authorization metadata,
+but never opens an actor or builds a page for a refused caller.
+
+A durably accepted refresh changes reader admission immediately, even during a run or when
+tools and system text must wait for a later prefix or history rebuild. Reader-only changes
+alter neither tools nor system text. Each open subscription rechecks its own caller and ends
+with `scope_owner_mismatch` when admission is
+lost; subscribers still admitted remain connected. The implicit compaction grant follows
+the effective plan, not a pending refresh: adding the first compaction provider grants it
+read access only when the next run applies that plan.
+
+A reader grant authorizes no send, cancel or retract. `session.send_status` and `send.status`
+retain their own-send checks: under a reader policy, only the owner and current plan-named
+senders are admitted, with a sender limited to its own sends or the predecessor named by
+its current `succeeds` grant. `run.result` and `run.tool_calls` keep their existing rules.
+The reader member is stored inside the existing opaque plan and its refresh setup parts;
+plans omitting it keep their previous stored bytes.
+
 ## 16. Subscribe to a terminal run
 
 Terminal state does not special-case attach behavior. `from:"start"` or a historical cursor
@@ -2970,10 +3009,12 @@ dispatch intent. `run.tool_calls` already preserved it. Ordinary keys and all `r
 bytes remain unchanged.
 
 An error `session.head` can carry `last_run_error: {class, retry_after_secs?,
-resets_at_ms?}`. Its values come from the same named run's terminal reconciliation
-as `run.status`, with the same caller-facing class mapping. Fractional retry delays
-are preserved; a missing delay remains absent. Paused, interrupted, successful and
-never-written sessions carry no error summary.
+resets_at_ms?, provider_code?}`. Its values come from the error `run.status` reports
+for the same named run, with the same caller-facing class mapping. Fractional retry
+delays are preserved; a missing delay remains absent. `provider_code` copies that
+run error's `provider_code` string verbatim, including `billing_exhausted` and
+`account_limit_exhausted`; an error without a code leaves the member absent.
+Paused, interrupted, successful and never-written sessions carry no error summary.
 
 Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
 `session_retention`: broca does not promise provider-chosen ride waits, marked

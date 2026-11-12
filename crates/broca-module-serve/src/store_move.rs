@@ -561,18 +561,19 @@ impl StoreMove {
         {
             return Err(not_movable(SESSION_BUSY));
         }
-        // Every run-index row must be terminal, have its usage recorded and owe no withdrawal.
-        // A row that doesn't is finished later by today's reconcilers, which read the WAL;
-        // once the session has moved they'd be refused by today's storage on every attempt.
+        // Every run-index row must be terminal, have its usage recorded and owe no withdrawal,
+        // but for the row of a run the move carries paused for sign-in. A row that isn't is
+        // finished later by today's reconcilers, which read the WAL; once the session has moved
+        // they'd be refused by today's storage on every attempt.
         let Some(rows) = &self.run_rows else {
             return Err(not_movable("reconcile_owed"));
         };
         let rows =
             rows(key).map_err(|error| unavailable("the run index couldn't be read", error))?;
-        if rows
-            .iter()
-            .any(|row| !row.state.is_terminal() || row.usage.is_none() || row.withdrawals_owed)
-        {
+        if !broca_session_convert::preconditions::run_rows_settled(
+            &rows,
+            broca_session_convert::preconditions::paused_for_sign_in(records).as_deref(),
+        ) {
             return Err(not_movable("reconcile_owed"));
         }
         Ok(())

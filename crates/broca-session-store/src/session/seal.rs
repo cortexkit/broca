@@ -97,6 +97,8 @@ pub(super) struct Created {
     pub(super) abandoned: Option<String>,
     /// Set by the cold step: the head records when the session went cold.
     pub(super) cold_since_ms: Option<u64>,
+    /// What the change saves of the session's media, which the commit installs.
+    pub(super) media: Option<super::media_index::MediaCommit>,
 }
 
 /// The open log as read back: its records, its batches, and its checkpoint.
@@ -430,6 +432,9 @@ impl<B: SessionBackend> Session<B> {
         // The commit settles the intent, so state carried past it has no open change.
         let mut settled = self.operations.clone();
         settled.open_change = None;
+        // The media index current through the intent, saved with the new checkpoint; an index the
+        // checkpoint no longer names is deleted with the rest of what the change replaced.
+        let (mut media, media_replaced) = self.media_for_seal(&name, intent_seq).await?;
 
         let pages = Pages {
             backend: &self.backend,
@@ -450,6 +455,7 @@ impl<B: SessionBackend> Session<B> {
             forced_merges: 0,
         };
         let mut replaced = Vec::new();
+        replaced.extend(media_replaced);
         let mut transcript_dir = self.head.transcript_dir.clone();
         if !transcript.is_empty() {
             let object = format!("{name}/t");
@@ -502,6 +508,7 @@ impl<B: SessionBackend> Session<B> {
             transcript_base,
             ledger_base: Some(intent_seq),
             activity_ms: self.window.newest_activity_ms,
+            media: media.member(),
         }
         .encode();
         let ledger_sealed = self
@@ -576,10 +583,12 @@ impl<B: SessionBackend> Session<B> {
                 let seq = first + offset as u64;
                 window.note(seq, record);
                 open_ids.add(seq, record, place);
+                media.fold(seq, record, &conversation, &settled_after);
                 super::apply(&mut conversation, &mut settled_after, seq, record)
                     .map_err(SessionError::Fold)?;
             }
         }
+        media.flush();
         self.backend
             .append_log(&self.addr, &change, &bytes, 0, self.version, true)
             .await?;
@@ -602,6 +611,7 @@ impl<B: SessionBackend> Session<B> {
             history_version: None,
             abandoned: None,
             cold_since_ms: None,
+            media: Some(media),
         })
     }
 
@@ -757,6 +767,9 @@ impl<B: SessionBackend> Session<B> {
         // facts of messages that left the window are found through the directory.
         self.open_ids = created.open_ids;
         self.window = created.window;
+        if let Some(media) = created.media {
+            self.media.install(media);
+        }
         // The new log's records up to here were copied or carried, not appended, so none is kept;
         // a read asking for them reads the log.
         self.kept = super::kept::KeptRecords::from_next(self.encoder.next_seq(), false);

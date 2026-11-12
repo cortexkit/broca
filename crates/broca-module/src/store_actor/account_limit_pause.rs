@@ -198,6 +198,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             provider_code: Some("account_limit_resume_refused".into()),
             status: None,
             retry_after_secs: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             resets_at_ms: None,
@@ -207,6 +208,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             credential_id: None,
             affordable_max_tokens: None,
             provider_details: None,
+            account_continue: None,
         };
         let now = (self.now_ms)();
         broca_session_loop::run::end_run_with_error_and_interrupt_reason(

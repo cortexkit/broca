@@ -801,6 +801,7 @@ fn auth_error() -> NormalizedEvent {
     NormalizedEvent::Control(ProviderControl::Error {
         error: broca_protocol::ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -814,6 +815,7 @@ fn auth_error() -> NormalizedEvent {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         },
         retries_used: 0,
     })

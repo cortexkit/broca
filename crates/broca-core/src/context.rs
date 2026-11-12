@@ -3412,6 +3412,7 @@ mod tests {
                 run_id: RunId("next-run".into()),
                 error: broca_protocol::error::ProviderError {
                     provider_details: None,
+                    cause: None,
                     provider_subcode: None,
                     class: ErrorClass::Permanent,
                     message: "unknown model".into(),
@@ -3425,6 +3426,7 @@ mod tests {
                     account_ref: None,
                     credential_id: None,
                     affordable_max_tokens: None,
+                    account_continue: None,
                 },
             }),
         }]);
@@ -3904,6 +3906,7 @@ mod tests {
         };
         let terminal_error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -3917,6 +3920,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         *wal.last_mut().expect("sample has RunFinished") = WalRecord::RunFinished {
             interrupt_reason: None,
@@ -4176,6 +4180,7 @@ mod tests {
         let mut wal = sample_wal();
         let error = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,
@@ -4189,6 +4194,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         let last = wal.last_mut().expect("sample has terminal");
         *last = WalRecord::RunFinished {

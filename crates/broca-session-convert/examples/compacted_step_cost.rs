@@ -1145,6 +1145,8 @@ impl RunExecutor for BenchExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: None,
+                pause_for_auth_at_start: None,
+                account_continue: None,
             };
             broca_session_loop::run::run(&mut writer, parts.as_mut(), admission, &seams)
                 .await
@@ -1536,6 +1538,8 @@ async fn cut_run(
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
+        account_continue: None,
     };
     let window_start = Writer::conversation(session).window_start();
     let mut parts = parts.clone();

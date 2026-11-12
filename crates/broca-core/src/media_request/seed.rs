@@ -114,12 +114,22 @@ struct Index {
 
 impl Index {
     fn capture(session: &SessionMedia) -> Self {
-        let mut captures: Vec<_> = session.captures.values().cloned().collect();
-        captures.sort_by_key(|capture| capture.id);
+        let captures: Vec<_> = session
+            .captures
+            .iter()
+            .map(|capture| Capture {
+                id: capture.id,
+                reference: session.refs.get(capture.reference).clone(),
+                ordinal: capture.ordinal,
+                tool_call: capture.tool_call.clone(),
+                first_step: capture.first_step,
+                person: capture.person,
+            })
+            .collect();
         let mut held: Vec<_> = session
             .held_messages
             .iter()
-            .map(|(key, message)| (*key, Skeleton::capture(message)))
+            .map(|(key, copy)| (*key, Skeleton::capture(&copy.message(&session.refs, None))))
             .collect();
         held.sort_by_key(|(key, _)| *key);
         let mut batch_order: Vec<_> = session
@@ -140,7 +150,12 @@ impl Index {
             skeleton: session
                 .skeleton
                 .iter()
-                .map(|(ordinal, message)| (*ordinal, Skeleton::capture(message)))
+                .map(|(ordinal, copy)| {
+                    (
+                        *ordinal,
+                        Skeleton::capture(&copy.message(&session.refs, Some(*ordinal))),
+                    )
+                })
                 .collect(),
             held,
             batch_order,
@@ -164,15 +179,21 @@ impl Index {
         session.pending = self.pending;
         session.steers = self.steers;
         session.protected = self.protected;
+        session.feed = super::Feed::Records;
         session.skeleton = self
             .skeleton
             .into_iter()
-            .map(|(ordinal, message)| (ordinal, message.restore()))
+            .map(|(ordinal, message)| {
+                (
+                    ordinal,
+                    super::MessageCopy::Whole(Box::new(message.restore())),
+                )
+            })
             .collect();
         session.held_messages = self
             .held
             .into_iter()
-            .map(|(key, message)| (key, message.restore()))
+            .map(|(key, message)| (key, super::MessageCopy::Whole(Box::new(message.restore()))))
             .collect();
         session.batch_order = self.batch_order.into_iter().collect();
         session.replacements = self.replacements;

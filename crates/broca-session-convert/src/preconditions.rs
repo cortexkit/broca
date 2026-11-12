@@ -8,8 +8,10 @@ use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use broca_wal::{FramedRecord, WalLineageId, WalRecord};
 
-/// Open work: a run that hasn't ended (active, paused, or held by a provider), a send queued,
-/// pending or ordered and not yet delivered, or an approval still open.
+/// Open work a move can't carry: a run that hasn't ended (active, paused other than for sign-in,
+/// or holding calls), a send queued or pending other than an ordered send that waits for a tool
+/// result, or an approval still open. The two exceptions move as they are (see
+/// [`wal_refusal`]).
 pub const SESSION_BUSY: &str = "session_busy";
 /// A tool batch whose results arrived but which didn't close. Today's storage and the new one
 /// place such a turn's message at different times, so it can't be carried across.
@@ -29,12 +31,22 @@ pub const INPUT_TOKEN_BUDGET: &str = "input_token_budget";
 pub const FIRST_PROTOCOL_COMPACTION: &str = "first_protocol_compaction";
 
 /// The first reason the WAL `records` gives for not moving its session now, if any.
+///
+/// Two kinds of open work move with the session as they are, because the new storage serves
+/// them as today's does: an ordered send whose only delivery mode is `tool_result`, which waits
+/// for a later run's tool batch or a send that supersedes it, and a latest run paused for
+/// sign-in with no call held (see [`paused_for_sign_in`]), which waits for its own send's
+/// retry, a cancel or an interrupt. Today's storage leaves both as they are when it opens the
+/// session.
 pub fn wal_refusal(
     records: &[FramedRecord],
     lineage: Option<WalLineageId>,
 ) -> Option<&'static str> {
     let raw: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
-    if !broca_core::pending_submissions(&raw).is_empty() {
+    if !broca_core::pending_submissions(&raw)
+        .iter()
+        .all(waits_for_a_tool_result)
+    {
         return Some(SESSION_BUSY);
     }
     if let Some(lineage) = lineage {
@@ -42,9 +54,13 @@ pub fn wal_refusal(
             return Some(SESSION_BUSY);
         }
     }
+    let paused = paused_in(&raw);
     let unfinished = raw.iter().any(|record| match record {
-        WalRecord::RunStarted { run_id, .. } => broca_core::reconcile_run_state(&raw, &run_id.0)
-            .is_none_or(|state| !state.state.is_terminal()),
+        WalRecord::RunStarted { run_id, .. } => {
+            paused.as_deref() != Some(run_id.0.as_str())
+                && broca_core::reconcile_run_state(&raw, &run_id.0)
+                    .is_none_or(|state| !state.state.is_terminal())
+        }
         _ => false,
     });
     if unfinished {
@@ -67,6 +83,50 @@ pub fn wal_refusal(
         return Some(UNSUPPORTED_FEATURE);
     }
     None
+}
+
+/// Whether the pending send `pending` is an ordered send that only a tool result delivers: it
+/// joins no run by itself, and today's storage keeps it queued until a later run's tool batch
+/// carries it or a send with its dedupe key supersedes it.
+fn waits_for_a_tool_result(pending: &broca_core::PendingSubmission) -> bool {
+    pending
+        .order
+        .as_ref()
+        .is_some_and(|order| order.modes == [broca_protocol::DeliveryMode::ToolResult])
+}
+
+/// The run id of the session's latest run when it is paused for sign-in with no call held, no
+/// step in flight and no tool batch open: the one unfinished run a move carries as it is. Today's
+/// storage leaves such a run paused when it opens the session (its restart resume skips sign-in
+/// pauses), and answers a new send with the pause, until the run's own send is retried, or the
+/// run is cancelled or interrupted.
+pub fn paused_for_sign_in(records: &[FramedRecord]) -> Option<String> {
+    let raw: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
+    paused_in(&raw)
+}
+
+fn paused_in(raw: &[WalRecord]) -> Option<String> {
+    let latest = broca_core::replay(raw).ok()?.run_id?;
+    let state = broca_core::reconcile_run_state(raw, &latest.0)?;
+    let paused = state.state == broca_core::RunIndexState::Paused
+        && state.pause_reason == Some(broca_protocol::PauseReason::AuthRequired)
+        && state.held_calls.is_empty()
+        && state.live_step.is_none();
+    paused.then_some(latest.0)
+}
+
+/// Whether the session's run-index rows `rows` let it move: each terminal with its usage recorded
+/// and no withdrawal owed, which today's reconcilers would otherwise finish from a WAL the move
+/// takes away. The row of a run the move carries paused for sign-in (`paused`, from
+/// [`paused_for_sign_in`]) is the exception: it is paused, without usage, and nothing finishes it
+/// but the run itself, on the new storage.
+pub fn run_rows_settled(rows: &[broca_core::RunIndexRow], paused: Option<&str>) -> bool {
+    rows.iter().all(|row| {
+        let carried = paused == Some(row.run_id.as_str())
+            && row.state == broca_core::RunIndexState::Paused
+            && !row.withdrawals_owed;
+        carried || (row.state.is_terminal() && row.usage.is_some() && !row.withdrawals_owed)
+    })
 }
 
 /// The first feature the new run loop refuses that the WAL `records` use, of those the WAL alone

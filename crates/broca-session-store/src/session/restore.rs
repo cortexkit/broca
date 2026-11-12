@@ -307,6 +307,8 @@ enum Named {
     Import(ImportedIds),
     /// An enrollment's decisions.
     Enrollment(crate::record::EnrollmentOverlayRef),
+    /// The saved media index a checkpoint names.
+    MediaIndex(String),
 }
 
 /// The setup parts `record` names, which were stored before it was appended.
@@ -349,6 +351,21 @@ fn named_by_state(operations: &Operations) -> Vec<Named> {
             .enrolled
             .as_ref()
             .map(|enrolled| Named::Enrollment(enrolled.overlay.clone())),
+    );
+    named
+}
+
+/// The files a log's checkpoint names: what its operational state names, and its saved media
+/// index. The media index is derived, but a version naming one is complete only with it, as with
+/// an import's id map.
+fn named_by_checkpoint(checkpoint: &Checkpoint) -> Vec<Named> {
+    let mut named = named_by_state(&checkpoint.operational);
+    named.extend(
+        checkpoint
+            .media
+            .as_ref()
+            .and_then(|media| media.object.clone())
+            .map(Named::MediaIndex),
     );
     named
 }
@@ -420,6 +437,13 @@ impl<B: SessionBackend> Objects<'_, B> {
                     .await?
                     .is_some_and(|bytes| EnrolledEntries::decode(&bytes).is_ok());
                 Ok((!whole).then(|| format!("enrollment overlay {name}")))
+            }
+            Named::MediaIndex(name) => {
+                let whole = self
+                    .sealed_object(name)
+                    .await?
+                    .is_some_and(|bytes| super::media_index::is_whole(&bytes));
+                Ok((!whole).then(|| format!("media index {name}")))
             }
         }
     }
@@ -542,7 +566,7 @@ async fn check_version<B: SessionBackend>(
     // What the checkpoint's state names was written before the change that wrote the
     // checkpoint.
     if let Some(what) = objects
-        .first_lacking(named_by_state(&checkpoint.operational))
+        .first_lacking(named_by_checkpoint(&checkpoint))
         .await?
     {
         return Err(lacks(what));

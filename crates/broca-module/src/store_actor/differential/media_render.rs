@@ -75,6 +75,7 @@ fn refusal(code: String) -> broca_protocol::ProviderError {
         message: code.clone(),
         provider_code: Some(code),
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         status: None,
@@ -85,6 +86,7 @@ fn refusal(code: String) -> broca_protocol::ProviderError {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 
@@ -152,8 +154,28 @@ impl Provider for Rendering {
 }
 
 /// The tool plane of both sides: `photo` answers with an image captured for its call through
-/// the batch's capture, as a tool module's image reaches the session; `read` answers text.
+/// the batch's capture, as a tool module's image reaches the session; `read` answers text;
+/// `wait` answers once the test releases the hold its input names (see [`ToolHold`]).
 struct PhotoPlane(StubToolPlane);
+
+/// A `wait` call the test holds, so it can take the state root while the call runs, as a crash
+/// finds it. A call names its hold by its input's `hold` member.
+#[derive(Default)]
+struct ToolHold {
+    /// How many calls reached the hold.
+    reached: std::sync::atomic::AtomicUsize,
+    /// Lets the waiting call answer.
+    released: tokio::sync::Notify,
+}
+
+/// The holds `wait` calls name, by name.
+static HOLDS: Mutex<std::collections::BTreeMap<String, Arc<ToolHold>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// A hold named `name`, which a `wait` call naming it waits on.
+fn tool_hold(name: &str) -> Arc<ToolHold> {
+    Arc::clone(HOLDS.lock().unwrap().entry(name.to_owned()).or_default())
+}
 
 impl PhotoPlane {
     fn new() -> Self {
@@ -173,6 +195,21 @@ impl ToolPlane for PhotoPlane {
     }
 
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        if call.tool_name == "wait" {
+            let name = call.input["hold"]
+                .as_str()
+                .expect("a wait call names its hold");
+            let hold = tool_hold(name);
+            hold.reached.fetch_add(1, Ordering::SeqCst);
+            hold.released.notified().await;
+            return DispatchResult::Completed(broca_protocol::ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "waited".into(),
+                },
+                is_error: false,
+            });
+        }
         if call.tool_name != "photo" {
             return self.0.dispatch(ctx, call).await;
         }
@@ -283,43 +320,18 @@ impl RenderExecutor {
 }
 
 /// The new storage's renderer, installed as the module's executor installs it for a store run
-/// that may carry media: ready once the session's media fold is, each model call waiting for it.
+/// that may carry media: ready once the session's image index is, each model call waiting for it.
 fn install_store(
     job_media: Option<crate::store_media::StoreRunMediaWait>,
     holds_media: bool,
     tools: bool,
-    budget: Option<broca_protocol::request::BudgetConfig>,
     provider: &Rendering,
 ) -> Result<Option<Arc<dyn broca_session_loop::run::ModelCallReady>>, RunError> {
     if !(holds_media || tools) {
         return Ok(None);
     }
     let media = job_media.ok_or_else(|| RunError::Wal("store_media_unavailable".into()))?;
-    let frozen: broca_provider::wire::FrozenRenderConfig =
-        serde_json::from_value(image_render_config()).unwrap();
-    let lazy = crate::store_media::LazyRenderer::new(
-        media,
-        Box::new(move |bytes, checkpoint, read_tail| {
-            let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                bytes,
-                checkpoint,
-                budget,
-                frozen.media,
-                read_tail,
-            )?;
-            Ok(Arc::new(
-                move |frozen: &Value,
-                      opts: &broca_protocol::request::CallOptions,
-                      tags: bool,
-                      commit: bool,
-                      provenance: Option<
-                    &mut broca_protocol::render_provenance::RenderProvenance,
-                >| {
-                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                },
-            ) as Arc<MediaRequestRenderer>)
-        }),
-    );
+    let lazy = crate::store_media::LazyRenderer::new(media, Box::new(|media| Ok(media.renderer())));
     provider.set_media_request_renderer(lazy.renderer());
     Ok(Some(lazy))
 }
@@ -407,17 +419,13 @@ impl RunExecutor for RenderExecutor {
                         .map(|message| &**message),
                 )
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
-            let budget = writer
-                .operations()
-                .run
-                .as_ref()
-                .and_then(|run| run.start.as_ref())
-                .map(|start| broca_session_loop::run::run_config_of_start(start, parts.as_ref()))
-                .transpose()
-                .map_err(StoreRunError::Loop)?
-                .and_then(|config| config.budget);
-            let ready = install_store(media, holds_media, !req.tools.is_empty(), budget, &provider)
-                .map_err(StoreRunError::Admission)?;
+            // A seal writes its records and calls no model, so, as the module's executor does,
+            // it installs no media renderer and waits for none of the session's media state.
+            let ready = match mode {
+                crate::executor::StoreRunMode::Seal(_) => None,
+                _ => install_store(media, holds_media, !req.tools.is_empty(), &provider)
+                    .map_err(StoreRunError::Admission)?,
+            };
             let tools = PhotoPlane::new();
             let now = || 1;
             let seams = broca_session_loop::Seams {
@@ -441,6 +449,8 @@ impl RunExecutor for RenderExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: ready,
+                pause_for_auth_at_start: None,
+                account_continue: None,
             };
             match mode {
                 crate::executor::StoreRunMode::Fresh => {
@@ -1377,4 +1387,6 @@ async fn a_photo_between_numbered_messages_renders_alike(cipher: Cipher) {
     );
 }
 
+mod crash_cuts;
 mod import_media;
+mod tool_crash;

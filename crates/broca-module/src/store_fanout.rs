@@ -78,6 +78,7 @@ impl CursorIdentity {
 /// One item of the live broadcast, in the order the session recorded what it stands for.
 #[derive(Debug, Clone)]
 pub(crate) enum LiveItem {
+    AdmissionChanged,
     Unit(Arc<ControlEvent>),
     /// The live projection lost continuity: every subscriber resumes from its last cursor.
     Detach,
@@ -605,6 +606,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             .ring
             .send(LiveItem::AccessEnded(Box::new(refusal)));
     }
+
+    /// Wake idle streams after durable policy acceptance. Each route checks its own caller,
+    /// leaving subscribers whose admission is unchanged connected.
+    pub(crate) fn recheck_read_access(&self) {
+        let _ = self
+            .publisher
+            .lock()
+            .unwrap()
+            .ring
+            .send(LiveItem::AdmissionChanged);
+    }
 }
 
 impl<B> Drop for StoreFanout<B> {
@@ -997,6 +1009,11 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
                         continue;
                     }
                     if deliver(&sink, &cancel, Delivery::Control(event)).await.is_break() {
+                        return;
+                    }
+                }
+                Ok(LiveItem::AdmissionChanged) => {
+                    if deliver(&sink, &cancel, Delivery::AdmissionChanged).await.is_break() {
                         return;
                     }
                 }

@@ -260,6 +260,11 @@ pub struct ProviderError {
     /// Provider-specific error code, for telemetry/observability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
+    /// A broca-assigned, routable reason under `provider_code`. Unlike `provider_subcode`,
+    /// which is the provider's own code and must never be routed on, this vocabulary belongs
+    /// to broca. Today the only value is `signed_reasoning_rejected` under [`REQUEST_INVALID`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     /// The provider's own short code for an error broca has already given a typed
     /// `provider_code`, kept as a finer-grained diagnostic beneath it. Today it is set only on a
     /// [`REQUEST_INVALID`] error, where it carries the provider's reason for refusing the request
@@ -268,7 +273,7 @@ pub struct ProviderError {
     /// credentials.
     ///
     /// It is an open vocabulary the provider defines, so a consumer must never route on it:
-    /// routing reads `class` and `provider_code`. The producer only admits a value matching
+    /// routing reads `class`, `provider_code`, and broca's optional `cause`. The producer only admits a value matching
     /// `[a-z0-9_]{1,64}` (anything else is dropped, never rewritten), so it is always a short
     /// identifier and never message text. `provider_subcode` is absent on every other error, so
     /// their serialized bytes are unchanged by this field's existence.
@@ -321,6 +326,26 @@ pub struct ProviderError {
     /// truncated. WAL records carrying this field require `google-rpc-error-details/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_details: Option<Box<GoogleRpcErrorDetails>>,
+    /// Why the run did not move to another account at this limit: routing's answer when the
+    /// run asked it for one and routing held or refused. Set only on an
+    /// [`ACCOUNT_LIMIT_EXHAUSTED`] error that ended a run, and only when routing answered; absent
+    /// on every other error, so their serialized bytes are unchanged by this field's existence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_continue: Option<Box<AccountContinueAnswer>>,
+}
+
+/// Routing's answer to a run that asked to move to another provider account after its own
+/// account's usage window was spent, when no move followed. See
+/// [`ProviderError::account_continue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountContinueAnswer {
+    /// Routing's code for why it offered no account: a hold (no account has room now) or a
+    /// refusal (this run may not move).
+    pub routing_code: String,
+    /// For a hold, when routing expects an account to have room, as an absolute UTC epoch in
+    /// milliseconds. Absent when routing didn't say, which means unknown, not now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
 }
 
 /// The `provider_code` of a rate-limit refusal that means ONE provider account has used up a

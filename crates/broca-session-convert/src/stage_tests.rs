@@ -63,19 +63,49 @@ fn record(value: serde_json::Value) -> WalRecord {
 /// Writes a WAL of two runs, each one model step answering in text, whose attempts recorded
 /// the digest of the request today's renderer builds for them, and reads it back.
 fn written(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>) {
+    written_with(root, false, &["Hello.", "Again."])
+}
+
+/// [`written`] with a run for each of `inputs`, or with `tagged` a WAL whose runner tags are
+/// stored on its records, as today's writer stamps them on a lineage that numbers its parts, each
+/// run's input one message of two text parts.
+fn written_with(
+    root: &Path,
+    tagged: bool,
+    inputs: &[&str],
+) -> (Vec<FramedRecord>, Option<WalLineageId>) {
     let path = root.join("session.wal");
-    let mut wal = broca_wal::FileWal::open(&path).unwrap();
+    // Stored runner tags are a WAL feature the log's floor must name before they're written.
+    let mut wal = broca_wal::FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME));
     let lineage = wal.lineage_id();
     let mut written: Vec<WalRecord> = Vec::new();
-    let mut append = |record: WalRecord, written: &mut Vec<WalRecord>| {
+    let mut tags = broca_core::tags::LineageTags::unstarted();
+    let mut append = |mut record: WalRecord, written: &mut Vec<WalRecord>| {
+        if tagged {
+            broca_core::tags::stamp(&mut tags, &mut record);
+        }
         wal.append(1, &record, true).unwrap();
         written.push(record);
     };
-    for (run, step, at, input, answer) in [
-        ("r1", 1u64, 1_000u64, "Hello.", "One."),
-        ("r2", 2, 2_000, "Again.", "Two."),
-    ] {
-        let start = run_started(run, at, input);
+    let answers = ["One.", "Two.", "Three.", "Four.", "Five.", "Six."];
+    for (index, (input, answer)) in inputs.iter().zip(answers).enumerate() {
+        let step = index as u64 + 1;
+        let at = step * 1_000;
+        let run = format!("r{step}");
+        let run = run.as_str();
+        let input = *input;
+        let mut start = run_started(run, at, input);
+        if tagged {
+            if let WalRecord::RunStarted { input: parts, .. } = &mut start {
+                *parts = std::sync::Arc::new(vec![serde_json::from_value(json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": input}, {"type": "text", "text": "More."}],
+                }))
+                .unwrap()]);
+            }
+        }
         let WalRecord::RunStarted { config, .. } = &start else {
             unreachable!()
         };
@@ -584,6 +614,47 @@ fn a_staged_session_agrees_with_its_wal_on_every_check() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A session holding a message too large to serve verifies. Today's storage and the new one both
+/// refuse the page that holds it, and each refusal counts the whole page's size. That size
+/// includes the members a move changes by design (the head, incarnation and history version), so
+/// the two refusals differ by exactly what the pages served before it differ by.
+#[test]
+fn a_message_too_large_to_serve_is_refused_alike() {
+    let root = scratch("too-large");
+    let large = "x".repeat(5 << 20);
+    let (records, lineage) = written_with(
+        &root,
+        false,
+        &["Hello.", "Again.", "Third.", "Fourth.", &large],
+    );
+    let staged = staged(&root, &records, lineage);
+    let verified = verified(&root, &records, lineage, &staged.converted, Mode::Move).unwrap();
+    assert!(verified.checks.contains(&"read"));
+    assert!(verified.checks.contains(&"history_display"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A session on a lineage whose runner tags are stored on its records verifies, the next send's
+/// request included. The next send repeats the session's last run start with a one-part input,
+/// numbered on from the lineage's last part as today's writer numbers an appended run start, not
+/// with the tags of the two-part input it repeats, which don't cover its parts.
+#[test]
+fn a_session_with_stored_runner_tags_verifies_its_next_send() {
+    let root = scratch("stored-tags");
+    let (records, lineage) = written_with(&root, true, &["Hello.", "Again."]);
+    assert!(
+        records.iter().any(|frame| matches!(
+            &frame.record,
+            WalRecord::RunStarted { tags: Some(tags), .. } if tags[0].parts.len() == 2
+        )),
+        "the run starts carry tags for their two parts"
+    );
+    let staged = staged(&root, &records, lineage);
+    let verified = verified(&root, &records, lineage, &staged.converted, Mode::Move).unwrap();
+    assert!(verified.checks.contains(&"next_request"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A difference planted in the WAL the staged session is checked against fails the check that
 /// compares it: a changed answer fails `run.result`, a changed prompt fails `session.read`.
 #[test]
@@ -641,7 +712,7 @@ fn delivered_messages_rebuild_after_staging(mode: &str) {
             json!({"type": "run_finished", "reason": "completed", "usage": {}, "retries_used": 0}),
         ),
     ]);
-    let staged = staged(&root, &records, None);
+    staged(&root, &records, None);
     let staging = root.join("session-store/staging/store-move-test");
     let view = block_on(Session::view(
         LocalBackend::new(&staging),
@@ -650,15 +721,11 @@ fn delivered_messages_rebuild_after_staging(mode: &str) {
         &deployment(),
     ))
     .unwrap();
-    let parts = broca_session_loop::parts::MemoryParts {
-        parts: staged.converted.parts,
-    };
-    let mut fold = broca_module::store_media::MediaFold::new(session());
-    block_on(fold.catch_up(&view, &parts));
-    assert_eq!(
-        fold.broken(),
-        None,
-        "the stored receipt must name its delivery"
+    let last = view.next_seq() - 1;
+    let history = block_on(view.media_history(last));
+    assert!(
+        history.is_ok(),
+        "the stored session must fold for media: {history:?}"
     );
     drop(view);
     std::fs::remove_dir_all(root).unwrap();
@@ -1151,6 +1218,90 @@ fn a_final_message_is_named_alike_on_a_log_with_a_compaction_plan() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// An imported session's seeded run: a run start that seeds a user prompt and an assistant reply
+/// from the source, ended completed with no step. Today's `run.result` serves the seeded reply as
+/// the run's final message; the converted session serves the same, not a refusal of a completed
+/// run that placed no message. A later run of the session answers from its own reply, as before.
+#[test]
+fn an_imported_runs_final_message_is_served_alike() {
+    use broca_module::store_status::{todays, Reader};
+    use broca_session_store::backend::MemoryBackend;
+    let mut seed = run_started("run-iid-import", 1_000, "Imported prompt.");
+    if let WalRecord::RunStarted { input, origin, .. } = &mut seed {
+        *input = std::sync::Arc::new(vec![
+            serde_json::from_value(json!({
+                "role": "user", "content": [{"type": "text", "text": "Imported prompt."}],
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "role": "assistant", "content": [{"type": "text", "text": "Imported reply."}],
+            }))
+            .unwrap(),
+        ]);
+        *origin = serde_json::from_value(
+            json!({"kind": "seeded_from", "origin_kind": "import", "source_ref": "src:1"}),
+        )
+        .unwrap();
+    }
+    let mut records = vec![
+        seed,
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_001,
+            "usage": {}, "retries_used": 0}),
+        ),
+        run_started("r2", 2_000, "Next."),
+    ];
+    records.extend(
+        [
+            json!({"type": "step_started", "step_id": 1}),
+            json!({"type": "model_step_finished", "step_id": 1,
+                "assistant_message": {"message_id": "m1",
+                    "content": [{"type": "text", "text": "Own reply."}]},
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "finish_reason": "stop", "retries_used": 0}),
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 2_003,
+                "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ]
+        .into_iter()
+        .map(record),
+    );
+    let framed = framed(records);
+    let converted = crate::convert(&framed, None).unwrap();
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    let backend = MemoryBackend::default();
+    let mut store = block_on(Session::create(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session())),
+        crate::stage::triple(&session()),
+        &deployment(),
+        false,
+    ))
+    .unwrap();
+    block_on(store.append(&converted.records, false)).unwrap();
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    let reader = Reader {
+        parts: &parts,
+        live: false,
+        settled: None,
+        session_name: "s",
+        live_step: None,
+    };
+    for (run, ordinal, text) in [
+        ("run-iid-import", 2, "Imported reply."),
+        ("r2", 4, "Own reply."),
+    ] {
+        let run = broca_protocol::RunId(run.into());
+        let today =
+            serde_json::to_value(todays::run_result(&framed, &run, "s", None).unwrap()).unwrap();
+        assert_eq!(today["final_message"]["ordinal"], json!(ordinal), "{today}");
+        assert_eq!(today["final_message"]["text"], json!(text), "{today}");
+        let served = block_on(reader.run_result(&store, &run)).unwrap();
+        assert_eq!(serde_json::to_value(served).unwrap(), today, "{}", run.0);
+    }
+}
+
 /// Compares today's and the new storage's `send.status` of a note delivered with a tool result,
 /// with a ride envelope when `enveloped`.
 fn note_status_alike(enveloped: bool) {
@@ -1265,4 +1416,221 @@ fn note_status_alike(enveloped: bool) {
             let _ = std::fs::remove_dir_all(&root);
         }
     }
+}
+
+/// The queued send of an ordered delivery whose only mode is `mode`, under submission `sub-q`.
+fn ordered_send(mode: &str) -> [WalRecord; 2] {
+    [
+        record(json!({"type": "delivery_ordered", "submission_id": "sub-q",
+            "order": {"modes": [mode], "dedupe_key": "nudge"}})),
+        record(
+            json!({"type": "queued", "submission_id": "sub-q", "send_id": "q",
+            "request": {"model": {"provider_module_id": "p", "model_id": "m"},
+                "input": [{"role": "user", "content": [{"type": "text", "text": "note"}]}],
+                "policy_allowed": [], "tool_choice": {"type": "auto"},
+                "generation": {}, "stop_when": []},
+            "written_at_ms": 1_001}),
+        ),
+    ]
+}
+
+/// A run that queued `queued` during its step and then answered in text and completed: the
+/// queued send is still pending when the run ends.
+fn completed_with_queued(queued: Vec<WalRecord>) -> Vec<FramedRecord> {
+    let mut records = vec![
+        run_started("r1", 1_000, "Hello."),
+        record(json!({"type": "step_started", "step_id": 1})),
+    ];
+    records.extend(queued);
+    records.extend([
+        record(json!({"type": "model_step_finished", "step_id": 1,
+            "assistant_message": {"message_id": "m1",
+                "content": [{"type": "text", "text": "Done."}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0})),
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+            "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ),
+    ]);
+    framed(records)
+}
+
+/// An ordered send whose only delivery mode is `tool_result`, queued while a run that made no
+/// later tool call finished, waits for a later run's tool result: today's storage keeps it
+/// queued. It moves as it is: the staged session answers its `send.status` as today's does,
+/// and the next send's first tool result delivers it alike. Any other pending send still keeps
+/// the session from moving.
+#[test]
+fn an_ordered_send_waiting_for_a_tool_result_moves_and_delivers_alike() {
+    use crate::preconditions::{wal_refusal, SESSION_BUSY};
+    let records = completed_with_queued(ordered_send("tool_result").into());
+    assert_eq!(wal_refusal(&records, None), None);
+    let root = scratch("waiting-order");
+    let staged = staged(&root, &records, None);
+    let verified = verified(&root, &records, None, &staged.converted, Mode::Move).unwrap();
+    for check in ["send_status", "first_open", "next_request", "delivery"] {
+        assert!(
+            verified.checks.contains(&check),
+            "{check}: {:?}",
+            verified.checks
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+
+    let steer = completed_with_queued(ordered_send("steer").into());
+    assert_eq!(wal_refusal(&steer, None), Some(SESSION_BUSY));
+    let [_, plain] = ordered_send("tool_result");
+    let plain = completed_with_queued(vec![plain]);
+    assert_eq!(wal_refusal(&plain, None), Some(SESSION_BUSY));
+}
+
+/// A session whose one run started a step and paused with `reason`, under send id `k1`.
+fn paused(reason: &str) -> Vec<FramedRecord> {
+    let mut start = run_started("r1", 1_000, "Hello.");
+    if let WalRecord::RunStarted { send_id, .. } = &mut start {
+        *send_id = Some("k1".into());
+    }
+    framed(vec![
+        start,
+        record(json!({"type": "step_started", "step_id": 1})),
+        record(json!({"type": "run_paused", "run_id": "r1", "ts_ms": 1_002, "reason": reason})),
+    ])
+}
+
+/// A latest run paused for sign-in, with no call held, waits for its own send's retry: today's
+/// storage leaves it paused. It moves as it is: the staged session answers its `run.status`,
+/// `run.result` and `send.status` as today's does, and its resume sends the step it couldn't
+/// send alike. Its session has no next send, which today's storage refuses with the pause. A run
+/// paused for any other reason still keeps the session from moving.
+#[test]
+fn a_run_paused_for_sign_in_moves_and_resumes_alike() {
+    use crate::preconditions::{paused_for_sign_in, wal_refusal, SESSION_BUSY};
+    let records = paused("auth_required");
+    assert_eq!(wal_refusal(&records, None), None);
+    assert_eq!(paused_for_sign_in(&records).as_deref(), Some("r1"));
+    let root = scratch("paused-sign-in");
+    let staged = staged(&root, &records, None);
+    let verified = verified(&root, &records, None, &staged.converted, Mode::Move).unwrap();
+    for check in [
+        "run_status",
+        "run_result",
+        "send_status",
+        "first_open",
+        "resume",
+    ] {
+        assert!(
+            verified.checks.contains(&check),
+            "{check}: {:?}",
+            verified.checks
+        );
+    }
+    assert!(!verified.checks.contains(&"next_request"));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let restart = paused("restart");
+    assert_eq!(wal_refusal(&restart, None), Some(SESSION_BUSY));
+    assert_eq!(paused_for_sign_in(&restart), None);
+}
+
+/// The run-index rows that let a session move: every row terminal with its usage and no
+/// withdrawal owed, and, as the one exception, the paused row of the run the move carries paused
+/// for sign-in.
+#[test]
+fn only_the_carried_paused_runs_row_may_be_unfinished() {
+    use crate::preconditions::run_rows_settled;
+    use broca_core::{RunIndexRow, RunIndexState};
+    let row = |run: &str, state: RunIndexState, usage: bool| RunIndexRow {
+        run_id: run.into(),
+        session: session(),
+        submission_id: None,
+        request_identity_digest: None,
+        state,
+        usage: usage.then(Default::default),
+        final_step_finish_reason: None,
+        retries_used: 0,
+        title: None,
+        withdrawals_owed: false,
+    };
+    let finished = row("r0", RunIndexState::Completed, true);
+    let paused = row("r1", RunIndexState::Paused, false);
+    assert!(run_rows_settled(std::slice::from_ref(&finished), None));
+    assert!(run_rows_settled(
+        &[finished.clone(), paused.clone()],
+        Some("r1")
+    ));
+    assert!(!run_rows_settled(&[finished.clone(), paused.clone()], None));
+    assert!(!run_rows_settled(std::slice::from_ref(&paused), Some("r2")));
+    let active = row("r1", RunIndexState::Active, false);
+    assert!(!run_rows_settled(&[active], Some("r1")));
+    let owing = RunIndexRow {
+        withdrawals_owed: true,
+        ..paused
+    };
+    assert!(!run_rows_settled(&[owing], Some("r1")));
+    let unreconciled = row("r0", RunIndexState::Completed, false);
+    assert!(!run_rows_settled(&[unreconciled], Some("r1")));
+}
+
+/// A session compacted under the first compaction protocol moves read-only: it stages and
+/// verifies its reads, history and entries as any session does, without rebuilding the requests
+/// the new run loop refuses to render or opening it as a writer, and says so.
+#[test]
+fn a_session_compacted_under_the_first_protocol_moves_read_only() {
+    use crate::preconditions::{converted_refusal, wal_refusal, UNSUPPORTED_FEATURE};
+    let mut records = vec![
+        run_started("r1", 1_000, "Hello."),
+        record(
+            json!({"type": "compaction_message", "provider": "mc", "kind": "setup",
+            "compaction_id": "c", "version": 1, "range": {"from": 0, "to": 0},
+            "replacement": [],
+            "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}),
+        ),
+        record(json!({"type": "step_started", "step_id": 1})),
+    ];
+    records.extend([
+        // A recorded request, which the new run loop would refuse to rebuild.
+        record(
+            json!({"type": "model_attempt_finished", "step_id": 1, "attempt": 0,
+            "outcome": "complete", "ts_ms": 1_001, "request_body_len": 0,
+            "request_body_sha256": crate::verify::sha256_hex(b""),
+            "response_body_len": 0, "response_body_sha256": crate::verify::sha256_hex(b"")}),
+        ),
+        record(json!({"type": "model_step_finished", "step_id": 1,
+            "assistant_message": {"message_id": "m1",
+                "content": [{"type": "text", "text": "Done."}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0})),
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+            "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ),
+    ]);
+    let records = framed(records);
+    assert_eq!(wal_refusal(&records, None), None);
+    let prepared = crate::stage::prepare(&records, None, None).unwrap();
+    assert_eq!(
+        block_on(converted_refusal(&prepared)).unwrap(),
+        Some(UNSUPPORTED_FEATURE),
+        "the new run loop refuses to run it"
+    );
+    let root = scratch("first-protocol");
+    let staged = staged(&root, &records, None);
+    let verified = verified(&root, &records, None, &staged.converted, Mode::Move).unwrap();
+    assert!(verified.read_only);
+    for check in ["read", "history_raw", "history_display", "entries"] {
+        assert!(
+            verified.checks.contains(&check),
+            "{check}: {:?}",
+            verified.checks
+        );
+    }
+    for skipped in ["last_step", "first_open", "next_request"] {
+        assert!(
+            !verified.checks.contains(&skipped),
+            "{skipped}: {:?}",
+            verified.checks
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

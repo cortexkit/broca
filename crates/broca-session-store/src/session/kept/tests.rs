@@ -8,7 +8,7 @@ use broca_protocol::request::ModelHandle;
 use futures::executor::block_on;
 
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
-use crate::codec::Digest;
+use crate::codec::{Digest, Message as _};
 use crate::head::SessionTriple;
 use crate::idindex::{self, IdKind};
 use crate::keys::{Cipher, DeploymentKey};
@@ -21,6 +21,7 @@ use crate::session::{Session, SessionError};
 cipher_tests!(
     a_writer_keeps_its_latest_runs_records,
     a_view_keeps_every_record_it_read,
+    a_sealed_views_open_log_reads_back_only_its_checkpoint_frame,
     a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history,
     a_sync_makes_an_unsynced_tail_durable_once,
     a_failed_sync_leaves_the_tail_unsynced,
@@ -188,7 +189,8 @@ fn a_writer_keeps_its_latest_runs_records(cipher: Cipher) {
 }
 
 /// A view keeps every record it read, so even reading from memory only it serves any run's
-/// records, and never reads the log again.
+/// records, and never reads the log again. Serving its open log whole reads back only the log's
+/// checkpoint frame, which the view doesn't hold, so reading from memory only refuses that.
 fn a_view_keeps_every_record_it_read(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
@@ -199,9 +201,71 @@ fn a_view_keeps_every_record_it_read(cipher: Cipher) {
         // A record appended after the view was loaded is not part of it.
         let mut session = session;
         session.append(&[event("later")], true).await.unwrap();
-        let _memory = fresh.in_memory();
-        assert_eq!(fresh.records_from(1).await.unwrap(), expected);
-        assert_eq!(fresh.open_log_records().await.unwrap(), expected);
+        {
+            let _memory = fresh.in_memory();
+            assert_eq!(fresh.records_from(1).await.unwrap(), expected);
+            assert_eq!(fresh.open_log_records().await.unwrap(), expected);
+            assert!(matches!(
+                fresh.from_log_holding(fresh.next_seq(), u64::MAX).await,
+                Err(SessionError::NotInMemory)
+            ));
+        }
+        let reads = (backend.log_reads(), backend.checkpoint_frame_reads());
+        let loaded = fresh
+            .from_log_holding(fresh.next_seq(), u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(loaded.checkpoint.covers_through, 0);
+        assert_eq!(loaded.records, expected);
+        assert_eq!(
+            (backend.log_reads(), backend.checkpoint_frame_reads()),
+            (reads.0, reads.1 + 1),
+            "one read of the checkpoint frame, none of the log"
+        );
+    });
+}
+
+/// A sealed session's open log starts from a checkpoint that carries the sealed history's state.
+/// A view serves that log whole from the records it kept and the checkpoint read back from the
+/// log's first frame: one read of that frame and none of the log, giving the log a read from
+/// storage gives.
+fn a_sealed_views_open_log_reads_back_only_its_checkpoint_frame(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let (mut session, _) = history(&backend, cipher).await;
+        // The checkpoint the session was created with, before any history was sealed.
+        let created = view(&backend, cipher)
+            .await
+            .from_log_holding(session.next_seq(), u64::MAX)
+            .await
+            .unwrap()
+            .checkpoint
+            .encode();
+        session.seal(None, 1_000).await.unwrap();
+        session.append(&[end("c")], true).await.unwrap();
+        session
+            .append(&[start("d"), input("d", "ask d")], true)
+            .await
+            .unwrap();
+        let fresh = view(&backend, cipher).await;
+        let seq = fresh.next_seq();
+        let stored = fresh
+            .stored_records(&backend)
+            .from_log_holding(seq, u64::MAX)
+            .await
+            .unwrap();
+        assert!(stored.checkpoint.covers_through > 0);
+        assert!(stored.checkpoint.encode().len() > created.len());
+        assert!(!stored.records.is_empty());
+        let reads = (backend.log_reads(), backend.checkpoint_frame_reads());
+        let loaded = fresh.from_log_holding(seq, u64::MAX).await.unwrap();
+        assert_eq!(
+            (backend.log_reads(), backend.checkpoint_frame_reads()),
+            (reads.0, reads.1 + 1),
+            "one read of the checkpoint frame, none of the log"
+        );
+        assert_eq!(loaded.checkpoint.encode(), stored.checkpoint.encode());
+        assert_eq!(loaded.records, stored.records);
     });
 }
 

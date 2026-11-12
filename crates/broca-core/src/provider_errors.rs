@@ -37,6 +37,7 @@ pub fn render_identity_error<P: Provider + ?Sized>(
 
     Some(ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -50,6 +51,7 @@ pub fn render_identity_error<P: Provider + ?Sized>(
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     })
 }
 
@@ -95,6 +97,7 @@ mod tests {
     fn stamp_credential_names_the_credential_only_on_credential_scoped_errors() {
         let error = |class, status: Option<u16>, code: Option<&str>| ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -108,6 +111,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         };
         use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, RATE_LIMITED};
         use ErrorClass::*;

@@ -356,6 +356,9 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             // v5's OpenCode Go body quirks are enabled only by flags added to new frozen configs;
             // v4 configs omit them and keep their prior bytes.
             (4, Reproducible),
+            // v6's tool schema typing is enabled only by `moonshot_schema_types`, a flag added to
+            // new frozen configs; v5 configs omit it and keep their prior bytes.
+            (5, Reproducible),
         ],
         WireFamilyId::BedrockConverse => &[
             (
@@ -506,6 +509,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             reasoning_echo: None,
             tool_call_content_empty_string: false,
             media: None,
+            moonshot_schema_types: false,
         },
         WireFamilyId::OpenAiChat => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -516,6 +520,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             reasoning_echo: None,
             tool_call_content_empty_string: false,
             media: None,
+            moonshot_schema_types: false,
         },
         WireFamilyId::OpenAiResponses => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -526,6 +531,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             reasoning_echo: None,
             tool_call_content_empty_string: false,
             media: None,
+            moonshot_schema_types: false,
         },
         WireFamilyId::Gemini => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -536,6 +542,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             reasoning_echo: None,
             tool_call_content_empty_string: false,
             media: None,
+            moonshot_schema_types: false,
         },
         WireFamilyId::BedrockConverse => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -546,6 +553,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             reasoning_echo: None,
             tool_call_content_empty_string: false,
             media: None,
+            moonshot_schema_types: false,
         },
         // The inner body is the Gemini generateContent body, so the render quirks are
         // Gemini's; the family differs only in the envelope wrap + endpoint + OAuth auth.
@@ -641,6 +649,7 @@ pub fn resolve_frozen(
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
+        moonshot_schema_types: provider.quirks.moonshot_schema_types,
         // Admission adds the profile with `media_profile::freeze_media_profile` once the
         // config's family and wire model are final; until then the config renders as before.
         media: None,
@@ -699,7 +708,12 @@ fn frozen_from_family_defaults(
         tool_name_aliases: Default::default(),
         anthropic_turn_system: false,
         family_id: family,
-        renderer_version: renderer_version_for(family),
+        // An OpenAI Chat config freezes v6 only with the Moonshot schema flag, which no family
+        // default sets.
+        renderer_version: match family {
+            WireFamilyId::OpenAiChat => openai_chat_renderer_version(q.moonshot_schema_types),
+            _ => renderer_version_for(family),
+        },
         image_notice_labels: false,
         wire_model_id: wire_model_id.into(),
         base_url: None,
@@ -737,6 +751,7 @@ fn frozen_from_family_defaults(
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
+        moonshot_schema_types: q.moonshot_schema_types,
         media: None,
         refusal_fallback: None,
         ride_placement: None,
@@ -838,7 +853,26 @@ pub fn apply_anthropic_apikey_quirks(frozen: &mut FrozenRenderConfig) {
 /// v2: render `CallOptions.generation` (`temperature`, `top_p`, `stop`).
 /// v3: request streaming usage with `stream_options.include_usage`.
 /// v5: apply OpenCode Go's reasoning-signature, Qwen, DeepSeek, and Kimi K2.6 cache body quirks.
-pub const OPENAI_CHAT_RENDERER_VERSION: u32 = 5;
+/// v6: type the `enum` nodes of tool schemas on routes served by Moonshot's API.
+///
+/// v6's change is reachable only from the frozen config's own `moonshot_schema_types` flag, so
+/// only a config that carries it freezes v6 (see [`openai_chat_renderer_version`]). Every other
+/// OpenAI Chat config freezes v5 and keeps rendering and recording v5 bytes, and a build rolled
+/// back past v6 still resumes every run that never set the flag.
+pub const OPENAI_CHAT_RENDERER_VERSION: u32 = 6;
+
+/// The OpenAI Chat render ABI version a config with this flag freezes: v6 once the config types
+/// tool schema enums for Moonshot's API, v5 otherwise.
+///
+/// The flag is the only way a v6 config differs from a v5 one, so recording v6 for a config
+/// without it would make a later rollback refuse to resume runs whose bytes are unchanged.
+pub fn openai_chat_renderer_version(moonshot_schema_types: bool) -> u32 {
+    if moonshot_schema_types {
+        OPENAI_CHAT_RENDERER_VERSION
+    } else {
+        5
+    }
+}
 
 /// Build the frozen render config for a standard OpenAI `/chat/completions` model:
 /// system as a leading message, no thinking blocks, `max_tokens` for the limit. Quirks

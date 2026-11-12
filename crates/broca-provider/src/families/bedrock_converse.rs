@@ -1690,6 +1690,7 @@ fn bedrock_error(event_type: &str, payload: &Value, header_message: Option<&str>
         .to_owned();
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: if crate::normalize::context_overflow_code(
@@ -1714,6 +1715,7 @@ fn bedrock_error(event_type: &str, payload: &Value, header_message: Option<&str>
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }
 }
 

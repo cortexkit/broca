@@ -248,9 +248,75 @@ fn is_uuid(id: &str) -> bool {
         })
 }
 
+/// The persona a run speaks as after it moved to another account inside the run: the one a
+/// fresh run on `account_id` would freeze for this session, in the identity values that name the
+/// account (the device id and account id) and in a new prompt id, while the values that name the
+/// session and its pinned billing text (the version, the session id, the `cc_version` suffix and
+/// the prompt ordinal) stay the recorded ones, so the move changes only what must change.
+pub fn moved_persona(
+    recorded: &ClaudeCodePersona,
+    install_id: &str,
+    account_id: Option<&str>,
+    credential_id: &str,
+    session: &BindIdentity,
+) -> std::io::Result<ClaudeCodePersona> {
+    let fresh = fresh_persona(
+        install_id,
+        account_id,
+        credential_id,
+        session,
+        recorded.cc_version_suffix.clone(),
+        recorded.prompt_ordinal.unwrap_or_default(),
+    )?;
+    Ok(ClaudeCodePersona {
+        device_id: fresh.device_id,
+        account_uuid: fresh.account_uuid,
+        prompt_id: fresh.prompt_id,
+        ..recorded.clone()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A move keeps every value that names the session and its billing text, and takes the new
+    /// account's device and account ids and a new prompt id, as a fresh run there would.
+    #[test]
+    fn a_moved_persona_names_the_new_account_and_keeps_the_session() {
+        let session = BindIdentity::new("/project", "harness", "s1");
+        let old = "00000000-0000-4000-8000-00000000000a";
+        let new = "00000000-0000-4000-8000-00000000000b";
+        let mut recorded = fresh_persona(
+            "install",
+            Some(old),
+            "cred-a",
+            &session,
+            Some("abc".into()),
+            3,
+        )
+        .unwrap();
+        recorded.version = "2.1.0".into();
+        let moved = moved_persona(&recorded, "install", Some(new), "cred-b", &session).unwrap();
+        let fresh = fresh_persona(
+            "install",
+            Some(new),
+            "cred-b",
+            &session,
+            Some("abc".into()),
+            3,
+        )
+        .unwrap();
+        assert_eq!(moved.device_id, fresh.device_id);
+        assert_ne!(moved.device_id, recorded.device_id);
+        assert_eq!(moved.account_uuid.as_deref(), Some(new));
+        assert_ne!(moved.prompt_id, recorded.prompt_id);
+        assert!(moved.prompt_id.is_some());
+        assert_eq!(moved.version, "2.1.0");
+        assert_eq!(moved.session_id, recorded.session_id);
+        assert_eq!(moved.cc_version_suffix.as_deref(), Some("abc"));
+        assert_eq!(moved.prompt_ordinal, Some(3));
+    }
 
     fn scratch(label: &str) -> std::path::PathBuf {
         let root = broca_test_support::scratch_root().join(format!(

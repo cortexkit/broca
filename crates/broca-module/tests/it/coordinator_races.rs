@@ -4030,6 +4030,7 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
     usage: Usage::default(),
     error: Some(ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -4043,6 +4044,7 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
         account_ref: None,
         credential_id: None,
         affordable_max_tokens: None,
+        account_continue: None,
     }),
     retries_used: 0, });
     writer.sync().await.expect("fsync the core-sealed terminal");

@@ -147,6 +147,9 @@ struct Folds {
     kept: kept::KeptRecords,
     /// What the log's facts repeat, held once (see `crate::interned`).
     interner: crate::interned::Interner,
+    /// The media fold, which hands over the images' events of the records after the saved
+    /// index's through-seq as the load reads them, so an open reads no record twice.
+    media: media_index::Loading,
 }
 
 impl Folds {
@@ -154,6 +157,7 @@ impl Folds {
     /// (`per_run`) or as a view does.
     fn start(checkpoint: Checkpoint, hash_key: [u8; 32], per_run: bool) -> Box<Self> {
         Box::new(Self {
+            media: media_index::Loading::new(&checkpoint),
             covers_through: checkpoint.covers_through,
             next_seq: checkpoint.next_seq,
             window: OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq),
@@ -171,6 +175,9 @@ impl Folds {
         // Interned before the fold and the kept records share it.
         self.interner.record(&mut record);
         self.window.note(seq, &record);
+        // The media fold reads each record against the folds as they stand before it.
+        self.media
+            .note(seq, &record, &self.conversation, &self.operations);
         let ledger = record.stream() == Stream::Ledger;
         let mut from_memory = false;
         if !(ledger && seq <= self.covers_through) {
@@ -248,13 +255,15 @@ fn fold_log(
             return Err(SessionError::Corrupt { at, durable_bound })
         }
     };
+    // The log opened, so its first frame is its checkpoint.
+    let checkpoint_len = crate::log::first_frame_len(&bytes).and_then(std::num::NonZeroU32::new);
     drop(bytes);
     if let Some(error) = failed {
         return Err(error);
     }
     // A log that opens with no batch read has no folds started yet: they start from its
     // checkpoint, decoded from what was read of it.
-    let folds = match folds {
+    let mut folds = match folds {
         Some(folds) => folds,
         None => Folds::start(
             Checkpoint::decode(&read.checkpoint).map_err(SessionError::Checkpoint)?,
@@ -262,6 +271,12 @@ fn fold_log(
             per_run,
         ),
     };
+    if let Some(len) = checkpoint_len {
+        // A view reads that frame back to serve its open log whole, rather than holding the
+        // checkpoint, whose state is already folded into the view.
+        let covers_through = folds.covers_through;
+        folds.kept.view_checkpoint(len, covers_through);
+    }
     Ok((read, folds))
 }
 
@@ -405,6 +420,8 @@ pub struct Session<B: SessionBackend> {
     observer: Option<PositionedAppendObserver>,
     /// The open log's records kept in memory (see `kept`).
     kept: kept::KeptRecords,
+    /// The media fold, and the media index the open log's checkpoint names (see `media_index`).
+    media: media_index::MediaState,
     /// Set while reads come from memory only (see [`Session::in_memory`]).
     memory_only: std::sync::atomic::AtomicBool,
     /// Set when a read refused for needing storage while reads came from memory only.
@@ -591,6 +608,7 @@ impl<B: SessionBackend> Session<B> {
             transcript_base: None,
             ledger_base: None,
             activity_ms: None,
+            media: None,
         };
         let encoded = encoder.checkpoint(&checkpoint.encode())?;
         backend
@@ -625,6 +643,7 @@ impl<B: SessionBackend> Session<B> {
             sealed_entries: Default::default(),
             observer: None,
             kept: kept::KeptRecords::from_next(head_next_seq, true),
+            media: Default::default(),
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
@@ -819,6 +838,7 @@ impl<B: SessionBackend> Session<B> {
             window,
             mut kept,
             interner,
+            media,
             ..
         } = *folds;
         let next_seq = head
@@ -844,6 +864,7 @@ impl<B: SessionBackend> Session<B> {
             sealed_entries: Default::default(),
             observer: None,
             kept,
+            media: media.finish(),
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
@@ -959,6 +980,17 @@ impl<B: SessionBackend> Session<B> {
     /// Folds `records` into the state, then appends them as one batch, synced if `barrier`.
     /// Returns the seq of the first record.
     pub async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
+        let (first, media) = self.append_folding(records, barrier).await?;
+        self.media.handed(media);
+        Ok(first)
+    }
+
+    /// [`Session::append`], returning what the batch's records handed over to the image engine.
+    async fn append_folding(
+        &mut self,
+        records: &[Record],
+        barrier: bool,
+    ) -> Result<(u64, MediaFeed), SessionError> {
         let timing = crate::metrics::Phase::Append
             .start()
             .with_session(|| Some(self.addr.0.clone()));
@@ -986,9 +1018,17 @@ impl<B: SessionBackend> Session<B> {
                 .map(|(record, interned)| interned.as_ref().unwrap_or(record))
         };
         self.poisoned = true;
+        let mut media = MediaFeed::default();
         for (position, record) in records_held().enumerate() {
             check_announced_mid(&self.conversation, &self.operations, record)
                 .map_err(SessionError::Fold)?;
+            self.media.fold.apply(
+                first + position as u64,
+                record,
+                &self.conversation,
+                &self.operations,
+                &mut media,
+            );
             apply(
                 &mut self.conversation,
                 &mut self.operations,
@@ -997,6 +1037,7 @@ impl<B: SessionBackend> Session<B> {
             )
             .map_err(SessionError::Fold)?;
         }
+        self.media.fold.flush(&mut media);
         self.backend
             .append_log(
                 &self.addr,
@@ -1028,6 +1069,7 @@ impl<B: SessionBackend> Session<B> {
             }
             self.window.note(seq, record);
         }
+        self.advance_send_ids(first, records);
         self.poisoned = false;
         drop(timing);
         self.observed(Appended::Records {
@@ -1035,7 +1077,7 @@ impl<B: SessionBackend> Session<B> {
             records,
             durable: barrier,
         });
-        Ok(first)
+        Ok((first, media))
     }
 
     /// Tells `observer` of every batch this writer appends from now on, right after its append
@@ -1079,10 +1121,45 @@ impl<B: SessionBackend> Session<B> {
 
     /// The log holding `seq`, from its start through `last` (see
     /// [`StoredRecords::from_log_holding`]), read over this session's own backend. It reads
-    /// storage, so a read from memory only refuses it.
+    /// storage, so a read from memory only refuses it. A view whose open log holds `seq` kept
+    /// every record of that log, so it reads only the log's checkpoint frame back, never the
+    /// whole log again.
     pub async fn from_log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, SessionError> {
         self.storage_read()?;
+        if let Some(len) = self.kept.view_checkpoint_for(seq) {
+            let checkpoint = self.open_checkpoint(len).await?;
+            return Ok(LogFrom {
+                checkpoint,
+                records: self.kept.through(last),
+            });
+        }
         stored::from_log_holding(&self.place(), seq, last).await
+    }
+
+    /// The open log's checkpoint, read back from the log's first frame, `len` bytes long: one
+    /// ranged read. A log's first frame never changes once written, so a frame that doesn't read
+    /// back as the checkpoint is damage.
+    async fn open_checkpoint(&self, len: u32) -> Result<Checkpoint, SessionError> {
+        let bytes = self
+            .backend
+            .read_log(&self.addr, &self.log, 0..u64::from(len))
+            .await?;
+        let key = self.key.frame_key();
+        let bind = log_bind(&self.head.session_id, &self.log);
+        match crate::frame::open(&bytes, |id| (id == key.id()).then_some(&key), &bind) {
+            Ok(crate::frame::FrameRead::Frame { header, body, .. })
+                if header.frame_index == 0 && header.stream == crate::frame::FrameStream::None =>
+            {
+                Checkpoint::decode(&body).map_err(SessionError::Checkpoint)
+            }
+            Ok(_) => Err(SessionError::Fold(
+                "the open log's first frame no longer reads back as its checkpoint".into(),
+            )),
+            Err(error) => Err(SessionError::Damaged(crate::log::LogEnd::Damaged {
+                at: 0,
+                damage: crate::log::Damage::Frame(error),
+            })),
+        }
     }
 
     /// Appends a claim-only frame, so the log's last barrier counts toward its durable bound.
@@ -1286,6 +1363,17 @@ pub use media::{
 };
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia, PreparedImport, MAX_BATCH_RECORDS};
+mod media_index;
+pub use crate::fold::media::{
+    limits_in, LimitsSource, MediaFeed, MediaFold, MediaIndexRef, MediaItem, MediaStart,
+    RunStartNeedingLimits,
+};
+pub use media_index::{
+    AcceptedMessage, HeldSkeleton, LoadedMedia, MediaIndexSave, MediaIndexSource, PlacedSkeleton,
+    SavedIndex, ShownOccurrence, StoredAging, StoredBinding, StoredCapture, StoredMediaId,
+    StoredMediaIndex, StoredObject, StoredOccurrence, StoredReplacement, StoredSelection,
+    StoredSkeleton, StoredSlot, MEDIA_INDEX_VERSION,
+};
 mod enrollment;
 pub use enrollment::EnrollmentOverlay;
 

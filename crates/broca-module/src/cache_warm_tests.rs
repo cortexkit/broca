@@ -600,6 +600,7 @@ impl RunExecutor for WarmExecutor {
         if self.pause.lock().unwrap().contains(&job.req.run_id.0) {
             control.pause_for_auth_at_start = Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -613,6 +614,7 @@ impl RunExecutor for WarmExecutor {
                 account_ref: None,
                 credential_id: None,
                 affordable_max_tokens: None,
+                account_continue: None,
             });
         }
         run_loop_on_writer_admitted_with_prior_snapshot(

@@ -2678,6 +2678,44 @@ async fn websocket_upgrade_usage_limit_body_is_reported_without_https() {
     );
 }
 
+/// A usage limit stated by the refused upgrade takes its window from the upgrade response's
+/// quota headers, here the captured weekly 429's (`broca-module-serve/tests/fixtures/
+/// usage-observe/codex-quota-capture-2026-11-02.json`). So when its account's usage window is
+/// spent, a ChatGPT run on the WebSocket transport can ask routing for another account to go on
+/// with, as an HTTPS run can.
+#[tokio::test]
+async fn websocket_upgrade_usage_limit_takes_its_window_from_the_upgrade_headers() {
+    let capture: Value = serde_json::from_str(include_str!(
+        "../../broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json"
+    ))
+    .unwrap();
+    let mut refusal = upgrade_refusal(429, USAGE_LIMIT_BODY);
+    for (name, value) in capture[0]["headers"].as_object().unwrap() {
+        let name: &'static str = Box::leak(name.clone().into_boxed_str());
+        let value: &'static str = Box::leak(value.as_str().unwrap().to_owned().into_boxed_str());
+        refusal.headers.push((name, value));
+    }
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(refusal);
+    let provider = provider(&mock)
+        .with_account_refs(Some("account".into()), Some("account".into()))
+        .with_credential_refresher(rejected_token_refresher());
+    let events = step(&provider, 1, &opts()).await;
+    let error = terminal_error(&events);
+    assert!(error.is_account_limit_exhausted(), "{error:?}");
+    assert_eq!(error.limit_window.as_deref(), Some("seven_day"));
+    let attempts = attempts(&events);
+    assert_eq!(attempts[0].transport.as_deref(), Some("websocket"));
+    assert_eq!(
+        attempts[0]
+            .account_observation
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.limit_window.as_deref()),
+        Some("seven_day")
+    );
+}
+
 fn virtual_attempts(provider: &mut LiveProvider<OpenAiResponsesChatgpt>, seconds: &[u64]) {
     provider.retry_clock.virtual_waits = Some(Arc::new(Mutex::new(Vec::new())));
     provider.retry_clock.virtual_retry_attempts = Some(Arc::new(Mutex::new(
@@ -3213,6 +3251,91 @@ fn wrapped_chatgpt_refusals_keep_their_classes() {
     );
     assert!(!failure.retry_forbidden);
     assert_eq!(trace.account_observation.limit, None);
+}
+
+/// A wrapped usage-limit refusal that carries the response's quota headers takes its window from
+/// them, as an HTTPS answer does, and the attempt's observation names it: the captured weekly
+/// refusal's headers (`broca-module-serve/tests/fixtures/usage-observe/
+/// codex-quota-capture-2026-11-02.json`) show the 10080-minute window spent.
+#[test]
+fn a_wrapped_chatgpt_usage_limit_takes_its_window_from_the_frames_headers() {
+    let capture: Value = serde_json::from_str(include_str!(
+        "../../broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json"
+    ))
+    .unwrap();
+    let usage = serde_json::json!({"type":"error","status":429,"headers":capture[0]["headers"].clone(),"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}});
+    let mut trace = AttemptTrace::default();
+    let failure = responses_websocket::wrapped_error(usage.to_string().as_bytes(), &mut trace)
+        .expect("a wrapped 429 is a refusal");
+    assert!(failure.error.is_account_limit_exhausted());
+    assert_eq!(failure.error.limit_window.as_deref(), Some("seven_day"));
+    assert_eq!(
+        trace
+            .account_observation
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.limit_window.as_deref()),
+        Some("seven_day")
+    );
+}
+
+/// A usage limit wrapped in an error frame on an open socket carries no quota headers, so it
+/// takes its window from the newest `codex.rate_limits` frame of the same response: the frame
+/// captured 2026-11-02 on a socket for an account past its weekly allowance
+/// (`broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json`, its
+/// websocket entry) shows the 10080-minute primary window spent. A newer frame replaces an
+/// older one, and a response without such a frame gets no window.
+#[test]
+fn a_wrapped_chatgpt_usage_limit_takes_its_window_from_the_responses_rate_limits_frame() {
+    let capture: Value = serde_json::from_str(include_str!(
+        "../../broca-module-serve/tests/fixtures/usage-observe/codex-quota-capture-2026-11-02.json"
+    ))
+    .unwrap();
+    let recorded = capture[2]["frame"].clone();
+    assert_eq!(recorded["type"], "codex.rate_limits");
+    let usage = serde_json::json!({"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}});
+    let window_after = |frames: &[Value]| {
+        let mut trace = AttemptTrace::default();
+        for frame in frames {
+            assert!(responses_websocket::wrapped_error(frame.to_string().as_bytes(), &mut trace)
+                .is_none());
+        }
+        let failure = responses_websocket::wrapped_error(usage.to_string().as_bytes(), &mut trace)
+            .expect("a wrapped 429 is a refusal");
+        assert!(failure.error.is_account_limit_exhausted());
+        let observed = trace
+            .account_observation
+            .limit
+            .as_ref()
+            .and_then(|limit| limit.limit_window.as_deref().map(str::to_owned));
+        assert_eq!(failure.error.limit_window.as_deref(), observed.as_deref());
+        observed
+    };
+    assert_eq!(window_after(std::slice::from_ref(&recorded)).as_deref(), Some("seven_day"));
+    // The recorded frame with its window five hours long.
+    let mut five_hour = recorded.clone();
+    five_hour["rate_limits"]["primary"]["window_minutes"] = serde_json::json!(300);
+    assert_eq!(
+        window_after(std::slice::from_ref(&five_hour)).as_deref(),
+        Some("five_hour")
+    );
+    // No frame in this response: nothing carries over from another response's trace.
+    assert_eq!(window_after(&[]), None);
+    // A newer frame that shows nothing spent replaces the recorded one.
+    let mut cleared = recorded.clone();
+    cleared["rate_limits"]["primary"]["used_percent"] = serde_json::json!(40);
+    assert_eq!(window_after(&[recorded.clone(), cleared]), None);
+    // Both windows spent, a window whose numbers don't parse, or another length: no window.
+    let mut both = recorded.clone();
+    both["rate_limits"]["secondary"] =
+        serde_json::json!({"used_percent": 100, "window_minutes": 300});
+    let mut unparsable = recorded.clone();
+    unparsable["rate_limits"]["primary"]["window_minutes"] = serde_json::json!("weekly");
+    let mut other = recorded.clone();
+    other["rate_limits"]["primary"]["window_minutes"] = serde_json::json!(1440);
+    for frame in [both, unparsable, other] {
+        assert_eq!(window_after(std::slice::from_ref(&frame)), None, "{frame}");
+    }
 }
 
 /// The production refusal of a structured-output schema, as the ChatGPT backend wraps it in a

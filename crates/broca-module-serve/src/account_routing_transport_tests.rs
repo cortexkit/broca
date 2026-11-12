@@ -11,6 +11,9 @@ struct RoutingDaemon {
     catalog: Arc<Mutex<Vec<CatalogEntry>>>,
     catalog_reads: Arc<AtomicUsize>,
     hang_reopens: Arc<std::sync::atomic::AtomicBool>,
+    hang_requests: Arc<std::sync::atomic::AtomicBool>,
+    reply: Arc<Mutex<Result<Vec<u8>, Vec<u8>>>>,
+    goodbyes: tokio::sync::mpsc::UnboundedSender<broca_subc::RouteHandle>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -64,13 +67,19 @@ impl RoutingDaemon {
         let catalog = Arc::new(Mutex::new(vec![routing_provider("routing-provider", true)]));
         let catalog_reads = Arc::new(AtomicUsize::new(0));
         let hang_reopens = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hang_requests = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reply = Arc::new(Mutex::new(reply));
+        let (goodbyes, mut goodbye_rx) =
+            tokio::sync::mpsc::unbounded_channel::<broca_subc::RouteHandle>();
         let server = {
+            let reply = Arc::clone(&reply);
             let requests = Arc::clone(&requests);
             let opens = Arc::clone(&opens);
             let opened_modules = Arc::clone(&opened_modules);
             let catalog = Arc::clone(&catalog);
             let catalog_reads = Arc::clone(&catalog_reads);
             let hang_reopens = Arc::clone(&hang_reopens);
+            let hang_requests = Arc::clone(&hang_requests);
             tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 subc_transport::authenticate_server(
@@ -82,7 +91,22 @@ impl RoutingDaemon {
                 )
                 .await
                 .unwrap();
-                while let Some(frame) = read_frame(&mut stream).await.unwrap() {
+                loop {
+                    let frame = tokio::select! {
+                        frame = read_frame(&mut stream) => match frame.unwrap() {
+                            Some(frame) => frame,
+                            None => break,
+                        },
+                        Some(route) = goodbye_rx.recv() => {
+                            let goodbye = Frame::build(
+                                FrameType::Goodbye,
+                                Flags::new(false, Priority::Interactive, false),
+                                route.channel, route.epoch, 0, Vec::new(),
+                            ).unwrap();
+                            write_frame(&mut stream, &goodbye).await.unwrap();
+                            continue;
+                        }
+                    };
                     let (ty, body) = match (frame.header.channel, frame.header.ty) {
                         (0, FrameType::Ping) => (FrameType::Pong, Vec::new()),
                         (0, FrameType::Request) => {
@@ -144,10 +168,13 @@ impl RoutingDaemon {
                         (_, FrameType::Goodbye) => continue,
                         (channel, FrameType::Request) if channel != 0 => {
                             requests.lock().unwrap().push(frame.body.clone());
+                            if hang_requests.load(Ordering::SeqCst) {
+                                continue;
+                            }
                             if close_after_request {
                                 (FrameType::Goodbye, Vec::new())
                             } else {
-                                match &reply {
+                                match &*reply.lock().unwrap() {
                                     Ok(body) => (FrameType::Response, body.clone()),
                                     Err(body) => (FrameType::Error, body.clone()),
                                 }
@@ -182,6 +209,9 @@ impl RoutingDaemon {
             catalog,
             catalog_reads,
             hang_reopens,
+            hang_requests,
+            reply,
+            goodbyes,
             server,
         }
     }
@@ -199,6 +229,340 @@ impl RoutingDaemon {
     fn request_bodies(&self) -> Vec<Vec<u8>> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+fn capability_reply(declared: bool) -> Result<Vec<u8>, Vec<u8>> {
+    describe_reply(if declared { &["account_continue"] } else { &[] })
+}
+
+fn describe_reply(capabilities: &[&str]) -> Result<Vec<u8>, Vec<u8>> {
+    let mut describe = cortexkit_role_routing::describe::RoleDescribe::new(vec![], false);
+    for capability in capabilities {
+        describe = describe.with_capability(*capability);
+    }
+    Ok(serde_json::to_vec(&json!({"result": describe})).unwrap())
+}
+
+async fn advance_cache_age(duration: Duration) {
+    // Pause only after network setup, and resume before another exchange, so socket I/O
+    // does not accidentally auto-advance its authentication or request deadlines.
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn routing_capabilities_declared_and_cached_across_names() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    let client = daemon.client();
+    assert_eq!(client.capability("account_continue").await, Declared);
+    assert_eq!(client.capability("account_continue").await, Declared);
+    assert_eq!(client.capability("not_a_group").await, NotDeclared);
+    assert_eq!(
+        daemon.request_bodies(),
+        vec![br#"{"method":"role.describe","params":{}}"#.to_vec()]
+    );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn routing_capabilities_not_declared_is_distinct_from_unknown() {
+    let daemon = RoutingDaemon::start(capability_reply(false), false).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        crate::routing_capabilities::CapabilitySupport::NotDeclared
+    );
+}
+
+#[tokio::test]
+async fn routing_capabilities_unreachable_and_unresolved_are_unknown() {
+    use crate::routing_capabilities::CapabilitySupport::Unknown;
+    let daemon = RoutingDaemon::start(capability_reply(true), true).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(
+        daemon.request_bodies().len(),
+        1,
+        "unreachable answer is cached"
+    );
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    daemon.catalog.lock().unwrap().clear();
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+    assert!(daemon.request_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn routing_capabilities_undecodable_or_refused_describe_is_unknown() {
+    use crate::routing_capabilities::CapabilitySupport::Unknown;
+    for reply in [
+        Ok(b"not JSON".to_vec()),
+        Ok(br#"{"result":{"capabilities":["account_continue"]}}"#.to_vec()),
+        Err(br#"{"code":"invalid_request"}"#.to_vec()),
+    ] {
+        let daemon = RoutingDaemon::start(reply, false).await;
+        assert_eq!(
+            daemon.client().capability("account_continue").await,
+            Unknown
+        );
+        assert_eq!(
+            daemon.client().capability("account_continue").await,
+            Unknown
+        );
+        assert_eq!(daemon.request_bodies().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn routing_capabilities_reregistration_goodbye_drops_cached_description() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    let route = daemon.transport.route().await.unwrap();
+    *daemon.reply.lock().unwrap() = capability_reply(false);
+    daemon.goodbyes.send(route).unwrap();
+    broca_test_support::wait_until("routing re-registration closes its old route", || async {
+        (!daemon.transport.conn.route_is_open(&route))
+            .then_some(())
+            .ok_or_else(|| "old routing route is still open".to_owned())
+    })
+    .await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        NotDeclared
+    );
+    assert_eq!(daemon.request_bodies().len(), 2);
+    assert_eq!(daemon.opens.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn routing_capabilities_age_bound_recovers_an_unknown_provider() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    daemon.catalog.lock().unwrap().clear();
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    *daemon.catalog.lock().unwrap() = vec![routing_provider("routing-provider", true)];
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    advance_cache_age(Duration::from_secs(4)).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+    advance_cache_age(Duration::from_secs(1)).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn routing_capabilities_known_description_is_read_again_after_sixty_seconds() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    *daemon.reply.lock().unwrap() = capability_reply(false);
+    advance_cache_age(Duration::from_secs(59)).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    assert_eq!(daemon.request_bodies().len(), 1);
+    advance_cache_age(Duration::from_secs(1)).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        NotDeclared
+    );
+    assert_eq!(daemon.request_bodies().len(), 2);
+}
+
+#[tokio::test]
+async fn routing_capabilities_failed_refresh_keeps_known_answers_on_an_open_route() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(describe_reply(&["service_tier"]), false).await;
+    assert!(daemon.transport.service_tier_supported().await.unwrap());
+    let route = daemon.transport.route().await.unwrap();
+    advance_cache_age(Duration::from_secs(60)).await;
+    *daemon.reply.lock().unwrap() = Err(br#"{"code":"unavailable"}"#.to_vec());
+    assert!(daemon.transport.service_tier_supported().await.unwrap());
+    assert_eq!(
+        daemon.client().capability("observe_backoff").await,
+        NotDeclared
+    );
+    assert_eq!(daemon.request_bodies().len(), 2);
+    assert!(daemon.transport.conn.route_is_open(&route));
+    advance_cache_age(Duration::from_secs(59)).await;
+    assert!(daemon.transport.service_tier_supported().await.unwrap());
+    assert_eq!(
+        daemon.request_bodies().len(),
+        2,
+        "a failed refresh restarts the known age"
+    );
+}
+
+#[tokio::test]
+async fn routing_capabilities_timed_out_refresh_keeps_known_description() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    advance_cache_age(Duration::from_secs(60)).await;
+    daemon.hang_requests.store(true, Ordering::SeqCst);
+    let transport = Arc::clone(&daemon.transport);
+    let refresh = tokio::spawn(async move { transport.capability("account_continue").await });
+    broca_test_support::wait_until("capability refresh reached routing", || async {
+        (daemon.request_bodies().len() == 2)
+            .then_some(())
+            .ok_or_else(|| "no refresh request".to_owned())
+    })
+    .await;
+    advance_cache_age(ADMISSION_BUDGET).await;
+    assert_eq!(refresh.await.unwrap(), Declared);
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    assert_eq!(daemon.request_bodies().len(), 2);
+}
+
+#[tokio::test]
+async fn routing_capabilities_closed_route_drops_known_answers_even_if_refresh_fails() {
+    use crate::routing_capabilities::CapabilitySupport::Unknown;
+    let daemon = RoutingDaemon::start(describe_reply(&["service_tier"]), false).await;
+    assert!(daemon.transport.service_tier_supported().await.unwrap());
+    let route = daemon.transport.route().await.unwrap();
+    *daemon.reply.lock().unwrap() = Err(br#"{"code":"unavailable"}"#.to_vec());
+    daemon.goodbyes.send(route).unwrap();
+    broca_test_support::wait_until("routing closed its old capability route", || async {
+        (!daemon.transport.conn.route_is_open(&route))
+            .then_some(())
+            .ok_or_else(|| "old route still open".to_owned())
+    })
+    .await;
+    assert!(daemon.transport.service_tier_supported().await.is_err());
+    assert_eq!(daemon.client().capability("service_tier").await, Unknown);
+    assert_eq!(daemon.request_bodies().len(), 2);
+}
+
+#[tokio::test]
+async fn routing_capabilities_error_frame_is_unknown_for_all_callers_and_recovers_after_five_seconds(
+) {
+    use crate::routing_capabilities::CapabilitySupport::Unknown;
+    let daemon = RoutingDaemon::start(Err(br#"{"code":"unavailable"}"#.to_vec()), false).await;
+    let error = daemon.transport.service_tier_supported().await.unwrap_err();
+    assert!(
+        error.contains("routing capabilities could not be read"),
+        "{error}"
+    );
+    assert_eq!(daemon.client().capability("service_tier").await, Unknown);
+    assert!(daemon.transport.observe_backoff_supported().await.is_err());
+    assert!(daemon
+        .transport
+        .observe_credential_refused_supported()
+        .await
+        .is_err());
+    let outcome = daemon
+        .client()
+        .account_for(
+            json!({"service_tier":"fast"}),
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    assert!(
+        matches!(outcome, AccountForOutcome::Unreachable(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        daemon.request_bodies().len(),
+        1,
+        "unknown capabilities must not silently downgrade a tier send"
+    );
+    *daemon.reply.lock().unwrap() = describe_reply(&[
+        "service_tier",
+        "observe_backoff",
+        "observe_credential_refused",
+    ]);
+    advance_cache_age(Duration::from_secs(4)).await;
+    assert!(daemon.transport.service_tier_supported().await.is_err());
+    assert_eq!(daemon.request_bodies().len(), 1);
+    advance_cache_age(Duration::from_secs(1)).await;
+    assert!(daemon.transport.service_tier_supported().await.unwrap());
+    assert!(daemon.transport.observe_backoff_supported().await.unwrap());
+    assert!(daemon
+        .transport
+        .observe_credential_refused_supported()
+        .await
+        .unwrap());
+    assert_eq!(
+        daemon.request_bodies().len(),
+        2,
+        "all support APIs share the successful description"
+    );
+}
+
+#[tokio::test]
+async fn routing_capabilities_waiting_tier_caller_cancels_at_its_own_deadline() {
+    let daemon = RoutingDaemon::start(describe_reply(&["service_tier"]), false).await;
+    daemon.hang_requests.store(true, Ordering::SeqCst);
+    let transport = Arc::clone(&daemon.transport);
+    let first = tokio::spawn(async move { transport.service_tier_supported().await });
+    broca_test_support::wait_until("first caller holds the capability refresh", || async {
+        (daemon.request_bodies().len() == 1)
+            .then_some(())
+            .ok_or_else(|| "no describe request".to_owned())
+    })
+    .await;
+    let outcome = daemon
+        .client()
+        .account_for(
+            json!({"service_tier":"fast"}),
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await;
+    assert_eq!(outcome, AccountForOutcome::NoDecisionWithinBudget);
+    assert!(
+        !first.is_finished(),
+        "the waiting caller's deadline does not cancel the single flight"
+    );
+    assert_eq!(daemon.request_bodies().len(), 1);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    daemon.hang_requests.store(false, Ordering::SeqCst);
+    assert!(daemon.transport.service_tier_supported().await.unwrap());
+    assert_eq!(
+        daemon.request_bodies().len(),
+        2,
+        "cancelled lock waiters leave no abandoned refresh"
+    );
 }
 
 fn routing_provider(module: &str, verified: bool) -> CatalogEntry {
@@ -552,10 +916,11 @@ async fn stale_routing_cache_retries_all_management_bodies_unchanged() {
 #[tokio::test]
 async fn stale_routing_capability_probe_caches_the_reopened_handle() {
     let daemon = RoutingDaemon::start(
-        Ok(serde_json::to_vec(&json!({"result":{"capabilities":[
-            "service_tier", "observe_backoff", "observe_credential_refused"
-        ]}}))
-        .unwrap()),
+        describe_reply(&[
+            "service_tier",
+            "observe_backoff",
+            "observe_credential_refused",
+        ]),
         false,
     )
     .await;
@@ -572,14 +937,7 @@ async fn stale_routing_capability_probe_caches_the_reopened_handle() {
         1,
         "the successful capability probe is cached"
     );
-    let cached_handle = daemon
-        .transport
-        .capabilities
-        .lock()
-        .await
-        .as_ref()
-        .unwrap()
-        .0;
+    let cached_handle = daemon.transport.route().await.unwrap();
     assert!(daemon.transport.conn.route_is_open(&cached_handle));
     assert_eq!(daemon.opens.load(Ordering::SeqCst), 2);
 }
@@ -629,4 +987,67 @@ async fn stale_routing_reopen_stays_inside_the_original_admission_deadline() {
         "the retry reached route.open"
     );
     assert!(daemon.request_bodies().is_empty());
+}
+
+/// A continue question whose route goes stale between the capability check and the send is
+/// sent again only after the reopened route's description is read: here the routing module
+/// behind it no longer declares continuation, so nothing is sent there and the answer is
+/// NotDeclared.
+#[tokio::test]
+async fn a_continue_request_on_a_reopened_route_rechecks_the_capabilities() {
+    use crate::routing_capabilities::{CapabilitySupport, ACCOUNT_CONTINUE_RESUME};
+    let daemon = RoutingDaemon::start(
+        describe_reply(&["account_continue", ACCOUNT_CONTINUE_RESUME]),
+        false,
+    )
+    .await;
+    let client = daemon.client();
+    assert!(client.answers_moved_runs_with_current_account().await);
+    // Routing registers again without continuation, and the route the question is about to go
+    // out on goes stale after the (cached) capabilities were read for it.
+    *daemon.reply.lock().unwrap() = describe_reply(&[]);
+    daemon
+        .transport
+        .stale_before_checked_send_for_test
+        .store(true, Ordering::SeqCst);
+    let request = cortexkit_role_routing::account_continue::ContinueRequest::new(
+        "run-1",
+        "run-1",
+        "broca-session:abc",
+        "decision-a",
+        cortexkit_role_routing::account_continue::ExhaustedAccount::new(
+            "credential-a",
+            "acct-a",
+            "seven_day",
+            7,
+        ),
+        "wall-1",
+    );
+    let outcome = client
+        .account_continue(
+            true,
+            &request,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(outcome, ContinueOutcome::NotDeclared);
+    let methods: Vec<String> = daemon
+        .request_bodies()
+        .iter()
+        .map(|body| {
+            serde_json::from_slice::<Value>(body).unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        ["role.describe", "role.describe"],
+        "no continue request was sent"
+    );
+    assert_eq!(
+        client.capability("account_continue").await,
+        CapabilitySupport::NotDeclared
+    );
 }

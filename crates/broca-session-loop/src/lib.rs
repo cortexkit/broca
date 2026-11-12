@@ -36,6 +36,7 @@
 static ALLOCATOR: broca_test_support::alloc::CountingAlloc =
     broca_test_support::alloc::CountingAlloc;
 
+pub mod account_move;
 pub mod admit;
 pub mod billing;
 pub mod budget;
@@ -45,6 +46,7 @@ pub mod enroll;
 pub mod entries;
 pub mod inverse;
 pub mod media;
+pub mod media_index;
 pub mod output;
 pub mod owner;
 pub mod parts;
@@ -54,6 +56,7 @@ mod refusal;
 pub mod run;
 pub mod shared;
 pub mod today;
+mod transport;
 pub mod writer;
 
 pub use media::{HeldInputMedia, PendingMedia};

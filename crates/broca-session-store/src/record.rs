@@ -1117,6 +1117,70 @@ message! {
     }
 }
 
+values! {
+    /// What a [`Fork`] record says happened to its fork.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum ForkEvent {
+        /// The fork was prepared: who prepared it, the head request it is based on, and how long
+        /// it lives idle and is kept afterwards. The first record of a fork's session.
+        1 Prepared,
+        /// An ask's numbered attempt began, once the head request the fork is based on was
+        /// rebuilt to its recorded digest, under the routing admission it names when the account
+        /// is routed.
+        2 AskStarted,
+        /// Usage the attempt in flight has incurred so far, kept so a restart can store it.
+        3 AskUsage,
+        /// The attempt ended with a stored answer, finish and usage.
+        4 AskFinished,
+        /// The attempt was refused after it began and before any model call (routing held or
+        /// blocked it, or chose another account): nothing is stored for the ask.
+        5 AskRefused,
+        /// The fork ended: by its preparer, or because a reply held a tool call.
+        6 Ended,
+        /// The fork's preparer lost the right to fork the head, so the fork answers nobody.
+        7 Revoked,
+        /// The routing admission it names was released.
+        8 Released,
+        /// The finished attempt's spend is in the usage export.
+        9 Billed,
+    }
+}
+
+message! {
+    /// One fact of a fork of a head session (llm-runner `fork_answer`): a private branch that asks
+    /// questions of a copy of the head's last served request. A fork lives in a short-lived
+    /// session of its own, never the head's, holding only these records; its session's records
+    /// fold into the fork's state in order. `event` says which fields are set.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Fork {
+        1 req fork_id: String,
+        2 req event: ForkEvent,
+        /// Wall-clock time of the fact, in milliseconds since the Unix epoch.
+        3 req at_ms: u64,
+        4 opt ask_id: String,
+        /// The attempt's number for its ask, counted from 1.
+        5 opt attempt: u64,
+        6 opt question: String,
+        7 opt answer: String,
+        /// The answer's finish, verbatim (llm-runner `ForkFinish`).
+        8 opt finish: String,
+        /// llm-runner `RunUsage` JSON.
+        9 opt usage: serde_json::Value,
+        /// The preparing principal, as fork admission matched it.
+        10 opt principal: String,
+        /// Owned by the fork's server: the head request the fork is based on, and what the head
+        /// froze for routing.
+        11 opt base: serde_json::Value,
+        12 opt admission_id: String,
+        /// How long the fork lives after its last counted activity.
+        13 opt idle_ms: u64,
+        /// How long the fork's session is kept after the fork can last be used.
+        14 opt retain_ms: u64,
+        /// Owned by the fork's server: why an attempt was refused, and other facts no fold reads.
+        15 opt detail: serde_json::Value,
+    }
+}
+
 message! {
     /// A session that ran outside the current compaction contract moved onto it: the run whose
     /// start shares this record's batch is its first run on the contract. The messages already
@@ -1468,9 +1532,14 @@ message! {
 }
 
 message! {
-    /// A paused run resumed before any provider call, and its provider now renders with a
-    /// different config than the run froze: the run renders with this one from here on. Only
-    /// before the first call is that safe, since no request bytes depend on the old config.
+    /// The run renders with a different config than it froze, from here on. Written in two
+    /// places. A paused run resumed before any provider call, whose provider now renders with
+    /// a different config: only before the first call is that safe, since no request bytes
+    /// depend on the old config. And together with an [`AuthRefrozen`], in the same batch, when
+    /// the run moves to another account at a quota wall and its config names the account (a
+    /// Claude Code persona does): the next request is the first on the new account, which has
+    /// none of the old account's cache to keep. A resume that finds any other config change
+    /// after a provider call still ends the run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct ConfigRefrozen {
         1 req run_id: String,
@@ -1482,10 +1551,13 @@ message! {
 }
 
 message! {
-    /// A paused run resumed on another provider account than it froze, which routing gave it:
-    /// its later requests and its spend name this account. Account metadata changes no request
-    /// bytes, so this may follow provider calls. Not written for a run paused on its account's
-    /// limit, which resumes only on that account.
+    /// The run uses another provider account than it froze, from here on: its later requests
+    /// and its spend name this account. Written when a paused run resumes on another account
+    /// routing gives it, and when routing moves the run to another account inside a step whose
+    /// account spent its usage window. Account metadata changes no request bytes, so this may
+    /// follow provider calls; a config that names the account is refrozen with it (see
+    /// [`ConfigRefrozen`]). Not written for a run paused on its account's limit, which resumes
+    /// only on that account.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct AuthRefrozen {
         1 req run_id: String,
@@ -1783,6 +1855,7 @@ impl Record {
             Record::Steer(r) => r.written_at_ms,
             Record::Delivery(r) => r.written_at_ms,
             Record::Moved(r) => Some(r.source_activity_ms),
+            Record::Fork(r) => Some(r.at_ms),
             _ => None,
         }
     }
@@ -1846,6 +1919,7 @@ records! {
         104 RefreshApplied,
         105 CompactionEnrolled,
         106 Moved,
+        107 Fork,
     }
 }
 

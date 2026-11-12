@@ -603,7 +603,8 @@ impl Inverse {
                 // where records are stored. Records keep their seqs and bytes through a change,
                 // so no message comes or goes with one.
                 Record::WriterOpened(_) | Record::ChangeIntent(_) | Record::ChangeAborted(_) => {}
-                Record::TranscriptReverted(_) | Record::RecoveryCut(_) => {
+                // A fork's session is only ever kept in the new storage.
+                Record::TranscriptReverted(_) | Record::RecoveryCut(_) | Record::Fork(_) => {
                     return Err(InverseError::NoTodayRecord(record.name()));
                 }
                 Record::Input(Input {

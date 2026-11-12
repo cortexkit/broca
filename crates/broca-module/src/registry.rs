@@ -454,7 +454,7 @@ impl std::fmt::Display for OpenError {
             }
             OpenError::ModuleStopping => f.write_str("open failed: module is stopping"),
             OpenError::NotServedOnNewStorage { feature } => f.write_str(
-                &crate::store_actor::unserved_on_creation(feature),
+                &crate::store_actor::unserved_message(feature),
             ),
         }
     }
@@ -2146,7 +2146,7 @@ impl LineageRegistry {
     }
 
     /// Whether a send creating a session of `class` may start it in the new storage.
-    fn starts_new_sessions_in_store(&self, class: Option<&str>) -> bool {
+    pub(crate) fn starts_new_sessions_in_store(&self, class: Option<&str>) -> bool {
         self.inner.store_new_sessions.load(Ordering::SeqCst)
             || class.is_some_and(|class| {
                 self.inner
@@ -2154,6 +2154,13 @@ impl LineageRegistry {
                     .get()
                     .is_some_and(|classes| classes.contains(class))
             })
+    }
+
+    pub(crate) fn store_can_create(&self) -> bool {
+        self.inner
+            .opener
+            .store_runtime()
+            .is_some_and(|runtime| runtime.can_create())
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
@@ -3805,6 +3812,33 @@ impl LineageRegistry {
             .map_err(OpenError::RetentionInvalid)?;
         let unserved =
             crate::store_actor::unserved_creating_send(&request, kind, retention.is_some());
+        if let Some(manifest) = plan.as_ref().and_then(|plan| plan.manifest.as_ref()) {
+            let policy: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text())
+                .expect("an opaque plan is valid JSON");
+            if let Some(policy) = policy.as_object().filter(|policy| {
+                policy.contains_key(cortexkit_role_llm_runner::app_readers::PLAN_READERS)
+            }) {
+                let supported = self.store_holding(key)?.is_some()
+                    || (unserved.is_none()
+                        && self.store_can_create()
+                        && self.wal_written(key) == Some(false)
+                        && (session_class.as_deref() == Some(HEAD_SESSION_CLASS)
+                            || self.starts_new_sessions_in_store(session_class.as_deref())));
+                // A creating send may otherwise fall back to today's storage, for example when
+                // its first prompt carries media. Never freeze a reader policy in that format.
+                if let Err(error) = crate::reader_admission::check_plan(policy, supported) {
+                    let message = match error {
+                        crate::serve::ServeError::InvalidParams { message, .. } => message,
+                        error => return Err(OpenError::Open(error.to_string())),
+                    };
+                    return Ok(SendOutcome::DeliveryRefused {
+                        code: "invalid_params",
+                        field: "plan.readers",
+                        message,
+                    });
+                }
+            }
+        }
         // How the session starts if this send creates it. A head starts only in the new
         // storage, and the opener refuses one it can't start there; any other send starts there
         // only when the registry creates sessions there and the store actor serves the send.
@@ -8520,13 +8554,26 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
+        self.check_expired_with_view(key, run).await.map(|_| ())
+    }
+
+    /// Check the same expiry barrier as every operation, retaining its stored snapshot so a
+    /// read can serve it without loading an over-budget view again.
+    pub(crate) async fn check_expired_with_view(
+        &self,
+        key: &LineageKey,
+        run: Option<&str>,
+    ) -> Result<Option<crate::store_read::StoredLocalView>, OpenError> {
+        let mut view = None;
         if let Some(runtime) = self.store_runtime() {
             let now_ms = self
                 .inner
                 .retention
                 .get()
                 .map_or(0, |service| service.clock.now_ms());
-            if let Some(expired_at_ms) = runtime.expired_at(key, run, now_ms).await? {
+            let (expired_at_ms, loaded) = runtime.expiry_with_view(key, run, now_ms).await?;
+            view = loaded;
+            if let Some(expired_at_ms) = expired_at_ms {
                 // While creating sends may still use legacy storage, a fresh legacy WAL can
                 // follow store deletion. Its live history wins over the address's old marker,
                 // but deleted run IDs still expire. Remove this guard with legacy fallback.
@@ -8549,11 +8596,11 @@ impl LineageRegistry {
         // Today's retention doesn't decide a session the new storage owns, or a move is
         // taking there: its WAL is the copy being moved or the retired one left behind.
         if self.store_owner_refusal(key)?.is_some() {
-            return Ok(());
+            return Ok(view);
         }
         self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(());
+            return Ok(view);
         };
         let head = match self.inner.slots.lock().unwrap().get(key) {
             Some(Entry::Open { handle, .. }) => Some(handle.durable_head.load(Ordering::Acquire)),
@@ -8590,7 +8637,7 @@ impl LineageRegistry {
         if let Some(expired_at_ms) = expired {
             return Err(OpenError::Expired { expired_at_ms });
         }
-        Ok(())
+        Ok(view)
     }
 
     async fn check_history_expired(&self, key: &LineageKey) -> Result<(), OpenError> {

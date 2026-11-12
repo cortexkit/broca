@@ -365,6 +365,7 @@ mod tests {
     ) -> ProviderError {
         ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -378,6 +379,7 @@ mod tests {
             account_ref: None,
             credential_id: None,
             affordable_max_tokens: None,
+            account_continue: None,
         }
     }
 

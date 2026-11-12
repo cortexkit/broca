@@ -308,6 +308,7 @@ mod golden {
                 refusal(WarmRefusalDetail::WarmFailed {
                     error: broca_protocol::error::ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         class: broca_protocol::error::ErrorClass::Transient,
@@ -321,6 +322,7 @@ mod golden {
                         account_ref: None,
                         credential_id: None,
                         affordable_max_tokens: None,
+                        account_continue: None,
                     }
                     .into(),
                 }),

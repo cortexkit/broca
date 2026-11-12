@@ -391,7 +391,7 @@ async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<Contro
                 }
             }
             // This harness's runs emit no display; ignore any display delivery.
-            Delivery::Display(_) => {}
+            Delivery::Display(_) | Delivery::AdmissionChanged => {}
             Delivery::Error(error) => panic!("subscriber replay failed unexpectedly: {error}"),
             Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
             Delivery::Expired { .. } => panic!("forever subscriber expired"),

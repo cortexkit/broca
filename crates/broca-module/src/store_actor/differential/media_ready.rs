@@ -170,7 +170,7 @@ struct ReadyExecutor {
     script: Arc<StubProvider>,
     compactor: Arc<Compactor>,
     /// Whether a run's renderer can be built; when not, building it fails with
-    /// [`BUILD_FAILED`], as building `LiveMedia` over the run's media can fail.
+    /// [`BUILD_FAILED`], as building a run's renderer over its media can fail.
     builds: Arc<AtomicBool>,
     log: Arc<Log>,
 }
@@ -226,32 +226,13 @@ impl RunExecutor for ReadyExecutor {
                 StoreRunError::Admission(RunError::Wal("the run has no media fold".into()))
             })?;
             let builds = self.builds.load(Ordering::SeqCst);
-            let frozen: broca_provider::wire::FrozenRenderConfig =
-                serde_json::from_value(image_render_config()).unwrap();
             let lazy = crate::store_media::LazyRenderer::new(
                 media,
-                Box::new(move |bytes, checkpoint, read_tail| {
+                Box::new(move |media| {
                     if !builds {
                         return Err(BUILD_FAILED.into());
                     }
-                    let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                        bytes,
-                        checkpoint,
-                        None,
-                        frozen.media,
-                        read_tail,
-                    )?;
-                    Ok(Arc::new(
-                        move |frozen: &Value,
-                              opts: &CallOptions,
-                              tags: bool,
-                              commit: bool,
-                              provenance: Option<
-                            &mut broca_protocol::render_provenance::RenderProvenance,
-                        >| {
-                            media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                        },
-                    ) as Arc<MediaRequestRenderer>)
+                    Ok(media.renderer())
                 }),
             );
             provider.set_media_request_renderer(lazy.renderer());
@@ -282,6 +263,8 @@ impl RunExecutor for ReadyExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 model_call_ready: Some(ready),
+                pause_for_auth_at_start: None,
+                account_continue: None,
             };
             match mode {
                 crate::executor::StoreRunMode::Fresh => {
