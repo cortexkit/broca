@@ -1408,6 +1408,7 @@ mod cutover {
     use broca_module::ServeHandler;
 
     mod background;
+    mod concurrent;
     mod rekey;
 
     fn engine(rig: &Rig, archives: bool, live: bool) -> Engine {
@@ -1438,11 +1439,7 @@ mod cutover {
         let deployment_key = deployment();
         let conversion = after_startup_recovery(
             async { wait.await.map_err(|error| error.to_string()) },
-            engine.run_live(
-                &deployment_key,
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry),
-            ),
+            engine.run_live(&deployment_key, Some(&rig.runtime), Some(&rig.registry)),
         );
         tokio::pin!(conversion);
         tokio::select! {
@@ -1491,7 +1488,7 @@ mod cutover {
         engine
             .run_archives(
                 &deployment(),
-                Some(rig.runtime.as_ref()),
+                Some(&rig.runtime),
                 Some(&rig.registry),
                 Duration::ZERO,
             )
@@ -1534,11 +1531,7 @@ mod cutover {
             let before = std::fs::read(rig.wal()).unwrap();
             let engine = engine(&rig, false, true);
             engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let rows = engine.ledger.rows().unwrap();
@@ -1577,11 +1570,7 @@ mod cutover {
         ]);
         let engine = engine(&rig, false, true);
         engine
-            .run_live(
-                &deployment(),
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry),
-            )
+            .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
             .await
             .unwrap();
         let rows = engine.ledger.rows().unwrap();
@@ -1654,11 +1643,7 @@ mod cutover {
             .unwrap();
         let engine = engine(&rig, false, true);
         engine
-            .run_live(
-                &deployment(),
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry),
-            )
+            .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
             .await
             .unwrap();
         let row = &engine.ledger.rows().unwrap()[0];
@@ -1716,11 +1701,7 @@ mod cutover {
         .unwrap();
         engine.set_mover(Arc::new(mover));
         engine
-            .run_live(
-                &deployment(),
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry),
-            )
+            .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
             .await
             .unwrap();
         let rows = engine.ledger.rows().unwrap();
@@ -1739,11 +1720,7 @@ mod cutover {
             engine.install_guard(&rig.registry);
             engine.crash = Some(boundary);
             assert!(engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry)
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .is_err());
             let row = &engine.ledger.rows().unwrap()[0];
@@ -1756,11 +1733,7 @@ mod cutover {
             let changed = std::fs::read(rig.wal()).unwrap();
             engine.crash = None;
             engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let row = &engine.ledger.rows().unwrap()[0];
@@ -1782,11 +1755,7 @@ mod cutover {
             );
             std::fs::write(rig.wal(), &before).unwrap();
             engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let row = &engine.ledger.rows().unwrap()[0];
@@ -1804,11 +1773,7 @@ mod cutover {
         let mut engine = engine(&rig, false, true);
         engine.crash = Some("awaiting_backup");
         assert!(engine
-            .run_live(
-                &deployment(),
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry)
-            )
+            .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
             .await
             .is_err());
         let backup = PathBuf::from(&engine.ledger.rows().unwrap()[0].source.backup);
@@ -1816,11 +1781,7 @@ mod cutover {
         std::fs::write(&backup, b"do not overwrite this backup").unwrap();
         engine.crash = None;
         engine
-            .run_live(
-                &deployment(),
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry),
-            )
+            .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
             .await
             .unwrap();
         let row = &engine.ledger.rows().unwrap()[0];
@@ -1833,11 +1794,7 @@ mod cutover {
         );
         std::fs::remove_file(&backup).unwrap();
         engine
-            .run_live(
-                &deployment(),
-                Some(rig.runtime.as_ref()),
-                Some(&rig.registry),
-            )
+            .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
             .await
             .unwrap();
         let row = &engine.ledger.rows().unwrap()[0];
@@ -1869,7 +1826,7 @@ mod cutover {
         assert!(engine
             .run_archives(
                 &deployment(),
-                Some(rig.runtime.as_ref()),
+                Some(&rig.runtime),
                 Some(&rig.registry),
                 Duration::ZERO
             )
@@ -1880,7 +1837,7 @@ mod cutover {
         engine
             .run_archives(
                 &deployment(),
-                Some(rig.runtime.as_ref()),
+                Some(&rig.runtime),
                 Some(&rig.registry),
                 Duration::ZERO,
             )
@@ -1921,7 +1878,7 @@ mod cutover {
         assert!(engine
             .run_archives(
                 &deployment(),
-                Some(rig.runtime.as_ref()),
+                Some(&rig.runtime),
                 Some(&rig.registry),
                 Duration::ZERO
             )
@@ -1964,7 +1921,7 @@ mod cutover {
         engine
             .run_archives(
                 &deployment(),
-                Some(rig.runtime.as_ref()),
+                Some(&rig.runtime),
                 Some(&rig.registry),
                 Duration::ZERO,
             )
@@ -2000,11 +1957,7 @@ mod cutover {
             let mut engine = engine(&rig, false, true);
             engine.crash = Some(boundary);
             let first = engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await;
             assert!(first.is_err(), "cut {boundary} wasn't reached");
             drop(engine);
@@ -2019,11 +1972,7 @@ mod cutover {
             .unwrap()
             .unwrap();
             engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let rows = engine.ledger.rows().unwrap();
@@ -2042,11 +1991,7 @@ mod cutover {
             write_verified_media_session(&rig);
             let engine = engine(&rig, false, true);
             engine
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let seen = engine.faults.seen.lock().unwrap().clone();
@@ -2076,11 +2021,7 @@ mod cutover {
             *first.faults.crash_at.lock().unwrap() = Some(at);
             assert!(
                 first
-                    .run_live(
-                        &deployment(),
-                        Some(rig.runtime.as_ref()),
-                        Some(&rig.registry)
-                    )
+                    .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                     .await
                     .is_err(),
                 "cut {at}: {}",
@@ -2106,11 +2047,7 @@ mod cutover {
             .unwrap()
             .unwrap();
             restarted
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let row = &restarted.ledger.rows().unwrap()[0];
@@ -2138,11 +2075,7 @@ mod cutover {
             first.crash = Some(boundary);
             assert!(
                 first
-                    .run_live(
-                        &deployment(),
-                        Some(rig.runtime.as_ref()),
-                        Some(&rig.registry)
-                    )
+                    .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                     .await
                     .is_err(),
                 "{boundary}"
@@ -2159,11 +2092,7 @@ mod cutover {
             .unwrap()
             .unwrap();
             restarted
-                .run_live(
-                    &deployment(),
-                    Some(rig.runtime.as_ref()),
-                    Some(&rig.registry),
-                )
+                .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
                 .await
                 .unwrap();
             let row = &restarted.ledger.rows().unwrap()[0];
