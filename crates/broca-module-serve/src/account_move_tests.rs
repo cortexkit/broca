@@ -454,6 +454,38 @@ async fn a_moved_chatgpt_resume_with(
     missing: Option<&'static str>,
     both_listed: bool,
 ) -> (Result<broca_core::AuthSelection, String>, usize) {
+    let (admitted, asked) = admit_chatgpt_resume(
+        label,
+        vault_account,
+        true,
+        records_change,
+        reply,
+        missing,
+        both_listed,
+    )
+    .await;
+    let selection = admitted.and_then(|admitted| {
+        assert!(!admitted.fresh_episode, "a resume");
+        admitted
+            .resolution
+            .selection
+            .ok_or_else(|| "no selection".to_owned())
+    });
+    (selection, asked)
+}
+
+/// Admits the resume of a ChatGPT run recorded on `chatgpt-a` under routing's decision (see
+/// [`a_moved_chatgpt_resume`]); `moved` says whether it moved there at a quota wall.
+#[allow(clippy::too_many_arguments)]
+async fn admit_chatgpt_resume(
+    label: &str,
+    vault_account: &'static str,
+    moved: bool,
+    records_change: bool,
+    reply: Result<serde_json::Value, serde_json::Value>,
+    missing: Option<&'static str>,
+    both_listed: bool,
+) -> (Result<EpisodeAdmission, String>, usize) {
     let root = fresh_vault_root(label);
     let daemon = CapturingVaultDaemon::start_expiring(
         &root,
@@ -526,7 +558,7 @@ async fn a_moved_chatgpt_resume_with(
             run_id: req.run_id.clone(),
             config: config.clone(),
             idle: false,
-            moved: true,
+            moved,
             records_account_change: records_change,
         }),
         last_config: Some(&config),
@@ -555,14 +587,7 @@ async fn a_moved_chatgpt_resume_with(
             &history,
         )
         .await
-        .map_err(|error| format!("{error}"))
-        .and_then(|admitted| {
-            assert!(!admitted.fresh_episode, "a resume");
-            admitted
-                .resolution
-                .selection
-                .ok_or_else(|| "no selection".to_owned())
-        });
+        .map_err(|error| format!("{error}"));
     let asked = routing.asked.load(std::sync::atomic::Ordering::SeqCst);
     drop(executor);
     if missing.is_some() {
@@ -718,3 +743,70 @@ async fn a_moved_runs_resume_keeps_its_routed_decision_on_a_static_pick() {
     assert_eq!(asked, 1);
     kept_the_recorded_account(&selection.unwrap());
 }
+
+/// Through the executor: a run that never moved resumes (a held call's resume, or any other)
+/// after a re-login in which the vault now serves its recorded credential for another account.
+/// The admission names that account, but the provider built for the resume keeps the run's
+/// frozen account, so its first request is refused before anything is sent: an Auth error with
+/// `account_changed`, which the loop turns into a pause for a sign-in. Nothing goes out on, or
+/// is recorded for, the other account.
+#[tokio::test]
+async fn a_resume_after_a_relogin_to_another_account_pauses_as_account_changed() {
+    let (admitted, asked) = admit_chatgpt_resume(
+        "relogin-other-account",
+        "chatgpt-c",
+        false,
+        false,
+        Ok(chosen("chatgpt-b", "chatgpt:openai:second")),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(asked, 0, "a run that never moved doesn't ask routing");
+    let admitted = admitted.unwrap();
+    assert_eq!(
+        admitted
+            .resolution
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.account_ref.as_deref()),
+        Some("chatgpt-c"),
+        "the vault served the recorded credential for another account"
+    );
+    let opts = broca_protocol::request::CallOptions::new(vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "hello".into(),
+        }],
+    )]);
+    let mut events = admitted
+        .resolved
+        .provider
+        .step(broca_protocol::StepId(2), &opts)
+        .await;
+    let mut seen = Vec::new();
+    while let Some(event) = events.recv().await {
+        seen.push(event);
+    }
+    assert!(
+        !seen.iter().any(|event| matches!(
+            event,
+            broca_protocol::NormalizedEvent::Control(
+                broca_protocol::provider::ProviderControl::AttemptFinished { .. }
+            )
+        )),
+        "no attempt was made: {seen:?}"
+    );
+    let error = seen
+        .iter()
+        .find_map(|event| match event {
+            broca_protocol::NormalizedEvent::Control(
+                broca_protocol::provider::ProviderControl::Error { error, .. },
+            ) => Some(error.clone()),
+            _ => None,
+        })
+        .expect("the step ends with an error");
+    assert_eq!(error.provider_code.as_deref(), Some("account_changed"));
+    assert_eq!(error.class, broca_protocol::ErrorClass::Auth);
+}
+
