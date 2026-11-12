@@ -2911,6 +2911,7 @@ mod executor {
             // The actor's in-flight step, which `run.status` serves for its active run.
             step_progress: control.step_progress.clone(),
             model_call_ready: None,
+            pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
         }
     }
 
@@ -4613,23 +4614,11 @@ mod executor {
                 mode: _,
                 resolved,
             } = admitted;
-            // The new run loop doesn't yet start a run paused for sign-in; today's loop writes
-            // such a run's start and its pause before any model call. A session in the new
-            // storage refuses that run by name until it does. A routing refusal of the caller's
-            // decision goes to the loop as the run's pre-model error, as `episode_control` hands
-            // it to today's loop: the run's start is written, then the run ends with that error.
             if fresh_episode != (mode == StoreRunMode::Fresh) {
                 return Err(StoreRunError::Admission(RunError::Config(format!(
                     "the store actor asked for a {mode:?} run, but the session's latest run says \
                      otherwise"
                 ))));
-            }
-            if routing_decision_error.is_none() && resolution.pause.is_some() {
-                return Err(StoreRunError::Admission(RunError::Config(
-                    "a run that starts paused for sign-in isn't served on the new session \
-                     storage yet"
-                        .into(),
-                )));
             }
             let holds_media = req
                 .input

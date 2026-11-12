@@ -291,6 +291,7 @@ async fn run_on(
         auth_selection: None,
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
     };
     let reads = Arc::new(Reads::default());
     let mut writer = Counting {
