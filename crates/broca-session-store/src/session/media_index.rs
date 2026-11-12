@@ -31,7 +31,7 @@ use crate::fold::conversation::Conversation;
 use crate::fold::media::{MediaFeed, MediaFold, MediaIndexRef};
 use crate::fold::operations::Operations;
 use crate::message;
-use crate::record::Record;
+use crate::record::{MediaObject, Record};
 
 /// The only version of the saved index this build writes and reads.
 pub const MEDIA_INDEX_VERSION: u32 = 1;
@@ -190,6 +190,17 @@ message! {
 }
 
 message! {
+    /// Where the bytes of the media with one digest are stored: the object a record of the
+    /// session names for them. An object is named by the record that wrote it, so a digest
+    /// alone doesn't find it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StoredObject {
+        1 req sha256: String,
+        2 req object: MediaObject,
+    }
+}
+
+message! {
     /// The image engine's state, as data: what a session's saved media index holds. Its owner
     /// converts it to and from the engine's own types; the store reads none of it but the
     /// checks [`StoredMediaIndex::check`] makes.
@@ -210,7 +221,9 @@ message! {
         7 rep accepted: AcceptedMessage,
         /// Captures protected from aging until the next step starts.
         8 rep protected: StoredMediaId,
-        /// Skeletons of the placed messages that hold media.
+        /// The skeletons of the placed messages the engine keeps: those holding media, and the
+        /// results messages of tool results whose output is a list of parts, with or without
+        /// media, whose place shifts the positions of later media.
         9 rep placed: PlacedSkeleton,
         /// Skeletons of the accepted messages not placed yet that hold media.
         10 rep held: HeldSkeleton,
@@ -223,6 +236,9 @@ message! {
         /// The media limits in force: the `media` member of the run's render config.
         15 opt limits: serde_json::Value,
         16 req aging: StoredAging,
+        /// Where the bytes of each medium the index may show are stored, one entry per digest:
+        /// the object the first record naming the digest names.
+        17 rep objects: StoredObject,
     }
 }
 

@@ -695,6 +695,46 @@ fn a_tool_batch_with_images_in_two_results() {
     );
 }
 
+/// Where a record stored the bytes of the media it names is handed over with the record, by
+/// digest, so the engine's owner can read them: a digest alone doesn't name the object.
+#[test]
+fn the_feed_hands_over_where_each_medium_is_stored() {
+    let mut history = History::new();
+    plain_run(&mut history);
+    history.batch(vec![
+        start("r2", vec![render_config()], false),
+        input("r2", Placement::RunInput, None, said("take photos")),
+        facts(3),
+    ]);
+    step(&mut history, "r2", 1, 4, vec![call("x")]);
+    history.batch(vec![batch_start("r2", 1, &["x"])]);
+    let stored = |part: u32, seq: u64| crate::record::MediaObject {
+        part,
+        log: crate::codec::Id128([1; 16]),
+        generation: crate::codec::Id128([2; 16]),
+        seq,
+    };
+    let mut photos = reply("r2", 1, "x", &["a", "b"]);
+    let Record::ToolReply(written) = &mut photos else {
+        unreachable!()
+    };
+    written.media = vec![stored(1, 40), stored(2, 40)];
+    let (_, feed) = history.batch(vec![
+        photos,
+        outcome("r2", 1, "x"),
+        facts(5),
+        turn_facts(4),
+        batch_end("r2", 1),
+    ]);
+    assert_eq!(
+        feed.objects,
+        vec![
+            (image("a").sha256, stored(1, 40)),
+            (image("b").sha256, stored(2, 40)),
+        ]
+    );
+}
+
 /// A result that arrives after its batch closed (a converted session's `late_result` event) is
 /// captured but never shown, and no assistant message waits for it.
 #[test]

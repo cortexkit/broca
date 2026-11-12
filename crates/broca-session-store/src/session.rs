@@ -1092,8 +1092,8 @@ pub use crate::fold::media::{
 pub use media_index::{
     AcceptedMessage, HeldSkeleton, LoadedMedia, MediaIndexSave, MediaIndexSource, PlacedSkeleton,
     SavedIndex, ShownOccurrence, StoredAging, StoredBinding, StoredCapture, StoredMediaId,
-    StoredMediaIndex, StoredOccurrence, StoredReplacement, StoredSelection, StoredSkeleton,
-    StoredSlot, MEDIA_INDEX_VERSION,
+    StoredMediaIndex, StoredObject, StoredOccurrence, StoredReplacement, StoredSelection,
+    StoredSkeleton, StoredSlot, MEDIA_INDEX_VERSION,
 };
 mod enrollment;
 pub use enrollment::EnrollmentOverlay;

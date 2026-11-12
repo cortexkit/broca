@@ -30,7 +30,7 @@ use broca_protocol::media_event::{MediaEvent, MediaInput, MediaLimits, MediaMess
 use crate::fold::conversation::Conversation;
 use crate::fold::operations::Operations;
 use crate::fold::Bound;
-use crate::record::{Input, PartKind, PartRef, Placement, Record};
+use crate::record::{Input, MediaObject, PartKind, PartRef, Placement, Record};
 
 crate::fold::state! {
     /// The media fold's state. A log's checkpoint carries it (`session::MediaIndexRef`), so a
@@ -235,11 +235,19 @@ pub struct MediaFeed {
     /// Only an index saved after it can carry the session past it; the items after it are
     /// relative to such an index.
     pub needs_saved_index: Option<u64>,
+    /// Where the records stored the bytes of the media they name, by digest, in record order:
+    /// a medium's bytes are read from the object a record names for them, which its digest
+    /// alone doesn't say. Handed over for every record that names one, whether or not the
+    /// session captured anything yet, so a queued send's media are known when it is placed.
+    pub objects: Vec<(String, MediaObject)>,
 }
 
 impl MediaFeed {
     pub fn is_empty(&self) -> bool {
-        self.start.is_none() && self.items.is_empty() && self.needs_saved_index.is_none()
+        self.start.is_none()
+            && self.items.is_empty()
+            && self.needs_saved_index.is_none()
+            && self.objects.is_empty()
     }
 
     /// Appends what later records handed over.
@@ -251,6 +259,7 @@ impl MediaFeed {
         if self.needs_saved_index.is_none() {
             self.needs_saved_index = later.needs_saved_index;
         }
+        self.objects.extend(later.objects);
     }
 
     fn event(&mut self, event: MediaEvent) {
@@ -378,6 +387,7 @@ impl MediaFold {
         operations: &Operations,
         out: &mut MediaFeed,
     ) {
+        out.objects.extend(crate::session::record_objects(record));
         if self.settles(record) {
             self.settle(out);
         }

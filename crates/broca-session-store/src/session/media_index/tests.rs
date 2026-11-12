@@ -25,8 +25,9 @@ cipher_tests!(
     an_undo_cuts_the_index_at_the_message_it_returns_to,
 );
 
-/// A session with 500 tool images, each in its results message's skeleton and shown in its
-/// requests, half of them aged out: its saved index stays under 1 KB per image.
+/// A session with 500 tool images, each in its results message's skeleton, shown in its
+/// requests and stored in an object of its own, half of them aged out: its saved index stays
+/// under 1 KB per image.
 #[test]
 fn a_saved_index_holds_under_a_kilobyte_per_image() {
     let reference = |n: u64| -> broca_protocol::content::MediaRef {
@@ -80,6 +81,15 @@ fn a_saved_index_holds_under_a_kilobyte_per_image() {
             capture: id,
             repetition: 0,
         };
+        index.objects.push(StoredObject {
+            sha256: format!("{n:064x}"),
+            object: crate::record::MediaObject {
+                part: 1,
+                log: crate::codec::Id128([7; 16]),
+                generation: crate::codec::Id128([9; 16]),
+                seq: 1_000_000 + n * 40 - 1,
+            },
+        });
         if n % 2 == 0 {
             index.aging.aged.push(occurrence);
         } else {
@@ -100,8 +110,9 @@ fn a_saved_index_holds_under_a_kilobyte_per_image() {
     .encode()
     .len();
     assert!(bytes < 500 * 1024, "{bytes} bytes for 500 images");
-    // About 314 bytes per image when this was written: far under the 1 KB budget.
-    assert!(bytes / 500 < 400, "{} bytes per image", bytes / 500);
+    // About 314 bytes per image when this was written, and about 424 with where its bytes are
+    // stored: far under the 1 KB budget.
+    assert!(bytes / 500 < 500, "{} bytes per image", bytes / 500);
 }
 
 fn triple() -> SessionTriple {
