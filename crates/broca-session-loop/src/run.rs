@@ -323,6 +323,18 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    let mut transport = crate::transport::Guard::bind(seams.provider, &seams.bind);
+    crate::transport::seed(
+        writer,
+        seams.provider,
+        seams
+            .auth_selection
+            .as_ref()
+            .and_then(|selection| selection.account_ref.as_deref()),
+        &admission.render_config,
+        (seams.now_ms)(),
+    )
+    .await?;
     refuse_first_protocol_compaction(writer)?;
     refuse_unbuilt(&admission)?;
     // A session on the current compaction contract stays on it, and a new run on it freezes the
@@ -447,6 +459,7 @@ where
             changes.tell(&placed, seams).await;
         }
     }
+    transport.finished(&finished);
     Ok(finished)
 }
 
@@ -512,6 +525,21 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    let mut transport = crate::transport::Guard::bind(seams.provider, &seams.bind);
+    if let Some(run) = writer.operations().run.as_ref() {
+        let admission = frozen_admission(run, parts)?;
+        crate::transport::seed(
+            writer,
+            seams.provider,
+            seams
+                .auth_selection
+                .as_ref()
+                .and_then(|selection| selection.account_ref.as_deref()),
+            &admission.render_config,
+            (seams.now_ms)(),
+        )
+        .await?;
+    }
     let unfinished = writer
         .operations()
         .run
@@ -533,6 +561,7 @@ where
             }
         }
     }
+    transport.finished(&finished);
     Ok(finished)
 }
 

@@ -16,6 +16,17 @@ impl std::fmt::Debug for Sessions {
 }
 
 impl Sessions {
+    pub(super) fn evidence(
+        &self,
+        bind: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> broca_core::provider::AcceptedSendEvidence {
+        self.0.lock().unwrap().get(bind).map_or(
+            broca_core::provider::AcceptedSendEvidence::NotLoaded,
+            |session| session.0.lock().unwrap().accepted_evidence(account),
+        )
+    }
+
     pub(super) fn accepted_at_ms(
         &self,
         bind: &broca_protocol::BindIdentity,
@@ -24,9 +35,7 @@ impl Sessions {
         let sessions = self.0.lock().unwrap();
         let session = sessions.get(bind)?;
         let state = session.0.lock().unwrap();
-        state
-            .accepted_loaded
-            .then(|| state.accepted_by_account.get(account).copied())
+        state.accepted_evidence(account).loaded_at_ms()
     }
 
     pub(super) fn bind(&self, bind: &broca_protocol::BindIdentity) -> Arc<Session> {
@@ -82,6 +91,22 @@ struct State {
     previous: Option<Previous>,
     accepted_by_account: HashMap<String, u64>,
     accepted_loaded: bool,
+    accepted_evidence: HashMap<String, broca_core::provider::AcceptedSendEvidence>,
+}
+
+impl State {
+    fn accepted_evidence(&self, account: &str) -> broca_core::provider::AcceptedSendEvidence {
+        use broca_core::provider::AcceptedSendEvidence;
+        if let Some(sent) = self.accepted_by_account.get(account) {
+            AcceptedSendEvidence::At(*sent)
+        } else if let Some(evidence) = self.accepted_evidence.get(account) {
+            *evidence
+        } else if self.accepted_loaded {
+            AcceptedSendEvidence::None
+        } else {
+            AcceptedSendEvidence::NotLoaded
+        }
+    }
 }
 
 struct Previous {
@@ -126,6 +151,29 @@ fn ttl(frozen: &FrozenRenderConfig) -> (Option<u64>, TtlKind) {
 }
 
 impl Session {
+    pub(super) fn accepted_send_evidence(
+        &self,
+        account: &str,
+    ) -> broca_core::provider::AcceptedSendEvidence {
+        self.0.lock().unwrap().accepted_evidence(account)
+    }
+
+    pub(super) fn seed_accepted_send(
+        &self,
+        account: &str,
+        evidence: broca_core::provider::AcceptedSendEvidence,
+    ) {
+        let mut state = self.0.lock().unwrap();
+        if let broca_core::provider::AcceptedSendEvidence::At(sent) = evidence {
+            let previous = state
+                .accepted_by_account
+                .entry(account.to_owned())
+                .or_insert(sent);
+            *previous = (*previous).max(sent);
+        }
+        state.accepted_evidence.insert(account.to_owned(), evidence);
+    }
+
     pub(super) fn needs_seed(&self, lineage: Option<&str>) -> bool {
         let state = self.0.lock().unwrap();
         !state.seeded || state.lineage.as_deref() != lineage
@@ -238,6 +286,7 @@ impl Session {
             previous,
             accepted_by_account,
             accepted_loaded: true,
+            accepted_evidence: HashMap::new(),
         };
     }
 
@@ -246,7 +295,6 @@ impl Session {
     }
     pub(super) fn annotate(&self, attempt: &mut ModelAttempt) {
         let mut state = self.0.lock().unwrap();
-        state.accepted_loaded = true;
         note_accepted(
             &mut state.accepted_by_account,
             attempt.http_status,
