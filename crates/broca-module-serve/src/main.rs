@@ -3282,8 +3282,11 @@ mod executor {
                     &self.req.session,
                 )
                 .map_err(|error| format!("the new account's persona: {error}"))?;
-                config.frozen_render_config["claude_code_persona"] = serde_json::to_value(&persona)
-                    .map_err(|error| format!("the new account's persona: {error}"))?;
+                refreeze_persona(
+                    &mut config.frozen_render_config,
+                    serde_json::to_value(&persona)
+                        .map_err(|error| format!("the new account's persona: {error}"))?,
+                );
             }
             Ok(config)
         }
@@ -3506,8 +3509,36 @@ mod executor {
             session,
         )
         .map_err(|error| format!("the resumed account's persona: {error}"))?;
+        // The refusal-fallback model's config carries the same persona as the source, so a step
+        // re-sent there after the change names the new account too.
+        if let Some(fallback) = frozen.refusal_fallback.as_mut() {
+            if fallback.frozen.claude_code_persona.is_some() {
+                fallback.frozen.claude_code_persona = Some(moved.clone());
+            }
+        }
         frozen.claude_code_persona = Some(moved);
         Ok(())
+    }
+
+    /// Puts `persona`, refrozen for another account, in a recorded render config: the config's
+    /// own `claude_code_persona`, and its refusal-fallback model's
+    /// (`refusal_fallback.frozen.claude_code_persona`) when that carries one, since the fallback
+    /// renders with the same persona as the source. Every other byte of the config is kept.
+    fn refreeze_persona(render_config: &mut serde_json::Value, persona: serde_json::Value) {
+        const PERSONA: &str = "claude_code_persona";
+        if let Some(fallback) = render_config
+            .get_mut("refusal_fallback")
+            .and_then(|fallback| fallback.get_mut("frozen"))
+            .and_then(serde_json::Value::as_object_mut)
+            .filter(|fallback| {
+                fallback
+                    .get(PERSONA)
+                    .is_some_and(|persona| !persona.is_null())
+            })
+        {
+            fallback.insert(PERSONA.into(), persona.clone());
+        }
+        render_config[PERSONA] = persona;
     }
 
     fn decode_recorded_render_config(

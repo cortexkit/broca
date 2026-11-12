@@ -2026,9 +2026,29 @@ fn differs_only_in_persona(current: &Value, frozen: &Value) -> bool {
     if current.get(PERSONA) == frozen.get(PERSONA) {
         return false;
     }
+    // The refusal-fallback model's config carries the same persona as the source, and is
+    // refrozen with it: a fallback still naming another persona than its source differs.
+    let fallback_persona = |config: &serde_json::Map<String, Value>| {
+        config
+            .get("refusal_fallback")
+            .and_then(|fallback| fallback.get("frozen"))
+            .and_then(|fallback| fallback.get(PERSONA))
+            .filter(|persona| !persona.is_null())
+            .cloned()
+    };
+    if fallback_persona(current).is_some_and(|persona| Some(&persona) != current.get(PERSONA)) {
+        return false;
+    }
     let without = |config: &serde_json::Map<String, Value>| {
         let mut config = config.clone();
         config.remove(PERSONA);
+        if let Some(fallback) = config
+            .get_mut("refusal_fallback")
+            .and_then(|fallback| fallback.get_mut("frozen"))
+            .and_then(Value::as_object_mut)
+        {
+            fallback.remove(PERSONA);
+        }
         config
     };
     without(current) == without(frozen)

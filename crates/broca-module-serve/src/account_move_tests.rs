@@ -79,6 +79,38 @@ fn a_resumed_runs_persona_follows_the_account_routing_gave_it() {
     assert_ne!(persona.device_id, recorded.device_id);
     assert_eq!(persona.session_id, recorded.session_id);
 
+    // The refusal-fallback model's config carries the source's persona, and follows it.
+    let mut with_fallback = frozen.clone();
+    let mut fallback = broca_provider::families::anthropic_frozen_config("claude-fallback");
+    fallback.claude_code_persona = Some(recorded.clone());
+    with_fallback.refusal_fallback = Some(Box::new(broca_provider::wire::RefusalFallbackConfig {
+        model: broca_protocol::request::ModelHandle::new("anthropic", "claude-fallback"),
+        context_limit: None,
+        frozen: fallback,
+    }));
+    persona_for_resumed_account(
+        &mut with_fallback,
+        Some("install"),
+        Some(old),
+        Some(&selection(new, "cred-c")),
+        &session,
+    )
+    .unwrap();
+    let source = with_fallback.claude_code_persona.clone().unwrap();
+    assert_eq!(source.account_uuid.as_deref(), Some(new));
+    assert_eq!(source.device_id, persona.device_id);
+    assert_eq!(
+        with_fallback
+            .refusal_fallback
+            .as_ref()
+            .unwrap()
+            .frozen
+            .claude_code_persona
+            .as_ref(),
+        Some(&source),
+        "the fallback renders with the same persona as its source"
+    );
+
     let mut without = broca_provider::families::anthropic_frozen_config("claude-test");
     without.claude_code_persona = None;
     persona_for_resumed_account(
@@ -143,4 +175,37 @@ fn a_resume_routing_gives_no_account_keeps_the_recorded_one() {
         Ok(AccountChoice::NotApplicable)
     ));
     assert!(asks, "an answer routing gave is taken");
+}
+
+/// A move's recorded render config takes the new account's persona in its own
+/// `claude_code_persona` and in its refusal-fallback model's, when that carries one, and keeps
+/// every other byte.
+#[test]
+fn a_refrozen_persona_reaches_the_refusal_fallbacks_config() {
+    let old = serde_json::json!({"account_uuid": "a"});
+    let new = serde_json::json!({"account_uuid": "b"});
+    let mut config = serde_json::json!({
+        "claude_code_persona": old,
+        "wire_model_id": "claude-test",
+        "refusal_fallback": {
+            "model": {"provider_module_id": "anthropic", "model_id": "claude-fallback"},
+            "frozen": {"claude_code_persona": old, "wire_model_id": "claude-fallback"},
+        },
+    });
+    refreeze_persona(&mut config, new.clone());
+    assert_eq!(
+        config,
+        serde_json::json!({
+            "claude_code_persona": new,
+            "wire_model_id": "claude-test",
+            "refusal_fallback": {
+                "model": {"provider_module_id": "anthropic", "model_id": "claude-fallback"},
+                "frozen": {"claude_code_persona": new, "wire_model_id": "claude-fallback"},
+            },
+        })
+    );
+    // A config without a fallback gains none.
+    let mut plain = serde_json::json!({"claude_code_persona": old});
+    refreeze_persona(&mut plain, new.clone());
+    assert_eq!(plain, serde_json::json!({"claude_code_persona": new}));
 }

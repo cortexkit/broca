@@ -2102,13 +2102,28 @@ async fn resume_paused_run_on(
     Vec<(u64, Record)>,
     Vec<Sent>,
 ) {
+    resume_paused_run_from(render_config("A"), account, render).await
+}
+
+/// [`resume_paused_run_on`], with the run first rendering on A under `first`.
+async fn resume_paused_run_from(
+    first: Value,
+    account: &str,
+    render: Value,
+) -> (
+    Result<broca_session_loop::Finished, broca_session_loop::LoopError>,
+    Vec<(u64, Record)>,
+    Vec<Sent>,
+) {
     let backend = MemoryBackend::default();
     let mut session = session(&backend).await;
     let mut parts = MemoryParts::default();
     let sent = Arc::new(Mutex::new(Vec::new()));
     let log: Log = Arc::default();
     let stop = tokio_util::sync::CancellationToken::new();
-    let provider: Box<dyn Provider> = Box::new(Account::new("A", vec![Reply::Tool], &sent, &log));
+    let mut on_a = Account::new("A", vec![Reply::Tool], &sent, &log);
+    on_a.render_config = first;
+    let provider: Box<dyn Provider> = Box::new(on_a);
     let a = routed("A", "decision-A");
     let mut request = request();
     request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
@@ -2220,6 +2235,56 @@ async fn a_resume_whose_config_changes_beyond_the_persona_still_ends_the_run() {
             .any(|(_, record)| matches!(record, Record::ConfigRefrozen(_))));
         assert_eq!(sent.len(), 1, "only the first step was sent");
     }
+}
+
+/// A render config naming `account`'s persona, with a refusal-fallback model whose own config
+/// names `fallback_account`'s, as an eligible Claude OAuth episode freezes it.
+fn render_config_with_fallback(account: &str, fallback_account: &str) -> Value {
+    let mut config = render_config(account);
+    config["refusal_fallback"] = json!({
+        "model": {"provider_module_id": "stub", "model_id": "fallback"},
+        "frozen": {"claude_code_persona": {"account_uuid": fallback_account}, "wire_model_id": "fallback"},
+    });
+    config
+}
+
+/// A paused run whose render config holds a refusal-fallback config resumes on another account
+/// only when the fallback's persona follows the account too: one left naming the old account
+/// is a change beyond the persona, and ends the run.
+#[tokio::test]
+async fn a_resume_on_another_account_refreezes_the_fallbacks_persona_too() {
+    let (finished, records, sent) = resume_paused_run_from(
+        render_config_with_fallback("A", "A"),
+        "C",
+        render_config_with_fallback("C", "C"),
+    )
+    .await;
+    assert_eq!(
+        finished.unwrap().reason,
+        RunFinishReason::Completed,
+        "{records:#?}"
+    );
+    let refrozen: Vec<_> = records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ConfigRefrozen(config) => Some(config.render_config.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refrozen, vec![render_config_with_fallback("C", "C")]);
+    assert_eq!(sent.last().map(|sent| sent.account.as_str()), Some("C"));
+
+    let (finished, records, sent) = resume_paused_run_from(
+        render_config_with_fallback("A", "A"),
+        "C",
+        render_config_with_fallback("C", "A"),
+    )
+    .await;
+    assert_eq!(finished.unwrap().reason, RunFinishReason::Interrupted);
+    assert!(!records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::ConfigRefrozen(_))));
+    assert_eq!(sent.len(), 1, "only the first step was sent");
 }
 
 /// Runs a run on A that walls at step 2 while `script` answers routing, with the runner's stop
