@@ -546,6 +546,7 @@ pub(crate) fn error(
 ) -> ProviderError {
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal,
         class: if retryable {

@@ -1119,6 +1119,7 @@ mod gated {
         let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let pause = broca_protocol::ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: broca_protocol::ErrorClass::Auth,

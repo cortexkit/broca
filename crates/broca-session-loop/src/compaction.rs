@@ -257,6 +257,7 @@ pub enum Send {
 pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
     broca_protocol::ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: broca_protocol::ErrorClass::Permanent,

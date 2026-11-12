@@ -313,7 +313,7 @@ the next one). Synced before the caller sees the terminal.
 
 `ProviderError`: `class` (`transient`, `permanent`, `auth_required` (older records may say
 `auth`), `context_overflow`, `provider_unavailable`), `message`, and absent-when-unset
-`status` (u16), `retry_after_secs` (float), `provider_code`, `provider_subcode`, `resets_at_ms`
+`status` (u16), `retry_after_secs` (float), `provider_code`, `cause`, `provider_subcode`, `resets_at_ms`
 (u64), `limit_window`, `account_ref`, `credential_id`, `affordable_max_tokens` (u32), and
 `provider_details` (object). Google `provider_details` retains bounded `errorInfo` (`reason`,
 `domain`, string-valued `metadata`), `quotaFailure.violations` (`subject`, `description`,
@@ -329,6 +329,15 @@ and there are at most 8 violations. A record carrying it is MUST-UNDERSTAND (fea
 class `permanent`, never re-sent. `provider_subcode` carries the provider's own short code
 beneath it (for example `invalid_json_schema`), only when it matches `[a-z0-9_]{1,64}`; it is
 an open, diagnostic-only vocabulary and is absent on every other error.
+
+`cause` is a broca-assigned routing reason beneath `provider_code`, unlike the provider-owned
+`provider_subcode`. Its only current value, `signed_reasoning_rejected`, refines an Anthropic
+HTTP 400 `invalid_request_error` with the exact modified-thinking refusal observed on
+11 November 2026: `messages.<digits>.content.<digits>: ` followed by
+`` `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response. ``
+Nothing may precede or follow that whole message. Other messages and provider families carry
+no `cause`, preserving their serialized bytes. The optional member is accepted by older JSON
+error readers; it adds no record type or must-understand feature.
 
 `affordable_max_tokens` is set only on a `credit_insufficient` terminal (a permanent refusal of a
 request the credential's remaining credit cannot pay for now, such as OpenRouter's HTTP 402 with

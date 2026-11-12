@@ -272,6 +272,7 @@ pub fn classify_tier_refusal(
     };
     ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         class: ErrorClass::Permanent,
@@ -547,6 +548,7 @@ mod tests {
     ) -> ProviderError {
         let original = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -661,6 +663,7 @@ mod tests {
         const CAPTURED: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode."},"request_id":"req_011CfQqPwHCYLA9161tYEBSn"}"#;
         let busy = |body: &str| ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -749,6 +752,7 @@ mod tests {
         }
         let untouched = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Permanent,

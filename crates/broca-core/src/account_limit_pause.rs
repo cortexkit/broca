@@ -133,6 +133,7 @@ pub fn request_changed_error() -> ProviderError {
         provider_code: Some("account_limit_request_changed".into()),
         status: None,
         retry_after_secs: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         resets_at_ms: None,

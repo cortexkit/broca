@@ -13,6 +13,7 @@ pub enum SealCause {
 pub fn crash_orphan_error() -> broca_protocol::ProviderError {
     broca_protocol::ProviderError {
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         class: broca_protocol::ErrorClass::Transient,
         message: "the previous broca process ended without sealing this run: host crash, kill, \

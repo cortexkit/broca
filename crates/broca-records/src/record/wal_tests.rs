@@ -1053,6 +1053,7 @@ mod schema_tests {
     fn every_v2_record_round_trips() {
         let provider_err = ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Auth,
@@ -1224,6 +1225,7 @@ mod schema_tests {
                     run_id: RunId("r3".into()),
                     error: ProviderError {
                         provider_details: None,
+                        cause: None,
                         provider_subcode: None,
                         refusal: None,
                         class: ErrorClass::Permanent,
@@ -1262,6 +1264,7 @@ mod schema_tests {
             usage: Usage::default(),
             error: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Transient,
@@ -1285,6 +1288,7 @@ mod schema_tests {
             reason: PauseReason::AuthRequired,
             error: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::Auth,
@@ -1319,6 +1323,7 @@ mod schema_tests {
         usage: Usage::default(),
         error: Some(ProviderError {
         provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class: ErrorClass::Transient,
@@ -1355,6 +1360,7 @@ mod schema_tests {
                      code: Option<&str>,
                      account: Option<&str>| ProviderError {
             provider_details: None,
+            cause: None,
             provider_subcode: None,
             refusal: None,
             class,
@@ -1458,6 +1464,7 @@ mod schema_tests {
             usage: Usage::default(),
             error: Some(ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: ErrorClass::ProviderUnavailable,

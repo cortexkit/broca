@@ -39,6 +39,7 @@ fn error(status: Option<u16>, code: Option<&str>, retry_after_secs: Option<f64>)
         provider_code: code.map(str::to_owned),
         retry_after_secs,
         provider_details: None,
+        cause: None,
         provider_subcode: None,
         refusal: None,
         resets_at_ms: None,

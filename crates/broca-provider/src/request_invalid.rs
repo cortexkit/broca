@@ -20,6 +20,54 @@ const INVALID_REQUEST_ERROR: &str = "invalid_request_error";
 /// input-token-limit refusal uses it too; that one is classed context overflow earlier.
 const GOOGLE_INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
 
+// Anthropic's production HTTP 400 text, observed on 11 November 2026. A message must consist
+// entirely of a messages.<index>.content.<index>: path followed by one of these exact refusals;
+// a substring could instead be request content echoed inside an unrelated validation error.
+const SIGNED_REASONING_REJECTION_MESSAGES: &[&str] = &[
+    "`thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+];
+
+fn signed_reasoning_rejected(message: &str) -> bool {
+    let Some(path) = message.strip_prefix("messages.") else {
+        return false;
+    };
+    let Some((message_index, path)) = path.split_once(".content.") else {
+        return false;
+    };
+    let Some((content_index, refusal)) = path.split_once(": ") else {
+        return false;
+    };
+    let is_index =
+        |index: &str| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit());
+    is_index(message_index)
+        && is_index(content_index)
+        && SIGNED_REASONING_REJECTION_MESSAGES.contains(&refusal)
+}
+
+/// Refine only Anthropic's request-validation refusals with a broca-owned routing cause.
+/// Match the entire structured message, never copy provider text into the cause.
+pub(crate) fn classify_anthropic_request_invalid(
+    error: ProviderError,
+    error_object: Option<&Value>,
+) -> ProviderError {
+    let mut error = classify_request_invalid(error, error_object);
+    if error.is_request_invalid()
+        && error.status == Some(400)
+        && error.class == ErrorClass::Permanent
+        && error_object
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            == Some(INVALID_REQUEST_ERROR)
+        && error_object
+            .and_then(|object| object.get("message"))
+            .and_then(Value::as_str)
+            .is_some_and(signed_reasoning_rejected)
+    {
+        error.cause = Some("signed_reasoning_rejected".to_owned());
+    }
+    error
+}
+
 /// Relabel `error` as [`REQUEST_INVALID`] when it is a request-validation refusal that no more
 /// specific code already describes.
 ///
@@ -100,6 +148,7 @@ mod tests {
             status: Some(400),
             retry_after_secs: None,
             provider_code: provider_code.map(str::to_owned),
+            cause: None,
             provider_subcode: None,
             refusal: None,
             resets_at_ms: None,

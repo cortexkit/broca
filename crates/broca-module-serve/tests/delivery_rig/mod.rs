@@ -675,6 +675,7 @@ impl RunExecutor for CoreExec {
             // credential needs it does.
             control.pause_for_auth_at_start = Some(broca_protocol::ProviderError {
                 provider_details: None,
+                cause: None,
                 provider_subcode: None,
                 refusal: None,
                 class: broca_protocol::ErrorClass::Auth,
