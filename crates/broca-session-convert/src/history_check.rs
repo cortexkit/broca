@@ -281,8 +281,8 @@ fn store_walks(
         .collect()
 }
 
-/// Today's pages on every walk, its head naming the store's `session`'s incarnation and
-/// history version.
+/// Today's pages on every walk, its head naming the store's `session`'s incarnation and the
+/// history version it serves, with the replies the store's session cleans served cleaned.
 fn todays_walks(
     old: &super::OldLog,
     session: &Session<&Backend>,
@@ -294,9 +294,13 @@ fn todays_walks(
         &old.records,
         old.lineage.as_deref(),
         broca_session_store::codec::hex(&head.incarnation.0),
-        head.history_version,
+        broca_module::store_exposure::served_history_version(head.history_version),
     )
-    .map_err(|error| format!("{error:?}"))?;
+    .map_err(|error| format!("{error:?}"))?
+    .with_clean_replies(
+        block_on(broca_module::store_read::clean_reply_ordinals(session))
+            .map_err(|error| format!("{error:?}"))?,
+    );
     Ok(WALKS
         .iter()
         .map(|(_, form, newest)| {

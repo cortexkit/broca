@@ -712,10 +712,19 @@ async fn shutdown_rejects_new_admission() {
         .await;
     clock.finish_stop(&f, stopping).await;
     assert!(
-        matches!(result, SendOutcome::Transient(_)),
+        matches!(
+            result,
+            SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission)
+        ),
         "buffered Send admitted while stopping: {result:?}"
     );
-    assert!(route_result.is_err(), "registry admitted while stopping");
+    assert!(
+        matches!(
+            route_result,
+            Err(crate::registry::OpenError::ModuleStopping)
+        ),
+        "registry admitted while stopping: {route_result:?}"
+    );
     assert!(!f
         .records()
         .iter()

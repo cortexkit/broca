@@ -66,6 +66,7 @@ mod provider_override_boot;
 mod provisional_run_status;
 mod renderer_version_resume_real_daemon;
 mod reply_deadline_real_daemon;
+mod resolution_refusal_class;
 mod retention_consent_wire;
 mod scope_carrier;
 mod scope_workdir;

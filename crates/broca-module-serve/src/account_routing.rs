@@ -317,12 +317,7 @@ async fn resolve_routing_module(conn: &broca_subc::SubcConnection) -> Result<Str
         .into_iter()
         .filter(|entry| {
             entry.nonce_verified
-                && entry.capabilities.as_ref().is_some_and(|capabilities| {
-                    capabilities
-                        .provides
-                        .iter()
-                        .any(|role| role == cortexkit_role_routing::PROVIDES)
-                })
+                && broca_subc::catalog_entry_provides(entry, cortexkit_role_routing::PROVIDES)
         })
         .map(|entry| entry.module_id)
         .collect::<Vec<_>>();
@@ -623,9 +618,12 @@ impl AccountForOutcome {
     }
 }
 
-/// Known refusal classes are pinned by name; a new routing code is a transient refusal, not
-/// evidence of a failed transport. Login pauses and the module off-switch are handled before
-/// refusal classification.
+/// Known refusal classes are pinned by name. A routing code broca does not know is a permanent
+/// refusal (routed as `account_selection_final`), never a failed transport and never a wait: until
+/// broca learns the code it can't tell that waiting would clear it, and holding a send forever on
+/// a refusal that can't clear is the worse failure. Routing's own contract classes every untimed
+/// refusal it sends as permanent, except `account_selection_unavailable`. Login pauses and the
+/// module off-switch are handled before refusal classification.
 pub fn classify_refusal(code: &str) -> ErrorClass {
     match code {
         "account_hold"
@@ -644,7 +642,8 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
         | "unscoped_caller"
         | "account_selection_unsupported"
         | ACCOUNT_NOT_AUTHORIZED => ErrorClass::Permanent,
-        _ => ErrorClass::Transient,
+        // An unknown code is final until broca learns it (see the doc comment).
+        _ => ErrorClass::Permanent,
     }
 }
 

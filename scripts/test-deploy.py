@@ -116,6 +116,8 @@ if name == "accept" and os.environ.get("WARMING_ACCEPTS"):
     if attempts <= int(os.environ["WARMING_ACCEPTS"]):
         print("ERROR bind management surface 'broca': subc rejected: module_warming")
         sys.exit(1)
+if name == "accept" and os.environ.get("ACCEPT_STATUS"):
+    sys.exit(int(os.environ["ACCEPT_STATUS"]))
 if name == "listing":
     assert args == ["auth", "list", "--json"]
     print(json.dumps({"v": 1, "credentials": []}))
@@ -362,7 +364,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assert_metadata_log(result, 0)
         self.assertIn("pid        4321", result.stdout)
         self.assertIn("sessions sealed at restart (WAL readback): session.wal", result.stdout)
-        self.assertIn("acceptance PASS", result.stdout)
+        self.assertIn("acceptance direct: PASS; worker: PASS; scoped: PASS", result.stdout)
         self.assertIn("CI log", result.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
 

@@ -661,6 +661,9 @@ enum StartRunFailure {
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     Expired,
     Shutdown,
+    /// The module began stopping before the run was handed to its executor, so nothing of it
+    /// was written by this start.
+    ModuleStopping,
     Infrastructure(String),
     Admission(RunError),
     /// The owner check refused the send against the session's history at admission.
@@ -813,6 +816,55 @@ pub(crate) fn steer_delivery(records: &[WalRecord], send_id: &str) -> Option<Del
     None
 }
 
+/// The answer to a send whose run was refused before it durably started. Each refusal keeps its
+/// own typed outcome, so the caller gets the same code, detail and class whichever storage the
+/// session is kept in; any other admission error is answered with the class its `RunError`
+/// states.
+pub(crate) fn admission_refusal_outcome(error: RunError) -> SendOutcome {
+    match error {
+        RunError::MediaUnsupported(message) => {
+            crate::person_media::outcome(RunError::MediaUnsupported(message))
+        }
+        RunError::MediaTooLarge(detail) => SendOutcome::MediaTooLarge(detail),
+        RunError::Upload(error) => SendOutcome::Upload(error),
+        RunError::Transient(message) => SendOutcome::Transient(message),
+        RunError::SendIdReuse { differing } => SendOutcome::SendIdReuse { differing },
+        RunError::VariantUnsupported(e) => SendOutcome::VariantUnsupported(e),
+        RunError::ToolAliasInvalid(e) => SendOutcome::ToolAliasInvalid(e),
+        error @ RunError::CompactionContextLimitMissing => SendOutcome::DeliveryRefused {
+            code: "invalid_params",
+            field: "context_limit",
+            message: error.to_string(),
+        },
+        RunError::AccountSelectionRefused(refusal) => SendOutcome::AccountSelectionRefused(refusal),
+        RunError::RoutingUnavailable(unavailable) => SendOutcome::RoutingUnavailable(unavailable),
+        RunError::CredentialsUnavailable => SendOutcome::CredentialsUnavailable,
+        RunError::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        } => SendOutcome::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        },
+        RunError::SessionTooLarge { max_bytes } => SendOutcome::SessionTooLarge { max_bytes },
+        RunError::RetainedSessionTooLarge { max_bytes } => {
+            SendOutcome::RetainedSessionTooLarge { max_bytes }
+        }
+        RunError::NewerWriter { missing } => {
+            // The same text the generic arm below renders for this refusal.
+            let reason = RunError::NewerWriter {
+                missing: missing.clone(),
+            }
+            .to_string();
+            SendOutcome::NewerWriter { missing, reason }
+        }
+        error => SendOutcome::ClassifiedError {
+            class: error.admission_error_class(),
+            reason: error.to_string(),
+        },
+    }
+}
+
 fn permanent_queued_refusal(message: String, provider_code: &'static str) -> ProviderError {
     ProviderError {
         provider_details: None,
@@ -857,7 +909,7 @@ struct AdmittedRequestIdentity {
 impl std::fmt::Display for StartRunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Shutdown => write!(f, "module is stopping"),
+            Self::Shutdown | Self::ModuleStopping => write!(f, "module is stopping"),
             Self::ContextCeiling(detail) => write!(
                 f,
                 "context_ceiling: size {} in window {} ({})",
@@ -2333,6 +2385,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = reply.send(self.status());
                 false
             }
+            // Today's storage isn't sized by the memory report; it counts this session only.
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
+                false
+            }
             LineageCmd::RunState { run_id, reply } => {
                 let _ = reply.send(self.resolve_run_state(&run_id).await);
                 false
@@ -2523,6 +2580,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::RunState { reply, .. } => {
                 let _ = reply.send(Err(format!("session writer is poisoned: {error}")));
+            }
+            // Today's storage isn't sized by the memory report; it counts this session only.
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
             }
             LineageCmd::Subscribe { reply, .. } => {
                 let _ = reply.send(if error == "expired" {
@@ -3323,7 +3384,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 };
         }
         if self.registry.is_stopping() {
-            return SendOutcome::Transient("module is stopping".into());
+            return SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission);
         }
         let send_id = key.send_id().map(str::to_owned);
         let skip_materialization =
@@ -4477,69 +4538,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Expired) => SendOutcome::Reopen,
                 Err(StartRunFailure::PlanRefused(refusal)) => SendOutcome::PlanRefused(refusal),
                 Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
-                Err(StartRunFailure::Admission(RunError::MediaUnsupported(message))) => {
-                    crate::person_media::outcome(RunError::MediaUnsupported(message))
-                }
-                Err(StartRunFailure::Admission(RunError::MediaTooLarge(detail))) => {
-                    SendOutcome::MediaTooLarge(detail)
-                }
-                Err(StartRunFailure::Admission(RunError::Upload(error))) => {
-                    SendOutcome::Upload(error)
-                }
-                Err(StartRunFailure::Admission(RunError::Transient(message))) => {
-                    SendOutcome::Transient(message)
-                }
-                Err(StartRunFailure::Admission(RunError::SendIdReuse { differing })) => {
-                    SendOutcome::SendIdReuse { differing }
-                }
-                Err(StartRunFailure::Admission(RunError::VariantUnsupported(e))) => {
-                    SendOutcome::VariantUnsupported(e)
-                }
-                Err(StartRunFailure::Admission(RunError::ToolAliasInvalid(e))) => {
-                    SendOutcome::ToolAliasInvalid(e)
-                }
-                Err(StartRunFailure::Admission(
-                    error @ RunError::CompactionContextLimitMissing,
-                )) => SendOutcome::DeliveryRefused {
-                    code: "invalid_params",
-                    field: "context_limit",
-                    message: error.to_string(),
-                },
-                Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
-                    SendOutcome::AccountSelectionRefused(refusal)
-                }
-                Err(StartRunFailure::Admission(RunError::RoutingUnavailable(unavailable))) => {
-                    SendOutcome::RoutingUnavailable(unavailable)
-                }
-                Err(StartRunFailure::Admission(RunError::CredentialsUnavailable)) => {
-                    SendOutcome::CredentialsUnavailable
-                }
-                Err(StartRunFailure::Admission(RunError::CredentialAmbiguous {
-                    credential,
-                    candidate_ids,
-                })) => SendOutcome::CredentialAmbiguous {
-                    credential,
-                    candidate_ids,
-                },
-                Err(StartRunFailure::Admission(RunError::SessionTooLarge { max_bytes })) => {
-                    SendOutcome::SessionTooLarge { max_bytes }
-                }
-                Err(StartRunFailure::Admission(RunError::RetainedSessionTooLarge {
-                    max_bytes,
-                })) => SendOutcome::RetainedSessionTooLarge { max_bytes },
-                Err(StartRunFailure::Admission(RunError::NewerWriter { missing })) => {
-                    // The same text the generic arm below renders for this refusal.
-                    let reason = RunError::NewerWriter {
-                        missing: missing.clone(),
-                    }
-                    .to_string();
-                    SendOutcome::NewerWriter { missing, reason }
-                }
                 Err(StartRunFailure::Scope(refusal)) => SendOutcome::ScopeRefused(refusal),
-                Err(StartRunFailure::Admission(error)) => SendOutcome::ClassifiedError {
-                    class: error.admission_error_class(),
-                    reason: error.to_string(),
-                },
+                Err(StartRunFailure::Admission(error)) => admission_refusal_outcome(error),
+                Err(StartRunFailure::ModuleStopping) => {
+                    SendOutcome::ModuleStopping(crate::serve::StoppingAt::Open)
+                }
                 // Infrastructure strings include replay failures, so retryability is unknown.
                 Err(error) => SendOutcome::Error(error.to_string()),
             },
@@ -5508,7 +5511,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         req.scope = episode_scope;
 
         if self.registry.is_stopping() {
-            return Err(StartRunFailure::Infrastructure("module is stopping".into()));
+            return Err(StartRunFailure::ModuleStopping);
         }
         let cancel = CancellationToken::new();
         if cancel_before_execute {
@@ -6014,7 +6017,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         prepared: Option<pre_user::PreparedInput>,
     ) -> SendOutcome {
         if self.registry.is_stopping() {
-            return SendOutcome::Transient("module is stopping".into());
+            return SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission);
         }
         let SendIdentity {
             display_sent_by,
@@ -6541,7 +6544,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         order: broca_protocol::DeliveryOrder,
     ) -> SendOutcome {
         if self.registry.is_stopping() {
-            return SendOutcome::Transient("module is stopping".into());
+            return SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission);
         }
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let request_scope = request.scope.clone();
@@ -8672,6 +8675,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Status { reply } => {
                     let _ = reply.send(LineageStatus::Closing);
                 }
+                LineageCmd::MemoryReport { reply } => {
+                    let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
+                }
                 LineageCmd::RunState { run_id, reply } => {
                     // Even while closing, a run-state lookup can be answered (it reads the
                     // index + WAL, not the live run state) — so a status racing close still
@@ -9639,6 +9645,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Warm { reply, .. } => {
                 let _ = reply.send(WarmOutcome::Reopen);
             }
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
+            }
+
             LineageCmd::WarmFinished { warm } => {
                 let _ = warm.0.reply.send(WarmOutcome::Reopen);
             }

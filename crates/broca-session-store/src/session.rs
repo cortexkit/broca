@@ -396,20 +396,33 @@ impl<B: SessionBackend> Session<B> {
             appends_in_conversation: appends_in_conversation.then_some(true),
             cipher,
         };
+        Self::create_from_head(backend, addr, head, &key, log).await
+    }
+
+    /// Creates a session from `head`, whose residence names `log` as the log being created and
+    /// whose keys wrap `key`: writes the head, creates the log and opens the writer.
+    async fn create_from_head(
+        backend: B,
+        addr: SessionAddr,
+        head: Head,
+        key: &DataKey,
+        log: Id128,
+    ) -> Result<Self, SessionError> {
+        let appends_in_conversation = head.appends_in_conversation.unwrap_or(false);
         let version = backend
-            .write_head(&addr, &head::seal(&head, &key), None, 1)
+            .write_head(&addr, &head::seal(&head, key), None, 1)
             .await?;
         let mut session = Self::create_log(
             backend,
             addr,
-            head.clone(),
+            head,
             version,
-            &key,
+            key,
             log,
             appends_in_conversation,
         )
         .await?;
-        session.open_writer(&key).await?;
+        session.open_writer(key).await?;
         Ok(session)
     }
 
@@ -1073,6 +1086,81 @@ impl<B: SessionBackend> Session<B> {
     }
 }
 
+/// What an open session holds in memory, by holder, estimated by walking it when asked (see
+/// `crate::held`). The memory report asks for it; nothing on an append's path keeps it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionHeld {
+    /// The window's messages, and the assistant message held for its tool results.
+    pub messages: usize,
+    /// Each window message's entry state: its facts, its turn's call facts and the texts
+    /// delivered with its calls.
+    pub entry_facts: usize,
+    /// The open log's records kept in memory, each slot they fill included.
+    pub kept_records: usize,
+    /// The kept records' buffer beyond the slots they fill.
+    pub kept_capacity: usize,
+    /// The open log's id-naming ledger records, by id.
+    pub id_index: usize,
+    /// Sealed entries read by message id and kept.
+    pub sealed_entries: usize,
+    /// Everything else the session holds: the folds' other state, the open log's index, the head,
+    /// the import's id map and the enrollment's decisions once read, and the writer.
+    pub rest: usize,
+}
+
+impl SessionHeld {
+    pub fn total(&self) -> usize {
+        self.messages
+            + self.entry_facts
+            + self.kept_records
+            + self.kept_capacity
+            + self.id_index
+            + self.sealed_entries
+            + self.rest
+    }
+}
+
+impl<B: SessionBackend> Session<B> {
+    /// What this session holds in memory, by holder (see [`SessionHeld`]). The backend handle
+    /// counts by its inline size only.
+    pub fn held_bytes(&self) -> SessionHeld {
+        use crate::held::HeldBytes;
+        let conversation = &self.conversation;
+        let messages = conversation.messages.heap_bytes() + conversation.open_heap_bytes();
+        let entry_facts = conversation.entries.heap_bytes() + conversation.open_entry.heap_bytes();
+        let (kept_records, kept_capacity) = self.kept.held_bytes();
+        let sealed_entries = self
+            .sealed_entries
+            .lock()
+            .map_or(0, |caches| caches.held_bytes());
+        let imported = self
+            .imported
+            .lock()
+            .map_or(0, |imported| imported.heap_bytes());
+        let enrollment = self
+            .enrollment
+            .lock()
+            .map_or(0, |enrollment| enrollment.heap_bytes());
+        let rest = std::mem::size_of::<Self>()
+            + (conversation.heap_bytes() - messages - entry_facts)
+            + self.operations.heap_bytes()
+            + self.window.heap_bytes()
+            + self.head.heap_bytes()
+            + self.encoder.heap_bytes()
+            + imported
+            + enrollment;
+        SessionHeld {
+            messages,
+            entry_facts,
+            kept_records,
+            kept_capacity,
+            id_index: self.open_ids.heap_bytes(),
+            sealed_entries,
+            rest,
+        }
+    }
+}
+
 mod kept;
 pub mod moves;
 pub use kept::InMemory;
@@ -1083,7 +1171,7 @@ pub use media::{
     NamedMedium, NewMedia,
 };
 mod import;
-pub use import::{is_broca_id_form, NewInputMedia};
+pub use import::{is_broca_id_form, NewInputMedia, PreparedImport, MAX_BATCH_RECORDS};
 mod media_index;
 pub use crate::fold::media::{
     limits_in, LimitsSource, MediaFeed, MediaFold, MediaIndexRef, MediaItem, MediaStart,
@@ -1115,5 +1203,7 @@ mod collect;
 pub use collect::{collect_stored, stored_due};
 pub mod restore;
 
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod tests;

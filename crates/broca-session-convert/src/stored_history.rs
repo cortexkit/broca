@@ -24,20 +24,56 @@ pub type Backend = Counting<MemoryBackend>;
 
 /// `session.history` on the new storage, read from `session` by the functions the session's
 /// actor serves with, with the session's setup parts `parts`. `B` is the session's backend: the
-/// check's counting memory backend by default, or a session folder on disk (`LocalBackend`), as
-/// a move's verifier reads its staged session.
+/// check's counting memory backend by default, or a session folder on disk (`LocalBackend`).
 pub struct StoredHistory<'a, B: broca_session_store::backend::SessionBackend = &'a Backend> {
     pub session: &'a Session<B>,
     pub parts: &'a MemoryParts,
+}
+
+impl<B: broca_session_store::backend::SessionBackend> StoredHistory<'_, B> {
+    async fn read_page(
+        &self,
+        req: &SessionReadRequest,
+    ) -> Result<broca_module::serve::SessionReadResponse, ServeError> {
+        broca_module::store_read::serve_view(self.session, self.parts, req).await
+    }
+}
+
+/// A verifier's walk of an unchanged session. History uses the real page builder, but shares
+/// the stream head across pages instead of reopening and projecting the open log for each one.
+pub(crate) struct StoredHistoryWalk<'a, B: broca_session_store::backend::SessionBackend> {
+    session: &'a Session<B>,
+    parts: &'a MemoryParts,
+    reader: broca_module::store_read::ViewReader<'a, B>,
+}
+
+impl<'a, B: broca_session_store::backend::SessionBackend> StoredHistoryWalk<'a, B> {
+    pub(crate) async fn new(
+        session: &'a Session<B>,
+        parts: &'a MemoryParts,
+    ) -> Result<Self, ServeError> {
+        Ok(Self {
+            session,
+            parts,
+            reader: broca_module::store_read::ViewReader::new(session, parts).await?,
+        })
+    }
+
+    async fn read_page(
+        &self,
+        req: &SessionReadRequest,
+    ) -> Result<broca_module::serve::SessionReadResponse, ServeError> {
+        self.reader.read(req).await
+    }
 }
 
 /// The serve handler for each backend a history is read from. Written once, for both: the
 /// trait's futures must be `Send`, which a concrete backend's are and a generic one's needn't
 /// be.
 macro_rules! stored_history_handler {
-    ($backend:ty) => {
+    ($handler:ident, $backend:ty) => {
         #[async_trait]
-        impl<'a> ServeHandler for StoredHistory<'a, $backend> {
+        impl<'a> ServeHandler for $handler<'a, $backend> {
             async fn send(&self, _: SendRequest) -> Result<SendResponse, ServeError> {
                 unreachable!("session.history sends nothing")
             }
@@ -78,7 +114,7 @@ macro_rules! stored_history_handler {
                 &self,
                 req: SessionReadRequest,
             ) -> Result<broca_module::serve::SessionReadResponse, ServeError> {
-                broca_module::store_read::serve_view(self.session, self.parts, &req).await
+                self.read_page(&req).await
             }
 
             async fn store_history_head(
@@ -89,6 +125,15 @@ macro_rules! stored_history_handler {
                 broca_module::store_entries::history_head_of(self.session, mid)
                     .await
                     .map(Some)
+            }
+
+            async fn output_ref_history_version(
+                &self,
+                _: &LineageKey,
+                served: u64,
+            ) -> Result<u64, ServeError> {
+                broca_module::store_exposure::stored_history_version(served)
+                    .ok_or(ServeError::HistoryChanged)
             }
 
             async fn tag_location(
@@ -131,8 +176,13 @@ macro_rules! stored_history_handler {
     };
 }
 
-stored_history_handler!(&'a Backend);
-stored_history_handler!(broca_session_store::backend::LocalBackend);
+stored_history_handler!(StoredHistory, &'a Backend);
+stored_history_handler!(StoredHistory, broca_session_store::backend::LocalBackend);
+stored_history_handler!(StoredHistoryWalk, &'a Backend);
+stored_history_handler!(
+    StoredHistoryWalk,
+    broca_session_store::backend::LocalBackend
+);
 
 /// `session.history` with `params`, over `handler`.
 pub fn history(handler: &dyn ServeHandler, name: &str, params: &Value) -> Result<Value, String> {

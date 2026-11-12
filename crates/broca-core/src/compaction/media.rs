@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 pub struct CapturedMedia(Arc<BTreeMap<String, Vec<MediaRef>>>);
 
 impl CapturedMedia {
+    /// The heap the references hold, behind the `Arc` the engine's clones share (see
+    /// `media_request::held`).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use crate::media_request::held::{btree_map, media_ref, vec};
+        2 * std::mem::size_of::<usize>()
+            + btree_map(&*self.0, |key, value| {
+                key.capacity() + vec(value, media_ref)
+            })
+    }
+
     pub(crate) fn by_digest(&self, sha256: &str) -> Option<&MediaRef> {
         self.0.get(sha256)?.first()
     }

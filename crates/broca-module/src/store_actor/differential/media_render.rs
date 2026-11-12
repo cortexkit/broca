@@ -39,6 +39,7 @@ cipher_tests!(
     an_input_photo_and_a_tool_image_render_offline_as_sent,
     a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent,
     a_run_after_a_view_drops_a_photo_renders_alike,
+    a_setup_covering_a_photo_teaches_its_id_without_a_notice,
     a_photo_between_numbered_messages_renders_alike,
     an_ordered_steer_photo_lands_with_its_bytes_alike,
     an_idle_start_photo_starts_its_run_and_renders_alike,
@@ -446,10 +447,11 @@ async fn registry(
             gate,
             render_config: Some(image_render_config()),
             notes_sends: false,
+            hold: None,
         }),
         wal: Arc::clone(&wal),
         sent: Arc::clone(sent),
-        compactor,
+        compactor: compactor.clone(),
     });
     let runtime = crate::store_open::StoreRuntime::open(
         dir,
@@ -459,6 +461,25 @@ async fn registry(
     )
     .await
     .unwrap();
+    let runtime = Arc::new(runtime);
+    if let Some(compactor) = compactor {
+        let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
+        if store {
+            let runtime = Arc::downgrade(&runtime);
+            compactor.reads(Arc::new(move || {
+                let runtime = runtime.upgrade().expect("the session runtime is open");
+                let key = key.clone();
+                Box::pin(async move {
+                    let view = runtime.current_view(&key).await.unwrap().unwrap();
+                    crate::store_entries::all_entries(view.as_ref())
+                        .await
+                        .unwrap()
+                })
+            }));
+        } else {
+            compactor.reads_today(Arc::clone(&wal), key);
+        }
+    }
     let registry = LineageRegistry::new_with_reader(
         Arc::new(
             crate::opener::DefaultOpener::new(
@@ -467,7 +488,7 @@ async fn registry(
                 executor,
             )
             .with_idle_ttl(super::IDLE)
-            .with_store_runtime(Arc::new(runtime)),
+            .with_store_runtime(runtime),
         ),
         wal,
         None,
@@ -1252,6 +1273,33 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
     );
 }
 
+/// Setup may run after the photo is durable and cover it before any notice. A restarted
+/// provider must read the session's entries before answering a ride that drops that photo.
+async fn a_setup_covering_a_photo_teaches_its_id_without_a_notice(cipher: Cipher) {
+    let plan = super::controls::compacting_plan();
+    for store in [false, true] {
+        let compactor = Arc::new(super::controls::Compactor::default());
+        let side = Rendered::with_compactor(
+            store,
+            three_texts(),
+            false,
+            Some(Arc::clone(&compactor)),
+            cipher,
+        )
+        .await;
+        let sent = send_planned(&side, "r1", planned(text("first")), &plan).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.idle().await;
+        let upload = side.side.uploaded(&bytes_of(PNG)).await;
+        let sent = send_planned(&side, "r2", planned(photo("look", &[&upload])), &plan).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.idle().await;
+        compactor
+            .assert_drop_after_setup_without_notice(3, &side.side.key)
+            .await;
+    }
+}
+
 /// On a session whose plan shows part numbers, a request whose photo message sits between
 /// numbered messages renders alike: the loop leaves the photo's message for the media renderer
 /// to number, as today's loop does, and numbers the others itself.
@@ -1288,3 +1336,5 @@ async fn a_photo_between_numbered_messages_renders_alike(cipher: Cipher) {
         String::from_utf8_lossy(&last)
     );
 }
+
+mod import_media;

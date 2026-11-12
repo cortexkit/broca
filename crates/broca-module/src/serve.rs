@@ -263,7 +263,7 @@ pub struct SendRequest {
 pub enum PlanState {
     /// The history cannot be read without the session's actor; the actor decides.
     Unknown,
-    /// No episode yet: a plan sent now is fetched and frozen.
+    /// No admitting episode yet (possibly only an import seed): a plan is fetched and frozen.
     NotAdmitted,
     /// The session has episodes. `frozen` is its plan's identity, `None` when it was admitted
     /// without a plan.
@@ -2240,6 +2240,16 @@ pub(crate) fn run_status_response_with_reader_policy(
     }
 }
 
+/// Where a request refused because the module is stopping was turned away. The refusal body is
+/// the same either way; each place keeps the message it has always answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppingAt {
+    /// A session actor refused to admit the send.
+    Admission,
+    /// The session could not be opened, or its run could not be started.
+    Open,
+}
+
 /// An error from the serve surface (distinct from a successful per-request outcome). Opening
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
@@ -2273,6 +2283,10 @@ pub enum ServeError {
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
     Open(String, Option<broca_protocol::ErrorClass>),
+    /// broca refused this request because it is stopping. This request did nothing; repeat it
+    /// after the restart. It says nothing about whether an earlier request with the same send
+    /// id was admitted: a keyed resend is answered from the record once broca serves again.
+    ModuleStopping(StoppingAt),
     /// The store proves history exists, but neither live nor archived WAL can cover it.
     HistoryUnreachable {
         session_ref: String,
@@ -2426,6 +2440,7 @@ impl From<OpenError> for ServeError {
             OpenError::HistoryChanged => ServeError::HistoryChanged,
             OpenError::HistoryRewriting => ServeError::HistoryRewriting,
             OpenError::Open(s) => ServeError::Open(s, None),
+            OpenError::ModuleStopping => ServeError::ModuleStopping(StoppingAt::Open),
             OpenError::Classified { reason, class } => ServeError::Open(reason, Some(class)),
             OpenError::HistoryUnreachable {
                 session_ref,
@@ -2492,6 +2507,13 @@ impl std::fmt::Display for ServeError {
                 "send_id was already used with different {differing}; retries must be byte-identical"
             ),
             ServeError::Transient(s) => write!(f, "transient admission failure: {s}"),
+            // Each place keeps the message it has always answered this refusal with.
+            ServeError::ModuleStopping(StoppingAt::Admission) => {
+                f.write_str("transient admission failure: module is stopping")
+            }
+            ServeError::ModuleStopping(StoppingAt::Open) => {
+                f.write_str("open failed: module is stopping")
+            }
             ServeError::TagsAwaitSetup => f.write_str(
                 "the running run's tag numbers wait for its compaction Setup answer; retry shortly",
             ),
@@ -2582,6 +2604,11 @@ pub trait ServeHandler: Send + Sync {
     }
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
+    }
+    /// `memory.report`: what the daemon's open sessions and caches hold, estimated by walking
+    /// them now. `None` from a handler without sessions to report.
+    async fn memory_report(&self) -> Option<broca_wire::MemoryReport> {
+        None
     }
     /// Check the move latch before authorization reads frozen session metadata.
     /// File-backed handlers enforce the durable fence even for already-bound routes.
@@ -2738,6 +2765,27 @@ pub trait ServeHandler: Send + Sync {
         None
     }
 
+    /// The applied plan, read without opening an actor. `None` means the session is kept on
+    /// the old storage, which does not serve this operation.
+    async fn plan_view(
+        &self,
+        _session: &LineageKey,
+    ) -> Result<Option<broca_wire::plan_view::PlanViewResponse>, crate::store_plan_view::Error>
+    {
+        Ok(None)
+    }
+
+    /// `session.tag_map`: which message and part each part number of the session belongs to
+    /// (see `store_tag_map`). `None` for a session today's storage keeps, which the operation
+    /// doesn't serve; a handler without the new storage keeps every session there.
+    async fn tag_map(
+        &self,
+        _session: &LineageKey,
+        _params: &broca_wire::tag_map::TagMapParams,
+    ) -> Result<Option<broca_wire::tag_map::TagMapResponse>, ServeError> {
+        Ok(None)
+    }
+
     /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
     /// the new storage, from the files the store holds after a backup came back (see
     /// `registry::store_restore`). A handler without the new storage refuses by name.
@@ -2842,6 +2890,18 @@ pub trait ServeHandler: Send + Sync {
         incarnation: &str,
     ) -> Result<String, ServeError> {
         Ok(incarnation.to_owned())
+    }
+
+    /// The history version output-reference ids of `session` are scoped to, given `served`, the
+    /// version its reads serve: the stored transcript's own version, which only a rewrite of the
+    /// stored history moves. A reference names stored tool output, so an id stays valid across a
+    /// change in how reads expose stored replies (`crate::store_exposure`).
+    async fn output_ref_history_version(
+        &self,
+        _session: &LineageKey,
+        served: u64,
+    ) -> Result<u64, ServeError> {
+        Ok(served)
     }
 
     /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
@@ -3328,6 +3388,9 @@ impl ServeHandler for crate::LineageRegistry {
     fn backup_classes(&self) -> Vec<String> {
         crate::LineageRegistry::backup_classes(self)
     }
+    async fn memory_report(&self) -> Option<broca_wire::MemoryReport> {
+        Some(crate::LineageRegistry::memory_report(self).await)
+    }
     async fn check_migration(&self, session: &LineageKey, write: bool) -> Result<(), ServeError> {
         self.check_move(session, write).map_err(Into::into)
     }
@@ -3370,6 +3433,17 @@ impl ServeHandler for crate::LineageRegistry {
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn output_ref_history_version(
+        &self,
+        session: &LineageKey,
+        served: u64,
+    ) -> Result<u64, ServeError> {
+        if self.store_holding(session)?.is_none() {
+            return Ok(served);
+        }
+        crate::store_exposure::stored_history_version(served).ok_or(ServeError::HistoryChanged)
     }
 
     async fn output_ref_namespace(
@@ -3772,6 +3846,7 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::ClassifiedError { reason, class } => {
                 Err(ServeError::Open(reason, Some(class)))
             }
+            SendOutcome::ModuleStopping(at) => Err(ServeError::ModuleStopping(at)),
             SendOutcome::SessionTooLarge { max_bytes } => {
                 Err(ServeError::SessionTooLarge { max_bytes })
             }
@@ -3849,7 +3924,9 @@ impl ServeHandler for crate::LineageRegistry {
     async fn plan_state(&self, session: &LineageKey) -> PlanState {
         match self.session_ownership_for_bind(session).await {
             None => PlanState::Unknown,
-            Some(ownership) if ownership.episodes == 0 => PlanState::NotAdmitted,
+            Some(ownership) if ownership.episodes == 0 || ownership.first_episode.is_none() => {
+                PlanState::NotAdmitted
+            }
             Some(ownership) => PlanState::Admitted {
                 frozen: ownership
                     .first_episode
@@ -3988,6 +4065,45 @@ impl ServeHandler for crate::LineageRegistry {
         all: bool,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
         crate::LineageRegistry::restore_from_backup(self, session, all).await
+    }
+
+    async fn plan_view(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<broca_wire::plan_view::PlanViewResponse>, crate::store_plan_view::Error>
+    {
+        if let Some(store) = self.store_holding(session).map_err(ServeError::from)? {
+            return crate::store_plan_view::serve(self, &store, session)
+                .await
+                .map(Some);
+        }
+        if self.wal_written(session) == Some(false) {
+            self.check_session_log(session)
+                .await
+                .map_err(ServeError::from)?;
+            return Err(crate::store_plan_view::Error::NoPlan);
+        }
+        Ok(None)
+    }
+
+    async fn tag_map(
+        &self,
+        session: &LineageKey,
+        params: &broca_wire::tag_map::TagMapParams,
+    ) -> Result<Option<broca_wire::tag_map::TagMapResponse>, ServeError> {
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_tag_map::serve(self, &store, session, params)
+                .await
+                .map(Some);
+        }
+        // No storage holds a session with no WAL and no head in the new storage: it reads as
+        // `session.read` reads it, an empty transcript, which numbers nothing, unless its
+        // history is known to be missing. Any other session is kept on today's storage.
+        if self.wal_written(session) == Some(false) {
+            self.check_session_log(session).await?;
+            return Ok(Some(broca_wire::tag_map::TagMapResponse::unnumbered()));
+        }
+        Ok(None)
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {
@@ -4580,6 +4696,9 @@ impl ServeHandler for crate::LineageRegistry {
                                 .filter(|reason| reason.as_str() != "interrupted")
                                 .map(|reason| reason.as_str().to_owned())
                         }),
+                        // Today's storage holds no heads, only workers, so its head leaves the
+                        // optional resume time out; `run.status` serves it for every run.
+                        resume_not_before_ms: None,
                     }
                 }),
                 updated_at: Some(updated_at),
@@ -5468,6 +5587,8 @@ impl ServeHandler for crate::LineageRegistry {
                     session_class,
                     ts_ms,
                     manifest,
+                    principal,
+                    scope,
                     ..
                 } = frame.record
                 {
@@ -5480,6 +5601,8 @@ impl ServeHandler for crate::LineageRegistry {
                             })?,
                             broca_wire::RunAdmissionStorage::Wal,
                             manifest.as_deref(),
+                            principal.as_ref(),
+                            scope.as_ref(),
                         )
                         .map(Some);
                     }

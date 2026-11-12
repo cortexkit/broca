@@ -149,6 +149,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         frozen_account_ref: None,
         clock: None,
         refusal_fallback_model: None,
+        ride_placement: None,
         quota_observer: None,
     }
 }
@@ -528,7 +529,7 @@ impl RunExecutor for ReauthCoreExec {
     }
 }
 
-fn min_config() -> broca_wal::RunConfig {
+pub(super) fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
         account_route: None,
         global_system: None,
@@ -998,6 +999,118 @@ async fn vault_audit_is_answered_by_the_daemon_auditor_without_opening_a_session
     assert_eq!(refused.header.ty, FrameType::Error);
     assert_eq!(auditor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
+    drop(cwriter);
+    drop(creader);
+    let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `memory.report` is listed in the manifest as a query, answers the operator's own connection
+/// with the registry's report, refuses any other principal, refuses an option it doesn't have,
+/// and opens no session.
+#[tokio::test]
+async fn memory_report_answers_only_the_operator_and_opens_no_session() {
+    let dir = tmpdir("memory-report");
+    let (reg, _store) = registry_with_export(&dir);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut creader, mut cwriter) = tokio::io::split(client);
+    let (sreader, swriter) = tokio::io::split(server);
+    let serve_reg = reg.clone();
+    let serve = tokio::spawn(async move {
+        let _ = serve_connection(
+            sreader,
+            swriter,
+            "broca",
+            serve_reg.clone(),
+            serve_reg,
+            broca_module_serve::serve::VaultGauge::not_in_use(),
+        )
+        .await;
+    });
+    let hello = read_one(&mut creader).await;
+    assert!(
+        String::from_utf8_lossy(&hello.body).contains("\"memory.report\""),
+        "the HELLO manifest declares memory.report"
+    );
+    let hello_ack = Frame::build(
+        FrameType::HelloAck,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        hello.header.corr,
+        serde_json::to_vec(&ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage: None,
+            machine_id: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut cwriter, &hello_ack).await.unwrap();
+    for (channel, principal) in [(7, None), (8, Some(subc_protocol::Principal::Direct))] {
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 2,
+            target: RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("runner", "memory"),
+            principal,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_req(
+            &mut cwriter,
+            0,
+            10 + u64::from(channel),
+            serde_json::to_value(bind).unwrap(),
+        )
+        .await;
+        assert_eq!(read_one(&mut creader).await.header.ty, FrameType::Response);
+    }
+    // A connection that isn't the operator's is refused.
+    write_req_epoch(
+        &mut cwriter,
+        7,
+        2,
+        21,
+        serde_json::json!({"method": "memory.report"}),
+    )
+    .await;
+    let refused = read_one(&mut creader).await;
+    assert_eq!(refused.header.ty, FrameType::Error);
+    assert!(String::from_utf8_lossy(&refused.body).contains("operator_required"));
+    // The operator's is answered with the registry's report: nothing open here.
+    write_req_epoch(
+        &mut cwriter,
+        8,
+        2,
+        22,
+        serde_json::json!({"method": "memory.report"}),
+    )
+    .await;
+    let answered = read_one(&mut creader).await;
+    assert_eq!(answered.header.ty, FrameType::Response);
+    let body: serde_json::Value = serde_json::from_slice(&answered.body).unwrap();
+    assert_eq!(body["result"]["sessions"], serde_json::json!([]));
+    assert_eq!(body["result"]["legacy_sessions"], 0);
+    assert!(body["result"]["settled_runs"]["max_entries"].is_u64());
+    // An option the op does not have is refused, not ignored.
+    write_req_epoch(
+        &mut cwriter,
+        8,
+        2,
+        23,
+        serde_json::json!({"method": "memory.report", "params": {"verbose": true}}),
+    )
+    .await;
+    assert_eq!(read_one(&mut creader).await.header.ty, FrameType::Error);
+    assert_eq!(reg.slot_counts().open, 0, "memory.report opens no session");
     drop(cwriter);
     drop(creader);
     let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;

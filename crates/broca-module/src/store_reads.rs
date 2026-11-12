@@ -98,6 +98,8 @@ pub enum StoreReadRequest {
     /// What `session.baseline` reports, before its owner check and cache declaration (see
     /// `store_plan_change::baseline`).
     Baseline,
+    /// The applied manifest and dated requests under it, without opening an actor.
+    PlanView,
 }
 
 impl StoreReadRequest {
@@ -178,6 +180,7 @@ pub enum StoreReadReply {
     PlanIdentities(Result<RefreshedIdentities, String>),
     /// `None` before the session's first run.
     Baseline(Result<Option<Box<crate::store_plan_change::BaselineFacts>>, String>),
+    PlanView(Result<broca_wire::plan_view::PlanViewResponse, crate::store_plan_view::Error>),
 }
 
 /// A medium a record of the session names: its reference, and its bytes or why they couldn't be
@@ -395,6 +398,9 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::Baseline => StoreReadReply::Baseline(
             crate::store_plan_change::baseline(session, ctx.parts).map(|facts| facts.map(Box::new)),
         ),
+        StoreReadRequest::PlanView => {
+            StoreReadReply::PlanView(crate::store_plan_view::build(session, ctx.parts).await)
+        }
     }
 }
 
@@ -622,6 +628,26 @@ impl<V> ViewCache<V> {
     pub fn usage(&self) -> (usize, u64) {
         let inner = self.inner.lock().unwrap();
         (inner.entries.len(), inner.bytes)
+    }
+
+    /// What the cache holds, with its caps: the bytes it counts against its byte cap (each
+    /// view's open-log length times [`ViewCache::BYTES_PER_LOG_BYTE`]), and the bytes each loaded
+    /// view holds as `estimate` walks it.
+    pub fn memory(&self, estimate: impl Fn(&V) -> usize) -> broca_wire::MemoryCache {
+        let inner = self.inner.lock().unwrap();
+        let estimated = inner
+            .entries
+            .values()
+            .filter_map(|entry| entry.cell.get())
+            .map(|view| estimate(view))
+            .sum::<usize>();
+        broca_wire::MemoryCache {
+            entries: inner.entries.len() as u64,
+            max_entries: self.max_entries as u64,
+            counted_bytes: Some(inner.bytes),
+            max_bytes: Some(self.max_bytes),
+            estimated_bytes: estimated as u64,
+        }
     }
 
     pub(crate) fn token_counts(

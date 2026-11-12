@@ -98,6 +98,7 @@ clap = { version = "4", features = ["derive"] }
 signal-hook = "0.4"
 
 [dev-dependencies]
+ck-session-import = { path = "../ck-session-import" }
 broca-store = { path = "../broca-store" }
 broca-crash-harness = { path = "../broca-crash-harness" }
 broca-subc = { path = "../broca-subc", features = ["test-clock", "test-refusals"] }

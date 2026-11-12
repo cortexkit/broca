@@ -16,7 +16,7 @@ encrypted session files in the client. It uses the same session authorization as
 not the latest baseline of its session. A known run returns:
 
 ```json
-{"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}]}
+{"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}],"scope":{"owner":{"kind":"reserved","module_id":"core"},"ref":"worker-1","epoch":1,"principal":{"kind":"reserved","module_id":"core"}}}
 ```
 
 `storage` is `wal` or `store`. `session_class` and each fetch's
@@ -28,6 +28,17 @@ returns `{"state":"unknown"}`, as `run.status` does. The required `run_id` is
 scoped to the bound session; unknown parameter keys are refused.
 An older start without a recorded timestamp is unreadable through this query,
 not assigned a fabricated start time.
+
+`scope` is omitted for an unscoped start, preserving its existing reply bytes. For a
+scoped start, `scope.owner`, `scope.ref` and `scope.epoch` project the recorded scope's
+owner principal, reference and `scope_epoch`; `scope.principal` is the recorded driving
+principal, omitted when the start did not record one. These fields come from the
+requested run's own start on either storage, never from the caller's current bind or
+the session's latest ownership. They expose no tool arguments, transcript or credentials;
+adding scope metadata does not change which callers may read `run.admission`. A worker
+class or a fetch from the `aft` tool provider alone does not establish a scope.
+Write-ahead log (WAL) readers still verify `scope/v1` on the original frame;
+new storage records the scope in its typed start schema rather than a WAL feature list.
 
 On new storage the query uses the run-id index to find `RunStart` and resolves
 the setup parts it froze, without a transcript walk. On WAL storage it reads
@@ -249,8 +260,10 @@ the default order is `chatgpt`, `oauth`, `antigravity`, then `apikey` among elig
 Frozen vault ids are reused on resume; older selections without a resolved id look up their
 frozen key by the same row rule, without changing their method.
 
-New sends refuse `credentials_unavailable` while no listing has loaded, with
-`detail.class: "transient"`. An ambiguous fixed key refuses `credential_ambiguous` with
+New sends refuse with code `transient` and
+`detail: {class: "transient", cause: "credentials_unavailable"}` while no listing has loaded:
+the listing loads by itself, so the same send may be admitted on retry, and `transient` is the
+runner contract's retryable code. An ambiguous fixed key refuses `credential_ambiguous` with
 `detail: {class: "permanent", credential: <broca key>, candidate_ids: [<vault ids>]}`;
 it never chooses a row silently. Existing missing-credential refusals are unchanged.
 
@@ -318,6 +331,20 @@ A consumer can be both. The surface is **session-centric**: consumers address
   unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
   Tool routes to the plan's compaction or step-transform providers bind the session's own
   harness and session; other tool modules bind `runner` with the unchanged session string.
+  AFT (`module_id: aft`) additionally receives the real harness `broca` only when its daemon
+  catalog manifest declares `scope-background-tasks/v1`, so background-command completion
+  notices can address that session. The existing catalog snapshot supplies this decision;
+  no entry, no readable snapshot, or no capability means `runner`, with no discovery call per
+  route. If a stale snapshot permits `broca` but the target refuses that bind, Broca tries
+  `runner` once. A successful fallback is remembered until the snapshot refreshes; if it
+  fails too, the first refusal is returned unchanged. Transport/decoding failures and the
+  daemon's own routing, scope and permission refusals do not trigger this fallback; temporary
+  refusals retain their existing retry policy. Snapshots refresh after a route is invalidated
+  because it is no longer live, or once when batch routing cannot resolve a provider; there
+  is no timer. Each plan fetcher uses a separate catalog snapshot, shared by that admission's
+  provider lookups. Existing routes keep their bind.
+  Other harnesses still become `runner`; this exception changes neither the attested
+  principal, the frozen scope, nor the session string.
   Keeping one `(harness, session)` bind pair per session at a provider relies on the session
   string being unique per consumer and provider, which every caller today satisfies
   (Core names each session with its own task id).
@@ -861,6 +888,12 @@ For a listed method, `auth.pool` is sent as `route.account_for.pool`, and option
 may overrule. Either hint requires routing even with a single candidate. If the vault cannot
 provide its candidate credential list, or routing answers `account_selection_disabled`, broca
 refuses rather than using the configured default credential without honoring the hints.
+A routing refusal reaches the caller with an outer code that says whether to wait:
+`account_limit_exhausted` for an exhausted pool, a hold or unknown quota,
+`account_selection_refused` for another refusal that may clear, and `account_selection_final`
+for a permanent one (including every routing code broca does not know, and the hinted
+`account_selection_disabled` refusal above), which waiting can't change. See the
+[error class contract](error-class-contract.md).
 Both hints are ignored for unlisted methods before request storage and identity comparison.
 A strict `auth.account` pin cannot be combined with either hint for a listed method:
 `invalid_params` names `auth.account` before storage or any routing request. A pin without
@@ -2062,6 +2095,12 @@ address-keyed high-water row survives log retention and recreation. An absent lo
 `unwritten`, without creating a log, lease or history row. Destructive same-lineage recovery
 fences reads with retryable `history_rewriting` until its writer has durably finished.
 `session.resolve`, tag rows and model-view read pages are not served in llm-runner 0.8.
+On the new storage, every llm-runner surface serves `history_version` one above the head's
+stored version (`store_exposure::EXPOSURE_EPOCH`), because this build serves replies cleaned of
+tag notation where their run cleans them (`EntryFacts::clean_reply`), which earlier builds
+served with their tags; nothing stored changes, so an older build opens every session and
+serves the raw text at the stored version again, which is what that version meant. The
+compaction provider's route carries no history version and is unchanged.
 
 **Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
 `include_display_facts: true` also exposes the recorded assistant `completed_at` and readable Responses `reasoning_summaries` indexed by stored content part, never opaque or encrypted reasoning; default message bytes and digests are unchanged.
@@ -2165,6 +2204,46 @@ session never ran. Without the flag the response bytes are exactly what they wer
 flag existed, and the request omits `include_tools` when false. `include_tools` is a known
 field only in that spelling: `ReadParams` stays strict, so an older daemon refuses it with
 `invalid_params` instead of silently answering without tools.
+
+## 15a. `session.plan_view`: the applied plan
+
+`session.plan_view {session}` is a read on the new session storage, addressed and
+admitted like `session.read`. It returns `{"result": ...}` with the plan that
+built the latest run's requests, not a provider-rendered prompt:
+
+- `generation` is the applied plan generation (`0` before a refresh applies),
+  and optional `applied_at_ms` is the stored start time of the run that applied
+  it (the first run for generation zero). When that run recorded no time, the
+  member is absent; its age is unknown, not derived from another event.
+- `system.text` is the manifest's system text, byte for byte. Optional `items`
+  attribute nonempty text ranges to their `provider` and optional `preset`.
+  `start` and `end` are UTF-8 byte offsets, inclusive and exclusive respectively;
+  separators belong to no item. Empty and unanswered optional providers have no
+  range. If this build cannot reproduce the stored join, it omits `items` rather
+  than returning unchecked offsets.
+- `tools` contains `name`, `description`, `input_schema`, and `provider` in offer
+  order. Optional `tokens: {count, exact}` describes a per-definition estimate,
+  using the same definition counter as compaction's `tools_tokens` with
+  `exact: false`, not an additional model or provider measurement. The estimate
+  excludes operator-selected name aliases, like the as-planned tool list.
+- Optional `newest_step` identifies the newest request with a recorded send time
+  under that generation, not necessarily the request in flight. It uses the
+  stored attempt's `sent_at_ms` and, only when it produced an assistant message,
+  `reply_mid` matching the message id returned by `session.read`.
+  Undated requests do not displace a dated request. If the applied generation
+  has no dated request, the member is absent, even if an older generation did.
+- Optional `pending: {generation}` identifies an accepted refresh that has not
+  yet applied. It does not replace the applied system text or tools and has no
+  `notes` member because broca has not told the model about the pending change.
+- `as_planned` is always `true`. It excludes the identity line broca prepends on
+  a Claude subscription route and tool-name rewrites to a provider's grammar
+  during rendering.
+
+A session admitted with system text and tools on its first send, without a plan
+manifest, refuses with `no_plan`; it never returns an empty substitute plan. A
+reply that would exceed the read frame limit refuses with `too_large`; it is
+never truncated.
+Sessions kept on the old storage refuse with `not_served_on_old_storage`.
 
 ## 16. Subscribe to a terminal run
 
@@ -2611,7 +2690,10 @@ freezes it for the episode. It is not inherited from an earlier send and is part
 of keyed-send identity.
 
 On the daemon's channel-0 `module.draining` push, broca stops new admission and
-queued dispatch immediately, without starting its final seal timer. A resume-enabled
+queued dispatch immediately, without starting its final seal timer. Requests refused
+because broca is stopping answer code `transient` with
+`detail: {class: "transient", cause: "module_stopping"}` (see
+[module lifecycle and shutdown](module-lifecycle.md)). A resume-enabled
 run finishes its current work and writes
 `RunPaused{Restart}` at the next clean step-entry boundary. The gated frame requires
 `restart-pause/v1`; the writer raises the local WAL feature floor before appending
@@ -2634,6 +2716,15 @@ provider request bytes from the WAL. A readable session refused by admission is
 sealed `Interrupted` with the refusal reason. An unreadable newer-writer WAL is
 only logged at WARN with its session and missing features: no bytes or metadata
 are changed, and other sessions still resume.
+
+On the session-store backend a restart pause is continued only within one hour of the
+time it records. A restart takes seconds to minutes, so an older pause was left by a long
+outage and its caller has stopped waiting. Such a run, or one whose pause records no time,
+is not continued: when its session is next opened (at startup for every session with an
+unfinished run) the run is sealed `Interrupted` with `restart_resume_expired`, no provider
+request is sent for it, and the session's queue drains. The caller decides whether to send
+again. A paused run with a cancel pending still ends `Cancelled`. The WAL backend has no
+such limit: it resumes every restart pause at its next start.
 
 New episodes freeze image-only labeling for multipart image-notice text; older episodes keep
 their literal text projection on resume, while a new episode adopting the rule may rebuild its
@@ -2681,7 +2772,7 @@ session it creates by the same rule, in one complete store per class:
 `session-store-durable/`, `session-store/` (ordinary) and `session-store-ephemeral/`;
 the root holding a session's head is authoritative afterwards, and a head found in
 two roots is refused `session_in_two_classes`. A file import (`session.import` with a
-file source, which brings an OpenCode 2 or Pi agent head onto broca) carries no
+file source, which brings an OpenCode 1, OpenCode 2 or Pi agent head onto broca) carries no
 label and is placed durable by the same rule: ephemeral if it carries a retention
 policy, else `session-store-durable/`, whatever `backup_classes` lists.
 `session.move_to_store` (operator only)
@@ -2694,6 +2785,57 @@ Classed records require the must-understand WAL feature `session-class/v1`.
 A `v0.3.205` reader refuses those records by feature name; unclassed records retain
 their old bytes and remain readable. The reader, writer and capability ship
 together, with no writer switch or second rollout release.
+
+A file import records its attested owner and scope but applies no plan. Its owner's first
+`session.send` must carry `plan` and passes ordinary plan admission, including compaction
+enrollment and model selection; an omitted plan is `invalid_params` naming `plan`. Another
+principal is refused `scope_owner_mismatch`. The imported history precedes that send's prompt.
+`session.install_view` may install the moved head's view before this send, but is refused once
+the session has run. No `session.adopt` is needed or served for this transition. OpenCode 1
+sources are single-session SQLite extracts made by `ck-import opencode1-extract`, not the live
+host database; the source is digest-checked before reading and deleted only after durability.
+Both import list shapes carry `newest: {ordinal, mid, digest}`, all required: the exact last
+entry the import placed, including the digest `session.entries` serves. It is not the current
+session head. The receipt records the imported message count and move ids; retries reproject
+that original immutable entry and its facts through the same stored-entry code as
+`session.entries`, checking its id against the receipt. Source deletion, views and later owner
+runs do not change it. No extra receipt field is needed; a missing/replaced original entry
+refuses recovery instead of answering with another entry.
+
+OpenCode 1 source rows cover every session message, ordered by `time_created`, then id, even
+when a row projects nothing and has `entry: null`. The extract preserves both ordering columns.
+`finished_summary` is true when summary is true/numeric 1 and finish is `stop`, regardless of
+role or error, exactly `COALESCE(json_extract(data,'$.summary'),0) = 1 AND
+COALESCE(json_extract(data,'$.finish'),'') = 'stop'`. A summary object or another finish is false.
+Move rows have no `source_entry` member, not even null.
+An older OpenCode 1 message's `pending` or `running` tool part is a historical interruption:
+it keeps its recorded input (or `{}`) and the host's error result
+`[Tool execution was interrupted]`. Only such a part in the last source message row refuses
+`import_open_call`, because that row can still be live. Source-row order is `time_created`, then
+message id; a later row that projects no message still makes an earlier unfinished call historical.
+
+Before importing, an operator can run `ck-import opencode1-check --extract FILE --session ID`.
+It uses the import reader and the same media byte/type admission without needing a store. It
+prints one counts-only JSON object: source/imported roles, calls, exclusive result kinds,
+distinct media byte objects and occurrences, dropped systems, rows projecting nothing (including
+systems), and finished summaries (including errored summaries). A refusal prints only its code
+and one-based source message ordinal, or null when no source row is responsible, and exits 1; it prints
+neither source diagnostics nor message ids/content. The check does not exercise import-root,
+digest or idempotency checks, or store-write/encryption/durability admission. Without
+`--moves-out`, it also does not check whether imported part numbers fit above the caller's
+highest already-shown number (`tag_floor`). A successful check is not a promise that a later
+durable import cannot fail.
+
+With `--moves-out FILE` and optional `--tag-floor N` (default 0), the checker also runs the real
+import seeder without a daemon or store. It creates a new owner-only file with wrapper
+`{offline: true, unminted_prefix: "unminted:", moves, newest}`. The `moves` member remains
+wire-decodable: source rows are exact; every added row keeps its exact ordinal and `added: true`
+but its mid is `unminted:<n>` counting added rows from 1. The real store must mint those ids
+from its message-id prefix and next record sequence. `newest.ordinal` is exact; its mid/digest
+are exact for a source newest, or both `unminted:` markers for an added newest. A single stderr
+line reports the count and reason. The wrapper prevents this partial rehearsal list from
+being mistaken for a real import reply, and contains no message content. `--tag-floor` requires
+`--moves-out`; seeding also validates that imported part numbers fit above that floor.
 
 ### Restoring the new storage from a backup
 
@@ -2755,6 +2897,45 @@ The command prints one line per session (`--json-events`: one JSON object, the l
 - `unrecoverable`: what each kept version lacks, for example a sealed segment no kept version
   can do without; nothing changed;
 - `refused`, `busy`, `key_unavailable` or `failed`: why it wasn't restored; nothing changed.
+
+### Part number map
+
+`session.tag_map` (operator only: only a direct operator connection may call it, and it is
+not one of the runner role's operations) names, for a session
+kept in the new storage, which message and part each part number belongs to: the number broca
+renders in front of a numbered part, as the model is shown it. No caller-facing read carries
+these rows. Another caller is refused `operator_required` before anything reads the session.
+A session today's storage keeps is refused `not_served_on_old_storage`, by name; an unknown
+session answers as `session.read` reads it, an empty transcript that numbers nothing.
+
+Request: `{"after_ordinal": <u64, optional>, "limit": <u64, optional>}`. `limit` counts
+messages, not rows, so a message's parts are never split across pages; it defaults to 500 and
+is held between 1 and 2000. An unknown field is refused `invalid_params`. Reply:
+
+```json
+{"numbered": true,
+ "rows": [{"tag": 12, "mid": "<message id>", "ordinal": 7, "part": 0, "role": "user"}],
+ "next_after_ordinal": 7}
+```
+
+One row per numbered part, in transcript order, sealed history included. `mid` and `ordinal`
+are the message's id and ordinal (from 1) as `session.read` and `session.entries` serve them,
+`part` is the zero-based index of the part's block within its message (its id in
+`session.entries`), and `role` is the message's role. `next_after_ordinal` is present only
+when more messages follow. `numbered` is true when the session's latest run shows the model
+numbers, or when the page holds a part that an earlier run numbered; when it is false the page
+has no rows. Ids and numbers only: the reply carries no content.
+
+On the current compaction contract a part takes the number `session.entries` serves it with;
+off it, the number its run's own tag rules gave it. Both are read from what was recorded when
+each message was placed, so a page costs work for its own messages only. The read uses a
+read-only view of the session as stored: it never takes the session's lease or occupies its
+actor, and with an actor open it sees what the actor has made durable.
+
+```sh
+broca-session --subc <connection file> --project-root <root> --harness <harness> \
+  --session <session> tag-map --out map.json   # {"session": "<session>", "rows": [...]}
+```
 
 ## External session and call identities
 
@@ -2897,3 +3078,18 @@ header and requires this order:
    check. Do not proceed while the MC-owned check is unavailable or nonzero.
 4. Only then roll the Magic Context reader back. A rollback reader that itself
    tolerates the new header does not need this compatibility drain.
+
+## Experiments
+
+`experiments.json` in the state root (the folder holding `run-index.db`) turns on probes for
+chosen project folders; today it holds one, `{"ride_placement": {"sibling_project_roots":
+["/absolute/project/folder"]}}`. It must be owner-only, is read each time a fresh run on the new
+session storage is admitted (an edit needs no restart), and a missing, unreadable or malformed
+file selects nothing and logs one warning; it never refuses a run. A selected run on an
+Anthropic Messages route freezes `ride_placement: "after_results"` into its render config: each
+ride (text a send delivered with a tool result) is then sent as its own text block after all of
+that turn's tool results, which hold only the tools' own output, and takes no part number.
+Nothing stored or read changes, and every other run's config and bytes are as before. An older
+build decodes such a config without error but drops the member, so it refuses to resume that
+run (`frozen_render_config_drift`) rather than render it with the other placement. The probe is
+removed or replaced once the placement question is decided.

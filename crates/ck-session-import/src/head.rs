@@ -21,6 +21,7 @@ use std::fmt;
 use broca_protocol::{ContentBlock, MediaRef, Message, Role, ToolCallId};
 
 mod calls;
+pub mod opencode1;
 pub mod opencode2;
 pub mod pi;
 mod sends;
@@ -59,6 +60,9 @@ pub struct SourceRow {
     /// host never sends the row to its model. A row that became two messages (an OpenCode 2
     /// assistant row whose calls have results) names the first, the assistant message.
     pub message: Option<usize>,
+    /// The source row is a finished compaction summary: OpenCode 1 marks it `summary` true (or 1)
+    /// and `finish` `stop`, and it counts even when the row also recorded an error.
+    pub finished_summary: bool,
 }
 
 /// One message of a head's history.
@@ -489,5 +493,7 @@ pub(crate) fn base64_bytes(data: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("its base64 bytes don't decode: {error}"))
 }
 
+#[cfg(test)]
+mod opencode1_tests;
 #[cfg(test)]
 mod tests;

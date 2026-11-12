@@ -20,6 +20,7 @@ pub mod codex;
 pub mod goose;
 pub mod head;
 pub mod opencode;
+pub mod opencode_extract;
 pub mod pi;
 
 mod sqlite_read;

@@ -38,6 +38,9 @@ pub const OP_MOVE_TO_STORE: &str = "session.move_to_store";
 /// holds after a backup came back. Only the operator calls it, through `broca-session
 /// restore-from-backup`.
 pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
+/// Read which message and part each part number of a session kept in the new storage belongs
+/// to. Only the operator calls it, through `broca-session tag-map`; it is outside the runner role.
+pub const OP_TAG_MAP: &str = broca_wire::tag_map::OP_SESSION_TAG_MAP;
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
 pub const OP_RUN_ADMISSION: &str = "run.admission";
@@ -45,6 +48,8 @@ pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
 /// Daemon-scoped read of the credential vault's listing under broca's grants.
 pub const OP_VAULT_AUDIT: &str = "vault.audit";
+/// Daemon-scoped, operator-only read of what the open sessions and caches hold in memory.
+pub const OP_MEMORY_REPORT: &str = "memory.report";
 /// The held-open stream observability surface.
 pub const OP_SUBSCRIBE: &str = "session.subscribe";
 /// The `llm-runner/v1` operations broca exposes: role discovery, session head and baseline, run
@@ -232,6 +237,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
+            name: OP_TAG_MAP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Page which message and part each part number of a session kept in the new storage belongs to, ids and numbers only; operator only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
             name: OP_INSTALL_VIEW.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: Some(
@@ -391,6 +404,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: Some(
                 "List the vault credentials broca's grants cover, and name every configured credential the vault did not list."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_MEMORY_REPORT.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Report, for the operator, the estimated bytes each open session and shared cache holds in memory: sizes and counts only."
                     .to_string(),
             ),
         },

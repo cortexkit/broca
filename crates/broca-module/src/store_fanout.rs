@@ -528,6 +528,43 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         !self.subscribers.is_empty()
     }
 
+    /// What the live side of the stream holds, estimated by walking it when asked (see
+    /// `broca_session_store::held`): the projector's copies of the folds and its run facts, the
+    /// open step's units, and the batches waiting for a barrier. A unit counts by its compact
+    /// JSON, which stands in for its heap. The broadcast ring's retained units can't be walked:
+    /// each counts only its slot.
+    pub(crate) fn held_bytes(&self) -> usize {
+        use broca_session_store::held::HeldBytes;
+        let Ok(publisher) = self.publisher.lock() else {
+            return 0;
+        };
+        let unit = |event: &Arc<ControlEvent>| {
+            2 * std::mem::size_of::<usize>()
+                + std::mem::size_of::<ControlEvent>()
+                + serde_json::to_vec(&event.1).map_or(0, |bytes| bytes.len())
+        };
+        let live = match &publisher.live {
+            Live::Unseeded => 0,
+            Live::Seeding { waiting, .. } => waiting.heap_bytes(),
+            Live::Seeded(projection) => {
+                std::mem::size_of::<LiveProjection>()
+                    + projection.control.held_bytes()
+                    + projection.step.units().iter().map(unit).sum::<usize>()
+            }
+        };
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<Publisher>()
+            + live
+            + publisher.unsynced.heap_bytes()
+            + publisher.ring.len() * std::mem::size_of::<LiveItem>()
+            + self.subscribers.capacity()
+                * std::mem::size_of::<(
+                    CancellationToken,
+                    JoinHandle<()>,
+                    mpsc::WeakSender<Delivery>,
+                )>()
+    }
+
     /// The display lane's sender and the step its deltas belong to, for a run's output drain.
     pub(crate) fn display(&self) -> (DisplaySender, Arc<Mutex<Option<String>>>) {
         (self.display.clone(), Arc::clone(&self.display_mid))

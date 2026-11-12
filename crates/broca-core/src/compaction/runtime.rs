@@ -97,6 +97,18 @@ async fn clock_deadline(clock: Option<&crate::Clock>, deadline_ms: u64) {
     .await;
 }
 
+/// What a catalog read establishes about a compaction provider. A failed read is not evidence
+/// that the provider has no declarations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderCapabilities {
+    /// The provider's declared `provides` list, possibly kept from a successful earlier read.
+    Declared(Vec<String>),
+    /// A successful catalog read contained no entry for the provider.
+    NotInCatalog,
+    /// The catalog could not be read and no declared list is available.
+    Unknown,
+}
+
 /// A sibling of HookPlane on the same module-level route machinery. Route errors and answers
 /// that do not decode are failed calls.
 /// Each call carries the session's frozen scope so opening a provider route cannot drop it.
@@ -116,10 +128,10 @@ pub trait CompactionPlane: Send + Sync {
         Err(crate::compaction_v2::runtime::CallError::Unavailable)
     }
 
-    /// The capabilities `provider`'s catalog entry lists (`provides`), read from the daemon's
-    /// catalog when asked. `None` when the catalog can't be read or names no such module.
-    async fn provider_capabilities(&self, _provider: &str) -> Option<Vec<String>> {
-        None
+    /// Read the daemon's catalog afresh, with a bounded wait. A failed read may use the last
+    /// successfully read list, but must not claim that the provider declared nothing.
+    async fn provider_capabilities(&self, _provider: &str) -> ProviderCapabilities {
+        ProviderCapabilities::Unknown
     }
 
     async fn setup(

@@ -85,6 +85,21 @@ pub(super) struct Gated {
     pub(super) gate: Option<Arc<Notify>>,
     pub(super) render_config: Option<serde_json::Value>,
     pub(super) notes_sends: bool,
+    /// When set, each call keeps its request's bytes while it waits at the gate, as a transport
+    /// keeps a request's body for its call, and says it reached the gate.
+    pub(super) hold: Option<Arc<Hold>>,
+}
+
+/// What a gated provider keeps of the call waiting at its gate (see [`Gated::hold`]).
+#[derive(Default)]
+pub(super) struct Hold {
+    /// Notified when a call reaches the gate, holding its request's bytes.
+    pub(super) reached: Notify,
+    /// The bytes of the request waiting, while it waits.
+    pub(super) body_len: std::sync::atomic::AtomicUsize,
+    /// The options of the latest call, held weakly: a test checks they are freed after the call.
+    pub(super) options:
+        std::sync::Mutex<Option<std::sync::Weak<broca_protocol::request::CallOptions>>>,
 }
 
 #[async_trait]
@@ -95,6 +110,9 @@ impl broca_core::provider::Provider for Gated {
         opts: Arc<broca_protocol::request::CallOptions>,
         runtime: broca_core::provider::StepRuntime,
     ) -> mpsc::Receiver<NormalizedEvent> {
+        if let Some(hold) = &self.hold {
+            *hold.options.lock().unwrap() = Some(Arc::downgrade(&opts));
+        }
         let mut input = match runtime.seal {
             Some(seal) => {
                 self.step_with_shutdown_seal(
@@ -205,9 +223,19 @@ impl broca_core::provider::Provider for Gated {
         step_id: broca_protocol::StepId,
         opts: &broca_protocol::request::CallOptions,
     ) -> mpsc::Receiver<NormalizedEvent> {
+        // The request's bytes, rendered as JSON, stand in for the body a transport holds while
+        // its call is in flight.
+        let body = self.hold.as_ref().map(|hold| {
+            let body = serde_json::to_vec(opts).unwrap();
+            hold.body_len
+                .store(body.len(), std::sync::atomic::Ordering::SeqCst);
+            hold.reached.notify_one();
+            body
+        });
         if let Some(gate) = &self.gate {
             gate.notified().await;
         }
+        drop(body);
         self.inner.step(step_id, opts).await
     }
 
@@ -242,6 +270,8 @@ impl broca_core::provider::Provider for Gated {
 /// Runs each store job through the new loop's admission and run, over a scripted provider.
 pub(super) struct LoopExecutor {
     pub(super) provider: Gated,
+    /// Override admission's stored run-start time, including an unknown historical time.
+    pub(super) start_time: Option<Arc<std::sync::Mutex<Option<u64>>>>,
     /// When set, a run drained from the queue signals the first `Notify` and waits on the second
     /// before its admission, so a test can act while the drain has started a run whose start
     /// isn't durable yet.
@@ -351,11 +381,13 @@ pub(super) fn executor(
     gate: Option<Arc<Notify>>,
 ) -> LoopExecutor {
     LoopExecutor {
+        start_time: None,
         provider: Gated {
             inner: StubProvider::new(steps),
             gate,
             render_config: None,
             notes_sends: false,
+            hold: None,
         },
         drain_gate: None,
         planes: Planes::default(),
@@ -419,7 +451,12 @@ impl RunExecutor for LoopExecutor {
                         &control,
                         &self.provider,
                         writer.operations(),
-                        Some(control.clock.as_ref().map_or(1, |clock| clock.now_ms())),
+                        self.start_time
+                            .as_ref()
+                            .map(|time| *time.lock().unwrap())
+                            .unwrap_or_else(|| {
+                                Some(control.clock.as_ref().map_or(1, |clock| clock.now_ms()))
+                            }),
                     )
                     .map_err(StoreRunError::Admission)?,
                 )
@@ -824,6 +861,154 @@ pub(super) fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn recovery_registration_syncs_once_across_three_runs_in_one_actor() {
+    use crate::store_open::recovery_index as index;
+    let root = broca_test_support::scratch_root()
+        .join(format!("store-registration-cost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let live = root.join("live");
+    index::prepare_complete_for_test(&live).unwrap();
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let gate = Arc::new(Notify::new());
+    let actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(
+            vec![
+                text_step("a1", "one"),
+                text_step("a2", "two"),
+                text_step("a3", "three"),
+            ],
+            Some(gate.clone()),
+        )),
+        Box::new(MemoryParts::default()),
+    )
+    .with_recovery_index(live.clone())
+    .with_readers(Arc::new(move || backend));
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(sender, backend);
+    let served = tokio::spawn(actor.serve(receiver));
+    let addr = SessionAddr(broca_core::session_addr(&bind()));
+    let mut syncs = Vec::new();
+    for n in 1..=3 {
+        let before = index::sync_counts_for_test();
+        assert!(matches!(
+            send(&commands, &format!("r{n}"), "hello").await,
+            SendOutcome::Active { .. }
+        ));
+        if n == 1 {
+            // Capture the durable index while the first model step is held, with its start
+            // already acknowledged. Discovery after a crash cannot depend on the actor field.
+            let cut = root.join("cut");
+            let directory = "recovery-candidates";
+            std::fs::create_dir_all(cut.join(directory)).unwrap();
+            for name in ["complete", addr.0.as_str()] {
+                std::fs::copy(
+                    live.join(directory).join(name),
+                    cut.join(directory).join(name),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                index::members_for_test(&cut).unwrap().unwrap(),
+                vec![addr.clone()]
+            );
+        }
+        gate.notify_one();
+        broca_test_support::wait_until("the registered actor finishes its run", || async {
+            match status(&commands).await {
+                LineageStatus::Idle => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+        let after = index::sync_counts_for_test();
+        syncs.push((after.0 - before.0, after.1 - before.1));
+    }
+    assert_eq!(
+        syncs,
+        [(1, 1), (0, 0), (0, 0)],
+        "only the first run may sync the recovery member and its directory"
+    );
+    assert_eq!(index::members_for_test(&live).unwrap().unwrap(), vec![addr]);
+    let before_close = index::sync_counts_for_test();
+    drop(commands);
+    served.await.unwrap();
+    assert!(index::members_for_test(&live).unwrap().unwrap().is_empty());
+    assert_eq!(
+        index::sync_counts_for_test(),
+        before_close,
+        "retirement needs no durable unlink"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn restart_admission_keeps_immutable_authorization_reads_available() {
+    fn owner(outcome: crate::store_reads::StoreReadOutcome) -> serde_json::Value {
+        let crate::store_reads::StoreReadOutcome::Served(reply) = outcome else {
+            panic!("authorization must remain answerable during restart admission")
+        };
+        let crate::store_reads::StoreReadReply::AuthorizationOwnership(value) = *reply else {
+            panic!("the ownership request must return ownership")
+        };
+        serde_json::to_value(value.unwrap()).unwrap()
+    }
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, backend) =
+        actor_with(executor(vec![text_step("a1", "done")], None), parts.clone()).await;
+    assert!(matches!(
+        send(&commands, "r1", "hello").await,
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("the seed run completes", || async {
+        match status(&commands).await {
+            LineageStatus::Idle => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    drop(commands);
+    served.await.unwrap();
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let mut actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(Vec::new(), None)),
+        Box::new(parts),
+    )
+    .with_readers(Arc::new(move || backend));
+    let request = crate::store_reads::StoreReadRequest::AuthorizationOwnership;
+    let expected = owner(actor.store_read(&request).await);
+    let before = actor.session.next_seq();
+    actor.restart_admitting = true;
+    assert_eq!(owner(actor.store_read(&request).await), expected);
+    assert_eq!(
+        actor.session.next_seq(),
+        before,
+        "authorization must not flush or append"
+    );
+    assert!(matches!(
+        actor
+            .store_read(&crate::store_reads::StoreReadRequest::Head)
+            .await,
+        crate::store_reads::StoreReadOutcome::Refused(_)
+    ));
+}
+
 /// A send on an idle session is answered `active` once its run's start is in the session, and
 /// the run, written through the actor, finishes there. A second send then runs on the same
 /// session, after the first.
@@ -884,8 +1069,12 @@ async fn a_refused_send_writes_nothing() {
             reply,
         })
         .unwrap();
+    // The refusal is permanent: resending the same request cannot change the result.
     match answer.await.unwrap() {
-        SendOutcome::Error(message) => assert!(message.contains("step_count"), "{message}"),
+        SendOutcome::ClassifiedError { reason, class } => {
+            assert!(reason.contains("step_count"), "{reason}");
+            assert_eq!(class, broca_protocol::ErrorClass::Permanent);
+        }
         other => panic!("expected the refusal: {other:?}"),
     }
     assert_eq!(status(&commands).await, LineageStatus::Idle);
@@ -1740,7 +1929,7 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
 
 /// A fetch plan's manifest for these tests, with `plan` as the plan the caller sent: the tools
 /// `read` and `edit`, and a system text.
-fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanManifest {
+pub(super) fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanManifest {
     broca_wal::PlanManifest {
         rich_ui: None,
         plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
@@ -1770,7 +1959,7 @@ fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanMani
 
 /// A send carrying a plan, as the serve layer hands it over: its identity, and the manifest it
 /// fetched when the session had no run. The session's caller sends it.
-async fn send_planned(
+pub(super) async fn send_planned(
     commands: &Commands,
     run_id: &str,
     request: SubmissionRequest,
@@ -1805,7 +1994,7 @@ async fn send_planned(
 }
 
 /// A send carrying no tools of its own, as a planned session's sends do.
-fn untooled(text: &str) -> SubmissionRequest {
+pub(super) fn untooled(text: &str) -> SubmissionRequest {
     let mut request = request(text);
     request.tools = None;
     request.policy_allowed = Default::default();

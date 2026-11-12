@@ -57,10 +57,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
-    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE,
-    OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
-    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MEMORY_REPORT,
+    OP_MOVE_TO_STORE, OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT,
+    OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS,
+    OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP,
+    OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -1828,6 +1829,19 @@ where
                     bind,
                 )
                 .await?;
+            } else if req.method == OP_MEMORY_REPORT && bind.management {
+                spawn_memory_report_request(
+                    req,
+                    writer,
+                    conn_cancel,
+                    request_slots,
+                    request_tasks,
+                    (ver, channel, epoch, corr),
+                    handler.clone(),
+                    session,
+                    bind,
+                )
+                .await?;
             } else {
                 let prepared = prepare_route_request(req, routes, channel, conn_cancel);
                 let dispatch_ticket = routes.reserve_dispatch(&session);
@@ -2679,6 +2693,97 @@ fn subscribe_from(
     Ok((from, params.limits))
 }
 
+/// Dispatch `memory.report` without acquiring an actor lease or touching the bound session: the
+/// report is daemon-scoped, and the bound route is only its transport. Only the operator's own
+/// connection is answered, since the report names every open session's address.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_memory_report_request<H: ServeHandler + 'static>(
+    req: RouteRequest,
+    writer: &EgressSender<Frame>,
+    conn_cancel: &CancellationToken,
+    request_slots: &Arc<Semaphore>,
+    request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    handler: Arc<H>,
+    session: BrocaBindIdentity,
+    bind: BindObservation,
+) -> Result<(), ServeIoError> {
+    let request_slots = request_slots.clone();
+    let writer = writer.clone();
+    let conn_cancel = conn_cancel.clone();
+    request_tasks.spawn(reply_on_panic(
+        writer.clone(),
+        (ver, channel, epoch, corr),
+        async move {
+            log_served_request(
+                OP_MEMORY_REPORT,
+                &session,
+                caller_module(&bind),
+                "reply",
+                async {
+                    let _permit = request_slots
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
+                    // Every request is counted, a refused one too, as every management operation is.
+                    count_management_operation(OP_MEMORY_REPORT);
+                    if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                        return send_error(
+                            &writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "operator_required",
+                            "memory.report is for the operator only",
+                        )
+                        .await;
+                    }
+                    if !req.params.is_null() {
+                        if let Err(error) =
+                            serde_json::from_value::<crate::wire::MemoryReportParams>(req.params)
+                        {
+                            return send_error(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "invalid_params",
+                                &error.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                    let report = tokio::select! {
+                        _ = conn_cancel.cancelled() => return Ok(()),
+                        report = handler.memory_report() => report,
+                    };
+                    match report {
+                        Some(report) => {
+                            send_json_response(&writer, ver, channel, epoch, corr, &report).await
+                        }
+                        None => {
+                            send_error(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "unavailable",
+                                "this broca serves no sessions to report",
+                            )
+                            .await
+                        }
+                    }
+                },
+            )
+            .await
+        },
+    ));
+    Ok(())
+}
+
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
 /// The configured `VaultAuditor` performs the vault call; this decodes params and writes the answer.
 #[allow(clippy::too_many_arguments)]
@@ -2806,6 +2911,20 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
+        // Only the operator's own connection reads a session's tag map, refused before anything
+        // reads the session and before the request is counted.
+        if method == OP_TAG_MAP && !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+            return send_error(
+                &writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "operator_required",
+                "session.tag_map is for the operator only",
+            )
+            .await;
+        }
         if let Some((converting, reason)) = handler.conversion_refusal(&session) {
             let body = ErrorBody::new(
                 if converting { "session_converting" } else { "session_unconverted" },
@@ -2844,7 +2963,7 @@ where
             OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | OP_TAG_MAP | broca_wire::plan_view::OP_SESSION_PLAN_VIEW | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
@@ -3798,6 +3917,57 @@ where
                 }
             }
         }
+        OP_TAG_MAP => {
+            // Checked again here so no path reaches the read without the operator's own
+            // connection.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.tag_map is for the operator only",
+                )
+                .await;
+            }
+            let params: broca_wire::tag_map::TagMapParams = if req.params.is_null() {
+                Default::default()
+            } else {
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                }
+            };
+            match handler.tag_map(session, &params).await {
+                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(None) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        NOT_SERVED_ON_OLD_STORAGE,
+                        "session.tag_map serves sessions kept in the new storage only, and this session is kept on today's storage",
+                    )
+                    .await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         OP_INSTALL_VIEW => {
             let params: broca_wire::head_import::InstallViewParams =
                 match serde_json::from_value(req.params) {
@@ -4112,6 +4282,30 @@ where
                 }
                 Err(broca_module::history::HistoryError::Refused { code, message }) => {
                     send_error(writer, ver, channel, epoch, corr, code, &message).await
+                }
+            }
+        }
+        broca_wire::plan_view::OP_SESSION_PLAN_VIEW => {
+            if let Err((field, message)) =
+                decode_params::<broca_wire::plan_view::PlanViewParams>(&req.params)
+            {
+                return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                    .await;
+            }
+            match handler.plan_view(session).await {
+                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(None) => send_error(
+                    writer, ver, channel, epoch, corr, NOT_SERVED_ON_OLD_STORAGE,
+                    "session.plan_view serves sessions kept in the new storage only, and this session is kept on today's storage",
+                ).await,
+                Err(broca_module::store_plan_view::Error::NoPlan) => send_error(
+                    writer, ver, channel, epoch, corr, "no_plan", "the session has no plan manifest",
+                ).await,
+                Err(broca_module::store_plan_view::Error::TooLarge) => send_error(
+                    writer, ver, channel, epoch, corr, "too_large", "the plan view exceeds the transport frame limit",
+                ).await,
+                Err(broca_module::store_plan_view::Error::Serve(error)) => {
+                    send_serve_error(writer, ver, channel, epoch, corr, &error).await
                 }
             }
         }
@@ -5175,7 +5369,8 @@ async fn send_response_bytes(
 
 fn refused_send_code(error: &ServeError) -> String {
     match error {
-        ServeError::CredentialsUnavailable => "credentials_unavailable".into(),
+        // Answered on the wire as the contract's `transient` code (see `admission_refusal`).
+        ServeError::CredentialsUnavailable => "transient".into(),
         ServeError::CredentialAmbiguous { .. } => "credential_ambiguous".into(),
         ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
@@ -5208,6 +5403,8 @@ fn refused_send_code(error: &ServeError) -> String {
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse".into(),
         ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient".into(),
+        // Answered on the wire as the contract's `transient` code (see `admission_refusal`).
+        ServeError::ModuleStopping(_) => "transient".into(),
         ServeError::Import(_) => "import_rejected".into(),
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
@@ -5252,6 +5449,7 @@ fn refused_send_class(error: &ServeError) -> &'static str {
         ServeError::RoutingUnavailable(_)
         | ServeError::CredentialsUnavailable
         | ServeError::Transient(_)
+        | ServeError::ModuleStopping(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
         | ServeError::SessionConverting
@@ -5318,6 +5516,10 @@ fn restore_all(params: &serde_json::Value) -> Result<bool, String> {
 /// The refusal of an op that has no implementation yet for a session kept in the new storage.
 const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 
+/// The refusal of an op that serves only sessions kept in the new storage, for a session today's
+/// storage keeps. Permanent while the session stays there.
+const NOT_SERVED_ON_OLD_STORAGE: &str = "not_served_on_old_storage";
+
 /// Whether `method` is served for a session kept in the new storage. Every other op is refused
 /// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
 /// reads. An op joins this list in the change that gives it a store implementation.
@@ -5329,7 +5531,7 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
-        OP_READ | OP_HEAD => true,
+        OP_READ | OP_HEAD | broca_wire::plan_view::OP_SESSION_PLAN_VIEW => true,
         cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS
         | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ => true,
         // The store actor's subscriptions (`store_fanout`).
@@ -5350,6 +5552,8 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         OP_INSTALL_VIEW => true,
         // Restore repairs the new storage's own files (`store_restore`).
         OP_RESTORE_FROM_BACKUP => true,
+        // The tag map reads the store's own entry facts (`store_tag_map`).
+        OP_TAG_MAP => true,
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
         OP_WARM => true,
@@ -5496,6 +5700,7 @@ async fn send_serve_error(
         | ServeError::MediaTooLarge(_)
         | ServeError::SendIdReuse { .. }
         | ServeError::Transient(_)
+        | ServeError::ModuleStopping(_)
         | ServeError::InvalidParams { .. }
         | ServeError::AccountSelectionRefused(_)
         | ServeError::RoutingUnavailable(_) => unreachable!("admission refusal returned above"),
@@ -6513,6 +6718,7 @@ fn method_code(method: &str) -> u8 {
         OP_WARM => 17,
         OP_RUN_TOOL_CALLS => 19,
         OP_INSTALL_VIEW => 20,
+        OP_MEMORY_REPORT => 21,
         _ => 255,
     }
 }
@@ -7634,7 +7840,7 @@ mod tests {
         .unwrap();
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
-        assert_eq!(frame.body.as_slice(), br#"{"code":"variant_unsupported","message":"open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]","detail":{"defined":["none","low","medium","high"],"model":"anthropic/claude-opus-5","variant":"max"}}"#);
+        assert_eq!(frame.body.as_slice(), br#"{"code":"variant_unsupported","message":"open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]","detail":{"class":"permanent","defined":["none","low","medium","high"],"model":"anthropic/claude-opus-5","variant":"max"}}"#);
     }
 
     #[tokio::test]

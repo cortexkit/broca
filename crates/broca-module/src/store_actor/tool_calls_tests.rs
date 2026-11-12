@@ -87,6 +87,7 @@ async fn side_at(
             provider: Gated {
                 render_config: None,
                 notes_sends: false,
+                hold: None,
                 inner: broca_core::provider::StubProvider::new(steps),
                 gate: None,
             },
@@ -481,8 +482,9 @@ async fn crash_mid_dispatch(dir: std::path::PathBuf, store: bool, cipher: Cipher
     .unwrap();
 }
 
-/// A call a crash cut off after its dispatch: before anything reopens the session, and after
-/// its open closed the call with an unknown outcome, it lists as indeterminate, alike.
+/// A call a crash cut off after dispatch lists as indeterminate. A store read recovers the
+/// session before answering, matching the WAL-backed actor after recovery, and subsequent reads
+/// keep the recorded unknown-outcome result unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_a_crash_cut_off_lists_as_indeterminate_alike() {
     for cipher in Cipher::ALL {
@@ -492,20 +494,27 @@ async fn a_call_a_crash_cut_off_lists_as_indeterminate_alike() {
         let today = side_at(today_dir, false, Vec::new(), None, cipher).await;
         let store = side_at(store_dir, true, Vec::new(), None, cipher).await;
         assert!(store.stored_in(cipher), "{}", cipher.label());
+        today.registry.status(&today.key).await.unwrap();
         let before = [today.pages("r1", None).await, store.pages("r1", None).await];
-        assert!(store.registry.slot_state(&store.key).is_none());
-        assert_eq!(before[1], before[0], "before the open, {}", cipher.label());
+        assert!(store.registry.slot_state(&store.key).is_some());
+        assert_eq!(
+            before[1],
+            before[0],
+            "the recovering read, {}",
+            cipher.label()
+        );
         assert_eq!(outcomes(&before[1][0]), [json!("indeterminate")]);
         assert!(
-            before[1][0]["calls"][0].get("result_bytes").is_none(),
-            "no result is recorded yet"
+            before[1][0]["calls"][0]["result_bytes"].is_u64(),
+            "the read recorded the call's unknown-outcome result"
         );
-        // The session's status opens it, which closes the call: it was sent, and no result came.
+        // Explicit status and actor eviction must not change what the recovering read answered.
         for side in [&today, &store] {
             side.registry.status(&side.key).await.unwrap();
             side.closed().await;
         }
         let after = [today.pages("r1", None).await, store.pages("r1", None).await];
+        assert_eq!(after[1], before[1], "the recovered read is stable");
         assert_eq!(
             after[1],
             after[0],

@@ -6333,12 +6333,16 @@ where
                 == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend);
             // A missing frozen limit ends the run as `compaction_unavailable` before any model
             // I/O, the same way the step boundary does; it is never a WAL error.
-            let conditions = match crate::compaction_v2::host::conditions(
-                &config,
+            // The snapshot was synced before reading; WAL reopen continues after its last seq
+            // (FileWal::open), so statements keep their order across writer and daemon restarts.
+            let conditions = match crate::compaction_v2::host::conditions_of(
+                &crate::compaction_v2::host::Frozen::of(&config),
                 &transcript.entries,
                 chained,
                 transcript.newest_step_fill(),
                 transcript.signed_floor,
+                &|_| None,
+                frames.last().map(|frame| frame.seq),
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {
@@ -10051,6 +10055,7 @@ async fn run_step_watched<P: Provider>(
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
+            request: Default::default(),
         });
     }
     // The renderer gets a shared handle to the durable snapshot, never a copy of the prompt.

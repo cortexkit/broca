@@ -258,7 +258,7 @@ fn history_cost(
         &old,
         Some(lineage),
         broca_session_store::codec::hex(&head.incarnation.0),
-        head.history_version,
+        broca_module::store_exposure::served_history_version(head.history_version),
     )
     .unwrap();
     let handler = StoredHistory {
@@ -427,5 +427,161 @@ fn part_numbers_are_found_where_todays_read_numbers_them() {
             numbered.get(&number).copied(),
             "part number {number}"
         );
+    }
+}
+
+#[test]
+fn shared_conversion_pages_are_byte_equal_in_every_read_mode() {
+    use broca_module::serve::SessionReadRequest;
+    use broca_module::store_read::{serve_view, ViewReader};
+    use broca_session_store::session::Session;
+    use futures::executor::block_on;
+
+    let old = synthetic_log(4, 12, true, false);
+    let lineage = Some("0b3c3c1e-1f2a-4c1d-9e57-5a0e5f0c0001");
+    for sealed in [false, true] {
+        let stored = if sealed {
+            store_then_seal(&old, lineage, "shared-pages")
+        } else {
+            crate::read_cost::store_unsealed(&old, lineage, "shared-pages")
+        }
+        .unwrap();
+        block_on(async {
+            let view = Session::view(
+                &stored.backend,
+                stored.addr.clone(),
+                &stored.triple,
+                &stored.deployment,
+            )
+            .await
+            .unwrap();
+            let reader = ViewReader::new(&view, &stored.parts).await.unwrap();
+            let key = broca_protocol::BindIdentity::new("/read-cost", "read-cost", "shared-pages");
+            for (mode, display, tools, rich_ui) in crate::verify::READ_MODES {
+                let mut from = 1;
+                let mut pages = 0;
+                loop {
+                    let mut request =
+                        SessionReadRequest::new(key.clone(), Some(from), Some(crate::verify::PAGE));
+                    request.include_display_facts = display;
+                    request.include_tools = tools;
+                    request.include_rich_ui = rich_ui;
+                    stored.backend.take();
+                    let shared = reader.read(&request).await.unwrap();
+                    let reads = stored.backend.take();
+                    if !sealed {
+                        assert_eq!(reads.log_reads, 0, "{mode} page from {from}");
+                    }
+                    let separate = serve_view(&view, &stored.parts, &request).await.unwrap();
+                    assert!(shared.head.is_some());
+                    assert_eq!(
+                        serde_json::to_vec(&shared).unwrap(),
+                        serde_json::to_vec(&separate).unwrap(),
+                        "sealed={sealed}, {mode} page from {from}"
+                    );
+                    pages += 1;
+                    match shared.next_from_ordinal {
+                        Some(next) if next > from => from = next,
+                        _ => break,
+                    }
+                }
+                assert!(pages > 1, "{mode} must exercise several pages");
+            }
+        });
+    }
+}
+
+#[test]
+fn conversion_history_walks_open_the_log_a_constant_number_of_times() {
+    use broca_session_store::session::Session;
+    use futures::executor::block_on;
+
+    let lineage = Some("0b3c3c1e-1f2a-4c1d-9e57-5a0e5f0c0001");
+    for messages in [64, 512] {
+        let old = synthetic_log(1, messages, true, false);
+        let stored = crate::read_cost::store_unsealed(&old, lineage, "history-walk").unwrap();
+        assert_eq!(stored.messages, messages as u64);
+        block_on(async {
+            stored.backend.take();
+            let view = Session::view(
+                &stored.backend,
+                stored.addr.clone(),
+                &stored.triple,
+                &stored.deployment,
+            )
+            .await
+            .unwrap();
+            let handler = crate::stored_history::StoredHistoryWalk::new(&view, &stored.parts)
+                .await
+                .unwrap();
+            let head = view.head();
+            let today = broca_module::store_read::history_sides::TodaysHistory::new(
+                &old,
+                lineage,
+                broca_session_store::codec::hex(&head.incarnation.0),
+                broca_module::store_exposure::served_history_version(head.history_version),
+            )
+            .unwrap();
+            let key = broca_protocol::BindIdentity::new("/read-cost", "read-cost", "history-walk");
+            for (form, newest) in crate::verify::HISTORY_WALKS {
+                let pages = crate::verify::history_pages(&handler, &key, form, newest).await;
+                assert!(pages.len() >= messages / crate::verify::PAGE as usize);
+                assert!(pages.iter().all(|page| page.get("refused").is_none()));
+                assert_eq!(
+                    pages,
+                    crate::verify::history_pages(&today, &key, form, newest).await,
+                    "{messages} messages, {form}, newest={newest}"
+                );
+            }
+            let reads = stored.backend.take();
+            // One load of the view and one projection of its shared stream head, regardless
+            // of the number of pages or the direction and form of the four history walks.
+            assert_eq!(reads.log_reads, 2, "{messages} messages: {reads:?}");
+            eprintln!(
+                "messages={messages} history_walks=4 log_reads={} log_bytes={}",
+                reads.log_reads, reads.log_bytes
+            );
+        });
+    }
+}
+
+/// Run explicitly to compare the old per-page projection with the shared reader on synthetic
+/// unsealed conversions. Timing is printed, not asserted: machine load is not a read contract.
+#[test]
+#[ignore = "synthetic conversion page-walk timing"]
+fn conversion_page_walk_timing() {
+    use crate::read_cost::{page_walk_cost, store_unsealed};
+
+    let output = (0..24)
+        .map(|line| {
+            format!("src/component_{line}.rs: changed item; checks passed, 32 cases, no failures\n")
+        })
+        .collect::<String>();
+    for messages in [200, 2_000, 10_000] {
+        let mut old = synthetic(messages / 4, 4);
+        for frame in &mut old {
+            let mut value = serde_json::to_value(&frame.record).unwrap();
+            if value["type"] == "tool_result" {
+                value["result"]["output"]["text"] = serde_json::Value::String(output.clone());
+                frame.record = serde_json::from_value(value).unwrap();
+            }
+        }
+        let stored = store_unsealed(
+            &old,
+            Some("0b3c3c1e-1f2a-4c1d-9e57-5a0e5f0c0001"),
+            "conversion-timing",
+        )
+        .unwrap();
+        assert_eq!(stored.messages, messages as u64);
+        for shared in [false, true] {
+            let (elapsed, pages, reads) = page_walk_cost(&stored, shared).unwrap();
+            eprintln!(
+                "messages={messages} shared={shared} pages={pages} elapsed_ms={:.3} us_per_message={:.3} log_reads={} log_bytes={}",
+                elapsed.as_secs_f64() * 1_000.0,
+                elapsed.as_secs_f64() * 1_000_000.0 / messages as f64,
+                reads.log_reads,
+                reads.log_bytes,
+            );
+        }
     }
 }

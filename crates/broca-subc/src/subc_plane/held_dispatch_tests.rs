@@ -108,6 +108,7 @@ impl ToolPlaneConnection for Rig {
         _: Option<&ScopeSelector>,
         shape: RouteShape,
         installed: bool,
+        _aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
     ) -> Result<RouteHandle, ConnError> {
         let RouteShape {
             tool_result_v1,

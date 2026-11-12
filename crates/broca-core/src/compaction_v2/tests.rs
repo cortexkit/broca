@@ -7,6 +7,9 @@ use cortexkit_role_compaction::{
 };
 use serde_json::json;
 
+#[path = "statement_seq_tests.rs"]
+mod statement_seq;
+
 use super::{
     conditions as session_conditions,
     entries::{project, Deliveries, EntryFacts},
@@ -162,6 +165,89 @@ fn frozen_and_legacy_deliveries_keep_record_order_and_error_status() {
     let entries = project(&messages, &facts(3), &only_new, true);
     let rendered = render::deliveries_only_with_rides(&messages, &entries, &rides).unwrap();
     assert!(matches!(&rendered[2].content[0], ContentBlock::ToolResult(result) if result.is_error));
+}
+
+/// A probe placement: with rides rendered after the results, each result keeps only the tool's
+/// own output (its part number included), and the tool message holds the ride texts beside it,
+/// by the carrying result's place and then delivery order, on both the deliveries-only and the
+/// planned render. Without it, each ride is appended to its result as before.
+#[test]
+fn rides_after_results_are_held_beside_the_tool_message() {
+    let call = |id: &str, path: &str| {
+        ContentBlock::ToolCall(ToolCall {
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: "read".into(),
+            input: json!({ "path": path }),
+            thought_signature: None,
+        })
+    };
+    let answer = |id: &str, text: &str| {
+        ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId(id.into()),
+            output: ToolOutput::Text { text: text.into() },
+            is_error: false,
+        })
+    };
+    let messages = vec![
+        text(Role::User, "question"),
+        Message::new(Role::Assistant, vec![call("c1", "a"), call("c2", "b")]),
+        Message::new(Role::Tool, vec![answer("c1", "one"), answer("c2", "two")]),
+    ];
+    let deliveries = Deliveries::from([
+        (
+            ("m12345678.1".into(), "1".into()),
+            vec![
+                Delivered::new("ck-mc", "third").with_send_id("third"),
+                Delivered::new("ck-mc", "fourth").with_send_id("fourth"),
+            ],
+        ),
+        (
+            ("m12345678.1".into(), "0".into()),
+            vec![Delivered::new("ck-mc", "first").with_send_id("first")],
+        ),
+    ]);
+    let entries = project(&messages, &facts(3), &deliveries, true);
+    let mut rides = super::entries::RideEnvelopes::default();
+    rides.push(&entries[1].mid, "0", Some(frozen_ride("first")));
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("third")));
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("fourth")));
+    let outputs = |message: &Message| -> Vec<String> {
+        message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult(result) => super::entries::tool_output(&result.output).1,
+                _ => panic!("a tool message holds results"),
+            })
+            .collect()
+    };
+    let renders = |rides: &super::entries::RideEnvelopes| {
+        [
+            render::deliveries_only_with_rides(&messages, &entries, rides).unwrap(),
+            render::prompt_with_rides(&messages, &entries, rides, &[], |_| panic!("no image"))
+                .unwrap(),
+        ]
+    };
+    let today = renders(&rides);
+    rides.set_after_results(true);
+    let after = renders(&rides);
+    for (today, after) in today.iter().zip(&after) {
+        let (today, after) = (&today[2], &after[2]);
+        assert!(today.tags.rides_after_results().is_empty());
+        let own: Vec<String> = outputs(today)
+            .into_iter()
+            .zip(["\n\nfirst", "\n\nthird\n\nfourth"])
+            .map(|(text, rides)| text.strip_suffix(rides).unwrap().to_owned())
+            .collect();
+        assert_eq!(outputs(after), own);
+        assert_eq!(
+            after.tags.rides_after_results(),
+            ["first", "third", "fourth"]
+        );
+        assert_eq!(after.content.len(), today.content.len());
+    }
+    // The planned render shows each result's part number in both placements.
+    assert!(outputs(&after[1][2])[0].starts_with('\u{a7}'));
 }
 
 #[test]
@@ -885,6 +971,310 @@ async fn compaction_v2_setup_unknown_answer_fails_and_next_setup_restarts_notice
         calls[0].1.get("entries").is_none(),
         "Setup must be content-free"
     );
+}
+
+/// Compaction contract N6: the first notice after Setup carries only what changed since the
+/// Setup, here on a fresh runtime, as an actor reopened or a restarted process has.
+#[tokio::test]
+async fn compaction_v2_first_notice_after_setup_sends_only_what_changed_since() {
+    let plane = RecordingPlane::default();
+    plane
+        .answers
+        .lock()
+        .unwrap()
+        .extend([json!({"answer":"ready"}), json!({"answer":"received"})]);
+    let runtime = runtime::Runtime::default();
+    // The window at Setup: a question and an assistant entry whose tool call is still running.
+    let at_setup = project(
+        &[text(Role::User, "question"), call()],
+        &facts(2),
+        &Deliveries::new(),
+        true,
+    );
+    let mut setup = setup();
+    setup.newest = views::newest(&at_setup);
+    runtime.observe(&at_setup);
+    runtime.flush(&plane, &setup, &conditions(), None).await;
+    assert_eq!(
+        plane.calls.lock().unwrap().len(),
+        1,
+        "Setup covers the window, so nothing is left to notice"
+    );
+
+    // The call's result arrives after Setup: the assistant entry's digest changes and a new
+    // entry follows it. Both go in the next notice; the question does not.
+    let after = project(
+        &[
+            text(Role::User, "question"),
+            call(),
+            result(ToolOutput::Text {
+                text: "contents".into(),
+            }),
+        ],
+        &facts(3),
+        &Deliveries::new(),
+        true,
+    );
+    assert_ne!(after[1].digest, at_setup[1].digest);
+    runtime.observe(&after);
+    runtime.flush(&plane, &setup, &conditions(), None).await;
+    let calls = plane.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .collect::<Vec<_>>(),
+        ["compaction.setup", "compaction.notice"]
+    );
+    let entries = calls[1].1["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["ordinal"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert_eq!(entries[0]["digest"], json!(after[1].digest));
+}
+
+/// A failed Setup drops nothing from the queue: the provider didn't read the window, so the
+/// entries it named are still owed. (The ready Setup here names no newest entry, so it covers
+/// nothing and the notice shows exactly what the failed one left queued.)
+#[tokio::test]
+async fn compaction_v2_a_failed_setup_drops_nothing_from_the_queue() {
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"answer":"future"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+    ]);
+    let runtime = runtime::Runtime::default();
+    let first = project(
+        &[text(Role::User, "one")],
+        &facts(1),
+        &Deliveries::new(),
+        true,
+    );
+    let mut failed = setup();
+    failed.newest = views::newest(&first);
+    runtime.observe(&first);
+    assert!(!runtime.setup(&plane, &failed).await);
+    let second = project(
+        &[text(Role::User, "one"), text(Role::User, "two")],
+        &facts(2),
+        &Deliveries::new(),
+        true,
+    );
+    runtime.observe(&second);
+    assert!(runtime.setup(&plane, &setup()).await);
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    let calls = plane.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let entries = calls[2].1["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["ordinal"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+/// Scripted answers at the catalog boundary, including a list kept by the transport after a
+/// failed read. Calls still use the ordinary recording rig.
+struct CatalogPlane {
+    inner: RecordingPlane,
+    capabilities: std::sync::Mutex<std::collections::VecDeque<crate::ProviderCapabilities>>,
+}
+
+#[async_trait::async_trait]
+impl crate::CompactionPlane for CatalogPlane {
+    async fn provider_capabilities(&self, _: &str) -> crate::ProviderCapabilities {
+        self.capabilities
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted catalog answer")
+    }
+
+    async fn setup(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: crate::compaction_provider::setup::SetupRequest,
+    ) -> Result<crate::compaction_provider::setup::SetupAnswer, crate::CompactionUnavailable> {
+        panic!("v2 uses call_v2")
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        params: serde_json::Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
+        runtime::Plane::call(&self.inner, method, params).await
+    }
+}
+
+#[tokio::test]
+async fn compaction_v2_kept_capabilities_preserve_setup_notice_and_ride_fields() {
+    use cortexkit_role_compaction::{
+        ride::{RideCause, RideRequest},
+        SignedFloor,
+    };
+    let capabilities = crate::ProviderCapabilities::Declared(vec![
+        cortexkit_role_compaction::COMPACTION_ENTRY_SPEAKS_FOR_PROVIDES.into(),
+        cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into(),
+        "compaction-notes-tokens/v1".into(),
+    ]);
+    // The first list is fresh; the second is the transport's kept answer after a failed read.
+    let plane = CatalogPlane {
+        inner: RecordingPlane::default(),
+        capabilities: std::sync::Mutex::new([capabilities.clone(), capabilities].into()),
+    };
+    for _ in 0..2 {
+        plane.inner.answers.lock().unwrap().extend([
+            json!({"answer":"ready"}),
+            json!({"answer":"received"}),
+            json!({"answer":"nothing"}),
+        ]);
+    }
+    let bind = broca_protocol::BindIdentity::new("/project", "test", "s");
+    let bound = runtime::BoundPlane {
+        plane: Some(&plane),
+        provider: "magic",
+        bind: &bind,
+        scope: None,
+    };
+    let mut conditions = conditions();
+    conditions.signed_floor = Some(SignedFloor::new("m12345678.1"));
+    let mut setup = setup();
+    setup.signed_floor = conditions.signed_floor.clone();
+    let speaker = json!({"agent_id":"agent-a","name":"Ada"});
+    for _ in 0..2 {
+        let runtime = runtime::Runtime::default();
+        let model = broca_protocol::request::ModelHandle::new("stub", "claude-opus-5");
+        let config = json!({});
+        let globals = vec![text(Role::System, "system instructions")];
+        runtime.tokens.lock().unwrap().configure(
+            &super::host::Frozen {
+                model: &model,
+                variant: None,
+                service_tier: None,
+                frozen_render_config: &config,
+                tools: &[],
+                global_system: Some(&globals),
+                auth_selection: None,
+                context_limit: Some(200_000),
+                max_output_tokens: Some(1000),
+            },
+            None,
+        );
+        let mut marked = facts(1);
+        marked[0].speaks_for = Some(serde_json::from_value(speaker.clone()).unwrap());
+        runtime.observe(&project(
+            &[text(Role::User, "agent words")],
+            &marked,
+            &Deliveries::new(),
+            true,
+        ));
+        runtime.flush(&bound, &setup, &conditions, None).await;
+        runtime
+            .ride(
+                &bound,
+                &setup,
+                &RideRequest::new(vec![RideCause::OverLimit], 1000, conditions.clone()),
+            )
+            .await;
+        assert_eq!(runtime.entry_speaks_for(), Some(true));
+    }
+    let calls = plane.inner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 6);
+    assert_eq!(&calls[..3], &calls[3..]);
+    assert_eq!(calls[0].1["signed_floor"], json!({"through":"m12345678.1"}));
+    assert_eq!(
+        calls[1].1["conditions"]["signed_floor"],
+        calls[0].1["signed_floor"]
+    );
+    assert_eq!(
+        calls[2].1["conditions"]["signed_floor"],
+        calls[0].1["signed_floor"]
+    );
+    assert_eq!(
+        calls[1].1["conditions"]["notes_tokens"],
+        json!({"count":0,"exact":true})
+    );
+    assert!(
+        calls[1].1["conditions"]["system_tokens"]["count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(calls[1].1["entries"][0]["speaks_for"], speaker);
+}
+
+#[tokio::test]
+async fn compaction_v2_unknown_catalog_setup_keeps_attribution_unknown() {
+    let plane = CatalogPlane {
+        inner: RecordingPlane::default(),
+        capabilities: std::sync::Mutex::new([crate::ProviderCapabilities::Unknown].into()),
+    };
+    plane
+        .inner
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(json!({"answer":"ready"}));
+    let bind = broca_protocol::BindIdentity::new("/project", "test", "s");
+    let bound = runtime::BoundPlane {
+        plane: Some(&plane),
+        provider: "magic",
+        bind: &bind,
+        scope: None,
+    };
+    let runtime = runtime::Runtime::default();
+    let mut setup = setup();
+    setup.signed_floor = Some(cortexkit_role_compaction::SignedFloor::new("m12345678.1"));
+    assert!(
+        runtime.setup(&bound, &setup).await,
+        "unknown capabilities do not block Setup"
+    );
+    assert_eq!(runtime.entry_speaks_for(), None);
+    assert!(plane.inner.calls.lock().unwrap()[0]
+        .1
+        .get("signed_floor")
+        .is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_catalog_deadline_does_not_learn_false_attribution() {
+    struct Slow(RecordingPlane);
+    #[async_trait::async_trait]
+    impl runtime::Plane for Slow {
+        async fn declarations(&self) -> runtime::Declarations {
+            std::future::pending().await
+        }
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
+            runtime::Plane::call(&self.0, method, params).await
+        }
+    }
+    let plane = Slow(RecordingPlane::default());
+    plane
+        .0
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(json!({"answer":"ready"}));
+    let runtime = runtime::Runtime::default();
+    assert!(runtime.setup(&plane, &setup()).await);
+    assert_eq!(runtime.entry_speaks_for(), None);
 }
 
 /// A plane whose provider answers each catalog read from a script, so a test can change the
@@ -2064,9 +2454,9 @@ async fn compaction_v2_cache_expired_rides_only_where_setup_listed_it() {
         let messages = vec![text(Role::User, "question")];
         let entries = project(&messages, &facts(1), &Deliveries::new(), true);
         let plane = RecordingPlane::default();
+        // Setup covers the one entry, so no notice goes before the ride (compaction N6).
         plane.answers.lock().unwrap().extend([
             json!({"answer":"ready"}),
-            json!({"answer":"received"}),
             json!({"answer":"nothing"}),
             json!({"answer":"received"}),
         ]);
@@ -2181,11 +2571,11 @@ async fn compaction_v2_request_over_limit_rides_reestimates_then_refuses() {
     let messages = vec![text(Role::User, &"x".repeat(1000))];
     let entries = project(&messages, &facts(1), &Deliveries::new(), true);
     let plane = RecordingPlane::default();
-    plane.answers.lock().unwrap().extend([
-        json!({"answer":"ready"}),
-        json!({"answer":"received"}),
-        json!({"answer":"nothing"}),
-    ]);
+    plane
+        .answers
+        .lock()
+        .unwrap()
+        .extend([json!({"answer":"ready"}), json!({"answer":"nothing"})]);
     let state = tokio::sync::Mutex::new(state::State::default());
     let conditions = conditions();
     let current = send_context();
@@ -2218,10 +2608,11 @@ async fn compaction_v2_request_over_limit_rides_reestimates_then_refuses() {
             .iter()
             .map(|(method, _)| method.as_str())
             .collect::<Vec<_>>(),
-        ["compaction.setup", "compaction.notice", "compaction.ride"]
+        // Setup covers the one entry, so no notice goes before the ride (compaction N6).
+        ["compaction.setup", "compaction.ride"]
     );
-    assert_eq!(calls[2].1["causes"], json!(["over_limit"]));
-    assert!(calls[2].1["request_tokens"].as_u64().unwrap() > 900);
+    assert_eq!(calls[1].1["causes"], json!(["over_limit"]));
+    assert!(calls[1].1["request_tokens"].as_u64().unwrap() > 900);
 }
 
 #[tokio::test]
@@ -2233,7 +2624,6 @@ async fn compaction_v2_refused_ride_warns_once_without_changing_the_view() {
     let plane = RecordingPlane::default();
     plane.answers.lock().unwrap().extend([
         json!({"answer":"ready"}),
-        json!({"answer":"received"}),
         json!({"answer":"view","view":view}),
         json!({"answer":"received"}),
     ]);
@@ -2284,9 +2674,9 @@ async fn compaction_v2_request_ride_view_applies_to_that_request_before_sending(
         )],
     );
     let plane = RecordingPlane::default();
+    // Setup covers the one entry, so no notice goes before the ride (compaction N6).
     plane.answers.lock().unwrap().extend([
         json!({"answer":"ready"}),
-        json!({"answer":"received"}),
         json!({"answer":"view", "view":view}),
     ]);
     let state = tokio::sync::Mutex::new(state::State::default());

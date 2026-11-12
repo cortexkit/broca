@@ -310,6 +310,7 @@ async fn actor(
     )
     .await
     .unwrap();
+    executor.compactor.reads_memory(backend);
     let actor = StoreActor::new(
         bind(),
         session,

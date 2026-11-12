@@ -155,6 +155,10 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.message_id_prefix()
     }
 
+    fn message_ids(&self) -> Option<crate::entries::MessageIds> {
+        self.writer.message_ids()
+    }
+
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         self.writer.open_log_records().await
     }
@@ -225,5 +229,9 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
 
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.writer.media()
+    }
+
+    fn share_window(&self, window: crate::compaction::WeakWindow) {
+        self.writer.share_window(window)
     }
 }

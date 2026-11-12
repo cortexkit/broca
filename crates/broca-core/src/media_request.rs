@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::media_store::{MediaBytes, MediaReadError, MediaStoreClass, ReadOnlyMediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
+pub mod held;
 mod initialization;
 mod seed;
 mod wal_events;

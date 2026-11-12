@@ -91,6 +91,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// Where setup parts are stored durably before any record names them: the deployment's
     /// setup store. `None` keeps them in memory only, as tests do.
     storage: Option<broca_session_loop::durable::SetupParts<B>>,
+    recovery_index: Option<std::path::PathBuf>,
+    /// A successful file-and-directory barrier covers later runs until ownership is given up.
+    recovery_registered: bool,
     run: Option<ActiveRun>,
     /// Non-durable one-shot hints, retained for queued sends and same-process pause resumes.
     /// Reopening loses the hints, as it does in the WAL actor.
@@ -99,6 +102,9 @@ pub struct StoreActor<B: SessionBackend> {
     close_after_one_shot: bool,
     /// A late result raced the task's held pause; resume after its terminal is processed.
     held_resume_owed: bool,
+    restart_admitting: bool,
+    restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    account_limit_timer: Option<account_limit_pause::TimedPause>,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -153,6 +159,7 @@ pub struct StoreActor<B: SessionBackend> {
     /// The warm the executor is sending, if any.
     warm: Option<warm::PendingStoreWarm>,
     step_event_warm_stops: crate::step_events::WarmStops,
+    step_message_ids: Option<broca_session_loop::entries::MessageIds>,
     /// The scope the ordered send being admitted was admitted under, set only while it is: the
     /// run it starts at once, if it does, records it (see `drained_start`).
     ordered_scope: Option<broca_protocol::SessionScope>,
@@ -172,6 +179,15 @@ pub struct StoreActor<B: SessionBackend> {
     /// The authoritative folder and the opener's backup selection rule. Without placement
     /// information an unlabelled session cannot safely adopt a class.
     class_placement: Option<(broca_wal::StorageClass, Vec<String>)>,
+    /// Where an import stages the session it writes before publishing it over this one (see
+    /// `store_import_stage`). Without it an import is refused.
+    import_staging: Option<Arc<dyn crate::store_import_stage::ImportStaging<B>>>,
+    /// The most records an import appends in one batch: one log batch's limit, or fewer in tests
+    /// that cut an import between its batches.
+    import_batch: usize,
+    /// Where a test stops an import as a crash would.
+    #[cfg(test)]
+    import_cut: Option<crate::store_import_stage::ImportCut>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -237,8 +253,10 @@ enum Exit {
 
 /// The run the session is running.
 struct ActiveRun {
+    restart_from_seq: Option<u64>,
     run_id: RunId,
     one_shot: bool,
+    account_limit_resume: bool,
     /// The actor's end of the run's writer.
     link: RunLink,
     /// Set once the run dropped its writer: it appends nothing more, and its end follows.
@@ -260,6 +278,9 @@ struct ActiveRun {
     tool_media: Arc<broca_session_loop::PendingMedia>,
     /// The actor's end of the run's keep-warm, for a run that keeps its cache warm.
     warming: Option<keep_warm::RunWarming>,
+    /// Where the run leaves a weak handle on the compaction transcript it keeps, which the
+    /// memory report sizes while the run holds it.
+    window: broca_session_loop::shared::RunWindow,
 }
 
 /// A run to start: the send's request and what the run's start records about the send.
@@ -350,6 +371,7 @@ enum Event {
     IdleDeadline,
     /// The session is idle and may hold deletions that have come due.
     Collect,
+    AccountLimit(account_limit_pause::TimedPause),
 }
 
 /// The next record of a warm the active run's keep-warm sent, or never when it keeps none.
@@ -393,11 +415,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             executor,
             parts: SharedParts::new(parts),
             storage: None,
+            recovery_index: None,
+            recovery_registered: false,
             run: None,
             one_shot_runs: Default::default(),
             one_shot_submissions: Default::default(),
             close_after_one_shot: false,
             held_resume_owed: false,
+            restart_admitting: false,
+            restart_waiters: Vec::new(),
+            account_limit_timer: None,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -416,6 +443,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             registry: None,
             warm: None,
             step_event_warm_stops: Default::default(),
+            step_message_ids: None,
             ordered_scope: None,
             created: None,
             collect_due: false,
@@ -423,7 +451,33 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
             retention_clock: None,
             class_placement: None,
+            import_staging: None,
+            import_batch: broca_session_store::session::MAX_BATCH_RECORDS,
+            #[cfg(test)]
+            import_cut: None,
         }
+    }
+
+    /// Stages an import in `staging` and publishes it over this session from there.
+    pub fn with_import_staging(
+        mut self,
+        staging: Arc<dyn crate::store_import_stage::ImportStaging<B>>,
+    ) -> Self {
+        self.import_staging = Some(staging);
+        self
+    }
+
+    /// Appends an import at most `records` records at a time, and stops it at `cut` as a crash
+    /// would.
+    #[cfg(test)]
+    pub(crate) fn with_import_cut(
+        mut self,
+        records: usize,
+        cut: Option<crate::store_import_stage::ImportCut>,
+    ) -> Self {
+        self.import_batch = records;
+        self.import_cut = cut;
+        self
     }
 
     pub(crate) fn with_class_placement(
@@ -433,6 +487,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ) -> Self {
         self.class_placement = Some((class, backup_classes));
         self
+    }
+
+    pub(crate) fn with_recovery_index(mut self, root: std::path::PathBuf) -> Self {
+        self.recovery_index = Some(root);
+        self
+    }
+
+    fn track_recovery(&mut self) -> Result<(), String> {
+        if self.recovery_registered {
+            return Ok(());
+        }
+        let Some(root) = &self.recovery_index else {
+            return Ok(());
+        };
+        // LocalBackend's barriers run inline on the owning actor task; registration follows
+        // the same ordering, once rather than adding a blocking-pool hop for each run.
+        crate::store_open::recovery_index::insert(
+            root,
+            &broca_session_store::backend::SessionAddr(broca_core::session_addr(&self.key)),
+        )
+        .map_err(|error| format!("cannot register session recovery: {error}"))?;
+        self.recovery_registered = true;
+        Ok(())
+    }
+
+    fn retire_recovery(&mut self) {
+        let operations = self.session.operations();
+        if self.run.is_some()
+            || operations
+                .run
+                .as_ref()
+                .is_some_and(|run| run.finished.is_none())
+            || !operations.queue.is_empty()
+            || (self.billing.is_some() && !operations.billing_owed.is_empty())
+        {
+            return;
+        }
+        if let Some(root) = &self.recovery_index {
+            match crate::store_open::recovery_index::remove(
+                root,
+                &broca_session_store::backend::SessionAddr(broca_core::session_addr(&self.key)),
+            ) {
+                Ok(()) => self.recovery_registered = false,
+                Err(error) => {
+                    tracing::warn!(target: "lifecycle", %error, "could not retire session recovery candidate")
+                }
+            }
+        }
     }
 
     /// Reads the time the session's deletions come due by from `now_ms`, in place of the wall
@@ -471,8 +573,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The actor serves `session.subscribe`, catching subscribers up over backends `readers`
     /// makes: handles on the session's storage that only read.
     pub fn with_readers(mut self, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
-        self.media = crate::store_media::SessionIndex::new(&self.session, Some(readers()));
         self.readers = Some(Arc::clone(&readers));
+        self.media = self.fresh_media_index();
         self.fanout = Some(crate::store_fanout::StoreFanout::new(
             &mut self.session,
             readers,
@@ -497,8 +599,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         readers: Arc<dyn Fn() -> B + Send + Sync>,
         gate: Arc<tokio::sync::Notify>,
     ) -> Self {
-        self.media = crate::store_media::SessionIndex::new(&self.session, Some(readers()));
         self.readers = Some(Arc::clone(&readers));
+        self.media = self.fresh_media_index();
         self.fanout = Some(crate::store_fanout::StoreFanout::held(
             &mut self.session,
             readers,
@@ -527,8 +629,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// What keeps the session from closing idle, under the names today's actor gives the
-    /// registry: a run, a warm being sent, or a subscriber still attached. A subscriber keeps a
-    /// session open for as long as it holds its stream, as on today's storage, so a caller
+    /// registry: a run, a warm being sent, an account-limit timer, or a subscriber still attached.
+    /// A subscriber keeps a session open for as long as it holds its stream, as on today's
+    /// storage, so a caller
     /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
     /// the last one has gone closes it. Empty when the session may close.
     fn idle_holds(&mut self) -> Vec<&'static str> {
@@ -538,6 +641,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         if self.warm.is_some() {
             holds.push("manual_warm");
+        }
+        if self.account_limit_timer.is_some() {
+            holds.push("account_limit_pause");
         }
         if self
             .fanout
@@ -562,6 +668,31 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         request: &crate::store_reads::StoreReadRequest,
     ) -> crate::store_reads::StoreReadOutcome {
+        // Dependency admission may ask for immutable ownership through this same actor.
+        // Keep authorization available while caller reads wait for the restart decision.
+        if self.restart_admitting && !request.is_authorization() {
+            return crate::store_reads::StoreReadOutcome::Refused(crate::serve::ServeError::Open(
+                "restart_resume_pending: restart admission has not completed".into(),
+                Some(broca_protocol::ErrorClass::Transient),
+            ));
+        }
+        if !request.is_authorization()
+            && self.run.is_none()
+            && self.session.operations().run.as_ref().is_some_and(|run| {
+                run.finished.is_none()
+                    && recovery_mode(run).is_some()
+                    && !(run.paused == Some(broca_protocol::PauseReason::Restart)
+                        && run.cancel.is_none()
+                        && !self.restart_resumes_ready()
+                        && !self.interrupt_waits_on_pause())
+            })
+        {
+            return crate::store_reads::StoreReadOutcome::Refused(crate::serve::ServeError::Open(
+                "session_needs_recovery: the unfinished run could not be recovered before reading"
+                    .into(),
+                Some(broca_protocol::ErrorClass::Transient),
+            ));
+        }
         if !request.is_authorization() {
             // Flush before caller reads so their subscribe cursor includes the durable controls
             // projected from every returned record.
@@ -620,9 +751,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(provider) = provider else {
             return EntryAttribution::Known(false);
         };
-        let declared = EntryAttribution::Catalog(self.executor.compaction_plane())
+        let declaration = EntryAttribution::Catalog(self.executor.compaction_plane())
             .declared(&provider)
             .await;
+        let Some(declared) = declaration.value() else {
+            return EntryAttribution::Unknown;
+        };
         runtime.learn_entry_speaks_for(declared);
         EntryAttribution::Known(runtime.entry_speaks_for().unwrap_or(declared))
     }
@@ -641,13 +775,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Install a content-free observer independent of transcript subscription demand.
     pub fn with_step_events(mut self, events: &crate::step_events::StepEvents) -> Self {
-        let mut observer = events.store_observer(
-            self.key.clone(),
-            self.session.head().incarnation.0,
-            self.session.next_seq(),
-            self.parts.clone(),
-            self.step_event_warm_stops.clone(),
-        );
+        let message_ids = broca_session_loop::entries::MessageIds::default();
+        self.step_message_ids = Some(message_ids.clone());
+        let mut observer = events
+            .store_observer(
+                self.key.clone(),
+                self.session.head().incarnation.0,
+                self.session.next_seq(),
+                self.parts.clone(),
+                self.step_event_warm_stops.clone(),
+            )
+            .with_message_ids(message_ids);
         if let Some(run) = self.session.operations().run.as_ref() {
             if let Some(start) = run.start.as_ref() {
                 observer.seed_run(start, run.refrozen_render.as_ref());
@@ -696,6 +834,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         records: &[Record],
         staged: &[crate::person_media::StagedMedia],
     ) -> Result<Vec<Record>, SessionError> {
+        if records
+            .iter()
+            .any(|record| matches!(record, Record::QueuedSend(_)))
+        {
+            self.track_recovery().map_err(|error| {
+                SessionError::Backend(broca_session_store::backend::BackendError::Io(
+                    std::io::Error::other(error),
+                ))
+            })?;
+        }
         let mut media = broca_session_loop::HeldInputMedia::default();
         for item in staged {
             media.hold(&item.reference, Arc::clone(&item.bytes));
@@ -717,6 +865,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .await;
         self.stop_for_shutdown().await;
         self.collect_on_exit(&exit).await;
+        if !self.session.unsynced() {
+            self.retire_recovery();
+        }
         self.session
     }
 
@@ -782,6 +933,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         .await;
         let key = self.key.clone();
         let untouched = self.created_and_untouched() && !matches!(exit, Exit::Cut(_));
+        // Paused cancellation and queue retraction can finish without a run task returning.
+        // Retire their registration while the lease is still held, only from durable state.
+        if !self.session.unsynced() {
+            self.retire_recovery();
+        }
         // Everything but the session is dropped here, before the lease, as the whole actor was.
         let session = self.into_session();
         if untouched {
@@ -840,6 +996,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // The session feeds its media from before its first write here.
         self.media_open().await;
         self.recover().await;
+        self.retire_recovery();
         if !self
             .registry
             .as_ref()
@@ -886,6 +1043,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             let built = media_built(&mut self.media_build);
+            let timed_pause = self.account_limit_timer.clone().filter(|_| {
+                self.registry.as_ref().is_none_or(|registry| {
+                    registry.restart_resume_ready() && !registry.is_stopping()
+                })
+            });
+            let account_deadline = timed_pause.as_ref().map(|pause| pause.resume_not_before_ms);
             let collect_due = self.collect_due;
             // A warm the executor is sending ends whatever else the actor waits on.
             let has_warm = self.warm.is_some();
@@ -920,6 +1083,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
                     command = commands.recv() => Event::Command(command),
+                    _ = expiry::wait(account_deadline, &clock) => {
+                        Event::AccountLimit(timed_pause.expect("an account-limit timer is armed"))
+                    },
                     // Only once no command is waiting: the session is idle.
                     () = std::future::ready(()), if collect_due => Event::Collect,
                     _ = async {
@@ -950,6 +1116,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Warmed(result) => self.finish_warm(result).await,
                 Event::KeptWarm(record) => self.record_kept_warm(*record).await,
                 Event::Collect => self.collect_unreferenced().await,
+                Event::AccountLimit(pause) => {
+                    if let Err(error) = self.wake_account_limit(pause).await {
+                        tracing::warn!(target: "broca.store_actor", %error, "account-limit wake could not be recovered");
+                    }
+                }
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
                     idle_deadline = idle_after(tokio::time::Instant::now());
@@ -1107,7 +1278,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Done(end) => return self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
                 Event::KeptWarm(record) => self.record_kept_warm(*record).await,
-                Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline | Event::Collect => {
+                Event::Command(_)
+                | Event::Warmed(_)
+                | Event::IdleDeadline
+                | Event::Collect
+                | Event::AccountLimit(_) => {
                     unreachable!("no command is read here, and no idle deadline is waited on")
                 }
             }
@@ -1200,14 +1375,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             } => {
                 // An ordered send is admitted below, by today's rules; how it is delivered is the
                 // order's, not the string `delivery` beside it. So is an interrupt.
-                // An imported session runs only once `session.adopt` gives it the plan its head
-                // ran under, which isn't built yet: without it, a run would start with none.
-                if self.session.operations().imported_ids.is_some() {
-                    let _ = reply.send(SendOutcome::Error(
-                        "an imported session takes no send until session.adopt gives it a plan"
-                            .into(),
-                    ));
-                    return false;
+                // Import already fixed the owner and scope. Its first owner send applies the
+                // plan through ordinary admission, without replacing that recorded ownership.
+                if self.session.operations().owner.awaiting_import_admission() {
+                    if let Err(outcome) = self
+                        .send_scope(&run_id, &request, delivery, false, false)
+                        .await
+                    {
+                        let _ = reply.send(outcome);
+                        return false;
+                    }
+                    if plan.is_none() {
+                        let _ = reply.send(SendOutcome::DeliveryRefused {
+                            code: "invalid_params",
+                            field: "plan",
+                            message: "an imported session's first owner send requires plan".into(),
+                        });
+                        return false;
+                    }
                 }
                 // As in today's actor, a send's display marks are admitted first, against the
                 // session's owner summary and the principal and scope the send came with, before
@@ -1388,7 +1573,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     if crate::plan_episode::tools_are_frozen(
                         retry,
                         matches!(key, crate::actor::SendKey::RunId),
-                        self.session.operations().owner.episodes > 0,
+                        !self.session.operations().owner.needs_admission(),
                         frozen.is_some(),
                     ) {
                         let _ = reply.send(crate::plan_episode::tools_frozen_refusal());
@@ -1401,7 +1586,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let mut manifest = frozen.clone();
                 let model_check = plan.as_ref().and_then(|plan| plan.model_check.clone());
                 if let Some(plan) = plan {
-                    if self.session.operations().owner.episodes == 0 {
+                    if self.session.operations().owner.needs_admission() {
                         match plan.manifest {
                             Some(fetched) => manifest = Some(fetched),
                             // The serve layer saw a run when it checked the plan, so it fetched
@@ -1441,6 +1626,36 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 let mut identity = None;
                 if key.is_keyed() {
+                    // Serve resolved plan.model on the imported head's admitting send, but a
+                    // retry arrives with an inherited-model placeholder. Hash that retry with
+                    // the admitting run's model, not the seed's model or a later selection.
+                    if self.session.operations().imported_ids.is_some()
+                        && request
+                            .inherit_frozen
+                            .contains(&broca_protocol::request::InheritedParam::Model)
+                    {
+                        if let Some(start) = self
+                            .session
+                            .operations()
+                            .owner
+                            .first_start
+                            .as_ref()
+                            .filter(|start| start.seeded != Some(true) && start.run_id == run_id.0)
+                        {
+                            match broca_session_loop::run::admission_of_start(start, &self.parts) {
+                                Ok(admitted) => {
+                                    request.model = admitted.model;
+                                    request.variant = admitted.variant;
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(SendOutcome::Transient(format!(
+                                        "the imported head's admitting run: {error:?}"
+                                    )));
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     match self
                         .keyed(retries::KeyedSend {
                             run_id: &run_id,
@@ -1528,7 +1743,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 {
                     // A session's first send runs on the plan it fetched; a later one on the
                     // session's choice.
-                    let selection = if self.session.operations().owner.episodes == 0 {
+                    let selection = if self.session.operations().owner.needs_admission() {
                         Ok(manifest
                             .as_deref()
                             .and_then(broca_core::head::manifest_selection))
@@ -1764,6 +1979,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 false
             }
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Store(Box::new(
+                    self.memory(),
+                )));
+                false
+            }
             LineageCmd::Status { reply } => {
                 let status = match &self.run {
                     Some(active) => LineageStatus::Active {
@@ -1880,6 +2101,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(self.store_read(&request).await);
                 false
             }
+            LineageCmd::ResumeRestart { reply } => {
+                let result = if self.restart_admitting {
+                    Ok(())
+                } else {
+                    Box::pin(self.resume_restart_pause()).await
+                };
+                if self.restart_admitting {
+                    self.restart_waiters.push(reply);
+                } else {
+                    let _ = reply.send(result);
+                }
+                false
+            }
             other => {
                 refuse(other);
                 false
@@ -1913,6 +2147,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mode: StoreRunMode,
         cancel: CancellationToken,
     ) {
+        if let Err(error) = self.track_recovery() {
+            if let Some(reply) = reply {
+                let _ = reply.send(SendOutcome::Error(error.clone()));
+            }
+            tracing::error!(target: "lifecycle", %error, "run refused before its recovery registration was durable");
+            return;
+        }
+        // A run is starting, so a timer armed for an account-limit pause no longer applies. A
+        // run refused above leaves it armed: the pause it was built from still stands.
+        self.account_limit_timer = None;
         if self.warm.as_ref().is_some_and(|warm| warm.idle_auto) {
             let pending = self.warm.as_mut().expect("idle warm exists");
             pending.task.abort();
@@ -2012,10 +2256,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ..Default::default()
         };
         let tool_media = Arc::new(broca_session_loop::PendingMedia::default());
+        let window = broca_session_loop::shared::RunWindow::default();
         let (writer, link) = ActorWriter::new(
             &self.session,
             Some(Arc::clone(&tool_media) as Arc<dyn broca_core::tool_media::MediaCapture>),
         );
+        let writer = writer
+            .sharing_window(Arc::clone(&window))
+            .with_message_ids(self.step_message_ids.clone());
         let parts: Box<dyn Parts> = Box::new(self.parts.clone());
         let executor = Arc::clone(&self.executor);
         let (out, mut events) = mpsc::channel(256);
@@ -2051,7 +2299,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let done = tokio::spawn(async move { executor.execute_on_store(job, out).await });
         self.run = Some(ActiveRun {
+            restart_from_seq: self.restart_admitting.then(|| self.session.next_seq()),
             one_shot: one_shot || self.one_shot_runs.contains(&run_id),
+            account_limit_resume: false,
             run_id,
             link,
             writer_gone: false,
@@ -2063,6 +2313,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             step,
             tool_media,
             warming,
+            window,
         });
     }
 
@@ -2100,6 +2351,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let addr = broca_core::session_addr(&self.key);
         timing.finish_with(move || Some(addr));
+    }
+
+    /// A new image index for the session as it stands, reading media objects over the actor's
+    /// readers when it has them; not yet fed (see [`StoreActor::media_open`]).
+    fn fresh_media_index(&self) -> crate::store_media::SessionIndex {
+        match &self.readers {
+            Some(readers) => crate::store_media::SessionIndex::new(&self.session, Some(readers())),
+            None => crate::store_media::SessionIndex::new::<B, B>(&self.session, None),
+        }
+    }
+
+    /// Starts the session's image index again, after the session was replaced by another
+    /// history (an import published over it): what the old one held or was building is dropped.
+    pub(super) async fn reopen_media(&mut self) {
+        self.media_build = None;
+        self.media = self.fresh_media_index();
+        self.media_open().await;
     }
 
     /// Applies to the session's index what the session's writes handed over since it last did.
@@ -2186,8 +2454,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// A held run parks until a late result resumes its original batch, even with an interrupt
     /// queued behind it, as today's held-call recovery does. A sign-in pause waits for its retry,
     /// unless an interrupt was queued before the process stopped: it ends the paused run now,
-    /// as today's drain does (`end_paused`). Resuming after a restart and the account-limit pause's
-    /// timer aren't recovered on this storage yet, so nothing is written for them.
+    /// as today's drain does (`end_paused`). A restart pause resumes after dependency routes
+    /// register. An account-limit pause rebuilds its timer from its durable evidence.
     async fn recover(&mut self) {
         self.bill_owed().await;
         self.bill_recorded_idle_warms().await;
@@ -2198,11 +2466,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
             return self.drain().await;
         };
+        if run.paused == Some(broca_protocol::PauseReason::Restart) && run.cancel.is_none() {
+            if self.interrupt_waits_on_pause() {
+                return self.end_paused().await;
+            }
+            if let Err(error) = Box::pin(self.resume_restart_pause()).await {
+                tracing::warn!(target: "lifecycle", %error, "restart resume recovery failed");
+            }
+            return;
+        }
         let mode = match recovery_mode(run) {
             Some(mode) => mode,
             None => {
                 if self.interrupt_waits_on_pause() {
                     return self.end_paused().await;
+                }
+                if run.paused == Some(broca_protocol::PauseReason::AccountLimit) {
+                    self.arm_account_limit().await;
+                    return;
                 }
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
                     tracing::warn!(
@@ -2507,7 +2788,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // plan's tools fill them in.
         let tools_were_omitted = start.request.tools.is_none();
         start.prepared.tools_were_omitted = tools_were_omitted;
-        let first_run = self.session.operations().owner.episodes == 0;
+        let first_run = self.session.operations().owner.needs_admission();
         if !first_run {
             let (manifest, applies) =
                 self.run_plan(&start.request.model, start.request.variant.as_deref())?;
@@ -2620,7 +2901,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let abandon = async move {
             tokio::select! {
                 biased;
-                _ = seal.cancelled() => SendOutcome::Transient("module is stopping".into()),
+                _ = seal.cancelled() => SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission),
                 _ = reply.closed() => SendOutcome::Transient("send cancelled".into()),
             }
         };
@@ -2966,6 +3247,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 });
             }
         }
+        if self.restart_admitting
+            && self.session.operations().run.as_ref().is_some_and(|run| {
+                run.paused != Some(broca_protocol::PauseReason::Restart) || run.finished.is_some()
+            })
+        {
+            self.finish_restart_waiters(Ok(()));
+        }
     }
 
     /// The run's task ended: answer a sender still waiting, whose run never started, and start
@@ -2988,6 +3276,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // Whatever the run's start stored of its send's media is the session's now; a run that
         // never wrote its start leaves nothing for the next one.
         self.held.clear();
+        // A run task that panicked or was aborted says nothing about whether the send could be
+        // admitted, so its answer below stays unclassified.
+        let task_failed = end.is_err();
         let result = match end {
             Ok(end) => end.result,
             Err(error) => Err(StoreRunError::Admission(broca_core::RunError::Config(
@@ -2995,6 +3286,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ))),
         };
         let completed = result.is_ok();
+        let restart_error = if active.restart_from_seq.is_some() && self.restart_admitting {
+            result.as_ref().err().map(|error| match error {
+                StoreRunError::Admission(error) => error.to_string(),
+                StoreRunError::Loop(error) => format!("{error:?}"),
+            })
+        } else {
+            None
+        };
+        if active.account_limit_resume {
+            if let Err(error) = &result {
+                if let Err(error) = self
+                    .refuse_account_limit_resume(&active.run_id, format!("{error:?}"))
+                    .await
+                {
+                    tracing::error!(target: "broca.store_actor", %error, "could not end a refused account-limit resume");
+                }
+            }
+        }
         let started = self
             .session
             .operations()
@@ -3046,17 +3355,60 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         } else if let Some(reply) = active.admitting {
             let _ = reply.send(match result {
                 Ok(_) => SendOutcome::Error("the run ended without writing its start".into()),
-                Err(StoreRunError::Admission(error)) => SendOutcome::Error(error.to_string()),
+                Err(StoreRunError::Admission(error)) if task_failed => {
+                    SendOutcome::Error(error.to_string())
+                }
+                // Refused before its start: answered with the refusal's own code, detail and
+                // class, as a session in today's storage answers it (`crate::actor`), never as an
+                // unclassified open failure.
+                Err(StoreRunError::Admission(error)) => {
+                    crate::actor::admission_refusal_outcome(error)
+                }
                 Err(StoreRunError::Loop(error)) => SendOutcome::Error(format!("{error:?}")),
             });
         } else if let Err(error) = result {
-            tracing::error!(
-                target: "broca.store_actor",
-                session = %self.key.session,
-                run_id = %active.run_id.0,
-                error = ?error,
-                "a run on the new storage stopped without a recorded end",
-            );
+            if restart_error.is_none() {
+                tracing::error!(
+                    target: "broca.store_actor",
+                    session = %self.key.session,
+                    run_id = %active.run_id.0,
+                    error = ?error,
+                    "a run on the new storage stopped without a recorded end",
+                );
+            }
+        }
+        if let Some(from) = active.restart_from_seq.filter(|_| self.restart_admitting) {
+            let result = if self.restart_stopping() {
+                Err("shutdown interrupted restart admission".into())
+            } else {
+                let recorded = self
+                    .session
+                    .records_from(from)
+                    .await
+                    .map(|records| {
+                        records
+                            .iter()
+                            .any(|(_, record)| matches!(record, Record::Resumed(_)))
+                    })
+                    .map_err(|error| format!("read restart admission records: {error:?}"));
+                match recorded {
+                    Ok(recorded) => {
+                        self.end_restart_refused(
+                            &active.run_id,
+                            restart_error.unwrap_or_else(|| {
+                                "restart resume ended without making progress".into()
+                            }),
+                            recorded,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(error) = &result {
+                tracing::warn!(target: "lifecycle", %error, "restart resume could not be sealed");
+            }
+            self.finish_restart_waiters(result);
         }
         if let Some(message) = loop_failed {
             self.end_failed_run(&active.run_id, message).await;
@@ -3078,6 +3430,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.drain().await;
+        self.arm_account_limit().await;
         self.arm_idle_warm().await;
     }
 
@@ -3896,6 +4249,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // them after its Cancelled end is durable. Neither cancel point waits for a result.
             let cancel = CancellationToken::new();
             cancel.cancel();
+            self.account_limit_timer = None;
             self.start_run_under(start, None, None, StoreRunMode::Resume, cancel)
                 .await;
             return CancelOutcome::Ack;
@@ -3986,7 +4340,8 @@ fn retry_of_queued(
 
 /// What opening the session does with its unfinished latest run `run` before it takes any
 /// command: seal it as a crash's orphan, or resume it to its end. `None` leaves it as it is: a
-/// paused run, or one waiting on calls a provider holds. A held batch with every result already
+/// sign-in/account pause, or one waiting on calls a provider holds. A restart pause has a resume
+/// mode whose actor waits for registration readiness. A held batch with every result already
 /// durable resumes to finish its barrier. A read of the session that no actor holds predicts
 /// the run's end from this same decision
 /// (`store_status`), so what it serves is what the next open records.
@@ -4004,7 +4359,42 @@ pub(crate) fn recovery_mode(
         }),
         Resolution::Idle(_) => Some(StoreRunMode::Resume),
         Resolution::ProviderHeld(waiting) if waiting.is_empty() => Some(StoreRunMode::Resume),
+        Resolution::Paused(broca_protocol::PauseReason::Restart) => Some(StoreRunMode::Resume),
         Resolution::ProviderHeld(_) | Resolution::Paused(_) => None,
+    }
+}
+
+/// An interrupt can end an ordinary pause on open; provider-held calls stay parked until
+/// their late results arrive. Reads and the actor must agree on this queued-work exception.
+pub(crate) fn pause_interrupt_waits(
+    operations: &broca_session_store::fold::operations::Operations,
+) -> bool {
+    operations
+        .run
+        .as_ref()
+        .filter(|run| run.finished.is_none())
+        .and_then(|run| run.paused)
+        .is_some_and(|reason| reason != broca_protocol::PauseReason::ToolHeld)
+        && operations
+            .queue
+            .first()
+            .is_some_and(|first| first.interrupt)
+}
+
+pub(crate) fn recovery_changes_reads(
+    operations: &broca_session_store::fold::operations::Operations,
+) -> bool {
+    use broca_session_store::fold::operations::Resolution;
+    match operations.run.as_ref().filter(|run| run.finished.is_none()) {
+        Some(run) => {
+            // Use the actor's seal/resume decision. A queued interrupt or a missing durable
+            // held pause also changes state before a read can answer it.
+            recovery_mode(run).is_some()
+                || pause_interrupt_waits(operations)
+                || (run.paused != Some(broca_protocol::PauseReason::ToolHeld)
+                    && matches!(run.resolution(), Resolution::ProviderHeld(waiting) if !waiting.is_empty()))
+        }
+        None => !operations.queue.is_empty(),
     }
 }
 
@@ -4124,6 +4514,10 @@ fn reopen(command: LineageCmd) {
         LineageCmd::RunState { reply, .. } => {
             let _ = reply.send(Err(CLOSING.into()));
         }
+        // A closing actor's session is about to go; the report counts it as unanswered.
+        LineageCmd::MemoryReport { reply } => {
+            let _ = reply.send(crate::memory_report::MemoryAnswer::Closing);
+        }
         LineageCmd::Subscribe { reply, .. } => {
             let _ = reply.send(crate::actor::SubscribeOutcome::Reopen);
         }
@@ -4169,7 +4563,7 @@ fn refuse(command: LineageCmd) {
             let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
         }
         LineageCmd::ResumeRestart { reply } => {
-            let _ = reply.send(Err(unserved("resuming after a restart")));
+            let _ = reply.send(Err("restart recovery is unavailable on this actor".into()));
         }
         LineageCmd::ResumeHeld { reply } => {
             let _ = reply.send(Err(unserved("a late tool result")));
@@ -4181,6 +4575,10 @@ fn refuse(command: LineageCmd) {
         }
         LineageCmd::RunState { reply, .. } => {
             let _ = reply.send(Err(unserved("run.status")));
+        }
+        // Served by `handle`; never refused here.
+        LineageCmd::MemoryReport { reply } => {
+            let _ = reply.send(crate::memory_report::MemoryAnswer::Closing);
         }
         LineageCmd::Subscribe { reply, .. } => {
             let _ = reply.send(crate::actor::SubscribeOutcome::Error(unserved("subscribe")));
@@ -4224,6 +4622,7 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+mod account_limit_pause;
 mod admission;
 mod apply_view;
 mod expiry;
@@ -4232,9 +4631,11 @@ mod idle_warm;
 mod import;
 mod inline_import;
 mod keep_warm;
+mod memory;
 mod ordered;
 mod pauses;
 mod recorded_warm;
+mod restart;
 mod retention;
 mod retries;
 mod scopes;
@@ -4260,9 +4661,13 @@ mod loop_error_tests;
 #[cfg(test)]
 mod media_wait_tests;
 #[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
 mod new_heads_tests;
 #[cfg(test)]
 mod pauses_tests;
+#[cfg(test)]
+mod plan_view_tests;
 #[cfg(test)]
 mod read_cost;
 #[cfg(test)]

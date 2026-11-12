@@ -268,7 +268,37 @@ pub struct InFlightStep {
     pub max_content_gap_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_content_gap_ended_at_ms: Option<u64>,
+    /// The step's request options while the call is in flight, for the session owner's memory
+    /// report. Never serialized.
+    #[serde(skip)]
+    pub request: InFlightRequest,
 }
+
+/// A weak handle on the options of a step's request while the call is in flight, which the
+/// session's owner may size for a memory report. It never keeps the options alive, is never
+/// serialized, and never makes two progress values differ.
+#[derive(Debug, Clone, Default)]
+pub struct InFlightRequest(Option<std::sync::Weak<crate::request::CallOptions>>);
+
+impl InFlightRequest {
+    /// A handle on `options`, which the step's call holds.
+    pub fn of(options: &std::sync::Arc<crate::request::CallOptions>) -> Self {
+        Self(Some(std::sync::Arc::downgrade(options)))
+    }
+
+    /// The options, while the call still holds them.
+    pub fn upgrade(&self) -> Option<std::sync::Arc<crate::request::CallOptions>> {
+        self.0.as_ref()?.upgrade()
+    }
+}
+
+impl PartialEq for InFlightRequest {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for InFlightRequest {}
 
 /// Exact UTF-8 text payload sent in a Responses WebSocket request, before frame compression.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

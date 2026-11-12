@@ -218,6 +218,8 @@ pub enum OpenError {
     LeaseHeld(String),
     /// The lease store / WAL / replay failed while opening.
     Open(String),
+    /// broca is stopping, so it opens no session. Nothing was written for the request.
+    ModuleStopping,
     /// A read failure whose typed cause is still available.
     Classified {
         reason: String,
@@ -450,6 +452,7 @@ impl std::fmt::Display for OpenError {
             | OpenError::NewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
+            OpenError::ModuleStopping => f.write_str("open failed: module is stopping"),
             OpenError::NotServedOnNewStorage { feature } => f.write_str(
                 &crate::store_actor::unserved_on_creation(feature),
             ),
@@ -1817,6 +1820,20 @@ impl LineageRegistry {
                 Entry::Open { handle, .. } if handle.run_in_flight.load(Ordering::Relaxed) != 0 => {
                     Some(session.clone())
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The command channels of every open actor, for a report that asks each of them.
+    pub(crate) fn open_actor_senders(&self) -> Vec<mpsc::Sender<crate::actor::LineageCmd>> {
+        self.inner
+            .slots
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::Open { handle, .. } => Some(handle.tx.clone()),
                 _ => None,
             })
             .collect()
@@ -3390,7 +3407,7 @@ impl LineageRegistry {
         self.actor_for_mode(key, retention, None, false).await
     }
 
-    async fn actor_for_mode(
+    pub(crate) async fn actor_for_mode(
         &self,
         key: &LineageKey,
         retention: Option<u64>,
@@ -3401,7 +3418,7 @@ impl LineageRegistry {
         let mut close_retries = 0;
         loop {
             if self.inner.stopping.is_cancelled() {
-                return Err(OpenError::Open("module is stopping".into()));
+                return Err(OpenError::ModuleStopping);
             }
             // Fast path under the lock: classify the slot + claim a transition. The slow
             // open/await happens AFTER the lock is dropped.
@@ -3901,10 +3918,10 @@ impl LineageRegistry {
     }
 
     /// Route a command only the new storage serves to the session's store actor. An import may
-    /// create its session there; nothing else creates one. An import is refused by name unless
-    /// the registry creates sessions in the new storage (`with_store_new_sessions`); any other
-    /// command is refused so unless the new storage already keeps the session, as it keeps a
-    /// head, whose compaction provider applies its views through here.
+    /// create its session there; nothing else creates one. An imported session is a head, and a
+    /// head starts in the new storage whenever the opener has one, so an import needs only the
+    /// store runtime. Any other command is refused by name unless the new storage already keeps
+    /// the session, as it keeps a head, whose compaction provider applies its views through here.
     pub async fn route_store_command(
         &self,
         key: &LineageKey,
@@ -3913,8 +3930,12 @@ impl LineageRegistry {
         use crate::actor::LineageCmd;
         use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
         let creates = matches!(command, StoreCommand::Import(_));
-        let served = self.inner.store_new_sessions.load(Ordering::SeqCst)
-            || (!creates && self.store_holding(key)?.is_some());
+        let served = if creates {
+            self.store_runtime().is_some()
+        } else {
+            self.inner.store_new_sessions.load(Ordering::SeqCst)
+                || self.store_holding(key)?.is_some()
+        };
         if !served {
             return Ok(StoreOutcome::Refused(ImportRefusal::new(
                 "new_storage_unavailable",
@@ -6298,6 +6319,12 @@ impl LineageRegistry {
         self.inner
             .restart_resume_ready
             .store(true, Ordering::Release);
+        // Store sessions have no legacy run-index row. Their durable candidate set also
+        // reaches actors opened before readiness, which must receive ResumeRestart now.
+        let store_recovery = self.store_runtime().map(|_| {
+            let registry = self.clone();
+            tokio::spawn(async move { registry.recover_store_crash_orphans().await })
+        });
         let mut seen = HashSet::new();
         let mut resumed = 0;
         let mut sealed = 0;
@@ -6396,6 +6423,16 @@ impl LineageRegistry {
                 Ok(_) => resumed += 1,
                 Err(error) => {
                     tracing::warn!(target: "lifecycle", "restart resume: refused session '{}': {error}", key.session)
+                }
+            }
+        }
+        if let Some(store_recovery) = store_recovery {
+            match store_recovery.await {
+                Ok(Ok(sweep)) => {
+                    tracing::info!(target: "lifecycle", ?sweep, "store restart resume candidate sweep complete")
+                }
+                error => {
+                    tracing::warn!(target: "lifecycle", ?error, "store restart resume recovery failed")
                 }
             }
         }
@@ -6514,6 +6551,14 @@ impl LineageRegistry {
                         // Refused only to a send creating a head, never to this pass's open.
                         | OpenError::NotServedOnNewStorage { .. } => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
+                        OpenError::ModuleStopping => {
+                            tracing::warn!(
+                                target: "lifecycle",
+                                "crash-orphan pass could not open session '{}': module is stopping",
+                                key.session
+                            );
+                            sweep.open_failed += 1;
+                        }
                         OpenError::Open(reason)
                         | OpenError::Classified { reason, .. }
                         | OpenError::HistoryUnreachable { reason, .. }
@@ -6617,6 +6662,13 @@ impl RegistryHandle {
     }
     pub(crate) fn restart_resume_ready(&self) -> bool {
         self.inner.restart_resume_ready.load(Ordering::Acquire)
+    }
+
+    #[cfg(all(test, feature = "test-clock"))]
+    pub(crate) fn enable_restart_resumes_for_test(&self) {
+        self.inner
+            .restart_resume_ready
+            .store(true, Ordering::Release);
     }
 
     /// The session's prompt-cache clock, shared with every run and warm of the session.
@@ -8270,8 +8322,27 @@ impl LineageRegistry {
     }
 
     pub async fn boot_retention(&self) -> Result<usize, OpenError> {
+        self.rebuild_retention_deletion_inventory().await?;
+        self.boot_retention_deletions().await?;
+        self.enroll_retention().await
+    }
+
+    pub async fn rebuild_retention_deletion_inventory(&self) -> Result<(), OpenError> {
         let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(0);
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || service.rebuild_deletion_inventory())
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))?
+            .map_err(OpenError::Open)?;
+        self.boot_retention_deletions().await
+    }
+
+    /// Complete content deletions before serving; enrollment can run later because every
+    /// keyed read checks its own WAL policy and tombstones, even without an indexed summary.
+    pub async fn boot_retention_deletions(&self) -> Result<(), OpenError> {
+        let Some(service) = self.inner.retention.get().cloned() else {
+            return Ok(());
         };
         let recovered = tokio::task::spawn_blocking({
             let service = service.clone();
@@ -8283,6 +8354,13 @@ impl LineageRegistry {
         for key in recovered {
             self.evict_retention_caches(&key);
         }
+        Ok(())
+    }
+
+    pub async fn enroll_retention(&self) -> Result<usize, OpenError> {
+        let Some(service) = self.inner.retention.get().cloned() else {
+            return Ok(0);
+        };
         let enrolled = tokio::task::spawn_blocking(move || service.recover_enrollment())
             .await
             .map_err(|e| OpenError::Open(e.to_string()))?

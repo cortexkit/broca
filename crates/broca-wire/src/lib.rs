@@ -7,8 +7,10 @@
 pub mod agent_data;
 pub mod diagnostics;
 pub mod head_import;
+pub mod plan_view;
 pub mod role;
 pub use role::*;
+pub mod tag_map;
 pub mod warm;
 pub use warm::*;
 
@@ -987,6 +989,18 @@ pub struct RunAdmissionFetch {
     pub declarations_frozen: Option<serde_json::Value>,
 }
 
+/// The scope and driving principal recorded on this run's own start, not the current bind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAdmissionScope {
+    pub owner: broca_protocol::BindPrincipal,
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub epoch: u64,
+    /// Older scoped starts may omit this field; absence means no driving principal was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<broca_protocol::BindPrincipal>,
+}
+
 /// Admission metadata only: no messages, tool arguments, system text or credentials.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunAdmissionResponse {
@@ -996,6 +1010,8 @@ pub struct RunAdmissionResponse {
     pub started_at_ms: u64,
     pub storage: RunAdmissionStorage,
     pub fetches: Vec<RunAdmissionFetch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RunAdmissionScope>,
 }
 
 #[cfg(test)]
@@ -1028,7 +1044,12 @@ mod run_admission_tests {
                 provider: "aft".into(),
                 declarations_frozen: None,
             }],
+            scope: None,
         };
+        assert_eq!(
+            serde_json::to_vec(&response).unwrap().as_slice(),
+            br#"{"run_id":"r","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft"}]}"#,
+        );
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({
@@ -2115,6 +2136,167 @@ pub struct VaultAuditMissing {
     pub credential_id: String,
     /// The broca routing keys that resolve to it.
     pub referenced_by: Vec<String>,
+}
+
+/// `memory.report` request parameters: none. An absent, null or empty params object all mean the
+/// same report; an unknown field is refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReportParams {}
+
+/// The `memory.report` answer: what the daemon's open sessions and shared caches hold in memory,
+/// estimated by walking them when the report is asked for.
+///
+/// Sizes and counts only: it never carries content, message ids or anything else from a
+/// transcript. A session is named by its store address.
+///
+/// "The new storage" is the session store of `broca-session-store`; "today's storage" is the
+/// write-ahead log the older runner keeps sessions in, which the report counts and doesn't size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryReport {
+    /// Every session open on the new storage (`broca-session-store`), largest first.
+    pub sessions: Vec<MemorySession>,
+    /// How many of them had a run in progress: those hold their run's entries and request on
+    /// top of what an idle session holds, so compare like with like.
+    pub running_sessions: u64,
+    /// Sessions open on the new storage whose actor didn't answer in time, or was closing;
+    /// counted, not sized.
+    #[serde(default)]
+    pub unanswered_sessions: u64,
+    /// Sessions open on today's storage (the write-ahead log), which the report doesn't size.
+    pub legacy_sessions: u64,
+    /// The sizes of every session in `sessions` added up, by holder.
+    pub totals: MemoryHolders,
+    /// The addresses of the ten largest sessions, largest first.
+    pub largest: Vec<String>,
+    /// The setup parts sessions hold decoded, each with how many sessions share it.
+    pub setup_parts: Vec<MemorySetupPart>,
+    /// Read-only loads of sessions no actor holds (each a session's open log and the folds built
+    /// from it), kept so the next read of the same session needn't load it again.
+    pub closed_session_views: MemoryCache,
+    /// Facts of runs that finished, kept for status reads.
+    pub settled_runs: MemoryCache,
+}
+
+/// One session open on the new storage (`broca-session-store`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySession {
+    /// The session's store address.
+    pub address: String,
+    /// The session class its first run froze; absent for a session created without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_class: Option<String>,
+    /// Messages in its window.
+    pub window_messages: u64,
+    /// Whether a run was in progress when the report was taken.
+    pub run_in_progress: bool,
+    /// Its estimated bytes by holder.
+    pub holders: MemoryHolders,
+    /// The rendered body of the request in flight, in bytes. Absent: the body lives in the
+    /// provider's transport, which the report doesn't reach yet; `request_body_untracked` says so
+    /// while a model call is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_bytes: Option<u64>,
+    /// Why `request_body_bytes` is absent while a model call is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_untracked: Option<String>,
+}
+
+/// Estimated bytes by holder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryHolders {
+    /// The window's messages.
+    pub messages: u64,
+    /// Each window message's entry facts.
+    pub entry_facts: u64,
+    /// The open log's records kept in memory.
+    pub kept_records: u64,
+    /// The kept records' buffer beyond the records it holds.
+    pub kept_records_capacity: u64,
+    /// The open log's id index.
+    pub id_index: u64,
+    /// Sealed entries read by id and kept.
+    pub sealed_entries: u64,
+    /// What a run on the compaction contract keeps of its transcript between steps: the
+    /// compaction provider's entries for the window's messages, and the message states they were
+    /// built from.
+    pub compaction_entries: u64,
+    /// The session's image index: what the session's actor keeps to render the media its
+    /// records name, such as the media it captured, their aging, and where each medium is
+    /// stored. The member keeps the name it had when a per-run media fold held this, so the
+    /// report's readers keep reading it.
+    pub media_fold: u64,
+    /// The request of a model call in flight: its prompt and options, without the tool list,
+    /// which `setup_parts` counts.
+    pub request_in_flight: u64,
+    /// Everything else the session's actor holds.
+    pub rest: u64,
+    /// The sum of the above.
+    pub total: u64,
+}
+
+impl MemoryHolders {
+    /// The holders with `total` set to their sum.
+    pub fn summed(mut self) -> Self {
+        self.total = self.messages
+            + self.entry_facts
+            + self.kept_records
+            + self.kept_records_capacity
+            + self.id_index
+            + self.sealed_entries
+            + self.compaction_entries
+            + self.media_fold
+            + self.request_in_flight
+            + self.rest;
+        self
+    }
+
+    /// Adds `other` holder by holder.
+    pub fn add(&mut self, other: &Self) {
+        self.messages += other.messages;
+        self.entry_facts += other.entry_facts;
+        self.kept_records += other.kept_records;
+        self.kept_records_capacity += other.kept_records_capacity;
+        self.id_index += other.id_index;
+        self.sealed_entries += other.sealed_entries;
+        self.compaction_entries += other.compaction_entries;
+        self.media_fold += other.media_fold;
+        self.request_in_flight += other.request_in_flight;
+        self.rest += other.rest;
+        self.total += other.total;
+    }
+}
+
+/// One setup part held decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySetupPart {
+    /// What the part holds: `tools`, `system_text` or `plan_manifest` (the rest of a plan's
+    /// frozen manifest).
+    pub kind: String,
+    /// The estimated bytes of one decoded copy.
+    pub decoded_bytes: u64,
+    /// Decoded copies held.
+    pub decoded_copies: u64,
+    /// Open sessions whose runs use it.
+    pub sessions: u64,
+}
+
+/// A bounded cache: its caps and what it holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCache {
+    /// Entries held.
+    pub entries: u64,
+    /// The most entries it keeps.
+    pub max_entries: u64,
+    /// The bytes it counts against its byte cap, as it counts them; absent for a cache capped by
+    /// entries only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_bytes: Option<u64>,
+    /// Its byte cap; absent for a cache capped by entries only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// The bytes it holds, estimated by walking its entries.
+    pub estimated_bytes: u64,
 }
 
 /// Non-secret authentication identity frozen for a paused run.
@@ -4117,8 +4299,14 @@ mod wal_newer_writer_golden {
 }
 
 /// The error code refusing a send because the routing module would not choose a provider
-/// account for it.
+/// account for it, for a refusal that may clear by itself (a transient class).
 pub const ACCOUNT_SELECTION_REFUSED: &str = "account_selection_refused";
+
+/// The error code refusing a send because the routing module refused the account choice in a
+/// way waiting can't change (a permanent class): an operator policy excluding the request, a
+/// request routing can't accept, or a refusal code broca does not know. A caller that decides
+/// an account wait by the outer code alone must not wait on it.
+pub const ACCOUNT_SELECTION_FINAL: &str = "account_selection_final";
 
 /// The error body for [`ACCOUNT_SELECTION_REFUSED`]. Nothing was written: the run never
 /// started. Callers branch on `detail.routing_code` and `detail.class`, never on the message.
@@ -4128,7 +4316,8 @@ pub const ACCOUNT_SELECTION_REFUSED: &str = "account_selection_refused";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountSelectionRefused {
     /// [`broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED`] for exhausted or reserve-limited
-    /// pools, holds or unknown quota; otherwise [`ACCOUNT_SELECTION_REFUSED`].
+    /// pools, holds or unknown quota; [`ACCOUNT_SELECTION_FINAL`] for a permanent refusal;
+    /// otherwise [`ACCOUNT_SELECTION_REFUSED`].
     pub code: String,
     /// Human-readable; derived from `detail`, never parsed.
     pub message: String,
@@ -4189,6 +4378,8 @@ impl AccountSelectionRefused {
         );
         let code = if account_limit {
             broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED
+        } else if class == broca_protocol::ErrorClass::Permanent {
+            ACCOUNT_SELECTION_FINAL
         } else {
             ACCOUNT_SELECTION_REFUSED
         };
@@ -4368,6 +4559,8 @@ mod account_selection_refused_golden {
 
     #[test]
     fn permanent_admission_conflict_refusal_bytes_are_pinned() {
+        // A permanent refusal goes out as `account_selection_final`, so a caller deciding an
+        // account wait by the outer code never waits on it.
         assert_golden(
             AccountSelectionRefused::new(
                 "admission_conflict".into(),
@@ -4375,7 +4568,7 @@ mod account_selection_refused_golden {
                 None,
                 Some("acd-0456".into()),
             ),
-            "account_selection_refused.admission_conflict.json",
+            "account_selection_final.admission_conflict.json",
             ADMISSION_CONFLICT_SHA256,
         );
     }
@@ -4383,7 +4576,7 @@ mod account_selection_refused_golden {
     const POOL_EXHAUSTED_SHA256: &str =
         "b2782d4a2ecc703e07f3590660b254e8cca95e440d8b8c526e286b37a712a776";
     const ADMISSION_CONFLICT_SHA256: &str =
-        "dd54e79088fd3443de13d848f3949d7ad4c1743f7b9b9cc436d4d923d8533780";
+        "7e1f17810b8cce76fe487bc02d40ea62713012d9d9e072bd5a83b841eedb2197";
 }
 
 #[cfg(test)]

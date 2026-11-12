@@ -87,6 +87,40 @@ pub struct MediaAging {
 }
 
 impl MediaAging {
+    /// What the aging state holds: its inline size and [`MediaAging::held_parts`].
+    pub fn held_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .held_parts()
+                .iter()
+                .map(|(_, bytes)| bytes)
+                .sum::<usize>()
+    }
+
+    /// The heap the aging state holds, by part, estimated as the engine's own state is (see
+    /// `broca_core::media_request::held`): the occurrences shown with their costs, the
+    /// unprotected and aged ones, and each capture's occurrences.
+    pub fn held_parts(&self) -> Vec<(&'static str, usize)> {
+        use broca_core::media_request::held::{btree_bytes, hash_map};
+        use std::mem::size_of;
+        let set = |len: usize| btree_bytes(len, size_of::<Occurrence>());
+        vec![
+            (
+                "aging: shown",
+                btree_bytes(
+                    self.shown.len(),
+                    size_of::<Occurrence>() + size_of::<(MediaCost, bool)>(),
+                ),
+            ),
+            ("aging: unprotected", set(self.unprotected.len())),
+            ("aging: aged", set(self.aged.len())),
+            (
+                "aging: by capture",
+                hash_map(&self.by_capture, |_, occurrences| set(occurrences.len())),
+            ),
+        ]
+    }
+
     /// Reconcile a newly selected post-compaction view. At a step with no view change,
     /// `SessionMedia::take_changes` supplies only new captures and protection releases;
     /// feed those to `fold_changes` instead. Return deltas for an independent replay fold.

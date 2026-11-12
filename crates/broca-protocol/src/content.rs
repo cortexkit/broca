@@ -103,9 +103,13 @@ impl Message {
         }
     }
 
-    /// Attach (or clear) this message's runner tags. Rendering state starts over.
+    /// Attach (or clear) this message's runner tags. Rendering state starts over. Ride texts
+    /// held beside the message ([`crate::tags::TagSlot::rides_after_results`]) aren't tags and
+    /// stay.
     pub fn set_tags(&mut self, tags: Option<std::sync::Arc<crate::tags::PartTags>>) {
+        let rides = self.tags.rides_after_results.take();
         self.tags = crate::tags::TagSlot::new(tags);
+        self.tags.rides_after_results = rides;
     }
 
     /// This message's runner tags, when its session has them.

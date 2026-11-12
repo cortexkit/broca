@@ -1413,7 +1413,8 @@ async fn undeclared_disabled_and_unsupported_codes_are_refusals_not_fallbacks() 
             panic!("routing answered a refusal")
         };
         assert_eq!(refusal.routing_code, code);
-        assert_eq!(refusal.class, ErrorClass::Transient);
+        // Codes broca does not know are final: a refusal, never a fallback and never a wait.
+        assert_eq!(refusal.class, ErrorClass::Permanent);
         assert_eq!(client.counters.get("disabled"), 0);
     }
 }
@@ -1628,16 +1629,26 @@ async fn outage_no_eligible_account_is_an_account_limit_not_unreachable() {
     assert_eq!(client.counters.get("unreachable"), 0);
 }
 
+/// A routing code broca does not know is final until broca learns it: permanent, kept verbatim,
+/// and sent with the outer code `account_selection_final`, never a wait.
 #[tokio::test]
-async fn an_unknown_routing_refusal_is_transient_and_preserved() {
+async fn an_unknown_routing_refusal_is_final_and_preserved() {
     assert_eq!(
         refusal_for("new_routing_refusal").await,
-        transient("new_routing_refusal")
+        permanent("new_routing_refusal")
     );
     assert_eq!(
         refusal_for("route_state_unavailable").await,
-        transient("route_state_unavailable")
+        permanent("route_state_unavailable")
     );
+    let body = broca_wire::AccountSelectionRefused::new(
+        "route_state_unavailable".into(),
+        classify_refusal("route_state_unavailable"),
+        None,
+        None,
+    );
+    assert_eq!(body.code, broca_wire::ACCOUNT_SELECTION_FINAL);
+    assert_eq!(body.detail.provider_code, None);
 }
 
 #[test]
@@ -1652,7 +1663,6 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
         "no_eligible_account",
         "store_error",
         "internal_error",
-        "future_code",
     ] {
         assert_eq!(classify_refusal(code), ErrorClass::Transient, "{code}");
     }
@@ -1663,6 +1673,8 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
         "unscoped_caller",
         "account_not_authorized",
         "account_selection_unsupported",
+        // A code broca does not know is final until broca learns it.
+        "future_code",
     ] {
         assert_eq!(classify_refusal(code), ErrorClass::Permanent, "{code}");
     }

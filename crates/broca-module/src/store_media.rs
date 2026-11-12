@@ -145,6 +145,22 @@ impl SessionIndex {
         self.slot().broken.get_or_insert(reason);
     }
 
+    /// The index `history` builds, which the media fold handed over for `session`'s records
+    /// through `last` (see `Session::media_history`), reading bytes over `reader`. It feeds on
+    /// nothing after: for rendering a session as it stands.
+    pub fn from_history<B: SessionBackend, R: SessionBackend + Send + Sync + 'static>(
+        session: &Session<B>,
+        reader: R,
+        history: MediaFeed,
+        last: u64,
+        parts: &dyn Parts,
+    ) -> Self {
+        let mut index = Self::new(session, Some(reader));
+        index.phase = Phase::Building { feeds: Vec::new() };
+        index.built(Ok(history), last, parts);
+        index
+    }
+
     /// Whether the session feeds its media to the index yet (see [`SessionIndex::open`]).
     pub fn opened(&self) -> bool {
         !matches!(self.phase, Phase::Unopened)
@@ -410,6 +426,60 @@ impl SessionIndex {
         }
     }
 
+    /// What the index holds, for the operator's memory report: its handles (the shared slot,
+    /// the map of where bytes are, the byte reader), and [`SessionIndex::content_bytes`].
+    /// Estimated by walking it when asked, as `broca_session_store::held` estimates the
+    /// store's values. A render that still holds an older copy of the engine keeps that copy
+    /// alive too, which isn't counted.
+    pub(crate) fn held_bytes(&self) -> usize {
+        use std::mem::{size_of, size_of_val};
+        let arc = 2 * size_of::<usize>();
+        arc + size_of::<Mutex<Slot>>()
+            + arc
+            + size_of::<Mutex<BTreeMap<String, MediaObject>>>()
+            + arc
+            + size_of_val(&*self.bytes)
+            + self.unreadable.as_ref().map_or(0, String::capacity)
+            + self.content_bytes()
+    }
+
+    /// What the index holds beyond its fixed handles (see [`SessionIndex::held_parts`]).
+    /// Nothing for a session that never captured a medium.
+    pub(crate) fn content_bytes(&self) -> usize {
+        self.held_parts().iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    /// What the index holds beyond its fixed handles, by part: the engine's parts and its aging
+    /// state's (see `SessionMedia::held_parts` and `MediaAging::held_parts`), the engine's
+    /// inline size, the media limits in force, where each medium's bytes are, why it broke,
+    /// and what waits for its one-time build.
+    pub(crate) fn held_parts(&self) -> Vec<(&'static str, usize)> {
+        use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+        let slot = self.slot();
+        let mut parts = Vec::new();
+        if let Some(index) = slot.index.as_ref() {
+            parts.push((
+                "engine, inline",
+                2 * std::mem::size_of::<usize>() + std::mem::size_of::<MediaIndex>(),
+            ));
+            parts.extend(index.session().held_parts());
+            parts.extend(index.aging().held_parts());
+            parts.push(("limits", index.profile().map_or(0, serde_heap_bytes)));
+        }
+        parts.push(("broken", slot.broken.heap_bytes()));
+        drop(slot);
+        parts.push(("objects", locked(&self.objects).heap_bytes()));
+        let waiting = match &self.phase {
+            Phase::Unbuilt { feeds, .. } | Phase::Building { feeds } => {
+                feeds.capacity() * std::mem::size_of::<MediaFeed>()
+                    + feeds.iter().map(feed_heap_bytes).sum::<usize>()
+            }
+            Phase::Unopened | Phase::Current => 0,
+        };
+        parts.push(("waiting for the build", waiting));
+        parts
+    }
+
     /// What a run renders its media from: the index as it stands at each render.
     pub fn for_run(&self) -> RunMedia {
         RunMedia {
@@ -431,6 +501,26 @@ impl SessionIndex {
             .collect();
         self.index().map(|index| to_stored(&index, &objects))
     }
+}
+
+/// The heap a feed waiting for the one-time build holds: its events by their serialized walk,
+/// and where its records stored their media.
+fn feed_heap_bytes(feed: &MediaFeed) -> usize {
+    use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+    let items = feed.items.capacity() * std::mem::size_of::<MediaItem>()
+        + feed
+            .items
+            .iter()
+            .map(|item| match item {
+                MediaItem::Event(event) => serde_heap_bytes(event),
+                MediaItem::RunStart(run) => serde_heap_bytes(&run.inputs),
+            })
+            .sum::<usize>();
+    let start = feed
+        .start
+        .as_ref()
+        .map_or(0, |start| start.batch.heap_bytes());
+    items + start + feed.objects.heap_bytes()
 }
 
 /// `index` as the session saves it.
@@ -870,9 +960,7 @@ where
         .media_history(last)
         .await
         .map_err(|error| format!("fold the session's media: {error:?}"))?;
-    let mut index = SessionIndex::new(session, Some(reader));
-    index.phase = Phase::Building { feeds: Vec::new() };
-    index.built(Ok(history), last, parts);
+    let index = SessionIndex::from_history(session, reader, history, last, parts);
     if let Some(reason) = index.broken() {
         return Err(reason);
     }
@@ -893,4 +981,4 @@ where
 
 #[cfg(test)]
 #[path = "store_media/tests.rs"]
-mod tests;
+pub(crate) mod tests;

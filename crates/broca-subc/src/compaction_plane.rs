@@ -1,6 +1,8 @@
 //! Compaction-provider RPCs on the same module-level role routes as step-transform hooks.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,13 +17,64 @@ use broca_core::{
         view::{ViewGetAnswer, ViewGetRequest},
         OpRequest, ROLE, VERSION,
     },
-    CompactionPlane, CompactionUnavailable,
+    CompactionPlane, CompactionUnavailable, ProviderCapabilities,
 };
 use broca_fetch_plan::{DescribeAnswer, FetchError};
 use broca_protocol::{BindIdentity, SessionScope};
+use subc_control::CatalogEntry;
 use tokio::time::Instant;
 
-use crate::{connection::SubcConnection, role_route::RoleRoute};
+use crate::{
+    connection::{ConnError, SubcConnection},
+    role_route::RoleRoute,
+};
+
+// Leave time for the previously read catalog list to reach Setup before its two-second deadline.
+const CATALOG_READ_BUDGET: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct CapabilityCatalog {
+    last: Mutex<HashMap<String, Vec<String>>>,
+}
+
+impl CapabilityCatalog {
+    async fn read(
+        &self,
+        provider: &str,
+        read: impl Future<Output = Result<Vec<CatalogEntry>, ConnError>>,
+    ) -> ProviderCapabilities {
+        let result = tokio::time::timeout(CATALOG_READ_BUDGET, read).await;
+        let mut last = self.last.lock().unwrap_or_else(|error| error.into_inner());
+        match result {
+            Ok(Ok(entries)) => match entries
+                .into_iter()
+                .find(|entry| entry.module_id == provider)
+            {
+                Some(entry) => {
+                    let provides = entry
+                        .capabilities
+                        .map(|caps| caps.provides)
+                        .unwrap_or_default();
+                    last.insert(provider.to_owned(), provides.clone());
+                    ProviderCapabilities::Declared(provides)
+                }
+                None => {
+                    last.remove(provider);
+                    ProviderCapabilities::NotInCatalog
+                }
+            },
+            failure => {
+                let kept = last.get(provider).cloned();
+                tracing::warn!(provider, used_kept_list = kept.is_some(), error = ?failure,
+                    "compaction provider catalog read failed");
+                kept.map_or(
+                    ProviderCapabilities::Unknown,
+                    ProviderCapabilities::Declared,
+                )
+            }
+        }
+    }
+}
 
 // The bound route supplies the full session identity. Accept its historical
 // handle, but address the provider using the current folder-independent handle.
@@ -46,11 +99,13 @@ pub struct SubcCompactionPlane {
     v2_route: RoleRoute,
     /// Asks the daemon's catalog what a provider declares; no route is opened for it.
     conn: Arc<SubcConnection>,
+    capabilities: CapabilityCatalog,
 }
 
 impl SubcCompactionPlane {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
+            capabilities: CapabilityCatalog::default(),
             conn: conn.clone(),
             v2_route: RoleRoute::without_discovery(conn.clone(), "compaction-provider", "v2"),
             route: RoleRoute::new(conn, ROLE, VERSION, |describe| {
@@ -163,14 +218,11 @@ fn bounded(deadline: Instant) -> Instant {
 impl CompactionPlane for SubcCompactionPlane {
     /// The provider's `provides` from the daemon's `catalog.list`, read fresh on every call: a
     /// provider declares compaction capabilities there, and Setup reads them each time it is
-    /// sent. A catalog that can't be read, or has no entry for the provider, answers `None`.
-    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
-        let entries = self.conn.catalog_list().await.ok()?;
-        entries
-            .into_iter()
-            .find(|entry| entry.module_id == provider)
-            .and_then(|entry| entry.capabilities)
-            .map(|capabilities| capabilities.provides)
+    /// sent. Only failed or timed-out reads use a previously read list.
+    async fn provider_capabilities(&self, provider: &str) -> ProviderCapabilities {
+        self.capabilities
+            .read(provider, self.conn.catalog_list())
+            .await
     }
 
     async fn call_v2(
@@ -268,6 +320,103 @@ impl CompactionPlane for SubcCompactionPlane {
             )
             .await
             .map_err(|_| CompactionUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn entry(provider: &str, provides: &[&str]) -> CatalogEntry {
+        let mut entry = CatalogEntry::new(provider, Vec::new(), Vec::new());
+        entry.capabilities =
+            Some(serde_json::from_value(serde_json::json!({"provides": provides})).unwrap());
+        entry
+    }
+
+    async fn failed() -> Result<Vec<CatalogEntry>, ConnError> {
+        Err(ConnError::Transport("catalog unavailable".into()))
+    }
+
+    #[tokio::test]
+    async fn provider_capabilities_keeps_list_only_for_failed_reads_and_the_same_provider() {
+        let catalog = CapabilityCatalog::default();
+        let declared = ProviderCapabilities::Declared(vec!["compaction-signed-floor/v1".into()]);
+        assert_eq!(
+            catalog
+                .read("magic", async {
+                    Ok(vec![entry("magic", &["compaction-signed-floor/v1"])])
+                })
+                .await,
+            declared
+        );
+        assert_eq!(catalog.read("magic", failed()).await, declared);
+        assert_eq!(
+            catalog.read("other", failed()).await,
+            ProviderCapabilities::Unknown
+        );
+        // A successful read replaces the kept list, including a declaration with no capabilities.
+        assert_eq!(
+            catalog
+                .read("magic", async { Ok(vec![entry("magic", &[])]) })
+                .await,
+            ProviderCapabilities::Declared(vec![])
+        );
+        assert_eq!(
+            catalog.read("magic", failed()).await,
+            ProviderCapabilities::Declared(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_capabilities_failed_first_read_is_unknown() {
+        assert_eq!(
+            CapabilityCatalog::default().read("magic", failed()).await,
+            ProviderCapabilities::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_capabilities_successful_removal_clears_the_kept_list() {
+        let catalog = CapabilityCatalog::default();
+        let _ = catalog
+            .read("magic", async {
+                Ok(vec![entry("magic", &["compaction-entry-speaks-for/v1"])])
+            })
+            .await;
+        assert_eq!(
+            catalog
+                .read("magic", async { Ok(vec![entry("other", &[])]) })
+                .await,
+            ProviderCapabilities::NotInCatalog
+        );
+        assert_eq!(
+            catalog.read("magic", failed()).await,
+            ProviderCapabilities::Unknown
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_capabilities_timed_out_read_uses_the_kept_list_or_is_unknown() {
+        let catalog = CapabilityCatalog::default();
+        let declared =
+            ProviderCapabilities::Declared(vec!["compaction-entry-speaks-for/v1".into()]);
+        assert_eq!(
+            catalog
+                .read("magic", async {
+                    Ok(vec![entry("magic", &["compaction-entry-speaks-for/v1"])])
+                })
+                .await,
+            declared
+        );
+        assert_eq!(
+            catalog.read("magic", std::future::pending()).await,
+            declared
+        );
+        assert_eq!(
+            catalog.read("other", std::future::pending()).await,
+            ProviderCapabilities::Unknown
+        );
     }
 }
 

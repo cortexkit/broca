@@ -497,6 +497,21 @@ enum Cmd {
         #[arg(long, value_parser = ["durable"])]
         class: Option<String>,
     },
+    /// `session.tag_map`: which message and part each part number of this session belongs to,
+    /// the number the model is shown in front of the part. Operator only, for a session
+    /// kept in the new storage. Pages until the last message and writes one JSON document,
+    /// `{"session": <name>, "rows": [...]}`, each row naming a number's message id, ordinal,
+    /// part index and role, never any content. A refusal is written to stdout as the daemon sent
+    /// it, and exits 1.
+    TagMap {
+        /// Write the document to this new file (an existing file is never overwritten) instead
+        /// of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Messages per page (the daemon holds it between 1 and 2000; 500 when omitted).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
     /// Import a canonical JSON message array into an empty session.
     Import {
         #[arg(long)]
@@ -570,6 +585,11 @@ enum Cmd {
         #[arg(long = "vault-ready-timeout-ms", hide = true)]
         vault_ready_timeout_ms: Option<u64>,
     },
+    /// `memory.report`: the daemon's estimate of what each open session and shared cache holds
+    /// in memory, walked when asked. Prints a table of the sessions by holder, the process's
+    /// totals, the setup parts sessions hold decoded and the caches; with `--json-events`, the
+    /// reply as JSON. Operator only; the session identity is only the transport attachment.
+    Memory,
     /// `session.read`: one durable transcript page (lease-free; works on idle and
     /// active sessions). Prints per-message role/ordinal/summary plus page timing.
     Read {
@@ -886,6 +906,7 @@ async fn run(args: Args) -> Result<i32, String> {
             | Cmd::Result { raw: true, .. }
             | Cmd::Describe { .. }
             | Cmd::EventGet { .. }
+            | Cmd::TagMap { .. }
     );
     if !raw_output {
         emit(
@@ -1104,6 +1125,72 @@ async fn run(args: Args) -> Result<i32, String> {
                 &mut std::io::stderr().lock(),
             )?;
             Ok(exit)
+        }
+        Cmd::TagMap { out, limit } => {
+            let mut pages = Vec::new();
+            let mut after_ordinal = None;
+            loop {
+                let params = broca_wire::tag_map::TagMapParams {
+                    after_ordinal,
+                    limit,
+                };
+                let params = serde_json::to_value(&params)
+                    .map_err(|error| format!("tag-map params: {error}"))?;
+                let reply = client
+                    .management_raw(broca_wire::tag_map::OP_SESSION_TAG_MAP, &params)
+                    .await
+                    .map_err(|error| format!("tag-map transport: {error}"))?;
+                let body = match reply {
+                    Ok(body) => body,
+                    Err(body) => {
+                        write_raw_reply_to(
+                            &body,
+                            None,
+                            &mut std::io::stdout().lock(),
+                            &mut std::io::stderr().lock(),
+                        )?;
+                        return Ok(1);
+                    }
+                };
+                let page = tag_map_page(&body)?;
+                let next = next_tag_map_page(after_ordinal, &page)?;
+                pages.push(page);
+                match next {
+                    Some(next) => after_ordinal = Some(next),
+                    None => break,
+                }
+            }
+            let document = tag_map_document(&session.session, pages);
+            let mut output: Box<dyn Write> = match out {
+                Some(path) => {
+                    let mut options = broca_owner_only::OpenOptions::new();
+                    options.write(true).create_new(true);
+                    Box::new(options.open(&path).map_err(|_| {
+                        "cannot create the tag map output (existing files are never overwritten)"
+                    })?)
+                }
+                None => Box::new(std::io::stdout().lock()),
+            };
+            serde_json::to_writer(&mut output, &document)
+                .map_err(|_| "cannot write the tag map")?;
+            writeln!(output).map_err(|_| "cannot write the tag map")?;
+            output.flush().map_err(|_| "cannot flush the tag map")?;
+            Ok(0)
+        }
+        Cmd::Memory => {
+            let report = client
+                .memory_report()
+                .await
+                .map_err(|error| format!("memory.report: {error}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).map_err(|error| error.to_string())?
+                );
+            } else {
+                print!("{}", memory_table(&report));
+            }
+            Ok(0)
         }
         Cmd::Raw { op, params } => {
             if op == "session.subscribe" {
@@ -1509,6 +1596,102 @@ fn audit_events(answer: &Result<VaultAuditResponse, String>) -> Vec<(serde_json:
         ),
     ));
     events
+}
+
+/// Bytes in mebibytes, for the memory table.
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The `memory.report` reply as a table: one row per session and a row of totals, by holder in
+/// MiB, then the setup parts and the caches.
+fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
+    use broca_module_serve::wire::MemoryHolders;
+    let mut out = String::new();
+    let header =
+        format!(
+        "{:<18} {:>3} {:>7} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}\n",
+        "session", "run", "msgs", "messages", "facts", "kept", "spare", "ids", "sealed",
+        "entries", "media", "request", "rest", "total MiB"
+    );
+    out.push_str(&header);
+    let row = |name: &str, run: &str, messages: String, h: &MemoryHolders| {
+        format!(
+            "{:<18} {:>3} {:>7} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}\n",
+            name,
+            run,
+            messages,
+            mib(h.messages),
+            mib(h.entry_facts),
+            mib(h.kept_records),
+            mib(h.kept_records_capacity),
+            mib(h.id_index),
+            mib(h.sealed_entries),
+            mib(h.compaction_entries),
+            mib(h.media_fold),
+            mib(h.request_in_flight),
+            mib(h.rest),
+            mib(h.total),
+        )
+    };
+    for session in &report.sessions {
+        out.push_str(&row(
+            &session.address,
+            if session.run_in_progress { "yes" } else { "" },
+            session.window_messages.to_string(),
+            &session.holders,
+        ));
+    }
+    out.push_str(&row(
+        "total",
+        &report.running_sessions.to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|session| session.window_messages)
+            .sum::<u64>()
+            .to_string(),
+        &report.totals,
+    ));
+    out.push_str(&format!(
+        "{} sessions on the new storage ({} with a run in progress), {} on today's storage, {} \
+         unanswered. Sessions with a run in progress hold their run's entries and request on top \
+         of an idle session's bytes.\n",
+        report.sessions.len(),
+        report.running_sessions,
+        report.legacy_sessions,
+        report.unanswered_sessions
+    ));
+    if !report.setup_parts.is_empty() {
+        out.push_str("\nsetup part      decoded MiB  copies  sessions\n");
+        for part in &report.setup_parts {
+            out.push_str(&format!(
+                "{:<15} {:>11} {:>7} {:>9}\n",
+                part.kind,
+                mib(part.decoded_bytes),
+                part.decoded_copies,
+                part.sessions
+            ));
+        }
+    }
+    out.push_str(
+        "\ncache                  entries  max entries  estimated MiB  counted MiB  max MiB\n",
+    );
+    for (name, cache) in [
+        ("closed-session views", &report.closed_session_views),
+        ("settled runs", &report.settled_runs),
+    ] {
+        out.push_str(&format!(
+            "{:<22} {:>7} {:>12} {:>14} {:>12} {:>8}\n",
+            name,
+            cache.entries,
+            cache.max_entries,
+            mib(cache.estimated_bytes),
+            cache.counted_bytes.map_or_else(|| "-".into(), mib),
+            cache.max_bytes.map_or_else(|| "-".into(), mib),
+        ));
+    }
+    out
 }
 
 /// Ask the daemon for `vault.audit`. A request that got no reply at all (no connection, no
@@ -2487,9 +2670,51 @@ fn write_raw_reply_to(
 /// Prints `session.restore_from_backup`'s reply `body` to `output`: each session's report line,
 /// or with `json` each session's report as one JSON object. Exits 0 when every session was kept
 /// or restored, 1 when any wasn't.
+/// The `after_ordinal` of the tag map page after `page`, which was read after `after`: `None`
+/// once no more messages follow. A next ordinal that doesn't move past the page's start is
+/// refused, so a broken reply can't page forever.
+fn next_tag_map_page(
+    after: Option<u64>,
+    page: &broca_wire::tag_map::TagMapResponse,
+) -> Result<Option<u64>, String> {
+    match page.next_after_ordinal {
+        Some(next) if after.is_some_and(|after| next <= after) => Err(format!(
+            "tag-map reply names page after {next}, which doesn't follow the page after {}",
+            after.unwrap_or_default()
+        )),
+        next => Ok(next),
+    }
+}
+
+/// The document `tag-map` writes: the session's name and every page's rows, in order.
+fn tag_map_document(
+    session: &str,
+    pages: Vec<broca_wire::tag_map::TagMapResponse>,
+) -> serde_json::Value {
+    let rows: Vec<_> = pages.into_iter().flat_map(|page| page.rows).collect();
+    serde_json::json!({ "session": session, "rows": rows })
+}
+
+/// The answer inside a management reply. The daemon frames every unary reply as
+/// `{"result": <answer>}`, and `management_raw` hands those bytes back unchanged, so a command
+/// that reads the answer must take it out of that member first.
+fn management_result(body: &[u8], op: &str) -> Result<serde_json::Value, String> {
+    let mut reply: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("{op} reply doesn't decode: {error}"))?;
+    reply
+        .get_mut("result")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| format!("{op} reply carries no result"))
+}
+
+/// One `session.tag_map` page, read from the reply bytes the daemon sent.
+fn tag_map_page(body: &[u8]) -> Result<broca_wire::tag_map::TagMapResponse, String> {
+    serde_json::from_value(management_result(body, "tag-map")?)
+        .map_err(|error| format!("tag-map reply doesn't decode: {error}"))
+}
+
 fn restore_report(json: bool, body: &[u8], output: &mut impl FnMut(String)) -> Result<i32, String> {
-    let reply: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| format!("restore-from-backup reply doesn't decode: {error}"))?;
+    let reply = management_result(body, "restore-from-backup")?;
     let sessions = reply["sessions"]
         .as_array()
         .ok_or("restore-from-backup reply names no sessions")?;
@@ -3067,6 +3292,7 @@ mod tests {
         parse_tools, run_id_for_combined_turn, ControlRenderMode, RunTurnAction, RunTurnRefusal,
         RunTurnTracker,
     };
+    use super::{next_tag_map_page, tag_map_document};
     use broca_module_serve::client::SendOutcome;
     use broca_module_serve::client::{
         decode_subscribe_event, SubscribeEvent, UnrecognizedRunState,
@@ -3456,6 +3682,59 @@ mod tests {
     /// `restore-from-backup` takes `--all`, prints each session's report line (or its JSON
     /// object), and exits 1 when any session wasn't kept or restored.
     #[test]
+    fn tag_map_pages_forward_and_writes_every_pages_rows_under_the_session_name() {
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "/tmp/subc.json",
+            "--project-root",
+            "/tmp/project",
+            "--session",
+            "s1",
+            "tag-map",
+            "--out",
+            "/tmp/map.json",
+            "--limit",
+            "2",
+        ])
+        .expect("parse tag-map");
+        assert!(matches!(
+            &args.cmd,
+            Cmd::TagMap { out: Some(out), limit: Some(2) } if out == std::path::Path::new("/tmp/map.json")
+        ));
+        // Pages are decoded from bytes framed as the daemon sends them, `{"result": …}`.
+        let page = |rows: serde_json::Value, next: Option<u64>| {
+            let mut page = serde_json::json!({"numbered": true, "rows": rows});
+            if let Some(next) = next {
+                page["next_after_ordinal"] = next.into();
+            }
+            let body = serde_json::json!({ "result": page }).to_string();
+            super::tag_map_page(body.as_bytes()).unwrap()
+        };
+        // An answer without the framing is refused, not read as an empty page.
+        assert!(super::tag_map_page(br#"{"numbered":true,"rows":[]}"#).is_err());
+        let first = page(
+            serde_json::json!([{"tag": 1, "mid": "m1", "ordinal": 1, "part": 0, "role": "user"}]),
+            Some(2),
+        );
+        let last = page(
+            serde_json::json!([{"tag": 2, "mid": "m3", "ordinal": 3, "part": 1, "role": "assistant"}]),
+            None,
+        );
+        assert_eq!(next_tag_map_page(None, &first), Ok(Some(2)));
+        assert_eq!(next_tag_map_page(Some(2), &last), Ok(None));
+        // A reply naming a page that doesn't move forward is refused rather than read forever.
+        assert!(next_tag_map_page(Some(2), &first).is_err());
+        assert_eq!(
+            tag_map_document("s1", vec![first, last]),
+            serde_json::json!({"session": "s1", "rows": [
+                {"tag": 1, "mid": "m1", "ordinal": 1, "part": 0, "role": "user"},
+                {"tag": 2, "mid": "m3", "ordinal": 3, "part": 1, "role": "assistant"},
+            ]})
+        );
+    }
+
+    #[test]
     fn restore_from_backup_prints_a_line_per_session_and_fails_on_any_left_broken() {
         let args = Args::try_parse_from([
             "broca-session",
@@ -3470,10 +3749,10 @@ mod tests {
         ])
         .expect("parse restore-from-backup");
         assert!(matches!(args.cmd, Cmd::RestoreFromBackup { all: true }));
-        let reply = serde_json::json!({"sessions": [
+        let reply = serde_json::json!({"result": {"sessions": [
             {"outcome": "kept", "report": "durable a: kept"},
             {"outcome": "log_cut", "report": "durable b: log cut"},
-        ]});
+        ]}});
         let mut lines: Vec<String> = Vec::new();
         let exit = super::restore_report(false, reply.to_string().as_bytes(), &mut |line| {
             lines.push(line)
@@ -3489,10 +3768,10 @@ mod tests {
                 ]
             )
         );
-        let reply = serde_json::json!({"sessions": [
+        let reply = serde_json::json!({"result": {"sessions": [
             {"outcome": "rolled_back", "report": "durable a: rolled back"},
             {"outcome": "unrecoverable", "report": "durable b: unrecoverable"},
-        ]});
+        ]}});
         let mut lines: Vec<String> = Vec::new();
         let exit = super::restore_report(true, reply.to_string().as_bytes(), &mut |line| {
             lines.push(line)

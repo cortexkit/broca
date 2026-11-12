@@ -52,6 +52,17 @@ impl MediaIndex {
         }
     }
 
+    /// What the index holds, estimated as `broca_core::media_request::held` estimates the
+    /// engine: its inline size, the engine and the aging state. The heap of the media limits in
+    /// force is left to the caller, which can walk a profile's serialized form.
+    pub fn held_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            - std::mem::size_of::<SessionMedia>()
+            - std::mem::size_of::<MediaAging>()
+            + self.session.held_bytes()
+            + self.aging.held_bytes()
+    }
+
     pub fn session(&self) -> &SessionMedia {
         &self.session
     }

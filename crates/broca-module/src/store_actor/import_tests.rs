@@ -27,6 +27,10 @@ use crate::store_import::{
     ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
 };
 
+// Imports staged and published on the new storage's class roots.
+#[path = "import_stage_tests.rs"]
+mod staged;
+
 const ADDR: &str = "fedcba9876543210";
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -187,12 +191,16 @@ impl Drop for Source {
 type Served = tokio::task::JoinHandle<Session<&'static MemoryBackend>>;
 
 fn serve(session: Session<&'static MemoryBackend>) -> (mpsc::UnboundedSender<LineageCmd>, Served) {
+    let backend = *session.backend();
     let actor = StoreActor::new(
         bind(),
         session,
         Arc::new(executor(Vec::new(), None)),
         Box::new(SharedParts::new(Box::new(MemoryParts::default()))),
-    );
+    )
+    .with_import_staging(Arc::new(
+        crate::store_import_stage::MemoryImportStaging::new(backend, deployment()),
+    ));
     let (commands, receiver) = mpsc::unbounded_channel();
     (commands, tokio::spawn(actor.serve(receiver)))
 }
@@ -284,14 +292,32 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
     let outcome = send_exactly(
         &commands,
         "r1",
-        request("next"),
+        {
+            let mut next = request("next");
+            next.principal = Some(core());
+            next.scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+                scope: scope(),
+                owner_authorized: true,
+                kind: broca_protocol::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+            });
+            next
+        },
         SendKey::Minted,
         broca_protocol::Delivery::Queue,
         None,
     )
     .await;
     assert!(
-        matches!(&outcome, SendOutcome::Error(message) if message.contains("session.adopt")),
+        matches!(
+            &outcome,
+            SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field: "plan",
+                ..
+            }
+        ),
         "{outcome:?}"
     );
     drop(commands);
@@ -748,7 +774,8 @@ async fn an_imported_image_is_a_persons_at_its_place_and_renders_with_its_bytes(
 }
 
 /// Through the registry: an import creates its session in the new storage, never on today's,
-/// and a retry is answered from it; with the new storage off, an import is refused by name.
+/// and a retry is answered from it. Like any head, it needs only the store runtime: the switch
+/// that starts every new session there stays off, as in production.
 #[tokio::test]
 async fn the_registry_creates_an_imported_session_in_the_new_storage() {
     use broca_core::{FileLeaseStore, FileWalStore, WalStore};
@@ -774,26 +801,12 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
         )
     };
     let key = broca_protocol::BindIdentity::new(dir.join("project"), "broca", "alfonso:head:a1");
-    let off = crate::registry::LineageRegistry::new_with_reader(
-        opener(Arc::clone(&runtime)),
-        wal.clone(),
-        None,
-    );
-    assert_eq!(
-        refused(
-            off.route_store_command(&key, source.import(source.params("imp-1")))
-                .await
-                .unwrap()
-        ),
-        "new_storage_unavailable"
-    );
     assert!(!runtime.holds(&key).unwrap());
     let registry = crate::registry::LineageRegistry::new_with_reader(
         opener(Arc::clone(&runtime)),
         wal.clone(),
         None,
-    )
-    .with_store_new_sessions();
+    );
     let reply = imported(
         registry
             .route_store_command(&key, source.import(source.params("imp-1")))
@@ -2254,4 +2267,79 @@ async fn a_pi_call_left_unanswered_is_listed_after_its_turn() {
         &closing.message.content[0],
         ContentBlock::ToolResult(result) if result.is_error
     ));
+}
+
+/// An imported session states no reading of its fill until its own first step is measured. The
+/// last reading it holds is the prompt size the source runner reported, for a prompt broca never
+/// built, so every compaction call before that step, its Setup included, carries neither
+/// `last_prompt_tokens` nor `last_prompt_view`. The session's own first reading names the view its request carried, here
+/// none (`0`).
+#[tokio::test]
+async fn an_imported_session_states_no_reading_until_its_own_step() {
+    let mut export: serde_json::Value = serde_json::from_slice(&exchanges()).unwrap();
+    // The source runner reported the last answer's prompt size.
+    export["messages"][7]["tokens"] = serde_json::json!({"input": 5_000, "output": 30});
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("measured", serde_json::to_vec(&export).unwrap(), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    drop(commands);
+    let mut session = served.await.unwrap();
+    let compactor = Compactor::default();
+    let mut parts = MemoryParts::default();
+    run_once(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("r1", "m"),
+        "Question 5.",
+    )
+    .await;
+    // Setup counts: it comes before the step and must not carry the source's reading either. No
+    // notice goes between Setup and the step, since Setup covers the imported window
+    // (compaction N6), so Setup is the only call before it.
+    let calls = compactor.calls.lock().unwrap();
+    let readings: Vec<(&str, Option<u64>, Option<u64>)> = calls
+        .iter()
+        .map(|(method, params)| {
+            if method == "compaction.setup" {
+                assert!(
+                    !params.to_string().contains("last_prompt"),
+                    "Setup states a reading: {params}"
+                );
+            } else {
+                assert!(params["conditions"].is_object(), "{method}: {params}");
+            }
+            let conditions = &params["conditions"];
+            (
+                method.as_str(),
+                conditions["last_prompt_tokens"].as_u64(),
+                conditions["last_prompt_view"].as_u64(),
+            )
+        })
+        .collect();
+    let own = readings
+        .iter()
+        .position(|(_, tokens, _)| *tokens == Some(100))
+        .unwrap_or_else(|| panic!("a call reports the session's own step: {readings:?}"));
+    assert!(own > 0, "{readings:?}");
+    assert!(
+        readings[..own]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (None, None)),
+        "{readings:?}"
+    );
+    assert!(
+        readings[own..]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (Some(100), Some(0))),
+        "{readings:?}"
+    );
+    // The source runner's number is never stated, on any call's bytes.
+    assert!(
+        calls
+            .iter()
+            .all(|(_, params)| !params.to_string().contains("\"last_prompt_tokens\":5000")),
+        "{calls:?}"
+    );
 }

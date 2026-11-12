@@ -48,9 +48,9 @@ pub trait Plane: Send + Sync {
     async fn provides_entry_speaks_for(&self) -> bool {
         false
     }
-    /// Whether the provider's catalog entry lists `compaction-signed-floor/v1` (compaction
-    /// contract W3.5). A plane that can't read the catalog answers false, so the provider is
-    /// sent no floor it may not understand.
+    /// Whether the provider's catalog entry lists `compaction-signed-floor/v1`. A plane that
+    /// can't read the catalog answers false, so the provider is sent no floor it may not
+    /// understand.
     async fn provides_signed_floor(&self) -> bool {
         false
     }
@@ -58,13 +58,45 @@ pub trait Plane: Send + Sync {
     async fn provides_notes_tokens(&self) -> bool {
         false
     }
+    /// Whether the provider can order runner state by the session's log position.
+    async fn provides_statement_seq(&self) -> bool {
+        false
+    }
     /// Declarations read together when the runner sends Setup. A catalog-backed plane answers
     /// them from one read.
     async fn declarations(&self) -> Declarations {
         Declarations {
-            entry_speaks_for: self.provides_entry_speaks_for().await,
+            entry_speaks_for: AttributionDeclaration::known(self.provides_entry_speaks_for().await),
             signed_floor: self.provides_signed_floor().await,
             notes_tokens: self.provides_notes_tokens().await,
+            statement_seq: self.provides_statement_seq().await,
+        }
+    }
+}
+
+/// Whether a catalog read established that entries may carry speaker attribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributionDeclaration {
+    Declared,
+    NotDeclared,
+    #[default]
+    Unknown,
+}
+
+impl AttributionDeclaration {
+    pub fn known(declared: bool) -> Self {
+        if declared {
+            Self::Declared
+        } else {
+            Self::NotDeclared
+        }
+    }
+
+    pub fn value(self) -> Option<bool> {
+        match self {
+            Self::Declared => Some(true),
+            Self::NotDeclared => Some(false),
+            Self::Unknown => None,
         }
     }
 }
@@ -74,19 +106,24 @@ pub trait Plane: Send + Sync {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Declarations {
     /// `compaction-entry-speaks-for/v1`: entries carry stored speaker marks.
-    pub entry_speaks_for: bool,
+    pub entry_speaks_for: AttributionDeclaration,
     /// `compaction-signed-floor/v1`: Setup and conditions carry the signed floor.
     pub signed_floor: bool,
     /// `compaction-notes-tokens/v1`: notice conditions separate persistent note counts.
     pub notes_tokens: bool,
+    /// `compaction-statement-seq/v1`: Setup and conditions carry the state stamp.
+    pub statement_seq: bool,
 }
 
 impl Declarations {
     fn of(provides: &[String]) -> Self {
         Self {
-            entry_speaks_for: cortexkit_role_compaction::provides_entry_speaks_for(provides),
+            entry_speaks_for: AttributionDeclaration::known(
+                cortexkit_role_compaction::provides_entry_speaks_for(provides),
+            ),
             signed_floor: cortexkit_role_compaction::provides_signed_floor(provides),
             notes_tokens: cortexkit_role_compaction::provides_notes_tokens(provides),
+            statement_seq: cortexkit_role_compaction::provides_statement_seq(provides),
         }
     }
 }
@@ -130,7 +167,7 @@ impl Plane for BoundPlane<'_> {
     }
 
     async fn provides_entry_speaks_for(&self) -> bool {
-        self.declarations().await.entry_speaks_for
+        self.declarations().await.entry_speaks_for == AttributionDeclaration::Declared
     }
 
     async fn provides_signed_floor(&self) -> bool {
@@ -141,16 +178,19 @@ impl Plane for BoundPlane<'_> {
         self.declarations().await.notes_tokens
     }
 
+    async fn provides_statement_seq(&self) -> bool {
+        self.declarations().await.statement_seq
+    }
+
     async fn declarations(&self) -> Declarations {
         let Some(plane) = self.plane else {
             return Declarations::default();
         };
-        plane
-            .provider_capabilities(self.provider)
-            .await
-            .map_or_else(Declarations::default, |provides| {
-                Declarations::of(&provides)
-            })
+        match plane.provider_capabilities(self.provider).await {
+            crate::ProviderCapabilities::Declared(provides) => Declarations::of(&provides),
+            crate::ProviderCapabilities::NotInCatalog => Declarations::of(&[]),
+            crate::ProviderCapabilities::Unknown => Declarations::default(),
+        }
     }
 }
 
@@ -171,6 +211,32 @@ struct Pending {
     newest: Option<Cursor>,
 }
 
+impl Pending {
+    /// Drops the queued entries a ready Setup naming `newest` covers. The provider reads the
+    /// window for itself after Setup (compaction contract N6), and each entry it reads is at
+    /// least as new as the one queued here: every caller observes the entries a Setup is built
+    /// from before sending it, so nothing queued is newer. Without this, a fresh runtime (an actor
+    /// reopened, a restarted process)
+    /// would send its whole first observation, up to the notice budget, in the first notice.
+    ///
+    /// Nothing else changes. `assistant` keeps the digest last observed, which is the one Setup
+    /// was built from, so a tool result or delivery reaching that entry after Setup changes its
+    /// digest and goes in the next notice. An entry not yet observed when Setup was sent is still
+    /// sent when it is: that only repeats an entry the provider has, which costs bytes, not state.
+    fn seen_at_setup(&mut self, newest: Option<&Cursor>) {
+        let Some(newest) = newest else {
+            return;
+        };
+        self.entries.retain(|ordinal, _| *ordinal > newest.ordinal);
+        self.entry_bytes = self.entries.values().map(|(_, bytes)| *bytes).sum();
+        // Entries left out for the budget are all covered when none past `newest` was observed.
+        if self.entries_omitted && self.observed_through <= newest.ordinal {
+            self.entries_omitted = false;
+        }
+        self.changed = !self.entries.is_empty() || self.entries_omitted;
+    }
+}
+
 struct Lane {
     seq: u64,
     ready: bool,
@@ -184,6 +250,13 @@ struct Lane {
     /// (compaction contract W3.5); the declaration holds until the next Setup.
     signed_floor_declared: bool,
     notes_tokens_declared: bool,
+    statement_seq_declared: bool,
+    /// The epoch the latest Setup carried, which every later notice and ride repeats beside its
+    /// stamp (compaction contract W3.5). It is minted fresh at each Setup and kept only in
+    /// memory: a restarted process always sends a new Setup first. `None` when the provider
+    /// didn't declare `compaction-statement-seq/v1`, or no epoch could be minted; the lane then
+    /// sends neither the epoch nor the stamp, because a stamp alone is dropped by the provider.
+    statement_epoch: Option<String>,
 }
 
 impl Default for Lane {
@@ -195,13 +268,15 @@ impl Default for Lane {
             detects_cache_expired: false,
             signed_floor_declared: false,
             notes_tokens_declared: false,
+            statement_seq_declared: false,
+            statement_epoch: None,
         }
     }
 }
 
 impl Lane {
-    /// `conditions` as this lane's provider may receive them: without the signed floor unless
-    /// it declared that it reads one.
+    /// `conditions` as this lane's provider may receive them, omitting optional state whose
+    /// capability the provider did not declare at Setup.
     fn conditions(&self, conditions: &Conditions) -> Conditions {
         let mut conditions = conditions.clone();
         if !self.signed_floor_declared {
@@ -210,8 +285,39 @@ impl Lane {
         if !self.notes_tokens_declared {
             conditions.notes_tokens = None;
         }
+        match &self.statement_epoch {
+            Some(epoch) if conditions.statement_seq.is_some() => {
+                conditions.statement_epoch = Some(epoch.clone());
+            }
+            _ => {
+                conditions.statement_epoch = None;
+                conditions.statement_seq = None;
+            }
+        }
         conditions
     }
+}
+
+/// A new Setup epoch: 32 lowercase hex digits from the operating system's random source, which
+/// fits the contract's 1 to 64 visible ASCII characters. `None` if the source fails.
+fn mint_statement_epoch() -> Option<String> {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(
+            %error,
+            "no compaction statement epoch could be minted; this Setup's statements carry no stamp"
+        );
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .fold(String::with_capacity(32), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            }),
+    )
 }
 
 /// A single actor owns this object across runs. The lane lock spans each call;
@@ -316,7 +422,21 @@ impl Runtime {
     /// before any model I/O.
     pub async fn setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
-        setup(&mut lane, plane, request, &self.entry_speaks_for).await
+        self.setup_on(&mut lane, plane, request).await
+    }
+
+    /// Sends `request` on `lane` and, once the provider is ready, drops the queued entries that
+    /// Setup covers, so the first notice after it carries only what changed since (compaction
+    /// contract N6).
+    async fn setup_on(&self, lane: &mut Lane, plane: &dyn Plane, request: &SetupRequest) -> bool {
+        let ready = setup(lane, plane, request, &self.entry_speaks_for).await;
+        if ready {
+            self.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .seen_at_setup(request.newest.as_ref());
+        }
+        ready
     }
 
     /// Whether entries handed to the provider may carry `speaks_for`: its catalog entry declared
@@ -381,7 +501,7 @@ impl Runtime {
     pub async fn ensure_setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
         if !lane.ready && lane.setup_due {
-            setup(&mut lane, plane, request, &self.entry_speaks_for).await
+            self.setup_on(&mut lane, plane, request).await
         } else {
             lane.ready
         }
@@ -411,9 +531,7 @@ impl Runtime {
     ) {
         let mut restarted = false;
         loop {
-            if !lane.ready
-                && (!lane.setup_due
-                    || !setup(lane, plane, setup_request, &self.entry_speaks_for).await)
+            if !lane.ready && (!lane.setup_due || !self.setup_on(lane, plane, setup_request).await)
             {
                 return;
             }
@@ -566,16 +684,41 @@ async fn setup(
     // The provider's declarations are read from the catalog at every Setup, before the Setup is
     // sent, so a provider that reads entries as soon as it is ready already sees them as
     // declared, and what they say holds for every call until the next Setup. A catalog that
-    // can't be read in time counts as no declaration.
+    // can't be read in time sends no optional fields, but leaves attribution unknown so an
+    // entries read cannot mistake the fallback for a provider's declaration.
     let declared = tokio::time::timeout(CALL_DEADLINE, plane.declarations())
         .await
         .unwrap_or_default();
-    entry_speaks_for.store(attribution(declared.entry_speaks_for), Ordering::Release);
+    entry_speaks_for.store(
+        declared
+            .entry_speaks_for
+            .value()
+            .map_or(ATTRIBUTION_UNKNOWN, attribution),
+        Ordering::Release,
+    );
     lane.signed_floor_declared = declared.signed_floor;
     lane.notes_tokens_declared = declared.notes_tokens;
+    lane.statement_seq_declared = declared.statement_seq;
+    lane.statement_epoch = if lane.statement_seq_declared {
+        mint_statement_epoch()
+    } else {
+        None
+    };
     let mut request = request.clone();
     if !lane.signed_floor_declared {
         request.signed_floor = None;
+    }
+    match &lane.statement_epoch {
+        Some(epoch) if request.statement_seq.is_some() => {
+            request.statement_epoch = Some(epoch.clone());
+        }
+        _ => {
+            request.statement_epoch = None;
+            request.statement_seq = None;
+            // A Setup without the pair clears the provider's held epoch, so the statements that
+            // follow it must not carry one either.
+            lane.statement_epoch = None;
+        }
     }
     let answer: Result<SetupAnswer, _> =
         call(plane, "compaction.setup", &request, CALL_DEADLINE).await;

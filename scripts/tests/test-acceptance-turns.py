@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -85,12 +86,22 @@ class ScopedTrafficTests(unittest.TestCase):
                 status, output = self.wait()
                 self.assertEqual(status, 0, output)
                 self.assertIn(f"session={self.address} successful_aft_results=2", output)
+                self.assertIn("examined_sessions=wal:1,store:0 qualifying_results=2", output)
                 path.unlink()
 
-    def test_no_traffic_is_reported_as_no_traffic_not_tool_errors(self):
+    def test_zero_examined_sessions_has_its_own_verdict(self):
+        status, output = self.wait()
+        self.assertEqual(status, 1)
+        self.assertIn("could not examine any session", output)
+        self.assertIn("examined_sessions=wal:0,store:0 qualifying_results=0", output)
+        self.assertNotIn("no scoped traffic", output)
+
+    def test_examined_session_without_traffic_reports_counts_not_tool_errors(self):
+        self.write([self.start])
         status, output = self.wait()
         self.assertEqual(status, 1)
         self.assertIn("no scoped traffic was seen", output)
+        self.assertIn("examined_sessions=wal:1,store:0 qualifying_results=0", output)
         self.assertNotIn("error_codes", output)
 
     def test_old_direct_unscoped_and_other_provider_results_do_not_certify(self):
@@ -158,8 +169,140 @@ class ScopedTrafficTests(unittest.TestCase):
             (self.root / "wal" / (self.address + ".wal")).unlink()
             status, output = self.wait(timeout=600)
         self.assertEqual(status, 1)
-        self.assertIn("no scoped traffic was seen", output)
+        self.assertIn("could not examine any session", output)
         sleep.assert_called_once_with(1)
+
+    def store(self, folder="session-store"):
+        root = self.root / folder
+        (root / "heads" / self.address).mkdir(parents=True)
+        (root / "heads" / self.address / "head").write_bytes(b"DO-NOT-READ-ENCRYPTED-HEAD")
+        log = root / "logs" / self.address / ("0" * 32)
+        log.parent.mkdir(parents=True)
+        log.write_bytes(b"DO-NOT-READ-ENCRYPTED-LOG")
+        with sqlite3.connect(self.root / "run-index.db") as db:
+            db.execute("CREATE TABLE IF NOT EXISTS agent_data_session_ref "
+                       "(address TEXT, project_root TEXT, harness TEXT, session TEXT)")
+            db.execute("INSERT INTO agent_data_session_ref VALUES (?, ?, ?, ?)",
+                       (self.address, "broca-unscoped-v1", "core", "DO-NOT-PRINT-SESSION"))
+        self.commands = []
+        self.admission = {"run_id": "fixture-run", "storage": "store", "started_at_ms": 101,
+                          "scope": {"principal": self.principal, "owner": self.principal,
+                                    "ref": "fixture-worker", "epoch": 1}}
+        self.messages = [
+            {"ordinal": 1, "run": {"run_id": "fixture-run"},
+             "message": {"role": "assistant", "content": []},
+             "tool_calls": [{"tool_call_id": "fixture-call", "call_key": "fixture-key",
+                             "dispatched_to": "aft", "indeterminate": False}]},
+            {"ordinal": 2, "written_at": 102, "run": {"run_id": "fixture-run"},
+             "message": {"role": "tool", "content": [dict(self.result["result"], type="tool_result")]}}
+        ]
+        self.calls = [{"tool_call_id": "fixture-call", "call_key": "fixture-key",
+                       "dispatched_to": "aft", "outcome": "succeeded", "ordinal": 1}]
+
+    def reply(self, command, timeout):
+        self.commands.append(command)
+        op = command[command.index("--op") + 1]
+        if op == "session.read":
+            result = {"messages": self.messages, "history_version": 1}
+        elif op == "run.admission":
+            result = self.admission
+        else:
+            self.assertEqual(op, "run.tool_calls")
+            result = {"run_id": "fixture-run", "calls": self.calls}
+        return subprocess.CompletedProcess(command, 0, json.dumps({"result": result}), "")
+
+    def test_new_storage_only_success_uses_daemon_and_counts_examined_sessions(self):
+        self.store()
+        with patch.object(scoped, "invoke", side_effect=self.reply, create=True), \
+                patch.object(Path, "read_bytes", side_effect=AssertionError("encrypted content opened")):
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        self.assertIn("examined_sessions=wal:0,store:1 qualifying_results=1", output)
+        for command in self.commands:
+            self.assertEqual(command[command.index("--project-root") + 1], "broca-unscoped-v1")
+            self.assertEqual(command[command.index("--harness") + 1], "core")
+            self.assertEqual(command[command.index("--session") + 1], "DO-NOT-PRINT-SESSION")
+        params = json.loads(self.commands[0][-1])
+        self.assertTrue(params["include_display_facts"])
+        self.assertEqual(params["limit"], 500)
+
+    def test_new_storage_empty_read_is_no_traffic_with_counts(self):
+        self.store("session-store-durable")
+        self.messages = []
+        with patch.object(scoped, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 1)
+        self.assertIn("no scoped traffic was seen", output)
+        self.assertIn("examined_sessions=wal:0,store:1 qualifying_results=0", output)
+
+    def test_new_storage_pre_restart_or_errored_results_never_count(self):
+        self.store("session-store-ephemeral")
+        for timestamp, error, outcome in ((100, False, "succeeded"), (99, False, "succeeded"),
+                                           (102, True, "failed"), (102, False, "indeterminate")):
+            with self.subTest(timestamp=timestamp, error=error, outcome=outcome):
+                self.messages[1]["written_at"] = timestamp
+                self.messages[1]["message"]["content"][0]["is_error"] = error
+                self.calls[0]["outcome"] = outcome
+                with patch.object(scoped, "invoke", side_effect=self.reply):
+                    status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("examined_sessions=wal:0,store:1 qualifying_results=0", output)
+
+    def test_new_storage_requires_real_scope_and_recorded_aft_dispatch(self):
+        self.store()
+        variants = [dict(self.admission, started_at_ms=100),
+                    dict(self.admission, scope=dict(self.admission["scope"], principal={"kind": "direct"})),
+                    dict(self.admission, scope=dict(self.admission["scope"], owner={"kind": "direct"})),
+                    dict(self.admission, scope=dict(self.admission["scope"], ref=""))]
+        original = self.admission
+        for admission in variants:
+            self.admission = admission
+            with self.subTest(admission=admission), patch.object(scoped, "invoke", side_effect=self.reply):
+                status, output = self.wait()
+            self.assertEqual(status, 1, output)
+        self.admission = original
+        self.calls[0]["dispatched_to"] = "other-module"
+        with patch.object(scoped, "invoke", side_effect=self.reply):
+            self.assertEqual(self.wait()[0], 1)
+
+    def test_new_storage_missing_scope_is_could_not_tell_not_no_traffic(self):
+        self.store()
+        del self.admission["scope"]
+        with patch.object(scoped, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 1)
+        self.assertIn("could not tell", output)
+        self.assertIn("this daemon's run.admission serves no scope", output)
+        self.assertNotIn("no scoped traffic", output)
+
+    def test_failed_daemon_read_reports_could_not_tell_with_error(self):
+        self.store()
+        failure = subprocess.CompletedProcess([], 7, '{"error":{"code":"unavailable"}}', "DO-NOT-PRINT")
+        with patch.object(scoped, "invoke", return_value=failure):
+            status, output = self.wait()
+        self.assertEqual(status, 1)
+        self.assertIn("could not tell", output)
+        self.assertIn("session.read: client exited 7 code=unavailable", output)
+        self.assertIn("examined_sessions=wal:0,store:0 qualifying_results=0 could_not_tell=1", output)
+        self.assertNotIn("no scoped traffic", output)
+
+    def test_new_storage_pages_keep_call_identity_across_boundaries(self):
+        self.store()
+        original = self.reply
+
+        def reply(command, timeout):
+            if command[command.index("--op") + 1] != "session.read":
+                return original(command, timeout)
+            self.commands.append(command)
+            params = json.loads(command[-1])
+            page = ({"messages": self.messages[:1], "next_from_ordinal": 2, "history_version": 1}
+                    if params["from_ordinal"] == 1 else {"messages": self.messages[1:], "history_version": 1})
+            return subprocess.CompletedProcess(command, 0, json.dumps({"result": page}), "")
+
+        with patch.object(scoped, "invoke", side_effect=reply):
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(json.loads(self.commands[1][-1])["history_version"], 1)
 
 
 class DeployScopedTests(unittest.TestCase):
@@ -186,6 +329,21 @@ class DeployScopedTests(unittest.TestCase):
         self.fixture.assert_gated_steps(["place", "verify", "accept", "worker-accept", "scoped-accept"])
         self.assertIn("SCOPED DISPATCH ACCEPTANCE FAILED; not publishing", result.stdout + result.stderr)
         self.assertIn("Rollback:", result.stdout + result.stderr)
+
+    def test_direct_refusal_warns_and_runs_both_other_checks_without_claiming_pass(self):
+        result = self.fixture.deploy(ACCEPT_STATUS="3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.fixture.assert_gated_steps(["place", "verify", "accept", "worker-accept", "scoped-accept", "publish"])
+        self.assertIn("WARNING -- direct tool acceptance: TOOL REFUSED (project_required), exit 3",
+                      result.stdout + result.stderr)
+        self.assertIn("acceptance direct: TOOL REFUSED (project_required); worker: PASS; scoped: PASS", result.stdout)
+        self.assertNotIn("acceptance PASS", result.stdout)
+
+    def test_direct_real_failure_still_stops_other_checks_and_publication(self):
+        result = self.fixture.deploy(ACCEPT_STATUS="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.fixture.assert_gated_steps(["place", "verify", "accept"])
+        self.assertIn("LIVE ACCEPTANCE FAILED", result.stdout + result.stderr)
 
 
 class DirectTurnTests(unittest.TestCase):
@@ -215,9 +373,15 @@ else:
         return self.fixture.run_script("acceptance-turn.sh", BROCA_BIN=str(self.placed),
                                        ACCEPTANCE_MODELS="fixture/model", **env)
 
-    def test_declared_build_accepts_exact_project_required_refusal(self):
-        result = self.run_turn(TOOL_TEXT=contract.PROJECT_REQUIRED)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def test_project_required_has_distinct_verdict_and_exit_code(self):
+        for text in (contract.PROJECT_REQUIRED, "tool/route rejected: project_required — newer explanation"):
+            with self.subTest(text=text):
+                result = self.run_turn(TOOL_TEXT=text)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertIn("acceptance-turn: TOOL REFUSED (project_required) -- the test session has no scope, "
+                              "so the tool module refused its route; dispatch, result and run completion worked", result.stdout)
+                self.assertNotIn("acceptance-turn: PASS", result.stdout)
+                self.assertNotIn("acceptance-turn: FAILED", result.stdout + result.stderr)
 
     def test_successful_result_still_passes_on_declared_and_legacy_builds(self):
         for declaration in ("bind-no-project/v1", "legacy"):
@@ -226,17 +390,18 @@ else:
                 result = self.run_turn(TOOL_ERROR="false")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_other_refusals_and_inexact_project_required_text_fail(self):
+    def test_other_tool_errors_fail_with_the_result_text(self):
         for text in (contract.PROJECT_REQUIRED.replace("project_required", "permission_denied"),
-                     contract.PROJECT_REQUIRED + " extra", "project_required", "is_error=false"):
+                     "project_required", "is_error=false"):
             with self.subTest(text=text):
                 result = self.run_turn(TOOL_TEXT=text)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("TOOL RESULT ERRORED -- " + text, result.stderr)
 
-    def test_legacy_build_cannot_accept_project_required(self):
+    def test_project_required_is_not_a_pass_on_legacy_builds_either(self):
         self.placed.write_text("legacy\n")
         result = self.run_turn(TOOL_TEXT=contract.PROJECT_REQUIRED)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
 
     def test_missing_dispatch_result_or_completion_still_fails(self):
         for missing in ("NO_DISPATCH", "NO_RESULT", "NO_COMPLETE"):
@@ -244,11 +409,11 @@ else:
                 result = self.run_turn(TOOL_ERROR="false", **{missing: "1"})
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
-    def test_failed_binary_probe_is_loud_not_legacy_or_success(self):
-        self.fixture.executable(self.fixture.bins / "strings", "#!/bin/sh\nexit 7\n")
-        result = self.run_turn(TOOL_ERROR="false")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("cannot probe placed binary", result.stdout + result.stderr)
+    def test_project_required_without_completed_run_is_a_failure(self):
+        result = self.run_turn(TOOL_TEXT=contract.PROJECT_REQUIRED, NO_COMPLETE="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("RUN DID NOT COMPLETE", result.stderr)
+        self.assertNotIn("acceptance-turn: TOOL REFUSED", result.stdout)
 
     def test_role_describe_declaration_is_used_when_available(self):
         with patch.dict(contract.os.environ, {"BROCA_BIN": "/not-a-placed-binary"}), \
@@ -259,7 +424,7 @@ else:
     def test_a_later_success_does_not_hide_another_tool_error(self):
         output = ("TOOL_RESULT seq=2 id=one is_error=true text=other refusal\n"
                   "TOOL_RESULT seq=3 id=two is_error=false text=ok\n")
-        self.assertFalse(contract.tool_results_pass(output, True))
+        self.assertEqual(contract.tool_result_verdict(output), (1, "TOOL RESULT ERRORED -- other refusal"))
 
 
 class WorkerTrafficFixture(unittest.TestCase):
@@ -809,7 +974,7 @@ class WorkerAddressTests(unittest.TestCase):
         report.write_text('{"restart_observed_at_ms":100}')
         with patch.object(self.acceptance, "wait_for_worker", return_value=1) as wait:
             result, output, invoke, _ = self.fixture.run_main(['{"result":{}}'], no_project=True,
-                extra_args=("--placement-report", str(report)))
+                extra_args=("--placement-report", str(report)), env={"HOME": str(Path.home())})
         self.assertEqual(result, 1, output)
         wait.assert_called_once_with(Path(self.fixture.tmp.name), 100, 600,
                                      session_bin=ROOT / "target/release/broca-session",

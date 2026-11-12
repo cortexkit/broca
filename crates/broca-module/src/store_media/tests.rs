@@ -26,11 +26,11 @@ use super::{RunAppends, SessionIndex};
 
 const ADDR: &str = "0123456789abcdef";
 
-fn addr() -> SessionAddr {
+pub(crate) fn addr() -> SessionAddr {
     SessionAddr(ADDR.into())
 }
 
-fn triple() -> SessionTriple {
+pub(crate) fn triple() -> SessionTriple {
     SessionTriple {
         project_root: "/project".into(),
         harness: "store-actor".into(),
@@ -38,7 +38,7 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
+pub(crate) fn deployment() -> DeploymentKey {
     DeploymentKey::new(1, &[7; 32])
 }
 
@@ -111,12 +111,12 @@ fn reference(n: u32) -> MediaRef {
     .unwrap()
 }
 
-fn said(words: &str) -> Message {
+pub(crate) fn said(words: &str) -> Message {
     Message::new(Role::User, vec![ContentBlock::Text { text: words.into() }])
 }
 
 /// A person's message with image `n` after its words, at block 1.
-fn photo(words: &str, n: u32) -> Message {
+pub(crate) fn photo(words: &str, n: u32) -> Message {
     Message::new(
         Role::User,
         vec![
@@ -127,17 +127,17 @@ fn photo(words: &str, n: u32) -> Message {
 }
 
 /// A session being written the way the actor serves a run's writes, with its image index.
-struct Store {
-    backend: &'static MemoryBackend,
-    session: Session<&'static MemoryBackend>,
-    index: SessionIndex,
-    parts: MemoryParts,
-    config: PartRef,
+pub(crate) struct Store {
+    pub(crate) backend: &'static MemoryBackend,
+    pub(crate) session: Session<&'static MemoryBackend>,
+    pub(crate) index: SessionIndex,
+    pub(crate) parts: MemoryParts,
+    pub(crate) config: PartRef,
     tool_media: broca_session_loop::PendingMedia,
 }
 
 impl Store {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let backend: &'static MemoryBackend = Box::leak(Box::default());
         let session = Session::create(backend, addr(), triple(), &deployment(), false)
             .await
@@ -146,7 +146,7 @@ impl Store {
     }
 
     /// The store over `session`, its index opened as an actor opens it.
-    async fn over(
+    pub(crate) async fn over(
         backend: &'static MemoryBackend,
         mut session: Session<&'static MemoryBackend>,
     ) -> Self {
@@ -175,13 +175,13 @@ impl Store {
         }
     }
 
-    async fn append(&mut self, records: Vec<Record>, barrier: bool) {
+    pub(crate) async fn append(&mut self, records: Vec<Record>, barrier: bool) {
         self.appends().append(&records, barrier).await.unwrap();
     }
 
     /// A run whose input is `message`, with its image's bytes stored, and one step answering
     /// it. Returns the id of the input message.
-    async fn run(&mut self, run: &str, message: Message, image: Option<u32>) -> String {
+    pub(crate) async fn run(&mut self, run: &str, message: Message, image: Option<u32>) -> String {
         let mid = self.session.message_id(2);
         let ordinal = self.session.conversation.placed + 1;
         let records = vec![
@@ -209,7 +209,7 @@ impl Store {
     }
 
     /// Model step `step` of `run`, answering in text.
-    async fn step(&mut self, run: &str, step: u64) {
+    pub(crate) async fn step(&mut self, run: &str, step: u64) {
         self.append(vec![step_start(run, step)], true).await;
         self.append(vec![attempt(run, step)], true).await;
         let ordinal = self.session.conversation.placed + 1;
@@ -265,7 +265,7 @@ impl Store {
     }
 
     /// The names of the saved index objects the session holds.
-    fn index_objects(&self) -> Vec<String> {
+    pub(crate) fn index_objects(&self) -> Vec<String> {
         self.backend
             .object_names(&addr())
             .into_iter()
@@ -274,7 +274,7 @@ impl Store {
     }
 
     /// Seals the open log, as the run's writer does.
-    async fn seal(&mut self) {
+    pub(crate) async fn seal(&mut self) {
         self.index.absorb(&mut self.session, &self.parts);
         self.session.seal(None, 1_000).await.unwrap();
         self.index.absorb(&mut self.session, &self.parts);
@@ -563,7 +563,7 @@ fn steer(messages: Vec<Message>) -> Record {
     })
 }
 
-fn start(run: &str, setup: Vec<PartRef>) -> Record {
+pub(crate) fn start(run: &str, setup: Vec<PartRef>) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
         run_id: run.into(),
@@ -609,7 +609,12 @@ fn end(run: &str) -> Record {
     })
 }
 
-fn input(run: &str, placement: Placement, receipt: Option<u64>, message: Message) -> Record {
+pub(crate) fn input(
+    run: &str,
+    placement: Placement,
+    receipt: Option<u64>,
+    message: Message,
+) -> Record {
     Record::Input(Input {
         run_id: run.into(),
         placement,
@@ -624,7 +629,7 @@ fn input(run: &str, placement: Placement, receipt: Option<u64>, message: Message
     })
 }
 
-fn facts(ordinal: u64, mid: String) -> Record {
+pub(crate) fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(EntryFacts {
         send_id: None,
         named_speaker: None,
@@ -654,7 +659,7 @@ fn facts(ordinal: u64, mid: String) -> Record {
     })
 }
 
-fn step_start(run: &str, step: u64) -> Record {
+pub(crate) fn step_start(run: &str, step: u64) -> Record {
     Record::StepStart(StepStart {
         run_id: run.into(),
         step_id: step,
@@ -662,7 +667,7 @@ fn step_start(run: &str, step: u64) -> Record {
     })
 }
 
-fn attempt(run: &str, step: u64) -> Record {
+pub(crate) fn attempt(run: &str, step: u64) -> Record {
     Record::Attempt(Attempt {
         run_id: run.into(),
         step_id: step,
@@ -687,7 +692,7 @@ fn attempt(run: &str, step: u64) -> Record {
     })
 }
 
-fn assistant(run: &str, step: u64) -> Record {
+pub(crate) fn assistant(run: &str, step: u64) -> Record {
     let content = vec![ContentBlock::Text {
         text: "seen".into(),
     }];
@@ -705,7 +710,7 @@ fn assistant(run: &str, step: u64) -> Record {
     })
 }
 
-fn step_end(run: &str, step: u64, calls: u32) -> Record {
+pub(crate) fn step_end(run: &str, step: u64, calls: u32) -> Record {
     Record::StepEnd(StepEnd {
         run_id: run.into(),
         step_id: step,

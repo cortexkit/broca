@@ -149,6 +149,57 @@ struct Reply {
     media: Vec<MediaPart>,
 }
 
+/// What a batch's waiting records hold, for the memory report (see `crate::held`).
+impl crate::held::HeldBytes for Work {
+    fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let reference = |reference: &broca_protocol::content::MediaRef| reference.heap_bytes();
+        let skeleton = |message: &MediaMessage| {
+            message.slots.capacity() * size_of::<broca_protocol::media_event::MediaSlot>()
+                + message
+                    .slots
+                    .iter()
+                    .map(|slot| {
+                        reference(&slot.reference)
+                            + slot
+                                .tool_part
+                                .as_ref()
+                                .map_or(0, |(call, _)| call.heap_bytes())
+                    })
+                    .sum::<usize>()
+        };
+        let Work {
+            run,
+            awaiting,
+            held_step: _,
+            replies,
+        } = self;
+        let run = run.as_ref().map_or(0, |run| {
+            run.render_config.heap_bytes()
+                + run.media.capacity() * size_of::<RunInput>()
+                + run
+                    .media
+                    .iter()
+                    .map(|input| skeleton(&input.skeleton))
+                    .sum::<usize>()
+        });
+        let replies = replies.capacity() * size_of::<Reply>()
+            + replies
+                .iter()
+                .map(|reply| {
+                    reply.call.heap_bytes()
+                        + reply.media.capacity() * size_of::<MediaPart>()
+                        + reply
+                            .media
+                            .iter()
+                            .map(|part| reference(&part.reference))
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        run + awaiting.capacity() * size_of::<Awaiting>() + replies
+    }
+}
+
 /// One fact the fold hands over: a complete event, or a run start still missing its media
 /// limits, which only the run's render config holds.
 #[derive(Debug, Clone, PartialEq)]

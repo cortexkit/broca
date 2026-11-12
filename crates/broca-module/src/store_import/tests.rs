@@ -241,22 +241,27 @@ fn history() -> HeadHistory {
             SourceRow {
                 mid: "u1".into(),
                 message: Some(0),
+                finished_summary: false,
             },
             SourceRow {
                 mid: "sys".into(),
                 message: None,
+                finished_summary: false,
             },
             SourceRow {
                 mid: "u2".into(),
                 message: Some(1),
+                finished_summary: false,
             },
             SourceRow {
                 mid: "u3".into(),
                 message: Some(2),
+                finished_summary: false,
             },
             SourceRow {
                 mid: "a1".into(),
                 message: Some(3),
+                finished_summary: false,
             },
         ],
         dropped_system_messages: 1,
@@ -297,6 +302,87 @@ fn facts(seed: &Seed) -> Vec<&broca_session_store::record::EntryFacts> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn old_plugin_receipt_retries_omit_absent_finished_summary() {
+    use broca_session_store::codec::Message as _;
+    let seed = seeded(history(), None).unwrap();
+    let newest = newest_of_records(&seed.records).unwrap();
+    let mut receipt = seed.receipt;
+    receipt.shape = "plugin".into();
+    for row in &mut receipt.moves {
+        row.finished_summary = None;
+    }
+    let receipt = broca_session_store::record::ImportReceipt::decode(&receipt.encode()).unwrap();
+    let reply =
+        serde_json::to_value(reply_of(&receipt, 0, "abcd".into(), newest).unwrap()).unwrap();
+    assert!(reply["moves"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row.get("finished_summary").is_none()));
+}
+
+#[test]
+fn offline_moves_keep_the_wire_shape_and_mark_only_store_minted_identity() {
+    let history = history();
+    let preview = offline_moves(history.clone(), Some(40)).unwrap();
+    let encoded = serde_json::to_value(&preview.moves).unwrap();
+    let decoded: broca_wire::head_import::MoveList =
+        serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, preview.moves);
+    assert_eq!(preview.unminted, 1);
+    assert_eq!(preview.newest.ordinal, 5);
+    assert_eq!(preview.newest.mid, "unminted:1");
+    assert_eq!(preview.newest.digest, "unminted:1");
+    assert!(preview
+        .moves
+        .rows
+        .iter()
+        .all(|row| row.finished_summary == Some(false)));
+    assert!(encoded["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row.get("source_entry").is_none()));
+    let added = preview.moves.rows.iter().find(|row| row.added).unwrap();
+    assert_eq!(
+        (&added.mid, added.entry),
+        (&"unminted:1".to_string(), Some(5))
+    );
+    for source in &history.rows {
+        let row = preview
+            .moves
+            .rows
+            .iter()
+            .find(|row| !row.added && row.mid == source.mid)
+            .unwrap();
+        assert_eq!(row.entry, source.message.map(|index| index as u64 + 1));
+    }
+    let mut with_last_source = history.clone();
+    let mut last = with_last_source.messages[0].clone();
+    last.mid = Some("last-user".into());
+    last.send = None;
+    with_last_source.rows.push(SourceRow {
+        mid: "last-user".into(),
+        message: Some(with_last_source.messages.len()),
+        finished_summary: false,
+    });
+    with_last_source.messages.push(last);
+    let preview = offline_moves(with_last_source.clone(), Some(40)).unwrap();
+    let actual = seeded(with_last_source, Some(40)).unwrap();
+    assert_eq!(preview.newest, newest_of_records(&actual.records).unwrap());
+    assert_eq!(preview.newest.mid, "last-user");
+    let refused = offline_moves(history.clone(), Some(MAX_PART_NUMBER + 1)).unwrap_err();
+    assert_eq!(refused.code, "import_tag_floor_refused");
+    assert_eq!(refused.message_ordinal, None);
+    let mut reserved = history;
+    reserved.messages[0].mid = Some("gfeed.1".into());
+    reserved.rows[0].mid = "gfeed.1".into();
+    let refused = offline_moves(reserved, None).unwrap_err();
+    assert_eq!(refused.code, "import_id_refused");
+    assert_eq!(refused.message_ordinal, Some(1));
 }
 
 /// The source runner's notice rule: the owner's plain prompt has none, the owner's templated

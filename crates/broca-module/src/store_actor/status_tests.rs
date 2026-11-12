@@ -69,6 +69,7 @@ async fn side_at(
             provider: Gated {
                 render_config: None,
                 notes_sends: false,
+                hold: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },
@@ -214,7 +215,7 @@ fn reply<T: serde::Serialize>(reply: Result<T, crate::serve::ServeError>) -> Val
     }
 }
 
-async fn admission_case(store: bool) {
+async fn admission_case(store: bool, scoped: bool) {
     let side = side(store, vec![text_step("answer", "done")], None).await;
     let manifest: broca_wal::PlanManifest = serde_json::from_value(json!({
         "plan": "{}", "plan_identity": "admission-plan", "composition_digest": "composition",
@@ -225,6 +226,20 @@ async fn admission_case(store: bool) {
     })).unwrap();
     let key = SendKey::Minted;
     let mut request = request("private input");
+    let principal = json!({"kind": "reserved", "module_id": "scope-owner"});
+    if scoped {
+        request.principal = Some(serde_json::from_value(principal.clone()).unwrap());
+        request.scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+            scope: serde_json::from_value(json!({
+                "owner": principal, "ref": "recorded-scope", "scope_epoch": 17
+            }))
+            .unwrap(),
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            owner_authorized: true,
+        });
+    }
     request.tools = None;
     request.policy_allowed = Default::default();
     let request = side.caller.shape("admitted", &key, request);
@@ -272,7 +287,40 @@ async fn admission_case(store: bool) {
             broca_wire::RunAdmissionStorage::Wal
         }
     );
+    let bytes = serde_json::to_vec(&admission).unwrap();
+    if let Ok(folder) = std::env::var("BROCA_ADMISSION_SCOPE_SAMPLES") {
+        let phase = std::env::var("BROCA_ADMISSION_SAMPLE_PHASE").unwrap();
+        assert!(matches!(phase.as_str(), "before" | "after"));
+        let storage = if store { "store" } else { "wal" };
+        let scope = if scoped { "scoped" } else { "unscoped" };
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            std::path::Path::new(&folder).join(format!("{storage}-{scope}-{phase}.json")),
+            &bytes,
+        )
+        .unwrap();
+    }
+    if !scoped {
+        let expected = r#"{"run_id":"admitted","session_class":"sidekick","started_at_ms":$TIME,"storage":"$STORAGE","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true,"result_formats":{"read":"text"}}}]}"#
+            .replace("$TIME", &admission.started_at_ms.to_string())
+            .replace("$STORAGE", if store { "store" } else { "wal" });
+        assert_eq!(
+            bytes,
+            expected.as_bytes(),
+            "unscoped reply bytes stay unchanged"
+        );
+    }
     let value = serde_json::to_value(admission).unwrap();
+    if scoped {
+        assert_eq!(
+            value["scope"],
+            json!({
+                "owner": principal, "ref": "recorded-scope", "epoch": 17, "principal": principal
+            })
+        );
+    } else {
+        assert!(value.get("scope").is_none());
+    }
     assert_eq!(
         value["fetches"],
         json!([{ "provider": "aft", "declarations_frozen": {
@@ -285,12 +333,22 @@ async fn admission_case(store: bool) {
 
 #[tokio::test]
 async fn run_admission_wal_freezes_class_and_aft_declarations() {
-    admission_case(false).await;
+    admission_case(false, false).await;
 }
 
 #[tokio::test]
 async fn run_admission_store_freezes_class_and_aft_declarations() {
-    admission_case(true).await;
+    admission_case(true, false).await;
+}
+
+#[tokio::test]
+async fn run_admission_wal_serves_recorded_scope() {
+    admission_case(false, true).await;
+}
+
+#[tokio::test]
+async fn run_admission_store_serves_recorded_scope() {
+    admission_case(true, true).await;
 }
 
 #[tokio::test]
@@ -726,10 +784,9 @@ async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
 }
 
 /// A run a crash cut off, with a send queued behind it, on a session no actor holds. Today's
-/// `run.status` opens the session, which seals the run; the new storage's reads it without an
-/// actor, as the seal the next open writes: interrupted by the crash. The session's own status
-/// then opens it, which seals the run and runs the queued send, and every answer read before
-/// stays the same.
+/// `run.status` opens the session on either storage, sealing the run and draining the queued
+/// send before any read observes the recovered state. The interrupted terminal is stable
+/// across later reads and completion of the queued run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
     let today_dir = scratch();
@@ -748,7 +805,7 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
         store.run_result("r1").await,
         store.run_status("r2").await,
     ];
-    assert!(store.registry.slot_state(&store.key).is_none());
+    assert!(store.registry.slot_state(&store.key).is_some());
     assert_eq!(before[0]["state"], json!("interrupted"), "{}", before[0]);
     assert_eq!(before[0]["reason"], json!("runner_crash"), "{}", before[0]);
     assert_eq!(
@@ -757,7 +814,7 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
         "{}",
         before[0]
     );
-    assert_eq!(before[2]["state"], json!("pending"), "{}", before[2]);
+    assert_eq!(before[2]["state"], json!("active"), "{}", before[2]);
     // Today's answers once its read sealed the run.
     same(
         &today.run_status("r1").await,

@@ -12,6 +12,11 @@ use broca_session_store::session::Session;
 pub(super) struct Admission(Arc<OnceLock<FirstEpisodeV1>>);
 
 impl Admission {
+    /// The session's first episode, once known.
+    pub(super) fn known(&self) -> Option<&FirstEpisodeV1> {
+        self.0.get()
+    }
+
     /// Learn only from the durable first start, never from a send that may still be refused.
     pub(super) fn learn<B: SessionBackend>(
         &self,
@@ -21,6 +26,9 @@ impl Admission {
         registry: Option<&crate::registry::RegistryHandle>,
     ) -> Result<(), String> {
         if self.0.get().is_some() {
+            return Ok(());
+        }
+        if session.operations().owner.awaiting_import_admission() {
             return Ok(());
         }
         let Some(first) = session.operations().owner.first_start.as_ref() else {

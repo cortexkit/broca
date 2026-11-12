@@ -181,7 +181,7 @@ impl HarnessReader for OpenCodeReader {
 // OpenCode messages receive zero-based ordinals after sorting by `time_created` and then `id`.
 // Saved compartment boundaries still match through their persisted source IDs: older snapshots
 // may use one-based ordinals, and inserting an earlier message can shift calculated positions.
-fn load_messages(
+pub(crate) fn load_messages(
     connection: &Connection,
     session_id: &str,
 ) -> ReaderResult<Vec<(String, String, i64)>> {
@@ -426,7 +426,7 @@ fn extend_new_block_origins(
     block_origins.extend(std::iter::repeat_n(origin.clone(), blocks_added));
 }
 
-fn load_parts(
+pub(crate) fn load_parts(
     connection: &Connection,
     session_id: &str,
 ) -> ReaderResult<HashMap<String, Vec<String>>> {
@@ -482,7 +482,7 @@ fn unix_millis_date(timestamp: i64) -> Option<String> {
     Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
-fn sqlite_snapshot_error(
+pub(crate) fn sqlite_snapshot_error(
     action: &'static str,
     error: rusqlite::Error,
 ) -> Box<dyn Error + Send + Sync> {

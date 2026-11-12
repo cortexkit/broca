@@ -192,6 +192,50 @@ impl SettledRuns {
         self.inner.lock().map_or(0, |inner| inner.facts.len())
     }
 
+    /// What the cache holds, estimated by walking it when asked (see
+    /// `broca_session_store::held`), with its cap. A final message counts by its compact JSON,
+    /// which stands in for its heap.
+    pub fn memory(&self) -> broca_wire::MemoryCache {
+        use broca_session_store::held::HeldBytes;
+        let Ok(inner) = self.inner.lock() else {
+            return broca_wire::MemoryCache::default();
+        };
+        let key_heap =
+            |(address, _, _, run_id): &SettledKey| address.heap_bytes() + run_id.heap_bytes();
+        // The table's buckets, each a slot and a control byte.
+        let slot = std::mem::size_of::<SettledKey>() + std::mem::size_of::<RunFacts>();
+        let buckets = match inner.facts.capacity() {
+            0 => 0,
+            capacity => (capacity * 8 / 7).next_power_of_two(),
+        };
+        let facts: usize = inner
+            .facts
+            .iter()
+            .map(|(key, facts)| {
+                key_heap(key)
+                    + facts.interrupt_reason.heap_bytes()
+                    + facts
+                        .final_message
+                        .as_ref()
+                        .map_or(0, |message| match message {
+                            Ok(message) => {
+                                serde_json::to_vec(message).map_or(0, |bytes| bytes.len())
+                            }
+                            Err(_) => 0,
+                        })
+            })
+            .sum();
+        let order = inner.order.capacity() * std::mem::size_of::<SettledKey>()
+            + inner.order.iter().map(key_heap).sum::<usize>();
+        broca_wire::MemoryCache {
+            entries: inner.facts.len() as u64,
+            max_entries: self.capacity as u64,
+            counted_bytes: None,
+            max_bytes: None,
+            estimated_bytes: (buckets * (slot + 1) + facts + order) as u64,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -996,13 +1040,15 @@ async fn final_message<B: SessionBackend>(
                 // current compaction contract; on a session converted from an older one, the
                 // writing run's frozen rules say it.
                 let ours = placed.contains_key(&entry.ordinal);
+                let served = crate::store_exposure::served_message(
+                    &entry.message,
+                    facts.clean_reply || (ours && cleans_text),
+                );
                 return Ok(broca_wire::FinalMessage {
                     ordinal: entry.ordinal,
                     mid: facts.mid.clone(),
-                    text: crate::serve::joined_text(
-                        &entry.message,
-                        facts.clean_reply || (ours && cleans_text),
-                    ),
+                    // `served` is already cleaned where its reply is, so the join adds no cleaning.
+                    text: crate::serve::joined_text(&served, false),
                 });
             }
         }
@@ -1016,9 +1062,8 @@ async fn final_message<B: SessionBackend>(
 }
 
 /// The no-run `status` of a store session that no actor holds asks the actor anyway when its
-/// latest run is unfinished and not paused (or has a cancel pending), or when sends wait in its
-/// queue: opening the actor recovers the run and drains the queue, as today's `status` wakes a
-/// session a crash left so.
+/// latest run has open-time recovery, or when queued work can drain: the same decision as a
+/// caller read. Pauses without recoverable work and already parked held waits need no actor.
 pub async fn status_needs_actor(
     store: &crate::store_open::StoreRuntime,
     key: &broca_protocol::BindIdentity,
@@ -1026,10 +1071,9 @@ pub async fn status_needs_actor(
     let Some(session) = store.current_view(key).await? else {
         return Ok(false);
     };
-    let unfinished = session.operations.run.as_ref().is_some_and(|run| {
-        run.finished.is_none() && (run.paused.is_none() || run.cancel.is_some())
-    });
-    Ok(unfinished || !session.operations.queue.is_empty())
+    Ok(crate::store_actor::recovery_changes_reads(
+        &session.operations,
+    ))
 }
 
 /// A read of a store session's run and send facts, served by its actor when one holds it open,
@@ -1246,6 +1290,8 @@ impl Reader<'_> {
                 .ok_or_else(|| damaged("the run's start has no timestamp"))?,
             broca_wire::RunAdmissionStorage::Store,
             admission.manifest.as_deref(),
+            admission.send.principal.as_ref(),
+            admission.send.scope.as_ref(),
         )
         .map(Some)
     }

@@ -134,6 +134,17 @@ struct Loops {
 
 #[async_trait]
 impl RunExecutor for Loops {
+    fn warm_costs(
+        &self,
+        _: &broca_wal::RunConfig,
+        _: u64,
+        _: u64,
+    ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        Ok(broca_core::keep_warm::WarmCosts {
+            warm: 0.4,
+            bust: 1.0,
+        })
+    }
     async fn execute(
         &self,
         job: RunJob,
@@ -215,6 +226,7 @@ async fn registry_at(
                 gate: None,
                 render_config,
                 notes_sends: false,
+                hold: None,
             },
             wal: Arc::clone(&wal),
             planes: Default::default(),
@@ -335,6 +347,79 @@ fn attempted_step(id: &str, text: &str, sent_at_ms: u64) -> Vec<NormalizedEvent>
     )];
     step.extend(crate::store_actor::tests::text_step(id, text));
     step
+}
+
+#[tokio::test]
+async fn startup_rearms_an_untouched_automatic_head() {
+    let dir = scratch();
+    let config = warmable();
+    let sent = Arc::default();
+    let registry = registry_at(
+        &dir,
+        true,
+        true,
+        Some(&config),
+        vec![attempted_step("a1", "hello", crate::actor::epoch_ms())],
+        &sent,
+        Cipher::None,
+    )
+    .await;
+    let key = BindIdentity::new(dir.join("project"), "store-actor", "automatic-head");
+    let mut first = request("hello");
+    first.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
+    first.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
+    assert!(matches!(
+        registry
+            .route_submission_with_order(
+                &key,
+                RunId("r1".into()),
+                first,
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                Some("head".into()),
+                false,
+                None,
+            )
+            .await
+            .unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("the automatic head is idle", || async {
+        if registry.handle().has_idle_warm(&key) {
+            Ok(())
+        } else {
+            Err("no idle warm timer".into())
+        }
+    })
+    .await;
+    assert!(registry.stop_and_seal().await);
+    let reboot = registry_at(
+        &dir,
+        true,
+        true,
+        Some(&config),
+        Vec::new(),
+        &sent,
+        Cipher::None,
+    )
+    .await;
+    assert!(reboot.slot_state(&key).is_none());
+    assert!(!reboot.handle().has_idle_warm(&key));
+    let sweep = reboot.recover_store_crash_orphans().await.unwrap();
+    assert!(sweep.failed.is_empty(), "{sweep:?}");
+    assert_eq!(sweep.recovered, 1);
+    assert!(
+        reboot.handle().has_idle_warm(&key),
+        "startup restores the timer without a session command"
+    );
+    assert!(reboot.stop_and_seal().await);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// The refusals decided before anything is sent answer alike: a warm naming a lineage, a module

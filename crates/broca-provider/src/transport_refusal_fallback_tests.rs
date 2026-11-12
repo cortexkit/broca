@@ -266,6 +266,7 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
+            request: Default::default(),
         },
     )));
 

@@ -26,7 +26,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let operations = self.session.operations();
         // The session's choice of next-run model, as the send's model inheritance reads it: a
         // first send's from the plan it fetched, a later one's from the session.
-        let selection = if operations.owner.episodes == 0 {
+        let selection = if operations.owner.needs_admission() {
             manifest.and_then(broca_core::head::manifest_selection)
         } else {
             broca_session_loop::plan::selection(operations, &self.parts)

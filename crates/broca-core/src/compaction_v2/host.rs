@@ -85,12 +85,16 @@ pub fn conditions(
     newest_step_fill: Option<(&str, u64)>,
     signed_floor: Option<u64>,
 ) -> Result<Conditions, String> {
+    // Today's loop doesn't tie its reading to the view its request was rendered under, so its
+    // conditions never name one (`last_prompt_view` stays absent).
     conditions_of(
         &Frozen::of(config),
         entries,
         chained,
         newest_step_fill,
         signed_floor,
+        &|_| None,
+        None,
     )
 }
 
@@ -130,13 +134,19 @@ pub fn view_floor(conditions: &Conditions) -> Floor<'_> {
         .map_or(Floor::none(), |floor| Floor::through(&floor.through))
 }
 
-/// [`conditions`] from a run's frozen choices in any shape.
+/// [`conditions`] from a run's frozen choices in any shape. `prompt_view` names, for the entry
+/// whose usage gives the session's fill ([`last_prompt`]), the version of the view the request
+/// that produced it was rendered under: `Some(0)` for no view, `None` when the caller can't tie
+/// that request to a view. `statement_seq` is the newest log record the statement reflects;
+/// rule-only checks may omit it. The runtime gates the stamp on the provider's declaration.
 pub fn conditions_of(
     config: &Frozen<'_>,
     entries: &[Entry],
     chained: bool,
     newest_step_fill: Option<(&str, u64)>,
     signed_floor: Option<u64>,
+    prompt_view: &dyn Fn(&Entry) -> Option<u64>,
+    statement_seq: Option<u64>,
 ) -> Result<Conditions, String> {
     let window = config
         .context_limit
@@ -160,13 +170,21 @@ pub fn conditions_of(
     }
     let mut conditions =
         conditions::conditions(context_of(config, None).model, window, reserve, chained);
+    if statement_seq.is_some_and(|seq| seq > 9_007_199_254_740_991) {
+        return Err("compaction statement_seq exceeds the protocol integer range".into());
+    }
+    conditions.statement_seq = statement_seq;
     conditions.accepts_images = config
         .frozen_render_config
         .pointer("/media/modalities/image")
         .and_then(serde_json::Value::as_bool);
     // The provider measures the session's fill from this field alone; without it a session
     // never reaches the provider's compaction threshold.
-    conditions.last_prompt_tokens = last_prompt_tokens(entries, newest_step_fill);
+    // The view is read off the same entry as the reading, so the two always describe one
+    // request: the provider ignores a reading taken under an older view than its newest.
+    let reading = last_prompt(entries, newest_step_fill);
+    conditions.last_prompt_tokens = reading.map(|(_, tokens)| tokens);
+    conditions.last_prompt_view = reading.and_then(|(entry, _)| prompt_view(entry));
     // Every condition carries the floor; the runtime sends it only to a provider that declares
     // it reads one (`runtime::Runtime`).
     conditions.signed_floor = self::signed_floor(signed_floor, entries, &conditions.rules);
@@ -176,12 +194,23 @@ pub fn conditions_of(
 /// The newest entry's reported prompt, using the last serving model's fill when that
 /// entry came from the newest input-reporting step. Imported entries keep their own usage.
 pub fn last_prompt_tokens(entries: &[Entry], newest_step_fill: Option<(&str, u64)>) -> Option<u64> {
+    last_prompt(entries, newest_step_fill).map(|(_, tokens)| tokens)
+}
+
+/// [`last_prompt_tokens`], with the entry whose usage gave it.
+pub fn last_prompt<'e>(
+    entries: &'e [Entry],
+    newest_step_fill: Option<(&str, u64)>,
+) -> Option<(&'e Entry, u64)> {
     entries.iter().rev().find_map(|entry| {
         let prompt = entry.usage.as_ref()?.prompt_tokens?;
-        Some(match newest_step_fill {
-            Some((mid, fill)) if entry.mid == mid => fill,
-            _ => prompt,
-        })
+        Some((
+            entry,
+            match newest_step_fill {
+                Some((mid, fill)) if entry.mid == mid => fill,
+                _ => prompt,
+            },
+        ))
     })
 }
 
@@ -341,12 +370,16 @@ pub async fn notice(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .configure(&Frozen::of(&config), manifest);
-    let conditions = conditions(
-        &config,
+    // This synced snapshot's WAL position survives reopen: FileWal resumes at last_seq + 1
+    // (file_wal.rs). Run close-out appends records; it never rewinds the log.
+    let conditions = conditions_of(
+        &Frozen::of(&config),
         &transcript.entries,
         false,
         transcript.newest_step_fill(),
         transcript.signed_floor,
+        &|_| None,
+        frames.last().map(|frame| frame.seq),
     )?;
     let applied = session.state.lock().await.applied_identity();
     let mut setup = conditions::setup_request(

@@ -650,8 +650,9 @@ fn an_import_seed_and_its_interrupted_cut_both_ways() {
     both.finish();
 }
 
-/// The old storage's first compaction protocol has no events: a session holding it
-/// continues from a checkpoint saved after it. `prefix` ends with such a record.
+/// A first-protocol compaction record (CompactionViewApplied, or a CompactionMessage) has no
+/// media event: a session that applied one continues from a checkpoint saved after it.
+/// `prefix` ends with such a record.
 fn continue_after(
     name: &'static str,
     fixture: &Fixture,

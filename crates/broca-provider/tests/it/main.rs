@@ -78,6 +78,7 @@ mod reasoning_context_legacy;
 mod render_golden_version_enforcement;
 mod renderer_version_reproduction;
 mod responses_cache_write_usage;
+mod ride_placement_render;
 mod runner_tags_render;
 mod service_tier_used;
 #[cfg(feature = "live")]

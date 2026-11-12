@@ -149,7 +149,8 @@ async fn actor_on(
     )
 }
 
-/// The bytes a request's tool list renders to, as a wire family writes JSON.
+/// A request's tool list as canonical JSON bytes, the form every provider request renderer
+/// writes it in.
 fn tool_bytes(call: &broca_protocol::request::CallOptions) -> String {
     let tools = serde_json::to_value(&*call.tools).unwrap();
     String::from_utf8(broca_protocol::canonical::canonical_json_bytes(&tools)).unwrap()

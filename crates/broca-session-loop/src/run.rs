@@ -1731,6 +1731,27 @@ fn frozen_render_tags(admission: &Admission) -> bool {
             .is_some_and(broca_core::tags::plan_renders_tags)
 }
 
+/// Whether `admission`'s requests show each ride as its own text block after the tool turn's
+/// results, which then hold only the tools' own output: its frozen render config says
+/// `ride_placement: after_results` on an Anthropic Messages route. Every other run renders each
+/// ride inside its carrying result, as before.
+///
+/// Probe only, for measuring how models treat the two placements; removed or replaced once the
+/// placement question is decided. The member is frozen at admission, so a resumed or rebuilt
+/// step of the run decides alike.
+pub(crate) fn rides_after_results(admission: &Admission) -> bool {
+    let config = &*admission.render_config;
+    config.get("family_id").and_then(Value::as_str)
+        == Some(broca_protocol::tags::ANTHROPIC_MESSAGES_FAMILY)
+        && config
+            .get(broca_provider::wire::RidePlacement::MEMBER)
+            .cloned()
+            .and_then(|member| {
+                serde_json::from_value::<broca_provider::wire::RidePlacement>(member).ok()
+            })
+            == Some(broca_provider::wire::RidePlacement::AfterResults)
+}
+
 /// The request the latest run's step `step_id` sends, built from the session's state exactly as
 /// the run loop builds it before sending, without any provider or tool plane: for checking
 /// requests rebuilt from stored sessions against the bytes that were sent. A run whose plan names
@@ -3289,7 +3310,11 @@ fn call_options<W: Writer>(
             // Off the compaction contract a ride renders into its result's copy here, before
             // anything else edits the results, where today's replay joins it as it reads the
             // ride's record. On the contract the entries render it.
-            crate::entries::render_rides(&mut prompt, writer.conversation());
+            crate::entries::render_rides(
+                &mut prompt,
+                writer.conversation(),
+                rides_after_results(admission),
+            );
             repetition_guidance(
                 &mut prompt,
                 episodes,
@@ -3406,7 +3431,8 @@ fn call_options<W: Writer>(
     .map(crate::entries::project)
     .collect::<Result<Vec<_>, _>>()
     .map_err(LoopError::Parts)?;
-    let rides = crate::entries::ride_envelopes(conversation);
+    let mut rides = crate::entries::ride_envelopes(conversation);
+    rides.set_after_results(rides_after_results(admission));
     let mut prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
         &opts.prompt,
         &entries,
@@ -3630,6 +3656,9 @@ async fn model_step<W: Writer, P: Provider, T>(
         .keep_warm
         .as_ref()
         .and_then(|driver| driver.step_seal());
+    // The call's options, shared with the provider. The published progress names them weakly,
+    // so the session's owner can size the request in flight without keeping it.
+    let opts = Arc::new(opts);
     if let Some(progress) = &seams.step_progress {
         let now = (seams.now_ms)();
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
@@ -3640,6 +3669,7 @@ async fn model_step<W: Writer, P: Provider, T>(
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
+            request: broca_protocol::provider::InFlightRequest::of(&opts),
         });
     }
     if let Some(ready) = &seams.model_call_ready {
@@ -3667,7 +3697,7 @@ async fn model_step<W: Writer, P: Provider, T>(
         _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
         events = seams
             .provider
-            .step_with_runtime(StepId(step_id), Arc::new(opts), runtime) => events,
+            .step_with_runtime(StepId(step_id), opts, runtime) => events,
     };
     let mut message = None;
     // The provider's `StepFinished` usage wins; its final `Finished` fills it only when the
@@ -4885,12 +4915,59 @@ pub async fn end_run_with_error<W: Writer>(
     error: &ProviderError,
     now_ms: u64,
 ) -> Result<Finished, LoopError> {
+    end_run_with_error_and_interrupt_reason(writer, run_id, reason, error, now_ms, None).await
+}
+
+/// [`end_run_with_error`] with the recorded interruption reason the actor's seal selected, so
+/// callers read the same cause whether the loop or its actor wrote the interrupted end.
+pub async fn end_run_with_error_and_interrupt_reason<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    reason: RunFinishReason,
+    error: &ProviderError,
+    now_ms: u64,
+    interrupt_reason: Option<String>,
+) -> Result<Finished, LoopError> {
     let mut record = run_end(writer, run_id, reason, now_ms);
     if let Record::RunEnd(end) = &mut record {
         end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+        end.interrupt_reason = interrupt_reason;
     }
     append_end(writer, run_id, vec![record]).await?;
     Ok(finished(writer, reason))
+}
+
+/// Records a refused restart continuation and its interrupted terminal without dispatching
+/// anything. Set `record_resume` when the attempt failed before recording a resume entry;
+/// owners that already recorded it keep the existing entry instead of appending a duplicate.
+pub async fn end_restart_resume_refused<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    error: &ProviderError,
+    now_ms: u64,
+    record_resume: bool,
+) -> Result<Finished, LoopError> {
+    if record_resume {
+        let resolution = run_state(writer).resolution();
+        let mut batch = Some(vec![Record::Resumed(resumed_record(writer, &resolution))]);
+        writer
+            .append_with(
+                &mut |_, _, first_seq| {
+                    let mut batch = batch.take().expect("one refused resume entry");
+                    name_resumed_from(&mut batch, first_seq);
+                    batch
+                },
+                false,
+            )
+            .await?;
+    }
+    let mut record = run_end(writer, run_id, RunFinishReason::Interrupted, now_ms);
+    if let Record::RunEnd(end) = &mut record {
+        end.interrupt_reason = Some("runner_crash".into());
+        end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+    }
+    append_end(writer, run_id, vec![record]).await?;
+    Ok(finished(writer, RunFinishReason::Interrupted))
 }
 
 /// The timed pause on the run's own account that `limited`, the step's attempt the provider
@@ -6137,12 +6214,15 @@ async fn compaction_ctx<W: Writer, P, T>(
     }
     let has_view = session.state.lock().await.applied().is_some();
     session.runtime.begin_send(has_view).await;
+    // The run keeps one transcript for its life; its owner gets a weak handle on it, once.
+    let window = crate::compaction::WindowTranscript::default();
+    writer.share_window(window.downgrade());
     Ok(Some(crate::compaction::Ctx {
         earlier: crate::compaction::earlier_context(writer, admission, parts).await?,
         session,
         provider,
         preset,
-        window: Default::default(),
+        window,
     }))
 }
 

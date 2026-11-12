@@ -635,7 +635,8 @@ async fn writing_request<H: ServeHandler + ?Sized>(
     Ok(request)
 }
 
-/// The sets at a stored message position, scoped to its incarnation and history version.
+/// The sets at a stored message position, scoped to its incarnation and the stored history
+/// version (`ServeHandler::output_ref_history_version`).
 /// An expected scope from another snapshot names nothing, before any target content is read.
 pub async fn message_output_refs<H: ServeHandler + ?Sized>(
     handler: &H,
@@ -656,7 +657,11 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
     let namespace = handler
         .output_ref_namespace(session, &page.incarnation)
         .await?;
-    let current = snapshot_scope(&namespace, page.history_version);
+    // Ids name the stored transcript's version; reads are pinned to the version they serve.
+    let scope = handler
+        .output_ref_history_version(session, page.history_version)
+        .await?;
+    let current = snapshot_scope(&namespace, scope);
     if lineage.is_some_and(|lineage| lineage != current) {
         return Ok(None);
     }
@@ -689,6 +694,7 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
 
 /// Derive a display page's sets with one manifest read and a shared message cache. Page entries
 /// seed the cache, so references to another row and repeated targets do not reread that message.
+/// `history_version` is the version the page was read at, as reads serve it.
 pub async fn page_output_refs<H: ServeHandler + ?Sized>(
     handler: &H,
     session: &LineageKey,
@@ -698,10 +704,13 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
     records: Option<Vec<broca_wal::WalRecord>>,
 ) -> Result<BTreeMap<u64, MessageOutputDescriptors>, ServeError> {
     let namespace = handler.output_ref_namespace(session, lineage).await?;
+    let scope = handler
+        .output_ref_history_version(session, history_version)
+        .await?;
     let mut messages = Messages {
         handler,
         session,
-        lineage: snapshot_scope(&namespace, history_version),
+        lineage: snapshot_scope(&namespace, scope),
         history_version,
         cache: entries
             .iter()

@@ -494,3 +494,42 @@ async fn a_send_racing_the_move_is_never_lost() {
         rig.finish().await;
     }
 }
+
+/// `session.tag_map` serves only sessions kept in the new storage. On a session today's storage
+/// keeps, a caller that isn't the operator is refused `operator_required`, and the operator's own
+/// route is refused `not_served_on_old_storage`, by name. With `TAG_MAP_SAMPLES_DIR` set, the
+/// operator's refusal is written there as the serve path sent it.
+#[tokio::test]
+async fn a_tag_map_of_a_session_on_todays_storage_is_refused_by_name() {
+    let mut rig = Rig::start_movable("tag-map-today").await;
+    rig.script.push(&[Step::Text("answer")]);
+    let started = rig.send("turn-1", "hi", None).await;
+    assert_eq!(result(&started)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let refused = refusal(&call(&mut rig, "session.tag_map", json!({})).await);
+    assert_eq!(refused["code"], "operator_required", "{refused}");
+    rig.bind_as(2, Some(subc_protocol::Principal::Direct)).await;
+    let frame = rig
+        .request(2, json!({"method": "session.tag_map", "params": {}}))
+        .await;
+    let refused = refusal(&frame);
+    assert_eq!(refused["code"], "not_served_on_old_storage", "{refused}");
+    if let Some(dir) = std::env::var_os("TAG_MAP_SAMPLES_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("refused-old-storage.json"), &frame.body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn plan_view_on_old_storage_is_refused_by_name() {
+    let mut rig = Rig::start_movable("plan-view-today").await;
+    rig.script.push(&[Step::Text("answer")]);
+    let started = rig.send("turn-1", "hi", None).await;
+    assert_eq!(result(&started)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let refused = refusal(&call(&mut rig, "session.plan_view", json!({})).await);
+    assert_eq!(refused["code"], "not_served_on_old_storage", "{refused}");
+}

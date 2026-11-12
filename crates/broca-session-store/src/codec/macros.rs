@@ -15,6 +15,9 @@
 //! encodes as a message holding exactly one field, numbered by the variant.
 //!
 //! `values!` declares a field-less enum encoded as a varint.
+//!
+//! Each also implements `held::HeldBytes` from the same declaration, so the memory a type holds
+//! is estimated over every field it has.
 
 #[doc(hidden)]
 #[macro_export]
@@ -174,6 +177,12 @@ macro_rules! message {
         }
 
         impl $crate::codec::Message for $name {}
+
+        impl $crate::held::HeldBytes for $name {
+            fn heap_bytes(&self) -> usize {
+                0 $(+ $crate::held::HeldBytes::heap_bytes(&self.$field))*
+            }
+        }
     };
 }
 
@@ -254,6 +263,14 @@ macro_rules! oneof {
         }
 
         impl $crate::codec::Message for $name {}
+
+        impl $crate::held::HeldBytes for $name {
+            fn heap_bytes(&self) -> usize {
+                match self {
+                    $( Self::$var(value) => $crate::held::HeldBytes::heap_bytes(value), )*
+                }
+            }
+        }
     };
 }
 
@@ -305,6 +322,12 @@ macro_rules! values {
                         $crate::codec::DecodeErrorKind::UnknownVariant(other),
                     )),
                 }
+            }
+        }
+
+        impl $crate::held::HeldBytes for $name {
+            fn heap_bytes(&self) -> usize {
+                0
             }
         }
     };

@@ -110,7 +110,7 @@ pub use capability::{
 pub use clock::Clock;
 pub use compaction::{
     CompactionCheckpoint, CompactionPlane, CompactionState, CompactionUnavailable, CompactionViews,
-    ViewReadyInbox, MAX_REPLACEMENT_BYTES,
+    ProviderCapabilities, ViewReadyInbox, MAX_REPLACEMENT_BYTES,
 };
 pub use context::{
     call_key, catch_up_usage_exports, dispatches_of_turns, effective_context,

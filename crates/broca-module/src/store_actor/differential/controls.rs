@@ -76,9 +76,10 @@ pub(super) struct Compactor {
     bodies: Mutex<Vec<(String, Value)>>,
     methods: Mutex<Vec<String>>,
     calls: Mutex<Vec<Value>>,
-    /// The id of each entry the notices carried, by its ordinal. Each storage mints its own ids,
-    /// so a view names the messages each session told its provider of.
+    /// Entry ids learned from session.entries after Setup and from later notices. Each storage
+    /// mints its own ids, so a view must name entries read from that same session.
     mids: Mutex<std::collections::BTreeMap<u64, String>>,
+    read_entries: Mutex<Option<ReadEntries>>,
     /// The ordinal of the message the next ride's view drops.
     drop_at_ride: Mutex<Option<u64>>,
     /// The views rides were answered with.
@@ -86,6 +87,14 @@ pub(super) struct Compactor {
     /// The events the notices told of, such as a view's refusal.
     events: Mutex<Vec<Value>>,
 }
+
+type ReadEntries = Arc<
+    dyn Fn() -> futures::future::BoxFuture<
+            'static,
+            Vec<broca_core::compaction_v2::protocol::read::Entry>,
+        > + Send
+        + Sync,
+>;
 
 impl Compactor {
     /// Answers the next ride with a view dropping the message at `ordinal`.
@@ -95,6 +104,131 @@ impl Compactor {
 
     pub(super) fn views(&self) -> usize {
         self.views.lock().unwrap().len()
+    }
+
+    pub(super) fn reads(&self, read: ReadEntries) {
+        *self.read_entries.lock().unwrap() = Some(read);
+    }
+
+    pub(super) fn reads_today(&self, wal: Arc<broca_core::FileWalStore>, key: BindIdentity) {
+        self.reads(Arc::new(move || {
+            let (records, lineage) = wal.read_records_with_lineage(&key).unwrap();
+            let entries = broca_core::compaction_v2::transcript::project(
+                &records,
+                &lineage.unwrap().to_string(),
+            )
+            .unwrap()
+            .entries;
+            Box::pin(async move { entries })
+        }));
+    }
+
+    pub(super) fn reads_memory(&self, backend: &'static MemoryBackend) {
+        self.reads(Arc::new(move || {
+            Box::pin(async move {
+                let view = Session::view(
+                    backend,
+                    SessionAddr(store::ADDR.into()),
+                    &store::triple(),
+                    &store::deployment(),
+                )
+                .await
+                .unwrap();
+                crate::store_entries::all_entries(&view).await.unwrap()
+            })
+        }));
+    }
+
+    async fn entries(&self) -> Vec<broca_core::compaction_v2::protocol::read::Entry> {
+        let read = self
+            .read_entries
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the provider has its session.entries reader");
+        read().await
+    }
+
+    async fn read_session(&self) {
+        // Setup covers the current window, so notices need not repeat any of its entries.
+        // Learn their ids through the same projection a provider reads from session.entries.
+        let entries = self.entries().await;
+        self.mids
+            .lock()
+            .unwrap()
+            .extend(entries.into_iter().map(|entry| (entry.ordinal, entry.mid)));
+    }
+
+    /// Restart the provider after the entries are durable, then let Setup cover the whole
+    /// window. No notice repeats that window, but the next ride must still name its entries.
+    pub(super) async fn assert_drop_after_setup_without_notice(
+        &self,
+        ordinal: u64,
+        bind: &BindIdentity,
+    ) {
+        use broca_core::compaction_v2::{protocol::ride, runtime};
+        let entries = self.entries().await;
+        let expected = entries
+            .iter()
+            .find(|entry| entry.ordinal == ordinal)
+            .unwrap();
+        let restarted = Self::default();
+        restarted.reads(self.read_entries.lock().unwrap().clone().unwrap());
+        let (mut setup, conditions) = {
+            let bodies = self.bodies.lock().unwrap();
+            let setup: broca_core::compaction_v2::protocol::setup::SetupRequest =
+                serde_json::from_value(
+                    bodies
+                        .iter()
+                        .rev()
+                        .find(|(method, _)| method == "compaction.setup")
+                        .unwrap()
+                        .1
+                        .clone(),
+                )
+                .unwrap();
+            let conditions = serde_json::from_value(
+                bodies
+                    .iter()
+                    .rev()
+                    .find(|(method, _)| method == "compaction.notice")
+                    .unwrap()
+                    .1["conditions"]
+                    .clone(),
+            )
+            .unwrap();
+            (setup, conditions)
+        };
+        setup.newest = broca_core::compaction_v2::views::newest(&entries);
+        assert!(setup.newest.as_ref().unwrap().ordinal >= ordinal);
+        let runtime = runtime::Runtime::default();
+        let plane = runtime::BoundPlane {
+            plane: Some(&restarted),
+            provider: "compactor",
+            bind,
+            scope: None,
+        };
+        runtime.observe(&entries);
+        assert!(runtime.setup(&plane, &setup).await);
+        restarted.drop_at_next_ride(ordinal);
+        let answer = runtime
+            .ride(
+                &plane,
+                &setup,
+                &ride::RideRequest::new(vec![ride::RideCause::ModelChange], 1_000, conditions),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.methods.lock().unwrap().as_slice(),
+            ["compaction.setup", "compaction.ride"],
+            "Setup covers the entry, so no notice teaches the provider its id",
+        );
+        assert_eq!(
+            serde_json::to_value(answer.view()).unwrap()["edits"][0]["mid"],
+            expected.mid,
+            "a Setup-covered entry is named without a notice",
+        );
     }
 
     fn setups(&self) -> usize {
@@ -142,6 +276,9 @@ impl broca_core::CompactionPlane for Compactor {
         _: u64,
     ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
     {
+        if method == "compaction.setup" {
+            self.read_session().await;
+        }
         self.methods.lock().unwrap().push(method.to_owned());
         self.bodies
             .lock()
@@ -176,8 +313,8 @@ impl broca_core::CompactionPlane for Compactor {
                 None => json!({"answer": "nothing"}),
                 Some(ordinal) => {
                     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
-                    // An ordinal no notice named gives an id no message has, which the session
-                    // refuses; the scenario then finds its view unapplied.
+                    // A missing entry gives an id no message has, which the session refuses;
+                    // the scenario then finds its view unapplied.
                     let mid = self
                         .mids
                         .lock()
@@ -273,6 +410,7 @@ fn noting(noter: &Arc<Noter>) -> Planes {
 /// executor offering its own planes.
 struct Pair {
     today: Today,
+    backend: &'static MemoryBackend,
     commands: mpsc::UnboundedSender<LineageCmd>,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     store: Arc<LoopExecutor>,
@@ -345,6 +483,7 @@ impl Pair {
         let served = tokio::spawn(actor.serve(receiver));
         Self {
             today,
+            backend,
             commands,
             served,
             store: executor,
@@ -900,6 +1039,8 @@ async fn compacting_pair_in(
         Arc::new(Compactor::default()),
     );
     let pair = Pair::new_in(script, gated, compacting(&old), compacting(&new), cipher).await;
+    old.reads_today(Arc::clone(&pair.today.wal), pair.today.key.clone());
+    new.reads_memory(pair.backend);
     (pair, old, new)
 }
 
@@ -1071,8 +1212,18 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         .map(|(_, body)| body.clone())
         .collect();
     assert!(!new_notices.is_empty());
+    // Today's loop never ties its reading to a view; the new loop names the view each reading's
+    // request was rendered under, none here (`0`). Apart from that member the notices match.
+    let without_view = |notice: &Value| {
+        let mut notice = notice.clone();
+        let conditions = notice["conditions"].as_object_mut().unwrap();
+        let view = conditions.remove("last_prompt_view");
+        let expected = conditions.get("last_prompt_tokens").map(|_| json!(0));
+        assert_eq!(view, expected, "{notice:?}");
+        masked(&notice)
+    };
     assert_eq!(
-        new_notices.iter().map(masked).collect::<Vec<_>>(),
+        new_notices.iter().map(without_view).collect::<Vec<_>>(),
         old_notices.iter().map(masked).collect::<Vec<_>>()
     );
     for notice in &new_notices {

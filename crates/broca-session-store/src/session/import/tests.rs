@@ -4,7 +4,7 @@ use broca_protocol::request::ModelHandle;
 use futures::executor::block_on;
 use sha2::{Digest as _, Sha256};
 
-use super::{is_broca_id_form, NewInputMedia};
+use super::{is_broca_id_form, NewInputMedia, MAX_BATCH_RECORDS};
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend as _};
 use crate::codec::{hex, DecodeErrorKind, Message as _};
 use crate::head::SessionTriple;
@@ -19,6 +19,8 @@ cipher_tests!(
     an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal,
     a_damaged_id_map_reads_as_damage,
     turn_facts_attach_to_their_message,
+    an_import_larger_than_one_batch_reads_back_whole,
+    a_replacement_keeps_the_session_and_takes_its_place_once_published,
 );
 
 fn triple() -> SessionTriple {
@@ -161,15 +163,33 @@ fn receipt() -> ImportReceipt {
             ImportedMove {
                 mid: "msg_u1".into(),
                 ordinal: Some(1),
+                finished_summary: None,
             },
             ImportedMove {
                 mid: "msg_sys".into(),
                 ordinal: None,
+                finished_summary: None,
             },
         ],
         imported_messages: 3,
         dropped_system_messages: 1,
     }
+}
+
+#[test]
+fn import_receipts_without_finished_summary_remain_readable() {
+    let old = receipt();
+    let decoded = ImportReceipt::decode(&old.encode()).unwrap();
+    assert_eq!(decoded, old);
+    assert!(decoded
+        .moves
+        .iter()
+        .all(|row| row.finished_summary.is_none()));
+    let mut plugin = old.clone();
+    plugin.moves[0].finished_summary = Some(true);
+    plugin.moves[1].finished_summary = Some(false);
+    assert_eq!(ImportReceipt::decode(&plugin.encode()).unwrap(), plugin);
+    assert_ne!(plugin.encode(), old.encode());
 }
 
 /// An imported history of three messages, the first carrying an image, each message followed
@@ -435,5 +455,131 @@ fn turn_facts_attach_to_their_message(cipher: Cipher) {
         let entry = loaded.entries(1, 1).await.unwrap().remove(0);
         assert_eq!(entry.state.turn, Some(turn));
         assert_eq!(entry.state.facts.unwrap().mid, "msg_a");
+    });
+}
+
+/// An import of more records than one log batch holds is appended in as many batches as it
+/// needs, and reads back whole, after a reload too.
+fn an_import_larger_than_one_batch_reads_back_whole(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), true)
+            .await
+            .unwrap();
+        // Each message is an input and its facts: one record more than a batch holds in all.
+        let messages = MAX_BATCH_RECORDS as u64 / 2;
+        let mut records = vec![start("seed", true)];
+        let mut ids = Vec::new();
+        for n in 1..=messages {
+            let role = if n % 2 == 1 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let content = vec![text(&format!("message {n}"))];
+            records.push(input("seed", Placement::Imported, role, content));
+            records.push(facts(n, &format!("msg_{n}")));
+            ids.push((format!("msg_{n}"), n));
+        }
+        records.push(end("seed"));
+        assert!(records.len() > MAX_BATCH_RECORDS);
+        let first = session.next_seq();
+        let (at, appended) = session
+            .append_import(&records, Vec::new(), ids, &receipt())
+            .await
+            .unwrap();
+        assert_eq!(at, first);
+        assert_eq!(appended.len(), records.len());
+        assert_eq!(session.next_seq(), first + records.len() as u64);
+        assert_eq!(session.conversation.placed, messages);
+        session.close().await.unwrap();
+
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(loaded.conversation.placed, messages);
+        assert!(loaded.operations.run.as_ref().unwrap().finished.is_some());
+        assert_eq!(loaded.import_receipt().await.unwrap(), Some(receipt()));
+        for n in [1, messages / 2, messages] {
+            assert_eq!(
+                loaded.find_message(&format!("msg_{n}")).await.unwrap(),
+                Some(n)
+            );
+            let entry = loaded.entries(n, 1).await.unwrap().remove(0);
+            assert_eq!(entry.message.content, vec![text(&format!("message {n}"))]);
+            assert_eq!(entry.state.facts.unwrap().mid, format!("msg_{n}"));
+        }
+    });
+}
+
+/// A replacement staged elsewhere is the same session (id, triple, incarnation, mode) with a log
+/// of its own, and lists the replaced session's log for deletion. Once its log, objects and head
+/// are in place of the replaced session's, the writer takes the reloaded session in, and the
+/// observer of its appends is told the history was replaced. A session that changed its log is
+/// never replaced.
+fn a_replacement_keeps_the_session_and_takes_its_place_once_published(cipher: Cipher) {
+    use std::sync::{Arc, Mutex};
+    let live = MemoryBackend::default();
+    let staging = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&live, addr(), triple(), &deployment(cipher), true)
+            .await
+            .unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let observer = Arc::clone(&told);
+        session.observe_appends(Box::new(move |appended| {
+            observer.lock().unwrap().push(match appended {
+                crate::session::Appended::Records { .. } => "records",
+                crate::session::Appended::Synced => "synced",
+                crate::session::Appended::Replaced => "replaced",
+            })
+        }));
+        let (replaced, _) = session.open_log();
+        let mut staged = session.stage_replacement(&staging, 77).await.unwrap();
+        assert_eq!(staged.head().session_id, session.head().session_id);
+        assert_eq!(staged.head().triple, session.head().triple);
+        assert_eq!(staged.head().incarnation, session.head().incarnation);
+        assert_eq!(staged.head().cipher, session.head().cipher);
+        assert_ne!(staged.open_log().0, replaced);
+        assert_eq!(staged.next_seq(), session.next_seq());
+        let pending = &staged.head().pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].logs, vec![replaced]);
+        assert_eq!(pending[0].unreferenced_at_ms, 77);
+        let (records, media, ids) = import_batch(b"image");
+        staged
+            .append_import(&records, media, ids, &receipt())
+            .await
+            .unwrap();
+        drop(staged);
+
+        // Published by hand: the staged log and objects beside the live ones, then the head.
+        for log in staging.log_names(&addr()) {
+            let end = staging.log_end(&addr(), &log).await.unwrap();
+            let bytes = staging.read_log(&addr(), &log, 0..end).await.unwrap();
+            live.set_log(&addr(), &log, bytes);
+        }
+        for name in staging.object_names(&addr()) {
+            let bytes = staging.get_object(&addr(), &name).await.unwrap().unwrap();
+            live.set_object(&addr(), &name, bytes);
+        }
+        let (head, _) = staging.read_head(&addr()).await.unwrap().unwrap();
+        let at = session.head_version();
+        live.write_head(&addr(), &head, Some(at), at + 1)
+            .await
+            .unwrap();
+        let reloaded = Session::load(&live, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        session.replace_with(reloaded);
+        assert_eq!(*told.lock().unwrap(), ["replaced"]);
+        assert_eq!(session.conversation.placed, 3);
+        assert_eq!(session.find_message("msg_a1").await.unwrap(), Some(2));
+        assert_eq!(session.import_receipt().await.unwrap(), Some(receipt()));
+        assert_eq!(session.head().pending[0].logs, vec![replaced]);
+
+        // The published session changed its log once sealed, so it is never replaced.
+        session.seal(None, 0).await.unwrap();
+        assert!(session.stage_replacement(&staging, 78).await.is_err());
     });
 }

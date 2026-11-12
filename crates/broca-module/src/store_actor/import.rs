@@ -3,13 +3,23 @@
 
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::record::{Record, ViewApplied};
+use broca_session_store::session::SessionError;
 use broca_wire::head_import::InstallViewReply;
 
 use super::StoreActor;
 use crate::store_import::{
-    delete_sources, payload_digest, read_source, reply_of, seed, ImportCommand, ImportRefusal,
-    InstallViewCommand, SeedFacts, StoreCommand, StoreOutcome,
+    delete_sources, newest_of_entry, payload_digest, read_source, reply_of, seed, ImportCommand,
+    ImportRefusal, InstallViewCommand, SeedFacts, StoreCommand, StoreOutcome,
 };
+use crate::store_import_stage::ImportStaging;
+
+/// What an import's command says of its seed besides its history.
+struct ImportFacts<'a> {
+    params: &'a broca_wire::head_import::FileImportParams,
+    principal: &'a broca_protocol::BindPrincipal,
+    scope: Option<&'a broca_protocol::SessionScope>,
+    now_ms: u64,
+}
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Serves a command only this storage serves. Returns the outcome, and whether the actor
@@ -59,14 +69,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The reply this session's import kept.
     async fn stored_reply(&self) -> StoreOutcome {
         match self.session.import_receipt().await {
-            Ok(Some(receipt)) => match reply_of(
-                &receipt,
-                self.session.operations.history_version,
-                self.incarnation(),
-            ) {
-                Ok(reply) => StoreOutcome::Imported(reply),
-                Err(refusal) => StoreOutcome::Refused(refusal),
-            },
+            Ok(Some(receipt)) => self.reply_from_receipt(&receipt).await,
             Ok(None) => StoreOutcome::Refused(ImportRefusal::new(
                 "session_exists",
                 "the session exists and holds no import",
@@ -75,6 +78,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "session_needs_recovery",
                 format!("the session's import receipt could not be read: {error:?}"),
             )),
+        }
+    }
+
+    /// Imported inputs and their entry facts are immutable. Read the receipt's last imported
+    /// ordinal, never the current session head, so views and later owner runs cannot change the
+    /// import's newest. Reprojection also supports receipts written before newest was served.
+    async fn reply_from_receipt(
+        &self,
+        receipt: &broca_session_store::record::ImportReceipt,
+    ) -> StoreOutcome {
+        let expected = receipt
+            .moves
+            .iter()
+            .find(|row| row.ordinal == Some(receipt.imported_messages));
+        let entries = match self.session.entries(receipt.imported_messages, 1).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                return StoreOutcome::Refused(ImportRefusal::new(
+                    "session_needs_recovery",
+                    format!("the import's newest entry could not be read: {error:?}"),
+                ))
+            }
+        };
+        let Some(entry) = entries.first().filter(|entry| {
+            entry.ordinal == receipt.imported_messages
+                && entry
+                    .state
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| expected.is_some_and(|row| row.mid == facts.mid))
+        }) else {
+            return StoreOutcome::Refused(ImportRefusal::new(
+                "session_needs_recovery",
+                "the import's newest entry is no longer retained under its recorded id",
+            ));
+        };
+        let newest = match newest_of_entry(entry) {
+            Ok(newest) => newest,
+            Err(refusal) => return StoreOutcome::Refused(refusal),
+        };
+        match reply_of(
+            receipt,
+            self.session.operations.history_version,
+            self.incarnation(),
+            newest,
+        ) {
+            Ok(reply) => StoreOutcome::Imported(reply),
+            Err(refusal) => StoreOutcome::Refused(refusal),
         }
     }
 
@@ -87,19 +138,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             now_ms,
         } = command;
         let digest = payload_digest(&params);
-        // A retry: the session's seeded run names this key. The same payload is answered from
-        // the receipt, after the source is gone; another payload under the key is refused.
-        let seeded = self
-            .session
-            .operations
-            .owner
-            .first_start
-            .as_ref()
-            .filter(|start| start.seeded == Some(true))
-            .map(|start| (start.send_id.clone(), start.request_identity_digest.clone()));
-        if let Some((key, stored)) = seeded {
-            if key.as_deref() == Some(params.import_id.as_str()) {
-                if stored.as_deref() != Some(digest.as_str()) {
+        // The receipt survives source deletion and the first real owner run, whose start
+        // replaces the seed as the session's admitting episode.
+        if self.session.operations.imported_ids.is_some() {
+            let receipt = match self.session.import_receipt().await {
+                Ok(Some(receipt)) => receipt,
+                other => {
+                    return (
+                        StoreOutcome::Refused(ImportRefusal::new(
+                            "session_needs_recovery",
+                            format!("the import receipt could not be read: {other:?}"),
+                        )),
+                        false,
+                    )
+                }
+            };
+            if receipt.import_id == params.import_id {
+                if receipt.digest != digest {
                     return (
                         StoreOutcome::Refused(ImportRefusal::new(
                             "send_id_reuse",
@@ -179,46 +234,138 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 )
             }
         };
-        let prefix = self.session.message_id_prefix();
-        let facts = SeedFacts {
+        // The import is written into a replacement of this empty session in a private staging
+        // folder, in as many batches as it needs, and published whole over it (see
+        // `store_import_stage`).
+        let Some(staging) = self.import_staging.clone() else {
+            return (
+                StoreOutcome::Refused(ImportRefusal::new(
+                    "internal_error",
+                    "this session has nowhere to stage an import",
+                )),
+                false,
+            );
+        };
+        let attempt = broca_session_store::codec::hex(&broca_session_store::keys::random_id().0);
+        let facts = ImportFacts {
             params: &params,
             principal: &principal,
             scope: scope.as_ref(),
             now_ms,
-            prefix: &prefix,
-            first_seq: self.session.next_seq(),
         };
-        let seed = match seed(history, &facts) {
-            Ok(seed) => seed,
-            Err(refusal) => return (StoreOutcome::Refused(refusal), false),
+        let written = self
+            .import_staged(staging.as_ref(), &attempt, history, &facts)
+            .await;
+        // A published attempt's staging folder holds nothing more, and a failed one's is never
+        // published.
+        staging.discard(&attempt);
+        let receipt = match written {
+            Ok(receipt) => receipt,
+            Err((refusal, exit)) => return (StoreOutcome::Refused(refusal), exit),
         };
-        if let Err(error) = self
+        delete_sources(&roots, params.source.harness, &path);
+        (self.reply_from_receipt(&receipt).await, false)
+    }
+
+    /// Writes the import of `history` into a replacement of this session staged as `attempt`,
+    /// then publishes it over this session and takes the published session in. Returns the
+    /// import's receipt, or the refusal and whether the actor must go away: once publishing has
+    /// begun, the session on disk may be either one, and the next open reads which.
+    async fn import_staged(
+        &mut self,
+        staging: &dyn ImportStaging<B>,
+        attempt: &str,
+        history: ck_session_import::head::HeadHistory,
+        facts: &ImportFacts<'_>,
+    ) -> Result<broca_session_store::record::ImportReceipt, (ImportRefusal, bool)> {
+        let write_failed = |error: String| {
+            ImportRefusal::new(
+                "import_write_failed",
+                format!("the import could not be written: {error}"),
+            )
+        };
+        let refused = |error: SessionError| match error {
+            SessionError::Media(media) => ImportRefusal::new(
+                "import_media_refused",
+                format!("a medium could not be stored: {media:?}"),
+            ),
+            other => write_failed(format!("{other:?}")),
+        };
+        // Until the publication, nothing is written to the live session, so it stays as it
+        // was, and the actor goes on serving it.
+        let backend = staging
+            .begin(attempt)
+            .map_err(|error| (write_failed(error), false))?;
+        let mut staged = self
             .session
-            .append_import(&seed.records, seed.media, seed.ids, &seed.receipt)
+            .stage_replacement(backend, (self.now_ms)())
+            .await
+            .map_err(|error| (refused(error), false))?;
+        let prefix = staged.message_id_prefix();
+        let seed = seed(
+            history,
+            &SeedFacts {
+                params: facts.params,
+                principal: facts.principal,
+                scope: facts.scope,
+                now_ms: facts.now_ms,
+                prefix: &prefix,
+                first_seq: staged.next_seq(),
+            },
+        )
+        .map_err(|refusal| (refusal, false))?;
+        let prepared = staged
+            .prepare_import(&seed.records, seed.media, seed.ids, &seed.receipt)
+            .await
+            .map_err(|error| (refused(error), false))?;
+        self.import_step("before_first_batch").await;
+        let mut batches = prepared.records.chunks(self.import_batch).peekable();
+        while let Some(batch) = batches.next() {
+            staged
+                .append_import_batch(&prepared, batch)
+                .await
+                .map_err(|error| (refused(error), false))?;
+            if batches.peek().is_some() {
+                self.import_step("between_batches").await;
+            }
+        }
+        self.import_step("after_last_batch").await;
+        drop(staged);
+        let addr = self.session.address().clone();
+        if let Err(error) = staging
+            .publish(attempt, &addr, self.session.head_version())
             .await
         {
-            let refusal = match error {
-                broca_session_store::session::SessionError::Media(media) => ImportRefusal::new(
-                    "import_media_refused",
-                    format!("a medium could not be stored: {media:?}"),
-                ),
-                other => ImportRefusal::new(
-                    "import_write_failed",
-                    format!("the import could not be written: {other:?}"),
-                ),
-            };
-            // Nothing of the batch is durable, but the writer may be poisoned: the session
-            // reloads on its next open.
-            return (StoreOutcome::Refused(refusal), true);
+            // The head may have been replaced before the failure, so this writer's session may
+            // no longer be the stored one: the actor goes away, and the next open reads which
+            // it is. Nor may its close delete the session as one it created and left untouched.
+            self.created = None;
+            return Err((write_failed(error), true));
         }
-        delete_sources(&roots, params.source.harness, &path);
-        match reply_of(
-            &seed.receipt,
-            self.session.operations.history_version,
-            self.incarnation(),
-        ) {
-            Ok(reply) => (StoreOutcome::Imported(reply), false),
-            Err(refusal) => (StoreOutcome::Refused(refusal), false),
+        self.import_step("after_publish").await;
+        let triple = self.session.head().triple.clone();
+        let published = staging.load(addr, &triple).await.map_err(|error| {
+            self.created = None;
+            (
+                ImportRefusal::new(
+                    "session_needs_recovery",
+                    format!("the published import could not be loaded: {error:?}"),
+                ),
+                true,
+            )
+        })?;
+        self.session.replace_with(published);
+        // The published session is a new history, which the index of the empty one it replaced
+        // never saw: the index starts again from what the published session's open hands over.
+        self.reopen_media().await;
+        Ok(seed.receipt)
+    }
+
+    /// Where a test stops an import as a crash would; nothing outside tests.
+    async fn import_step(&self, _step: &'static str) {
+        #[cfg(test)]
+        if let Some(cut) = &self.import_cut {
+            cut.hold(_step).await;
         }
     }
 

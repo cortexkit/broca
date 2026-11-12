@@ -206,6 +206,7 @@ fn today_at(
         provider: Gated {
             render_config: None,
             notes_sends: false,
+            hold: None,
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
         },
@@ -1476,6 +1477,7 @@ async fn module_options_with_render(
             provider: Gated {
                 render_config,
                 notes_sends: false,
+                hold: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },
@@ -1875,6 +1877,8 @@ mod step_events;
 mod streams;
 mod warm;
 
+#[cfg(feature = "test-clock")]
+mod account_limit_pause;
 mod held;
 
 #[tokio::test]

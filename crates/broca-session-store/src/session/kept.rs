@@ -265,3 +265,21 @@ impl<B: SessionBackend> Session<B> {
 
 #[cfg(test)]
 mod tests;
+
+impl KeptRecords {
+    /// What the kept records hold, estimated by walking them (see `crate::held`): their
+    /// contents, each slot of the buffer they fill included, and the buffer's slots beyond them.
+    pub(crate) fn held_bytes(&self) -> (usize, usize) {
+        use crate::held::HeldBytes;
+        let slot = std::mem::size_of::<(u64, Record)>();
+        let contents = self.records.len() * slot
+            + self
+                .records
+                .iter()
+                .map(|(_, record)| record.heap_bytes())
+                .sum::<usize>()
+            + self.latest_start.heap_bytes();
+        let spare = (self.records.capacity() - self.records.len()) * slot;
+        (contents, spare)
+    }
+}

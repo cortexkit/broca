@@ -138,6 +138,16 @@ fn mismatch(check: &'static str, detail: impl Into<String>) -> Mismatch {
     }
 }
 
+/// The zero-based ordinals of the staged session's replies its reads serve cleaned of tag
+/// notation (`broca_module::store_read::clean_reply_ordinals`).
+async fn clean_replies<B: SessionBackend>(
+    view: &Session<B>,
+) -> Result<std::collections::BTreeSet<u64>, Mismatch> {
+    broca_module::store_read::clean_reply_ordinals(view)
+        .await
+        .map_err(|error| mismatch(READ, format!("the staged entry facts: {error:?}")))
+}
+
 /// Fails `check` where `store` first differs from `today`, naming `what` was compared.
 fn same(check: &'static str, what: &str, store: &Value, today: &Value) -> Result<(), Mismatch> {
     if store == today {
@@ -455,7 +465,7 @@ async fn runs<B: SessionBackend>(
 }
 
 /// The read modes: whether each asks for display facts, tools and Rich UI.
-const READ_MODES: [(&str, bool, bool, bool); 5] = [
+pub(crate) const READ_MODES: [(&str, bool, bool, bool); 5] = [
     ("default", false, false, false),
     ("display_facts", true, false, false),
     ("tools", false, true, false),
@@ -465,7 +475,7 @@ const READ_MODES: [(&str, bool, bool, bool); 5] = [
 
 /// How many messages a compared page asks for. Small, so a session's pages are many and their
 /// boundaries are compared too.
-const PAGE: u64 = 7;
+pub(crate) const PAGE: u64 = 7;
 
 /// A page's members beside its messages, as compared: all of them but the ones a moved session
 /// changes by design (the log's incarnation and history version, and the subscribe cursor).
@@ -485,7 +495,13 @@ async fn reads<B: SessionBackend>(
     view: &Session<B>,
     parts: &MemoryParts,
 ) -> Result<(), Mismatch> {
-    let todays = Todays::new(verify.records, lineage);
+    // The new storage serves a reply cleaned of tag notation where its run cleans replies, which
+    // today's storage doesn't: today's side is compared as this build exposes the same session.
+    let todays =
+        Todays::new(verify.records, lineage).with_clean_replies(clean_replies(view).await?);
+    let reader = broca_module::store_read::ViewReader::new(view, parts)
+        .await
+        .map_err(|error| mismatch(READ, format!("the stream head can't be read: {error:?}")))?;
     for (mode, display_facts, tools, rich_ui) in READ_MODES {
         let mut from = 1;
         loop {
@@ -495,7 +511,7 @@ async fn reads<B: SessionBackend>(
             request.include_tools = tools;
             request.include_rich_ui = rich_ui;
             let today = todays.read(&request);
-            let store = broca_module::store_read::serve_view(view, parts, &request).await;
+            let store = reader.read(&request).await;
             let at = format!("{mode} page from {from}");
             let (today, store) = match (today, store) {
                 (Ok(today), Ok(store)) => (today, store),
@@ -934,6 +950,7 @@ async fn head<B: SessionBackend>(
             .map(str::to_owned),
         mode3,
         updated_at: Some(updated_at),
+        resume_not_before_ms: broca_module::store_head::account_limit_resume_of(records),
     });
     let built = broca_module::store_head::build(view, parts, true)
         .await
@@ -1573,7 +1590,7 @@ fn scratch_progress(
 
 /// The walks `session.history` is read by: each form, from the newest page by `older` cursors
 /// and from the first message by `newer` cursors.
-const HISTORY_WALKS: [(&str, bool); 4] = [
+pub(crate) const HISTORY_WALKS: [(&str, bool); 4] = [
     ("raw", true),
     ("raw", false),
     ("display", true),
@@ -1582,7 +1599,7 @@ const HISTORY_WALKS: [(&str, bool); 4] = [
 
 /// Every page of one walk of `session.history` over `handler`, as `broca_module::history::read`
 /// serves them, ending at a refusal if one comes.
-async fn history_pages(
+pub(crate) async fn history_pages(
     handler: &dyn broca_module::ServeHandler,
     session: &BindIdentity,
     form: &str,
@@ -1618,8 +1635,9 @@ async fn history_pages(
 }
 
 /// `session.history` in both forms, every page of every walk, compared whole. Today's side is
-/// given the staged session's incarnation and history version, which each storage keeps for
-/// itself, so cursors compare as the positions they hold.
+/// given the staged session's incarnation and the history version it serves, which each storage
+/// keeps for itself, so cursors compare as the positions they hold, and serves the replies the
+/// staged session cleans cleaned.
 async fn history_walks(
     verify: &Verify<'_>,
     lineage: Option<&str>,
@@ -1631,13 +1649,13 @@ async fn history_walks(
         verify.records,
         lineage,
         broca_session_store::codec::hex(&head.incarnation.0),
-        head.history_version,
+        broca_module::store_exposure::served_history_version(head.history_version),
     )
-    .map_err(|error| mismatch(HISTORY_DISPLAY, format!("today's history: {error:?}")))?;
-    let staged = crate::stored_history::StoredHistory {
-        session: view,
-        parts,
-    };
+    .map_err(|error| mismatch(HISTORY_DISPLAY, format!("today's history: {error:?}")))?
+    .with_clean_replies(clean_replies(view).await?);
+    let staged = crate::stored_history::StoredHistoryWalk::new(view, parts)
+        .await
+        .map_err(|error| mismatch(HISTORY_DISPLAY, format!("the staged history: {error:?}")))?;
     for (form, newest) in HISTORY_WALKS {
         let walk = format!(
             "{form} from the {}",

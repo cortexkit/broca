@@ -58,6 +58,7 @@ async fn gated_module_in(
             provider: Gated {
                 render_config: None,
                 notes_sends: false,
+                hold: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },
@@ -519,10 +520,9 @@ async fn a_planned_session_heads_alike() {
 }
 
 /// A store session whose latest run is still running with no live actor holding it was left by
-/// a process that stopped without ending the run: the head reads it interrupted, naming no
-/// reason, where a live actor's run reads active. Opening the session ends the run interrupted
-/// with the crash named, and the head serves that reason, also once a seal has moved the run's
-/// end out of the open log.
+/// a process that stopped without ending the run. The first head read recovers it and names
+/// the crash, where a live actor's run reads active. Reopening and sealing the session keep
+/// the interrupted terminal and its reason unchanged.
 #[tokio::test]
 async fn a_run_no_live_actor_holds_reads_interrupted() {
     let store = gated_module(true, vec![text_step("a1", "hello")], None).await;
@@ -554,7 +554,7 @@ async fn a_run_no_live_actor_holds_reads_interrupted() {
     let left = head_json(&store, None).await;
     assert_eq!(
         left["last_run_state"],
-        serde_json::json!({"run_id": "r2", "state": "interrupted"})
+        serde_json::json!({"run_id": "r2", "state": "interrupted", "reason": "runner_crash"})
     );
     drop(
         store

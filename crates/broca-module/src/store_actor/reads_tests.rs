@@ -31,6 +31,8 @@ use crate::store_reads::{
 };
 use crate::store_status::SettledRuns;
 
+mod capability_tests;
+
 /// A memory backend that records how far the session's log is written and how far a barrier
 /// made it durable, and can fail the next barrier.
 #[derive(Default)]
@@ -826,6 +828,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Baseline(facts) => format!("{facts:?}"),
+        StoreReadReply::PlanView(reply) => format!("{reply:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
         StoreReadReply::AuthorizationSubmissionSender(sender) => format!("{sender:?}"),
@@ -1143,6 +1146,78 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         .await;
 }
 
+#[tokio::test]
+async fn store_read_future_keeps_recovery_off_the_callers_stack() {
+    let m = module(Vec::new()).await;
+    let runtime = m.runtime();
+    let read = runtime.read(&m.registry, &m.key, StoreReadRequest::Head);
+    assert!(
+        std::mem::size_of_val(&read) < 4096,
+        "composed request futures must not inline the actor-opening recovery future: {} bytes",
+        std::mem::size_of_val(&read)
+    );
+    drop(read);
+    assert!(m.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn paused_session_reads_stay_in_the_view_without_opening_an_actor() {
+    for reason in [
+        broca_protocol::PauseReason::AuthRequired,
+        broca_protocol::PauseReason::AccountLimit,
+    ] {
+        let m = module(vec![text_step("a1", "seed")]).await;
+        active(m.send("r1", "seed").await);
+        m.gate.notify_one();
+        m.ended("r1", "completed").await;
+        m.close().await;
+        let mut writer = m.writer().await;
+        let mut start = writer
+            .operations
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .clone()
+            .unwrap();
+        start.run_id = "paused".into();
+        start.submission_id = None;
+        start.send_id = None;
+        writer
+            .append(
+                &[
+                    Record::RunStart(Box::new(start)),
+                    Record::Pause(broca_session_store::record::Pause {
+                        run_id: "paused".into(),
+                        reason,
+                        ts_ms: None,
+                        error: None,
+                        account_limit: None,
+                    }),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let before = m.backend().read_stored_head(&m.addr()).unwrap();
+        for request in [
+            StoreReadRequest::Head,
+            StoreReadRequest::RunStatusReply(RunId("paused".into())),
+        ] {
+            let expected = shape(m.fresh(&request).await);
+            let actual = shape(m.served(&request).await);
+            assert_eq!(actual, expected, "{reason:?}: {request:?}");
+            assert!(
+                m.registry.slot_state(&m.key).is_none(),
+                "{reason:?} reads must not open an actor"
+            );
+        }
+        assert_eq!(m.backend().read_stored_head(&m.addr()).unwrap(), before);
+        assert!(m.registry.stop_and_seal().await);
+    }
+}
+
 /// A session deleted and created again with the same history reads as the new session: its kept
 /// view is never served for it, though the new session's head versions and log length can equal
 /// the old one's, since the new session's log is another log.
@@ -1183,4 +1258,142 @@ async fn a_session_created_again_is_read_fresh() {
     assert_ne!(shape(after), before, "a new incarnation");
     m.compare(&reads(&["r1"]), "the session created again")
         .await;
+}
+
+/// Every llm-runner surface serves a store session's history version one above the version its
+/// head stores (`store_exposure::EXPOSURE_EPOCH`), from the session's first read on, and takes a
+/// caller's version back the same way: a page asked for at the served version is served, and one
+/// asked for at the stored version, which an earlier build served, is refused as after any
+/// rewrite. A revert raises both by one.
+#[tokio::test]
+async fn the_served_history_version_is_the_stored_one_past_the_exposure_epoch() {
+    use crate::serve::{ServeError, ServeHandler, SessionReadRequest};
+    use crate::store_exposure::{served_history_version, EXPOSURE_EPOCH};
+    assert_eq!(EXPOSURE_EPOCH, 1);
+    let m = module(vec![text_step("a1", "one"), text_step("b1", "two")]).await;
+    active(m.send("r1", "first").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    active(m.send("r2", "second").await);
+    m.gate.notify_one();
+    m.ended("r2", "completed").await;
+
+    let read = m
+        .registry
+        .read(SessionReadRequest::new(m.key.clone(), Some(1), None))
+        .await
+        .unwrap();
+    assert_eq!(read.history_version, 1, "a new session serves version 1");
+    let head = m.registry.head(&m.key).await.unwrap();
+    assert_eq!(head.history_version, 1);
+    let history = crate::history::read(
+        &m.registry,
+        &m.key,
+        &serde_json::from_value(serde_json::json!({"from_ordinal": 1})).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history["history_version"], 1);
+
+    // `after_mid` at the served version pages on; at the stored one it is refused.
+    let after = |version| {
+        let mut request = SessionReadRequest::new(m.key.clone(), None, None);
+        request.after_mid = Some(read.messages[0].mid.clone());
+        request.history_version = Some(version);
+        request
+    };
+    let next = m.registry.read(after(1)).await.unwrap();
+    assert_eq!(next.messages[0].ordinal, 2);
+    assert!(matches!(
+        m.registry.read(after(0)).await,
+        Err(ServeError::HistoryChanged)
+    ));
+
+    // A revert to r2's input raises the stored version, and the served one with it.
+    m.close().await;
+    let mut writer = m.writer().await;
+    assert_eq!(writer.head().history_version, 0);
+    let (ordinal, target) = entry_of(&writer, "second").await;
+    let records = writer.records_from(1).await.unwrap();
+    let mut start = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::RunStart(start) if start.run_id == "r2" => Some(start.clone()),
+            _ => None,
+        })
+        .expect("r2's start");
+    start.run_id = "r9".into();
+    start.send_id = Some("s9".into());
+    let input = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::Input(input) if input.run_id == "r2" => {
+                let mut input = input.clone();
+                input.run_id = "r9".into();
+                Some(input)
+            }
+            _ => None,
+        })
+        .expect("r2's input");
+    let facts = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::EntryFacts(facts) if facts.ordinal == ordinal => {
+                let mut facts = facts.clone();
+                facts.run_id = Some("r9".into());
+                Some(facts)
+            }
+            _ => None,
+        })
+        .expect("the input's entry facts");
+    writer
+        .revert(
+            &target,
+            vec![
+                Record::RunStart(start),
+                Record::Input(input),
+                Record::EntryFacts(facts),
+            ],
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    let stored = writer.head().history_version;
+    assert_eq!(stored, 1, "the revert raised the stored version");
+    writer.close().await.unwrap();
+    let view = Session::view(m.backend(), m.addr(), &m.triple(), &deployment_key())
+        .await
+        .unwrap();
+    let runtime = m.runtime();
+    let parts = runtime.parts_for(
+        broca_wal::StorageClass::Ordinary,
+        broca_session_store::keys::Cipher::XChaCha20Poly1305,
+    );
+    let page = |version: Option<u64>| {
+        let mut request = SessionReadRequest::new(m.key.clone(), Some(1), None);
+        request.history_version = version;
+        request
+    };
+    let reverted = crate::store_read::serve_view(&*view, parts, &page(None))
+        .await
+        .unwrap();
+    assert_eq!(reverted.history_version, served_history_version(stored));
+    assert_eq!(
+        reverted.history_version, 2,
+        "the served version rose by one"
+    );
+    assert!(crate::store_read::serve_view(&*view, parts, &page(Some(2)))
+        .await
+        .is_ok());
+    for stale in [0, 1] {
+        assert!(matches!(
+            crate::store_read::serve_view(&*view, parts, &page(Some(stale))).await,
+            Err(ServeError::HistoryChanged)
+        ));
+    }
+    let head = crate::store_entries::history_head_of(&*view, None)
+        .await
+        .unwrap();
+    assert_eq!(head.history_version, 2);
 }

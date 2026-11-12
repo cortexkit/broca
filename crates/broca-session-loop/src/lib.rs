@@ -29,6 +29,13 @@
 //! views, approval questions, budgets or the rest of today's loop yet. Each part it covers is
 //! proven against today's loop by the differential tests in `tests/`.
 
+// The memory budget tests count what their thread allocates (see `broca_test_support::alloc`).
+// Only the test binary installs the counting allocator.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: broca_test_support::alloc::CountingAlloc =
+    broca_test_support::alloc::CountingAlloc;
+
 pub mod admit;
 pub mod billing;
 pub mod budget;
@@ -54,3 +61,6 @@ pub use media::{HeldInputMedia, PendingMedia};
 pub use parts::{MemoryParts, Parts};
 pub use run::{resume, run, seal, AccountReports, Admission, Finished, LoopError, Seams};
 pub use writer::Writer;
+
+#[cfg(test)]
+mod step_budget_tests;

@@ -98,6 +98,7 @@ pub(crate) struct Observer {
     dropped: Arc<AtomicU64>,
     parts: broca_session_loop::parts::SharedParts,
     warm_stops: super::WarmStops,
+    message_ids: broca_session_loop::entries::MessageIds,
 }
 
 impl Observer {
@@ -122,7 +123,13 @@ impl Observer {
             dropped,
             parts,
             warm_stops,
+            message_ids: Default::default(),
         }
+    }
+
+    pub(crate) fn with_message_ids(mut self, ids: broca_session_loop::entries::MessageIds) -> Self {
+        self.message_ids = ids;
+        self
     }
 
     pub(crate) fn run_start(&mut self, start: &RunStart) {
@@ -210,6 +217,7 @@ impl Observer {
             }
             Appended::Synced => self.synced(position),
             Appended::Replaced => {
+                self.message_ids.clear();
                 self.unsynced.clear();
                 self.completed.clear();
             }
@@ -239,6 +247,10 @@ impl Observer {
                 };
                 let status = match attempt.outcome.as_str() {
                     "complete" => "completed",
+                    // run::record_attempt syncs tool_args_trailing_garbage before message
+                    // placement. Preserve its failed hint: it is published before its message
+                    // exists, so no message_id can be reported at this publication point.
+                    "tool_args_trailing_garbage" => "failed",
                     "cancelled" => "cancelled",
                     "unknown" | "sealed_in_flight" => "interrupted",
                     _ => "failed",
@@ -291,8 +303,21 @@ impl Observer {
                 }
             }
             Record::StepEnd(end) => {
+                let message_id = self.message_ids.take(&end.run_id, end.step_id);
                 if let Some(events) = self.completed.remove(&(end.run_id.clone(), end.step_id)) {
-                    for mut event in events {
+                    let last = events.len().saturating_sub(1);
+                    for (index, mut event) in events.into_iter().enumerate() {
+                        // Only the final completed attempt supplied the reply placed by this step.
+                        if index == last {
+                            event.message_id.clone_from(&message_id);
+                            if event.message_id.is_none() {
+                                tracing::warn!(target: "broca.step_events",
+                                    session_addr = %broca_core::session_addr(&self.bind),
+                                    session_ref = %event.session_ref, run_id = %end.run_id,
+                                    step_id = end.step_id,
+                                    "completed step has no assistant entry id; publishing without message_id");
+                            }
+                        }
                         apply_step_end(&mut event, end);
                         event.cache = self.cache(&event);
                         self.unsynced
@@ -350,6 +375,7 @@ impl Observer {
                 self.unsynced.push(finish(event, &envelope, false));
             }
             Record::RunEnd(end) => {
+                self.message_ids.forget_run(&end.run_id);
                 let keys: Vec<_> = self
                     .completed
                     .keys()

@@ -51,6 +51,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[path = "compaction/statement_seq.rs"]
+mod statement_seq;
+
 /// Serves scripted steps in order and records every request it was asked to send.
 #[derive(Clone)]
 struct ScriptedProvider {
@@ -125,6 +128,10 @@ impl ScriptedProvider {
         // markers ask for a lifetime; this provider still renders requests its own way.
         if cache() {
             return serde_json::to_value(cached_config()).expect("a frozen config serializes");
+        }
+        // The ride placement probe's tests freeze a real route, with or without the placement.
+        if let Some(route) = ride_placement::frozen_route() {
+            return serde_json::to_value(route).expect("a frozen config serializes");
         }
         let mut blob = json!({ "render_config": "stateless" });
         if let Some(structured) = structured() {
@@ -914,7 +921,8 @@ tokio::task_local! {
 
 tokio::task_local! {
     /// When set, the multi-run comparison adds here, once per comparison, the calls the new loop
-    /// made on its tool plane and compaction provider, after comparing them with today's.
+    /// made on its tool plane and compaction provider, after comparing them with today's (which
+    /// leaves out the new loop's `last_prompt_view`; these calls keep it).
     static NEW_CALLS: Arc<Mutex<Vec<Vec<String>>>>;
 }
 
@@ -1256,8 +1264,12 @@ const HARNESS_TIME_MS: u64 = 1;
 
 /// The time the new loop reads: today's loop reads the wall clock, so a comparison whose result
 /// depends on it does too; every other comparison reads [`HARNESS_TIME_MS`] and normalizes the
-/// times recorded.
+/// times recorded. A scoped account clock overrides both loops' time for a comparison that must
+/// remain on one side of a reset regardless of how long it takes to run.
 fn harness_now() -> u64 {
+    if let Ok(now) = ACCOUNT_CLOCK.try_with(|clock| clock.now_ms()) {
+        return now;
+    }
     if cache() || account().is_some() || fallback().is_some() {
         broca_core::clock::Clock::default().now_ms()
     } else {
@@ -1443,6 +1455,8 @@ tokio::task_local! {
     /// The provider account a comparison routes, with the boot cap on same-account waits.
     /// `None` routes no account, and no run may pause on one.
     static ACCOUNT: Option<AccountScript>;
+    /// A frozen clock for comparisons that must stay before the account's reset under load.
+    static ACCOUNT_CLOCK: broca_core::Clock;
 }
 
 #[derive(Clone)]
@@ -1767,6 +1781,14 @@ tokio::task_local! {
     static LOST: Lost;
 }
 
+tokio::task_local! {
+    /// The entries a resumed run's compaction provider reads for itself after its Setup, as a
+    /// real provider does with `session.entries`. A run resumed from a cut log sends no notice
+    /// repeating the window Setup covers (compaction N6), so without this read the provider
+    /// would never learn the ids of the entries written before the cut.
+    static PROVIDER_READ: Option<Arc<Value>>;
+}
+
 /// Where a restarted compaction provider first hears from the run again.
 #[derive(Clone, Copy, Debug)]
 enum Lost {
@@ -1778,16 +1800,42 @@ enum Lost {
 
 impl CompactionSpy {
     fn new(script: &CompactionScript) -> Self {
+        let mut mids = std::collections::BTreeMap::new();
+        let mut tool_parts = std::collections::BTreeMap::new();
+        if let Ok(Some(read)) = PROVIDER_READ.try_with(Clone::clone) {
+            remember_entries(&read, &mut mids, &mut tool_parts);
+        }
         Self {
             rides: Mutex::new(script.rides.iter().copied().collect()),
-            mids: Mutex::default(),
-            tool_parts: Mutex::default(),
+            mids: Mutex::new(mids),
+            tool_parts: Mutex::new(tool_parts),
             version: Default::default(),
             calls: Mutex::default(),
             lost: Mutex::new(LOST.try_with(|lost| *lost).ok()),
             notices: Default::default(),
             rides_asked: Default::default(),
         }
+    }
+
+    /// The spy as a provider that has read `session`'s entries for itself, as a real provider
+    /// reads `session.entries` after its Setup. A Setup names the newest entry, so no notice
+    /// repeats the window it covers (compaction N6); without this read a scripted view could not
+    /// name an entry written before the run's Setup. Returns the entries read.
+    async fn read_session(&self, session: &Session<&MemoryBackend>) -> Value {
+        let entries: Vec<_> = session
+            .compaction_entries(1, usize::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|stored| broca_session_loop::entries::project(stored).unwrap())
+            .collect();
+        let read = serde_json::to_value(entries).unwrap();
+        remember_entries(
+            &read,
+            &mut self.mids.lock().unwrap(),
+            &mut self.tool_parts.lock().unwrap(),
+        );
+        read
     }
 
     /// Whether this call is the one the script answers as a provider that lost its Setup; it is
@@ -1821,6 +1869,40 @@ impl CompactionSpy {
             .iter()
             .map(|(method, params)| {
                 let mut params = params.clone();
+                rename(&mut params, &mut names);
+                format!("{method} {params}")
+            })
+            .collect()
+    }
+
+    /// [`Self::calls`] without the conditions' `last_prompt_view`, for comparing the new loop's
+    /// calls with today's: today's loop never ties its reading to a view, so it never sends
+    /// the member, and the new loop's value is checked by tests of its own. The member never
+    /// comes without the reading it describes.
+    fn calls_but_prompt_view(&self) -> Vec<String> {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(members) => {
+                    if members.remove("last_prompt_view").is_some() {
+                        assert!(
+                            members.contains_key("last_prompt_tokens"),
+                            "a view named without a reading: {members:?}"
+                        );
+                    }
+                    members.values_mut().for_each(strip);
+                }
+                Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let mut names = std::collections::HashMap::new();
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, params)| {
+                let mut params = params.clone();
+                strip(&mut params);
                 rename(&mut params, &mut names);
                 format!("{method} {params}")
             })
@@ -1908,10 +1990,12 @@ impl broca_core::CompactionPlane for CompactionSpy {
     }
 
     /// The provider reads the signed floor, so both loops must report the same one.
-    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
-        Some(vec![
-            cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into(),
-        ])
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        let mut provides = vec![cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into()];
+        if statement_seq::declared() {
+            provides.push(cortexkit_role_compaction::COMPACTION_STATEMENT_SEQ_PROVIDES.into());
+        }
+        broca_core::ProviderCapabilities::Declared(provides)
     }
 
     async fn call_v2(
@@ -2660,7 +2744,7 @@ async fn new_from(
             .log()
             .iter()
             .map(|event| format!("{event:?}"))
-            .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
+            .chain(spy.map_or_else(Vec::new, |spy| spy.calls_but_prompt_view()))
             .collect(),
     }
 }
@@ -3220,9 +3304,22 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
             convert_unbilled(&frames, lineage(&cut_image).as_deref()).expect("the cut converts");
         let cut_records = converted.records.clone();
         let before = converted.records.len();
-        let (today, _, _) = today_from(&scenario, Some((&name, &bytes)), steps.clone()).await;
+        // The window the cut log holds, as the resumed run's compaction provider reads it.
+        let read = lineage(&cut_image)
+            .and_then(|lineage| {
+                broca_core::compaction_v2::transcript::project(&frames, &lineage).ok()
+            })
+            .map(|transcript| Arc::new(serde_json::to_value(&transcript.entries).unwrap()));
+        let (today, _, _) = PROVIDER_READ
+            .scope(
+                read.clone(),
+                Box::pin(today_from(&scenario, Some((&name, &bytes)), steps.clone())),
+            )
+            .await;
         eprintln!("cut after record {cut} of {records}");
-        let new = new_from(&scenario, Some(converted), steps).await;
+        let new = PROVIDER_READ
+            .scope(read, Box::pin(new_from(&scenario, Some(converted), steps)))
+            .await;
         let today_appended = &today.records[before.min(today.records.len())..];
         let context = format!("cut after record {cut} of {records}");
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
@@ -3826,7 +3923,10 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
             .log()
             .iter()
             .map(|event| format!("{event:?}"))
-            .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
+            .chain(
+                spy.as_ref()
+                    .map_or_else(Vec::new, |spy| spy.calls_but_prompt_view()),
+            )
             .collect(),
     };
 
@@ -3848,7 +3948,17 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     assert_eq!(new.records.len(), today.records.len(), "record count");
     assert_eq!(new.calls, today.calls, "tool calls");
     let _ = NEW_REQUESTS.try_with(|seen| seen.lock().unwrap().extend(new.requests.clone()));
-    let _ = NEW_CALLS.try_with(|seen| seen.lock().unwrap().push(new.calls.clone()));
+    // Every call as the new loop made it, `last_prompt_view` included.
+    let _ = NEW_CALLS.try_with(|seen| {
+        seen.lock().unwrap().push(
+            plane
+                .log()
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
+                .collect(),
+        )
+    });
 }
 
 #[tokio::test]
@@ -4313,6 +4423,16 @@ impl Provider for SteeringProvider {
     /// does, so both loops read a cancelled call's stream for its attempt in flight.
     fn reports_attempt_evidence(&self) -> bool {
         self.reports_attempts
+    }
+
+    /// In a ride placement test, the config the inner provider froze, which a resume there
+    /// checks against the run's. Every other comparison keeps the default stateless config
+    /// here, as it always has.
+    fn render_config_blob(&self) -> Value {
+        match ride_placement::frozen_route() {
+            Some(_) => self.inner.render_config_blob(),
+            None => json!({ "render_config": "stateless" }),
+        }
     }
 
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -5315,6 +5435,7 @@ async fn compare_auth_pause_in_once(
                     _ => account_selection(),
                 },
                 account_limit_pause: account().is_some(),
+                clock: ACCOUNT_CLOCK.try_with(Clone::clone).ok(),
                 max_same_account_wait: account()
                     .map_or_else(Default::default, |script| script.wait),
                 new_log_compaction_plan_version: layout(),
@@ -8557,15 +8678,28 @@ fn tool_then_limited(limited: Vec<NormalizedEvent>) -> Scenario {
 /// Asked to resume before the account resets, both loops leave the run paused and send nothing.
 #[tokio::test]
 async fn an_account_limit_pause_stays_paused_before_the_reset() {
-    compare_routed(
-        AccountScript {
-            selection: routed("acct-1"),
-            wait: broca_core::SameAccountWait::default(),
-            wait_for_reset: false,
-        },
-        compare_auth_pause(tool_then_limited(account_limited())),
-    )
-    .await;
+    let dir = broca_test_support::scratch_root().join(format!(
+        "account-clock-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("test-clock"), br#"{"now_ms":1000000}"#).unwrap();
+    let clock = broca_core::Clock::for_state_root(&dir).unwrap();
+    ACCOUNT_CLOCK
+        .scope(
+            clock,
+            compare_routed(
+                AccountScript {
+                    selection: routed("acct-1"),
+                    wait: broca_core::SameAccountWait::default(),
+                    wait_for_reset: false,
+                },
+                compare_auth_pause(tool_then_limited(account_limited())),
+            ),
+        )
+        .await;
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A resume whose requests can't be rendered until it waited for something (as a store run's
@@ -9391,6 +9525,22 @@ async fn an_enrolled_session_serves_and_renders_its_history_on_the_contract() {
                     .any(|call| call.contains("\"last_prompt_tokens\":100")),
                 "{calls:?}"
             );
+            // That step ran before the session was on the contract, under no view: every call
+            // naming its reading names view 0 beside it.
+            let readings = prompt_readings(&spy);
+            assert!(
+                readings_only(&readings)
+                    .iter()
+                    .filter(|(_, tokens, _)| *tokens == Some(100))
+                    .all(|(_, _, view)| *view == Some(0)),
+                "{readings:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.contains("\"last_prompt_tokens\":100,\"last_prompt_view\":0")),
+                "{calls:?}"
+            );
 
             // The entries: every message, the global system messages with no parts, with times.
             let raw = session.entries(1, usize::MAX).await.unwrap();
@@ -9552,6 +9702,7 @@ async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_r
                 context_limit: 1_200,
                 rides: vec![Ride::CutAndTrim(cut, big_call)],
             });
+            spy.read_session(&session).await;
             let mut enrolling = enrolling_run(vec![
                 answer(
                     "a6",
@@ -9817,7 +9968,7 @@ impl broca_core::CompactionPlane for SetupFailsOnce {
             .await
     }
 
-    async fn provider_capabilities(&self, module: &str) -> Option<Vec<String>> {
+    async fn provider_capabilities(&self, module: &str) -> broca_core::ProviderCapabilities {
         self.inner.provider_capabilities(module).await
     }
 }
@@ -10258,9 +10409,9 @@ async fn converted_with_global_system(
 }
 
 /// The converted session of [`converted_with_global_system`] enrolls through the new loop. Its
-/// global system message is suppressed: the plan's system text takes its place. The compaction
-/// provider is still told of it, as a system entry with no parts at ordinal 1, since the contract
-/// counts every message, so a view it builds can name that entry. A view that cuts through it,
+/// global system message is suppressed: the plan's system text takes its place. The entries the
+/// compaction provider reads still hold it, as a system entry with no parts at ordinal 1, since
+/// the contract counts every message, so a view it builds can name that entry. A view that cuts through it,
 /// besides trimming the run's big output, is accepted at the step where the provider answers
 /// with it and applies; the requests, and the next run's, render byte for byte as under the same
 /// view without the cut, since an entry with no parts renders nothing.
@@ -10284,6 +10435,7 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                 context_limit: 1_200,
                 rides: vec![ride],
             });
+            spy.read_session(&session).await;
             let mut enrolling = enrolling_run(vec![
                 answer(
                     "a6",
@@ -10303,15 +10455,14 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                 spy.calls()
             );
             assert_eq!(requests.len(), 2, "{:?}", spy.calls());
-            // The provider was told of the suppressed message's entry, with no parts.
-            let told = spy
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .flat_map(|(_, params)| told_entries(params))
+            // Once the run enrolled the session, the entries the provider reads hold the
+            // suppressed message's with no parts: the contract counts every message, so a view
+            // can name it.
+            let read = spy.read_session(&session).await;
+            let told = told_entries(&read)
+                .into_iter()
                 .find(|entry| entry["ordinal"] == 1)
-                .expect("the provider was told of ordinal 1");
+                .expect("the provider read ordinal 1");
             assert_eq!(told["role"], "system", "{told}");
             assert_eq!(told["parts"], json!([]), "{told}");
             assert!(spy.rides.lock().unwrap().is_empty(), "the ride was answered");
@@ -10520,3 +10671,434 @@ async fn crash_after_a_durable_refusal() {
     }
     assert!(resumed > 0, "a cut fell after the durable refusal");
 }
+
+// Each reading of the session's fill names the view the request it measured was rendered under
+// (`last_prompt_view`), so the compaction provider can tell a reading taken before the view it
+// just built applied from one taken under it. These drive the new loop alone: today's loop
+// names no view.
+
+/// What each compaction call's conditions say of the newest measured request, in call order:
+/// the call, the prompt size, the view it was rendered under, and the call's params as sent.
+fn prompt_readings(spy: &CompactionSpy) -> Vec<(String, Option<u64>, Option<u64>, String)> {
+    /// The conditions in a call's params: the one object that states a context window.
+    fn conditions_in(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Object(members) if members.contains_key("context_window") => Some(value),
+            Value::Object(members) => members.values().find_map(conditions_in),
+            Value::Array(items) => items.iter().find_map(conditions_in),
+            _ => None,
+        }
+    }
+    spy.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, params)| {
+            let conditions = conditions_in(params).unwrap_or(&Value::Null);
+            (
+                method.clone(),
+                conditions["last_prompt_tokens"].as_u64(),
+                conditions["last_prompt_view"].as_u64(),
+                params.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The prompt size and view of each call in `readings` but Setup, by method. Setup states no
+/// reading (the contract's Setup has no member for it); the notice after it does.
+fn readings_only(
+    readings: &[(String, Option<u64>, Option<u64>, String)],
+) -> Vec<(&str, Option<u64>, Option<u64>)> {
+    readings
+        .iter()
+        .filter(|(method, .., params)| {
+            let setup = method.starts_with("compaction.setup");
+            assert!(!(setup && params.contains("last_prompt_")), "{params}");
+            !setup
+        })
+        .map(|(method, tokens, view, _)| (method.as_str(), *tokens, *view))
+        .collect()
+}
+
+/// Where the first call naming a reading is in `seen`, every call before it naming neither a
+/// reading nor a view.
+fn first_reading(seen: &[(&str, Option<u64>, Option<u64>)]) -> usize {
+    let first = seen
+        .iter()
+        .position(|(_, tokens, _)| tokens.is_some())
+        .expect("a call names a reading");
+    assert!(
+        seen[..first]
+            .iter()
+            .all(|(_, tokens, view)| tokens.is_none() && view.is_none()),
+        "{seen:?}"
+    );
+    first
+}
+
+/// A run on the current compaction contract, with its own system text.
+fn contract_run(id: &'static str, input: &str, steps: Vec<Vec<NormalizedEvent>>) -> EnrollRun {
+    EnrollRun {
+        id,
+        input: vec![user(input)],
+        manifest: Some(enrolling_manifest()),
+        steps,
+        limit: None,
+    }
+}
+
+/// A text step whose request the provider measured at `prompt` tokens.
+fn measured(id: &str, text: &str, prompt: u64) -> Vec<NormalizedEvent> {
+    served(text_step(id, text), usage(prompt, 20), json!({}))
+}
+
+/// When the provider builds a view from a reading, until a request goes out under that view
+/// every call repeats the reading with the older view (here none, `0`), so the provider doesn't
+/// take it as fresh pressure and build another view on it. Once the first request under
+/// the view is measured, the calls carry its reading with the new version. Closing the session
+/// and opening it again, after the cut sealed the history before it, keeps the same value.
+#[tokio::test]
+async fn each_reading_names_the_view_its_request_was_rendered_under() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let mut session = enrollment_session(backend).await;
+    let mut parts = MemoryParts::default();
+    let spy = CompactionSpy::new(&CompactionScript {
+        context_limit: ENROLLED_LIMIT,
+        rides: vec![Ride::Cut(2)],
+    });
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r1", "first", vec![measured("a1", "one", 700)]),
+    )
+    .await
+    .expect("the first run");
+    // The model changes, so the next run's first step rides, and the provider answers with
+    // view 1, which cuts through the first answer.
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r2@m2", "second", vec![measured("a2", "two", 300)]),
+    )
+    .await
+    .expect("the second run");
+    let readings = prompt_readings(&spy);
+    let seen = readings_only(&readings);
+    assert_eq!(
+        session
+            .operations
+            .view_applied
+            .as_ref()
+            .map(|applied| applied.view.version),
+        Some(1),
+        "{seen:?}"
+    );
+    // Before any reading, the calls name neither a reading nor a view.
+    let first = first_reading(&seen);
+    let ride = seen
+        .iter()
+        .position(|(method, _, _)| *method == "compaction.ride")
+        .expect("the second run rides");
+    let measured_under_view = seen
+        .iter()
+        .position(|(_, tokens, _)| *tokens == Some(300))
+        .expect("a call reports the request sent under the view");
+    assert!(ride < measured_under_view, "{seen:?}");
+    // From the first reading until the first request under view 1 is measured, every call,
+    // the ride that built the view and each call after the view was accepted included,
+    // repeats the first reading with the view its request carried: none.
+    assert!(
+        seen[first..measured_under_view]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (Some(700), Some(0))),
+        "{seen:?}"
+    );
+    assert!(
+        seen[ride + 1..measured_under_view]
+            .iter()
+            .any(|(method, _, _)| *method != "compaction.ride"),
+        "a call after the view was accepted and before a request under it: {seen:?}"
+    );
+    // From then on, the new reading names the new view.
+    assert!(
+        seen[measured_under_view..]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (Some(300), Some(1))),
+        "{seen:?}"
+    );
+    // As the provider receives it, the reading and its view side by side.
+    let notice = readings
+        .iter()
+        .find(|(method, tokens, ..)| method == "compaction.notice" && *tokens == Some(300))
+        .map(|(.., params)| params)
+        .expect("a notice after the measured request");
+    assert!(
+        notice.contains("\"last_prompt_tokens\":300,\"last_prompt_view\":1"),
+        "{notice}"
+    );
+    let stale = readings
+        .iter()
+        .take_while(|(_, tokens, ..)| *tokens != Some(300))
+        .filter(|(method, ..)| method == "compaction.notice")
+        .last()
+        .map(|(.., params)| params)
+        .expect("a notice before the measured request");
+    assert!(
+        stale.contains("\"last_prompt_tokens\":700,\"last_prompt_view\":0"),
+        "{stale}"
+    );
+
+    // Closed and opened again, the session's next Setup names the same reading and view.
+    drop(session);
+    let mut loaded = Session::load(
+        backend,
+        enrollment_addr(),
+        &enrollment_triple(),
+        &enrollment_key(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        loaded.conversation.window_start() > 1,
+        "the cut sealed the history before it"
+    );
+    let reopened = CompactionSpy::new(&CompactionScript {
+        context_limit: ENROLLED_LIMIT,
+        rides: Vec::new(),
+    });
+    enroll_run(
+        &mut loaded,
+        &mut parts,
+        &reopened,
+        &contract_run("r3@m2", "third", vec![measured("a3", "three", 400)]),
+    )
+    .await
+    .expect("the run after the reopen");
+    let after = prompt_readings(&reopened);
+    let after = readings_only(&after);
+    assert_eq!((after[0].1, after[0].2), (Some(300), Some(1)), "{after:?}");
+    assert_eq!(
+        after.last().copied(),
+        Some(("compaction.notice", Some(400), Some(1))),
+        "{after:?}"
+    );
+}
+
+/// A view applied to a step whose request fails without usage leaves the reading where it
+/// was, with the view of the step that was measured: the next run's calls, the ride that
+/// builds another view included, name the first step's reading and its view (none), not the
+/// view the failed step applied.
+#[tokio::test]
+async fn a_reading_keeps_its_view_when_a_later_view_never_got_measured() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let mut session = enrollment_session(backend).await;
+    let mut parts = MemoryParts::default();
+    let spy = CompactionSpy::new(&CompactionScript {
+        context_limit: ENROLLED_LIMIT,
+        rides: vec![Ride::Cut(2), Ride::Cut(3)],
+    });
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r1", "first", vec![measured("a1", "one", 700)]),
+    )
+    .await
+    .expect("the first run");
+    let failure = vec![NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(json!({
+            "class": "permanent",
+            "message": "the request failed",
+            "status": 400
+        }))
+        .unwrap(),
+        retries_used: 0,
+    })];
+    // View 1 applies to this run's step, whose request fails without usage.
+    let _ = enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r2@m2", "second", vec![failure]),
+    )
+    .await;
+    assert_eq!(
+        session
+            .operations
+            .view_applied
+            .as_ref()
+            .map(|applied| applied.view.version),
+        Some(1)
+    );
+    let before = spy.calls.lock().unwrap().len();
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r3@m3", "third", vec![measured("a3", "three", 300)]),
+    )
+    .await
+    .expect("the third run");
+    let readings = prompt_readings(&spy);
+    let seen = readings_only(&readings[before..]);
+    assert_eq!(
+        session
+            .operations
+            .view_applied
+            .as_ref()
+            .map(|applied| applied.view.version),
+        Some(2),
+        "{seen:?}"
+    );
+    let measured_under_view = seen
+        .iter()
+        .position(|(_, tokens, _)| *tokens == Some(300))
+        .expect("a call reports the request sent under view 2");
+    assert!(
+        seen[..measured_under_view]
+            .iter()
+            .any(|(method, _, _)| *method == "compaction.ride"),
+        "{seen:?}"
+    );
+    assert!(
+        seen[..measured_under_view]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (Some(700), Some(0))),
+        "{seen:?}"
+    );
+    assert!(
+        seen[measured_under_view..]
+            .iter()
+            .all(|(_, tokens, view)| (*tokens, *view) == (Some(300), Some(2))),
+        "{seen:?}"
+    );
+}
+
+/// On a session no view ever applied to, every reading names no view (`0`), and before the
+/// first reading the calls name neither.
+#[tokio::test]
+async fn a_reading_with_no_view_ever_names_none() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let mut session = enrollment_session(backend).await;
+    let mut parts = MemoryParts::default();
+    let spy = CompactionSpy::new(&CompactionScript {
+        context_limit: ENROLLED_LIMIT,
+        rides: Vec::new(),
+    });
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run(
+            "r1",
+            "read a",
+            vec![
+                served(
+                    answer(
+                        "a1",
+                        vec![call("c1", "read", json!({}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    usage(700, 20),
+                    json!({}),
+                ),
+                measured("a2", "done", 800),
+            ],
+        ),
+    )
+    .await
+    .expect("the run");
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r2", "again", vec![measured("a3", "again", 900)]),
+    )
+    .await
+    .expect("the second run");
+    let readings = prompt_readings(&spy);
+    let seen = readings_only(&readings);
+    assert!(session.operations.view_applied.is_none());
+    let first = first_reading(&seen);
+    assert_eq!(seen[first].1, Some(700), "{seen:?}");
+    for reading in [700, 800, 900] {
+        assert!(
+            seen.contains(&("compaction.notice", Some(reading), Some(0))),
+            "{seen:?}"
+        );
+    }
+    assert!(
+        seen.iter()
+            .all(|(_, tokens, view)| *view == tokens.map(|_| 0)),
+        "{seen:?}"
+    );
+}
+
+/// A session converted from today's storage, whose last step ran under a view: its entry
+/// facts carry that view, so the first run on the new storage names it with the step's reading.
+#[tokio::test]
+async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
+    let scenario = compacted_scenario(vec![
+        answer(
+            "a1",
+            vec![call("c1", "big", json!({}))],
+            FinishReason::ToolCalls,
+        ),
+        measured("a2", "done", 900),
+    ]);
+    let (_, image, _) = LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 1_200,
+                    rides: vec![Ride::Trim(2)],
+                })),
+                today_from(&scenario, None, scenario.steps.clone()),
+            ),
+        )
+        .await;
+    let converted =
+        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let mut session = enrollment_session(backend).await;
+    session.append(&converted.records, true).await.unwrap();
+    let mut parts = MemoryParts::default();
+    parts.parts = converted.parts;
+    assert_eq!(
+        session
+            .operations
+            .view_applied
+            .as_ref()
+            .map(|applied| applied.view.version),
+        Some(1),
+        "today's step ran under view 1"
+    );
+    let spy = CompactionSpy::new(&CompactionScript {
+        context_limit: ENROLLED_LIMIT,
+        rides: Vec::new(),
+    });
+    enroll_run(
+        &mut session,
+        &mut parts,
+        &spy,
+        &contract_run("r2", "more", vec![measured("a3", "more", 1_000)]),
+    )
+    .await
+    .expect("the first run on the new storage");
+    let readings = prompt_readings(&spy);
+    let seen = readings_only(&readings);
+    assert_eq!((seen[0].1, seen[0].2), (Some(900), Some(1)), "{seen:?}");
+    assert_eq!(
+        seen.last().copied(),
+        Some(("compaction.notice", Some(1_000), Some(1))),
+        "{seen:?}"
+    );
+}
+
+/// The probe placement of rides after a tool turn's results, run on the new loop alone.
+#[path = "differential/ride_placement.rs"]
+mod ride_placement;

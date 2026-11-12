@@ -228,8 +228,9 @@ pub enum MediaEvent {
     /// point. The media of the removed messages are forgotten, with their aging, and so is
     /// every accepted message not yet placed. The cut also ends the run's state: the open
     /// batch, and the protection of the current step's media. A medium that had aged out and
-    /// whose message remains stays aged, so the request prefix already cached keeps its
-    /// bytes.
+    /// whose message remains stays aged. The request prefix, the start of the provider request
+    /// that the provider has already written to its prompt cache, shows that medium as a
+    /// not-shown marker; showing it again would change those bytes and lose the cache.
     Truncated { len: u64 },
 }
 

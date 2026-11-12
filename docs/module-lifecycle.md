@@ -10,7 +10,12 @@ Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs
    `{"op":"module.draining","reason":"restart","deadline_ms":...}` over the
    module's registered connection. Broca calls `LineageRegistry::begin_stop`:
    new runs are refused, durable queued work stays queued, and active runs finish
-   their current step. It keeps serving health probes and receiving tool results.
+   their current step. Every request refused because broca is stopping (a send, or any
+   operation that would open a session) is answered
+   `{"code":"transient","message":…,"detail":{"class":"transient","cause":"module_stopping"}}`:
+   the request did nothing, so repeating it after the restart may be answered. The cause says
+   nothing about an earlier request with the same `send_id`; a keyed resend is answered from the
+   record once broca serves again. It keeps serving health probes and receiving tool results.
    Yieldable tool calls are asked immediately to hand back through `tool.yield` on their
    own routes. A held final frame parks its run `tool_held`; shutdown leaves that obligation
    open for the late result after restart, rather than writing an Interrupted terminal.

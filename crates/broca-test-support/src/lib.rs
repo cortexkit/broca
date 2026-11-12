@@ -26,8 +26,11 @@
 //! Nothing removes a process's own scratch when it exits. A failing test's scratch is the
 //! evidence you read to find out why it failed, so it is left in place and reclaimed only
 //! once it has aged past [`SWEEP_AGE`].
-#![forbid(unsafe_code)]
+// Only the counting allocator needs `unsafe`, to implement `GlobalAlloc`: its impl carries an
+// `#[allow(unsafe_code)]` of its own, and the rest of the crate stays denied.
+#![deny(unsafe_code)]
 
+pub mod alloc;
 mod ckdev;
 mod process;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -244,6 +247,10 @@ pub fn public_tree_entries(root: &std::path::Path) -> std::io::Result<Vec<String
     found.sort();
     Ok(found)
 }
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc::CountingAlloc = alloc::CountingAlloc;
 
 #[cfg(test)]
 mod tests {

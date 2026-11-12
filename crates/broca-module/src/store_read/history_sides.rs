@@ -66,6 +66,16 @@ impl<'a> TodaysHistory<'a> {
             manifest: manifest.flatten(),
         })
     }
+
+    /// This history with the replies at `ordinals` (zero-based) served cleaned of tag notation,
+    /// as [`Todays::with_clean_replies`] serves its pages.
+    pub fn with_clean_replies(self, ordinals: std::collections::BTreeSet<u64>) -> Self {
+        let todays = self.todays.into_inner().expect("today's reads");
+        Self {
+            todays: Mutex::new(todays.with_clean_replies(ordinals)),
+            ..self
+        }
+    }
 }
 
 #[async_trait]
@@ -115,6 +125,16 @@ impl ServeHandler for TodaysHistory<'_> {
 
     async fn head(&self, _: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
         Ok(self.head.clone())
+    }
+
+    /// This history stands for the store's session, whose served version it was given: its
+    /// output-reference ids are scoped to the version that session stores, as the store's are.
+    async fn output_ref_history_version(
+        &self,
+        _: &LineageKey,
+        served: u64,
+    ) -> Result<u64, ServeError> {
+        crate::store_exposure::stored_history_version(served).ok_or(ServeError::HistoryChanged)
     }
 
     async fn session_log(

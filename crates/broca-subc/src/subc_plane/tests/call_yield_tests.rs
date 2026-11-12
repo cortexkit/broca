@@ -32,6 +32,7 @@ impl ToolPlaneConnection for Wire {
         _: Option<&ScopeSelector>,
         _: RouteShape,
         installed: bool,
+        _aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
     ) -> Result<RouteHandle, ConnError> {
         let mut route = self.route;
         route.reads_tool_result = installed;

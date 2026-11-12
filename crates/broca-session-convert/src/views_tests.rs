@@ -517,3 +517,97 @@ fn view_checksum(compacted: &Compacted, version: u64) -> String {
         })
         .unwrap()
 }
+
+/// A session on the current compaction contract whose replies carry part-number notation is
+/// moved and verified: the staged copy keeps the replies as the model wrote them, serves them
+/// cleaned (its entry facts say its runs clean replies), and serves the source's history
+/// version raised by the exposure epoch, and the verifier, which compares today's reads raised
+/// and cleaned the same way, finds no mismatch.
+#[test]
+fn a_session_whose_replies_carry_part_numbers_moves_and_verifies() {
+    let root = scratch("tagged-replies");
+    let written = [
+        "\u{a7}2\u{a7} One.",
+        "As \u{a7}1\u{a7} said, \u{a7}3\u{a7} two.",
+    ];
+    let mut log = Log::open(&root);
+    log.append(run_started("r1", 1_000, "Hello."));
+    log.step("r1", 1, 1_000, Vec::new(), written[0]);
+    log.finish(1_000);
+    log.append(run_started("r2", 2_000, "Again."));
+    log.step("r2", 2, 2_000, Vec::new(), written[1]);
+    log.finish(2_000);
+    let (records, lineage) = log.read();
+    let lineage_text = lineage.map(|id| id.to_string());
+    let prepared = crate::stage::prepare(&records, lineage_text.as_deref(), None).unwrap();
+    let staging = root.join("session-store/staging/store-move-test");
+    let source_history_version = 3;
+    let staged = block_on(crate::stage::write(
+        &Stage {
+            source_history_version,
+            records: &records,
+            lineage: lineage_text.as_deref(),
+            session: &session(),
+            deployment: &deployment(),
+            store_root: &root.join("session-store"),
+            staging: &staging,
+            media: None,
+            moved: &moved(&records),
+        },
+        prepared,
+    ))
+    .unwrap();
+    let compacted = Compacted {
+        records,
+        lineage,
+        body: Vec::new(),
+        staged,
+        staging,
+    };
+    verify_offline(&root, &compacted);
+
+    let store = load(&compacted.staging);
+    assert_eq!(store.head().history_version, source_history_version);
+    let stored: Vec<String> = block_on(store.entries(1, 16))
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.message.role == broca_protocol::Role::Assistant)
+        .inspect(|entry| assert!(entry.state.facts.as_ref().unwrap().clean_reply))
+        .flat_map(|entry| entry.message.content)
+        .filter_map(|block| match block {
+            broca_protocol::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored, written, "the staged copy keeps the written replies");
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: compacted.staged.converted.parts.clone(),
+    };
+    let request = broca_module::serve::SessionReadRequest::new(session(), Some(1), None);
+    let read = block_on(broca_module::store_read::serve_view(
+        &store, &parts, &request,
+    ))
+    .unwrap();
+    assert_eq!(
+        read.history_version,
+        broca_module::store_exposure::served_history_version(source_history_version)
+    );
+    let served: Vec<String> = read
+        .messages
+        .iter()
+        .filter(|entry| entry.message.role == broca_protocol::Role::Assistant)
+        .flat_map(|entry| entry.message.content.clone())
+        .filter_map(|block| match block {
+            broca_protocol::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    let cleaned: Vec<String> = written
+        .iter()
+        .map(|text| broca_protocol::tags::exposed_model_text(true, text).into_owned())
+        .collect();
+    assert_eq!(served, cleaned);
+    assert_ne!(served, written);
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
+}

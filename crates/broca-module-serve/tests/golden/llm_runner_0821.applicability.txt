@@ -1,4 +1,8 @@
 N/A cache_policy_plan_decode: missing groups: cache_policy
+N/A keep_warm_auto_warms_idle_session: missing groups: cache_policy
+N/A keep_warm_auto_stops_at_one_rewrite: missing groups: cache_policy
+N/A keep_warm_auto_rearms_after_real_request: missing groups: cache_policy
+N/A keep_warm_off_sends_no_warms: missing groups: cache_policy
 N/A cache_policy_send_decode: missing groups: cache_policy
 N/A cache_policy_plan_refusals: missing groups: cache_policy
 N/A cache_policy_send_refusals: missing groups: cache_policy

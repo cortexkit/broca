@@ -498,7 +498,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                     // WAL directory. Another live writer still receives the ordinary refusal.
                     let stop = registry.stopping_signal();
                     tokio::select! {
-                        _ = stop.cancelled() => return Err(OpenError::Open("module is stopping".into())),
+                        _ = stop.cancelled() => return Err(OpenError::ModuleStopping),
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                     }
                 }

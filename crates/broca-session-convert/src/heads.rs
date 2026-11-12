@@ -238,6 +238,7 @@ fn today_head(framed: &[FramedRecord]) -> Result<(Compared, HeadProjection), Str
         mode3,
         // Today's head always serves a time: the log file's own when no record carries one.
         updated_at: Some(0),
+        resume_not_before_ms: broca_module::store_head::account_limit_resume_of(framed),
     });
     let compared = Compared {
         reply: comparable(&reply, reply.mode3),

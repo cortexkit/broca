@@ -9,6 +9,8 @@ pub(crate) fn response(
     started_at_ms: u64,
     storage: RunAdmissionStorage,
     manifest: Option<&broca_wal::PlanManifest>,
+    principal: Option<&broca_protocol::BindPrincipal>,
+    scope: Option<&broca_protocol::SessionScope>,
 ) -> Result<RunAdmissionResponse, ServeError> {
     let fetches = manifest
         .into_iter()
@@ -37,5 +39,11 @@ pub(crate) fn response(
         started_at_ms,
         storage,
         fetches,
+        scope: scope.map(|scope| broca_wire::RunAdmissionScope {
+            owner: scope.owner.clone(),
+            scope_ref: scope.scope_ref.clone(),
+            epoch: scope.scope_epoch,
+            principal: principal.cloned(),
+        }),
     })
 }

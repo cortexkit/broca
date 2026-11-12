@@ -1134,7 +1134,7 @@ fn convert_message(
     }
     match m.role {
         Role::Tool => {
-            let content: Vec<Value> = m
+            let mut content: Vec<Value> = m
                 .content
                 .iter()
                 .filter_map(|b| match b {
@@ -1147,6 +1147,17 @@ fn convert_message(
                     _ => None,
                 })
                 .collect();
+            // Probe only, for measuring where models trust a ride's text: a run frozen with
+            // `RidePlacement::AfterResults` holds its rides beside the tool message instead of
+            // inside the results, and they go out here as their own text blocks after every
+            // result of the turn, in order. Removed or replaced once the placement is decided.
+            // Any other message holds none, so its bytes are unchanged.
+            content.extend(
+                m.tags
+                    .rides_after_results()
+                    .iter()
+                    .map(|text| json!({ "type": "text", "text": text })),
+            );
             json!({ "role": "user", "content": content })
         }
         Role::User => {
