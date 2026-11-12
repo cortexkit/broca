@@ -8,7 +8,10 @@
 use crate::catalog_refresh::CATALOG_POLL_INTERVAL;
 use crate::consumer_routes::ConsumerRoutes;
 use broca_catalog::live::WireFamilyId;
-use cortexkit_role_routing::declarations::{ConsumerDeclarations, RunnerDeclaration, RunnerPair};
+use cortexkit_role_routing::declarations::{
+    ConsumerDeclarations, HarnessLimits, RunnerDeclaration, RunnerPair,
+};
+use cortexkit_role_routing::placement::HarnessCapability;
 use std::collections::BTreeMap;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::manifest::{
@@ -21,6 +24,11 @@ use subc_protocol::manifest::{
     SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence,
 };
 use subc_protocol::PROTOCOL_VERSION;
+
+// Enable only after the routing provider (STRIATUM) advertises runner_harness_facts
+// and uses those per-harness facts when placing tasks, rather than ignoring them.
+// Older readers may refuse the whole runner slot when these facts are present.
+const DECLARE_RUNNER_HARNESS_FACTS: bool = false;
 
 /// The request/response ops, classified Query vs Mutate.
 pub const OP_SEND_STATUS: &str = broca_wire::OP_SEND_STATUS;
@@ -494,7 +502,7 @@ fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
         .collect()
 }
 
-fn routing_declarations() -> ConsumerDeclarations {
+fn routing_declarations(declare_harness_facts: bool) -> ConsumerDeclarations {
     let pairs = routing_runner_pairs()
         .into_iter()
         .map(|pair| {
@@ -504,6 +512,20 @@ fn routing_declarations() -> ConsumerDeclarations {
         .collect();
     let mut runner = RunnerDeclaration::new(pairs);
     runner.follows_account_choice = true;
+    if declare_harness_facts {
+        // ChatGPT routes strip max_output_tokens, so broca cannot promise output_cap.
+        let limits = HarnessLimits::new().with_capabilities(vec![
+            HarnessCapability::OneOff,
+            HarnessCapability::ForkAnswer,
+        ]);
+        runner = runner
+            .with_harnesses(vec!["broca".into()])
+            .with_harness_limits(BTreeMap::from([("broca".into(), limits)]));
+        runner
+            .typed_harness_limits()
+            .expect("broca declares harness limits")
+            .expect("broca's harness facts are valid producer data");
+    }
     let declarations = ConsumerDeclarations::new().with_runner(runner);
     declarations
         .validate()
@@ -517,6 +539,20 @@ pub fn manifest_configured(
     module_id: &str,
     archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: &ConsumerRoutes,
+) -> ModuleManifest {
+    manifest_configured_with_harness_facts(
+        module_id,
+        archive,
+        consumer_routes,
+        DECLARE_RUNNER_HARNESS_FACTS,
+    )
+}
+
+fn manifest_configured_with_harness_facts(
+    module_id: &str,
+    archive: crate::wal_archive::WalArchiveConfig,
+    consumer_routes: &ConsumerRoutes,
+    declare_harness_facts: bool,
 ) -> ModuleManifest {
     // BUILT THROUGH THE BUILDER, because `ModuleManifest` is `#[non_exhaustive]` upstream.
     //
@@ -729,7 +765,7 @@ pub fn manifest_configured(
     .consumes(consumer_routes.consumer_roles())
     .role_declarations(BTreeMap::from([(
         cortexkit_role_routing::ROLE_DECLARATIONS_KEY.to_string(),
-        serde_json::to_value(routing_declarations())
+        serde_json::to_value(routing_declarations(declare_harness_facts))
             .expect("routing declaration serializes")
             .as_object()
             .expect("routing declaration is an object")
@@ -792,22 +828,25 @@ mod routing_tests {
                 .copied()
                 .collect()
         );
+        let methods: BTreeSet<_> = crate::auth_routing::DEFAULT_METHOD_ORDER
+            .iter()
+            .map(|method| method.as_token())
+            .collect();
         assert_eq!(
-            crate::auth_routing::DEFAULT_METHOD_ORDER
-                .iter()
-                .map(|method| method.as_token())
-                .collect::<BTreeSet<_>>(),
-            cortexkit_role_routing::spellings::AUTH_METHODS
-                .iter()
-                .copied()
-                .collect()
+            methods,
+            BTreeSet::from(["apikey", "oauth", "chatgpt", "antigravity"])
         );
+        // Routing also knows gateway credentials, which broca does not yet serve.
+        for method in methods {
+            assert!(cortexkit_role_routing::spellings::AUTH_METHODS.contains(&method));
+        }
     }
 
     #[test]
     fn hello_routing_slot_passes_the_whole_slot_parser() {
         let manifest = serde_json::to_value(manifest("broca")).unwrap();
         let slot = &manifest["role_declarations"][cortexkit_role_routing::ROLE_DECLARATIONS_KEY];
+        assert_eq!(*slot, serialized_routing_slot(DECLARE_RUNNER_HARNESS_FACTS));
         let parsed = parse_consumer_declarations(slot).expect("the entire routing slot validates");
         assert!(parsed.consumers.is_empty());
         let runner = parsed.runner.as_ref().expect("broca declares its runner");
@@ -844,8 +883,25 @@ mod routing_tests {
                 .count(),
             9
         );
-        // The pair field is Option<bool>: Some(false) is explicit, not omitted like
-        // the runner-level false. Pin the real manifest bytes, including that distinction.
+        assert_eq!(serde_json::to_value(parsed).unwrap(), *slot);
+    }
+
+    fn serialized_routing_slot(declare_harness_facts: bool) -> serde_json::Value {
+        let manifest = manifest_configured_with_harness_facts(
+            "broca",
+            crate::wal_archive::WalArchiveConfig::default(),
+            &ConsumerRoutes::default(),
+            declare_harness_facts,
+        );
+        serde_json::to_value(manifest).unwrap()["role_declarations"]
+            [cortexkit_role_routing::ROLE_DECLARATIONS_KEY]
+            .clone()
+    }
+
+    #[test]
+    fn harness_facts_disabled_preserve_legacy_slot_bytes() {
+        // These are the pre-harness-facts manifest bytes. Explicit pair false values
+        // remain present, unlike the omitted runner-level false.
         let expected = concat!(
             r#"{"runner":{"follows_account_choice":true,"pairs":["#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
@@ -861,11 +917,46 @@ mod routing_tests {
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.responses"},"#,
             r#"{"auth_method":"oauth","requires_wire_api":false,"wire_api":"openai.responses"}]}}"#,
         );
-        assert_eq!(serde_json::to_string(slot).unwrap(), expected);
-        assert_eq!(serde_json::to_value(parsed).unwrap(), *slot);
+        let slot = serialized_routing_slot(false);
+        assert_eq!(serde_json::to_vec(&slot).unwrap(), expected.as_bytes());
         println!(
-            "routing/v1 HELLO slot: {}",
-            serde_json::to_string(slot).unwrap()
+            "routing/v1 HELLO slot (harness facts off): {}",
+            serde_json::to_string(&slot).unwrap()
+        );
+    }
+
+    #[test]
+    fn harness_facts_enabled_declare_only_supported_capabilities_and_validate() {
+        let slot = serialized_routing_slot(true);
+        let parsed = parse_consumer_declarations(&slot).expect("the entire routing slot validates");
+        parsed
+            .validate()
+            .expect("the producer declaration validates");
+        let runner = parsed.runner.as_ref().unwrap();
+        let limits = runner
+            .typed_harness_limits()
+            .expect("broca declares harness limits")
+            .expect("the ungated producer validator accepts the harness facts");
+        assert_eq!(
+            limits,
+            BTreeMap::from([(
+                "broca".into(),
+                HarnessLimits::new().with_capabilities(vec![
+                    HarnessCapability::OneOff,
+                    HarnessCapability::ForkAnswer,
+                ]),
+            )])
+        );
+
+        let mut expected = serialized_routing_slot(false);
+        expected["runner"]["harnesses"] = serde_json::json!(["broca"]);
+        expected["runner"]["harness_limits"] = serde_json::json!({
+            "broca": { "capabilities": ["one_off", "fork_answer"] }
+        });
+        assert_eq!(slot, expected, "no other runner offers change");
+        println!(
+            "routing/v1 HELLO slot (harness facts on): {}",
+            serde_json::to_string(&slot).unwrap()
         );
     }
 }
