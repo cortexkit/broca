@@ -99,30 +99,12 @@ impl Counts {
                 _ => None,
             })
             .map(|n| SurfaceTokens::new(n, family.exact));
-        let operator_aliases = frozen
-            .frozen_render_config
-            .get("tool_name_aliases")
-            .and_then(serde_json::Value::as_object);
-        let tools: Vec<_> = definitions
-            .iter()
-            .map(|tool| {
-                let name = operator_aliases
-                    .and_then(|aliases| aliases.get(&tool.name))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&tool.name);
-                serde_json::json!({
-                    "name": broca_protocol::tool_name_alias::normalize(name),
-                    "description": tool.description, "input_schema": tool.input_schema,
-                })
-            })
-            .collect();
-        // Provider-specific schema wrapping and dispatch metadata are outside these inputs.
-        let tools_count = timed_count(
+        let tools_count = count_definitions(
             family.family,
-            &serde_json::to_string(&tools).expect("tools serialize"),
+            &definitions,
+            frozen.frozen_render_config,
             &mut self.tokenizer_time,
-        )
-        .map(|n| SurfaceTokens::new(n, false));
+        );
         let api = match frozen
             .frozen_render_config
             .get("family_id")
@@ -369,6 +351,52 @@ fn has_counts(entries: &[Entry]) -> bool {
     })
 }
 
+/// The same definition counter that supplies compaction's `tools_tokens`, applied to any
+/// slice of definitions. Counts remain estimates because provider-specific schema wrapping
+/// and dispatch metadata are outside these inputs.
+pub fn tool_definition_tokens(
+    model_id: &str,
+    tools: &[broca_protocol::Tool],
+    render: &serde_json::Value,
+) -> Option<SurfaceTokens> {
+    count_definitions(
+        family_for_model(model_id).family,
+        tools,
+        render,
+        &mut Default::default(),
+    )
+}
+
+fn count_definitions(
+    family: Family,
+    definitions: &[broca_protocol::Tool],
+    render: &serde_json::Value,
+    elapsed: &mut std::time::Duration,
+) -> Option<SurfaceTokens> {
+    let operator_aliases = render
+        .get("tool_name_aliases")
+        .and_then(serde_json::Value::as_object);
+    let tools: Vec<_> = definitions
+        .iter()
+        .map(|tool| {
+            let name = operator_aliases
+                .and_then(|aliases| aliases.get(&tool.name))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&tool.name);
+            serde_json::json!({
+                "name": broca_protocol::tool_name_alias::normalize(name),
+                "description": tool.description, "input_schema": tool.input_schema,
+            })
+        })
+        .collect();
+    timed_count(
+        family,
+        &serde_json::to_string(&tools).expect("tools serialize"),
+        elapsed,
+    )
+    .map(|n| SurfaceTokens::new(n, false))
+}
+
 fn timed_count(family: Family, text: &str, elapsed: &mut std::time::Duration) -> Option<u64> {
     let start = std::time::Instant::now();
     let tokens = count(family, text);
@@ -474,6 +502,41 @@ mod tests {
 
     fn expected(text: &str) -> u64 {
         count(Family::O200k, text).unwrap()
+    }
+
+    #[test]
+    fn per_definition_tokens_use_the_compaction_definition_counter() {
+        let mut counts = Counts::default();
+        let model = broca_protocol::ModelHandle::new("fixture", "gpt-4o");
+        let tools = vec![serde_json::from_value(json!({
+            "name":"read", "description":"Read a file", "input_schema":{"type":"object"},
+            "module":"fixture",
+        }))
+        .unwrap()];
+        let render = json!({});
+        counts.configure(
+            &super::super::host::Frozen {
+                model: &model,
+                variant: None,
+                service_tier: None,
+                frozen_render_config: &render,
+                tools: &tools,
+                global_system: None,
+                auth_selection: None,
+                context_limit: Some(200_000),
+                max_output_tokens: Some(1000),
+            },
+            None,
+        );
+        let single = tool_definition_tokens("gpt-4o", &tools, &render).unwrap();
+        assert_eq!(single, counts.facts.as_ref().unwrap().tools_count.unwrap());
+        assert_eq!(
+            single.count,
+            expected(
+                r#"[{"description":"Read a file","input_schema":{"type":"object"},"name":"read"}]"#
+            )
+        );
+        assert!(!single.exact);
     }
 
     #[test]

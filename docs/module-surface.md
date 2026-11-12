@@ -2193,6 +2193,46 @@ flag existed, and the request omits `include_tools` when false. `include_tools` 
 field only in that spelling: `ReadParams` stays strict, so an older daemon refuses it with
 `invalid_params` instead of silently answering without tools.
 
+## 15a. `session.plan_view`: the applied plan
+
+`session.plan_view {session}` is a read on the new session storage, addressed and
+admitted like `session.read`. It returns `{"result": ...}` with the plan that
+built the latest run's requests, not a provider-rendered prompt:
+
+- `generation` is the applied plan generation (`0` before a refresh applies),
+  and optional `applied_at_ms` is the stored start time of the run that applied
+  it (the first run for generation zero). When that run recorded no time, the
+  member is absent; its age is unknown, not derived from another event.
+- `system.text` is the manifest's system text, byte for byte. Optional `items`
+  attribute nonempty text ranges to their `provider` and optional `preset`.
+  `start` and `end` are UTF-8 byte offsets, inclusive and exclusive respectively;
+  separators belong to no item. Empty and unanswered optional providers have no
+  range. If this build cannot reproduce the stored join, it omits `items` rather
+  than returning unchecked offsets.
+- `tools` contains `name`, `description`, `input_schema`, and `provider` in offer
+  order. Optional `tokens: {count, exact}` describes a per-definition estimate,
+  using the same definition counter as compaction's `tools_tokens` with
+  `exact: false`, not an additional model or provider measurement. The estimate
+  excludes operator-selected name aliases, like the as-planned tool list.
+- Optional `newest_step` identifies the newest request with a recorded send time
+  under that generation, not necessarily the request in flight. It uses the
+  stored attempt's `sent_at_ms` and, only when it produced an assistant message,
+  `reply_mid` matching the message id returned by `session.read`.
+  Undated requests do not displace a dated request. If the applied generation
+  has no dated request, the member is absent, even if an older generation did.
+- Optional `pending: {generation}` identifies an accepted refresh that has not
+  yet applied. It does not replace the applied system text or tools and has no
+  `notes` member because broca has not told the model about the pending change.
+- `as_planned` is always `true`. It excludes the identity line broca prepends on
+  a Claude subscription route and tool-name rewrites to a provider's grammar
+  during rendering.
+
+A session admitted with system text and tools on its first send, without a plan
+manifest, refuses with `no_plan`; it never returns an empty substitute plan. A
+reply that would exceed the read frame limit refuses with `too_large`; it is
+never truncated.
+Sessions kept on the old storage refuse with `not_served_on_old_storage`.
+
 ## 16. Subscribe to a terminal run
 
 Terminal state does not special-case attach behavior. `from:"start"` or a historical cursor

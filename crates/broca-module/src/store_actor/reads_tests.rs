@@ -828,6 +828,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Baseline(facts) => format!("{facts:?}"),
+        StoreReadReply::PlanView(reply) => format!("{reply:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
         StoreReadReply::AuthorizationSubmissionSender(sender) => format!("{sender:?}"),

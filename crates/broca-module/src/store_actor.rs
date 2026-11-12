@@ -4573,6 +4573,8 @@ mod new_heads_tests;
 #[cfg(test)]
 mod pauses_tests;
 #[cfg(test)]
+mod plan_view_tests;
+#[cfg(test)]
 mod read_cost;
 #[cfg(test)]
 mod reads_tests;
