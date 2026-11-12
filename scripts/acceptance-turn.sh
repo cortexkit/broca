@@ -19,8 +19,10 @@
 # is the most expensive possible confusion during a placement.
 #
 # Usage: scripts/acceptance-turn.sh [expected-version]
-# Exits 0 only if the turn dispatched a tool, got a success or the declared
-# folderless-route refusal, and completed. Scoped success is checked separately.
+# Exits 0 only for a dispatched tool with is_error=false and a completed run.
+# Exit 3 means TOOL REFUSED (project_required), with dispatch, result and completion
+# verified; exit 1 is failure, and exit 2 means invalid setup or cannot compare.
+# acceptance_scoped.py separately checks successful AFT dispatch under a recorded scope.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/exit-guard.sh"
@@ -98,7 +100,6 @@ if ! timeout 30 "$BIN" --subc "$CONN" --project-root "$PWD" --session "$SID" \
   cat "$DESCRIPTION" "$OUT" >&2
   exit 1
 fi
-NO_PROJECT="$(python3 "$SCRIPT_DIR/lib/acceptance_contract.py" probe "$DESCRIPTION")" || exit 2
 
 served=0
 refused=""
@@ -154,12 +155,11 @@ grep -aE "TOOL_CALL|TOOL_RESULT|RUN_FINISHED|FINAL_TEXT" "$OUT" | cut -c1-100 | 
 # can reach RUN_FINISHED without ever dispatching, which is why the tool legs are separate.
 fail=0
 grep -aq '^TOOL_CALL ' "$OUT"            || { echo "acceptance-turn: NO TOOL DISPATCH" >&2; fail=1; }
-# Folderless routes intentionally refuse project tools on bind-no-project builds.
-# Only AFT's exact typed refusal proves the expected result path; other errors fail.
-python3 "$SCRIPT_DIR/lib/acceptance_contract.py" tool-result "$OUT" "$NO_PROJECT" || {
-  echo "acceptance-turn: TOOL RESULT MISSING OR ERRORED (only declared project_required is allowed)" >&2
+tool_status=0
+python3 "$SCRIPT_DIR/lib/acceptance_contract.py" tool-result "$OUT" || tool_status=$?
+if [ "$tool_status" -ne 0 ] && [ "$tool_status" -ne 3 ]; then
   fail=1
-}
+fi
 grep -aq '^RUN_FINISHED .*reason=Completed' "$OUT" || { echo "acceptance-turn: RUN DID NOT COMPLETE" >&2; fail=1; }
 
 # NO VERSION CHECK HERE, DELIBERATELY, AND THIS USED TO BE ONE.
@@ -189,6 +189,12 @@ if [ "$fail" -ne 0 ]; then
   echo "acceptance-turn: FAILED \u2014 full output follows" >&2
   cat "$OUT" >&2
   exit 1
+fi
+
+if [ "$tool_status" -eq 3 ]; then
+  echo "acceptance-turn: TOOL REFUSED (project_required) -- the test session has no scope, so the tool module refused its route; dispatch, result and run completion worked"
+  BROCA_EXIT_GUARD_FINISHED=1
+  exit 3
 fi
 
 # Name what was proven, not what was asked for. The old form echoed the version argument into

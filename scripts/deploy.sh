@@ -155,10 +155,18 @@ fi
 # daemon saying "not yet", not a failed deploy, so retry it for up to five minutes; any other
 # failure ends the deploy at once.
 acceptance() {
-  local attempt
+  local attempt status
   for attempt in $(seq 1 30); do
     if bash scripts/acceptance-turn.sh "$version" >"$logdir/acceptance.log" 2>&1; then
       cat "$logdir/acceptance.log"
+      return 0
+    else
+      status=$?
+    fi
+    if [ "$status" -eq 3 ]; then
+      cat "$logdir/acceptance.log"
+      direct_verdict="TOOL REFUSED (project_required)"
+      echo "deploy: WARNING -- direct tool acceptance: TOOL REFUSED (project_required), exit 3; continuing worker and scoped checks" >&2
       return 0
     fi
     if ! grep -q 'module_warming' "$logdir/acceptance.log"; then
@@ -174,6 +182,7 @@ acceptance() {
   return 1
 }
 # stage-release builds both ck-broca and this client from the same committed HEAD.
+direct_verdict="PASS"
 if [ ! -x "${CARGO_TARGET_DIR:-./target}/release/broca-session" ] || ! acceptance; then
   echo "deploy: LIVE ACCEPTANCE FAILED (including unavailable providers/client); not publishing." >&2
   rollback_command >&2
@@ -205,7 +214,7 @@ ci_log="$logdir/ci.log"
 if [ "$publish" -eq 0 ]; then
   echo "deploy: --no-publish: deployed here only. Publish later with: scripts/tag-when-green.sh $sha $version"
 elif ! TAG_WHEN_GREEN_LOG="$ci_log" bash scripts/tag-when-green.sh "$sha" "$version"; then
-  echo "deploy: live acceptance passed, but could not start background publication. Retry scripts/tag-when-green.sh $sha $version" >&2
+  echo "deploy: live acceptance checks finished (direct: $direct_verdict; worker: PASS; scoped: PASS), but could not start background publication. Retry scripts/tag-when-green.sh $sha $version" >&2
   rollback_command >&2
   exit 1
 fi
@@ -228,7 +237,7 @@ if report["seal_error"]:
 if report.get("sessions_cancelled"):
     sys.exit(1)
 PY
-echo "   acceptance PASS (direct tool round trip; classed fetch-plan turn; scoped AFT dispatch)"
+echo "   acceptance direct: $direct_verdict; worker: PASS; scoped: PASS"
 rollback_command
 if [ "$publish" -eq 1 ]; then
   echo "   CI log     $ci_log (detached; CI does not gate deployment)"

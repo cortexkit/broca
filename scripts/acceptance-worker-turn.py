@@ -203,7 +203,7 @@ def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
         return summaries, set()
     try:
         # mode=ro refuses missing databases and never creates or migrates inventory tables.
-        db = sqlite3.connect((state_root / "run-index.db").resolve().as_uri() + "?mode=ro", timeout=1)
+        db = sqlite3.connect((state_root / "run-index.db").resolve().as_uri() + "?mode=ro", timeout=1, uri=True)
         try:
             for address in sorted(addresses):
                 binds = db.execute("SELECT DISTINCT project_root,harness,session FROM agent_data_session_ref "
