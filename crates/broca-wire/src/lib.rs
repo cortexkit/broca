@@ -7,6 +7,7 @@
 pub mod agent_data;
 pub mod diagnostics;
 pub mod head_import;
+pub mod plan_view;
 pub mod role;
 pub use role::*;
 pub mod tag_map;

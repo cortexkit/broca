@@ -657,17 +657,46 @@ pub fn check_plan_model(
 /// Join fetched system texts in plan order under [`JOIN_VERSION`]. An empty text adds no bytes
 /// and no separator.
 pub fn join_system_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> String {
+    join_system_texts_with_ranges(texts).0
+}
+
+/// Join under [`JOIN_VERSION`] and retain the UTF-8 byte range of each input. Empty inputs
+/// have no range, and separators belong to neither neighbor. Sharing the loop with
+/// [`join_system_texts`] keeps read-time attribution identical to admission's text.
+pub fn join_system_texts_with_ranges<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+) -> (String, Vec<Option<std::ops::Range<usize>>>) {
     let mut joined = String::new();
+    let mut ranges = Vec::new();
     for text in texts {
         if text.is_empty() {
+            ranges.push(None);
             continue;
         }
         if !joined.is_empty() {
             joined.push_str(JOIN_SEPARATOR);
         }
+        let start = joined.len();
         joined.push_str(text);
+        ranges.push(Some(start..joined.len()));
     }
-    joined
+    (joined, ranges)
+}
+
+#[cfg(test)]
+mod join_range_tests {
+    #[test]
+    fn join_ranges_exclude_empty_texts_and_separators_in_utf8_bytes() {
+        let texts = ["", "π", "", "工具", ""];
+        let (joined, ranges) = super::join_system_texts_with_ranges(texts);
+        assert_eq!(joined, "π\n\n工具");
+        assert_eq!(ranges, [None, Some(0..2), None, Some(4..10), None]);
+        assert_eq!(super::join_system_texts(texts), "π\n\n工具");
+        assert_eq!(
+            super::join_system_texts_with_ranges(["", ""]),
+            (String::new(), vec![None, None])
+        );
+    }
 }
 
 /// Call `attempt` until it answers, a non-retryable outcome arrives, or `deadline` passes.

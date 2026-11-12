@@ -51,6 +51,7 @@ pub mod store_media;
 pub mod store_open;
 pub mod store_output_refs;
 mod store_plan_change;
+pub mod store_plan_view;
 pub mod store_read;
 pub mod store_reads;
 pub mod store_status;

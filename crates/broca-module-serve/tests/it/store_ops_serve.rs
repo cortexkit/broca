@@ -877,6 +877,154 @@ fn tag_map_sample(name: &str, body: &[u8]) {
     }
 }
 
+fn plan_view_sample(name: &str, body: &[u8]) {
+    if let Some(dir) = std::env::var_os("BROCA_PLAN_VIEW_SAMPLE_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(PathBuf::from(dir).join(name), body).unwrap();
+    }
+}
+
+fn inspection_plan(label: &str) -> SendPlan {
+    let mut plan = compacting_plan();
+    plan.identity = label.into();
+    let manifest = Arc::make_mut(plan.manifest.as_mut().unwrap());
+    manifest.plan_identity = label.into();
+    manifest.system_text = format!("Synthetic session: {label}");
+    let mut providers = vec![
+        json!({"provider":PROVIDER,"tools":[]}),
+        json!({"provider":"synthetic-persona","tools":[]}),
+    ];
+    providers.sort_by(|a, b| a["provider"].as_str().cmp(&b["provider"].as_str()));
+    let composition = json!({"providers":providers, "step_transform_items":[], "compaction":{"provider":PROVIDER}});
+    let composition_digest =
+        cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap();
+    manifest.composition_digest = composition_digest.clone();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({
+        "compaction_item":{"provider":PROVIDER,"preset":"default","params":{}},
+        "system_text_items":[{"provider":"synthetic-persona","params":{}}],
+        "tool_items":[], "step_transform_items":[],
+        "composition":composition, "composition_digest":composition_digest,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    manifest.fetches = vec![serde_json::from_value(json!({
+        "provider":"synthetic-persona", "catalog_digest":"synthetic", "tools":[],
+        "text":manifest.system_text,
+    }))
+    .unwrap()];
+    plan
+}
+
+#[tokio::test]
+async fn plan_view_wire_serves_applied_and_pending_plans_without_operator_requirement() {
+    let mut rig = Rig::start(
+        "synthetic-plan-view",
+        vec![text_step("a", "first"), text_step("b", "second")],
+    )
+    .await;
+    rig.send("r1", "hello", Some(inspection_plan("fresh")))
+        .await;
+    rig.assert_store_only();
+    rig.bind_session(1, core()).await;
+    let frame = rig
+        .request(1, json!({"method":"session.plan_view","params":{}}))
+        .await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let fresh: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(fresh["result"]["generation"], 0);
+    assert_eq!(
+        fresh["result"]["system"]["text"],
+        "Synthetic session: fresh"
+    );
+    plan_view_sample("fresh.json", &frame.body);
+    assert!(matches!(
+        rig.registry
+            .route_session_refresh(
+                &rig.key,
+                1,
+                "immediately".into(),
+                Box::new(Arc::try_unwrap(inspection_plan("applied").manifest.unwrap()).unwrap()),
+            )
+            .await
+            .unwrap(),
+        broca_module::actor::SessionRefreshOutcome::Accepted { .. }
+    ));
+    rig.send("r2", "next", None).await;
+    let frame = rig
+        .request(1, json!({"method":"session.plan_view","params":{}}))
+        .await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let applied: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(applied["result"]["generation"], 1);
+    assert_eq!(
+        applied["result"]["system"]["text"],
+        "Synthetic session: applied"
+    );
+    plan_view_sample("applied.json", &frame.body);
+    assert!(matches!(
+        rig.registry
+            .route_session_refresh(
+                &rig.key,
+                2,
+                "on_prefix_rebuild".into(),
+                Box::new(Arc::try_unwrap(inspection_plan("pending").manifest.unwrap()).unwrap()),
+            )
+            .await
+            .unwrap(),
+        broca_module::actor::SessionRefreshOutcome::Accepted { .. }
+    ));
+    let frame = rig
+        .request(1, json!({"method":"session.plan_view","params":{}}))
+        .await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let pending: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(pending["result"]["system"], applied["result"]["system"]);
+    assert_eq!(pending["result"]["pending"], json!({"generation":2}));
+    plan_view_sample("pending.json", &frame.body);
+    assert_eq!(
+        rig.refused(1, "session.plan_view", json!({"generation":2}))
+            .await,
+        "invalid_params"
+    );
+}
+
+#[tokio::test]
+async fn plan_view_wire_no_plan_and_too_large_are_named_refusals() {
+    let mut unplanned = Rig::start("synthetic-no-plan", vec![text_step("a", "reply")]).await;
+    unplanned.send("r1", "hello", None).await;
+    unplanned.bind_session(1, core()).await;
+    let frame = unplanned
+        .request(1, json!({"method":"session.plan_view","params":{}}))
+        .await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&frame.body).unwrap()["code"],
+        "no_plan"
+    );
+    plan_view_sample("no-plan.json", &frame.body);
+
+    let mut large = Rig::start("synthetic-large-plan", vec![text_step("a", "reply")]).await;
+    let mut plan = inspection_plan("large");
+    let manifest = Arc::make_mut(plan.manifest.as_mut().unwrap());
+    manifest.system_text = "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize);
+    large.send("r1", "hello", Some(plan)).await;
+    large.bind_session(1, core()).await;
+    assert_eq!(
+        large.refused(1, "session.plan_view", json!({})).await,
+        "too_large"
+    );
+    assert_eq!(
+        large.result(1, "session.read", json!({"limit":1})).await["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the oversize refusal preserves the connection"
+    );
+}
+
 /// `session.tag_map` reaches the store through the serve path on the operator's own route only:
 /// another caller is refused `operator_required` before anything reads the session. The operator
 /// pages the map, a message at a time if asked, and its numbers are the ones the compaction

@@ -521,3 +521,15 @@ async fn a_tag_map_of_a_session_on_todays_storage_is_refused_by_name() {
         std::fs::write(dir.join("refused-old-storage.json"), &frame.body).unwrap();
     }
 }
+
+#[tokio::test]
+async fn plan_view_on_old_storage_is_refused_by_name() {
+    let mut rig = Rig::start_movable("plan-view-today").await;
+    rig.script.push(&[Step::Text("answer")]);
+    let started = rig.send("turn-1", "hi", None).await;
+    assert_eq!(result(&started)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let refused = refusal(&call(&mut rig, "session.plan_view", json!({})).await);
+    assert_eq!(refused["code"], "not_served_on_old_storage", "{refused}");
+}

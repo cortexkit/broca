@@ -98,6 +98,8 @@ pub enum StoreReadRequest {
     /// What `session.baseline` reports, before its owner check and cache declaration (see
     /// `store_plan_change::baseline`).
     Baseline,
+    /// The applied manifest and dated requests under it, without opening an actor.
+    PlanView,
 }
 
 impl StoreReadRequest {
@@ -178,6 +180,7 @@ pub enum StoreReadReply {
     PlanIdentities(Result<RefreshedIdentities, String>),
     /// `None` before the session's first run.
     Baseline(Result<Option<Box<crate::store_plan_change::BaselineFacts>>, String>),
+    PlanView(Result<broca_wire::plan_view::PlanViewResponse, crate::store_plan_view::Error>),
 }
 
 /// A medium a record of the session names: its reference, and its bytes or why they couldn't be
@@ -395,6 +398,9 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::Baseline => StoreReadReply::Baseline(
             crate::store_plan_change::baseline(session, ctx.parts).map(|facts| facts.map(Box::new)),
         ),
+        StoreReadRequest::PlanView => {
+            StoreReadReply::PlanView(crate::store_plan_view::build(session, ctx.parts).await)
+        }
     }
 }
 

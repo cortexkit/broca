@@ -242,6 +242,8 @@ impl broca_core::provider::Provider for Gated {
 /// Runs each store job through the new loop's admission and run, over a scripted provider.
 pub(super) struct LoopExecutor {
     pub(super) provider: Gated,
+    /// Override admission's stored run-start time, including an unknown historical time.
+    pub(super) start_time: Option<Arc<std::sync::Mutex<Option<u64>>>>,
     /// When set, a run drained from the queue signals the first `Notify` and waits on the second
     /// before its admission, so a test can act while the drain has started a run whose start
     /// isn't durable yet.
@@ -351,6 +353,7 @@ pub(super) fn executor(
     gate: Option<Arc<Notify>>,
 ) -> LoopExecutor {
     LoopExecutor {
+        start_time: None,
         provider: Gated {
             inner: StubProvider::new(steps),
             gate,
@@ -419,7 +422,12 @@ impl RunExecutor for LoopExecutor {
                         &control,
                         &self.provider,
                         writer.operations(),
-                        Some(control.clock.as_ref().map_or(1, |clock| clock.now_ms())),
+                        self.start_time
+                            .as_ref()
+                            .map(|time| *time.lock().unwrap())
+                            .unwrap_or_else(|| {
+                                Some(control.clock.as_ref().map_or(1, |clock| clock.now_ms()))
+                            }),
                     )
                     .map_err(StoreRunError::Admission)?,
                 )
@@ -1770,7 +1778,7 @@ fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanMani
 
 /// A send carrying a plan, as the serve layer hands it over: its identity, and the manifest it
 /// fetched when the session had no run. The session's caller sends it.
-async fn send_planned(
+pub(super) async fn send_planned(
     commands: &Commands,
     run_id: &str,
     request: SubmissionRequest,
@@ -1805,7 +1813,7 @@ async fn send_planned(
 }
 
 /// A send carrying no tools of its own, as a planned session's sends do.
-fn untooled(text: &str) -> SubmissionRequest {
+pub(super) fn untooled(text: &str) -> SubmissionRequest {
     let mut request = request(text);
     request.tools = None;
     request.policy_allowed = Default::default();

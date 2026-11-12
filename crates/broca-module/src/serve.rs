@@ -2738,6 +2738,16 @@ pub trait ServeHandler: Send + Sync {
         None
     }
 
+    /// The applied plan, read without opening an actor. `None` means the session is kept on
+    /// the old storage, which does not serve this operation.
+    async fn plan_view(
+        &self,
+        _session: &LineageKey,
+    ) -> Result<Option<broca_wire::plan_view::PlanViewResponse>, crate::store_plan_view::Error>
+    {
+        Ok(None)
+    }
+
     /// `session.tag_map`: which message and part each part number of the session belongs to
     /// (see `store_tag_map`). `None` for a session today's storage keeps, which the operation
     /// doesn't serve; a handler without the new storage keeps every session there.
@@ -3999,6 +4009,25 @@ impl ServeHandler for crate::LineageRegistry {
         all: bool,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
         crate::LineageRegistry::restore_from_backup(self, session, all).await
+    }
+
+    async fn plan_view(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<broca_wire::plan_view::PlanViewResponse>, crate::store_plan_view::Error>
+    {
+        if let Some(store) = self.store_holding(session).map_err(ServeError::from)? {
+            return crate::store_plan_view::serve(self, &store, session)
+                .await
+                .map(Some);
+        }
+        if self.wal_written(session) == Some(false) {
+            self.check_session_log(session)
+                .await
+                .map_err(ServeError::from)?;
+            return Err(crate::store_plan_view::Error::NoPlan);
+        }
+        Ok(None)
     }
 
     async fn tag_map(

@@ -2858,7 +2858,7 @@ where
             OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | OP_TAG_MAP | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | OP_TAG_MAP | broca_wire::plan_view::OP_SESSION_PLAN_VIEW | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
@@ -4180,6 +4180,30 @@ where
                 }
             }
         }
+        broca_wire::plan_view::OP_SESSION_PLAN_VIEW => {
+            if let Err((field, message)) =
+                decode_params::<broca_wire::plan_view::PlanViewParams>(&req.params)
+            {
+                return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                    .await;
+            }
+            match handler.plan_view(session).await {
+                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(None) => send_error(
+                    writer, ver, channel, epoch, corr, NOT_SERVED_ON_OLD_STORAGE,
+                    "session.plan_view serves sessions kept in the new storage only, and this session is kept on today's storage",
+                ).await,
+                Err(broca_module::store_plan_view::Error::NoPlan) => send_error(
+                    writer, ver, channel, epoch, corr, "no_plan", "the session has no plan manifest",
+                ).await,
+                Err(broca_module::store_plan_view::Error::TooLarge) => send_error(
+                    writer, ver, channel, epoch, corr, "too_large", "the plan view exceeds the transport frame limit",
+                ).await,
+                Err(broca_module::store_plan_view::Error::Serve(error)) => {
+                    send_serve_error(writer, ver, channel, epoch, corr, &error).await
+                }
+            }
+        }
         OP_READ => {
             if req.params.get("tag").is_some() {
                 return send_invalid_params(
@@ -5398,7 +5422,7 @@ const NOT_SERVED_ON_OLD_STORAGE: &str = "not_served_on_old_storage";
 pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
-        OP_READ | OP_HEAD => true,
+        OP_READ | OP_HEAD | broca_wire::plan_view::OP_SESSION_PLAN_VIEW => true,
         cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS
         | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ => true,
         // The store actor's subscriptions (`store_fanout`).
