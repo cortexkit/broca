@@ -2983,6 +2983,32 @@ mod executor {
         moved && records_account_change && routing_serves_continuation
     }
 
+    /// What a resume that asked routing for its account goes on with. A moved run's resume
+    /// that gets no usable account from routing (no answer in the budget, routing unreachable,
+    /// a hold, a refusal or a conflict) keeps the account it recorded, as a resume that doesn't
+    /// ask does: when broca can't tell which account routing holds the run on, it keeps the one
+    /// it wrote down. `resume_asks` is cleared then, so nothing after this follows an account
+    /// routing didn't give. Any other answer, and a choice no resume asked for, pass unchanged.
+    fn resumed_choice(
+        chosen: Result<AccountChoice, RunError>,
+        resume_asks: &mut bool,
+        run_id: &broca_protocol::RunId,
+    ) -> Result<AccountChoice, RunError> {
+        match chosen {
+            Err(error) if *resume_asks => {
+                tracing::warn!(
+                    target: "accounts",
+                    run_id = %run_id.0,
+                    %error,
+                    "routing gave the resumed run no account; it keeps the account it recorded"
+                );
+                *resume_asks = false;
+                Ok(AccountChoice::NotApplicable)
+            }
+            chosen => chosen,
+        }
+    }
+
     async fn store_history(
         writer: &broca_session_loop::shared::ActorWriter,
         parts: &dyn broca_session_loop::parts::Parts,
@@ -4310,7 +4336,7 @@ mod executor {
             let records_account_change = prior_run
                 .as_ref()
                 .is_some_and(|prior| prior.records_account_change);
-            let resume_asks = resume_asks_routing(
+            let mut resume_asks = resume_asks_routing(
                 moved,
                 records_account_change,
                 job.routing_serves_continuation,
@@ -4347,6 +4373,7 @@ mod executor {
                     .await
                 }
             };
+            let chosen = resumed_choice(chosen, &mut resume_asks, &job.req.run_id);
             let account_choice = match chosen {
                 Ok(choice) => choice,
                 Err(RunError::AccountSelectionRefused(refusal))

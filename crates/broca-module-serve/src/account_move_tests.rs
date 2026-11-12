@@ -101,3 +101,46 @@ fn a_resumed_runs_persona_follows_the_account_routing_gave_it() {
     )
     .is_err());
 }
+
+/// A moved run's resume that asked routing and got no usable answer (no answer in the budget,
+/// routing unreachable, a hold, a refusal or a conflict) keeps the account it recorded: the
+/// admission goes on as a resume that never asked. A fresh run's refusal still ends it.
+#[test]
+fn a_resume_routing_gives_no_account_keeps_the_recorded_one() {
+    let run_id = broca_protocol::RunId("resumed".into());
+    let refusal = |routing_code: &str| {
+        RunError::AccountSelectionRefused(broca_core::AccountSelectionRefusal {
+            routing_code: routing_code.into(),
+            retry_after_s: None,
+            resets_at_ms: None,
+            routing_detail: None,
+            decision_id: None,
+            class: broca_protocol::ErrorClass::Transient,
+        })
+    };
+    for error in [
+        RunError::RoutingUnavailable(broca_core::RoutingUnavailable::no_decision_within_budget(
+            1_500,
+        )),
+        RunError::RoutingUnavailable(broca_core::RoutingUnavailable::unreachable()),
+        refusal("account_hold"),
+        refusal("account_pinned"),
+        refusal("admission_conflict"),
+    ] {
+        let mut asks = true;
+        let choice = resumed_choice(Err(error), &mut asks, &run_id);
+        assert!(matches!(choice, Ok(AccountChoice::NotApplicable)));
+        assert!(!asks, "nothing after follows an account routing didn't give");
+    }
+    let mut fresh = false;
+    assert!(matches!(
+        resumed_choice(Err(refusal("account_pinned")), &mut fresh, &run_id),
+        Err(RunError::AccountSelectionRefused(_))
+    ));
+    let mut asks = true;
+    assert!(matches!(
+        resumed_choice(Ok(AccountChoice::NotApplicable), &mut asks, &run_id),
+        Ok(AccountChoice::NotApplicable)
+    ));
+    assert!(asks, "an answer routing gave is taken");
+}
