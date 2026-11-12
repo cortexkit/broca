@@ -1589,7 +1589,7 @@ fn scratch_progress(
 
 /// The walks `session.history` is read by: each form, from the newest page by `older` cursors
 /// and from the first message by `newer` cursors.
-const HISTORY_WALKS: [(&str, bool); 4] = [
+pub(crate) const HISTORY_WALKS: [(&str, bool); 4] = [
     ("raw", true),
     ("raw", false),
     ("display", true),
@@ -1598,7 +1598,7 @@ const HISTORY_WALKS: [(&str, bool); 4] = [
 
 /// Every page of one walk of `session.history` over `handler`, as `broca_module::history::read`
 /// serves them, ending at a refusal if one comes.
-async fn history_pages(
+pub(crate) async fn history_pages(
     handler: &dyn broca_module::ServeHandler,
     session: &BindIdentity,
     form: &str,
@@ -1652,10 +1652,9 @@ async fn history_walks(
     )
     .map_err(|error| mismatch(HISTORY_DISPLAY, format!("today's history: {error:?}")))?
     .with_clean_replies(clean_replies(view).await?);
-    let staged = crate::stored_history::StoredHistory {
-        session: view,
-        parts,
-    };
+    let staged = crate::stored_history::StoredHistoryWalk::new(view, parts)
+        .await
+        .map_err(|error| mismatch(HISTORY_DISPLAY, format!("the staged history: {error:?}")))?;
     for (form, newest) in HISTORY_WALKS {
         let walk = format!(
             "{form} from the {}",
