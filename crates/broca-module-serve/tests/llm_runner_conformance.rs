@@ -333,6 +333,8 @@ mod attribution;
 mod boundary_cancel;
 #[path = "llm_runner_conformance/evidence.rs"]
 mod evidence;
+#[path = "llm_runner_conformance/fork_answer.rs"]
+mod fork_answer;
 #[path = "llm_runner_conformance/held_late_results.rs"]
 mod held_late_results;
 #[path = "llm_runner_conformance/optional_tools.rs"]
@@ -424,6 +426,9 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    fork_head_keys: Mutex<HashMap<String, String>>,
+    fork_asks: Mutex<fork_answer::PendingAsks>,
+    fork_raw_requests: Mutex<fork_answer::RawRequests>,
     routed_account_peers:
         Mutex<HashMap<String, cortexkit_role_llm_runner_conformance::RecordingRoutingPeer>>,
     routed_http_requests: Mutex<HashMap<String, Vec<routed_accounts::HttpRequestEvidence>>>,
@@ -852,6 +857,9 @@ async fn serve_model_request(
                 Some(name)
             })
     };
+    if let Some(session) = &session {
+        shared.record_model_ingress(session, &request, &buffer[body_start..body_start + length]);
+    }
     let refusal = session
         .as_ref()
         .and_then(|session| shared.errors.lock().unwrap().get(session).cloned());
@@ -906,13 +914,6 @@ async fn serve_model_request(
                 .or_default()
                 .push(evidence);
         }
-        shared
-            .raw_bodies
-            .lock()
-            .unwrap()
-            .entry(session.clone())
-            .or_default()
-            .push(buffer[body_start..body_start + length].to_vec());
     }
     let Some(turn) = turn else {
         eprintln!(
@@ -2373,7 +2374,25 @@ impl RunnerRoute for BrocaRoute {
             rows,
         )))
     }
-    async fn request(&self, method: &str, params: Value) -> Result<Reply, RouteFailure> {
+    async fn request(&self, method: &str, mut params: Value) -> Result<Reply, RouteFailure> {
+        if method == "session.send" {
+            if let Some(key) = self
+                .subject
+                .shared
+                .fork_head_keys
+                .lock()
+                .unwrap()
+                .get(&self.session.session)
+            {
+                params["conversation_key"] = json!(key);
+            }
+        }
+        let _fork_capture = fork_answer::AskCapture::new(
+            &self.subject.shared,
+            &self.session.session,
+            method,
+            &params,
+        );
         let polled_run = (method == "run.result")
             .then(|| params["run_id"].as_str().map(str::to_owned))
             .flatten();
@@ -2697,6 +2716,19 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .insert(session.into(), peer);
         Ok(())
+    }
+
+    async fn configure_fork_head_key(
+        &self,
+        session: &str,
+        key: &str,
+    ) -> Result<bool, HarnessError> {
+        self.shared
+            .fork_head_keys
+            .lock()
+            .unwrap()
+            .insert(session.into(), key.into());
+        Ok(true)
     }
 
     async fn head_selection_models(
@@ -3151,6 +3183,9 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(session)
         {
             let mut fields = routed_accounts::send_fields(session, first, peer);
+            if let Some(key) = self.shared.fork_head_keys.lock().unwrap().get(session) {
+                fields.insert("conversation_key".into(), json!(key));
+            }
             if first && step_events::fixture_session(session) {
                 // The new-head path records durable attempt identities. The fixture's daemon
                 // uses plain storage because its vault has no deployment key.
@@ -3704,6 +3739,28 @@ impl LlmRunnerSubject for BrocaSubject {
         Ok(())
     }
 
+    async fn raw_model_requests(
+        &self,
+        session: &str,
+    ) -> Result<Vec<cortexkit_role_llm_runner_conformance::RawModelRequestObservation>, HarnessError>
+    {
+        Ok(self
+            .shared
+            .fork_raw_requests
+            .lock()
+            .unwrap()
+            .get(session)
+            .into_iter()
+            .flatten()
+            .map(|(fork, body)| {
+                cortexkit_role_llm_runner_conformance::RawModelRequestObservation::new(
+                    fork.clone(),
+                    body.clone(),
+                )
+            })
+            .collect())
+    }
+
     async fn model_requests(
         &self,
         session: &str,
@@ -3947,8 +4004,16 @@ impl LlmRunnerSubject for BrocaSubject {
         }]}))
     }
 
-    /// Broca has no fork or clone operation, so no session is ever a fork the runner could
-    /// detect; the fork case names that as inapplicable.
+    async fn revert_session(
+        &self,
+        _handle: &Live,
+        _session: &str,
+        _mid: &str,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::new("broca serves no transcript revert"))
+    }
+
+    /// The legacy whole-session clone fixture is not the short-lived fork_answer surface.
     async fn fork_session(
         &self,
         _handle: &Self::Handle,
@@ -4154,6 +4219,14 @@ impl LlmRunnerSubject for BrocaSubject {
         milliseconds: u64,
     ) -> Result<(), HarnessError> {
         self.advance_retention(session, milliseconds).await
+    }
+    #[cfg(feature = "test-clock")]
+    async fn advance_fork_clock(
+        &self,
+        session: &str,
+        milliseconds: u64,
+    ) -> Result<(), HarnessError> {
+        self.advance_fork_time(session, milliseconds).await
     }
     #[cfg(feature = "test-clock")]
     async fn retention_deletion_finished(

@@ -5366,8 +5366,23 @@ mod executor {
         }
     }
 
+    include!("fork_executor.rs");
+
     #[async_trait]
     impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        async fn fork_call(
+            &self,
+            job: broca_module::executor::ForkCallJob,
+        ) -> broca_module::executor::ForkCallOutcome {
+            self.call_fork(job).await
+        }
+
+        async fn fork_release(
+            &self,
+            job: broca_module::executor::ForkReleaseJob,
+        ) -> Result<(), String> {
+            self.release_fork(job).await
+        }
         fn head_selection_wire(
             &self,
             model: &cortexkit_role_llm_runner::head_selection::PlanModel,
@@ -6259,6 +6274,7 @@ mod executor {
 
         include!("credential_source_guard_tests.rs");
         include!("frozen_auth_method_resume_tests.rs");
+        include!("fork_executor_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
         /// that omitted `cache`) takes the cache policy and caller cache key frozen in the

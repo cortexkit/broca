@@ -1276,11 +1276,32 @@ impl RoutingClient {
     /// Ask routing for an account, giving up at `deadline`.
     pub async fn account_for(
         &self,
-        mut params: Value,
+        params: Value,
         deadline: tokio::time::Instant,
     ) -> AccountForOutcome {
+        self.account_for_inner(params, deadline, false).await
+    }
+
+    /// Admit a frozen account pin without discarding a chosen account on a tier mismatch.
+    /// The fork caller must compare the choice and release even a mismatched admission.
+    pub async fn account_for_pinned(
+        &self,
+        params: Value,
+        deadline: tokio::time::Instant,
+    ) -> AccountForOutcome {
+        self.account_for_inner(params, deadline, true).await
+    }
+
+    async fn account_for_inner(
+        &self,
+        mut params: Value,
+        deadline: tokio::time::Instant,
+        pinned: bool,
+    ) -> AccountForOutcome {
         // Legacy tierless admissions must not gain a discovery RPC or its failure modes.
-        let tier_aware = if params
+        let tier_aware = if pinned {
+            true
+        } else if params
             .get("service_tier")
             .is_some_and(|tier| !tier.is_null())
         {
@@ -1317,11 +1338,11 @@ impl RoutingClient {
             ..
         } = &mut outcome
         {
-            if tier_aware {
+            if tier_aware && !pinned {
                 if let Err(message) = check_account_tier(&params, service_tier_chosen.as_deref()) {
                     return AccountForOutcome::Unreachable(message);
                 }
-            } else {
+            } else if !tier_aware {
                 *service_tier_chosen = None;
             }
         }
@@ -1434,6 +1455,31 @@ impl RoutingClient {
                 );
             }
         }
+    }
+
+    /// Release a fork admission, retaining delivery failures so restart recovery can retry.
+    /// Its stable event id lets routing deduplicate a release whose reply was lost.
+    pub async fn finish_fork(
+        &self,
+        admission_id: &str,
+        run_id: &str,
+        account: Option<(&str, &str)>,
+    ) -> Result<(), String> {
+        let mut params = report(
+            "run_finished",
+            &format!("{admission_id}:run_finished"),
+            admission_id,
+        );
+        params.insert("run_id".into(), json!(run_id));
+        if let Some((account_id, credential_id)) = account {
+            params.insert("served_account_id".into(), json!(account_id));
+            params.insert("credential_id".into(), json!(credential_id));
+        }
+        let params = Value::Object(params);
+        self.classifier_rpc::<Value>(ACCOUNT_OBSERVE_OP, &params)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("fork admission release: {error:?}"))
     }
 }
 
