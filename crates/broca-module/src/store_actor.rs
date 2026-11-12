@@ -3821,10 +3821,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             selection: broca_session_loop::plan::recorded_selection(&manifest),
         });
         match self.append_own(record).await {
-            Ok(()) => SessionRefreshOutcome::Accepted {
-                run_in_progress,
-                applies_from_next_run,
-            },
+            Ok(()) => {
+                if manifest
+                    .plan
+                    .as_json_text()
+                    .parse::<serde_json::Value>()
+                    .ok()
+                    .is_some_and(|plan| plan.get("readers").is_some())
+                {
+                    if let Some(fanout) = &self.fanout {
+                        fanout.recheck_read_access();
+                    }
+                }
+                SessionRefreshOutcome::Accepted {
+                    run_in_progress,
+                    applies_from_next_run,
+                }
+            }
             Err(error) => SessionRefreshOutcome::Error(error),
         }
     }

@@ -36,6 +36,7 @@ pub mod person_media;
 mod phase_metrics_tests;
 mod plan_change;
 mod plan_episode;
+pub mod reader_admission;
 pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;

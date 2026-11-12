@@ -415,6 +415,8 @@ pub fn broca_role_describe_with_writers(
         // Served on the new storage, where every head lives; a session still kept in today's
         // storage refuses the read by name until it is converted.
         cortexkit_role_llm_runner::capabilities::PLAN_VIEW,
+        // Reader policies are served on the new storage; today's storage refuses plan.readers.
+        cortexkit_role_llm_runner::capabilities::APP_READERS,
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,
@@ -1354,7 +1356,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "00b25d5bc6f0d15505d746539fd7db4113cd4ceffba4c22f94ed61be407f8a54",
+            "721ce8b06f87007a6eb66ff2532084047a79cdcf62bf771305259c82f87705a9",
         );
     }
 
@@ -1550,7 +1552,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "3fe10bba5cf1010e4a3ab272c42a593574246b23c9d1fbea30862e87dd6b311f";
+        "f136a3f6ec1808f8069bd82f04c0b8c62b33d0fd4c2f05ecbc757ebde35e82b0";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
