@@ -444,7 +444,7 @@ async fn codex_store_two_completed_runs_reuse_the_websocket_lease() {
             hook_plane: None, now_ms: &|| 1000, session_address: None, compaction_plane: None,
             compaction_session: None, compaction_changes: false, keep_warm: None, account_reports: None,
             max_same_account_wait: Default::default(), auth_selection: None, step_progress: None,
-            model_call_ready: None, pause_for_auth_at_start: None,
+            model_call_ready: None, pause_for_auth_at_start: None, account_continue: None,
         };
         let finished = broca_session_loop::run(&mut session, &mut parts, admission, &seams).await.unwrap();
         assert_eq!(finished.reason, RunFinishReason::Completed);

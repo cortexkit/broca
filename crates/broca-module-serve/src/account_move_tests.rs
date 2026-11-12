@@ -909,6 +909,7 @@ async fn a_sealed_routed_run_reports_its_end_to_routing() {
             auth_selection: control.auth_selection.clone(),
             step_progress: None,
             model_call_ready: None,
+            pause_for_auth_at_start: None,
             account_continue: None,
         };
         let mut started = req.clone();

@@ -323,6 +323,24 @@ impl Provider for Account {
     fn last_accepted_at_ms(&self, _account: &str) -> Option<u64> {
         self.accepted_at_ms
     }
+
+    fn bind_run_transport(&self, _session: &BindIdentity) {
+        self.log.lock().unwrap().push(format!("bind {}", self.name));
+    }
+
+    fn close_run_transport(&self) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("close {}", self.name));
+    }
+
+    fn complete_run_transport(&self) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("complete {}", self.name));
+    }
 }
 
 /// What the scripted routing answers, in turn.
@@ -816,6 +834,7 @@ fn seams<'a>(
         auth_selection: Some(selection),
         step_progress: None,
         model_call_ready: None,
+        pause_for_auth_at_start: None,
         account_continue: routing.map(|routing| routing as &dyn AccountContinue<Box<dyn Provider>>),
     }
 }
@@ -1010,6 +1029,13 @@ async fn a_wall_moves_the_step_to_the_offered_account() {
     let moved = position(log, refused, "append durable AuthRefrozen");
     let resent = position(log, moved, "send B step 2");
     assert!(walled < refused && refused < moved && moved < resent);
+    // The new account's provider owns the run's transport from the move on, as the run's own
+    // provider did before it: A's is closed, B's is bound before its first send and completed
+    // with the run.
+    let left = position(log, moved, "close A");
+    let bound = position(log, left, "bind B");
+    assert!(bound < resent);
+    position(log, resent, "complete B");
     // Routing hears of the refused attempt, then of the move, then of the attempt on B.
     let reported = position(log, walled, "report attempt A");
     let reported_move = position(log, reported, "report moved B");
@@ -1777,7 +1803,7 @@ impl broca_core::CompactionPlane for Compactor {
                                     part,
                                     field: "output".into(),
                                     value: json!("compacted tool output"),
-                                    expect,
+                                    expect: expect.into(),
                                 },
                             )],
                         );
