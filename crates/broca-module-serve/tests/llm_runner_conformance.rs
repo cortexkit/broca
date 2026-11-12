@@ -5012,13 +5012,22 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
     const CASE: &str = "read_display_facts_send_id_when_present";
     const REASON: &str = "send_ids guarantee is checked by read_display_facts_send_id";
+    // The case's unkeyed send reaches an idle session and starts its run at once, and a
+    // send that starts a run is answered with its run id, never a submission id (serve.rs
+    // answers a submission id only to a queued, `Pending`, send). The contract lets an admitted
+    // unkeyed send return none, and the kit then checks the id is absent from the read instead.
+    const SEND_ID: &str = "read_display_facts_send_id";
+    const UNKEYED: &str =
+        "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead";
     assert_eq!(
         expected_0821_cases()
             .into_iter()
-            .find(|(name, _)| *name == "read_display_facts_send_id")
+            .find(|(name, _)| *name == SEND_ID)
             .unwrap()
             .1,
-        CaseOutcome::Passed
+        CaseOutcome::PassedWithInapplicableRule {
+            reason: UNKEYED.into()
+        }
     );
     let mut cases: Vec<_> = expected_0821_cases()
         .into_iter()
@@ -5056,6 +5065,24 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
         let mut changed = cases.clone();
         changed[index].outcome = outcome;
         assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+    }
+    // The send-id case itself: any other outcome, or the same outcome for another reason,
+    // is a drift.
+    let send_id = cases.iter().position(|case| case.case == SEND_ID).unwrap();
+    for outcome in [
+        CaseOutcome::Passed,
+        CaseOutcome::PassedWithInapplicableRule {
+            reason:
+                "read_display_facts_send_id_unkeyed: runner does not admit unkeyed non-owner sends"
+                    .into(),
+        },
+        CaseOutcome::Inapplicable {
+            reason: UNKEYED.into(),
+        },
+    ] {
+        let mut changed = cases.clone();
+        changed[send_id].outcome = outcome;
+        assert!(check_0821_cases(&changed).unwrap_err().contains(SEND_ID));
     }
     cases.remove(index);
     assert_eq!(
