@@ -1026,14 +1026,6 @@ impl UnmappedCredentials {
     }
 }
 
-/// Whether broca owns account admission for this sign-in method.
-pub fn selects_accounts(method: AuthMethod) -> bool {
-    matches!(
-        method,
-        AuthMethod::Oauth | AuthMethod::Chatgpt | AuthMethod::ApiKey
-    )
-}
-
 /// The admission id a run is known by in routing. It is the run id, which is itself derived
 /// from the session and the caller's `send_id` when the send carries one, so a genuine retry of
 /// the same send (after a crash between asking routing and writing `RunStarted`, say) presents
@@ -1713,9 +1705,6 @@ where
     };
     let method = inputs.static_credential.method;
     let provider = inputs.static_credential.provider.as_str();
-    if !selects_accounts(method) {
-        return Ok(AccountChoice::NotApplicable);
-    }
     let admission = admission_id(inputs.run_id);
     let hinted =
         inputs.pool.is_some() || inputs.credential_id.is_some() || inputs.account_route.is_some();

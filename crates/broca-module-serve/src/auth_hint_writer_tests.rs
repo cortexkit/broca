@@ -88,41 +88,6 @@ async fn account_route_admission_uses_routing_names_and_keeps_auth_hints() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
-async fn account_route_refuses_unlisted_default_method_before_any_write() {
-    use broca_core::WalStore as _;
-    if !run_catalog_drift_child("account_route_refuses_unlisted_default_method_before_any_write") { return; }
-    install_queued_ultrafast_catalog();
-    let root = fresh_vault_root("account-route-method");
-    let daemon = CapturingVaultDaemon::start(&root).await;
-    let http = resume_http_fixture().await;
-    let routing = Arc::new(AuthHintRouting::default());
-    let mut live = auth_hint_executor(&root, &daemon, routing.clone(), &http.url).await;
-    let cache = listed_credentials([("antigravity:openai", "antigravity:openai")]);
-    let (mut rows, _) = cache.get().unwrap();
-    Arc::make_mut(&mut rows).credentials.retain(|row| row.provider_ids != ["openai"] || row.auth_method.as_deref() == Some("antigravity"));
-    cache.store((*rows).clone());
-    let vault = Arc::get_mut(live.vault.as_mut().unwrap()).unwrap();
-    vault.methods = broca_module_serve::MethodConfig::from_listing(cache.clone());
-    vault.addressing = broca_module_serve::VaultAddressing::new(cache.clone());
-    vault.listing = cache;
-    let store = live.wal_store.clone();
-    let mut rig = TierServeRig::start_with_executor(&root, None, None, live, None).await;
-    let reply = rig.call("session.send", serde_json::json!({"send_id":"unsupported-route","prompt":"hello",
-        "model":{"provider":"openai","model":"test-ultrafast"},
-        "account_route":{"provider":"routing-openai","model":"routing-model"}})).await;
-    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
-    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(error["code"], "invalid_params", "{error}");
-    assert_eq!(error["detail"]["field"], "account_route", "{error}");
-    assert!(routing.requests.lock().unwrap().is_empty());
-    assert!(http.requests.lock().unwrap().is_empty());
-    assert!(store.read_records(&rig.session).unwrap().is_empty());
-    rig.close().await;
-    drop(daemon);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 async fn refuse_mixed_auth_hint(hint: &str) {
     use broca_core::WalStore as _;
     let root = fresh_vault_root("auth-hint-conflict");
@@ -208,21 +173,4 @@ async fn routed_auth_queued_pool_survives_restart_and_drains_to_account_for() {
     drop(store);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn auth_routing_hints_do_not_change_unlisted_method_submission_bytes_or_identity() {
-    use broca_module_serve::wire::SendParamsExt;
-    use broca_protocol::{BindIdentity, RunId};
-    let base = serde_json::json!({"prompt":"hello","model":{"provider":"anthropic","model":"fixture"},
-        "auth":{"method":"antigravity","account":"work"}});
-    let mut hinted = base.clone();
-    hinted["auth"]["pool"] = serde_json::json!("ignored-pool");
-    hinted["auth"]["credential_id"] = serde_json::json!("ignored-credential");
-    let convert = |value| serde_json::from_value::<broca_wire::SendParams>(value).unwrap()
-        .into_send_request(BindIdentity::new("/private", "runner", "session"), RunId("run".into())).unwrap().request;
-    let base = convert(base);
-    let hinted = convert(hinted);
-    assert_eq!(serde_json::to_vec(&base).unwrap(), serde_json::to_vec(&hinted).unwrap());
-    assert_eq!(broca_core::submission_identity_digest(&base), broca_core::submission_identity_digest(&hinted));
 }

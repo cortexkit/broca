@@ -255,6 +255,10 @@ async fn a_store_session_runs_through_the_production_executor() {
 async fn a_fresh_trial_folder_run_ignores_the_retired_selection_file() {
     use std::io::Write;
 
+    // It replaces the process-global catalog, so it runs in its own process.
+    if !run_catalog_drift_child("a_fresh_trial_folder_run_ignores_the_retired_selection_file") {
+        return;
+    }
     let server = resume_http_fixture().await;
     let root = fresh_vault_root("retired-ride-selection");
     let trial_project = std::path::Path::new("/Users/Shared/ck-move-scratch-broca");

@@ -86,9 +86,10 @@ pub trait SendParamsExt {
 pub(crate) const AUTH_PIN_HINT_CONFLICT: &str =
     "an auth.account pin cannot be combined with auth.pool or auth.credential_id";
 
+/// Whether `method` is a sign-in method broca knows: every one of them takes its account from
+/// routing.
 fn self_routed_auth(method: &str) -> bool {
-    broca_catalog::live::AuthMethod::from_token(method)
-        .is_some_and(crate::account_routing::selects_accounts)
+    broca_catalog::live::AuthMethod::from_token(method).is_some()
 }
 
 pub(crate) fn auth_pin_hint_conflict(auth: &AuthParams) -> bool {

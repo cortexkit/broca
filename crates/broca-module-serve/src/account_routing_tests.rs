@@ -12,8 +12,24 @@ use std::sync::atomic::AtomicUsize;
 #[path = "account_routing_transport_tests.rs"]
 mod transport_tests;
 
+/// Every sign-in method takes its account from routing, so broca declares all of them. The match
+/// names every method, so adding one fails to compile here until it's listed below too.
 #[test]
-fn routed_accounts_discovery_lists_only_self_routed_sign_in_methods() {
+fn routed_accounts_discovery_lists_every_sign_in_method() {
+    let every = [
+        AuthMethod::ApiKey,
+        AuthMethod::Oauth,
+        AuthMethod::Antigravity,
+        AuthMethod::Chatgpt,
+    ];
+    for method in every {
+        match method {
+            AuthMethod::ApiKey
+            | AuthMethod::Oauth
+            | AuthMethod::Antigravity
+            | AuthMethod::Chatgpt => {}
+        }
+    }
     for describe in [
         broca_wire::broca_role_describe("test"),
         broca_wire::broca_role_describe_with_writers("test", true, true, true),
@@ -23,22 +39,12 @@ fn routed_accounts_discovery_lists_only_self_routed_sign_in_methods() {
         assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ROUTED_ACCOUNTS));
         assert_eq!(
             value["routed_accounts"],
-            json!(["oauth", "chatgpt", "apikey"])
+            json!(["oauth", "chatgpt", "apikey", "antigravity"])
         );
-        for method in [
-            AuthMethod::ApiKey,
-            AuthMethod::Oauth,
-            AuthMethod::Antigravity,
-            AuthMethod::Chatgpt,
-        ] {
-            assert_eq!(
-                selects_accounts(method),
-                checked
-                    .routed_accounts
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .any(|listed| listed == method.as_token()),
+        let listed = checked.routed_accounts.as_ref().unwrap();
+        for method in every {
+            assert!(
+                listed.iter().any(|listed| listed == method.as_token()),
                 "{method:?}"
             );
         }
@@ -3252,16 +3258,39 @@ async fn auth_routing_hints_cannot_fall_back_when_selection_is_disabled() {
     );
 }
 
+/// An Antigravity run with two Google accounts asks routing which one to use, as Claude and
+/// ChatGPT runs do, rather than taking the default credential: that default may be the account
+/// whose quota is spent while the other has room.
 #[tokio::test]
-async fn auth_routing_hints_are_ignored_for_unlisted_methods() {
-    let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
-    assert_eq!(
-        choose_with_auth_hints(&client(&routing), "antigravity:google", None)
-            .await
-            .unwrap(),
-        AccountChoice::NotApplicable
+async fn an_antigravity_run_with_two_accounts_asks_routing_for_one() {
+    let routing = FakeRouting::choosing("acct-g2", "antigravity:google:second");
+    let choice = choose(
+        &client(&routing),
+        "antigravity:google",
+        false,
+        Some(listing(vec![
+            row(
+                "antigravity:google",
+                Some("acct-g1"),
+                "google",
+                "antigravity",
+            ),
+            row(
+                "antigravity:google:second",
+                Some("acct-g2"),
+                "google",
+                "antigravity",
+            ),
+        ])),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&choice, AccountChoice::Routed { credential_id, .. }
+            if credential_id == "antigravity:google:second"),
+        "{choice:?}"
     );
-    assert!(routing.requests.lock().unwrap().is_empty());
+    assert_eq!(routing.methods(), ["route.account_for"]);
 }
 
 /// A wall on `account`, as the run loop states it, for a run routed under `decision-a`.

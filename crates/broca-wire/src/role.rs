@@ -510,7 +510,13 @@ pub fn broca_role_describe_with_writers(
     // `unknown`.
     .with_steer_receipt(steer_receipt::GUARANTEED)
     .with_run_cancel(vec!["now".into(), "step_boundary".into()])
-    .with_routed_accounts(vec!["oauth".into(), "chatgpt".into(), "apikey".into()]);
+    // Every sign-in method broca knows takes its account from routing.
+    .with_routed_accounts(vec![
+        "oauth".into(),
+        "chatgpt".into(),
+        "apikey".into(),
+        "antigravity".into(),
+    ]);
     if broca_protocol::FORK_ANSWER_SERVED {
         describe = describe.with_fork_idle_s(broca_protocol::FORK_IDLE_S);
     }
@@ -1408,7 +1414,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "5d994cccd65229db47db132ca879b03e5f261d872392e619140eb127e9172126",
+            "15cc14478fa2bb911ea3cbba9c75d43286a2029cdf087b930adbb1dc01dc048d",
         );
     }
 
@@ -1605,7 +1611,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "40e0ff125f45702f0c564b710231c43b9f030a9916c5018e7f8618df244eebad";
+        "eb85e1bb56c29e0839825701a95d493b1034f68eaad587168c6c033a34936b2f";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

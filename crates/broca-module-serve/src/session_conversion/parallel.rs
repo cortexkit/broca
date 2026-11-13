@@ -380,6 +380,9 @@ mod tests {
     fn concurrent_conversion_conflicts_include_completed_members_and_transitive_addresses() {
         let root = broca_test_support::scratch_root().join("conversion-components");
         std::fs::create_dir_all(&root).unwrap();
+        // The engine keeps its root canonical, so sources named under a scratch root reached
+        // through a symlink (macOS's /tmp) must be named under the same canonical path.
+        let root = std::fs::canonicalize(&root).unwrap();
         let engine = Engine::configured(
             &root,
             Config {

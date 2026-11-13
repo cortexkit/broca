@@ -6095,7 +6095,6 @@ mod executor {
                         let listing = listing.as_ref()?;
                         let routed = self.routing.is_some()
                             && key.method != AuthMethod::ApiKey
-                            && broca_module_serve::account_routing::selects_accounts(key.method)
                             && broca_module_serve::account_routing::Candidates::from_listing(
                                 listing,
                                 key.method,
@@ -6208,29 +6207,10 @@ mod executor {
             &self,
             request: &broca_protocol::request::SubmissionRequest,
         ) -> Result<(), String> {
-            let (pin, account) =
-                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
-                    .map_err(|error| format!("account_route: {error}"))?;
-            let method = self
-                .vault
-                .as_ref()
-                .map_or(pin.unwrap_or(FALLBACK_METHOD), |vault| {
-                    broca_module_serve::auth_routing::resolve_credential_id(
-                        &request.model.provider_module_id,
-                        pin,
-                        account,
-                        &vault.methods,
-                        FALLBACK_METHOD,
-                    )
-                    .method
-                });
-            if !broca_module_serve::account_routing::selects_accounts(method) {
-                return Err(format!(
-                    "account_route is not accepted for sign-in method {}",
-                    method.as_token()
-                ));
-            }
-            Ok(())
+            // Every sign-in method takes its account from routing, so only the auth is checked.
+            caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
+                .map(|_| ())
+                .map_err(|error| format!("account_route: {error}"))
         }
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()

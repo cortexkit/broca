@@ -56,6 +56,7 @@ pub(super) fn fixture(method: &str) -> Result<Value, HarnessError> {
     let provider = match method {
         "oauth" => "anthropic",
         "chatgpt" | "apikey" => "openai",
+        "antigravity" => "google",
         _ => {
             return Err(HarnessError::new(format!(
                 "no routed-account fixture for {method}"
@@ -213,7 +214,7 @@ pub(super) fn configure(
     let methods = root.join("routed-auth-methods.json");
     std::fs::write(
         &methods,
-        br#"{"defaults":{"anthropic":"oauth","openai":"chatgpt"}}"#,
+        br#"{"defaults":{"anthropic":"oauth","openai":"chatgpt","google":"antigravity"}}"#,
     )
     .map_err(|error| HarnessError::new(error.to_string()))?;
     daemon["modules"]["broca"]["env"]["BROCA_AUTH_METHODS_PATH"] = json!(methods);
@@ -355,7 +356,7 @@ impl subc_client_rs::ModuleHandler for Router {
 
 fn credentials() -> Vec<Value> {
     let mut rows = vec![];
-    for method in ["oauth", "chatgpt", "apikey"] {
+    for method in ["oauth", "chatgpt", "apikey", "antigravity"] {
         let fixture = fixture(method).unwrap();
         for spare in [false, true] {
             let mut row = json!({"id":format!("{}{}",fixture["credential_id"].as_str().unwrap(),if spare {"-spare"} else {""}),
@@ -1146,7 +1147,7 @@ mod tests {
                     .all(|row| row.account_id.is_none()));
             }
         }
-        assert!(fixture("antigravity").is_err());
+        assert!(fixture("cursor").is_err());
         assert_eq!(runner_declaration()["follows_account_choice"], true);
     }
 
@@ -1224,7 +1225,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             methods["defaults"],
-            json!({"anthropic":"oauth","openai":"chatgpt"})
+            json!({"anthropic":"oauth","openai":"chatgpt","google":"antigravity"})
         );
         seed_structured_output_catalog(&root).unwrap();
         seed_catalog(&root, "http://127.0.0.1:7/v1", "native-session").unwrap();
