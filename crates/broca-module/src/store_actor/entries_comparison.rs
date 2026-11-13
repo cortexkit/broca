@@ -2992,3 +2992,6 @@ mod tag_map_tests;
 
 #[path = "entries_comparison/message_ids.rs"]
 mod message_ids;
+
+#[path = "entries_comparison/model_fallback.rs"]
+mod model_fallback;

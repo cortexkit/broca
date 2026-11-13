@@ -61,6 +61,7 @@ fn stateful_caller_message_serializer_uses_borrowed_content() {
         client_message_id: None,
         tool_times: Vec::new(),
         rich_ui: None,
+        model_fallback: None,
         written_at: None,
         ordinal: 0,
         mid: "m0".into(),

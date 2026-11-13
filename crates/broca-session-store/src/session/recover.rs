@@ -311,6 +311,8 @@ impl<B: SessionBackend> Session<B> {
         // the conversation folds the transcript records after it (`Conversation::enrolled`).
         let mut conversation = checkpoint.conversation.clone();
         let mut operations = checkpoint.operational.clone();
+        let mut reply_fallbacks =
+            super::model_fallback::ReplyFallbacks::from_operations(&operations);
         let mut activity =
             OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
         conversation.enrolled(operations.enrolled_through());
@@ -319,6 +321,7 @@ impl<B: SessionBackend> Session<B> {
             .map(|(seq, _, record)| (*seq, record))
             .peekable();
         for (seq, record) in &ledger {
+            reply_fallbacks.note(*seq, record);
             while let Some((kept_seq, kept)) =
                 kept_transcript.next_if(|(transcript_seq, _)| transcript_seq < seq)
             {
@@ -603,6 +606,7 @@ impl<B: SessionBackend> Session<B> {
             memory_refused: Default::default(),
             retired_tag_floor: 1,
             interner: Default::default(),
+            reply_fallbacks,
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,
