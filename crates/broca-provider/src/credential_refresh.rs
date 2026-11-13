@@ -22,10 +22,55 @@ use broca_protocol::CredentialRefresh;
 
 use crate::wire::AuthHandle;
 
-/// The future a refresher returns. `None` means no fresh token is available (the source
-/// refused, the credential needs re-authentication, the source is unreachable, or this
-/// credential cannot be force-refreshed), and the caller keeps the rejection it already has.
-pub type RefreshFuture<'a, T> = Pin<Box<dyn Future<Output = Option<T>> + Send + 'a>>;
+/// A rejected-token read must not confuse definite sign-in loss with an unavailable source.
+pub enum RejectedRefresh<T> {
+    Token(T),
+    NeedsReauth,
+    Unavailable,
+}
+
+impl<T> RejectedRefresh<T> {
+    pub fn into_token(self) -> Option<T> {
+        match self {
+            Self::Token(token) => Some(token),
+            _ => None,
+        }
+    }
+}
+
+pub type RefreshFuture<'a, T> = Pin<Box<dyn Future<Output = RejectedRefresh<T>> + Send + 'a>>;
+
+/// A pre-send read distinguishes a definite sign-in loss from an unavailable source. A
+/// still-unexpired held token can be sent even when the source cannot renew its sign-in.
+pub enum ExpiringRefresh<T> {
+    Token(T),
+    NeedsReauth { held_expires_at_ms: Option<i64> },
+    Unavailable,
+}
+
+pub type ExpiringRefreshFuture<'a, T> =
+    Pin<Box<dyn Future<Output = ExpiringRefresh<T>> + Send + 'a>>;
+
+pub(crate) fn needs_reauth_error() -> broca_protocol::ProviderError {
+    broca_protocol::ProviderError {
+        class: broca_protocol::ErrorClass::Auth,
+        message: "credential needs re-authentication before another attempt".into(),
+        provider_code: Some("needs_reauth".into()),
+        status: None,
+        retry_after_secs: None,
+        provider_subcode: None,
+        provider_details: None,
+        cause: None,
+        refusal: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+        account_continue: None,
+    }
+}
 
 /// A fresh raw secret for the run's frozen credential, plus what was asked to obtain it.
 pub struct RefreshedSecret {
@@ -62,18 +107,19 @@ pub trait SecretRefresher: Send + Sync {
     fn note_unrecovered_rejection(&self, _status: u16) {}
 
     /// Called before every attempt. Returns a fresh token only when the one served last is
-    /// about to expire and the source could serve a newer one; `None` otherwise, including
-    /// for tokens that never expire and when the source could not be reached. Nothing was
+    /// about to expire and the source could serve a newer one. A source reporting sign-in loss
+    /// returns `NeedsReauth` with the held expiry; all other failures return `Unavailable`.
+    /// Tokens that never expire need no read. Nothing was
     /// rejected, so implementations must not report a failure to the source here.
     ///
     /// The default never refreshes, for sources that cannot tell when a token expires.
-    fn refresh_expiring_secret(&self) -> RefreshFuture<'_, RefreshedSecret> {
-        Box::pin(async { None })
+    fn refresh_expiring_secret(&self) -> ExpiringRefreshFuture<'_, RefreshedSecret> {
+        Box::pin(async { ExpiringRefresh::Unavailable })
     }
 }
 
 /// What the transport calls after an HTTP 401: a fresh credential shaped for this provider's
-/// auth header, or `None` to let the rejection stand.
+/// auth header, definite sign-in loss, or an unavailable source.
 pub trait CredentialRefresher: Send + Sync {
     /// See [`SecretRefresher::refresh_rejected_secret`].
     fn refresh_rejected(&self, status: u16) -> RefreshFuture<'_, RefreshedCredential>;
@@ -82,10 +128,10 @@ pub trait CredentialRefresher: Send + Sync {
     fn note_unrecovered_rejection(&self, _status: u16) {}
 
     /// What the transport calls before each attempt: a fresh credential when the held one is
-    /// about to expire, or `None` to send with the held one (see
+    /// about to expire, or a typed sign-in/unavailability outcome (see
     /// [`SecretRefresher::refresh_expiring_secret`]). The default never refreshes.
-    fn refresh_expiring(&self) -> RefreshFuture<'_, RefreshedCredential> {
-        Box::pin(async { None })
+    fn refresh_expiring(&self) -> ExpiringRefreshFuture<'_, RefreshedCredential> {
+        Box::pin(async { ExpiringRefresh::Unavailable })
     }
 }
 
@@ -131,8 +177,11 @@ where
 {
     fn refresh_rejected(&self, status: u16) -> RefreshFuture<'_, RefreshedCredential> {
         Box::pin(async move {
-            let refreshed = self.source.refresh_rejected_secret(status).await?;
-            Some(self.shaped(refreshed))
+            match self.source.refresh_rejected_secret(status).await {
+                RejectedRefresh::Token(token) => RejectedRefresh::Token(self.shaped(token)),
+                RejectedRefresh::NeedsReauth => RejectedRefresh::NeedsReauth,
+                RejectedRefresh::Unavailable => RejectedRefresh::Unavailable,
+            }
         })
     }
 
@@ -140,10 +189,15 @@ where
         self.source.note_unrecovered_rejection(status);
     }
 
-    fn refresh_expiring(&self) -> RefreshFuture<'_, RefreshedCredential> {
+    fn refresh_expiring(&self) -> ExpiringRefreshFuture<'_, RefreshedCredential> {
         Box::pin(async move {
-            let refreshed = self.source.refresh_expiring_secret().await?;
-            Some(self.shaped(refreshed))
+            match self.source.refresh_expiring_secret().await {
+                ExpiringRefresh::Token(token) => ExpiringRefresh::Token(self.shaped(token)),
+                ExpiringRefresh::NeedsReauth { held_expires_at_ms } => {
+                    ExpiringRefresh::NeedsReauth { held_expires_at_ms }
+                }
+                ExpiringRefresh::Unavailable => ExpiringRefresh::Unavailable,
+            }
         })
     }
 }

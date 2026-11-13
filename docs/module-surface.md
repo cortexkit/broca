@@ -2407,6 +2407,39 @@ resume **continues the SAME run_id from the last durable boundary**; no new epis
 until the pause is resolved or cancelled. The error detail is persisted for `run.status`.
 (Auto pause→refresh→continue is deferred; the lineage is preserved + manually resumable.)
 
+On `broca-session-store` storage only, a routed run may instead move to another compatible account
+through `route.account_for` with `mode: "continue"` and `exhausted.limit_window: "signed_out"`.
+This requires all three current declarations: `account_continue`, `account_continue_resume`
+and `account_continue_signed_out`; unknown support counts as no support. The signal is a vault
+`needs_reauth` with no usable held token, or an authentication-class HTTP 401/403 whose
+post-rejection vault read says `needs_reauth` or supplied a newer token that was also refused.
+When the vault read after a 401 fails, or returns the same token version, the 401 alone does
+not prove the sign-in is lost: the run keeps today's auth pause and does not ask routing. An unreachable vault, transient failure or
+timeout never triggers the exchange.
+A still-unexpired held token remains usable even when its refresh needs sign-in. Legacy
+storage retains its auth pause and never moves an account through this exchange.
+
+An offer uses the existing durable account move before another send: `AuthRefrozen`, together
+with `ConfigRefrozen` when the renderer carries account identity. A live move writes no pause;
+a move of an already paused run writes the refreezes and `Resumed` in one batch. A hold retains
+the auth pause and re-asks with a fresh selection id at `until_ms`, or at the next credential
+re-check when no time was supplied. Restoring the original credential first resumes that
+account and cancels the re-ask. A refusal, unreachable router or missing declaration retains
+the auth pause. The actor remembers the typed outcome: refusal/unreachability is not asked
+again for that pause during its life. Discovery that did not send a request, failed admission,
+and an offer rejected locally do not consume that exchange; a prior timed hold survives them.
+A hold time at or before receipt is clamped to a re-ask floor 30 seconds after receipt.
+Opening an actor probes an existing sign-in pause once after dependency routes are ready,
+including pauses written before this behavior existed. Only an offer can lift it during that
+probe; a now-usable original credential or a permanent admission failure leaves it unchanged.
+There is no new storage record
+or reply member.
+
+A timed account-limit pause checks for this sign-in loss once its recorded deadline is due.
+An offer lifts that pause in the same account-move/resume batch, without an intermediate auth
+pause. Without an offer it becomes today's auth pause; a refusal or unreachable router is not
+asked again during that actor's life.
+
 Recorded Anthropic fallback settings are frozen on resume, even if the current switches
 are off. If the resolved credential method is not OAuth, restoring an episode that froze
 either fallback produces a permanent configuration refusal naming

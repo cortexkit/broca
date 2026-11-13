@@ -448,7 +448,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         let latest = operations.run.as_ref();
         let auto = match mode {
             StoreRunMode::Fresh => request.keep_warm == Some(KeepWarm::Auto),
-            StoreRunMode::Resume => {
+            StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn => {
                 latest
                     .and_then(|run| run.start.as_ref())
                     .and_then(|start| start.keep_warm.clone())
@@ -474,7 +474,10 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
                 .unwrap_or_default();
             (send.sent_at_ms, ttl_ms, usage)
         });
-        let recorded = if mode == StoreRunMode::Resume {
+        let recorded = if matches!(
+            mode,
+            StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
+        ) {
             Some(self.recorded_warm_request().await.and_then(|request| {
                 super::recorded_warm::media(media).map(|renderer| (request, renderer))
             }))

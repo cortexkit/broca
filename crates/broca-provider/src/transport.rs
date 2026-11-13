@@ -1146,6 +1146,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             // snapshot of the current credential rather than a deep copy of the secret; only
             // an in-step refresh after a 401 ever replaces it.
             auth: Arc::new(std::sync::RwLock::new(ServedAuth {
+                definite_auth_failure: None,
                 revision: 0,
                 auth_refreshed: false,
                 auth: Arc::new(auth),
@@ -1259,6 +1260,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         first_attempt: u32,
         attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
     ) -> mpsc::Receiver<NormalizedEvent> {
+        self.auth
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .definite_auth_failure = None;
         let (tx, rx) = mpsc::channel::<NormalizedEvent>(256);
         let served = self.current_auth();
         let error = account_changed_error(
@@ -1696,6 +1701,13 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     /// attempt's `cancelled` record before its task ends and the stream closes.
     fn reports_attempt_evidence(&self) -> bool {
         true
+    }
+    fn definite_auth_failure(&self, step_id: StepId) -> bool {
+        self.auth
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .definite_auth_failure
+            .is_some_and(|(step, _)| step == step_id)
     }
 
     /// One attempt with the credential this provider currently holds, after checking, as a step
@@ -3256,6 +3268,7 @@ where
     // `credential_refresh` is the evidence the next attempt's record carries when it goes out
     // with a token refreshed inside this step, by either the 401 path or the pre-send check.
     let mut credential_refresh: Option<CredentialRefresh> = None;
+    let mut refreshed_after_rejection = false;
     // Driver-kept exceptions: the model has no cancellation, receiver-close, shutdown-seal
     // or top-of-loop deadline outcome. These remain quiet ends with zero retries. Journal
     // settlement errors also bypass retry policy: a failed durability effect cannot be retried
@@ -3263,6 +3276,14 @@ where
     // one recorded attempt.
     loop {
         let attempt_index = attempts.attempt_index();
+        if let Some(recovery) = &auth_recovery {
+            recovery
+                .recovery
+                .current
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .definite_auth_failure = None;
+        }
         let attempt_started = retry_clock.mark();
         if cancel.is_cancelled() || tx.is_closed() {
             return Ok((Vec::new(), 0));
@@ -3273,16 +3294,29 @@ where
         }
         // A token that expires before this request and its stream are done would be refused
         // with a 401, costing an attempt and telling the credential source it was rejected
-        // when it merely ran out. Ask for a fresh one first; the refresher answers `None`
-        // straight away for a token with enough life left or one that never expires, and also
-        // when it could not get a fresh one, in which case the held token goes out and the
-        // 401 recovery below still covers it.
+        // when it merely ran out. Ask for a fresh one first. An unavailable read keeps the
+        // held token and the 401 recovery below still covers it. A definite sign-in loss
+        // stops before sending only when the held token has already expired.
         if let Some(recovery) = auth_recovery.as_mut() {
             let refreshed = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                 _ = tx.closed() => return Ok((Vec::new(), 0)),
                 refreshed = recovery.recovery.refresher.refresh_expiring() => refreshed,
+            };
+            let refreshed = match refreshed {
+                crate::credential_refresh::ExpiringRefresh::Token(token) => Some(token),
+                crate::credential_refresh::ExpiringRefresh::NeedsReauth { held_expires_at_ms }
+                    if held_expires_at_ms
+                        .and_then(|expiry| u64::try_from(expiry).ok())
+                        .is_none_or(|expiry| clock.now_ms() >= expiry) =>
+                {
+                    return Err((
+                        crate::credential_refresh::needs_reauth_error(),
+                        attempt_index.saturating_sub(1) as u32,
+                    ));
+                }
+                _ => None,
             };
             #[cfg(test)]
             attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
@@ -3559,11 +3593,27 @@ where
                             failure.error.status.unwrap_or(401)
                         ) => refreshed,
                     };
+                    let needs_reauth = matches!(
+                        &refreshed,
+                        crate::credential_refresh::RejectedRefresh::NeedsReauth
+                    );
+                    let refreshed = refreshed.into_token();
                     #[cfg(test)]
                     attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
                         rejected: true,
                         credential: refreshed.is_some(),
                     });
+                    if needs_reauth {
+                        recovery
+                            .recovery
+                            .current
+                            .write()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .definite_auth_failure = Some((
+                            step_seal.step_id,
+                            step_seal.first_attempt.saturating_add(attempt_index as u32),
+                        ));
+                    }
                     let refresh_result = match refreshed.as_ref() {
                         None => RejectedRefreshResult::NoCredential,
                         Some(refreshed) => {
@@ -3594,6 +3644,7 @@ where
                         refresh_result,
                     );
                     if matches!(decision, AttemptDecision::Resend { .. }) {
+                        refreshed_after_rejection = true;
                         let refreshed =
                             refreshed.expect("a resend requires a refreshed credential");
                         recovery.adopt(
@@ -3628,6 +3679,22 @@ where
                         note_unrecovered_rejection,
                         ..
                     } => {
+                        if refreshed_after_rejection
+                            && failure.error.class == ErrorClass::Auth
+                            && matches!(failure.error.status, Some(401 | 403))
+                        {
+                            if let Some(recovery) = &auth_recovery {
+                                recovery
+                                    .recovery
+                                    .current
+                                    .write()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .definite_auth_failure = Some((
+                                    step_seal.step_id,
+                                    step_seal.first_attempt.saturating_add(attempt_index as u32),
+                                ));
+                            }
+                        }
                         if note_unrecovered_rejection {
                             auth_recovery
                                 .as_ref()
@@ -3833,6 +3900,9 @@ fn refreshed_account_changed_error(
 /// Keep each token together with its associated account when carrying auth between steps.
 #[derive(Clone)]
 struct ServedAuth {
+    /// Terminal evidence for one step attempt, cleared before every step and attempt.
+    /// It is queried only at the run loop's signed-out gate and is never serialized.
+    definite_auth_failure: Option<(StepId, u32)>,
     auth_refreshed: bool,
     /// Local to this provider/run. Even a refresh returning the same header bytes starts
     /// a new socket authentication revision; it never changes the canonical request body.
@@ -3879,6 +3949,7 @@ impl StepAuthRecovery<'_> {
             .unwrap_or_else(|poison| poison.into_inner());
         request.auth_revision = current.revision.wrapping_add(1);
         *current = ServedAuth {
+            definite_auth_failure: None,
             auth_refreshed: true,
             auth,
             account_ref,
@@ -10422,17 +10493,19 @@ mod tests {
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
-                Some(crate::credential_refresh::RefreshedCredential {
-                    account_ref: self.account_ref.clone(),
-                    auth: AuthHandle::Bearer("fresh-test-token".into()),
-                    evidence: super::CredentialRefresh {
-                        vault_op: "get".into(),
-                        min_ttl_ms: None,
-                        force_refresh: true,
-                        record_version: Some(2),
-                        reason: Some(super::CredentialRefresh::REASON_REJECTED.into()),
+                crate::credential_refresh::RejectedRefresh::Token(
+                    crate::credential_refresh::RefreshedCredential {
+                        account_ref: self.account_ref.clone(),
+                        auth: AuthHandle::Bearer("fresh-test-token".into()),
+                        evidence: super::CredentialRefresh {
+                            vault_op: "get".into(),
+                            min_ttl_ms: None,
+                            force_refresh: true,
+                            record_version: Some(2),
+                            reason: Some(super::CredentialRefresh::REASON_REJECTED.into()),
+                        },
                     },
-                })
+                )
             })
         }
     }

@@ -304,7 +304,12 @@ pub trait RoutingTransport: Send + Sync {
     /// `names`; `None` when it doesn't, and then nothing was sent. A transport that can reach
     /// another registration of routing between the check and the send checks again against the
     /// route the request actually goes out on.
-    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+    async fn request_where_declared(
+        &self,
+        body: Vec<u8>,
+        names: &[&str],
+        started: &std::sync::atomic::AtomicBool,
+    ) -> Option<RoutingReply> {
         for name in names {
             if self.capability(name).await
                 != crate::routing_capabilities::CapabilitySupport::Declared
@@ -312,6 +317,7 @@ pub trait RoutingTransport: Send + Sync {
                 return None;
             }
         }
+        started.store(true, Ordering::Release);
         Some(self.request(body).await)
     }
 }
@@ -591,7 +597,12 @@ impl RoutingTransport for SubcRoutingTransport {
     /// A stale route is reopened once, as for any request, and the reopened route may reach a
     /// re-registered routing module that declares other capabilities. Its description is read
     /// again (a closed route drops the cached one) before the request is sent there.
-    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+    async fn request_where_declared(
+        &self,
+        body: Vec<u8>,
+        names: &[&str],
+        started: &std::sync::atomic::AtomicBool,
+    ) -> Option<RoutingReply> {
         let declared = || async {
             for name in names {
                 if self.capability(name).await
@@ -619,7 +630,13 @@ impl RoutingTransport for SubcRoutingTransport {
                 .await
                 .expect("close test route");
         }
-        match self.conn.route_request_terminal(&route, body.clone()).await {
+        match self
+            .conn
+            .route_request_terminal_observed(&route, body.clone(), || {
+                started.store(true, Ordering::Release)
+            })
+            .await
+        {
             Ok(reply) => return Some(Ok(reply)),
             Err(error) => {
                 self.forget(route);
@@ -638,7 +655,9 @@ impl RoutingTransport for SubcRoutingTransport {
         };
         Some(
             self.conn
-                .route_request_terminal(&route, body)
+                .route_request_terminal_observed(&route, body, || {
+                    started.store(true, Ordering::Release)
+                })
                 .await
                 .map_err(|error| {
                     self.forget(route);
@@ -2708,6 +2727,8 @@ impl ListingCache {
 /// What a continue request came to, as the run acts on it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContinueOutcome {
+    /// Discovery, route opening or the budget ended before a request could be sent.
+    NotAsked,
     /// Routing answered with an offer, a hold or a refusal. A routing error body (an
     /// `invalid_request`, say) reads as a refusal under the error's code.
     Answered(cortexkit_role_routing::account_continue::ContinueAnswer),
@@ -2719,9 +2740,9 @@ pub enum ContinueOutcome {
     NoAnswerWithinBudget,
 }
 
-/// The continue request for a wall, in routing's types: the run, its original admission and
-/// conversation key, the decision the run uses now, and the exhausted account with the evidence
-/// of the refused attempt's own record. `None` when the run's selection lacks what routing needs
+/// The continue request for a usage wall or sign-in loss, in routing's types: the run, its
+/// original admission and conversation key, the decision the run uses now, and the unavailable
+/// account with its quota evidence or sign-in observation time. `None` when the selection lacks what routing needs
 /// to find the run (an admission id, a conversation key, a decision id).
 pub fn continue_request(
     wall: &broca_session_loop::account_move::Wall<'_>,
@@ -2740,13 +2761,28 @@ pub fn continue_request(
     if let Some(retry_after_s) = wall.retry_after_s {
         exhausted = exhausted.with_retry_after_s(retry_after_s);
     }
+    let selection_id = if wall.limit_window == "signed_out" {
+        // Every credential re-check is a new eligibility question. Transport retries keep
+        // this serialized request and its id. Without entropy there is no safe fresh question.
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).ok()?;
+        format!(
+            "sign-in-{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    } else {
+        continue_selection_id(wall)
+    };
     Some(ContinueRequest::new(
         wall.run_id,
         decision.admission_id.as_deref()?,
         decision.conversation_key.as_deref()?,
         decision.decision_id.as_deref()?,
         exhausted,
-        continue_selection_id(wall),
+        selection_id,
     ))
 }
 
@@ -2775,22 +2811,31 @@ pub fn continue_selection_id(wall: &broca_session_loop::account_move::Wall<'_>) 
 
 impl RoutingClient {
     /// [`Self::account_continue`], asked only when routing serves continuation: it is known to
-    /// declare both `account_continue` and `account_continue_resume`. An unknown description,
-    /// or one that doesn't arrive by `deadline`, counts as no, and then nothing is sent.
+    /// declare `account_continue` and `account_continue_resume`, plus
+    /// `account_continue_signed_out` for a sign-in question. An unknown description, or one
+    /// that doesn't arrive by `deadline`, counts as no, and then nothing is sent.
     pub async fn account_continue_if_served(
         &self,
         request: &cortexkit_role_routing::account_continue::ContinueRequest,
         deadline: tokio::time::Instant,
     ) -> ContinueOutcome {
-        let serves =
-            tokio::time::timeout_at(deadline, self.answers_moved_runs_with_current_account())
-                .await
-                .unwrap_or(false);
+        let serves = tokio::time::timeout_at(deadline, async {
+            self.answers_moved_runs_with_current_account().await
+                && (request.exhausted.limit_window != "signed_out"
+                    || self
+                        .capability(
+                            cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE_SIGNED_OUT,
+                        )
+                        .await
+                        == crate::routing_capabilities::CapabilitySupport::Declared)
+        })
+        .await
+        .unwrap_or(false);
         self.account_continue(serves, request, deadline).await
     }
 
-    /// Asks routing for another account for a run whose account spent its usage window, by
-    /// `route.account_for` with `mode: "continue"`, over the same route as an admission, giving up
+    /// Asks routing for another account after a usage wall or sign-in loss, by
+    /// `route.account_for` with `mode: "continue"`, over the admission route, giving up
     /// at `deadline`. `routing_serves_continuation` is true only when routing declares both
     /// `account_continue` and `account_continue_resume` (unknown counts as false); otherwise
     /// nothing is sent.
@@ -2809,18 +2854,23 @@ impl RoutingClient {
             Ok(body) => body,
             Err(error) => return ContinueOutcome::Unreachable(format!("encode request: {error}")),
         };
-        // Sent only where routing declares both capabilities, checked again on the route the
-        // request goes out on.
-        let sent = self.transport.request_where_declared(
-            body,
-            &[
-                cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
-                crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
-            ],
-        );
+        // Check every required capability again on the route the request goes out on.
+        let mut declarations = vec![
+            cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
+            crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+        ];
+        if request.exhausted.limit_window == "signed_out" {
+            declarations.push(cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE_SIGNED_OUT);
+        }
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let sent = self
+            .transport
+            .request_where_declared(body, &declarations, &started);
         let outcome = match tokio::time::timeout_at(deadline, sent).await {
+            Err(_) if !started.load(Ordering::Acquire) => ContinueOutcome::NotAsked,
             Err(_) => ContinueOutcome::NoAnswerWithinBudget,
             Ok(None) => ContinueOutcome::NotDeclared,
+            Ok(Some(Err(_))) if !started.load(Ordering::Acquire) => ContinueOutcome::NotAsked,
             Ok(Some(Err(cause))) => ContinueOutcome::Unreachable(cause),
             Ok(Some(Ok(reply))) => classify_continue_reply(reply),
         };
@@ -2829,6 +2879,7 @@ impl RoutingClient {
             ContinueOutcome::NotDeclared => "continue_not_declared",
             ContinueOutcome::Unreachable(_) => "continue_unreachable",
             ContinueOutcome::NoAnswerWithinBudget => "continue_no_answer_within_budget",
+            ContinueOutcome::NotAsked => "continue_unreachable",
         });
         outcome
     }
@@ -2836,11 +2887,9 @@ impl RoutingClient {
 
 /// Reads one continue reply: `result` is the tagged answer. An error body under one of the
 /// codes routing's contract names for its own refusals (`RefusalCode`) is routing refusing the
-/// question, read as a refusal under that code. Any other error body says routing wasn't reached
-/// or can't be read, so it is `Unreachable`: no move, and no routing answer on the run's error.
-/// Such bodies are written by the daemon for a route it couldn't serve (`target_unavailable`,
-/// `module_warming`, `unknown_module`), by broca when it finds no single routing provider
-/// (`routing_unavailable`, `routing_ambiguous`), or carry a code this build doesn't know.
+/// question, read as a refusal under that code. Known message-plane errors mean routing did
+/// not receive the request, so they are `NotAsked`, even if the frame reached the daemon.
+/// Other unreadable answers are `Unreachable`, with no continuation answer on the run's error.
 pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutcome {
     use cortexkit_role_routing::account_continue::{ContinueAnswer, ContinueRefusal};
     match reply {
@@ -2857,6 +2906,7 @@ pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutco
             }
         }
         Err(body) => match serde_json::from_slice::<ErrorBodyView>(&body) {
+            Ok(error) if is_message_plane_code(&error.code) => ContinueOutcome::NotAsked,
             Ok(error) if is_routing_refusal(&error.code) => {
                 ContinueOutcome::Answered(ContinueAnswer::Refuse(ContinueRefusal::new(
                     error.code,

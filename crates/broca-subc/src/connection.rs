@@ -2062,6 +2062,30 @@ impl SubcConnection {
         body: Vec<u8>,
         deadline: Duration,
     ) -> ConnResult<Result<Vec<u8>, Vec<u8>>> {
+        self.route_request_terminal_noted(route, body, deadline, || {})
+            .await
+    }
+
+    /// Internal dispatch evidence for a runner deciding whether an unanswered request was
+    /// actually queued. The observer runs after validated enqueue, with no intervening await.
+    #[doc(hidden)]
+    pub async fn route_request_terminal_observed<F: FnOnce() + Send>(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        dispatched: F,
+    ) -> ConnResult<Result<Vec<u8>, Vec<u8>>> {
+        self.route_request_terminal_noted(route, body, RESPONSE_TIMEOUT, dispatched)
+            .await
+    }
+
+    async fn route_request_terminal_noted<F: FnOnce() + Send>(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        deadline: Duration,
+        dispatched: F,
+    ) -> ConnResult<Result<Vec<u8>, Vec<u8>>> {
         let corr = self.next_corr();
         let (runtime, _registration, mut rx) =
             self.register_route(route, (route.channel, route.epoch, corr))?;
@@ -2083,6 +2107,7 @@ impl SubcConnection {
         .map_err(|e| ConnError::Transport(e.to_string()))?;
         async {
             self.send(&runtime, frame).await?;
+            dispatched();
             tracing::debug!(
                 target: "subc.wire",
                 stage = "queued",
@@ -6840,6 +6865,70 @@ mod tests {
         response_tx.send(response).unwrap();
 
         assert_eq!(task.await.unwrap().unwrap(), response_body);
+    }
+
+    #[tokio::test]
+    async fn terminal_dispatch_observer_stays_clear_before_writer_enqueue() {
+        use futures::FutureExt;
+        let pending: PendingMap = Arc::default();
+        let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(9, 1)])));
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        write_tx.try_send(frame(FrameType::Push, 0, 0, 0)).unwrap();
+        let conn = test_connection(write_tx, pending.clone(), routes, ConnToken(1), 1);
+        let route = RouteHandle::new(9, 1, ConnToken(1));
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        {
+            let request = conn.route_request_terminal_observed(
+                &route,
+                br#"{"method":"route.account_for","params":{"mode":"continue"}}"#.to_vec(),
+                || dispatched.store(true, Ordering::Release),
+            );
+            tokio::pin!(request);
+            assert!(request.as_mut().now_or_never().is_none());
+            assert!(
+                !dispatched.load(Ordering::Acquire),
+                "a blocked queue is not dispatch evidence"
+            );
+        }
+        assert_eq!(write_rx.try_recv().unwrap().header.ty, FrameType::Push);
+        assert!(write_rx.try_recv().is_err());
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_dispatch_observer_fires_for_an_enqueued_unanswered_request() {
+        use futures::FutureExt;
+        let pending: PendingMap = Arc::default();
+        let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(9, 1)])));
+        let (write_tx, mut write_rx) = mpsc::channel(1);
+        let conn = test_connection(write_tx, pending.clone(), routes, ConnToken(1), 1);
+        let route = RouteHandle::new(9, 1, ConnToken(1));
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        {
+            let request = conn.route_request_terminal_observed(
+                &route,
+                br#"{"method":"route.account_for","params":{"mode":"continue"}}"#.to_vec(),
+                || dispatched.store(true, Ordering::Release),
+            );
+            tokio::pin!(request);
+            assert!(
+                request.as_mut().now_or_never().is_none(),
+                "the terminal reply is still absent"
+            );
+            assert!(dispatched.load(Ordering::Acquire));
+            let queued = write_rx.try_recv().unwrap();
+            assert_eq!(queued.header.ty, FrameType::Request);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&queued.body).unwrap()["params"]
+                    ["mode"],
+                "continue"
+            );
+            assert!(pending
+                .lock()
+                .unwrap()
+                .contains_key(&(9, 1, queued.header.corr)));
+        }
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

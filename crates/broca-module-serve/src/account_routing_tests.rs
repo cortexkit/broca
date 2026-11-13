@@ -3483,11 +3483,10 @@ fn continue_replies_are_read_as_offer_hold_refusal_or_nothing() {
     ));
 }
 
-/// An error frame the route wrote, not routing (the target is gone or warming, or a code
-/// routing's contract doesn't name), is routing unreachable: never a refusal, so no routing
-/// code lands on the run's error.
+/// Known daemon errors prove routing never received the question. Unknown codes remain
+/// unreachable rather than inventing a routing refusal or erasing a possibly completed ask.
 #[test]
-fn an_error_frame_routing_did_not_write_is_unreachable_not_a_refusal() {
+fn daemon_error_frames_are_not_asked_but_unknown_codes_are_unreachable() {
     for code in [
         "target_unavailable",
         "unknown_module",
@@ -3495,17 +3494,23 @@ fn an_error_frame_routing_did_not_write_is_unreachable_not_a_refusal() {
         "module_warming",
         "routing_unavailable",
         "routing_ambiguous",
-        "some_future_code",
     ] {
         let reply = classify_continue_reply(Err(serde_json::to_vec(
             &json!({"code": code, "message": "not routing", "detail": {}}),
         )
         .unwrap()));
         assert!(
-            matches!(reply, ContinueOutcome::Unreachable(_)),
+            matches!(reply, ContinueOutcome::NotAsked),
             "{code}: {reply:?}"
         );
     }
+    assert!(matches!(
+        classify_continue_reply(Err(serde_json::to_vec(
+            &json!({"code":"some_future_code","message":"unknown"})
+        )
+        .unwrap())),
+        ContinueOutcome::Unreachable(_)
+    ));
     for code in [
         "account_hold",
         "admission_conflict",

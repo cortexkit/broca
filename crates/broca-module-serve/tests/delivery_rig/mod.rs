@@ -843,7 +843,7 @@ impl RunExecutor for CoreExec {
                 StoreRunMode::Seal(cause) => {
                     broca_session_loop::seal(&mut writer, parts.as_ref(), &seams, cause).await
                 }
-                StoreRunMode::Resume => {
+                StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn => {
                     broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await
                 }
             }

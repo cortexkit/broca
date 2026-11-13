@@ -105,6 +105,10 @@ pub struct StoreActor<B: SessionBackend> {
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     account_limit_timer: Option<account_limit_pause::TimedPause>,
+    sign_in_check: Option<account_limit_pause::SignInCheck>,
+    sign_in_in_flight: Option<account_limit_pause::TimedPause>,
+    sign_in_open_owed: bool,
+    sign_in_open_deadline: Option<tokio::time::Instant>,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -258,6 +262,7 @@ struct ActiveRun {
     run_id: RunId,
     one_shot: bool,
     account_limit_resume: bool,
+    preserve_auth_pause: bool,
     /// The actor's end of the run's writer.
     link: RunLink,
     /// Set once the run dropped its writer: it appends nothing more, and its end follows.
@@ -426,6 +431,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             restart_admitting: false,
             restart_waiters: Vec::new(),
             account_limit_timer: None,
+            sign_in_check: None,
+            sign_in_in_flight: None,
+            sign_in_open_owed: false,
+            sign_in_open_deadline: None,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -631,14 +640,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         crate::actor::SubscribeOutcome::Attached
     }
 
-    /// What keeps the session from closing idle, under the names today's actor gives the
-    /// registry: a run, a warm being sent, an account-limit timer, or a subscriber still attached.
-    /// A subscriber keeps a session open for as long as it holds its stream, as on today's
-    /// storage, so a caller
+    /// Work that keeps this session open past its idle deadline: a run, an owed sign-in
+    /// probe, a warm, an account-limit timer, or a subscriber.
+    /// A subscriber keeps the session open while its stream is attached, so a caller
     /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
     /// the last one has gone closes it. Empty when the session may close.
     fn idle_holds(&mut self) -> Vec<&'static str> {
         let mut holds = Vec::new();
+        if self.sign_in_open_owed
+            && self
+                .sign_in_open_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+        {
+            // Waiting for readiness may hold an idle actor for at most two minutes.
+            // Shutdown still exits independently of idle holds.
+            holds.push("sign_in_probe");
+        }
         if self.run.is_some() {
             holds.push("active_run");
         }
@@ -997,9 +1014,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let never = CancellationToken::new();
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
+        self.sign_in_open_deadline =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(120));
         // The session feeds its media from before its first write here.
         self.media_open().await;
         self.recover().await;
+        if !self.sign_in_open_owed {
+            self.sign_in_open_deadline = None;
+        }
         self.retire_recovery();
         if !self
             .registry
@@ -1020,6 +1042,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let clock = self.retention_clock.clone().unwrap_or_default();
         let mut clock_changes = clock.subscribe();
         loop {
+            self.probe_sign_in_on_open().await;
             // What the last event's writes handed over, before anything else reads the index.
             self.absorb_media();
             let expiry_deadline = retention
@@ -1047,6 +1070,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             let built = media_built(&mut self.media_build);
+            let probe_wake = self
+                .sign_in_open_deadline
+                .filter(|_| self.sign_in_open_owed)
+                .map(|deadline| {
+                    deadline
+                        .min(tokio::time::Instant::now() + std::time::Duration::from_millis(250))
+                });
             let timed_pause = self.account_limit_timer.clone().filter(|_| {
                 self.registry.as_ref().is_none_or(|registry| {
                     registry.restart_resume_ready() && !registry.is_stopping()
@@ -1083,6 +1113,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     biased;
                     _ = seal.cancelled() => return Exit::Stop,
                     _ = clock_changes.changed() => continue,
+                    _ = async {
+                        match probe_wake {
+                            Some(wake) => tokio::time::sleep_until(wake).await,
+                            None => std::future::pending().await,
+                        }
+                    } => continue,
                     _ = expiry::wait(expiry_deadline, &clock) => continue,
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
@@ -1700,8 +1736,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 // The resumed run's start is already durable, with its marks.
                                 message_marks: None,
                             };
-                            self.start_run(start, None, Some(reply), StoreRunMode::Resume)
-                                .await;
+                            let mode = self.sign_in_recheck_mode().await;
+                            self.start_run(start, None, Some(reply), mode).await;
                             return false;
                         }
                         Err(error) => {
@@ -2152,8 +2188,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         reply: Option<oneshot::Sender<SendOutcome>>,
         mode: StoreRunMode,
     ) {
+        self.sign_in_open_owed = false;
+        self.sign_in_open_deadline = None;
         self.start_run_under(start, drained, reply, mode, CancellationToken::new())
             .await;
+        if self.run.is_none() && self.sign_in_in_flight.is_some() {
+            self.finish_sign_in_check(None).await;
+            self.arm_account_limit().await;
+        }
     }
 
     /// [`Self::start_run`], under `cancel`, which a caller's cancel trips. A token tripped before
@@ -2332,6 +2374,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             restart_cancelling,
             one_shot: one_shot || self.one_shot_runs.contains(&run_id),
             account_limit_resume: false,
+            preserve_auth_pause: mode == StoreRunMode::ProbeSignIn,
             run_id,
             link,
             writer_gone: false,
@@ -2488,9 +2531,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// - with no unfinished run, the first queued send drains.
     ///
     /// A held run parks until a late result resumes its original batch, even with an interrupt
-    /// queued behind it, as today's held-call recovery does. A sign-in pause waits for its retry,
-    /// unless an interrupt was queued before the process stopped: it ends the paused run now,
-    /// as today's drain does (`end_paused`). A restart pause resumes after dependency routes
+    /// queued behind it, as today's held-call recovery does. After dependency routes are ready,
+    /// a routed sign-in pause gets one probe that may ask routing and move on an offer, but
+    /// never resumes the old account. Other sign-in pauses wait for their retry. A queued
+    /// interrupt ends a paused run now (`end_paused`). A restart pause resumes after routes
     /// register. An account-limit pause rebuilds its timer from its durable evidence.
     async fn recover(&mut self) {
         self.bill_owed().await;
@@ -2519,6 +2563,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 if run.paused == Some(broca_protocol::PauseReason::AccountLimit) {
                     self.arm_account_limit().await;
+                    return;
+                }
+                if run.paused == Some(broca_protocol::PauseReason::AuthRequired) {
+                    let routed =
+                        broca_session_loop::account_move::current_auth_selection(run, &self.parts)
+                            .ok()
+                            .flatten()
+                            .and_then(|selection| selection.account_decision)
+                            .is_some_and(|decision| {
+                                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                                    && decision.admission_id.is_some()
+                                    && decision.decision_id.is_some()
+                            });
+                    if !routed {
+                        return;
+                    }
+                    self.sign_in_open_owed = true;
+                    self.sign_in_open_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(120)
+                    });
+                    self.probe_sign_in_on_open().await;
                     return;
                 }
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
@@ -3381,11 +3446,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // It ends here with the error instead. A paused run keeps waiting when admission
         // fails temporarily: dependencies can recover before the next resume trigger. Only
         // a permanent refusal makes an existing pause unserviceable by the same request.
+        let sign_in_outcome = result
+            .as_ref()
+            .ok()
+            .and_then(|finished| finished.sign_in.clone());
         let loop_failed = match &result {
             Err(error) if started && restart_error.is_none() && !active.account_limit_resume => {
                 let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
                     run.run_id == active.run_id.0
                         && run.finished.is_none()
+                        && !(active.preserve_auth_pause && run.paused == Some(broca_protocol::PauseReason::AuthRequired))
                         && (run.paused.is_none()
                             || matches!(error, StoreRunError::Admission(error)
                                 if error.admission_error_class() == broca_protocol::ErrorClass::Permanent))
@@ -3487,6 +3557,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if let Some(message) = loop_failed {
             self.end_failed_run(&active.run_id, message).await;
         }
+        self.finish_sign_in_check(sign_in_outcome).await;
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
@@ -4809,6 +4880,10 @@ mod plan_view_tests;
 mod read_cost;
 #[cfg(test)]
 mod reads_tests;
+#[cfg(test)]
+mod sign_in_probe_tests;
+#[cfg(all(test, feature = "test-clock"))]
+mod sign_in_schedule_tests;
 #[cfg(test)]
 mod status_tests;
 #[cfg(test)]

@@ -2277,9 +2277,9 @@ struct RefreshScript {
 impl crate::credential_refresh::CredentialRefresher for RefreshScript {
     fn refresh_expiring(
         &self,
-    ) -> crate::credential_refresh::RefreshFuture<'_, crate::credential_refresh::RefreshedCredential>
+    ) -> crate::credential_refresh::ExpiringRefreshFuture<'_, crate::credential_refresh::RefreshedCredential>
     {
-        Box::pin(async { self.expiring.lock().unwrap().pop_front().flatten() })
+        Box::pin(async { self.expiring.lock().unwrap().pop_front().flatten().map_or(crate::credential_refresh::ExpiringRefresh::Unavailable, crate::credential_refresh::ExpiringRefresh::Token) })
     }
     fn refresh_rejected(
         &self,
@@ -2288,7 +2288,7 @@ impl crate::credential_refresh::CredentialRefresher for RefreshScript {
     {
         Box::pin(async {
             self.rereads.fetch_add(1, Ordering::SeqCst);
-            self.rejected.lock().unwrap().take()
+            self.rejected.lock().unwrap().take().map_or(crate::credential_refresh::RejectedRefresh::Unavailable, crate::credential_refresh::RejectedRefresh::Token)
         })
     }
 }

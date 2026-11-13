@@ -1818,7 +1818,8 @@ mod executor {
     use broca_protocol::error::{ErrorClass, ProviderError};
     use broca_protocol::{AuthRequest, BindIdentity};
     use broca_provider::credential_refresh::{
-        RefreshFuture, RefreshedSecret, SecretRefresher, SharedSecretRefresher,
+        ExpiringRefresh, ExpiringRefreshFuture, RefreshFuture, RefreshedSecret, RejectedRefresh,
+        SecretRefresher, SharedSecretRefresher,
     };
     use broca_provider::{build_provider_http_client, ProviderHttpClient};
     use broca_subc::{SubcToolPlane, VaultError, VaultGet, VaultToken};
@@ -2091,7 +2092,7 @@ mod executor {
                         // The run pauses as it did before in-step refresh existed.
                         if token.record_version <= rejected {
                             tracing::warn!(target: "credentials", "credential reread outcome=same_version vault_id='{}' rejected_version={rejected} served_version={} expires_at_ms={}", self.vault_id, token.record_version, token.expires_at_ms.map_or_else(|| "none".to_string(), |value| value.to_string()));
-                            return None;
+                            return RejectedRefresh::Unavailable;
                         }
                         tracing::warn!(target: "credentials", "credential reread outcome=refreshed vault_id='{}' old_version={rejected} new_version={}", self.vault_id, token.record_version);
                         self.vault
@@ -2100,7 +2101,7 @@ mod executor {
                         self.served_version
                             .store(token.record_version, Ordering::SeqCst);
                         self.set_served_expiry(token.expires_at_ms);
-                        Some(RefreshedSecret {
+                        RejectedRefresh::Token(RefreshedSecret {
                             evidence: broca_protocol::CredentialRefresh {
                                 vault_op: broca_core::VaultReadOp::GetScoped.as_str().to_string(),
                                 min_ttl_ms,
@@ -2116,12 +2117,17 @@ mod executor {
                             secret: token.token,
                         })
                     }
-                    // needs_reauth, a refusal, or no reply: no fresh token, so the 401 stands and
-                    // the run pauses exactly as it did before in-step refresh existed.
+                    // Only the vault's definite sign-in loss can authorize account continuation.
+                    // Any other read failure proves nothing about the sign-in: the provider's 401
+                    // stays the run's error and the run pauses for sign-in as before.
                     Err(error) => {
                         self.note_read_failure(&error);
                         tracing::warn!(target: "credentials", "credential reread outcome=reread_failed vault_id='{}' rejected_version={rejected} error_class={:?} vault_replied={}", self.vault_id, lkg_error_class(&error), got.vault_replied);
-                        None
+                        if matches!(error, VaultError::NeedsReauth) {
+                            RejectedRefresh::NeedsReauth
+                        } else {
+                            RejectedRefresh::Unavailable
+                        }
                     }
                 }
             })
@@ -2144,7 +2150,7 @@ mod executor {
         /// record that cannot meet `min_ttl_ms`, so the read returns a token with at least that
         /// much life left. NO failure report is sent: the token was not rejected, and a report
         /// would make the vault count an ordinary expiry as a provider rejection.
-        fn refresh_expiring_secret(&self) -> RefreshFuture<'_, RefreshedSecret> {
+        fn refresh_expiring_secret(&self) -> ExpiringRefreshFuture<'_, RefreshedSecret> {
             Box::pin(async move {
                 let expires_at_ms = self.served_expiry();
                 if expires_at_ms.is_none() {
@@ -2154,10 +2160,10 @@ mod executor {
                     {
                         tracing::info!(target: "credentials", "held credential for '{}' has no expiry; pre-send refresh cannot fire", self.vault_id);
                     }
-                    return None;
+                    return ExpiringRefresh::Unavailable;
                 }
                 if !held_token_is_expiring(expires_at_ms, epoch_millis()) {
-                    return None;
+                    return ExpiringRefresh::Unavailable;
                 }
                 let held = self.served_version.load(Ordering::SeqCst);
                 let min_ttl_ms = Some(VAULT_MIN_TTL_MS);
@@ -2171,7 +2177,7 @@ mod executor {
                         self.vault.gauge.stamp_ok();
                         if token.record_version < held {
                             // Older than what this run already holds: never step backwards.
-                            return None;
+                            return ExpiringRefresh::Unavailable;
                         }
                         self.vault
                             .cache
@@ -2182,11 +2188,11 @@ mod executor {
                         // but there is nothing new to send.
                         if token.record_version == held {
                             tracing::info!(target: "credentials", "credential reread outcome=same_version vault_id='{}' served_version={} expires_at_ms={}", self.vault_id, token.record_version, token.expires_at_ms.map_or_else(|| "none".to_string(), |value| value.to_string()));
-                            return None;
+                            return ExpiringRefresh::Unavailable;
                         }
                         self.served_version
                             .store(token.record_version, Ordering::SeqCst);
-                        Some(RefreshedSecret {
+                        ExpiringRefresh::Token(RefreshedSecret {
                             evidence: broca_protocol::CredentialRefresh {
                                 vault_op: broca_core::VaultReadOp::GetScoped.as_str().to_string(),
                                 min_ttl_ms,
@@ -2200,10 +2206,15 @@ mod executor {
                             secret: token.token,
                         })
                     }
-                    // The held token may still be valid, and if it is not, the provider's 401
-                    // still reaches the rejection path. So the attempt goes out as it is.
+                    // A definite sign-in loss is distinct from a read that could not tell.
+                    // The transport can still use the held token until its own expiry.
                     Err(error) => {
                         self.note_read_failure(&error);
+                        if matches!(error, VaultError::NeedsReauth) {
+                            return ExpiringRefresh::NeedsReauth {
+                                held_expires_at_ms: expires_at_ms,
+                            };
+                        }
                         if !self
                             .presend_failure_logged
                             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -2215,7 +2226,7 @@ mod executor {
                                 self.vault_id
                             );
                         }
-                        None
+                        ExpiringRefresh::Unavailable
                     }
                 }
             })
@@ -3071,12 +3082,13 @@ mod executor {
         })
     }
 
-    /// The error of a store session's newest run end or pause, read from its open log as
-    /// `terminal_provider_error` reads it from a WAL. A run's end is always in the open log:
+    /// This execution's newest run-end or pause error, never a previous invocation's pause.
+    /// A run's end is always in the open log:
     /// sealing never moves an unfinished run's records, and a run's end is written before any
     /// later seal.
     async fn store_terminal_error(
         writer: &broca_session_loop::shared::ActorWriter,
+        execution_start_seq: u64,
     ) -> Option<ProviderError> {
         use broca_session_loop::writer::Writer as _;
         use broca_session_store::record::Record;
@@ -3084,6 +3096,7 @@ mod executor {
         records
             .iter()
             .rev()
+            .take_while(|(seq, _)| *seq >= execution_start_seq)
             .find_map(|(_, record)| match record {
                 Record::RunEnd(end) => Some(end.error.clone()),
                 Record::Pause(pause) => Some(pause.error.clone()),
@@ -3092,13 +3105,67 @@ mod executor {
             .and_then(|error| serde_json::from_value(error).ok())
     }
 
-    /// A store run's account reports, handed to today's routing reporter. Its events are named
-    /// as the loop names them, `<session id>:<seq>`, from the session id the reporter holds.
-    struct StoreAccountReports(Arc<broca_module_serve::account_routing::RunReporter>);
+    type CredentialUseKey = (String, Option<String>, Option<String>);
+
+    /// Versions prepared for this execution are not used until an attempt records them.
+    #[derive(Default)]
+    struct SentCredentials {
+        versions: HashMap<CredentialUseKey, u64>,
+        last: Option<(broca_core::AuthSelection, u64)>,
+    }
+
+    impl SentCredentials {
+        fn key(selection: &broca_core::AuthSelection) -> CredentialUseKey {
+            (
+                selection.credential_id.clone(),
+                selection.account_ref.clone(),
+                selection
+                    .account_decision
+                    .as_ref()
+                    .and_then(|decision| decision.decision_id.clone()),
+            )
+        }
+        fn prepared(
+            &mut self,
+            selection: Option<&broca_core::AuthSelection>,
+            version: Option<u64>,
+        ) {
+            if let (Some(selection), Some(version)) = (selection, version) {
+                self.versions.insert(Self::key(selection), version);
+            }
+        }
+        fn attempted(
+            &mut self,
+            selection: Option<&broca_core::AuthSelection>,
+            attempt: &broca_protocol::ModelAttempt,
+        ) {
+            let Some(selection) = selection else {
+                return;
+            };
+            let key = Self::key(selection);
+            let version = attempt
+                .credential_refresh
+                .as_ref()
+                .and_then(|refresh| refresh.record_version)
+                .or_else(|| self.versions.get(&key).copied());
+            if let Some(version) = version {
+                self.versions.insert(key, version);
+                self.last = Some((selection.clone(), version));
+            }
+        }
+    }
+
+    /// Forward routing observations and retain the credential version of actual attempts.
+    struct StoreAccountReports {
+        routing: Option<Arc<broca_module_serve::account_routing::RunReporter>>,
+        sent: Arc<std::sync::Mutex<SentCredentials>>,
+    }
 
     impl broca_session_loop::AccountReports for StoreAccountReports {
         fn run_started(&self, _event_id: &str, seq: u64) {
-            broca_core::AccountReporter::run_started(&*self.0, None, seq);
+            if let Some(reporter) = &self.routing {
+                broca_core::AccountReporter::run_started(&**reporter, None, seq);
+            }
         }
 
         fn attempt_recorded(
@@ -3107,7 +3174,9 @@ mod executor {
             seq: u64,
             attempt: &broca_protocol::ModelAttempt,
         ) {
-            broca_core::AccountReporter::attempt_recorded(&*self.0, None, seq, attempt);
+            if let Some(reporter) = &self.routing {
+                broca_core::AccountReporter::attempt_recorded(&**reporter, None, seq, attempt);
+            }
         }
 
         fn attempt_recorded_on(
@@ -3117,11 +3186,16 @@ mod executor {
             attempt: &broca_protocol::ModelAttempt,
             selection: Option<&broca_core::AuthSelection>,
         ) {
-            self.0.attempt_recorded_on(None, seq, attempt, selection);
+            self.sent.lock().unwrap().attempted(selection, attempt);
+            if let Some(reporter) = &self.routing {
+                reporter.attempt_recorded_on(None, seq, attempt, selection);
+            }
         }
 
         fn account_moved(&self, _event_id: &str, seq: u64, selection: &broca_core::AuthSelection) {
-            self.0.moved(None, seq, selection);
+            if let Some(reporter) = &self.routing {
+                reporter.moved(None, seq, selection);
+            }
         }
     }
 
@@ -3142,7 +3216,6 @@ mod executor {
     struct AccountMoves<'a, W> {
         executor: &'a LiveLoopExecutor<W>,
         req: &'a broca_core::RunRequest,
-        auth: &'a Option<broca_protocol::AuthRequest>,
         clock: Option<&'a broca_core::Clock>,
         /// The media renderer the run's provider was given, which the new provider needs too.
         media: Option<Arc<broca_module::store_media::LazyRenderer>>,
@@ -3152,25 +3225,29 @@ mod executor {
         /// The credentials of moves prepared but not yet durable, and of the newest durable one.
         prepared: std::sync::Mutex<Vec<MovedCredential>>,
         adopted: std::sync::Mutex<Option<MovedCredential>>,
+        recheck_sign_in: bool,
+        probe_only: bool,
+        sent: Option<Arc<std::sync::Mutex<SentCredentials>>>,
     }
 
     impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
         fn new(
             executor: &'a LiveLoopExecutor<W>,
             req: &'a broca_core::RunRequest,
-            auth: &'a Option<broca_protocol::AuthRequest>,
             clock: Option<&'a broca_core::Clock>,
             media: Option<Arc<broca_module::store_media::LazyRenderer>>,
         ) -> Self {
             Self {
                 executor,
                 req,
-                auth,
                 clock,
                 media,
                 deadlines: Default::default(),
                 prepared: Default::default(),
                 adopted: Default::default(),
+                recheck_sign_in: true,
+                probe_only: false,
+                sent: None,
             }
         }
 
@@ -3186,21 +3263,22 @@ mod executor {
             wall: &broca_session_loop::account_move::Wall<'_>,
         ) -> Result<
             cortexkit_role_routing::account_continue::ContinueOffer,
-            Option<broca_protocol::error::AccountContinueAnswer>,
+            broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>,
         > {
             use broca_module_serve::account_routing::{ContinueOutcome, ADMISSION_BUDGET};
+            use broca_session_loop::account_move::Answer;
             use cortexkit_role_routing::account_continue::ContinueAnswer;
             let Some(routing) = self.executor.routing.as_ref() else {
-                return Err(None);
+                return Err(Answer::Ignored);
             };
             let Some(request) = broca_module_serve::account_routing::continue_request(wall) else {
                 tracing::warn!(
                     target: "accounts",
                     run_id = wall.run_id,
                     "the run's selection lacks the admission, conversation key or decision \
-                     routing knows it by; it does not ask to move at its quota wall"
+                     routing knows it by, or no fresh selection id could be made; continuation was not sent"
                 );
-                return Err(None);
+                return Err(Answer::Ignored);
             };
             let deadline = *self
                 .deadlines
@@ -3208,17 +3286,29 @@ mod executor {
                 .unwrap()
                 .entry(wall.attempt_seq)
                 .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
-            let answer = match routing.account_continue_if_served(&request, deadline).await {
+            let outcome = routing.account_continue_if_served(&request, deadline).await;
+            if wall.limit_window == "signed_out"
+                && !matches!(
+                    &outcome,
+                    ContinueOutcome::NotAsked | ContinueOutcome::NotDeclared
+                )
+            {
+                tracing::info!(target: "accounts", run_id = wall.run_id, "routing sign-in continuation exchange completed");
+            }
+            let answer = match outcome {
                 ContinueOutcome::Answered(answer) => answer,
-                ContinueOutcome::NotDeclared => return Err(None),
+                ContinueOutcome::NotDeclared | ContinueOutcome::NotAsked => {
+                    return Err(Answer::Ignored)
+                }
                 outcome => {
                     tracing::warn!(
                         target: "accounts",
                         run_id = wall.run_id,
                         ?outcome,
-                        "routing gave no answer to the run's continue request at its quota wall"
+                        limit_window = wall.limit_window,
+                        "routing gave no answer to the run's account-continuation request"
                     );
-                    return Err(None);
+                    return Err(Answer::Stay(None));
                 }
             };
             // Routing's answer travels on the run's error, which only the caller reads; the log
@@ -3231,9 +3321,10 @@ mod executor {
                         run_id = wall.run_id,
                         routing_code = %hold.routing_code,
                         until_ms = ?hold.until_ms,
-                        "routing held the run's continue request at its quota wall"
+                        limit_window = wall.limit_window,
+                        "routing held the run's account-continuation request"
                     );
-                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                    Err(Answer::Hold(broca_protocol::error::AccountContinueAnswer {
                         routing_code: hold.routing_code,
                         until_ms: hold.until_ms,
                     }))
@@ -3243,21 +3334,25 @@ mod executor {
                         target: "accounts",
                         run_id = wall.run_id,
                         routing_code = %refusal.routing_code,
-                        "routing refused the run's continue request at its quota wall"
+                        limit_window = wall.limit_window,
+                        "routing refused the run's account-continuation request"
                     );
-                    Err(Some(broca_protocol::error::AccountContinueAnswer {
-                        routing_code: refusal.routing_code,
-                        until_ms: None,
-                    }))
+                    Err(Answer::Stay(Some(
+                        broca_protocol::error::AccountContinueAnswer {
+                            routing_code: refusal.routing_code,
+                            until_ms: None,
+                        },
+                    )))
                 }
                 other => {
                     tracing::warn!(
                         target: "accounts",
                         run_id = wall.run_id,
                         answer = ?other,
-                        "routing answered the run's continue request with nothing broca can act on"
+                        "routing answered the run's account-continuation request with nothing \
+                         broca can act on"
                     );
-                    Err(None)
+                    Err(Answer::Ignored)
                 }
             }
         }
@@ -3329,7 +3424,7 @@ mod executor {
             use broca_session_loop::account_move::{Answer, Move};
             let offer = match self.offer(wall).await {
                 Ok(offer) => offer,
-                Err(answer) => return Answer::Stay(answer),
+                Err(answer) => return answer,
             };
             let refuse = |reason: &str| {
                 tracing::warn!(
@@ -3337,10 +3432,11 @@ mod executor {
                     run_id = wall.run_id,
                     step_id = wall.step_id,
                     offered = %offer.account,
-                    "routing offered an account at a quota wall, and the run does not take it: \
+                    limit_window = wall.limit_window,
+                    "routing offered an account for continuation, and the run does not take it: \
                      {reason}"
                 );
-                Answer::Stay(None)
+                Answer::Ignored
             };
             // The loop checks the reservation just before it writes the move, and asks again
             // once if it lapsed; an account that refused this step is never offered usefully.
@@ -3362,6 +3458,26 @@ mod executor {
             else {
                 return refuse("the run's credential names no auth method");
             };
+            let Some(vault) = self.executor.vault.as_ref() else {
+                return refuse("the offered credential's vault metadata is unavailable");
+            };
+            // Credential ids encode <method>:<provider>:<label>; changing a row's type is an
+            // operator edit bounded by the listing refresh, not ordinary token renewal.
+            // Use the last-known listing while its normal background refresh runs; refuse
+            // without a listing or compatible row. Provider-unmapped API keys cannot move.
+            let Some(listing) = latest_listing(Arc::clone(vault)).await else {
+                return refuse("the offered credential's vault metadata is unavailable");
+            };
+            let provider = wall.run_config.model.provider_module_id.as_str();
+            if !listing.credentials.iter().any(|row| {
+                row.id == offer.credential_id
+                    && row.auth_method.as_deref() == Some(method.as_token())
+                    && row.provider_ids.iter().any(|id| id == provider)
+            }) {
+                return refuse(
+                    "the offered credential's provider or auth method does not match the run",
+                );
+            }
             let decision = broca_core::AccountDecision {
                 decision_id: Some(offer.decision_id.clone()),
                 ..previous.clone()
@@ -3403,7 +3519,9 @@ mod executor {
                     EpisodeJob {
                         req: self.req,
                         kind: RunKind::FreshOrResume,
-                        auth: self.auth,
+                        // The offer authorizes this account; the fresh send's auth hints
+                        // are admission-only, not a new pin on this resumed episode.
+                        auth: &None,
                         conversation_key: &None,
                         queued_service_tier: &mut queued_service_tier,
                         media_profile: &None,
@@ -3465,9 +3583,22 @@ mod executor {
                 .iter()
                 .position(|moved| moved.selection == *selection)
             {
-                *self.adopted.lock().unwrap() = Some(prepared.swap_remove(position));
+                let moved = prepared.swap_remove(position);
+                if let Some(sent) = &self.sent {
+                    sent.lock()
+                        .unwrap()
+                        .prepared(Some(selection), moved.record_version);
+                }
+                *self.adopted.lock().unwrap() = Some(moved);
             }
             prepared.clear();
+        }
+
+        fn recheck_sign_in(&self) -> bool {
+            self.recheck_sign_in
+        }
+        fn probe_only(&self) -> bool {
+            self.probe_only
         }
     }
 
@@ -3748,9 +3879,18 @@ mod executor {
             .await
     }
 
+    #[derive(Clone, Copy)]
+    enum ReportedTokenVersion {
+        Admitted(u64),
+        Sent(u64),
+    }
+
     /// The rejection a run that ended on a wire auth error still owes the vault, if any: ONE
     /// REPORT PER REJECTION, naming the version the provider actually rejected.
     ///
+    /// An execution supplying `Sent` measures it from recorded attempts, so neither
+    /// an unused admission token nor a newer token fetched after a rejection can be reported.
+    /// The legacy `Admitted` path retains its existing refresher-based accounting:
     /// - Without an in-step refresher (`in_run` is `None`) nothing has reported anything, and
     ///   the run only ever held its admitted version: report that, with the terminal status.
     /// - When the provider rejected a token the step had already refreshed, the refresher
@@ -3763,9 +3903,37 @@ mod executor {
     /// - A refresher that never ran leaves the run on the version it holds now.
     fn run_end_report_target(
         in_run: Option<&InRunRefresh>,
-        admitted_version: u64,
+        version: ReportedTokenVersion,
         terminal_status: u16,
     ) -> Option<UnreportedRejection> {
+        let admitted_version = match version {
+            ReportedTokenVersion::Sent(sent) => {
+                if let Some(in_run) = in_run {
+                    if let Some(unreported) = *in_run
+                        .unreported_rejection
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                    {
+                        if unreported.record_version == sent {
+                            return Some(unreported);
+                        }
+                    }
+                    if *in_run
+                        .reported_version
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        == Some(sent)
+                    {
+                        return None;
+                    }
+                }
+                return Some(UnreportedRejection {
+                    status: terminal_status,
+                    record_version: sent,
+                });
+            }
+            ReportedTokenVersion::Admitted(admitted) => admitted,
+        };
         let Some(in_run) = in_run else {
             return Some(UnreportedRejection {
                 status: terminal_status,
@@ -3799,12 +3967,11 @@ mod executor {
     async fn report_rejection_after_run(
         vault: &VaultAuth,
         selection: &broca_core::AuthSelection,
-        admitted_version: u64,
+        version: ReportedTokenVersion,
         in_run: Option<&InRunRefresh>,
         terminal_status: u16,
     ) {
-        let Some(rejection) = run_end_report_target(in_run, admitted_version, terminal_status)
-        else {
+        let Some(rejection) = run_end_report_target(in_run, version, terminal_status) else {
             return;
         };
         // Provider rejection is authoritative even if the best-effort vault report cannot be
@@ -5002,7 +5169,7 @@ mod executor {
             summary: &Result<RunSummary, RunError>,
             account_reporter: Option<&broca_module_serve::account_routing::RunReporter>,
             report_selection: Option<broca_core::AuthSelection>,
-            used_credential: Option<(broca_core::AuthSelection, u64)>,
+            used_credential: Option<(broca_core::AuthSelection, ReportedTokenVersion)>,
             in_run_refresh: Option<&InRunRefresh>,
             terminal_error: impl Fn() -> F,
             lineage: Option<broca_wal::WalLineageId>,
@@ -5170,11 +5337,13 @@ mod executor {
                 }
                 return Ok(sealed);
             }
-            if mode == StoreRunMode::Resume
-                && control
-                    .cancel
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            if matches!(
+                mode,
+                StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
+            ) && control
+                .cancel
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
                 // A caller may cancel because sign-in or provider access is unavailable. Closing
                 // the existing run must not depend on admitting another model call first.
@@ -5340,18 +5509,18 @@ mod executor {
                 Some(writer.session_id()),
             );
             req.context_management = Some(episode_context_management);
-            let used_credential = used_credential_for_report(
-                &resolution.pause,
-                resolution.selection.clone(),
-                resolution.record_version,
-            );
+            let sent = Arc::new(std::sync::Mutex::new(SentCredentials::default()));
+            sent.lock()
+                .unwrap()
+                .prepared(resolution.selection.as_ref(), resolution.record_version);
             resolved
                 .provider
                 .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
-            let reports = account_reporter.clone().map(|reporter| {
-                Arc::new(StoreAccountReports(reporter))
-                    as Arc<dyn broca_session_loop::AccountReports>
-            });
+            let reports = Some(Arc::new(StoreAccountReports {
+                routing: account_reporter.clone(),
+                sent: sent.clone(),
+            })
+                as Arc<dyn broca_session_loop::AccountReports>);
             let fresh_admission = if fresh_episode {
                 match broca_session_loop::admit::admission(
                     req,
@@ -5366,7 +5535,13 @@ mod executor {
             } else {
                 None
             };
-            let moves = AccountMoves::new(self, req, auth, clock.as_ref(), media_renderer);
+            let mut moves = AccountMoves::new(self, req, clock.as_ref(), media_renderer);
+            moves.recheck_sign_in = matches!(
+                mode,
+                StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
+            );
+            moves.probe_only = mode == StoreRunMode::ProbeSignIn;
+            moves.sent = Some(sent.clone());
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -5386,6 +5561,7 @@ mod executor {
                 .provider
                 .set_cache_predecessor_loader(writer.cache_predecessor_loader());
             seams.account_continue = Some(&moves);
+            let execution_start_seq = writer.next_seq();
             let finished = match fresh_admission {
                 Some(admission) => {
                     // Keep the loop body off the executor's poll frame, as the legacy loop
@@ -5397,21 +5573,23 @@ mod executor {
             // A run that moved to another account at a quota wall reports its end under the
             // credential it moved to.
             let moved = moves.moved();
-            let (report_selection, used_credential, in_run_refresh) = match &moved {
-                Some(moved) => (
-                    Some(moved.selection.clone()),
-                    used_credential_for_report(
-                        &None,
-                        Some(moved.selection.clone()),
-                        moved.record_version,
-                    ),
-                    moved.in_run_refresh.as_ref(),
-                ),
-                None => (
-                    report_selection,
-                    used_credential,
-                    resolution.in_run_refresh.as_ref(),
-                ),
+            let report_selection = moved
+                .as_ref()
+                .map(|moved| moved.selection.clone())
+                .or(report_selection);
+            let used_credential = sent
+                .lock()
+                .unwrap()
+                .last
+                .clone()
+                .map(|(selection, version)| (selection, ReportedTokenVersion::Sent(version)));
+            let in_run_refresh = match moved.as_ref().filter(|moved| {
+                used_credential
+                    .as_ref()
+                    .is_some_and(|(selection, _)| *selection == moved.selection)
+            }) {
+                Some(moved) => moved.in_run_refresh.as_ref(),
+                None => resolution.in_run_refresh.as_ref(),
             };
             // The run's end, for routing and the vault, as `execute` reports it. The reports
             // read only how the run ended or paused.
@@ -5433,7 +5611,7 @@ mod executor {
                 report_selection,
                 used_credential,
                 in_run_refresh,
-                || store_terminal_error(reader),
+                || store_terminal_error(reader, execution_start_seq),
                 None,
                 &durable_head,
                 &req.session,
@@ -5860,9 +6038,14 @@ mod executor {
                 broca_core::AuthSelection {
                     billing_vault_facts: None,
                     credential_id: credential_key.clone(),
-                    // Freeze the vault-served account id verbatim alongside the credential id so
-                    // usage export labels spend with the account this run authenticated with.
-                    account_ref: account_id.clone(),
+                    // Keep the vault-served identity when available. A definite sign-in failure
+                    // still needs routing's selected account to identify which account's
+                    // credential is unavailable.
+                    account_ref: account_id.clone().or_else(|| {
+                        matches!(&outcome, Err(VaultError::NeedsReauth))
+                            .then(|| routed.as_ref().map(|(_, account, ..)| account.to_string()))
+                            .flatten()
+                    }),
                     resolved_credential_id: Some(vault_id.clone()),
                     // Present only if the vault replied; see `recorded_vault_request`.
                     vault_request: recorded_request,
@@ -6804,7 +6987,9 @@ mod executor {
                 &summary,
                 account_reporter.as_deref(),
                 report_selection,
-                used_credential,
+                used_credential.map(|(selection, version)| {
+                    (selection, ReportedTokenVersion::Admitted(version))
+                }),
                 in_run_refresh.as_ref(),
                 || terminal_provider_error(self.wal_store.clone(), session.clone()),
                 job.writer.lineage_id(),
@@ -6916,6 +7101,12 @@ mod executor {
         include!("credential_source_guard_tests.rs");
         include!("frozen_auth_method_resume_tests.rs");
         include!("account_move_tests.rs");
+        mod signed_out {
+            use super::*;
+            include!("signed_out_tests.rs");
+            include!("signed_out_audit_tests.rs");
+            include!("signed_out_reaudit_tests.rs");
+        }
         include!("fork_executor_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt

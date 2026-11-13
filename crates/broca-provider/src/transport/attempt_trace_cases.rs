@@ -471,14 +471,18 @@ struct Refresher {
 impl CredentialRefresher for Refresher {
     fn refresh_expiring(
         &self,
-    ) -> crate::credential_refresh::RefreshFuture<'_, crate::credential_refresh::RefreshedCredential>
-    {
+    ) -> crate::credential_refresh::ExpiringRefreshFuture<
+        '_,
+        crate::credential_refresh::RefreshedCredential,
+    > {
         let index = self.pre_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if self.pre_changed_at == Some(index) {
-                credential(Refresh::Changed, false)
+                crate::credential_refresh::ExpiringRefresh::Token(
+                    credential(Refresh::Changed, false).unwrap(),
+                )
             } else {
-                None
+                crate::credential_refresh::ExpiringRefresh::Unavailable
             }
         })
     }
@@ -489,7 +493,10 @@ impl CredentialRefresher for Refresher {
     {
         Box::pin(async move {
             attempt_test_hooks::advance(self.elapsed);
-            credential(self.result, true)
+            credential(self.result, true).map_or(
+                crate::credential_refresh::RejectedRefresh::Unavailable,
+                crate::credential_refresh::RejectedRefresh::Token,
+            )
         })
     }
 }
@@ -520,6 +527,7 @@ pub(super) fn recovery(case: &Case) -> Option<StepAuthRecovery<'static>> {
                     pre_calls: AtomicUsize::new(0),
                 }),
                 current: Arc::new(std::sync::RwLock::new(ServedAuth {
+                    definite_auth_failure: None,
                     auth_refreshed: false,
                     revision: 0,
                     auth: sent_auth.clone(),

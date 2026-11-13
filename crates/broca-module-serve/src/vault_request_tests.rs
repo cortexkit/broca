@@ -268,6 +268,8 @@ const REFRESHED_TTL_MS: i64 = 60 * 60 * 1000;
 /// The one credential record the stand-in serves, shared across its connections.
 #[derive(Default)]
 struct StandInRecord {
+    /// Per-credential read scripts; the final reply remains until the test changes it.
+    credential_replies: std::collections::HashMap<String, std::collections::VecDeque<serde_json::Value>>,
     /// Bumped by each refresh; 0 means "not read yet" and is shown as version 1.
     version: u64,
     stale: bool,
@@ -477,7 +479,18 @@ async fn serve_capturing_vault(
                         return Ok(());
                     }
                 }
+                let scripted = if method == "credential.get_scoped" {
+                    let mut state = record.lock().unwrap();
+                    let replies = request["params"]["credential_id"].as_str()
+                        .and_then(|id| state.credential_replies.get_mut(id));
+                    let reply = replies.and_then(|replies| {
+                        if replies.len() > 1 { replies.pop_front() } else { replies.front().cloned() }
+                    });
+                    if reply.is_some() { state.scoped_reads += 1; }
+                    reply
+                } else { None };
                 let reply = match method.as_str() {
+                    _ if scripted.is_some() => scripted.unwrap(),
                     "credential.get" => token(1, None),
                     "credential.get_scoped"
                         if request["params"]["credential_id"]
@@ -1274,7 +1287,7 @@ async fn refresh_after_a_rejection(label: &str, reports: ReportScript, status: u
     );
 
     let (refreshed, logs) = capture_credential_logs(async {
-        refresh.refresher.0.refresh_rejected_secret(status).await
+        refresh.refresher.0.refresh_rejected_secret(status).await.into_token()
     }).await;
     daemon.assert_healthy();
     let cached = executor
@@ -1455,9 +1468,13 @@ async fn pre_send_check(label: &str, expiry: ExpiryScript, then_401: bool) -> Pr
         let first = refresh.refresher.0.refresh_expiring_secret().await;
         if refresh.served_expires_at_ms.lock().unwrap().is_none() {
             let second = refresh.refresher.0.refresh_expiring_secret().await;
-            assert!(second.is_none());
+            assert!(matches!(second, ExpiringRefresh::Unavailable));
         }
-        first
+        match first {
+            ExpiringRefresh::Token(token) => Some(token),
+            ExpiringRefresh::Unavailable => None,
+            ExpiringRefresh::NeedsReauth { .. } => panic!("this script never loses its sign-in"),
+        }
     }).await;
     daemon.assert_healthy();
     let served = refresh.served_version.load(Ordering::SeqCst);
@@ -1472,7 +1489,7 @@ async fn pre_send_check(label: &str, expiry: ExpiryScript, then_401: bool) -> Pr
         .map(|token| token.record_version);
     let requests = daemon.requests();
     let after_401 = if then_401 {
-        refresh.refresher.0.refresh_rejected_secret(401).await
+        refresh.refresher.0.refresh_rejected_secret(401).await.into_token()
     } else {
         None
     };
@@ -1627,7 +1644,7 @@ fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
             '_,
             broca_provider::credential_refresh::RefreshedSecret,
         > {
-            Box::pin(async { None })
+            Box::pin(async { broca_provider::credential_refresh::RejectedRefresh::Unavailable })
         }
     }
     let in_run = |served: u64, reported: Option<u64>, unreported: Option<UnreportedRejection>| {
@@ -1646,22 +1663,22 @@ fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
         record_version,
     };
     // In-step refresh reported v1 and moved the run to v2, which was never rejected.
-    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), 1, 401), None);
+    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), ReportedTokenVersion::Admitted(1), 401), None);
     // In-step refresh reported v1 and the vault had nothing newer.
-    assert_eq!(run_end_report_target(Some(&in_run(1, Some(1), None)), 1, 401), None);
+    assert_eq!(run_end_report_target(Some(&in_run(1, Some(1), None)), ReportedTokenVersion::Admitted(1), 401), None);
     // The refreshed v2 was rejected too: report v2 alone, with its own status.
     assert_eq!(
-        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(401, 2)))), 1, 401),
+        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(401, 2)))), ReportedTokenVersion::Admitted(1), 401),
         Some(rejection(401, 2))
     );
     // A refresher that never ran: report the version the run holds now (3), with the status the
     // run's terminal error carries.
     assert_eq!(
-        run_end_report_target(Some(&in_run(3, None, None)), 1, 401),
+        run_end_report_target(Some(&in_run(3, None, None)), ReportedTokenVersion::Admitted(1), 401),
         Some(rejection(401, 3))
     );
     // A run with no in-step refresher reports the version admission served it (7).
-    assert_eq!(run_end_report_target(None, 7, 401), Some(rejection(401, 7)));
+    assert_eq!(run_end_report_target(None, ReportedTokenVersion::Admitted(7), 401), Some(rejection(401, 7)));
 }
 
 struct ChatgptRouting {
@@ -2047,7 +2064,7 @@ async fn chatgpt_refresh_run_rejecting(
         report_rejection_after_run(
             executor.vault.as_ref().unwrap(),
             &credential_key,
-            admitted_version,
+            ReportedTokenVersion::Admitted(admitted_version),
             auth.in_run_refresh.as_ref(),
             status,
         )
