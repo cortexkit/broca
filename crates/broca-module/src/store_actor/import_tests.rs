@@ -27,6 +27,9 @@ use crate::store_import::{
     ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
 };
 
+#[path = "import_inline_tests.rs"]
+mod inline;
+
 // Imports staged and published on the new storage's class roots.
 #[path = "import_stage_tests.rs"]
 mod staged;
