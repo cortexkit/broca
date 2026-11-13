@@ -848,6 +848,13 @@ impl StoreMove {
                 examples = ?verified.legacy_replay_limit_examples,
                 "converted requests match today's offline replay, which cannot reproduce every historical request digest");
         }
+        if verified.provider_rejected_request > 0 {
+            tracing::warn!(
+                provider_rejected_request = verified.provider_rejected_request,
+                examples = ?verified.provider_rejected_request_examples,
+                "historical requests rejected by their provider are not successful replay promises"
+            );
+        }
         // The runtime serving the session reads its setup parts from memory: hold the staged
         // ones there, already stored in the destination root.
         before!(Self::hold_parts(

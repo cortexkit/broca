@@ -1179,26 +1179,14 @@ impl Engine {
             }
             let verified =
                 verified.map_err(|error| Failure::failed("verification_failed", error))?;
-            // A converted session whose requests match today's offline replay, where that replay
-            // can't reproduce a historical request digest, still converts. The ledger keeps the
-            // affected steps so the limit stays visible after the conversion.
-            let replay_limit = (verified.legacy_replay_limit > 0).then(|| {
-                let steps: Vec<String> = verified
-                    .legacy_replay_limit_examples
-                    .iter()
-                    .map(|limit| format!("{} step {}", limit.run_id, limit.step))
-                    .collect();
-                format!(
-                    "legacy_replay_limit: {} step(s) match today's offline replay but not their recorded request digest ({})",
-                    verified.legacy_replay_limit,
-                    steps.join(", ")
-                )
-            });
-            if let Some(detail) = &replay_limit {
+            // Keep historical replay limits and provider-rejected requests visible after
+            // publication; neither category skips read, history or fresh-send verification.
+            let request_limits = verified.request_limits_detail();
+            if let Some(detail) = &request_limits {
                 tracing::warn!(target: "session_conversion", source = %source.id, "{detail}");
             }
             let read_only = verified.read_only.then_some(READ_ONLY_DETAIL);
-            let detail = match (replay_limit, read_only) {
+            let detail = match (request_limits, read_only) {
                 (Some(limit), Some(read_only)) => Some(format!("{read_only}; {limit}")),
                 (limit, read_only) => limit.or(read_only.map(str::to_owned)),
             };

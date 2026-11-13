@@ -581,6 +581,50 @@ async fn cutover_verification_failure_retains_check_and_first_difference_in_ledg
 /// converts, because its converted requests equal today's replay; the converted row keeps the
 /// affected step, also after the ledger is reopened.
 #[tokio::test]
+async fn cutover_keeps_provider_rejected_requests_on_the_converted_row() {
+    let rig = Rig::start("cutover-provider-rejected").await;
+    let mut records = session_records(&rig.wal());
+    let last_start = records
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .unwrap();
+    let mut tail = records.split_off(last_start);
+    tail.retain(|record| !matches!(record, WalRecord::ModelStepFinished { .. }));
+    let last = tail
+        .iter_mut()
+        .rev()
+        .find(|record| matches!(record, WalRecord::RunFinished { .. }))
+        .unwrap();
+    *last = serde_json::from_value(json!({
+        "type": "run_finished", "reason": "error", "ts_ms": 2_003,
+        "usage": {}, "retries_used": 0,
+        "error": {"class": "permanent", "provider_code": "request_invalid", "message": "Synthetic rejected request."},
+    })).unwrap();
+    records.extend(tail);
+    rig.write(&records);
+    let engine = super::engine(&rig, false, true);
+    engine
+        .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
+        .await
+        .unwrap();
+    let row = engine.ledger.rows().unwrap().remove(0);
+    assert_eq!(row.outcome.as_deref(), Some("converted"), "{row:?}");
+    assert!(
+        row.detail
+            .as_deref()
+            .unwrap()
+            .starts_with("provider_rejected_request: 1 step(s)"),
+        "{row:?}"
+    );
+    drop(engine);
+    let ledger = crate::conversion_ledger::Ledger::open(&rig.dir).unwrap();
+    assert_eq!(
+        ledger.row(&row.source.id).unwrap().unwrap().detail,
+        row.detail
+    );
+}
+
+#[tokio::test]
 async fn cutover_keeps_a_legacy_replay_limit_on_the_converted_row() {
     let rig = Rig::start("cutover-replay-limit").await;
     // The log records a request digest no render of its records produces.

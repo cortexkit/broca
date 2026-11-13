@@ -116,6 +116,10 @@ pub struct Verified {
     pub legacy_replay_limit: u64,
     /// Up to five affected steps, without request content.
     pub legacy_replay_limit_examples: Vec<ReplayLimit>,
+    /// Historical steps with no successful answer, in a run ended by permanent request_invalid.
+    /// Their failed request is not a successful request the conversion promises to reproduce.
+    pub provider_rejected_request: u64,
+    pub provider_rejected_request_examples: Vec<ReplayLimit>,
     /// Whether the session moves read-only: it was compacted under the first compaction
     /// protocol, which the new run loop refuses to run, so no request of it was rebuilt (its
     /// recorded steps' and its next one) and its first open wasn't checked.
@@ -126,6 +130,24 @@ pub struct Verified {
 pub struct ReplayLimit {
     pub run_id: String,
     pub step: u64,
+}
+
+impl Verified {
+    /// Operator-visible historical request categories, without request content.
+    pub fn request_limits_detail(&self) -> Option<String> {
+        let mut details = Vec::new();
+        for (category, count, examples, reason) in [
+            ("legacy_replay_limit", self.legacy_replay_limit, &self.legacy_replay_limit_examples,
+                "match today's offline replay but not their recorded request digest"),
+            ("provider_rejected_request", self.provider_rejected_request, &self.provider_rejected_request_examples,
+                "have no successful ModelStepFinished and belong to a run ended by permanent request_invalid"),
+        ] {
+            if count == 0 { continue; }
+            let steps: Vec<_> = examples.iter().map(|step| format!("{} step {}", step.run_id, step.step)).collect();
+            details.push(format!("{category}: {count} step(s) {reason} ({})", steps.join(", ")));
+        }
+        (!details.is_empty()).then(|| details.join("; "))
+    }
 }
 
 /// The first difference found, under the check that found it.
@@ -252,9 +274,12 @@ pub async fn verify_with_progress(
         recorded_steps(verify.records)
     };
     let mut replay_limits = Vec::new();
+    let mut provider_rejections = Vec::new();
     if let Some(last) = steps.last() {
-        if step(&verify, lineage.as_deref(), last, LAST_STEP, progress).await? {
-            replay_limits.push(last);
+        match step(&verify, lineage.as_deref(), last, LAST_STEP, progress).await? {
+            RequestVerification::Exact => {}
+            RequestVerification::LegacyReplayLimit => replay_limits.push(last),
+            RequestVerification::ProviderRejectedRequest => provider_rejections.push(last),
         }
         checks.push(LAST_STEP);
     }
@@ -274,8 +299,10 @@ pub async fn verify_with_progress(
     if verify.mode == Mode::Offline && !read_only {
         // The last step already ran above; count each historical replay limit only once.
         for recorded in steps.iter().take(steps.len().saturating_sub(1)) {
-            if step(&verify, lineage.as_deref(), recorded, ALL_STEPS, progress).await? {
-                replay_limits.push(recorded);
+            match step(&verify, lineage.as_deref(), recorded, ALL_STEPS, progress).await? {
+                RequestVerification::Exact => {}
+                RequestVerification::LegacyReplayLimit => replay_limits.push(recorded),
+                RequestVerification::ProviderRejectedRequest => provider_rejections.push(recorded),
             }
         }
         checks.push(ALL_STEPS);
@@ -288,6 +315,15 @@ pub async fn verify_with_progress(
         checks,
         legacy_replay_limit: replay_limits.len() as u64,
         legacy_replay_limit_examples: replay_limits
+            .iter()
+            .take(5)
+            .map(|step| ReplayLimit {
+                run_id: step.run.clone(),
+                step: step.step,
+            })
+            .collect(),
+        provider_rejected_request: provider_rejections.len() as u64,
+        provider_rejected_request_examples: provider_rejections
             .iter()
             .take(5)
             .map(|step| ReplayLimit {
@@ -1062,6 +1098,47 @@ struct RecordedStep {
     step: u64,
     config: broca_wal::RunConfig,
     digest: String,
+    provider_rejected: bool,
+}
+
+/// Outcomes of historical request verification, not WAL attempt outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestVerification {
+    Exact,
+    LegacyReplayLimit,
+    ProviderRejectedRequest,
+}
+
+fn provider_rejected_request(records: &[FramedRecord], index: usize, step: u64) -> bool {
+    let start = records[..=index]
+        .iter()
+        .rposition(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
+        .unwrap_or(0);
+    let run_tail: Vec<_> = records[start..]
+        .iter()
+        .enumerate()
+        .take_while(|(offset, frame)| {
+            *offset == 0 || !matches!(frame.record, WalRecord::RunStarted { .. })
+        })
+        .map(|(_, frame)| frame)
+        .collect();
+    if run_tail.iter().any(|frame| {
+        matches!(&frame.record,
+        WalRecord::ModelStepFinished { step_id, .. } if step_id.0 == step)
+    }) {
+        return false;
+    }
+    run_tail
+        .iter()
+        .rev()
+        .find_map(|frame| match &frame.record {
+            WalRecord::RunFinished { error, .. } => Some(error.as_ref().is_some_and(|error| {
+                error.class == broca_protocol::ErrorClass::Permanent
+                    && error.provider_code.as_deref() == Some("request_invalid")
+            })),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// Every step of the WAL with a recorded request, in order.
@@ -1100,6 +1177,7 @@ fn recorded_steps(records: &[FramedRecord]) -> Vec<RecordedStep> {
                         step: step_id.0,
                         config: config.clone(),
                         digest,
+                        provider_rejected: provider_rejected_request(records, index, step_id.0),
                     });
                 }
             }
@@ -1223,7 +1301,10 @@ async fn step(
     recorded: &RecordedStep,
     check: &'static str,
     progress: broca_session_store::backend::unpublished::Progress<'_>,
-) -> Result<bool, Mismatch> {
+) -> Result<RequestVerification, Mismatch> {
+    if recorded.provider_rejected {
+        return Ok(RequestVerification::ProviderRejectedRequest);
+    }
     let records = verify.records;
     let wal: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
     let contract = broca_core::is_mode3_log(&wal);
@@ -1329,7 +1410,15 @@ async fn step(
         holds_media,
     )
     .map_err(|error| at(format!("today's renderer: {error}")))?;
-    compare_request(&rebuilt, &today, &recorded.digest).map_err(|error| at(error.into()))
+    compare_request(&rebuilt, &today, &recorded.digest)
+        .map(|limited| {
+            if limited {
+                RequestVerification::LegacyReplayLimit
+            } else {
+                RequestVerification::Exact
+            }
+        })
+        .map_err(|error| at(error.into()))
 }
 
 pub(crate) fn compare_request(
@@ -1415,18 +1504,48 @@ fn wal_record(value: Value) -> Result<WalRecord, String> {
     serde_json::from_value(value).map_err(|error| format!("a continuation's record: {error}"))
 }
 
-/// The WAL with one more send after it: the session's last run start again, under a new run id
-/// with a fixed input and the effective serving identity, and its first step's start, as the
-/// next send to the session would begin.
+/// A deterministic fresh admission for the next-send comparison. It is not a historical run's
+/// renderer: import markers intentionally have none, and fresh sends freeze their own provider
+/// config. The legacy WAL renderer and the new session loop receive the same config without
+/// contacting a provider.
+fn fresh_next_admission() -> Result<broca_wal::RunConfig, String> {
+    let frozen = broca_provider::families::anthropic_frozen_config("claude-conversion-check");
+    serde_json::from_value(json!({
+        "model": {"provider_module_id": "anthropic", "model_id": "claude-conversion-check"},
+        "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+        "response_format": {"type": "text"}, "context_epoch": 0, "context_limit": 100_000,
+        "renderer_version": frozen.renderer_version,
+        "frozen_render_config": frozen,
+    }))
+    .map_err(|error| format!("the fresh next-send admission: {error}"))
+}
+
+/// The WAL with a freshly admitted send after it, using the config supplied to the legacy WAL
+/// renderer and the new session loop, a fixed input and the effective serving identity. An
+/// imported marker is never resumed.
 fn with_next_send(
     records: &[FramedRecord],
     effective: &BindIdentity,
+    config: &broca_wal::RunConfig,
 ) -> Result<Continuation, String> {
-    let mut start = records
+    // A fresh send retains the session's scope and plan. Dropping the plan would turn off
+    // compaction only in the new loop and change which sealed history its request includes.
+    let (scope, manifest, compaction_plan_version, marker_order_version) = records
         .iter()
         .rev()
         .find_map(|frame| match &frame.record {
-            WalRecord::RunStarted { .. } => Some(frame.record.clone()),
+            WalRecord::RunStarted {
+                scope,
+                manifest,
+                compaction_plan_version,
+                marker_order_version,
+                ..
+            } => Some((
+                scope.clone(),
+                manifest.clone(),
+                *compaction_plan_version,
+                *marker_order_version,
+            )),
             _ => None,
         })
         .ok_or("the WAL starts no run")?;
@@ -1435,40 +1554,15 @@ fn with_next_send(
         .rev()
         .find_map(|frame| broca_core::record_time_ms(&frame.record))
         .map(|at| at + 1);
-    let WalRecord::RunStarted {
-        run_id,
-        ts_ms,
-        input,
-        origin,
-        submission_id,
-        send_id,
-        request_identity_digest,
-        written_at_ms,
-        session,
-        tags,
-        config,
-        ..
-    } = &mut start
-    else {
-        unreachable!("the record found is a run start");
-    };
-    *run_id = RunId(NEXT_RUN.into());
-    *session = effective.clone();
-    *ts_ms = at;
-    *written_at_ms = at;
-    *origin = broca_wal::RunOrigin::Fresh;
-    *submission_id = None;
-    *send_id = None;
-    *request_identity_digest = None;
-    *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
-        "role": "user",
-        "content": [{"type": "text", "text": "The next message after the move."}],
+    let start = serde_json::from_value(json!({
+        "type": "run_started", "run_id": NEXT_RUN, "session": effective,
+        "ts_ms": at, "written_at_ms": at, "origin": {"kind": "fresh"}, "scope": scope,
+        "manifest": manifest,
+        "compaction_plan_version": compaction_plan_version, "marker_order_version": marker_order_version,
+        "config": config,
+        "input": [{"role": "user", "content": [{"type": "text", "text": "The next message after the move."}]}],
     }))
-    .map_err(|error| format!("the next send's input: {error}"))?]);
-    // The copied run start's runner tags number the parts of the input it carried, not this
-    // one: it is stamped again as it is appended.
-    *tags = None;
-    let config = (**config).clone();
+    .map_err(|error| format!("the fresh next send: {error}"))?;
     let mut extended = records.to_vec();
     let mut lineage_tags =
         broca_core::tags::lineage_tags(records.iter().map(|frame| &frame.record));
@@ -1485,7 +1579,7 @@ fn with_next_send(
         records: extended,
         run: NEXT_RUN.into(),
         step: 1,
-        config,
+        config: config.clone(),
         sends: Vec::new(),
     })
 }
@@ -1677,7 +1771,8 @@ fn continuations(verify: &Verify<'_>) -> Result<Vec<Continuation>, Mismatch> {
             with_resume(verify.records, &run).map_err(|error| mismatch(RESUME, error))?
         ]);
     }
-    let next = with_next_send(verify.records, verify.session)
+    let config = fresh_next_admission().map_err(|error| mismatch(NEXT_REQUEST, error))?;
+    let next = with_next_send(verify.records, verify.session, &config)
         .map_err(|error| mismatch(NEXT_REQUEST, error))?;
     let mut continuations = Vec::new();
     if let Some(delivery) =
@@ -1861,6 +1956,17 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
             .await
             .map_err(|error| mismatch(check, format!("close the copy: {error:?}")))?;
         if rebuilt != today {
+            if let (Ok(rebuilt), Ok(today)) = (
+                serde_json::from_slice::<Value>(&rebuilt),
+                serde_json::from_slice::<Value>(&today),
+            ) {
+                if let Some(path) = crate::inverse::first_difference(&rebuilt, &today, "") {
+                    return Err(mismatch(
+                        check,
+                        format!("the next request differs at {path}"),
+                    ));
+                }
+            }
             return Err(mismatch(
                 check,
                 "the request differs from the one today's renderer builds",

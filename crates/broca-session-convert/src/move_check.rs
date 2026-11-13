@@ -57,6 +57,8 @@ struct MoveCheckReport {
     /// Checked steps that agree with today's offline replay but not the historical digest.
     legacy_replay_limit: u64,
     legacy_replay_limit_examples: Vec<String>,
+    provider_rejected_request: u64,
+    provider_rejected_request_examples: Vec<String>,
     /// Refusals before anything is written, by reason (`not_movable {reason}`).
     not_movable: BTreeMap<String, u64>,
     /// Conversions that would not be exact, by what was lost.
@@ -426,6 +428,17 @@ fn check(args: &Args) -> MoveCheckReport {
                 report.verified_messages += verified.messages;
                 report.verified_media += verified.media;
                 report.legacy_replay_limit += verified.legacy_replay_limit;
+                report.provider_rejected_request += verified.provider_rejected_request;
+                if verified.provider_rejected_request > 0 {
+                    eprintln!("WARN {}: {name}", verified.request_limits_detail().unwrap());
+                    for step in &verified.provider_rejected_request_examples {
+                        if report.provider_rejected_request_examples.len() < 5 {
+                            report
+                                .provider_rejected_request_examples
+                                .push(format!("{name}: step {} of {}", step.step, step.run_id));
+                        }
+                    }
+                }
                 if verified.legacy_replay_limit > 0 {
                     eprintln!("WARN legacy_replay_limit: {name}: {} checked step(s); converted requests equal today's offline render", verified.legacy_replay_limit);
                     for step in &verified.legacy_replay_limit_examples {

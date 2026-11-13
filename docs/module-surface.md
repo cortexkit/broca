@@ -726,6 +726,14 @@ Each failed attempt logs a WARN with source path, class
 and detail. The standalone `--convert-clone` command, which tests conversion on an
 operator-supplied state-root copy without starting the daemon, writes these warnings to stderr.
 
+Verification reports historical provider-rejected requests separately as
+`provider_rejected_request`, with a count and run/step examples in the report and ledger detail.
+This category requires a step with no successful `ModelStepFinished` in a run that ended with a
+permanent `request_invalid`; it never exempts a successful step. Read, history, head and fresh
+next-send verification still run. Import markers are not provider runs to resume: verification
+admits a fresh synthetic next send with one config supplied to the legacy WAL renderer and the
+new session loop, leaving the marker and its imported history unchanged.
+
 For an operator-supplied **clone only**, `ck-broca --convert-clone ROOT --converted-sources BACKUP`
 runs the same conversion in plain mode without starting a daemon or reading the vault. It prints
 JSON counts, live-pass and total milliseconds, and session addresses whose legacy run-index rows
