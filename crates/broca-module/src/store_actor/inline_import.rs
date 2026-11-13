@@ -13,7 +13,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(outcome) => (outcome, false),
             Err(error) => (
                 ImportOutcome::Error(ImportError::Wal(format!("{error:?}"))),
-                true,
+                self.running().is_none(),
             ),
         }
     }
@@ -22,8 +22,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         request: ImportRequest,
     ) -> Result<ImportOutcome, SessionError> {
-        let previous = self.session.find_run_start(&request.run_id.0).await?;
         let active = self.running().is_some();
+        let previous = self.session.find_run_start(&request.run_id.0).await?;
         if active
             && previous
                 .as_ref()
