@@ -179,13 +179,14 @@ impl SharedProviderError {
             wire_class,
         };
         if shared.inner.provider_code.is_none() {
-            // Served errors require a code even when older stored records have none. Readers
-            // accept code values they do not recognize, so the catch-all needs no version bump.
+            // Served errors require a code even when older stored records have none: the class
+            // names it where the class has a code of its own, and the contract's catch-all
+            // covers the rest.
             let code = match shared.class_wire() {
                 "transient" => "transient",
                 "auth_required" => "auth_required",
                 "context_overflow" => "context_overflow",
-                _ => "provider_error",
+                _ => cortexkit_role_llm_runner::errors::provider_codes::PROVIDER_ERROR,
             };
             shared.inner.provider_code = Some(code.to_owned());
         }
