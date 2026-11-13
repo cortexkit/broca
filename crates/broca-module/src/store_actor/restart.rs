@@ -201,7 +201,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .await
         .map_err(|error| format!("seal refused restart resume: {error:?}"))?;
-        tracing::info!(target: "lifecycle", run_id = %run_id.0, session = %self.key.session, code,
+        tracing::info!(target: "lifecycle", run_id = %run_id.0,
+            session = %broca_core::session_addr(&self.key), outcome = "interrupted", code,
             "restart-paused run not continued; sealed interrupted");
         Ok(())
     }

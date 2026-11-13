@@ -43,6 +43,7 @@ pub struct StoreRecoverySweep {
     pub inspected: usize,
     pub recovered: usize,
     pub lease_held: usize,
+    pub deferred: usize,
     pub failed: Vec<String>,
 }
 
@@ -78,17 +79,26 @@ impl crate::registry::LineageRegistry {
                     .map_err(|error| format!("list {class} store sessions: {error:?}"))
             })?;
             let failures_before = sweep.failed.len();
+            let deferred_before = sweep.deferred;
             for addr in addresses {
                 if self.stopping_signal().is_cancelled() {
                     return Ok(sweep);
                 }
                 tokio::task::yield_now().await;
-                sweep.inspected += 1;
                 let result = async {
                     let (head, _) = backend
                         .read_stored_head(&addr)
                         .map_err(|error| format!("read head: {error:?}"))?
                         .ok_or_else(|| "head disappeared".to_owned())?;
+                    let cipher = broca_session_store::head::stored_cipher(&head)
+                        .map_err(|error| format!("decode head mode: {error:?}"))?;
+                    // An encrypted session's unfinished-run and queue state cannot be read
+                    // before the key arrives. Keep its durable candidate for the key-loaded pass.
+                    if cipher != Cipher::None && !runtime.key_loaded() {
+                        sweep.deferred += 1;
+                        return Ok(());
+                    }
+                    sweep.inspected += 1;
                     let triple = broca_session_store::head::stored_triple(&head)
                         .map_err(|error| format!("decode head identity: {error:?}"))?;
                     let key = BindIdentity::new(
@@ -163,8 +173,11 @@ impl crate::registry::LineageRegistry {
                 }
             }
             // Encrypted heads cannot be classified until the key arrives. Leave the marker
-            // absent on any failure so a later pass cannot mistake a partial scan for coverage.
-            if rebuilding && sweep.failed.len() == failures_before {
+            // absent on deferral or failure so a later pass cannot mistake a partial scan for coverage.
+            if rebuilding
+                && sweep.failed.len() == failures_before
+                && sweep.deferred == deferred_before
+            {
                 super::recovery_index::complete(&root)
                     .map_err(|error| format!("complete {class} recovery inventory: {error}"))?;
             }

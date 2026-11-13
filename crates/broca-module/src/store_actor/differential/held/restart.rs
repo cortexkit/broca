@@ -339,6 +339,7 @@ async fn background_candidates_resume_an_untouched_restart_paused_store_session(
     side.registry
         .resume_restart_pauses(side.executor.wal.clone(), Vec::new())
         .await;
+    side.registry.recover_store_crash_orphans().await.unwrap();
     ended_without_reading(&side, "r1").await;
     assert_eq!(side.executor.provider.inner.calls().len(), 1);
     assert_eq!(side.status().await["state"], "completed");

@@ -160,6 +160,23 @@ impl KeyLoader {
     pub async fn run(self, registry: broca_module::LineageRegistry) {
         let key_id = self.slot.key_id();
         let stopping = registry.stopping_signal();
+        let runtime_ready = match self.slot.open_without_key(&self.setup).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(target: "lifecycle", %error, "could not open store recovery runtime");
+                false
+            }
+        };
+        // Plain sessions need no vault. Encrypted candidates stay registered until the
+        // second pass can read them; refusals from client traffic are not our inventory.
+        let deferred = recover_sessions(&registry).await || !runtime_ready;
+        let stop_deferred = || {
+            tracing::info!(target: "lifecycle", "store recovery deferred until next startup: module stopping before deployment key recovery");
+        };
+        if stopping.is_cancelled() {
+            stop_deferred();
+            return;
+        }
         let Some(source) = self.source else {
             warn_missing(key_id, KeyUnavailable::NoVault);
             return;
@@ -167,7 +184,19 @@ impl KeyLoader {
         let mut wait = self.backoff.first;
         let mut warned = false;
         loop {
-            let loaded = match read_key(source.as_ref(), key_id).await {
+            if stopping.is_cancelled() {
+                stop_deferred();
+                return;
+            }
+            let read = tokio::select! {
+                biased;
+                _ = stopping.cancelled() => {
+                    stop_deferred();
+                    return;
+                }
+                read = read_key(source.as_ref(), key_id) => read,
+            };
+            let loaded = match read {
                 Ok(key) => self
                     .slot
                     .load(&self.setup, key)
@@ -190,7 +219,10 @@ impl KeyLoader {
             }
             tokio::select! {
                 biased;
-                _ = stopping.cancelled() => return,
+                _ = stopping.cancelled() => {
+                    stop_deferred();
+                    return;
+                },
                 _ = tokio::time::sleep(wait) => {}
             }
             wait = (wait * 2).min(self.backoff.max);
@@ -202,17 +234,12 @@ impl KeyLoader {
              storage are served"
         );
         let refused = self.slot.take_refused();
-        // Encrypted heads could not be inspected before the deployment key arrived. Enumerate
-        // their held heads now, including finished runs whose idle cache timers need restoring.
-        match registry.recover_store_crash_orphans().await {
-            Ok(sweep) => {
-                for error in sweep.failed {
-                    tracing::warn!(target: "cache_warm", %error, "could not restore a store session after key load");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(target: "cache_warm", %error, "could not enumerate idle heads after key load")
-            }
+        if stopping.is_cancelled() {
+            stop_deferred();
+            return;
+        }
+        if deferred {
+            recover_sessions(&registry).await;
         }
         if refused.is_empty() {
             return;
@@ -230,6 +257,29 @@ impl KeyLoader {
                 session = %session.session,
                 "a session refused before the deployment key loaded could not be opened: {error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests;
+
+/// Opens durable recovery candidates, not just sessions refused by commands during key loading.
+async fn recover_sessions(registry: &broca_module::LineageRegistry) -> bool {
+    match registry.recover_store_crash_orphans().await {
+        Ok(sweep) => {
+            tracing::info!(target: "lifecycle", inspected = sweep.inspected,
+                recovered = sweep.recovered, lease_held = sweep.lease_held,
+                deferred = sweep.deferred, failed = sweep.failed.len(),
+                "store restart resume candidate sweep complete");
+            for error in sweep.failed {
+                tracing::warn!(target: "lifecycle", %error, "could not recover a store session");
+            }
+            sweep.deferred != 0
+        }
+        Err(error) => {
+            tracing::warn!(target: "lifecycle", %error, "store recovery could not list candidate sessions");
+            true
         }
     }
 }

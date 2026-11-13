@@ -936,24 +936,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         registry.set_store_mover(mover);
     }
-    // The deployment key is read off the startup path: the module serves today's sessions at
-    // once, and sessions kept in the new storage from when the key loads.
-    let _store_key = {
-        let ready = scope_describer.clone();
-        let registry = registry.as_ref().clone();
-        let slot = Arc::clone(&store_slot);
-        tokio::spawn(async move {
-            ready.wait_registered().await;
-            broca_module_serve::store_key::KeyLoader {
-                source: store_key_source,
-                slot,
-                setup: store_setup,
-                backoff: Default::default(),
-            }
-            .run(registry)
-            .await;
-        })
-    };
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
@@ -1175,20 +1157,26 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     registry.set_cache_declarer(Arc::new(
         broca_module_serve::cache_warm::ProviderCacheDeclarer,
     ));
-    let recovery: Arc<dyn broca_core::RecoveryDiscovery> = run_index.as_ref().unwrap().clone();
-    let _store_recovery = {
-        let registry = registry.clone();
+    // Store recovery has one owner: plain sessions open now, encrypted candidates wait for
+    // the deployment key. Neither pass waits for WAL discovery.
+    let _store_key = {
+        let registry = registry.as_ref().clone();
+        let store_slot = Arc::clone(&store_slot);
         let ready = scope_describer.clone();
         tokio::spawn(async move {
             ready.wait_registered().await;
-            match registry.recover_store_crash_orphans().await {
-                Ok(store_recovery) => tracing::warn!(target: "lifecycle", ?store_recovery,
-                    "store crash-orphan recovery complete"),
-                Err(error) => tracing::warn!(target: "lifecycle", %error,
-                    "store crash-orphan recovery deferred"),
+            registry.enable_restart_resumes();
+            broca_module_serve::store_key::KeyLoader {
+                source: store_key_source,
+                slot: store_slot,
+                setup: store_setup,
+                backoff: Default::default(),
             }
+            .run(registry)
+            .await;
         })
     };
+    let recovery: Arc<dyn broca_core::RecoveryDiscovery> = run_index.as_ref().unwrap().clone();
     let crash_orphans = mark_crash_orphans(
         &registry,
         recovery.clone(),
