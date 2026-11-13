@@ -192,18 +192,29 @@ impl<B: SessionBackend> Session<B> {
     /// way. A log can only start at an input or an assistant message with no tool turn open
     /// before it, so when that entry is a tool turn's results, the seal falls at the nearest
     /// earlier entry that can start one: it may keep more than the cut keeps, never less.
+    ///
+    /// `None` when that entry is the open log's first message, so no message would leave the
+    /// window: nothing is written. A caller sealing at every cut it sees can ask again for the
+    /// same cut without rewriting the log each time.
     pub async fn seal_at_entry(
         &mut self,
         ordinal: u64,
         carry: &Carry<'_>,
         now_ms: u64,
-    ) -> Result<Sealed, SessionError> {
+    ) -> Result<Option<Sealed>, SessionError> {
         let cut = {
             // Dropped before the seal, which reads the open log again itself.
             let (records, _, checkpoint) = self.read_open_log().await?;
-            placing_seq(&checkpoint, &records, ordinal)?
+            let cut = placing_seq(&checkpoint, &records, ordinal)?;
+            let places_before_cut = records.iter().any(|(seq, record)| {
+                *seq < cut && matches!(record, Record::Input(_) | Record::Assistant(_))
+            });
+            if !places_before_cut {
+                return Ok(None);
+            }
+            cut
         };
-        self.seal_carrying(Some(cut), carry, now_ms).await
+        self.seal_carrying(Some(cut), carry, now_ms).await.map(Some)
     }
 
     /// Every seal moves the ledger out of the open log, and with it the `View` records the

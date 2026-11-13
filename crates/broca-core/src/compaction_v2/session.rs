@@ -44,9 +44,24 @@ pub struct Session {
     pub runtime: Runtime,
     initialized: std::sync::atomic::AtomicBool,
     serving_started: std::sync::atomic::AtomicBool,
+    /// The last cut this session's history was sealed at, and the ordinal the window started at
+    /// after that seal (see `broca_session_loop::compaction::cut_to_seal`).
+    sealed_at: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
 impl Session {
+    /// Whether sealing at the cut `target` with the window starting at `start` is worth asking
+    /// the store for: not when this session last sealed at that cut and the window started there
+    /// afterwards, since the store would find nothing more to move.
+    pub fn seal_due(&self, target: u64, start: u64) -> bool {
+        *self.sealed_at.lock().expect("sealed_at") != Some((target, start))
+    }
+
+    /// Records a seal at the cut `target` that left the window starting at `start`.
+    pub fn sealed_at(&self, target: u64, start: u64) {
+        *self.sealed_at.lock().expect("sealed_at") = Some((target, start));
+    }
+
     pub fn claim_serving_start(&self) -> bool {
         !self
             .serving_started

@@ -567,6 +567,28 @@ fn with_sealed(
     opts
 }
 
+/// The ordinal to seal the session's history before, if any: its marker's first kept entry when
+/// that lies above the window's start, or the newest placed message when the cut covers every
+/// message (a log can't start at a message not yet placed). A cut is sealed at the step that
+/// applies it, whether its view applied at the step's boundary or came with a ride, so an open
+/// session holds only the window the requests render from. A session whose history was never
+/// sealed at its cut is sealed at its next step.
+///
+/// The store seals at the nearest earlier entry a log can start at, so the window may still
+/// start below the cut afterwards. The session remembers each cut it sealed at, with where the
+/// window then started, and doesn't ask again for that cut until the window moves, so a cut the
+/// store can't reach costs one look at the open log, not one per step.
+pub fn cut_to_seal<W: Writer>(writer: &W, ctx: &Ctx) -> Option<u64> {
+    // A seal carries the applied view into the new log (`carried_views`), so a cut is sealed
+    // only while the view that made it is the applied one.
+    writer.operations().view_applied.as_ref()?;
+    let conversation = writer.conversation();
+    let marker = conversation.marker.as_ref()?;
+    let target = marker.first_kept_ordinal.min(conversation.placed);
+    let start = conversation.window_start();
+    (target > start && ctx.session.seal_due(target, start)).then_some(target)
+}
+
 /// Seals the session's history before a cut the step just applied, and starts the new open log
 /// with full copies of both view slots: a seal moves the ledger out, and a stored view is a
 /// change against the views before it. The copies go applied view first, then the step that

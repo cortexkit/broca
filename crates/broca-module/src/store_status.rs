@@ -160,6 +160,20 @@ struct SettledInner {
     bytes: usize,
 }
 
+impl SettledInner {
+    /// What the table's buckets beyond its entries (each a slot and a control byte) and the
+    /// order's spare room hold.
+    fn spare(&self) -> usize {
+        let slot = std::mem::size_of::<(SettledKey, Settled)>();
+        let buckets = match self.facts.capacity() {
+            0 => 0,
+            capacity => (capacity * 8 / 7).next_power_of_two(),
+        };
+        buckets.saturating_sub(self.facts.len()) * (slot + 1)
+            + (self.order.capacity() - self.order.len()) * std::mem::size_of::<SettledKey>()
+    }
+}
+
 /// One run's facts, with their walked size (see [`settled_bytes`]).
 struct Settled {
     facts: RunFacts,
@@ -223,11 +237,10 @@ impl SettledRuns {
             Some(replaced) => inner.bytes -= replaced.bytes,
             None => inner.order.push_back(key),
         }
-        // The walked size leaves out the table's spare buckets, about 2% measured, so it is kept
-        // a thirty-second below the cap and the real size stays under it.
-        while inner.order.len() > self.capacity
-            || inner.bytes > self.max_bytes - self.max_bytes / 32
-        {
+        // The walked size leaves out the table's spare buckets and the order's spare room, which
+        // the table's growth decides (a table can double after removals), so they are counted
+        // against the cap too and the real size stays under it.
+        while inner.order.len() > self.capacity || inner.bytes + inner.spare() > self.max_bytes {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
@@ -249,14 +262,7 @@ impl SettledRuns {
         let Ok(inner) = self.inner.lock() else {
             return broca_wire::MemoryCache::default();
         };
-        // The table's buckets beyond the entries, each a slot and a control byte.
-        let slot = std::mem::size_of::<(SettledKey, Settled)>();
-        let buckets = match inner.facts.capacity() {
-            0 => 0,
-            capacity => (capacity * 8 / 7).next_power_of_two(),
-        };
-        let spare = buckets.saturating_sub(inner.facts.len()) * (slot + 1)
-            + (inner.order.capacity() - inner.order.len()) * std::mem::size_of::<SettledKey>();
+        let spare = inner.spare();
         broca_wire::MemoryCache {
             entries: inner.facts.len() as u64,
             max_entries: self.capacity as u64,

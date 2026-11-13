@@ -762,11 +762,23 @@ fn a_seal_at_an_entry_cuts_where_that_entry_is_placed(cipher: Cipher) {
         let sealed = session
             .seal_at_entry(5, &Carry::default(), 1_000)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("entry 5 lies above the window's start");
         assert_eq!(sealed.transcript_records, 4);
         assert_eq!(texts(&session.conversation.messages), ["ask c", "c"]);
         let (records, _, _) = session.read_open_log().await.unwrap();
         assert_eq!(records[0].0, cut);
+        // The window now starts at entry 5, so sealing there again moves no message: nothing is
+        // written, and the open log is the one the first seal made.
+        assert_eq!(
+            session
+                .seal_at_entry(5, &Carry::default(), 2_000)
+                .await
+                .unwrap(),
+            None
+        );
+        let (again, _, _) = session.read_open_log().await.unwrap();
+        assert_eq!(again, records);
         // An answer starts an entry too; an ordinal past the log places nothing.
         let other_backend = MemoryBackend::default();
         let (mut other, _) = history(&other_backend, cipher).await;

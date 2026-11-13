@@ -2634,7 +2634,6 @@ where
         drop(media_timing);
         request_timing.resume();
         if let Some(ctx) = compaction.filter(|_| call_ready) {
-            let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(
                 writer,
                 admission,
@@ -2672,30 +2671,33 @@ where
                     .await;
                 }
             }
-            // The step applied a view with a new cut: the history before its first kept entry
-            // is sealed now, before the request goes out; the request is already built, so this
-            // changes none of its bytes.
-            if let Some(marker) = writer
-                .conversation()
-                .marker
-                .clone()
-                .filter(|marker| Some(marker) != marked.as_ref())
-            {
+            // The session's cut lies above the window's start: the history before its first kept
+            // entry is sealed now, before the request goes out. The request is already built, so
+            // this changes none of its bytes. The cut may be this step's, from a view the provider
+            // pushed between steps (applied at the step's start) or one it returned while the
+            // request was prepared, or one applied before the history was ever sealed.
+            if let Some(ordinal) = crate::compaction::cut_to_seal(writer, ctx) {
+                let start = writer.conversation().window_start();
                 crate::compaction::seal_at_cut(
                     writer,
                     seams,
                     ctx,
-                    marker.first_kept_ordinal,
+                    ordinal,
                     crate::repetition::after_input(&admission.render_config),
                 )
                 .await?;
-                // The seal moved the runs wholly before the cut out of the window and kept only
-                // those whose settings still shape a request (see `Conversation::seal_window`).
-                // The run's list is read again from the sealed conversation, as a run starting
-                // now would read it, so later steps carry the bounded list rather than every run
-                // the history held when this run started. Every renderer gives the same bytes
-                // for both lists (`openai_responses_chatgpt::reduce_episodes`).
-                episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+                let sealed_from = writer.conversation().window_start();
+                ctx.session.sealed_at(ordinal, sealed_from);
+                if sealed_from != start {
+                    // The seal moved the runs wholly before the cut out of the window and kept
+                    // only those whose settings still shape a request (see
+                    // `Conversation::seal_window`). The run's list is read again from the sealed
+                    // conversation, as a run starting now would read it, so later steps carry the
+                    // bounded list rather than every run the history held when this run started.
+                    // Every renderer gives the same bytes for both lists
+                    // (`openai_responses_chatgpt::reduce_episodes`).
+                    episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+                }
             }
         }
         // Once a refresh applied, the model sees the system text of the plan the run froze in

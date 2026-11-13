@@ -1440,6 +1440,68 @@ fn as_read(opts: &broca_protocol::request::CallOptions) -> (serde_json::Value, S
     )
 }
 
+/// A view that cuts and applies at the start of a step (here the view installed when the head was
+/// imported; a view the provider pushes between steps applies the same way) seals the history
+/// before its cut at that step, as a cut the provider returns while the request is prepared does:
+/// the open session keeps only the window its requests render from. A later step with no new view
+/// doesn't seal again, and a reload finds the window where the seal left it.
+#[tokio::test]
+async fn a_cut_applied_at_the_boundary_seals_the_history_before_it() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("boundary-cut", exchanges(), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    let cut = view_of(
+        1,
+        vec![(
+            1,
+            EditOp::Cut {
+                through: "msg_a2".into(),
+            },
+        )],
+    );
+    assert!(matches!(
+        ask(&commands, install_view(&cut)).await,
+        StoreOutcome::ViewInstalled(_)
+    ));
+    drop(commands);
+    let mut session = served.await.unwrap();
+    let mut parts = MemoryParts::default();
+    let compactor = Compactor::default();
+    assert_eq!(Writer::conversation(&session).window_start(), 1);
+
+    let first = run_once(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("r1", "m"),
+        "Question 5.",
+    )
+    .await;
+    let (_, body) = as_read(&first);
+    assert!(!body.contains("Question 2."), "{body}");
+    assert!(body.contains("Question 3."), "{body}");
+    // msg_u3, the first kept entry, has ordinal 5.
+    assert_eq!(
+        Writer::conversation(&session).window_start(),
+        5,
+        "the boundary's cut sealed the history before it"
+    );
+
+    run_once(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("r2", "m"),
+        "Question 6.",
+    )
+    .await;
+    assert_eq!(Writer::conversation(&session).window_start(), 5);
+    drop(session);
+    let session = load(backend).await.unwrap();
+    assert_eq!(Writer::conversation(&session).window_start(), 5);
+}
+
 /// The compaction provider's view names imported messages by their source ids. Installed, it applies at
 /// the first step; a later view cuts through the imported history, which seals it; and after a
 /// reload, the next step's request is what the same views give on a session that sealed
