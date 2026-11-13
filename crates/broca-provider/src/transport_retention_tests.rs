@@ -206,6 +206,7 @@ async fn retention_https_calls_private_diagnostics_on_every_retry() {
         &cancel,
         None,
         StepSeal {
+            progress: None,
             seal: None,
             step_id: StepId(1),
             cache_ttl_ms: None,

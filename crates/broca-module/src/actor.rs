@@ -14250,6 +14250,7 @@ mod tests {
             });
             job.writer.sync().await.expect("sync RunFinished");
             out.send(OutputEvent::Control(ControlUnit::RunFinished {
+                awaits: None,
                 run_id: Some(job.req.run_id.clone()),
                 reason: self.reason,
                 usage: Some(Usage::default()),

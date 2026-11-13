@@ -147,6 +147,7 @@ async fn ask(commands: &Harness, request: StoreReadRequest) -> StoreReadReply {
             .await
             .unwrap();
             let context = crate::store_reads::ReadContext {
+                labels: Default::default(),
                 token_counts: None,
                 parts: &commands.parts,
                 held: true,

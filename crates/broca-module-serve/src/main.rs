@@ -6244,6 +6244,17 @@ mod executor {
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()
         }
+        fn cached_account_email(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
+            let vault = self.vault.as_ref()?;
+            let id = vault.addressing.vault_id_for_selection(selection).ok()??;
+            let (listing, _) = vault.listing.get()?;
+            listing
+                .credentials
+                .iter()
+                .find(|row| row.id == id)?
+                .email
+                .clone()
+        }
         async fn media_profile(
             &self,
             request: &broca_protocol::request::SubmissionRequest,

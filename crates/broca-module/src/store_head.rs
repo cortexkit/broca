@@ -222,6 +222,7 @@ pub fn head_reply(facts: HeadFacts) -> broca_wire::HeadResponse {
         last_ordinal: (prompt_len > 0).then_some(prompt_len),
         first_ordinal: (prompt_len > 0).then_some(1),
         last_run_state: state.last_run_id.map(|run_id| broca_wire::LastRunState {
+            awaits: None,
             run_id: run_id.0,
             state: state.state.as_str().to_owned(),
             reason: interrupt_reason.or_else(|| {
@@ -245,6 +246,16 @@ pub async fn build<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
     live: bool,
+) -> Result<StoreHead, StoreHeadError> {
+    build_with_retry(session, parts, live, Default::default(), None).await
+}
+
+pub(crate) async fn build_with_retry<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    live: bool,
+    labels: crate::store_awaits::Labels,
+    retry: Option<&cortexkit_role_llm_runner::awaits::RunAwaits>,
 ) -> Result<StoreHead, StoreHeadError> {
     let operations = &session.operations;
     let page = crate::store_read::read_page(session, None, Some(1))
@@ -314,6 +325,31 @@ pub async fn build<B: SessionBackend>(
             .and_then(|pause| pause.get("resume_not_before_ms"))
             .and_then(serde_json::Value::as_u64),
     });
+    if let Some(last) = &mut reply.last_run_state {
+        let facts = crate::store_status::run_facts(session, parts, &last.run_id, live, None)
+            .await
+            .map_err(|error| StoreHeadError::Setup(format!("the latest run's wait: {error:?}")))?;
+        if let Some(mut facts) = facts {
+            facts.wait.set_labels(labels);
+            let wait = facts.wait.snapshot(
+                crate::store_awaits::now_ms(),
+                retry,
+                facts
+                    .state
+                    .ceiling_deadline_ms
+                    .or(facts.state.ride_wait_deadline_ms),
+                None,
+            );
+            last.awaits = wait.awaits;
+            if matches!(
+                facts.state.state,
+                broca_core::RunIndexState::Active | broca_core::RunIndexState::Paused
+            ) {
+                last.state = wait.state.into();
+                last.reason = wait.reason;
+            }
+        }
+    }
     let head = session.head();
     reply.history_version = crate::store_exposure::served_history_version(head.history_version);
     reply.incarnation = broca_session_store::codec::hex(&head.incarnation.0);

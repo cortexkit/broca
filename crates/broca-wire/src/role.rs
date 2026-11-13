@@ -110,6 +110,8 @@ pub struct HeadParams {}
 /// never the transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastRunState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaits: Option<cortexkit_role_llm_runner::awaits::RunAwaits>,
     pub run_id: String,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +271,8 @@ fn deserialize_run_usage_value(
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaits: Option<cortexkit_role_llm_runner::awaits::RunAwaits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<cortexkit_role_llm_runner::finish::Finish>,
     /// The credential id frozen at admission, as in `run.status`; never an empty string.
@@ -822,6 +826,7 @@ mod pinned_reply_bytes {
                 history_version: 1,
                 head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
+                    awaits: None,
                     run_id: "run-1".into(),
                     state: "completed".into(),
                     reason: None,
@@ -857,6 +862,7 @@ mod pinned_reply_bytes {
                 history_version: 1,
                 head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
+                    awaits: None,
                     run_id: "run-1".into(),
                     state: "completed".into(),
                     reason: None,
@@ -890,6 +896,7 @@ mod pinned_reply_bytes {
             history_version: 1,
             head: Some(CursorWire::new(12, 0)),
             last_run_state: Some(LastRunState {
+                awaits: None,
                 run_id: "run-1".into(),
                 state: "completed".into(),
                 reason: None,
@@ -1298,6 +1305,7 @@ mod pinned_reply_bytes {
             last_ordinal: Some(12),
             first_ordinal: Some(1),
             last_run_state: Some(LastRunState {
+                awaits: None,
                 run_id: "run-1".into(),
                 state: state.into(),
                 reason: reason.map(str::to_owned),
@@ -1543,6 +1551,7 @@ mod pinned_reply_bytes {
                 history_version: 1,
                 head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
+                    awaits: None,
                     run_id: "run-1".into(),
                     state: "completed".into(),
                     reason: None,

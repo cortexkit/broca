@@ -15,6 +15,17 @@ use crate::ids::{MessageId, ToolCallId};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DisplayEvent {
+    /// Advisory run state between provider attempts. Never a durable resume position.
+    RunStatus {
+        run_id: crate::RunId,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<Box<cortexkit_role_llm_runner::awaits::RunAwaits>>,
+    },
     /// Coalesced assistant text for live rendering.
     TextDelta {
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -190,7 +190,7 @@ async fn account_limit_declines_when_cache_is_lost_or_no_account_response_was_ac
         assert_eq!(summary.reason, RunFinishReason::Error, "{name}");
         assert_eq!(summary.paused, None, "{name}");
         assert!(output.iter().any(|event| matches!(event,
-            OutputEvent::Control(ControlUnit::Error { error })
+            OutputEvent::Control(ControlUnit::Error { error, .. })
             if error.class == ErrorClass::Transient && error.provider_code.as_deref() == Some("account_limit_exhausted"))));
         assert!(records_of(&wal, &session)
             .iter()

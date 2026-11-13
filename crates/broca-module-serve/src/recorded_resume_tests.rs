@@ -241,7 +241,7 @@ async fn production_executor_refuses_unreproducible_renderer_before_any_model_ca
     }).await;
     assert_eq!(summary.reason, RunFinishReason::Interrupted, "unreproducible renderer must refuse resume");
     let errors: Vec<_> = events.iter().filter_map(|event| match event {
-        OutputEvent::Control(broca_protocol::caller::ControlUnit::Error { error }) => Some(error), _ => None,
+        OutputEvent::Control(broca_protocol::caller::ControlUnit::Error { error, .. }) => Some(error), _ => None,
     }).collect();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].provider_code.as_deref(), Some("renderer_version_drift"));
@@ -263,7 +263,7 @@ async fn production_executor_preserves_unverifiable_blob_code_and_class() {
         let (summary, events, records) = execute_recorded_fixture(&root, &server, |config| { config.frozen_render_config = blob; }).await;
         assert_eq!(summary.reason, RunFinishReason::Interrupted, "{label}");
         let errors: Vec<_> = events.iter().filter_map(|event| match event {
-            OutputEvent::Control(broca_protocol::caller::ControlUnit::Error { error }) => Some(error), _ => None,
+            OutputEvent::Control(broca_protocol::caller::ControlUnit::Error { error, .. }) => Some(error), _ => None,
         }).collect();
         assert_eq!(errors.len(), 1, "{label}");
         assert_eq!(errors[0].provider_code.as_deref(), Some("frozen_render_config_unverifiable"), "{label}");

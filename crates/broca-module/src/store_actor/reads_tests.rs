@@ -578,6 +578,7 @@ impl Module {
         let settled = SettledRuns::default();
         let addr = self.addr().0;
         let context = ReadContext {
+            labels: Default::default(),
             token_counts: None,
             parts: runtime.parts_for(
                 broca_wal::StorageClass::Ordinary,

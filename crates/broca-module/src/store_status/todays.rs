@@ -129,6 +129,7 @@ pub fn run_result(
     };
     crate::serve::checked_run_result(
         broca_wire::RunResultResponse {
+            awaits: None,
             finish: if matches!(state.as_str(), "active" | "paused") {
                 None
             } else {

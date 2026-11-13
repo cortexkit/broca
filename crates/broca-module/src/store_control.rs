@@ -186,6 +186,7 @@ pub struct StoreControl {
     calls: HashMap<ToolCallId, CallIdentity>,
     indeterminate: IndeterminateToolCalls,
     held: HeldCallsProjection,
+    wait: crate::store_awaits::RunWait,
     has_completed_step: bool,
     final_step_finish_reason: Option<FinishReason>,
     cancelled: bool,
@@ -210,6 +211,10 @@ impl Default for StoreControl {
 }
 
 impl StoreControl {
+    pub(crate) fn with_labels(mut self, labels: crate::store_awaits::Labels) -> Self {
+        self.wait.set_labels(labels);
+        self
+    }
     /// An estimate of the memory this projection holds, walked when asked (see
     /// `broca_session_store::held`): its copies of the folds, and the facts it keeps of the
     /// current run, step and batch. It never holds the units it made. The shared call-state
@@ -255,6 +260,7 @@ impl StoreControl {
             calls: HashMap::new(),
             indeterminate: IndeterminateToolCalls::default(),
             held: HeldCallsProjection::default(),
+            wait: Default::default(),
             has_completed_step: false,
             final_step_finish_reason: None,
             cancelled: false,
@@ -271,6 +277,11 @@ impl StoreControl {
         let Some(run) = operations.run.as_ref() else {
             return control;
         };
+        if let Some(start) = &run.start {
+            let _ = control
+                .wait
+                .record(&Record::RunStart(Box::new(start.clone())));
+        }
         control.has_completed_step = run.completed_steps > 0;
         control.final_step_finish_reason = run.last_finish_reason;
         control.cancelled = run.cancel.is_some() && run.finished.is_none();
@@ -300,6 +311,7 @@ impl StoreControl {
                     );
                 }
                 if let Some(held) = call.held_reply.as_ref().filter(|_| call.terminal.is_none()) {
+                    let _ = control.wait.record(&Record::ToolHeld(held.clone()));
                     control.held.held(
                         &BatchId(held.batch_id.clone()),
                         &held.tool_call_id,
@@ -329,6 +341,7 @@ impl StoreControl {
         record: &Record,
         next: Option<&Record>,
     ) -> Result<Vec<StoreUnit>, String> {
+        self.wait.record(record)?;
         let mut out = Vec::new();
         let mut units = Units { seq, out: &mut out };
         let is_input = matches!(record, Record::Input(_));
@@ -357,6 +370,27 @@ impl StoreControl {
             Stream::Ledger => {}
         }
         self.after_folds(record, &mut units);
+        // Error and finished controls from one record use the same clock and wait snapshot.
+        let wait = self
+            .wait
+            .snapshot(crate::store_awaits::now_ms(), None, None, None);
+        for unit in &mut out {
+            match &mut unit.unit {
+                ControlUnit::Status { status, .. } => {
+                    if matches!(status.state.as_str(), "active" | "paused") {
+                        status.state = wait.state.into();
+                    }
+                    status.awaits = wait.awaits.clone();
+                    status.reason = wait.reason.clone().map(|reason| reason.into());
+                }
+                ControlUnit::Paused { awaits, .. }
+                | ControlUnit::Error { awaits, .. }
+                | ControlUnit::RunFinished { awaits, .. } => {
+                    *awaits = wait.awaits.clone().map(Box::new)
+                }
+                _ => {}
+            }
+        }
         Ok(out)
     }
 
@@ -479,6 +513,7 @@ impl StoreControl {
                         serde_json::from_value(error.clone())
                             .map_err(|e| format!("a run end's error: {e}"))?;
                     units.plain(ControlUnit::Error {
+                        awaits: None,
                         error: error.into(),
                     });
                 }
@@ -544,6 +579,7 @@ impl StoreControl {
                     );
                     units.push(unit, event);
                     units.plain(ControlUnit::Error {
+                        awaits: None,
                         error: failure.error.into(),
                     });
                     let (unit, event) = run_finished_unit(RunEndFacts {

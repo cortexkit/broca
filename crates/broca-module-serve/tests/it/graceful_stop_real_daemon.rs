@@ -1338,7 +1338,7 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
                 let event = broca_wire::decode_subscribe_event(&body).unwrap();
                 if let broca_wire::SubscribeEvent::Control { unit, .. } = event {
                     match unit {
-                        broca_protocol::ControlUnit::Error { error } => {
+                        broca_protocol::ControlUnit::Error { error, .. } => {
                             diagnostic = Some(serde_json::to_value(error).unwrap());
                         }
                         broca_protocol::ControlUnit::RunFinished { reason, .. } => {

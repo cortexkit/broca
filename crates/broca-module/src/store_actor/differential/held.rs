@@ -18,6 +18,98 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod intake;
 mod sign_in;
 
+#[tokio::test]
+async fn run_awaits_held_call_is_active_on_all_surfaces() {
+    for store in [false, true] {
+        let side = Side::new(
+            store,
+            Cipher::None,
+            vec![super::super::tests::read_step("m1")],
+        )
+        .await;
+        side.send().await;
+        side.idle().await;
+        crate::store_actor::awaits_tests::prove(
+            &side.registry,
+            &side.key,
+            if store { "held.after" } else { "held.before" },
+            store.then_some(("active", "runner", Some("tool_held"))),
+        )
+        .await;
+        assert!(side.registry.stop_and_seal().await);
+    }
+}
+
+#[tokio::test]
+async fn run_awaits_terminal_errors_match_status_head_result_and_both_controls() {
+    for (name, class, code, message, status, party) in [
+        ("terminal-account", "transient", "account_limit_exhausted", "Account limited.", None, "caller"),
+        ("terminal-retryable", "transient", "transient", "Try again.", None, "caller"),
+        ("terminal-final", "permanent", "request_invalid", "400: {\"error\":{\"message\":\"The request is invalid.\"}}", Some(400), "nobody"),
+        ("terminal-sign-in", "permanent", "auth_required", "Sign in.", None, "person"),
+        ("message-runner", "transient", "response_deadline", "the ChatGPT backend ended the response at its 900 s limit; send a smaller turn or lower reasoning effort", None, "nobody"),
+        ("message-withheld", "permanent", "request_invalid", "websocket error: response body omitted", Some(400), "nobody"),
+    ] {
+        for store in [false, true] {
+            let error = serde_json::from_value(json!({"class":class, "provider_code":code, "message":message, "status":status})).unwrap();
+            let side = Side::new(store, Cipher::None, vec![vec![NormalizedEvent::Control(
+                broca_protocol::provider::ProviderControl::Error { error, retries_used: 0 }
+            )]]).await;
+            side.send().await;
+            side.idle().await;
+            let body = crate::store_actor::awaits_tests::prove(&side.registry, &side.key,
+                &format!("{name}.{}", if store { "after" } else { "before" }),
+                store.then_some(("error", party, None))).await;
+            if store {
+                match name {
+                    "terminal-final" => assert_eq!(body["awaits"]["message"]["from"], "provider"),
+                    "message-runner" => assert_eq!(body["awaits"]["message"]["from"], "runner"),
+                    "message-withheld" => assert!(body["awaits"].get("message").is_none()),
+                    _ => {}
+                }
+            }
+            assert!(side.registry.stop_and_seal().await);
+        }
+    }
+}
+
+#[tokio::test]
+async fn run_awaits_unknown_error_code_keeps_every_surface_readable() {
+    for store in [false, true] {
+        let error = serde_json::from_value(json!({"class":"permanent", "message":"synthetic error without a provider code", "status":400})).unwrap();
+        let side = Side::new(
+            store,
+            Cipher::None,
+            vec![vec![NormalizedEvent::Control(
+                broca_protocol::provider::ProviderControl::Error {
+                    error,
+                    retries_used: 0,
+                },
+            )]],
+        )
+        .await;
+        side.send().await;
+        side.idle().await;
+        let body = crate::store_actor::awaits_tests::prove(
+            &side.registry,
+            &side.key,
+            if store {
+                "terminal-unknown-code.after"
+            } else {
+                "terminal-unknown-code.before"
+            },
+            None,
+        )
+        .await;
+        assert_eq!(body["state"], "error");
+        assert_eq!(
+            body["error"],
+            json!({"class":"permanent", "message":"synthetic error without a provider code", "status":400})
+        );
+        assert!(side.registry.stop_and_seal().await);
+    }
+}
+
 #[derive(Default)]
 struct HoldingTools(AtomicUsize, std::sync::atomic::AtomicBool);
 
@@ -79,6 +171,7 @@ impl ToolPlane for HoldingTools {
 }
 
 struct HeldExecutor {
+    auth_selection: std::sync::Mutex<Option<broca_wal::AuthSelection>>,
     provider: Gated,
     wal: Arc<FileWalStore>,
     tools: Arc<HoldingTools>,
@@ -108,6 +201,9 @@ impl HeldExecutor {
 
 #[async_trait]
 impl RunExecutor for HeldExecutor {
+    fn cached_account_email(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
+        (selection.credential_id == "oauth:stub").then(|| "  default@example.invalid  ".into())
+    }
     fn provider_held_lifecycle(
         &self,
     ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
@@ -139,7 +235,13 @@ impl RunExecutor for HeldExecutor {
             job.control.admitted_context_limit.or(job.req.context_limit);
         job.control.pause_for_auth_at_start = self.sign_in_error();
         if self.sign_in_fixture.load(Ordering::SeqCst) {
-            job.control.auth_selection = Some(sign_in::selection());
+            job.control.auth_selection = Some(
+                self.auth_selection
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(sign_in::selection),
+            );
         }
         let mode = if self.sign_in_fixture.load(Ordering::SeqCst)
             && job.control.pause_for_auth_at_start.is_none()
@@ -212,7 +314,13 @@ impl RunExecutor for HeldExecutor {
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
         control.pause_for_auth_at_start = self.sign_in_error();
         if self.sign_in_fixture.load(Ordering::SeqCst) {
-            control.auth_selection = Some(sign_in::selection());
+            control.auth_selection = Some(
+                self.auth_selection
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(sign_in::selection),
+            );
         }
         let result = async {
             let admission = if mode == StoreRunMode::Fresh {
@@ -336,6 +444,7 @@ impl Side {
             refuse_restart: false.into(),
             signed_out: false.into(),
             sign_in_fixture: false.into(),
+            auth_selection: Default::default(),
         });
         let runtime = crate::store_open::StoreRuntime::open(
             &dir,
@@ -581,6 +690,14 @@ mod cancel;
 mod restart;
 
 fn comparable(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("awaits");
+        if object.get("reason") == Some(&json!("tool_held"))
+            && object.get("state") == Some(&json!("active"))
+        {
+            object.remove("reason");
+        }
+    }
     if let Some(held) = value.get_mut("held_calls").and_then(Value::as_array_mut) {
         for call in held {
             let object = call.as_object_mut().unwrap();
@@ -1236,6 +1353,7 @@ async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
             refuse_restart: false.into(),
             signed_out: false.into(),
             sign_in_fixture: false.into(),
+            auth_selection: Default::default(),
         });
         let actor = super::super::StoreActor::new(
             source.key.clone(),

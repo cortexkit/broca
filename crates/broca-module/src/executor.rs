@@ -198,6 +198,11 @@ pub trait RunExecutor: Send + Sync + 'static {
     fn source_warm_enabled(&self) -> bool {
         false
     }
+
+    /// The email on a cached vault row, never a vault request on a read path.
+    fn cached_account_email(&self, _selection: &broca_wal::AuthSelection) -> Option<String> {
+        None
+    }
     /// Quote current catalog media facts for enqueue and read-only fresh-send preflight.
     /// Actual admission checks again against the provider's frozen render config.
     async fn media_profile(

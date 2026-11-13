@@ -1758,7 +1758,7 @@ async fn reopened_actor_resolves_permanent_queue_failure_and_serves_commands() {
                             saw_failed_start = run_id.0 == "b"
                                 && submission_id.as_ref().is_some_and(|id| id.0 == "sub-b");
                         }
-                        ControlUnit::Error { error } if saw_failed_start => {
+                        ControlUnit::Error { error, .. } if saw_failed_start => {
                             saw_failed_error =
                                 error.provider_code.as_deref() == Some("open_failed");
                         }
@@ -3384,7 +3384,7 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
         .expect("subscriber remains attached");
         if let Delivery::Control(event) = delivery {
             match &event.1 {
-                ControlUnit::Error { error } => {
+                ControlUnit::Error { error, .. } => {
                     typed_error = error.provider_code.as_deref() == Some("renderer_version_drift")
                         && error.message.contains("renderer version differs");
                 }

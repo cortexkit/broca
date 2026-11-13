@@ -1221,6 +1221,7 @@ fn service_tier_switch_off_pins_master_log_discovery_usage_and_request_bytes() {
     let usage = r#"{"steps":1,"unreported_steps":1,"by_model":[{"provider":"mock","model":"mock-model","steps":1,"unreported_steps":1}]}"#;
     assert_eq!(serde_json::to_string(&projection.usage).unwrap(), usage);
     let status = broca_wire::RunStatusResponse::Active {
+        awaits: None,
         auth_selection: None,
         reason: None,
         deadline_ms: None,
@@ -1235,6 +1236,7 @@ fn service_tier_switch_off_pins_master_log_discovery_usage_and_request_bytes() {
         format!(r#"{{"state":"active","usage":{usage}}}"#)
     );
     let result = broca_wire::RunResultResponse {
+        awaits: None,
 finish: None,
         auth_selection: None,
         directives: None,

@@ -1979,6 +1979,7 @@ mod approval_wire_tests {
     #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            awaits: None,
             held_calls: Vec::new(),
             auth_selection: None,
             reason: None,
@@ -2362,6 +2363,8 @@ pub struct PausedRunAuth {
 pub enum RunStatusResponse {
     Active {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<cortexkit_role_llm_runner::awaits::RunAwaits>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_selection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -2389,6 +2392,8 @@ pub enum RunStatusResponse {
         held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     },
     Paused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<cortexkit_role_llm_runner::awaits::RunAwaits>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_selection: Option<String>,
         /// Absolute send floor from the durable account-limit pause, absent on other pauses.
@@ -2623,6 +2628,8 @@ pub enum RunStatusResponse {
     },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<cortexkit_role_llm_runner::awaits::RunAwaits>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_selection: Option<String>,
         #[serde(
             default,
@@ -2695,6 +2702,9 @@ pub enum RunStatusResponse {
     #[serde(other)]
     Unknown,
 }
+
+#[cfg(test)]
+mod run_awaits_tests;
 
 #[cfg(test)]
 mod open_state_tests {
@@ -3346,7 +3356,13 @@ fn status_subscribe_event(
         "unit".into(),
         serde_json::json!({"type":"status", "run_id":run_id}),
     );
-    body.insert("state".into(), serde_json::json!(status.state));
+    let status = serde_json::to_value(status).expect("a typed run status serializes");
+    body.extend(
+        status
+            .as_object()
+            .expect("a run status is an object")
+            .clone(),
+    );
     if let Some(seq) = seq {
         body.insert("seq".into(), seq.into());
     }
@@ -3358,7 +3374,6 @@ fn status_subscribe_event(
         ),
         body,
     }
-    .with_held_calls(status.held_calls().to_vec())
 }
 
 #[cfg(test)]
@@ -3503,7 +3518,13 @@ enum SubscribeEventOwned {
         #[serde(default)]
         state: Option<String>,
         #[serde(default)]
+        reason: Option<cortexkit_role_llm_runner::run::RunReason>,
+        #[serde(default)]
+        awaits: Option<cortexkit_role_llm_runner::awaits::RunAwaits>,
+        #[serde(default)]
         held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
+        #[serde(flatten)]
+        status_fields: serde_json::Map<String, serde_json::Value>,
     },
     Display {
         event: DisplayEvent,
@@ -3572,10 +3593,18 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
                 cursor,
                 mut unit,
                 state,
+                reason,
+                awaits,
                 held_calls,
+                status_fields,
             } => {
                 if unit.get("type").and_then(serde_json::Value::as_str) == Some("status") {
                     if let Some(unit) = unit.as_object_mut() {
+                        for (key, value) in status_fields {
+                            if !matches!(key.as_str(), "seq" | "event") {
+                                unit.insert(key, value);
+                            }
+                        }
                         unit.insert(
                             "state".into(),
                             state.map_or(serde_json::Value::Null, Into::into),
@@ -3583,6 +3612,14 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
                         unit.insert(
                             "held_calls".into(),
                             serde_json::to_value(held_calls).map_err(serde::de::Error::custom)?,
+                        );
+                        unit.insert(
+                            "reason".into(),
+                            serde_json::to_value(reason).map_err(serde::de::Error::custom)?,
+                        );
+                        unit.insert(
+                            "awaits".into(),
+                            serde_json::to_value(awaits).map_err(serde::de::Error::custom)?,
                         );
                     }
                 }
@@ -5434,6 +5471,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Error {
+                awaits: None,
                 finish: None,
                 auth_selection: None,
                 title: None,
@@ -5452,6 +5490,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Paused {
+                awaits: None,
                 resume_not_before_ms: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
@@ -6038,6 +6077,7 @@ mod restart_wire_tests {
     fn restart_pause_status_and_invalid_policy_match_goldens() {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
+                awaits: None,
                 resume_not_before_ms: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
@@ -6265,6 +6305,7 @@ mod title_wire_tests {
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                awaits: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
                 reason: None,
@@ -6283,6 +6324,7 @@ mod title_wire_tests {
             )
             .unwrap(),
             RunStatusResponse::Active {
+                awaits: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
                 reason: None,

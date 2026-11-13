@@ -1,5 +1,38 @@
 use super::*;
 
+#[tokio::test]
+async fn run_awaits_sign_in_names_only_the_frozen_account_label() {
+    for store in [false, true] {
+        let side = Side::new(
+            store,
+            Cipher::None,
+            vec![super::super::super::tests::text_step("m1", "done")],
+        )
+        .await;
+        side.executor.sign_in_fixture.store(true, Ordering::SeqCst);
+        side.executor.signed_out.store(true, Ordering::SeqCst);
+        retry(&side).await;
+        let body = crate::store_actor::awaits_tests::prove(
+            &side.registry,
+            &side.key,
+            if store {
+                "auth-required.after"
+            } else {
+                "auth-required.before"
+            },
+            store.then_some(("paused", "person", Some("auth_required"))),
+        )
+        .await;
+        if store {
+            assert_eq!(
+                body["awaits"]["person"],
+                json!({"action":"sign_in", "on":"synthetic"})
+            );
+        }
+        assert!(side.registry.stop_and_seal().await);
+    }
+}
+
 pub(super) fn selection() -> broca_wal::AuthSelection {
     serde_json::from_value(
         json!({"credential_id":"oauth:stub:synthetic", "account_ref":"synthetic-account"}),
@@ -17,6 +50,30 @@ impl HeldExecutor {
             .unwrap()
         })
     }
+}
+
+#[tokio::test]
+async fn run_awaits_default_account_uses_only_cached_email() {
+    let side = Side::new(
+        true,
+        Cipher::None,
+        vec![super::super::super::tests::text_step("m1", "done")],
+    )
+    .await;
+    *side.executor.auth_selection.lock().unwrap() =
+        Some(serde_json::from_value(json!({"credential_id":"oauth:stub"})).unwrap());
+    side.executor.sign_in_fixture.store(true, Ordering::SeqCst);
+    side.executor.signed_out.store(true, Ordering::SeqCst);
+    retry(&side).await;
+    let body = crate::store_actor::awaits_tests::prove(
+        &side.registry,
+        &side.key,
+        "auth-default-email.after",
+        Some(("paused", "person", Some("auth_required"))),
+    )
+    .await;
+    assert_eq!(body["awaits"]["person"]["on"], "default@example.invalid");
+    assert!(side.registry.stop_and_seal().await);
 }
 
 async fn retry(side: &Side) {
@@ -53,6 +110,7 @@ async fn compare_reads(sides: &[Side]) {
         comparable(sides[0].status().await)
     );
     let normalize_result = |mut value: Value| {
+        value.as_object_mut().unwrap().remove("awaits");
         if let Some(message) = value
             .get_mut("final_message")
             .and_then(Value::as_object_mut)
@@ -88,6 +146,15 @@ async fn head(side: &Side) -> Value {
         .await
         .unwrap();
     let mut value = serde_json::to_value(head).unwrap();
+    if let Some(last) = value
+        .get_mut("last_run_state")
+        .and_then(Value::as_object_mut)
+    {
+        last.remove("awaits");
+        if last.get("reason") == Some(&json!("tool_held")) {
+            last.insert("state".into(), json!("active"));
+        }
+    }
     let object = value.as_object_mut().unwrap();
     for field in ["incarnation", "history_version", "head"] {
         object.remove(field);

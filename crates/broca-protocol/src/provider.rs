@@ -8,7 +8,29 @@
 //! control unit on this lane — the runner extracts the per-step tool batch from
 //! the assembled message in source order.
 
+pub use cortexkit_role_llm_runner::awaits::{AwaitParty, RunAwaits};
 use serde::{Deserialize, Serialize};
+
+/// Quote only text whose origin the retained error shape proves. Generic error messages mix
+/// runner prose with provider words, and WebSocket diagnostics deliberately withhold frame text.
+pub fn await_message(
+    error: &ProviderError,
+) -> Option<cortexkit_role_llm_runner::awaits::AwaitMessage> {
+    use cortexkit_role_llm_runner::awaits::{clean_await_message, AwaitMessage, AwaitMessageFrom};
+    const DEADLINE: &str = "the ChatGPT backend ended the response at its 900 s limit; send a smaller turn or lower reasoning effort";
+    if error.provider_code.as_deref() == Some("response_deadline") && error.message == DEADLINE {
+        return clean_await_message(DEADLINE)
+            .map(|text| AwaitMessage::new(text, AwaitMessageFrom::Runner));
+    }
+    let status = error.status?;
+    let body = error.message.strip_prefix(&format!("{status}: "))?;
+    let body = body
+        .strip_prefix("auth rejected — re-authenticate to get a fresh token. body: ")
+        .unwrap_or(body);
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let text = body.get("error")?.get("message")?.as_str()?;
+    clean_await_message(text).map(|text| AwaitMessage::new(text, AwaitMessageFrom::Provider))
+}
 
 use crate::{
     content::{AssistantMessage, FinishReason},
@@ -258,6 +280,12 @@ pub struct EventTypeTally {
 /// Live advisory status, never reconstructed from attempt records after a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InFlightStep {
+    /// The single source for the store actor's retry wait: status, head and subscribe snapshots
+    /// read this slot. Never part of provider attempt telemetry or the write-ahead log.
+    #[serde(skip)]
+    pub retry_awaits: Option<Box<cortexkit_role_llm_runner::awaits::RunAwaits>>,
+    #[serde(skip)]
+    pub report_awaits: bool,
     pub step_id: StepId,
     pub started_at_ms: u64,
     pub attempt: u32,
@@ -272,6 +300,46 @@ pub struct InFlightStep {
     /// report. Never serialized.
     #[serde(skip)]
     pub request: InFlightRequest,
+}
+
+/// The retry wait all live readers expose. Once a known long wait is visible it stays visible
+/// until its owner clears it, even when less than a second remains before the next attempt.
+pub fn visible_retry_awaits(
+    wait: Option<&cortexkit_role_llm_runner::awaits::RunAwaits>,
+    now_ms: u64,
+) -> Option<cortexkit_role_llm_runner::awaits::RunAwaits> {
+    wait.filter(|wait| {
+        now_ms.saturating_sub(wait.since_ms) >= 1000
+            || wait
+                .next_ms
+                .is_some_and(|next| next.saturating_sub(wait.since_ms) >= 1000)
+    })
+    .cloned()
+    .map(|mut wait| {
+        wait.next_ms = wait.next_ms.filter(|next| *next > now_ms);
+        wait
+    })
+}
+
+/// Build a retry display snapshot with the same visibility calculation as status and head.
+/// Transitions are published only between attempts; a joining reader gets a snapshot only
+/// while a wait is visible.
+pub fn retry_status_display(
+    run_id: crate::RunId,
+    wait: Option<&RunAwaits>,
+    now_ms: u64,
+) -> DisplayEvent {
+    let awaits = visible_retry_awaits(wait, now_ms);
+    DisplayEvent::RunStatus {
+        run_id,
+        state: "active".into(),
+        reason: awaits
+            .as_ref()
+            .and_then(|wait| wait.reason.clone())
+            .map(String::from),
+        deadline_ms: None,
+        awaits: awaits.map(Box::new),
+    }
 }
 
 /// A weak handle on the options of a step's request while the call is in flight, which the

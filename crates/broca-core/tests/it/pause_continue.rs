@@ -1707,7 +1707,7 @@ async fn auth_resumed_renderer_drift_after_a_provider_call_is_durably_sealed() {
     assert!(matches!(
         controls.as_slice(),
         [
-            ControlUnit::Error { error },
+            ControlUnit::Error { error, .. },
             ControlUnit::RunFinished {
                 reason: RunFinishReason::Interrupted,
                 ..
@@ -1842,7 +1842,7 @@ async fn null_blob_cannot_refreeze_an_at_start_auth_pause() {
     assert_eq!(summary.reason, RunFinishReason::Interrupted);
     assert!(events.iter().any(|event| matches!(
         event,
-        broca_core::OutputEvent::Control(ControlUnit::Error { error })
+        broca_core::OutputEvent::Control(ControlUnit::Error { error, .. })
             if error.provider_code.as_deref() == Some("frozen_render_config_unverifiable")
     )));
     let records = records_of(&wal, &session);

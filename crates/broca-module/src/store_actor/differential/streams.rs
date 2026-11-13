@@ -95,6 +95,12 @@ fn normalized(events: &[Arc<ControlEvent>]) -> Vec<Value> {
 fn rename(value: &mut Value, names: &mut HashMap<String, usize>) {
     match value {
         Value::Object(members) => {
+            members.remove("awaits");
+            if members.get("reason") == Some(&serde_json::json!("tool_held"))
+                && members.contains_key("state")
+            {
+                members.remove("reason");
+            }
             for (key, member) in members.iter_mut() {
                 match (key.as_str(), member.as_str()) {
                     ("mid" | "call_key", Some(text)) => {

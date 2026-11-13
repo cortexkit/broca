@@ -84,6 +84,8 @@ pub enum ControlUnit {
     },
     /// Terminal typed error.
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<Box<cortexkit_role_llm_runner::awaits::RunAwaits>>,
         error: SharedProviderError,
     },
     /// A durable change to the run's provider-held wait, not a terminal or pause.
@@ -97,6 +99,8 @@ pub enum ControlUnit {
     /// projected event for a paused run, mirroring how `RunFinished` is terminal — but
     /// the run is RESUMABLE under the same run_id once the cause clears.
     Paused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<Box<cortexkit_role_llm_runner::awaits::RunAwaits>>,
         run_id: RunId,
         reason: PauseReason,
         /// The durable same-selection send floor for a timed account pause.
@@ -106,6 +110,8 @@ pub enum ControlUnit {
         error: Option<SharedProviderError>,
     },
     RunFinished {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaits: Option<Box<cortexkit_role_llm_runner::awaits::RunAwaits>>,
         /// Which run this terminates.
         ///
         /// `RunStarted`, `Paused` and `BudgetFired` all carry the run they concern; this
@@ -551,6 +557,7 @@ mod tests {
     #[test]
     fn control_error_serializes_provider_unavailable_as_shared_transient() {
         let error_wire = serde_json::to_value(ControlUnit::Error {
+            awaits: None,
             error: unavailable_error().into(),
         })
         .unwrap();
@@ -561,6 +568,7 @@ mod tests {
     #[test]
     fn control_pause_serializes_provider_unavailable_as_shared_transient() {
         let paused_wire = serde_json::to_value(ControlUnit::Paused {
+            awaits: None,
             resume_not_before_ms: None,
             run_id: RunId("run-1".into()),
             reason: PauseReason::AuthRequired,
@@ -643,6 +651,7 @@ mod tests {
         //
         // So this asserts the shape the doc describes, and fails by naming the doc.
         let terminal = ControlUnit::RunFinished {
+            awaits: None,
             run_id: Some(RunId("run-x".into())),
             reason: RunFinishReason::Error,
             usage: None,
@@ -679,6 +688,7 @@ mod tests {
         }
 
         let terminal = ControlUnit::RunFinished {
+            awaits: None,
             run_id: Some(RunId("run-1".into())),
             reason: RunFinishReason::Interrupted,
             usage: None,
@@ -739,7 +749,7 @@ mod tests {
         }))
         .unwrap();
 
-        let ControlUnit::Error { error } = unit else {
+        let ControlUnit::Error { error, .. } = unit else {
             panic!("expected error control unit");
         };
         assert_eq!(
@@ -756,7 +766,7 @@ mod tests {
             "error": {"class": "future_class", "message": "new provider outcome"}
         }))
         .unwrap();
-        let ControlUnit::Error { error } = unit else {
+        let ControlUnit::Error { error, .. } = unit else {
             panic!("expected error control unit")
         };
 

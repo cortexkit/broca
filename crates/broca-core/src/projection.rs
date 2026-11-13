@@ -1036,6 +1036,7 @@ fn project_control_record<S: ControlProjectionSink>(
             // A typed terminal error is surfaced before RunFinished.
             if let Some(error) = error {
                 push!(ControlUnit::Error {
+                    awaits: None,
                     error: error.clone().into(),
                 });
             }
@@ -1089,10 +1090,12 @@ fn project_control_record<S: ControlProjectionSink>(
                 LiveEvent::RunStarted(live::RunStarted::new(failure.run_id.0.clone()))
             );
             push!(ControlUnit::Error {
+                awaits: None,
                 error: failure.error.clone().into(),
             });
             push!(
                 ControlUnit::RunFinished {
+                    awaits: None,
                     run_id: Some(failure.run_id.clone()),
                     reason: RunFinishReason::Error,
                     usage: None,
@@ -1812,6 +1815,7 @@ pub fn run_finished_unit(
     use cortexkit_role_llm_runner::live::{self, LiveEvent};
     (
         ControlUnit::RunFinished {
+            awaits: None,
             run_id: end.run_id.cloned(),
             reason: end.reason,
             usage: end.has_completed_step.then_some(end.usage),
@@ -1836,6 +1840,7 @@ pub fn paused_unit(
     use cortexkit_role_llm_runner::live::{self, LiveEvent};
     (
         ControlUnit::Paused {
+            awaits: None,
             run_id: run_id.clone(),
             reason,
             resume_not_before_ms,

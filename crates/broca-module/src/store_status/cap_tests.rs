@@ -8,6 +8,7 @@ use super::{fresh_state, RunFacts, SettledRuns};
 /// The facts of a completed run whose final message holds `text`.
 fn completed(n: u64, text: String) -> RunFacts {
     RunFacts {
+        wait: Default::default(),
         state: fresh_state(RunIndexState::Completed),
         interrupt_reason: None,
         wake_directive: false,
