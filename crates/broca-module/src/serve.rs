@@ -781,6 +781,7 @@ pub fn session_read_response(
                 client_message_id: None,
                 tool_times: Vec::new(),
                 rich_ui: None,
+                model_fallback: None,
                 written_at: message.written_at,
                 delivered_as: message
                     .run

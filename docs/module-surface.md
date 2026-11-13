@@ -2182,6 +2182,20 @@ Both read envelopes and display rows
 use the same stored strings, not a current tool catalog. A prepared call declined before
 dispatch keeps its key but has no dispatch schema pin.
 
+For sessions held by `broca-session-store`, an assistant reply routed to the refusal fallback
+carries `model_fallback: {requested, answered}` on a `session.read` entry with
+`include_display_facts: true` and on its display-history row. Legacy WAL storage omits the
+fact. The requested id comes from the durable `RunStart.model`; `StepStart.mid` links the
+reply to `StepEnd.fallback.route`, with `served_model` taking precedence for a recorded
+provider handoff. Both ids are provider-qualified like the row's `model`, and the answered
+id must match the reply's stored origin. No route, missing ids or an answer from the requested
+model means no fact; a schedule, usage or model names in text never supply one. This changes
+no stored or model-bound bytes, content digests, tags, compaction or message identity.
+The fact is a bounded, non-encoded session projection populated while existing append,
+open-log load/view and recovery folds pass the evidence. Reads never fetch ledger records
+to establish it. A sealed transcript or checkpoint alone lacks that evidence, so a fresh
+view may omit an older fact, as may cache eviction; absence means no claim.
+
 The first opt-in read, or first default read containing a tool result, lazily backfills
 only its own session's rebuildable display projection. Native tool output is copied from
 WAL results, never recovered by splitting joined text. The overlay changes only response

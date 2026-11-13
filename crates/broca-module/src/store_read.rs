@@ -23,6 +23,7 @@ use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError, StoredEntry};
 
 pub mod history_sides;
+mod model_fallback;
 pub mod todays;
 
 /// Why a store read refused.
@@ -688,6 +689,9 @@ pub(crate) async fn page<B: SessionBackend>(
     }
     if request.include_rich_ui {
         crate::serve::apply_rich_ui(&mut response, &stamps);
+    }
+    if request.include_display_facts {
+        model_fallback::attach(session, &mut response, &withheld);
     }
     crate::store_calls::attribute_tool_calls(session, &mut response, &turns)
         .await

@@ -17,6 +17,7 @@ fn message(ordinal: u64, len: usize) -> SessionReadMessage {
         client_message_id: None,
         tool_times: Vec::new(),
         rich_ui: None,
+        model_fallback: None,
         written_at: None,
         delivered_as: None,
         part_keys: None,

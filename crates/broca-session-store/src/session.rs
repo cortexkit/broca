@@ -150,6 +150,7 @@ struct Folds {
     /// The media fold, which hands over the images' events of the records after the saved
     /// index's through-seq as the load reads them, so an open reads no record twice.
     media: media_index::Loading,
+    reply_fallbacks: model_fallback::ReplyFallbacks,
 }
 
 impl Folds {
@@ -157,6 +158,9 @@ impl Folds {
     /// (`per_run`) or as a view does.
     fn start(checkpoint: Checkpoint, hash_key: [u8; 32], per_run: bool) -> Box<Self> {
         Box::new(Self {
+            reply_fallbacks: model_fallback::ReplyFallbacks::from_operations(
+                &checkpoint.operational,
+            ),
             media: media_index::Loading::new(&checkpoint),
             covers_through: checkpoint.covers_through,
             next_seq: checkpoint.next_seq,
@@ -175,6 +179,7 @@ impl Folds {
         // Interned before the fold and the kept records share it.
         self.interner.record(&mut record);
         self.window.note(seq, &record);
+        self.reply_fallbacks.note(seq, &record);
         // The media fold reads each record against the folds as they stand before it.
         self.media
             .note(seq, &record, &self.conversation, &self.operations);
@@ -429,6 +434,8 @@ pub struct Session<B: SessionBackend> {
     retired_tag_floor: u64,
     /// What the session's facts repeat, held once (see `crate::interned`).
     interner: crate::interned::Interner,
+    /// Bounded reply facts derived while folding records, never encoded or fetched for a read.
+    reply_fallbacks: model_fallback::ReplyFallbacks,
 }
 
 /// Where a session stood when it was read: the head version, the open log, and how many of the
@@ -648,6 +655,7 @@ impl<B: SessionBackend> Session<B> {
             memory_refused: Default::default(),
             retired_tag_floor: 1,
             interner: Default::default(),
+            reply_fallbacks: Default::default(),
         })
     }
 
@@ -839,6 +847,7 @@ impl<B: SessionBackend> Session<B> {
             mut kept,
             interner,
             media,
+            reply_fallbacks,
             ..
         } = *folds;
         let next_seq = head
@@ -869,6 +878,7 @@ impl<B: SessionBackend> Session<B> {
             memory_refused: Default::default(),
             retired_tag_floor: 1,
             interner,
+            reply_fallbacks,
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -1022,6 +1032,7 @@ impl<B: SessionBackend> Session<B> {
         for (position, record) in records_held().enumerate() {
             check_announced_mid(&self.conversation, &self.operations, record)
                 .map_err(SessionError::Fold)?;
+            self.reply_fallbacks.note(first + position as u64, record);
             self.media.fold.apply(
                 first + position as u64,
                 record,
@@ -1294,7 +1305,8 @@ pub struct SessionHeld {
     /// Sealed entries read by message id and kept.
     pub sealed_entries: usize,
     /// Everything else the session holds: the folds' other state, the open log's index, the head,
-    /// the import's id map and the enrollment's decisions once read, and the writer.
+    /// the import's id map and the enrollment's decisions once read, the bounded transient
+    /// reply-fallback facts, and the writer.
     pub rest: usize,
 }
 
@@ -1339,7 +1351,8 @@ impl<B: SessionBackend> Session<B> {
             + self.encoder.heap_bytes()
             + imported
             + enrollment
-            + self.interner.heap_bytes();
+            + self.interner.heap_bytes()
+            + self.reply_fallbacks.heap_bytes();
         SessionHeld {
             messages,
             entry_facts,
@@ -1353,6 +1366,8 @@ impl<B: SessionBackend> Session<B> {
 }
 
 mod kept;
+mod model_fallback;
+pub use model_fallback::ReplyModelFallback;
 pub mod moves;
 pub use kept::InMemory;
 mod media;

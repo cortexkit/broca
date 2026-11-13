@@ -1378,6 +1378,8 @@ pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_ui: Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_fallback: Option<cortexkit_role_llm_runner::display::ModelFallback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_at: Option<u64>,
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
@@ -1468,6 +1470,8 @@ impl Serialize for SessionReadMessage {
             #[serde(skip_serializing_if = "Option::is_none")]
             rich_ui: &'a Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            model_fallback: &'a Option<cortexkit_role_llm_runner::display::ModelFallback>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             client_message_id: &'a Option<String>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             tool_times: &'a [cortexkit_role_llm_runner::read::ToolTime],
@@ -1496,6 +1500,7 @@ impl Serialize for SessionReadMessage {
             digest: &self.digest,
             part_digests: &self.part_digests,
             rich_ui: &self.rich_ui,
+            model_fallback: &self.model_fallback,
             client_message_id: &self.client_message_id,
             tool_times: &self.tool_times,
             completed_at: self.completed_at,
@@ -6647,6 +6652,7 @@ mod caller_message_tests {
             client_message_id: None,
             tool_times: Vec::new(),
             rich_ui: None,
+            model_fallback: None,
             written_at: None,
             delivered_as: None,
             part_keys: None,
@@ -7159,6 +7165,7 @@ mod caller_message_tests {
             client_message_id: None,
             tool_times: Vec::new(),
             rich_ui: None,
+            model_fallback: None,
             written_at: None,
             delivered_as: None,
             part_keys: None,

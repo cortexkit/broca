@@ -396,6 +396,7 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
     row.sender.clone_from(&entry.sender);
     row.speaks_for.clone_from(&entry.speaks_for);
     row.notice = entry.notice;
+    row.model_fallback.clone_from(&entry.model_fallback);
     if let Some(origin) = &entry.message.origin {
         row = row.with_model(format!("{}/{}", origin.provider_module_id, origin.model_id));
     }
