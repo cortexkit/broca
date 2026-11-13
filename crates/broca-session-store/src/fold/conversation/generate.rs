@@ -29,6 +29,7 @@ fields!(Episode {
     first_user,
     render_config,
     render_key,
+    first_model_answer,
 });
 fields!(ToolTurn {
     assistant,

@@ -655,6 +655,7 @@ pub fn resolve_frozen(
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
         moonshot_schema_types: provider.quirks.moonshot_schema_types,
+        repetition_after_input: true,
         // Admission adds the profile with `media_profile::freeze_media_profile` once the
         // config's family and wire model are final; until then the config renders as before.
         media: None,
@@ -757,6 +758,7 @@ fn frozen_from_family_defaults(
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
         moonshot_schema_types: q.moonshot_schema_types,
+        repetition_after_input: false,
         media: None,
         refusal_fallback: None,
         ride_placement: None,

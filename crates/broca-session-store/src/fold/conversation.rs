@@ -96,6 +96,9 @@ crate::message! {
         4 opt render_config: PartRef,
         /// What renderers read from that config when rendering other runs' messages.
         5 opt render_key: Digest,
+        /// The first model answer's ordinal, derived from an Assistant record rather than input.
+        /// Optional so older checkpoints remain readable and older readers may ignore it.
+        6 opt first_model_answer: u64,
     }
 }
 
@@ -608,6 +611,7 @@ impl Conversation {
                 first_user: None,
                 render_config: self.render_config.clone(),
                 render_key: self.render_key,
+                first_model_answer: None,
             });
         }
         let episode = self.episodes.last_mut().expect("pushed above");
@@ -672,6 +676,13 @@ impl Conversation {
                 self.place(Arc::clone(&input.message), EntryState::default());
             }
             Record::Assistant(assistant) => {
+                if let Some(episode) = self
+                    .episodes
+                    .last_mut()
+                    .filter(|episode| episode.run_id == assistant.run_id)
+                {
+                    episode.first_model_answer.get_or_insert(self.placed + 1);
+                }
                 if self.open.is_some() {
                     return Err(FoldError::AssistantInsideToolTurn);
                 }

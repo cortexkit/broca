@@ -202,6 +202,23 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     verify_with_progress(verify, None).await
 }
 
+/// Confirm a published canonical conversion still serves every source page before retiring an
+/// archived alias. Open the head as a view: checking an alias must not recover or append to it.
+pub async fn verify_canonical_reads(verify: Verify<'_>) -> Result<(), Mismatch> {
+    let view = Session::view(
+        LocalBackend::new(verify.store_root),
+        SessionAddr(broca_core::session_addr(verify.session)),
+        &crate::stage::triple(verify.session),
+        verify.deployment,
+    )
+    .await
+    .map_err(|error| mismatch(READ, format!("canonical session doesn't open: {error:?}")))?;
+    let parts = setup_parts(&verify, view.head().cipher()).await?;
+    let lineage = verify.lineage.map(|id| id.to_string());
+    reads(&verify, lineage.as_deref(), &view, &parts).await?;
+    Ok(())
+}
+
 /// Performs every semantic comparison, with optional fallible scratch progress notifications.
 pub async fn verify_with_progress(
     verify: Verify<'_>,
@@ -1509,7 +1526,8 @@ fn wal_record(value: Value) -> Result<WalRecord, String> {
 /// config. The legacy WAL renderer and the new session loop receive the same config without
 /// contacting a provider.
 fn fresh_next_admission() -> Result<broca_wal::RunConfig, String> {
-    let frozen = broca_provider::families::anthropic_frozen_config("claude-conversion-check");
+    let mut frozen = broca_provider::families::anthropic_frozen_config("claude-conversion-check");
+    frozen.repetition_after_input = true;
     serde_json::from_value(json!({
         "model": {"provider_module_id": "anthropic", "model_id": "claude-conversion-check"},
         "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
@@ -1891,6 +1909,36 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
             .map_err(|error| mismatch(check, format!("the conversion: {}", error.0)))?;
         crate::stage::retain_run_identities(&mut converted, extended, verify.session)
             .map_err(|error| mismatch(check, error.to_string()))?;
+        // Inventory provenance is conversion evidence, not a WAL field. Preserve just that
+        // evidence when independently converting the prefix; all other bytes still must agree.
+        for record in &mut converted.records {
+            let broca_session_store::record::Record::RunStart(start) = record else {
+                continue;
+            };
+            let inventory = verify
+                .converted
+                .records
+                .iter()
+                .find_map(|record| match record {
+                    broca_session_store::record::Record::RunStart(staged)
+                        if staged.run_id == start.run_id =>
+                    {
+                        staged
+                            .run_choices
+                            .as_ref()?
+                            .pointer("/record/session/inventory")
+                    }
+                    _ => None,
+                });
+            if let Some(inventory) = inventory {
+                let choices = start.run_choices.get_or_insert_with(|| json!({}));
+                if choices.pointer("/record/session").is_none() {
+                    choices["record"]["session"] = serde_json::to_value(verify.session)
+                        .map_err(|error| mismatch(check, error.to_string()))?;
+                }
+                choices["record"]["session"]["inventory"] = inventory.clone();
+            }
+        }
         // Reproduce the staged prefix at its stored origin, so the appended records' seqs follow
         // it. That is safe because no appended record places a message that names another
         // record by its seq (`Input.receipt_seq`, which a steer's or delivered send's messages

@@ -540,6 +540,18 @@ impl StoreMove {
         records: &[FramedRecord],
         lineage: Option<WalLineageId>,
     ) -> Result<(), MoveRefusal> {
+        self.check_idle_for_recovery(key, records, lineage, None)
+    }
+
+    /// A recovered archive run belongs to the staged store. Its stale active index row may be
+    /// carried only without withdrawals; all other rows and export debt keep the normal gate.
+    pub(crate) fn check_idle_for_recovery(
+        &self,
+        key: &BindIdentity,
+        records: &[FramedRecord],
+        lineage: Option<WalLineageId>,
+        recovered: Option<&str>,
+    ) -> Result<(), MoveRefusal> {
         use broca_session_convert::preconditions::{wal_refusal, SESSION_BUSY};
         if let Some(reason) = wal_refusal(records, lineage) {
             return Err(not_movable(reason));
@@ -569,8 +581,13 @@ impl StoreMove {
         let Some(rows) = &self.run_rows else {
             return Err(not_movable("reconcile_owed"));
         };
-        let (rows, exports_settled) =
+        let (mut rows, exports_settled) =
             rows(key).map_err(|error| unavailable("the run index couldn't be read", error))?;
+        rows.retain(|row| {
+            !(recovered == Some(row.run_id.as_str())
+                && row.state == broca_core::RunIndexState::Active
+                && !row.withdrawals_owed)
+        });
         if !broca_session_convert::preconditions::run_rows_settled(
             &rows,
             broca_session_convert::preconditions::paused_for_sign_in(records).as_deref(),

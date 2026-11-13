@@ -1063,6 +1063,7 @@ fn resolve_provider_inner(
         let max_tokens = max_tokens_for(None, None);
         // Mode 1: explicit base_url override — OpenAI-Chat, model id verbatim.
         let mut frozen = openai_chat_frozen_config(model);
+        frozen.repetition_after_input = true;
         frozen.base_url = Some(base_url.to_string());
         // Explicit endpoints use the catalog's host-based echo selection too; a resume
         // restores its recorded policy (or absence) in EpisodeRenderConfig::apply.
@@ -1248,6 +1249,7 @@ fn resolve_provider_inner(
             .into());
         }
         let mut frozen = frozen_config_for_family(family, &wire_model_id);
+        frozen.repetition_after_input = true;
         // The override family owns the endpoint, but output capacity belongs to the model, so
         // the catalog answers it where it lists this provider/model. A tier alias the catalog
         // does not list gets the fallback rather than a guess about its base model's limit.
@@ -2638,6 +2640,7 @@ mod tests {
         let kimi = fresh("kimi-code-plan-global/k3");
         assert_eq!(kimi.family_id, WireFamilyId::OpenAiChat);
         let kimi_blob = kimi.provider.render_config_blob();
+        assert_eq!(kimi_blob["repetition_after_input"], true);
         assert_eq!(kimi_blob["moonshot_schema_types"], true);
         assert_eq!(kimi_blob["renderer_version"], 6);
         assert_eq!(kimi.provider.renderer_version(), 6);
@@ -2679,6 +2682,7 @@ mod tests {
         // A Kimi run recorded before the flag existed resumes without it, at v5.
         let mut recorded: FrozenRenderConfig =
             serde_json::from_value(kimi_blob.clone()).expect("the blob decodes");
+        recorded.repetition_after_input = false;
         recorded.moonshot_schema_types = false;
         recorded.renderer_version = 5;
         let resumed = |recorded: &FrozenRenderConfig| {
@@ -2696,6 +2700,11 @@ mod tests {
             .expect("the recorded Kimi run resumes")
         };
         let old = resumed(&recorded);
+        assert!(old
+            .provider
+            .render_config_blob()
+            .get("repetition_after_input")
+            .is_none());
         assert!(old
             .provider
             .render_config_blob()

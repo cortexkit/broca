@@ -808,6 +808,37 @@ fn an_import_only_session_verifies_a_fresh_next_send_without_resuming_its_marker
 }
 
 #[test]
+fn an_import_markers_repeated_tools_do_not_become_the_next_runs_repetition_history() {
+    let root = scratch("import-repeated-tools-next-send");
+    let mut marker =
+        serde_json::to_value(run_started("import-marker", 1_000, "Imported history.")).unwrap();
+    marker["origin"] = json!({"kind":"seeded_from","origin_kind":"import","source_ref":"synthetic:repeated-tools"});
+    marker["config"]["renderer_version"] = json!(0);
+    marker["config"]["frozen_render_config"] = serde_json::Value::Null;
+    let mut input =
+        vec![json!({"role":"user","content":[{"type":"text","text":"Imported prompt."}]})];
+    for index in 0..8 {
+        let id = format!("call-{index}");
+        input.push(json!({"role":"assistant","content":[{"type":"tool_call","tool_call_id":id,"tool_name":"read","input":{"path":"fixture.txt"}}]}));
+        input.push(json!({"role":"tool","content":[{"type":"tool_result","tool_call_id":id,"output":{"kind":"text","text":""},"is_error":false}]}));
+    }
+    marker["input"] = json!(input);
+    let records = framed(vec![
+        record(marker),
+        record(
+            json!({"type":"run_finished","reason":"completed","ts_ms":1_001,"usage":{},"retries_used":0}),
+        ),
+    ]);
+    let staged = staged(&root, &records, None);
+    let checked = verified(&root, &records, None, &staged.converted, Mode::Offline).unwrap();
+    assert!(checked.checks.contains(&crate::verify::NEXT_REQUEST));
+    assert!(checked.checks.contains(&crate::verify::READ));
+    assert!(checked.checks.contains(&crate::verify::HISTORY_RAW));
+    assert!(checked.checks.contains(&crate::verify::HEAD));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn a_provider_rejected_request_is_counted_without_skipping_the_fresh_next_send() {
     let root = scratch("provider-rejected-request");
     let (mut records, lineage) = written(&root);

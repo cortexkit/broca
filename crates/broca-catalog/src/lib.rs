@@ -2262,7 +2262,12 @@ mod tests {
             }
 
             let renderer = wire_family(family).expect("family is implemented");
-            let helper_frozen = helper(family, model_id);
+            let mut helper_frozen = helper(family, model_id);
+            assert!(catalog_frozen.repetition_after_input);
+            assert!(!helper_frozen.repetition_after_input);
+            // The raw family helper also rebuilds old admissions. Align only the newly frozen
+            // loop policy before comparing the catalog's fresh config and provider body.
+            helper_frozen.repetition_after_input = true;
             if family == WireFamilyId::AnthropicMessages {
                 assert_eq!(
                     serde_json::to_value(&catalog_frozen).unwrap(),
@@ -2308,7 +2313,8 @@ mod tests {
             broca_provider::families::openai_chat_renderer_version(false),
         )
         .expect("synthetic catalog fixtures publish known capability flags");
-        let family_default = helper(WireFamilyId::OpenAiChat, model_id);
+        let mut family_default = helper(WireFamilyId::OpenAiChat, model_id);
+        family_default.repetition_after_input = true;
         assert_eq!(
             family_default.token_limit_field,
             TokenLimitField::MaxTokens,

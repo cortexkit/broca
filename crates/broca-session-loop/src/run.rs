@@ -2618,8 +2618,14 @@ where
                 .clone()
                 .filter(|marker| Some(marker) != marked.as_ref())
             {
-                crate::compaction::seal_at_cut(writer, seams, ctx, marker.first_kept_ordinal)
-                    .await?;
+                crate::compaction::seal_at_cut(
+                    writer,
+                    seams,
+                    ctx,
+                    marker.first_kept_ordinal,
+                    crate::repetition::after_input(&admission.render_config),
+                )
+                .await?;
                 // The seal moved the runs wholly before the cut out of the window and kept only
                 // those whose settings still shape a request (see `Conversation::seal_window`).
                 // The run's list is read again from the sealed conversation, as a run starting
@@ -3720,13 +3726,24 @@ fn call_options<W: Writer>(
     let mut kept = kept.filter(|_| contract && compacted);
     let mut prompt = match kept.as_mut() {
         Some(kept) => {
-            kept.update(writer, episodes, enrollment)?;
+            kept.update(
+                writer,
+                episodes,
+                enrollment,
+                crate::repetition::after_input(&admission.render_config),
+            )?;
             Vec::new()
         }
         // A session on the current compaction contract renders its numbers from the entries.
         None if contract => {
             crate::compaction::prompt::taken(writer.conversation().messages.len());
-            crate::compaction::prompt::contract_prompt(writer.conversation(), episodes, enrollment)?
+            crate::compaction::prompt::contract_prompt(
+                writer.conversation(),
+                episodes,
+                enrollment,
+                crate::repetition::after_input(&admission.render_config),
+                &writer.session_id(),
+            )?
         }
         None => {
             // The request's one copy of the window, which the render inputs below are written into.
@@ -3749,6 +3766,8 @@ fn call_options<W: Writer>(
                 episodes,
                 writer.conversation().window_start() - 1,
                 writer.conversation().window_repetition.as_ref(),
+                crate::repetition::after_input(&admission.render_config)
+                    .then_some((writer.conversation(), writer.session_id())),
             )?;
             // Each message keeps its place in the session, which the window starts after once
             // history is sealed: the window's first message has the 0-based position
@@ -3891,6 +3910,10 @@ pub(crate) fn repetition_guidance(
     episodes: &[EpisodeRenderInput],
     first: u64,
     spanning: Option<&serde_json::Value>,
+    corrected: Option<(
+        &broca_session_store::fold::conversation::Conversation,
+        String,
+    )>,
 ) -> Result<(), LoopError> {
     let len = prompt.len();
     let index = |position: usize| position.saturating_sub(first as usize).min(len);
@@ -3904,6 +3927,15 @@ pub(crate) fn repetition_guidance(
         if start >= end {
             continue;
         }
+        let corrected_start = match &corrected {
+            Some((conversation, session)) => {
+                match crate::repetition::first_answer(conversation, episode.prompt_start, session) {
+                    Some(position) => Some(index(position)),
+                    None => continue,
+                }
+            }
+            None => None,
+        };
         if episode.prompt_start < first as usize {
             if let Some(seed) = spanning {
                 let seed = serde_json::from_value(seed.clone()).map_err(|error| {
@@ -3920,8 +3952,10 @@ pub(crate) fn repetition_guidance(
                 continue;
             }
         }
-        let first_step = (start..end)
-            .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant);
+        let first_step = corrected_start.or_else(|| {
+            (start..end)
+                .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant)
+        });
         if let Some(first_step) = first_step {
             broca_core::repetition::restore_repetition_guidance(&mut prompt[first_step..end]);
         }

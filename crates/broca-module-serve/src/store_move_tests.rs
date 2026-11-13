@@ -1409,6 +1409,7 @@ mod cutover {
     use crate::session_conversion::{after_startup_recovery, Config, Engine};
     use broca_module::ServeHandler;
 
+    mod archive_recovery;
     mod background;
     mod concurrent;
     mod open_work;

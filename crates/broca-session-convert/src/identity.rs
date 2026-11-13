@@ -51,7 +51,13 @@ pub fn effective_identity(
     if found.sessions.len() >= 101 {
         return Err(unresolved("several inventory rows; candidate page is full"));
     }
-    let mut candidates: Vec<_> = found.sessions.into_values().collect();
+    let mut candidates: Vec<_> = found
+        .sessions
+        .into_values()
+        .filter(|(stored, identity)| {
+            stored == address && broca_core::session_addr(identity) == address
+        })
+        .collect();
     candidates.sort_by(|a, b| {
         (&a.1.project_root, &a.1.harness, &a.1.session, &a.0).cmp(&(
             &b.1.project_root,
@@ -62,7 +68,7 @@ pub fn effective_identity(
     });
     candidates.dedup();
     let (inventoried_address, identity) = match candidates.as_slice() {
-        [] => return Err(unresolved("no inventory row for session")),
+        [] => return Err(unresolved("no inventory row hashes to the source address")),
         [candidate] => candidate,
         _ => {
             return Err(unresolved(
@@ -70,13 +76,83 @@ pub fn effective_identity(
             ))
         }
     };
-    let derived = broca_core::session_addr(identity);
-    if inventoried_address != address || derived != address {
-        return Err(unresolved(&format!(
-            "inventory identity address {derived} (inventory row {inventoried_address}) differs from source address"
-        )));
-    }
+    debug_assert_eq!(inventoried_address, address);
     Ok(identity.clone())
+}
+
+/// Prove an otherwise unservable live filename's identity from independently inventoried roots.
+/// Only runner/broca harnesses and names in its records or named inventory rows are candidates.
+/// Until publication, the caller must hold the selected session's lock excluding live writers
+/// and must recheck that no new-storage head exists. Returned inventory identities record
+/// provenance, not serving identities.
+pub fn old_root_identity(
+    recorded: &[BindIdentity],
+    address: &str,
+    roots: (&[String], bool),
+    inventory: &dyn SessionRefResolver,
+    occupied: bool,
+) -> Result<(BindIdentity, Vec<BindIdentity>), IdentityError> {
+    let unresolved =
+        |reason: &str| IdentityError::Unresolved(format!("source {address}: {reason}"));
+    if occupied {
+        return Err(unresolved(
+            "a new-storage head already occupies the source address",
+        ));
+    }
+    if !roots.1 {
+        return Err(unresolved("inventory roots are incomplete"));
+    }
+    let mut names: std::collections::BTreeSet<_> = recorded
+        .iter()
+        .map(|identity| identity.session.clone())
+        .collect();
+    let mut provenance = Vec::new();
+    for name in names.clone() {
+        let found = inventory
+            .named_refs(&name, 101)
+            .map_err(IdentityError::Inventory)?;
+        if !found.complete || found.sessions.len() >= 101 {
+            return Err(unresolved(
+                "named inventory is incomplete or its candidate page is full",
+            ));
+        }
+        for (_, identity) in found.sessions.into_values() {
+            names.insert(identity.session.clone());
+            provenance.push(identity);
+        }
+    }
+    let mut candidates = Vec::new();
+    for root in roots.0 {
+        for harness in ["runner", "broca"] {
+            for name in &names {
+                let candidate = BindIdentity::new(root, harness, name);
+                if broca_core::session_addr(&candidate) == address {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    let sort = |identities: &mut Vec<BindIdentity>| {
+        identities.sort_by(|a, b| {
+            (&a.project_root, &a.harness, &a.session).cmp(&(
+                &b.project_root,
+                &b.harness,
+                &b.session,
+            ))
+        });
+        identities.dedup();
+    };
+    sort(&mut candidates);
+    sort(&mut provenance);
+    match candidates.as_slice() {
+        [identity] => Ok((identity.clone(), provenance)),
+        [] => Err(unresolved(
+            "no inventory-root candidate hashes to the source address",
+        )),
+        _ => Err(unresolved(
+            "several inventory-root candidates hash to the source address",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +191,76 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_inventory_names_do_not_hide_the_unique_source_identity() {
+        let recorded = BindIdentity::new("/old", "runner", "s");
+        let effective = BindIdentity::new("/new", "broca", "s");
+        let inventory = Inventory {
+            identities: vec![recorded.clone(), effective.clone()],
+            complete: true,
+        };
+        assert_eq!(
+            effective_identity(
+                &recorded,
+                &broca_core::session_addr(&effective),
+                Some(&inventory)
+            )
+            .unwrap(),
+            effective
+        );
+    }
+
+    #[test]
+    fn old_root_candidates_require_complete_inventory_an_exact_hash_and_no_head() {
+        let recorded = BindIdentity::new("/embedded", "runner", "s");
+        let effective = BindIdentity::new("/old", "broca", "s");
+        let provenance = BindIdentity::new("/new", "broca", "s");
+        let mut inventory = Inventory {
+            identities: vec![provenance.clone()],
+            complete: true,
+        };
+        let roots = vec!["/new".into(), "/old".into(), "/old".into()];
+        let address = broca_core::session_addr(&effective);
+        assert_eq!(
+            old_root_identity(
+                std::slice::from_ref(&recorded),
+                &address,
+                (&roots, true),
+                &inventory,
+                false
+            )
+            .unwrap(),
+            (effective, vec![provenance])
+        );
+        for (complete, occupied) in [(false, false), (true, true)] {
+            assert!(old_root_identity(
+                std::slice::from_ref(&recorded),
+                &address,
+                (&roots, complete),
+                &inventory,
+                occupied
+            )
+            .is_err());
+        }
+        assert!(old_root_identity(
+            std::slice::from_ref(&recorded),
+            "0123456789abcdef",
+            (&roots, true),
+            &inventory,
+            false
+        )
+        .is_err());
+        inventory.complete = false;
+        assert!(old_root_identity(
+            std::slice::from_ref(&recorded),
+            &address,
+            (&roots, true),
+            &inventory,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
     fn matching_record_identity_needs_no_inventory() {
         let recorded = BindIdentity::new("/old", "runner", "s");
         assert_eq!(
@@ -141,9 +287,10 @@ mod tests {
                 effective
             );
             inventory.identities.push(recorded.clone());
-            let error = effective_identity(&recorded, &address, Some(&inventory)).unwrap_err();
-            assert_eq!(error.class(), "identity_unresolved");
-            assert!(error.to_string().contains("several inventory identities"));
+            assert_eq!(
+                effective_identity(&recorded, &address, Some(&inventory)).unwrap(),
+                effective
+            );
             inventory.identities.clear();
             assert!(effective_identity(&recorded, &address, Some(&inventory))
                 .unwrap_err()
@@ -153,7 +300,7 @@ mod tests {
             assert!(effective_identity(&recorded, &address, Some(&inventory))
                 .unwrap_err()
                 .to_string()
-                .contains("differs from source address"));
+                .contains("no inventory row hashes"));
             inventory.identities = vec![effective];
             inventory.complete = false;
             assert!(effective_identity(&recorded, &address, Some(&inventory))

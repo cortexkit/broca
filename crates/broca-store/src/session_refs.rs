@@ -206,6 +206,28 @@ impl SessionInventory {
         &self,
         select: impl FnOnce(&Connection) -> Result<BTreeMap<String, (String, BindIdentity)>, StoreError>,
     ) -> Result<SessionRefs, StoreError> {
+        let (sessions, complete) = self.read_inventory(select)?;
+        Ok(SessionRefs { sessions, complete })
+    }
+
+    /// Roots independently present in the bind inventory, with the same completeness proof as
+    /// named lookups. A conversion may use them to prove a source filename's old-root identity.
+    pub fn project_roots(&self) -> Result<(Vec<String>, bool), StoreError> {
+        self.read_inventory(|conn| {
+            let mut query = conn.prepare(
+                "SELECT DISTINCT project_root FROM agent_data_session_ref ORDER BY project_root",
+            )?;
+            let roots = query
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(roots)
+        })
+    }
+
+    fn read_inventory<T>(
+        &self,
+        select: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<(T, bool), StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let root = conn
             .path()
@@ -218,14 +240,15 @@ impl SessionInventory {
         let complete = projection_complete(&tx)?;
         let sessions = select(&tx)?;
         tx.commit()?;
-        Ok(SessionRefs {
-            sessions,
-            complete: complete && !was_incomplete && !gap()?,
-        })
+        Ok((sessions, complete && !was_incomplete && !gap()?))
     }
 }
 
 impl SqliteStore {
+    pub fn session_ref_project_roots(&self) -> Result<(Vec<String>, bool), StoreError> {
+        SessionInventory::shared(&self.conn).project_roots()
+    }
+
     pub fn session_refs<'a>(
         &self,
         refs: impl Iterator<Item = &'a str>,

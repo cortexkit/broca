@@ -363,6 +363,10 @@ pub struct FrozenRenderConfig {
     /// keep their prior bytes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub moonshot_schema_types: bool,
+    /// Count repetition only after a run's admitted input, never inside imported history.
+    /// Missing on older admissions, whose request bytes keep the previous boundary.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repetition_after_input: bool,
     /// The media profile frozen at admission (see `crate::media_profile::freeze_media_profile`)
     /// and refrozen when a model switch refreezes the run config. It gates media rendering: a
     /// config without one renders exactly as before media existed. Optional and omitted when
@@ -1473,5 +1477,23 @@ mod output_cap_tests {
             cross_model: crate::policy::CrossModelThinking::AnyAnthropicModel,
         };
         assert_eq!(anthropic.output_limits().unwrap().floor, 32_000);
+    }
+}
+
+#[cfg(test)]
+mod repetition_boundary_tests {
+    #[test]
+    fn an_absent_repetition_boundary_flag_preserves_the_frozen_blob() {
+        let original = crate::families::anthropic_frozen_config("fixture");
+        let old = serde_json::to_value(&original).unwrap();
+        assert!(old.get("repetition_after_input").is_none());
+        let mut read: super::FrozenRenderConfig = serde_json::from_value(old.clone()).unwrap();
+        assert!(!read.repetition_after_input);
+        assert_eq!(serde_json::to_value(&read).unwrap(), old);
+        read.repetition_after_input = true;
+        assert_eq!(
+            serde_json::to_value(read).unwrap()["repetition_after_input"],
+            true
+        );
     }
 }
