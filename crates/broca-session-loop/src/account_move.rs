@@ -1,5 +1,6 @@
 //! Moving a run to another provider account inside a step, when the provider refuses the step's
-//! request because the run's account has spent its usage window (a quota wall).
+//! request because the run's account has spent its usage window (a quota wall), or the
+//! credential needs sign-in and has no unexpired token.
 //!
 //! The loop can't reach routing or the credential vault; the session's executor can. So the
 //! executor answers one question through [`AccountContinue`]: given this wall, which account may
@@ -21,6 +22,9 @@
 //! pause on the same account keeps that pause, and a hold, a refusal, an answer that doesn't
 //! arrive or an offer the loop can't accept all end the run as before, with routing's answer on
 //! the error where there was one.
+//!
+//! Sign-in failures reuse the offer checks and durable move. Without an offer they retain
+//! the auth pause; a typed in-memory outcome tells the actor when that pause may ask again.
 
 use broca_core::account_limit_pause::FailedAccountLimitAttempt;
 use broca_protocol::error::AccountContinueAnswer;
@@ -44,7 +48,7 @@ pub struct Wall<'a> {
     /// The credential and account that hit the wall.
     pub credential_id: &'a str,
     pub account: &'a str,
-    /// `five_hour` or `seven_day`.
+    /// `five_hour`, `seven_day`, or `signed_out` without usage timing evidence.
     pub limit_window: &'a str,
     pub resets_at_ms: Option<u64>,
     /// The provider's own retry-after on the refused attempt's error, in whole seconds rounded
@@ -81,6 +85,17 @@ pub enum Answer<P> {
     /// told) or had no usable answer (routing unreachable within the budget, or an offer the
     /// executor refused).
     Stay(Option<AccountContinueAnswer>),
+    /// Routing has no compatible account yet; an absent deadline waits for a credential re-check.
+    Hold(AccountContinueAnswer),
+}
+
+/// Scheduling information for the actor owning a sign-in pause. Never persisted or inferred
+/// from the public error detail, which does not distinguish an untimed hold from a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInOutcome {
+    Hold(Option<u64>),
+    Refuse,
+    Unreachable,
 }
 
 /// An account the run may move to, ready to use once the move is durable.
@@ -107,6 +122,10 @@ pub trait AccountContinue<P>: Send + Sync {
     /// The move to `selection` is durable and the run sends on it from now on. Called once per
     /// move, after the records and before any request on the new account.
     fn adopted(&self, selection: &broca_wal::AuthSelection);
+    /// Whether this credential re-check may ask again for an already parked sign-in pause.
+    fn recheck_sign_in(&self) -> bool {
+        true
+    }
 }
 
 /// What the loop did at a wall it asked about.
@@ -115,6 +134,7 @@ pub(crate) enum AtWall<P> {
     Moved(Box<Move<P>>),
     /// No move; routing's answer, if it gave one, for the run's error.
     Stayed(Option<AccountContinueAnswer>),
+    Held(AccountContinueAnswer),
     /// The run was cancelled, or the runner asked to stop, while routing was being asked:
     /// nothing was recorded and the question was dropped. The run ends or pauses as it would
     /// at a step's boundary.
@@ -160,7 +180,7 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     retry_after_secs: Option<f64>,
     refused: &mut Vec<String>,
 ) -> Result<Option<AtWall<P>>, LoopError> {
-    let Some(continuer) = seams.account_continue else {
+    let Some(_) = seams.account_continue else {
         return Ok(None);
     };
     let Some(limit) = limited.attempt.account_observation.limit.as_ref() else {
@@ -218,37 +238,124 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     // An offer is taken only while routing still reserves its account. One that lapsed before
     // the move could be written is dead: routing is asked once more, under a new selection id,
     // within what is left of the wall's budget, and a second unusable answer ends the run.
-    let mut wall = wall;
-    let (moved, now) = loop {
+    let answer = prepare(seams, wall).await;
+    if let AtWall::Moved(moved) = &answer {
+        record_move(writer, seams, admission, moved).await?;
+    }
+    Ok(Some(answer))
+}
+
+async fn prepare<P, T>(seams: &Seams<'_, P, T>, mut wall: Wall<'_>) -> AtWall<P> {
+    let continuer = seams
+        .account_continue
+        .expect("the caller checked continuation");
+    let moved = loop {
         // A cancel or a stop does not wait for routing: an answer that arrives after either
         // would move a run that must end or pause.
         let answer = tokio::select! {
             answer = continuer.ask(&wall) => answer,
-            () = seams.cancel.cancelled() => return Ok(Some(AtWall::Stopped)),
-            () = seams.stop.cancelled() => return Ok(Some(AtWall::Stopped)),
+            () = seams.cancel.cancelled() => return AtWall::Stopped,
+            () = seams.stop.cancelled() => return AtWall::Stopped,
         };
         let moved = match answer {
-            Answer::Stay(answer) => return Ok(Some(AtWall::Stayed(answer))),
+            Answer::Stay(answer) => return AtWall::Stayed(answer),
+            Answer::Hold(answer) => return AtWall::Held(answer),
             Answer::Move(moved) => moved,
         };
         // The executor checks these too, before it reads the offered credential, and logs what
         // it refuses; they are checked again here because the loop is what must never send on
         // such an account: one that refused this step already (the walled one included), or a
         // selection that names another account than the offer.
-        if refused.contains(&moved.account)
+        if wall.refused_accounts.contains(&moved.account)
             || moved.selection.account_ref.as_deref() != Some(moved.account.as_str())
         {
-            return Ok(Some(AtWall::Stayed(None)));
+            return AtWall::Stayed(None);
         }
         let now = (seams.now_ms)();
         if now < moved.valid_until_ms {
-            break (moved, now);
+            break moved;
         }
         if wall.reask {
-            return Ok(Some(AtWall::Stayed(None)));
+            return AtWall::Stayed(None);
         }
         wall.reask = true;
     };
+    AtWall::Moved(moved)
+}
+
+/// Prepare the same account move for a definite sign-in failure. A paused caller appends
+/// the refreezes together with its resume, rather than lifting the pause in a separate batch.
+pub(crate) async fn signed_out<W: Writer, P, T>(
+    writer: &W,
+    parts: &dyn crate::parts::Parts,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    step_id: u64,
+    error: &broca_protocol::ProviderError,
+    refused: &mut Vec<String>,
+) -> Result<Option<AtWall<P>>, LoopError> {
+    if seams.account_continue.is_none()
+        || error.class != broca_protocol::ErrorClass::Auth
+        || !(error.provider_code.as_deref() == Some("needs_reauth")
+            || matches!(error.status, Some(401 | 403)))
+    {
+        return Ok(None);
+    }
+    // Keep the run's recorded routing decision and admission id. An unsuccessful vault
+    // read may give the executor only a credential id, which cannot identify the run to routing.
+    let Some(selection) = admission
+        .auth_selection
+        .as_ref()
+        .or(seams.auth_selection.as_ref())
+        .filter(|selection| {
+            selection.account_decision.as_ref().is_some_and(|decision| {
+                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                    && decision.decision_id.is_some()
+                    && decision.admission_id.is_some()
+            })
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(account) = selection.account_ref.as_deref() else {
+        return Ok(None);
+    };
+    if !refused.iter().any(|id| id == account) {
+        refused.push(account.to_owned());
+    }
+    let run_config = crate::run::run_config_of_run(crate::run::run_state(writer), parts)?;
+    Ok(Some(
+        prepare(
+            seams,
+            Wall {
+                run_id: &admission.run_id,
+                step_id,
+                selection,
+                credential_id: &selection.credential_id,
+                account,
+                limit_window: "signed_out",
+                resets_at_ms: None,
+                retry_after_s: None,
+                observed_at_ms: (seams.now_ms)(),
+                attempt_seq: writer.next_seq(),
+                refused_accounts: refused,
+                renderer_version: admission.renderer_version,
+                render_config: &admission.render_config,
+                run_config: &run_config,
+                reask: false,
+            },
+        )
+        .await,
+    ))
+}
+
+pub(crate) async fn record_move<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    moved: &Move<P>,
+) -> Result<(), LoopError> {
+    let now = (seams.now_ms)();
     let ts_ms = Some(now);
     let mut records = Vec::with_capacity(2);
     if let Some((renderer_version, render_config)) = &moved.render {
@@ -278,8 +385,11 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
             &moved.selection,
         );
     }
-    continuer.adopted(&moved.selection);
-    Ok(Some(AtWall::Moved(moved)))
+    seams
+        .account_continue
+        .expect("prepared move")
+        .adopted(&moved.selection);
+    Ok(())
 }
 
 /// A provider's retry-after in whole seconds, rounded up, as routing's continue request takes

@@ -1815,7 +1815,8 @@ mod executor {
     use broca_protocol::error::{ErrorClass, ProviderError};
     use broca_protocol::{AuthRequest, BindIdentity};
     use broca_provider::credential_refresh::{
-        RefreshFuture, RefreshedSecret, SecretRefresher, SharedSecretRefresher,
+        ExpiringRefresh, ExpiringRefreshFuture, RefreshFuture, RefreshedSecret, SecretRefresher,
+        SharedSecretRefresher,
     };
     use broca_provider::{build_provider_http_client, ProviderHttpClient};
     use broca_subc::{SubcToolPlane, VaultError, VaultGet, VaultToken};
@@ -2141,7 +2142,7 @@ mod executor {
         /// record that cannot meet `min_ttl_ms`, so the read returns a token with at least that
         /// much life left. NO failure report is sent: the token was not rejected, and a report
         /// would make the vault count an ordinary expiry as a provider rejection.
-        fn refresh_expiring_secret(&self) -> RefreshFuture<'_, RefreshedSecret> {
+        fn refresh_expiring_secret(&self) -> ExpiringRefreshFuture<'_, RefreshedSecret> {
             Box::pin(async move {
                 let expires_at_ms = self.served_expiry();
                 if expires_at_ms.is_none() {
@@ -2151,10 +2152,10 @@ mod executor {
                     {
                         tracing::info!(target: "credentials", "held credential for '{}' has no expiry; pre-send refresh cannot fire", self.vault_id);
                     }
-                    return None;
+                    return ExpiringRefresh::Unavailable;
                 }
                 if !held_token_is_expiring(expires_at_ms, epoch_millis()) {
-                    return None;
+                    return ExpiringRefresh::Unavailable;
                 }
                 let held = self.served_version.load(Ordering::SeqCst);
                 let min_ttl_ms = Some(VAULT_MIN_TTL_MS);
@@ -2168,7 +2169,7 @@ mod executor {
                         self.vault.gauge.stamp_ok();
                         if token.record_version < held {
                             // Older than what this run already holds: never step backwards.
-                            return None;
+                            return ExpiringRefresh::Unavailable;
                         }
                         self.vault
                             .cache
@@ -2179,11 +2180,11 @@ mod executor {
                         // but there is nothing new to send.
                         if token.record_version == held {
                             tracing::info!(target: "credentials", "credential reread outcome=same_version vault_id='{}' served_version={} expires_at_ms={}", self.vault_id, token.record_version, token.expires_at_ms.map_or_else(|| "none".to_string(), |value| value.to_string()));
-                            return None;
+                            return ExpiringRefresh::Unavailable;
                         }
                         self.served_version
                             .store(token.record_version, Ordering::SeqCst);
-                        Some(RefreshedSecret {
+                        ExpiringRefresh::Token(RefreshedSecret {
                             evidence: broca_protocol::CredentialRefresh {
                                 vault_op: broca_core::VaultReadOp::GetScoped.as_str().to_string(),
                                 min_ttl_ms,
@@ -2197,10 +2198,15 @@ mod executor {
                             secret: token.token,
                         })
                     }
-                    // The held token may still be valid, and if it is not, the provider's 401
-                    // still reaches the rejection path. So the attempt goes out as it is.
+                    // A definite sign-in loss is distinct from a read that could not tell.
+                    // The transport can still use the held token until its own expiry.
                     Err(error) => {
                         self.note_read_failure(&error);
+                        if matches!(error, VaultError::NeedsReauth) {
+                            return ExpiringRefresh::NeedsReauth {
+                                held_expires_at_ms: expires_at_ms,
+                            };
+                        }
                         if !self
                             .presend_failure_logged
                             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -2212,7 +2218,7 @@ mod executor {
                                 self.vault_id
                             );
                         }
-                        None
+                        ExpiringRefresh::Unavailable
                     }
                 }
             })
@@ -3139,7 +3145,6 @@ mod executor {
     struct AccountMoves<'a, W> {
         executor: &'a LiveLoopExecutor<W>,
         req: &'a broca_core::RunRequest,
-        auth: &'a Option<broca_protocol::AuthRequest>,
         clock: Option<&'a broca_core::Clock>,
         /// The media renderer the run's provider was given, which the new provider needs too.
         media: Option<Arc<broca_module::store_media::LazyRenderer>>,
@@ -3149,25 +3154,25 @@ mod executor {
         /// The credentials of moves prepared but not yet durable, and of the newest durable one.
         prepared: std::sync::Mutex<Vec<MovedCredential>>,
         adopted: std::sync::Mutex<Option<MovedCredential>>,
+        recheck_sign_in: bool,
     }
 
     impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
         fn new(
             executor: &'a LiveLoopExecutor<W>,
             req: &'a broca_core::RunRequest,
-            auth: &'a Option<broca_protocol::AuthRequest>,
             clock: Option<&'a broca_core::Clock>,
             media: Option<Arc<broca_module::store_media::LazyRenderer>>,
         ) -> Self {
             Self {
                 executor,
                 req,
-                auth,
                 clock,
                 media,
                 deadlines: Default::default(),
                 prepared: Default::default(),
                 adopted: Default::default(),
+                recheck_sign_in: true,
             }
         }
 
@@ -3183,12 +3188,13 @@ mod executor {
             wall: &broca_session_loop::account_move::Wall<'_>,
         ) -> Result<
             cortexkit_role_routing::account_continue::ContinueOffer,
-            Option<broca_protocol::error::AccountContinueAnswer>,
+            broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>,
         > {
             use broca_module_serve::account_routing::{ContinueOutcome, ADMISSION_BUDGET};
+            use broca_session_loop::account_move::Answer;
             use cortexkit_role_routing::account_continue::ContinueAnswer;
             let Some(routing) = self.executor.routing.as_ref() else {
-                return Err(None);
+                return Err(Answer::Stay(None));
             };
             let Some(request) = broca_module_serve::account_routing::continue_request(wall) else {
                 tracing::warn!(
@@ -3197,7 +3203,7 @@ mod executor {
                     "the run's selection lacks the admission, conversation key or decision \
                      routing knows it by; it does not ask to move at its quota wall"
                 );
-                return Err(None);
+                return Err(Answer::Stay(None));
             };
             let deadline = *self
                 .deadlines
@@ -3207,7 +3213,7 @@ mod executor {
                 .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
             let answer = match routing.account_continue_if_served(&request, deadline).await {
                 ContinueOutcome::Answered(answer) => answer,
-                ContinueOutcome::NotDeclared => return Err(None),
+                ContinueOutcome::NotDeclared => return Err(Answer::Stay(None)),
                 outcome => {
                     tracing::warn!(
                         target: "accounts",
@@ -3215,24 +3221,24 @@ mod executor {
                         ?outcome,
                         "routing gave no answer to the run's continue request at its quota wall"
                     );
-                    return Err(None);
+                    return Err(Answer::Stay(None));
                 }
             };
             match answer {
                 ContinueAnswer::Offer(offer) => Ok(offer),
                 ContinueAnswer::Hold(hold) => {
-                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                    Err(Answer::Hold(broca_protocol::error::AccountContinueAnswer {
                         routing_code: hold.routing_code,
                         until_ms: hold.until_ms,
                     }))
                 }
-                ContinueAnswer::Refuse(refusal) => {
-                    Err(Some(broca_protocol::error::AccountContinueAnswer {
+                ContinueAnswer::Refuse(refusal) => Err(Answer::Stay(Some(
+                    broca_protocol::error::AccountContinueAnswer {
                         routing_code: refusal.routing_code,
                         until_ms: None,
-                    }))
-                }
-                _ => Err(None),
+                    },
+                ))),
+                _ => Err(Answer::Stay(None)),
             }
         }
 
@@ -3303,7 +3309,7 @@ mod executor {
             use broca_session_loop::account_move::{Answer, Move};
             let offer = match self.offer(wall).await {
                 Ok(offer) => offer,
-                Err(answer) => return Answer::Stay(answer),
+                Err(answer) => return answer,
             };
             let refuse = |reason: &str| {
                 tracing::warn!(
@@ -3377,7 +3383,9 @@ mod executor {
                     EpisodeJob {
                         req: self.req,
                         kind: RunKind::FreshOrResume,
-                        auth: self.auth,
+                        // The offer authorizes this account; the fresh send's auth hints
+                        // are admission-only, not a new pin on this resumed episode.
+                        auth: &None,
                         conversation_key: &None,
                         queued_service_tier: &mut queued_service_tier,
                         media_profile: &None,
@@ -3442,6 +3450,10 @@ mod executor {
                 *self.adopted.lock().unwrap() = Some(prepared.swap_remove(position));
             }
             prepared.clear();
+        }
+
+        fn recheck_sign_in(&self) -> bool {
+            self.recheck_sign_in
         }
     }
 
@@ -5144,7 +5156,7 @@ mod executor {
                 }
                 return Ok(sealed);
             }
-            if mode == StoreRunMode::Resume
+            if matches!(mode, StoreRunMode::Resume | StoreRunMode::RecheckSignIn)
                 && control
                     .cancel
                     .as_ref()
@@ -5340,7 +5352,8 @@ mod executor {
             } else {
                 None
             };
-            let moves = AccountMoves::new(self, req, auth, clock.as_ref(), media_renderer);
+            let mut moves = AccountMoves::new(self, req, clock.as_ref(), media_renderer);
+            moves.recheck_sign_in = mode == StoreRunMode::RecheckSignIn;
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -6910,6 +6923,10 @@ mod executor {
         include!("credential_source_guard_tests.rs");
         include!("frozen_auth_method_resume_tests.rs");
         include!("account_move_tests.rs");
+        mod signed_out {
+            use super::*;
+            include!("signed_out_tests.rs");
+        }
         include!("fork_executor_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt

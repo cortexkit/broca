@@ -144,7 +144,7 @@ impl RunExecutor for FailingExecutor {
                         .await
                         .map_err(StoreRunError::Loop)
                 }
-                StoreRunMode::Resume => {
+                StoreRunMode::Resume | StoreRunMode::RecheckSignIn => {
                     if self.temporarily_refuse_resume.swap(false, Ordering::SeqCst) {
                         return Err(StoreRunError::Admission(RunError::CredentialsUnavailable));
                     }

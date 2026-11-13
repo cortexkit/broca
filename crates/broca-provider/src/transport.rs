@@ -3273,16 +3273,29 @@ where
         }
         // A token that expires before this request and its stream are done would be refused
         // with a 401, costing an attempt and telling the credential source it was rejected
-        // when it merely ran out. Ask for a fresh one first; the refresher answers `None`
-        // straight away for a token with enough life left or one that never expires, and also
-        // when it could not get a fresh one, in which case the held token goes out and the
-        // 401 recovery below still covers it.
+        // when it merely ran out. Ask for a fresh one first. An unavailable read keeps the
+        // held token and the 401 recovery below still covers it. A definite sign-in loss
+        // stops before sending only when the held token has already expired.
         if let Some(recovery) = auth_recovery.as_mut() {
             let refreshed = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                 _ = tx.closed() => return Ok((Vec::new(), 0)),
                 refreshed = recovery.recovery.refresher.refresh_expiring() => refreshed,
+            };
+            let refreshed = match refreshed {
+                crate::credential_refresh::ExpiringRefresh::Token(token) => Some(token),
+                crate::credential_refresh::ExpiringRefresh::NeedsReauth { held_expires_at_ms }
+                    if held_expires_at_ms
+                        .and_then(|expiry| u64::try_from(expiry).ok())
+                        .is_none_or(|expiry| clock.now_ms() >= expiry) =>
+                {
+                    return Err((
+                        crate::credential_refresh::needs_reauth_error(),
+                        attempt_index.saturating_sub(1) as u32,
+                    ));
+                }
+                _ => None,
             };
             #[cfg(test)]
             attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {

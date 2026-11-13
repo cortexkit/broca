@@ -8,6 +8,7 @@ pub(super) struct TimedPause {
     run_id: RunId,
     pause_seq: u64,
     pub resume_not_before_ms: u64,
+    sign_in: bool,
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
@@ -104,6 +105,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run_id: RunId(run.run_id.clone()),
             pause_seq,
             resume_not_before_ms: pause.resume_not_before_ms,
+            sign_in: false,
         }))
     }
 
@@ -116,6 +118,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(pause) => self.account_limit_timer = pause,
             Err(error) => {
                 tracing::warn!(target: "broca.store_actor", %error, "account-limit timer could not be rebuilt")
+            }
+        }
+        if self.account_limit_timer.is_none() {
+            if let (
+                Ok(Some(mut current)),
+                Some((
+                    expected,
+                    broca_session_loop::account_move::SignInOutcome::Hold(Some(until)),
+                )),
+            ) = (self.current_sign_in().await, &self.sign_in_check)
+            {
+                if current.run_id == expected.run_id && current.pause_seq == expected.pause_seq {
+                    current.resume_not_before_ms = *until;
+                    self.account_limit_timer = Some(current);
+                }
             }
         }
     }
@@ -131,6 +148,28 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return Ok(());
         }
         self.account_limit_timer = None;
+        if expected.sign_in {
+            let Some(current) = self.current_sign_in().await? else {
+                return Ok(());
+            };
+            if current.run_id != expected.run_id || current.pause_seq != expected.pause_seq {
+                return Ok(());
+            }
+            if (self.now_ms)() < expected.resume_not_before_ms {
+                self.account_limit_timer = Some(expected);
+                return Ok(());
+            }
+            let start = self.recovery_start(
+                self.session
+                    .operations()
+                    .run
+                    .as_ref()
+                    .expect("current sign-in pause"),
+            )?;
+            let mode = self.sign_in_recheck_mode().await;
+            self.start_run(start, None, None, mode).await;
+            return Ok(());
+        }
         let Some(pause) = self.current_account_limit().await? else {
             return Ok(());
         };
@@ -176,6 +215,75 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         Ok(())
+    }
+
+    pub(super) async fn current_sign_in(&self) -> Result<Option<TimedPause>, String> {
+        let Some(run) = self.session.operations().run.as_ref().filter(|run| {
+            run.finished.is_none()
+                && run.cancel.is_none()
+                && run.resolution() == Resolution::Paused(PauseReason::AuthRequired)
+        }) else {
+            return Ok(None);
+        };
+        let indexed = self
+            .session
+            .find_id(IdKind::RunId, &run.run_id)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let start = indexed
+            .iter()
+            .find_map(|(seq, record)| matches!(record, Record::RunStart(_)).then_some(*seq))
+            .ok_or("sign-in pause has no run start")?;
+        let records = self
+            .session
+            .records_from(start)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(records.iter().rev().find_map(|(seq, record)| match record {
+            Record::Pause(pause)
+                if pause.run_id == run.run_id && pause.reason == PauseReason::AuthRequired =>
+            {
+                Some(TimedPause {
+                    run_id: RunId(run.run_id.clone()),
+                    pause_seq: *seq,
+                    resume_not_before_ms: 0,
+                    sign_in: true,
+                })
+            }
+            _ => None,
+        }))
+    }
+
+    pub(super) async fn sign_in_recheck_mode(&mut self) -> StoreRunMode {
+        use broca_session_loop::account_move::SignInOutcome;
+        let pause = match self.current_sign_in().await {
+            Ok(Some(pause)) => pause,
+            Ok(None) => return StoreRunMode::Resume,
+            Err(error) => {
+                tracing::warn!(target: "broca.store_actor", %error, "sign-in pause re-check could not read its durable boundary");
+                return StoreRunMode::Resume;
+            }
+        };
+        let ask = match &self.sign_in_check {
+            Some((previous, outcome))
+                if previous.run_id == pause.run_id && previous.pause_seq == pause.pause_seq =>
+            {
+                match outcome {
+                    SignInOutcome::Hold(until) => {
+                        until.is_none_or(|until| (self.now_ms)() >= until)
+                    }
+                    SignInOutcome::Refuse | SignInOutcome::Unreachable => false,
+                }
+            }
+            _ => true,
+        };
+        if ask {
+            // A failed admission is also one attempted re-check, not an invitation to loop.
+            self.sign_in_check = Some((pause, SignInOutcome::Unreachable));
+            StoreRunMode::RecheckSignIn
+        } else {
+            StoreRunMode::Resume
+        }
     }
 
     pub(super) async fn refuse_account_limit_resume(

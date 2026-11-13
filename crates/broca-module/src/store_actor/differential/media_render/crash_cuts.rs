@@ -170,7 +170,8 @@ impl RunExecutor for CutExecutor {
                 crate::executor::StoreRunMode::Seal(cause) => {
                     broca_session_loop::seal(&mut writer, parts.as_ref(), &seams, cause).await
                 }
-                crate::executor::StoreRunMode::Resume => {
+                crate::executor::StoreRunMode::Resume
+                | crate::executor::StoreRunMode::RecheckSignIn => {
                     broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await
                 }
             }

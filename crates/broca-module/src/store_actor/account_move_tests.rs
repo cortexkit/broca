@@ -226,7 +226,9 @@ impl RunExecutor for MovingExecutor {
                         .await
                         .map_err(StoreRunError::Loop)
                 }
-                StoreRunMode::Resume => panic!("a run cut off mid-step is sealed, not resumed"),
+                StoreRunMode::Resume | StoreRunMode::RecheckSignIn => {
+                    panic!("a run cut off mid-step is sealed, not resumed")
+                }
             }
         }
         .await;

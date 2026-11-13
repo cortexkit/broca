@@ -421,6 +421,8 @@ pub enum StoreRunMode {
     Fresh,
     /// Continue the session's unfinished run from its last durable boundary.
     Resume,
+    /// Re-check a sign-in pause, allowing one fresh account-continuation question.
+    RecheckSignIn,
     /// End the session's unfinished run `Interrupted` without calling the model, writing what
     /// today's seal writes (`broca_core::resume::interrupted_seal`): `broca_session_loop::seal`.
     Seal(broca_core::seal::SealCause),

@@ -105,6 +105,10 @@ pub struct StoreActor<B: SessionBackend> {
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     account_limit_timer: Option<account_limit_pause::TimedPause>,
+    sign_in_check: Option<(
+        account_limit_pause::TimedPause,
+        broca_session_loop::account_move::SignInOutcome,
+    )>,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -426,6 +430,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             restart_admitting: false,
             restart_waiters: Vec::new(),
             account_limit_timer: None,
+            sign_in_check: None,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -1700,8 +1705,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 // The resumed run's start is already durable, with its marks.
                                 message_marks: None,
                             };
-                            self.start_run(start, None, Some(reply), StoreRunMode::Resume)
-                                .await;
+                            let mode = self.sign_in_recheck_mode().await;
+                            self.start_run(start, None, Some(reply), mode).await;
                             return false;
                         }
                         Err(error) => {
@@ -2519,6 +2524,31 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 if run.paused == Some(broca_protocol::PauseReason::AccountLimit) {
                     self.arm_account_limit().await;
+                    return;
+                }
+                if run.paused == Some(broca_protocol::PauseReason::AuthRequired) {
+                    let routed =
+                        broca_session_loop::account_move::current_auth_selection(run, &self.parts)
+                            .ok()
+                            .flatten()
+                            .and_then(|selection| selection.account_decision)
+                            .is_some_and(|decision| {
+                                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                                    && decision.admission_id.is_some()
+                                    && decision.decision_id.is_some()
+                            });
+                    if !routed {
+                        return;
+                    }
+                    match self.recovery_start(run) {
+                        Ok(start) => {
+                            let mode = self.sign_in_recheck_mode().await;
+                            self.start_run(start, None, None, mode).await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "broca.store_actor", %error, "sign-in pause recovery could not read its frozen start")
+                        }
+                    }
                     return;
                 }
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
@@ -3381,6 +3411,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // It ends here with the error instead. A paused run keeps waiting when admission
         // fails temporarily: dependencies can recover before the next resume trigger. Only
         // a permanent refusal makes an existing pause unserviceable by the same request.
+        let sign_in_outcome = result
+            .as_ref()
+            .ok()
+            .and_then(|finished| finished.sign_in.clone());
         let loop_failed = match &result {
             Err(error) if started && restart_error.is_none() && !active.account_limit_resume => {
                 let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
@@ -3486,6 +3520,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         if let Some(message) = loop_failed {
             self.end_failed_run(&active.run_id, message).await;
+        }
+        if let Some(outcome) = sign_in_outcome {
+            if let Ok(Some(pause)) = self.current_sign_in().await {
+                self.sign_in_check = Some((pause, outcome));
+            }
         }
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.

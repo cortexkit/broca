@@ -253,9 +253,8 @@ pub struct Seams<'a, P, T> {
     /// The credential source requires sign-in before another model call. A held resume first
     /// syncs the results already supplied by its tool provider, then records the auth pause.
     pub pause_for_auth_at_start: Option<ProviderError>,
-    /// Asks for another provider account when a step's account has spent its usage window and
-    /// the run would otherwise end (see [`crate::account_move`]). Without it such a step ends
-    /// the run, as before.
+    /// Asks for another routed account at a usage wall or definite sign-in loss (see
+    /// [`crate::account_move`]). Without it the run ends or pauses as before.
     pub account_continue: Option<&'a dyn crate::account_move::AccountContinue<P>>,
 }
 
@@ -350,6 +349,8 @@ pub struct Finished {
     /// Why the run paused, when it paused rather than ended. A paused run reports
     /// `Interrupted` as its reason, as today's loop does, and resumes as the same run.
     pub paused: Option<PauseReason>,
+    /// In-memory routing outcome for scheduling this actor's next sign-in re-check.
+    pub sign_in: Option<crate::account_move::SignInOutcome>,
 }
 
 #[derive(Debug)]
@@ -512,13 +513,13 @@ where
         }
         None => match seams.pause_for_auth_at_start.clone() {
             Some(error) => {
-                pause(
+                sign_in_at_start(
                     &mut placed,
+                    parts,
                     seams,
-                    &admission.run_id,
-                    PauseReason::AuthRequired,
-                    Some(error),
-                    None,
+                    &admission,
+                    compaction.as_ref(),
+                    error,
                 )
                 .await?
             }
@@ -679,6 +680,68 @@ where
     {
         return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
     }
+    let runner = runner_of_start(writer, parts, &admission.run_id).await?;
+    let mut sign_in = None;
+    let account_ready = resolution == Resolution::Paused(PauseReason::AccountLimit)
+        && account_limit_of(writer)?
+            .is_some_and(|pause| (seams.now_ms)() >= pause.resume_not_before_ms);
+    let may_ask = account_ready
+        || (resolution == Resolution::Paused(PauseReason::AuthRequired)
+            && seams
+                .account_continue
+                .is_some_and(|continuer| continuer.recheck_sign_in()));
+    let moved = if may_ask {
+        if let Some(error) = &seams.pause_for_auth_at_start {
+            match crate::account_move::signed_out(
+                writer,
+                parts,
+                seams,
+                &admission,
+                0,
+                error,
+                &mut Vec::new(),
+            )
+            .await?
+            {
+                Some(crate::account_move::AtWall::Moved(moved)) => Some(moved),
+                Some(crate::account_move::AtWall::Held(answer)) => {
+                    sign_in = Some(crate::account_move::SignInOutcome::Hold(answer.until_ms));
+                    None
+                }
+                Some(crate::account_move::AtWall::Stayed(answer)) => {
+                    sign_in = Some(if answer.is_some() {
+                        crate::account_move::SignInOutcome::Refuse
+                    } else {
+                        crate::account_move::SignInOutcome::Unreachable
+                    });
+                    None
+                }
+                _ => {
+                    sign_in = Some(crate::account_move::SignInOutcome::Unreachable);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let moved_seams = moved
+        .as_ref()
+        .map(|moved| seams.moved_to(&moved.provider, moved.selection.clone()));
+    let seams = moved_seams.as_ref().unwrap_or(seams);
+    let mut moved_transport = moved
+        .as_ref()
+        .map(|moved| crate::transport::Guard::bind(&moved.provider, &seams.bind));
+    // A quota pause keeps the account so it can reuse its cached prompt after the reset.
+    // That cache is unusable after sign-in loss, so a due pause may take an offered account
+    // through the ordinary auth-resume move batch instead.
+    let resolution = if account_ready && moved.is_some() {
+        Resolution::Paused(PauseReason::AuthRequired)
+    } else {
+        resolution
+    };
     // A run paused on its account's limit resumes on that same account, and only once the
     // account has reset, as today's resume decides it. Until then nothing is written and the
     // run stays paused; on another account it ends interrupted, saying why.
@@ -714,11 +777,12 @@ where
         if resolution == Resolution::Paused(PauseReason::AuthRequired) {
             return Ok(Finished {
                 paused: Some(PauseReason::AuthRequired),
+                sign_in,
                 ..finished(writer, RunFinishReason::Interrupted)
             });
         }
         if resolution == Resolution::Paused(PauseReason::AccountLimit) {
-            return pause(
+            let mut finished = pause(
                 writer,
                 seams,
                 &admission.run_id,
@@ -726,7 +790,9 @@ where
                 Some(error),
                 None,
             )
-            .await;
+            .await?;
+            finished.sign_in = sign_in.or(Some(crate::account_move::SignInOutcome::Unreachable));
+            return Ok(finished);
         }
     }
     // A resume that will call the provider again first confirms the provider still renders the
@@ -814,7 +880,6 @@ where
         }
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
-    let runner = runner_of_start(writer, parts, &admission.run_id).await?;
     let mut placed = Placed {
         calls: Default::default(),
         runner,
@@ -853,18 +918,32 @@ where
     // The refreezes come first, durable with the resume, so nothing the resume does renders or
     // bills under the old config or account.
     let barrier = !refrozen.is_empty();
+    let auth_position = refrozen
+        .iter()
+        .position(|record| matches!(record, Record::AuthRefrozen(_)));
     refrozen.push(Record::Resumed(resumed));
     let mut batch = Some(refrozen);
+    let mut auth_seq = None;
     writer
         .append_with(
             &mut |_, _, first_seq| {
                 let mut batch = batch.take().expect("one batch");
+                auth_seq = auth_position.map(|position| first_seq + position as u64);
                 name_resumed_from(&mut batch, first_seq);
                 batch
             },
             barrier,
         )
         .await?;
+    if let Some(moved) = &moved {
+        if let (Some(reports), Some(seq)) = (&seams.account_reports, auth_seq) {
+            reports.account_moved(&event_id(writer, seq), seq, &moved.selection);
+        }
+        seams
+            .account_continue
+            .expect("prepared move")
+            .adopted(&moved.selection);
+    }
     if let Some(error) = drift {
         return end_with_error(
             writer,
@@ -919,10 +998,10 @@ where
         return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
     }
     if let Some(error) = seams.pause_for_auth_at_start.clone() {
-        return pause_for_sign_in(writer, seams, &admission, error).await;
+        return sign_in_at_start(writer, parts, seams, &admission, None, error).await;
     }
     let compaction = compaction_ctx(writer, parts, &admission, seams, false).await?;
-    match resolution {
+    let finished = match resolution {
         Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
         Resolution::Interrupted(_) => {
@@ -940,7 +1019,11 @@ where
             drive(writer, parts, &admission, seams, compaction.as_ref()).await
         }
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
+    }?;
+    if let Some(transport) = &mut moved_transport {
+        transport.finished(&finished);
     }
+    Ok(finished)
 }
 
 /// The result a resume records for a call that was sent with no result recorded.
@@ -2870,18 +2953,100 @@ where
                     selection.and_then(|selection| selection.account_ref.as_deref()),
                     selection.map(|selection| selection.credential_id.as_str()),
                 ));
-                // A failed sign-in pauses the run: after the credential is refreshed, it resumes
-                // as the same run, asking for this step again.
+                // A definite sign-in failure can move the same step to another routed account.
+                // All other auth errors retain their existing resumable pause.
                 if error.class == broca_protocol::ErrorClass::Auth {
-                    return pause(
+                    let records = writer.open_log_records().await?;
+                    let mut refused = entering
+                        .as_ref()
+                        .map(|entry| entry.refused.clone())
+                        .unwrap_or_else(|| {
+                            crate::account_move::refused_in_step(
+                                &records,
+                                &admission.run_id,
+                                step_id,
+                            )
+                        });
+                    let mut error = *error;
+                    let outcome = crate::account_move::signed_out(
+                        writer,
+                        parts,
+                        seams,
+                        admission,
+                        step_id,
+                        &error,
+                        &mut refused,
+                    )
+                    .await?;
+                    let sign_in = match outcome {
+                        Some(crate::account_move::AtWall::Moved(moved)) => {
+                            crate::account_move::record_move(writer, seams, admission, &moved)
+                                .await?;
+                            let first_attempt = records
+                                .iter()
+                                .rev()
+                                .find_map(|(_, record)| match record {
+                                    Record::Attempt(attempt)
+                                        if attempt.run_id == admission.run_id
+                                            && attempt.step_id == step_id =>
+                                    {
+                                        Some(attempt.attempt.saturating_add(1))
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            *moving = Some(crate::account_move::Moving {
+                                moved,
+                                reentry: crate::account_move::Reentry {
+                                    step_id,
+                                    refused,
+                                    retries,
+                                    first_attempt,
+                                    accepted_under: entering
+                                        .map(|entry| entry.accepted_under)
+                                        .unwrap_or_else(|| Box::new(admission.clone())),
+                                },
+                            });
+                            return Ok(finished(writer, RunFinishReason::Interrupted));
+                        }
+                        Some(crate::account_move::AtWall::Held(answer)) => {
+                            let outcome = crate::account_move::SignInOutcome::Hold(answer.until_ms);
+                            error.account_continue = Some(Box::new(answer));
+                            outcome
+                        }
+                        Some(crate::account_move::AtWall::Stayed(answer)) => {
+                            let outcome = if answer.is_some() {
+                                crate::account_move::SignInOutcome::Refuse
+                            } else {
+                                crate::account_move::SignInOutcome::Unreachable
+                            };
+                            error.account_continue = answer.map(Box::new);
+                            outcome
+                        }
+                        Some(crate::account_move::AtWall::Stopped)
+                            if seams.cancel.is_cancelled() =>
+                        {
+                            return finish(
+                                writer,
+                                seams,
+                                &admission.run_id,
+                                RunFinishReason::Cancelled,
+                            )
+                            .await;
+                        }
+                        _ => crate::account_move::SignInOutcome::Unreachable,
+                    };
+                    let mut finished = pause(
                         writer,
                         seams,
                         &admission.run_id,
                         PauseReason::AuthRequired,
-                        Some(*error),
+                        Some(error),
                         None,
                     )
-                    .await;
+                    .await?;
+                    finished.sign_in = Some(sign_in);
+                    return Ok(finished);
                 }
                 // The provider refused the account's limit, which resets soon enough that the
                 // session's cache on that account outlives the wait: the run pauses on the same
@@ -2945,7 +3110,10 @@ where
                             });
                             return Ok(finished(writer, RunFinishReason::Interrupted));
                         }
-                        Some(crate::account_move::AtWall::Stayed(Some(answer))) => {
+                        Some(
+                            crate::account_move::AtWall::Stayed(Some(answer))
+                            | crate::account_move::AtWall::Held(answer),
+                        ) => {
                             crate::account_move::with_routing_answer(
                                 &mut error,
                                 answer,
@@ -6727,7 +6895,73 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
         usage: (run.completed_steps > 0).then_some(run.usage),
         retries_used: run.retries_used,
         paused: None,
+        sign_in: None,
     }
+}
+
+async fn sign_in_at_start<W: Writer, P: Provider, T: ToolPlane>(
+    writer: &mut W,
+    parts: &dyn Parts,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    compaction: Option<&crate::compaction::Ctx>,
+    mut error: ProviderError,
+) -> Result<Finished, LoopError> {
+    let sign_in = match crate::account_move::signed_out(
+        writer,
+        parts,
+        seams,
+        admission,
+        0,
+        &error,
+        &mut Vec::new(),
+    )
+    .await?
+    {
+        Some(crate::account_move::AtWall::Moved(moved)) => {
+            crate::account_move::record_move(writer, seams, admission, &moved).await?;
+            seams.provider.close_run_transport();
+            let admission = frozen_admission(run_state(writer), parts)?;
+            let moved_seams = seams.moved_to(&moved.provider, moved.selection.clone());
+            let mut transport = crate::transport::Guard::bind(&moved.provider, &seams.bind);
+            let moved_compaction = if compaction.is_none() {
+                compaction_ctx(writer, parts, &admission, &moved_seams, false).await?
+            } else {
+                None
+            };
+            let finished = drive(
+                writer,
+                parts,
+                &admission,
+                &moved_seams,
+                compaction.or(moved_compaction.as_ref()),
+            )
+            .await?;
+            transport.finished(&finished);
+            return Ok(finished);
+        }
+        Some(crate::account_move::AtWall::Held(answer)) => {
+            let outcome = crate::account_move::SignInOutcome::Hold(answer.until_ms);
+            error.account_continue = Some(Box::new(answer));
+            outcome
+        }
+        Some(crate::account_move::AtWall::Stayed(answer)) => {
+            let outcome = if answer.is_some() {
+                crate::account_move::SignInOutcome::Refuse
+            } else {
+                crate::account_move::SignInOutcome::Unreachable
+            };
+            error.account_continue = answer.map(Box::new);
+            outcome
+        }
+        Some(crate::account_move::AtWall::Stopped) if seams.cancel.is_cancelled() => {
+            return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await
+        }
+        _ => crate::account_move::SignInOutcome::Unreachable,
+    };
+    let mut finished = pause_for_sign_in(writer, seams, admission, error).await?;
+    finished.sign_in = Some(sign_in);
+    Ok(finished)
 }
 
 /// Retains only answers already deposited by held-call providers before parking for sign-in.

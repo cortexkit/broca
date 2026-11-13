@@ -268,6 +268,8 @@ const REFRESHED_TTL_MS: i64 = 60 * 60 * 1000;
 /// The one credential record the stand-in serves, shared across its connections.
 #[derive(Default)]
 struct StandInRecord {
+    /// Per-credential read scripts; the final reply remains until the test changes it.
+    credential_replies: std::collections::HashMap<String, std::collections::VecDeque<serde_json::Value>>,
     /// Bumped by each refresh; 0 means "not read yet" and is shown as version 1.
     version: u64,
     stale: bool,
@@ -477,7 +479,18 @@ async fn serve_capturing_vault(
                         return Ok(());
                     }
                 }
+                let scripted = if method == "credential.get_scoped" {
+                    let mut state = record.lock().unwrap();
+                    let replies = request["params"]["credential_id"].as_str()
+                        .and_then(|id| state.credential_replies.get_mut(id));
+                    let reply = replies.and_then(|replies| {
+                        if replies.len() > 1 { replies.pop_front() } else { replies.front().cloned() }
+                    });
+                    if reply.is_some() { state.scoped_reads += 1; }
+                    reply
+                } else { None };
                 let reply = match method.as_str() {
+                    _ if scripted.is_some() => scripted.unwrap(),
                     "credential.get" => token(1, None),
                     "credential.get_scoped"
                         if request["params"]["credential_id"]
@@ -1455,9 +1468,13 @@ async fn pre_send_check(label: &str, expiry: ExpiryScript, then_401: bool) -> Pr
         let first = refresh.refresher.0.refresh_expiring_secret().await;
         if refresh.served_expires_at_ms.lock().unwrap().is_none() {
             let second = refresh.refresher.0.refresh_expiring_secret().await;
-            assert!(second.is_none());
+            assert!(matches!(second, ExpiringRefresh::Unavailable));
         }
-        first
+        match first {
+            ExpiringRefresh::Token(token) => Some(token),
+            ExpiringRefresh::Unavailable => None,
+            ExpiringRefresh::NeedsReauth { .. } => panic!("this script never loses its sign-in"),
+        }
     }).await;
     daemon.assert_healthy();
     let served = refresh.served_version.load(Ordering::SeqCst);

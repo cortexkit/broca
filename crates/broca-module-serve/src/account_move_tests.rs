@@ -350,7 +350,7 @@ async fn a_chatgpt_wall_offered_b(
         run_config: &config,
         reask: false,
     };
-    let moves = AccountMoves::new(&executor, &req, &None, None, None);
+    let moves = AccountMoves::new(&executor, &req, None, None);
     let answer =
         broca_session_loop::account_move::AccountContinue::ask(&moves, &wall).await;
     let asked = routing.requests.lock().unwrap().clone();

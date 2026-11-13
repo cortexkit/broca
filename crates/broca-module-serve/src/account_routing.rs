@@ -2708,9 +2708,9 @@ pub enum ContinueOutcome {
     NoAnswerWithinBudget,
 }
 
-/// The continue request for a wall, in routing's types: the run, its original admission and
-/// conversation key, the decision the run uses now, and the exhausted account with the evidence
-/// of the refused attempt's own record. `None` when the run's selection lacks what routing needs
+/// The continue request for a usage wall or sign-in loss, in routing's types: the run, its
+/// original admission and conversation key, the decision the run uses now, and the unavailable
+/// account with its quota evidence or sign-in observation time. `None` when the selection lacks what routing needs
 /// to find the run (an admission id, a conversation key, a decision id).
 pub fn continue_request(
     wall: &broca_session_loop::account_move::Wall<'_>,
@@ -2729,13 +2729,28 @@ pub fn continue_request(
     if let Some(retry_after_s) = wall.retry_after_s {
         exhausted = exhausted.with_retry_after_s(retry_after_s);
     }
+    let selection_id = if wall.limit_window == "signed_out" {
+        // Every credential re-check is a new eligibility question. Transport retries keep
+        // this serialized request and its id. Without entropy there is no safe fresh question.
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).ok()?;
+        format!(
+            "sign-in-{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    } else {
+        continue_selection_id(wall)
+    };
     Some(ContinueRequest::new(
         wall.run_id,
         decision.admission_id.as_deref()?,
         decision.conversation_key.as_deref()?,
         decision.decision_id.as_deref()?,
         exhausted,
-        continue_selection_id(wall),
+        selection_id,
     ))
 }
 
@@ -2764,22 +2779,31 @@ pub fn continue_selection_id(wall: &broca_session_loop::account_move::Wall<'_>) 
 
 impl RoutingClient {
     /// [`Self::account_continue`], asked only when routing serves continuation: it is known to
-    /// declare both `account_continue` and `account_continue_resume`. An unknown description,
-    /// or one that doesn't arrive by `deadline`, counts as no, and then nothing is sent.
+    /// declare `account_continue` and `account_continue_resume`, plus
+    /// `account_continue_signed_out` for a sign-in question. An unknown description, or one
+    /// that doesn't arrive by `deadline`, counts as no, and then nothing is sent.
     pub async fn account_continue_if_served(
         &self,
         request: &cortexkit_role_routing::account_continue::ContinueRequest,
         deadline: tokio::time::Instant,
     ) -> ContinueOutcome {
-        let serves =
-            tokio::time::timeout_at(deadline, self.answers_moved_runs_with_current_account())
-                .await
-                .unwrap_or(false);
+        let serves = tokio::time::timeout_at(deadline, async {
+            self.answers_moved_runs_with_current_account().await
+                && (request.exhausted.limit_window != "signed_out"
+                    || self
+                        .capability(
+                            cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE_SIGNED_OUT,
+                        )
+                        .await
+                        == crate::routing_capabilities::CapabilitySupport::Declared)
+        })
+        .await
+        .unwrap_or(false);
         self.account_continue(serves, request, deadline).await
     }
 
-    /// Asks routing for another account for a run whose account spent its usage window, by
-    /// `route.account_for` with `mode: "continue"`, over the same route as an admission, giving up
+    /// Asks routing for another account after a usage wall or sign-in loss, by
+    /// `route.account_for` with `mode: "continue"`, over the admission route, giving up
     /// at `deadline`. `routing_serves_continuation` is true only when routing declares both
     /// `account_continue` and `account_continue_resume` (unknown counts as false); otherwise
     /// nothing is sent.
@@ -2798,15 +2822,15 @@ impl RoutingClient {
             Ok(body) => body,
             Err(error) => return ContinueOutcome::Unreachable(format!("encode request: {error}")),
         };
-        // Sent only where routing declares both capabilities, checked again on the route the
-        // request goes out on.
-        let sent = self.transport.request_where_declared(
-            body,
-            &[
-                cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
-                crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
-            ],
-        );
+        // Check every required capability again on the route the request goes out on.
+        let mut declarations = vec![
+            cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
+            crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+        ];
+        if request.exhausted.limit_window == "signed_out" {
+            declarations.push(cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE_SIGNED_OUT);
+        }
+        let sent = self.transport.request_where_declared(body, &declarations);
         let outcome = match tokio::time::timeout_at(deadline, sent).await {
             Err(_) => ContinueOutcome::NoAnswerWithinBudget,
             Ok(None) => ContinueOutcome::NotDeclared,

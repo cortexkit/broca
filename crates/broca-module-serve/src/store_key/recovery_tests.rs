@@ -70,6 +70,7 @@ impl RunExecutor for Continuing {
         StoreRunEnd {
             parts: job.parts,
             result: Ok(broca_session_loop::run::Finished {
+                sign_in: None,
                 reason,
                 usage: None,
                 retries_used: 0,

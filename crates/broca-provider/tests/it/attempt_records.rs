@@ -936,7 +936,10 @@ mod gated {
             })
         }
 
-        fn refresh_expiring(&self) -> RefreshFuture<'_, RefreshedCredential> {
+        fn refresh_expiring(
+            &self,
+        ) -> broca_provider::credential_refresh::ExpiringRefreshFuture<'_, RefreshedCredential>
+        {
             self.expiring_calls.fetch_add(1, Ordering::SeqCst);
             let next = self.expiring.lock().unwrap().pop_front().flatten();
             Box::pin(async move {
@@ -945,6 +948,10 @@ mod gated {
                     auth,
                     evidence: expiring_evidence(),
                 })
+                .map_or(
+                    broca_provider::credential_refresh::ExpiringRefresh::Unavailable,
+                    broca_provider::credential_refresh::ExpiringRefresh::Token,
+                )
             })
         }
     }
