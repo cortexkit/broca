@@ -132,6 +132,39 @@ pub trait SessionBackend {
         s: &SessionAddr,
         name: &str,
     ) -> Result<Option<Vec<u8>>, BackendError>;
+    /// The size of object `name` in bytes, or `None` when there is no such object. The default
+    /// fetches the object; a backend that can tell its size without reading it does.
+    async fn object_size(&self, s: &SessionAddr, name: &str) -> Result<Option<u64>, BackendError> {
+        Ok(self
+            .get_object(s, name)
+            .await?
+            .map(|bytes| bytes.len() as u64))
+    }
+    /// Bytes `range` of object `name`, or `None` when there is no such object. A range that
+    /// runs past the object's end is an error. A sealed segment is read this way a block at a
+    /// time, so reading one message never fetches the whole segment. The default fetches the
+    /// whole object and keeps the range; a backend that can read a range reads only it.
+    async fn get_object_range(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let Some(bytes) = self.get_object(s, name).await? else {
+            return Ok(None);
+        };
+        let span = usize::try_from(range.start)
+            .ok()
+            .zip(usize::try_from(range.end).ok())
+            .filter(|(start, end)| start <= end && *end <= bytes.len());
+        match span {
+            Some((start, end)) => Ok(Some(bytes[start..end].to_vec())),
+            None => Err(BackendError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("range {range:?} runs past object {name}"),
+            ))),
+        }
+    }
     /// Deletes object `name`, if it exists.
     async fn delete_object(
         &self,
@@ -250,6 +283,17 @@ impl<T: SessionBackend + ?Sized> SessionBackend for &T {
     ) -> Result<Option<Vec<u8>>, BackendError> {
         (**self).get_object(s, name).await
     }
+    async fn get_object_range(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        (**self).get_object_range(s, name, range).await
+    }
+    async fn object_size(&self, s: &SessionAddr, name: &str) -> Result<Option<u64>, BackendError> {
+        (**self).object_size(s, name).await
+    }
     async fn delete_object(
         &self,
         s: &SessionAddr,
@@ -294,8 +338,11 @@ pub struct MemoryBackend {
     crash_after: Mutex<Option<usize>>,
     /// Mutations left before exactly one of them fails. Tests only.
     fail_at: Mutex<Option<usize>>,
-    /// How many objects were fetched (`get_object`), found or not. Tests only.
+    /// How many objects were fetched (`get_object`, or a range by `get_object_range`), found or
+    /// not. Tests only.
     object_reads: std::sync::atomic::AtomicUsize,
+    /// How many object bytes those fetches returned. Tests only.
+    object_bytes_read: std::sync::atomic::AtomicUsize,
     /// How many log reads (`read_log`) were served, but for those of only a log's checkpoint
     /// frame. Tests only.
     log_reads: std::sync::atomic::AtomicUsize,
@@ -358,6 +405,12 @@ impl MemoryBackend {
     /// How many objects have been fetched from this backend so far, found or not. Tests only.
     pub fn object_reads(&self) -> usize {
         self.object_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many object bytes the fetches so far returned. Tests only.
+    pub fn object_bytes_read(&self) -> usize {
+        self.object_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many log reads this backend has served so far, but for those of only a log's
@@ -585,9 +638,52 @@ impl SessionBackend for MemoryBackend {
         self.object_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sessions = self.sessions.lock().unwrap();
+        let bytes = sessions
+            .get(s)
+            .and_then(|session| session.objects.get(name).cloned());
+        self.object_bytes_read.fetch_add(
+            bytes.as_ref().map_or(0, Vec::len),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(bytes)
+    }
+
+    async fn object_size(&self, s: &SessionAddr, name: &str) -> Result<Option<u64>, BackendError> {
+        let sessions = self.sessions.lock().unwrap();
         Ok(sessions
             .get(s)
-            .and_then(|session| session.objects.get(name).cloned()))
+            .and_then(|session| session.objects.get(name))
+            .map(|bytes| bytes.len() as u64))
+    }
+
+    async fn get_object_range(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        self.object_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sessions = self.sessions.lock().unwrap();
+        let Some(bytes) = sessions
+            .get(s)
+            .and_then(|session| session.objects.get(name))
+        else {
+            return Ok(None);
+        };
+        let span = usize::try_from(range.start)
+            .ok()
+            .zip(usize::try_from(range.end).ok())
+            .filter(|(start, end)| start <= end && *end <= bytes.len());
+        let Some((start, end)) = span else {
+            return Err(BackendError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("range {range:?} runs past object {name}"),
+            )));
+        };
+        self.object_bytes_read
+            .fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(bytes[start..end].to_vec()))
     }
 
     async fn delete_object(
@@ -1223,6 +1319,33 @@ impl SessionBackend for LocalBackend {
     ) -> Result<Option<Vec<u8>>, BackendError> {
         match std::fs::read(self.object_path(s, name)?) {
             Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn get_object_range(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let mut file = match std::fs::File::open(self.object_path(s, name)?) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let len = usize::try_from(range.end.saturating_sub(range.start))
+            .map_err(|_| io::Error::other(format!("range {range:?} is too long")))?;
+        let mut bytes = vec![0; len];
+        file.seek(SeekFrom::Start(range.start))?;
+        file.read_exact(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    async fn object_size(&self, s: &SessionAddr, name: &str) -> Result<Option<u64>, BackendError> {
+        match std::fs::metadata(self.object_path(s, name)?) {
+            Ok(metadata) => Ok(Some(metadata.len())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }

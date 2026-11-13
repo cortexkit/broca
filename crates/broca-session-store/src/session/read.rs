@@ -28,7 +28,7 @@ use crate::directory::Pages;
 use crate::fold::conversation::{Conversation, EntryState};
 use crate::idindex::{self, IdKind, IndexPages, IndexRoot};
 use crate::record::Record;
-use crate::segment::Segment;
+use crate::segment::{SegmentLayout, FOOTER, OPEN_PREFIX};
 
 use super::{Session, SessionError};
 
@@ -124,7 +124,18 @@ pub(super) struct SealedCaches {
     derived: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Exact send ids derived from records written before entry facts carried them.
     send_ids: Option<Box<send_ids::SendIdIndex>>,
+    /// The layouts (header and index) of the sealed segments read most recently, by object
+    /// name, at most [`SEALED_LAYOUTS_KEPT`]: a page reads only its blocks after the first.
+    /// Boxed, so a session that never reads sealed history carries one pointer for it.
+    layouts: Option<Box<KeptLayouts>>,
 }
+
+/// Sealed segments' layouts, by object name, oldest read first.
+type KeptLayouts = Vec<(String, Arc<SegmentLayout>)>;
+
+/// How many sealed segments' layouts a session keeps while open. A layout holds one index entry
+/// per block (a few tens of bytes per 16 KiB of history), so a session's largest segments fit.
+const SEALED_LAYOUTS_KEPT: usize = 8;
 
 pub(super) type SealedEntries = std::sync::Mutex<SealedCaches>;
 
@@ -217,6 +228,79 @@ impl<B: SessionBackend> Session<B> {
         let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
         conversation.enrolled(self.operations.enrolled_through());
         conversation
+    }
+
+    /// The layout of sealed segment `object`: its header and index, read by ranges (the leading
+    /// bytes, the footer, then the index), never its blocks. Kept while the session is open, so
+    /// later reads of the segment fetch only their blocks. `None` when no such object is stored.
+    async fn sealed_layout(
+        &self,
+        object: &str,
+        key: &crate::frame::FrameKey,
+    ) -> Result<Option<Arc<SegmentLayout>>, SessionError> {
+        let kept = self
+            .sealed_caches()
+            .layouts
+            .as_deref()
+            .and_then(|layouts| layouts.iter().find(|(name, _)| name == object))
+            .map(|(_, layout)| Arc::clone(layout));
+        if kept.is_some() {
+            return Ok(kept);
+        }
+        let version = self.operations.history_version;
+        let Some(size) = self.backend.object_size(&self.addr, object).await? else {
+            return Ok(None);
+        };
+        let read = |range: std::ops::Range<u64>| async move {
+            self.backend
+                .get_object_range(&self.addr, object, range)
+                .await?
+                .ok_or_else(|| SessionError::Fold(format!("sealed segment {object} is missing")))
+        };
+        let prefix = read(0..size.min(OPEN_PREFIX)).await?;
+        let header_end = SegmentLayout::header_end(&prefix).map_err(SessionError::Segment)?;
+        let header = if header_end <= prefix.len() as u64 {
+            prefix
+        } else {
+            read(0..header_end.min(size)).await?
+        };
+        let footer = read(size.saturating_sub(FOOTER)..size).await?;
+        let (offset, len) =
+            SegmentLayout::index_span(&footer, size).map_err(SessionError::Segment)?;
+        let sealed = read(offset..offset + len).await?;
+        let layout = Arc::new(
+            SegmentLayout::open(&header, &sealed, key, object.as_bytes())
+                .map_err(SessionError::Segment)?,
+        );
+        let mut caches = self.sealed_caches();
+        if caches.version == version {
+            let layouts = caches.layouts.get_or_insert_with(Box::default);
+            if layouts.len() == SEALED_LAYOUTS_KEPT {
+                layouts.remove(0);
+            }
+            layouts.push((object.to_owned(), Arc::clone(&layout)));
+        }
+        Ok(Some(layout))
+    }
+
+    /// The records of block `position` of sealed segment `object`, whose layout is `layout`:
+    /// fetches that block's bytes alone.
+    async fn sealed_block(
+        &self,
+        object: &str,
+        layout: &SegmentLayout,
+        position: usize,
+        key: &crate::frame::FrameKey,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        let (offset, len) = layout.block_span(position).map_err(SessionError::Segment)?;
+        let sealed = self
+            .backend
+            .get_object_range(&self.addr, object, offset..offset + len)
+            .await?
+            .ok_or_else(|| SessionError::Fold(format!("sealed segment {object} is missing")))?;
+        layout
+            .block(position, &sealed, key, object.as_bytes())
+            .map_err(SessionError::Segment)
     }
 
     /// The sealed caches, emptied first when the history version moved since they were filled.
@@ -346,13 +430,10 @@ impl<B: SessionBackend> Session<B> {
                 .await
                 .map_err(SessionError::Directory)?
                 .ok_or_else(damaged)?;
-            let bytes = self
-                .backend
-                .get_object(&self.addr, &entry.object)
+            let segment = self
+                .sealed_layout(&entry.object, &key)
                 .await?
                 .ok_or_else(damaged)?;
-            let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
-                .map_err(SessionError::Segment)?;
             let mut position = segment.block_for_ordinal(next).ok_or_else(damaged)?;
             // Read on through the segment's blocks while the page wants more.
             while position < segment.index.blocks.len() && next < window && out.len() < limit {
@@ -361,9 +442,9 @@ impl<B: SessionBackend> Session<B> {
                     .expect("block_for_ordinal only answers when every block has an ordinal");
                 let mut conversation = self.block_conversation();
                 conversation.placed = first - 1;
-                for (_, record) in segment
-                    .block(position)
-                    .map_err(SessionError::Segment)?
+                for (_, record) in self
+                    .sealed_block(&entry.object, &segment, position, &key)
+                    .await?
                     .into_iter()
                     .filter(|(seq, _)| entry.keeps(*seq))
                 {
@@ -514,13 +595,10 @@ impl<B: SessionBackend> Session<B> {
     ) -> Result<Vec<StoredEntry>, SessionError> {
         let damaged =
             || SessionError::Fold(format!("sealed segment {} is missing", segment.object));
-        let bytes = self
-            .backend
-            .get_object(&self.addr, &segment.object)
+        let opened = self
+            .sealed_layout(&segment.object, key)
             .await?
             .ok_or_else(damaged)?;
-        let opened =
-            Segment::open(&bytes, key, segment.object.as_bytes()).map_err(SessionError::Segment)?;
         let mut out = Vec::new();
         for position in 0..opened.index.blocks.len() {
             let Some(first) = opened.index.blocks[position].first_ordinal else {
@@ -528,9 +606,9 @@ impl<B: SessionBackend> Session<B> {
             };
             let mut conversation = self.block_conversation();
             conversation.placed = first - 1;
-            for (_, record) in opened
-                .block(position)
-                .map_err(SessionError::Segment)?
+            for (_, record) in self
+                .sealed_block(&segment.object, &opened, position, key)
+                .await?
                 .into_iter()
                 .filter(|(seq, _)| segment.keeps(*seq))
             {
@@ -623,20 +701,17 @@ impl<B: SessionBackend> Session<B> {
         {
             let damaged =
                 || SessionError::Fold(format!("directory names a missing segment for {seq}"));
-            let bytes = self
-                .backend
-                .get_object(&self.addr, &entry.object)
+            let segment = self
+                .sealed_layout(&entry.object, &key)
                 .await?
                 .ok_or_else(damaged)?;
-            let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
-                .map_err(SessionError::Segment)?;
-            for position in 0..segment.index.blocks.len() {
-                // A block whose successor starts at or before `seq` ends before it.
-                let next = segment.index.blocks.get(position + 1);
-                if next.is_some_and(|next| next.first_seq <= seq) {
-                    continue;
-                }
-                for (at, record) in segment.block(position).map_err(SessionError::Segment)? {
+            // Blocks before the one holding `seq` hold nothing at or after it.
+            let start = segment.block_for_seq(seq).unwrap_or(0);
+            for position in start..segment.index.blocks.len() {
+                for (at, record) in self
+                    .sealed_block(&entry.object, &segment, position, &key)
+                    .await?
+                {
                     let Record::EntryFacts(facts) = record else {
                         continue;
                     };
@@ -681,22 +756,19 @@ impl<B: SessionBackend> Session<B> {
             .await
             .map_err(SessionError::Directory)?
             .ok_or_else(damaged)?;
-        let bytes = self
-            .backend
-            .get_object(&self.addr, &entry.object)
+        let segment = self
+            .sealed_layout(&entry.object, &key)
             .await?
             .ok_or_else(damaged)?;
-        let segment =
-            Segment::open(&bytes, &key, entry.object.as_bytes()).map_err(SessionError::Segment)?;
         let position = segment.block_for_ordinal(ordinal).ok_or_else(damaged)?;
         let first = segment.index.blocks[position]
             .first_ordinal
             .expect("block_for_ordinal only answers when every block has an ordinal");
         let mut conversation = self.block_conversation();
         conversation.placed = first - 1;
-        for (_, record) in segment
-            .block(position)
-            .map_err(SessionError::Segment)?
+        for (_, record) in self
+            .sealed_block(&entry.object, &segment, position, &key)
+            .await?
             .into_iter()
             .filter(|(seq, _)| entry.keeps(*seq))
         {
@@ -913,19 +985,7 @@ impl<B: SessionBackend> Session<B> {
                 .map_err(SessionError::Directory)?;
             // A record a seal carried into the open log is read from there.
             if let Some(entry) = entry.filter(|entry| entry.keeps(seq)) {
-                let bytes = self
-                    .backend
-                    .get_object(&self.addr, &entry.object)
-                    .await?
-                    .ok_or_else(|| {
-                        SessionError::Fold(format!(
-                            "the directory names a missing segment {}",
-                            entry.object
-                        ))
-                    })?;
-                let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
-                    .map_err(SessionError::Segment)?;
-                if let Some(record) = segment.find(seq).map_err(SessionError::Segment)? {
+                if let Some(record) = self.sealed_record(&entry.object, seq, &key).await? {
                     return Ok(Some(record));
                 }
             }
@@ -967,22 +1027,37 @@ impl<B: SessionBackend> Session<B> {
         }
         let mut records = Vec::new();
         for (object, seqs) in by_object {
-            let bytes = self
-                .backend
-                .get_object(&self.addr, &object)
-                .await?
-                .ok_or_else(|| damaged(seqs[0]))?;
-            let segment =
-                Segment::open(&bytes, &key, object.as_bytes()).map_err(SessionError::Segment)?;
             for seq in seqs {
-                let record = segment
-                    .find(seq)
-                    .map_err(SessionError::Segment)?
+                let record = self
+                    .sealed_record(&object, seq, &key)
+                    .await?
                     .ok_or_else(|| damaged(seq))?;
                 records.push((seq, record));
             }
         }
         Ok(records)
+    }
+
+    /// The record with `seq` in sealed segment `object`, read from the one block that can hold
+    /// it, or `None` when the segment has no such record. A missing segment is damage.
+    async fn sealed_record(
+        &self,
+        object: &str,
+        seq: u64,
+        key: &crate::frame::FrameKey,
+    ) -> Result<Option<Record>, SessionError> {
+        let layout = self.sealed_layout(object, key).await?.ok_or_else(|| {
+            SessionError::Fold(format!("the directory names a missing segment {object}"))
+        })?;
+        let Some(position) = layout.block_for_seq(seq) else {
+            return Ok(None);
+        };
+        Ok(self
+            .sealed_block(object, &layout, position, key)
+            .await?
+            .into_iter()
+            .find(|(found, _)| *found == seq)
+            .map(|(_, record)| record))
     }
 
     /// Every record of both streams from seq `first` on, sealed or in the open log, in seq
@@ -1043,7 +1118,21 @@ impl SealedCaches {
     /// `crate::held`). A reader's derived value is opaque here, so only its pointer counts.
     pub(super) fn held_bytes(&self) -> usize {
         use crate::held::HeldBytes;
-        self.entries.held_bytes() + self.send_ids.heap_bytes()
+        self.entries.held_bytes() + self.send_ids.heap_bytes() + self.layouts_held_bytes()
+    }
+
+    /// The kept segment layouts: each one's index entries, its leading or trailing state and
+    /// its header, plus the list holding them.
+    fn layouts_held_bytes(&self) -> usize {
+        let Some(layouts) = &self.layouts else {
+            return 0;
+        };
+        let each = layouts.iter().map(|(name, layout)| {
+            name.capacity() + std::mem::size_of::<SegmentLayout>() + layout.held_bytes()
+        });
+        std::mem::size_of::<KeptLayouts>()
+            + layouts.capacity() * std::mem::size_of::<(String, Arc<SegmentLayout>)>()
+            + each.sum::<usize>()
     }
 }
 

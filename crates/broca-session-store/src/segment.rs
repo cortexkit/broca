@@ -318,68 +318,120 @@ fn range(bytes: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     bytes.get(start..end)
 }
 
-/// A segment opened for reading: its header and index, decrypted. Blocks are read on demand.
-pub struct Segment<'a> {
-    bytes: &'a [u8],
+/// A segment's header and index, decrypted, without its blocks: what a reader keeps to read a
+/// segment a block at a time, fetching only the bytes of the blocks it reads. [`Segment`] wraps
+/// it for a reader that holds all of the segment's bytes.
+#[derive(Debug)]
+pub struct SegmentLayout {
     header_bytes: Vec<u8>,
     pub header: SegmentHeader,
     pub index: SegmentIndex,
-    key: &'a FrameKey,
-    name: &'a [u8],
 }
 
-impl<'a> Segment<'a> {
-    /// Opens a segment from its bytes under `name` and `key`. Reads the header and the index,
-    /// never a block.
-    pub fn open(bytes: &'a [u8], key: &'a FrameKey, name: &'a [u8]) -> Result<Self, SegmentError> {
-        if bytes.len() < 9 + FOOTER_LEN || &bytes[..4] != SEGMENT_MAGIC {
+/// How many leading bytes a reader fetches to open a segment by ranges: the magic, format and
+/// header length, and the whole header for every header broca writes (fixed fields and one id
+/// per change prefix). A longer header is fetched again in full ([`SegmentLayout::header_end`]).
+pub const OPEN_PREFIX: u64 = 4096;
+/// The segment's last bytes, which name where its index is.
+pub const FOOTER: u64 = FOOTER_LEN as u64;
+
+impl SegmentLayout {
+    /// How many leading bytes hold the magic, format, header length and header, read from the
+    /// segment's first bytes (at least the first nine).
+    pub fn header_end(prefix: &[u8]) -> Result<u64, SegmentError> {
+        if prefix.len() < 9 || &prefix[..4] != SEGMENT_MAGIC {
             return Err(SegmentError::Malformed("not a segment"));
         }
-        if bytes[4] != SEGMENT_FORMAT {
+        if prefix[4] != SEGMENT_FORMAT {
             return Err(SegmentError::Malformed("unknown segment format"));
         }
-        let header_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-        let header_bytes = 9usize
-            .checked_add(header_len)
-            .and_then(|end| bytes.get(9..end))
-            .ok_or(SegmentError::Malformed("header past the end"))?
-            .to_vec();
-        let header = SegmentHeader::decode(&header_bytes).map_err(SegmentError::Decode)?;
-        let footer = &bytes[bytes.len() - FOOTER_LEN..];
-        if &footer[12..] != SEGMENT_MAGIC {
+        Ok(9 + u64::from(u32::from_le_bytes(prefix[5..9].try_into().unwrap())))
+    }
+
+    /// Where the index is (offset and length), read from the segment's last [`FOOTER`] bytes, in
+    /// a segment of `size` bytes.
+    pub fn index_span(footer: &[u8], size: u64) -> Result<(u64, u64), SegmentError> {
+        if footer.len() != FOOTER_LEN || &footer[12..] != SEGMENT_MAGIC {
             return Err(SegmentError::Malformed("no footer"));
         }
-        let index_offset = u64::from_le_bytes(footer[..8].try_into().unwrap());
-        let index_len = u32::from_le_bytes(footer[8..12].try_into().unwrap());
-        let sealed = range(bytes, index_offset, u64::from(index_len))
-            .ok_or(SegmentError::Malformed("index past the end"))?;
+        let offset = u64::from_le_bytes(footer[..8].try_into().unwrap());
+        let len = u64::from(u32::from_le_bytes(footer[8..12].try_into().unwrap()));
+        let fits = offset
+            .checked_add(len)
+            .is_some_and(|end| end <= size.saturating_sub(FOOTER));
+        if !fits {
+            return Err(SegmentError::Malformed("index past the end"));
+        }
+        Ok((offset, len))
+    }
+
+    /// Opens a segment named `name` under `key` from its leading bytes through the header's end
+    /// (`header`, at least [`Self::header_end`] of them) and its sealed index unit.
+    pub fn open(
+        header: &[u8],
+        sealed_index: &[u8],
+        key: &FrameKey,
+        name: &[u8],
+    ) -> Result<Self, SegmentError> {
+        let end = usize::try_from(Self::header_end(header)?)
+            .map_err(|_| SegmentError::Malformed("header past the end"))?;
+        let header_bytes = header
+            .get(9..end)
+            .ok_or(SegmentError::Malformed("header past the end"))?
+            .to_vec();
+        let decoded = SegmentHeader::decode(&header_bytes).map_err(SegmentError::Decode)?;
         let index = key
-            .open_unit(&unit_aad(&header_bytes, key, name, INDEX_POSITION), sealed)
+            .open_unit(
+                &unit_aad(&header_bytes, key, name, INDEX_POSITION),
+                sealed_index,
+            )
             .ok_or(SegmentError::Authentication)?;
         let index = SegmentIndex::decode(&index).map_err(SegmentError::Decode)?;
         Ok(Self {
-            bytes,
             header_bytes,
-            header,
+            header: decoded,
             index,
-            key,
-            name,
         })
     }
 
-    /// The records of block `position`.
-    pub fn block(&self, position: usize) -> Result<Vec<(u64, Record)>, SegmentError> {
+    /// The heap bytes the layout holds: its header bytes, index entries and the index's state.
+    pub fn held_bytes(&self) -> usize {
+        let state = |bytes: &Option<ByteBuf>| bytes.as_ref().map_or(0, |bytes| bytes.0.capacity());
+        self.header_bytes.capacity()
+            + self.header.prefixes.capacity() * std::mem::size_of::<Id128>()
+            + self.index.blocks.capacity() * std::mem::size_of::<BlockEntry>()
+            + state(&self.index.leading)
+            + state(&self.index.trailer)
+            + state(&self.index.log_start)
+    }
+
+    /// Where block `position` is: its offset and length.
+    pub fn block_span(&self, position: usize) -> Result<(u64, u64), SegmentError> {
         let entry = self
             .index
             .blocks
             .get(position)
             .ok_or(SegmentError::Malformed("no such block"))?;
-        let sealed = range(self.bytes, entry.offset, entry.len)
-            .ok_or(SegmentError::Malformed("block past the end"))?;
-        let compressed = self
-            .key
+        Ok((entry.offset, entry.len))
+    }
+
+    /// The records of block `position`, from its sealed bytes (the [`Self::block_span`] of the
+    /// segment named `name`).
+    pub fn block(
+        &self,
+        position: usize,
+        sealed: &[u8],
+        key: &FrameKey,
+        name: &[u8],
+    ) -> Result<Vec<(u64, Record)>, SegmentError> {
+        let entry = self
+            .index
+            .blocks
+            .get(position)
+            .ok_or(SegmentError::Malformed("no such block"))?;
+        let compressed = key
             .open_unit(
-                &unit_aad(&self.header_bytes, self.key, self.name, position as u32),
+                &unit_aad(&self.header_bytes, key, name, position as u32),
                 sealed,
             )
             .ok_or(SegmentError::Authentication)?;
@@ -431,18 +483,72 @@ impl<'a> Segment<'a> {
             .checked_sub(1)
     }
 
+    /// The one block that can hold the record with `seq`, if any.
+    pub fn block_for_seq(&self, seq: u64) -> Option<usize> {
+        self.index
+            .blocks
+            .partition_point(|entry| entry.first_seq <= seq)
+            .checked_sub(1)
+    }
+}
+
+/// A segment opened from all of its bytes: its header and index, decrypted. Blocks are read on
+/// demand from the bytes held.
+pub struct Segment<'a> {
+    bytes: &'a [u8],
+    layout: SegmentLayout,
+    pub header: SegmentHeader,
+    pub index: SegmentIndex,
+    key: &'a FrameKey,
+    name: &'a [u8],
+}
+
+impl<'a> Segment<'a> {
+    /// Opens a segment from its bytes under `name` and `key`. Reads the header and the index,
+    /// never a block.
+    pub fn open(bytes: &'a [u8], key: &'a FrameKey, name: &'a [u8]) -> Result<Self, SegmentError> {
+        if bytes.len() < 9 + FOOTER_LEN {
+            return Err(SegmentError::Malformed("not a segment"));
+        }
+        let size = bytes.len() as u64;
+        let header_end = SegmentLayout::header_end(bytes)?;
+        let header =
+            range(bytes, 0, header_end).ok_or(SegmentError::Malformed("header past the end"))?;
+        let (offset, len) = SegmentLayout::index_span(&bytes[bytes.len() - FOOTER_LEN..], size)?;
+        let sealed =
+            range(bytes, offset, len).ok_or(SegmentError::Malformed("index past the end"))?;
+        let layout = SegmentLayout::open(header, sealed, key, name)?;
+        Ok(Self {
+            bytes,
+            header: layout.header.clone(),
+            index: layout.index.clone(),
+            layout,
+            key,
+            name,
+        })
+    }
+
+    /// The records of block `position`.
+    pub fn block(&self, position: usize) -> Result<Vec<(u64, Record)>, SegmentError> {
+        let (offset, len) = self.layout.block_span(position)?;
+        let sealed =
+            range(self.bytes, offset, len).ok_or(SegmentError::Malformed("block past the end"))?;
+        self.layout.block(position, sealed, self.key, self.name)
+    }
+
+    /// See [`SegmentLayout::block_for_ordinal`].
+    pub fn block_for_ordinal(&self, ordinal: u64) -> Option<usize> {
+        self.layout.block_for_ordinal(ordinal)
+    }
+
     /// The record with `seq`, read from the one block that can hold it, or `None` when the
     /// segment has no such record.
     pub fn find(&self, seq: u64) -> Result<Option<Record>, SegmentError> {
-        let position = self
-            .index
-            .blocks
-            .partition_point(|entry| entry.first_seq <= seq);
-        if position == 0 {
+        let Some(position) = self.layout.block_for_seq(seq) else {
             return Ok(None);
-        }
+        };
         Ok(self
-            .block(position - 1)?
+            .block(position)?
             .into_iter()
             .find(|(found, _)| *found == seq)
             .map(|(_, record)| record))

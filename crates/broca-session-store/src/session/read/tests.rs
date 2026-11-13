@@ -32,6 +32,7 @@ cipher_tests!(
     records_from_a_seq_read_both_streams_sealed_and_open,
     a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history,
     ledger_tail_stops_before_older_segments_and_reads_the_open_log_once,
+    a_sealed_message_read_fetches_its_block_not_the_segment,
 );
 
 fn triple() -> SessionTriple {
@@ -242,6 +243,99 @@ fn every_message_reads_back_by_ordinal_after_two_cuts(cipher: Cipher) {
                 );
             }
         }
+    });
+}
+
+/// Text that zstd can't shrink, so a segment's size on storage is about its content's.
+fn noise(seed: u64, len: usize) -> String {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            char::from(b'a' + ((state >> 33) % 26) as u8)
+        })
+        .collect()
+}
+
+/// Reading one sealed message fetches the segment's layout (its first bytes, footer and index)
+/// and the one block that holds the message, never the whole segment; a second message of the
+/// same segment fetches only its block, since the session keeps the layout. A segment of a long
+/// session is tens of megabytes, so fetching it whole made every older-history page cost that.
+fn a_sealed_message_read_fetches_its_block_not_the_segment(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let mut cut = 0;
+        for n in 0..80u64 {
+            let id = format!("c{n}");
+            let first = 4 * n + 1;
+            let batches = vec![
+                vec![input(format!("ask {n}")), facts(first)],
+                vec![assistant(vec![call(&id)]), facts(first + 1)],
+                vec![reply(&id, noise(n, 6000))],
+                vec![
+                    assistant(vec![ContentBlock::Text {
+                        text: format!("answer {n}"),
+                    }]),
+                    facts(first + 3),
+                ],
+            ];
+            for (part, batch) in batches.into_iter().enumerate() {
+                let seq = session.append(&batch, true).await.unwrap();
+                if part == 0 && n == 70 {
+                    cut = seq;
+                }
+            }
+        }
+        let expected = session.conversation.messages.clone();
+        session.seal(Some(cut), 0).await.unwrap();
+        session.close().await.unwrap();
+        let segment = backend
+            .object_names(&addr())
+            .into_iter()
+            .filter(|name| name.ends_with("/t"))
+            .collect::<Vec<_>>();
+        assert_eq!(segment.len(), 1, "one transcript segment");
+        let segment_bytes =
+            crate::backend::SessionBackend::get_object(&backend, &addr(), &segment[0])
+                .await
+                .unwrap()
+                .unwrap()
+                .len();
+        assert!(segment_bytes > 200_000, "segment of {segment_bytes} bytes");
+
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        let before = backend.object_bytes_read();
+        let read = loaded.message(3).await.unwrap();
+        assert_eq!(read.as_ref(), Some(&expected[2]));
+        let first = backend.object_bytes_read() - before;
+        assert!(
+            first < segment_bytes / 4,
+            "the first read fetched {first} of the segment's {segment_bytes} bytes"
+        );
+
+        let (bytes, objects) = (backend.object_bytes_read(), backend.object_reads());
+        let read = loaded.message(200).await.unwrap();
+        assert_eq!(read.as_ref(), Some(&expected[199]));
+        let directory_pages = loaded.head().transcript_dir.as_ref().unwrap().level as usize + 1;
+        assert_eq!(
+            backend.object_reads() - objects,
+            directory_pages + 1,
+            "a later read fetches the directory pages and one block"
+        );
+        let second = backend.object_bytes_read() - bytes;
+        assert!(
+            second < 4 * crate::segment::BLOCK_TARGET,
+            "a later read fetched {second} bytes"
+        );
     });
 }
 
