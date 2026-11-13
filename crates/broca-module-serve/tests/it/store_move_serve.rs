@@ -325,6 +325,33 @@ async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
     rig.finish().await;
 }
 
+/// Move the session once its finished runs are settled. A run's usage export is written after
+/// the run ends, so a move right after a run may be refused `reconcile_owed` until the export
+/// lands; that refusal changes nothing, and any other refusal fails the test.
+async fn move_once_settled(rig: &mut Rig) -> Frame {
+    let mut moved = None;
+    broca_test_support::wait_for(
+        "the move goes through once the finished run's export is written",
+        async {
+            loop {
+                let again = rig
+                    .request(2, json!({"method": "session.move_to_store", "params": {}}))
+                    .await;
+                if again.header.ty == FrameType::Response {
+                    moved = Some(again);
+                    return;
+                }
+                let body: Value = serde_json::from_slice(&again.body).unwrap();
+                assert_eq!(body["detail"]["reason"], "reconcile_owed", "{body}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+        || "the move kept refusing reconcile_owed".to_owned(),
+    )
+    .await;
+    moved.unwrap()
+}
+
 #[tokio::test]
 async fn a_store_subscription_keeps_converted_message_and_tool_ids() {
     let mut rig = Rig::start_movable("store-subscribe-ids").await;
@@ -346,9 +373,7 @@ async fn a_store_subscription_keeps_converted_message_and_tool_ids() {
     assert_eq!(mids, ["m0", "m1", "m2", "m3"]);
 
     rig.bind_as(2, Some(subc_protocol::Principal::Direct)).await;
-    let moved = rig
-        .request(2, json!({"method": "session.move_to_store", "params": {}}))
-        .await;
+    let moved = move_once_settled(&mut rig).await;
     assert_eq!(result(&moved)["moved"], true);
     assert!(rig.wal_path.with_extension("moved").exists());
     let stored = result(&call(&mut rig, "session.read", json!({})).await);

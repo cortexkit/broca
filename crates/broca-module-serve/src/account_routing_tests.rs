@@ -470,10 +470,10 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
 }
 
 #[tokio::test]
-async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero_or_static_choices() {
+async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero() {
     let before = account_limit_hold_cap_unknown();
     let credential = CredentialId::parse("oauth:anthropic").unwrap();
-    for (unknown, pinned, expected) in [(false, false, 0), (true, true, 0), (true, false, 1)] {
+    for (unknown, pinned, expected) in [(false, false, 0), (true, false, 1)] {
         let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
         let client = client(&routing);
         choose_account(
@@ -666,12 +666,12 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
 // Paused clock with tokio's Instant: the budget is measured in virtual time, so the bound
 // checks the code's own waiting and not how promptly the host scheduled this test.
 #[tokio::test(start_paused = true)]
-async fn a_slow_listing_shares_the_admission_budget() {
+async fn a_slow_listing_shares_the_admission_budget_and_is_refused_as_unreachable() {
     let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
     let client = client(&routing);
     let static_credential = CredentialId::parse("oauth:anthropic").unwrap();
     let started = tokio::time::Instant::now();
-    let choice = choose_account(
+    let refusal = choose_account(
         &client,
         ChoiceInputs {
             account_route: None,
@@ -694,33 +694,43 @@ async fn a_slow_listing_shares_the_admission_budget() {
         tokio::time::Instant::now() + Duration::from_millis(200),
     )
     .await
-    .unwrap();
+    .unwrap_err();
     assert!(started.elapsed() < Duration::from_millis(700));
-    assert_eq!(path_of(&choice), "candidates_unknown");
-    assert!(routing.methods().is_empty());
-}
-
-#[tokio::test]
-async fn a_caller_pin_is_kept_and_routing_is_not_asked() {
-    let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
-    let client = client(&routing);
-    let choice = choose(&client, "oauth:anthropic:work", true, Some(two_accounts()))
-        .await
-        .unwrap();
-    assert_eq!(path_of(&choice), "pinned");
+    // No static fallback: without candidates there is nothing to offer, so the send is
+    // refused as transient and retried.
     assert_eq!(
-        choice.decision().unwrap().admission_id.as_deref(),
-        None,
-        "a static pin reserved no routing admission"
+        refusal,
+        ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable())
     );
     assert!(routing.methods().is_empty());
 }
 
+/// A caller's pin narrows the offer to the pinned account, and routing still admits it.
 #[tokio::test]
-async fn one_candidate_account_asks_nothing() {
-    let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
+async fn a_caller_pin_offers_only_the_pinned_account_to_routing() {
+    let routing = FakeRouting::choosing("acct-work", "oauth:anthropic:work");
     let client = client(&routing);
-    // Two records of ONE account are one candidate.
+    let pinned = listing(vec![
+        anthropic("oauth:anthropic:work", "acct-work"),
+        anthropic("oauth:anthropic:home", "acct-home"),
+    ]);
+    let choice = choose(&client, "oauth:anthropic:work", true, Some(pinned))
+        .await
+        .unwrap();
+    assert_eq!(path_of(&choice), "routed");
+    assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
+    assert_eq!(
+        routing.requests.lock().unwrap()[0]["params"]["candidates"]["accounts"],
+        json!([{"account_id":"acct-work","credential_id":"oauth:anthropic:work"}])
+    );
+}
+
+/// One account still asks: routing's blocks and caps apply to it like any other.
+#[tokio::test]
+async fn one_candidate_account_still_asks_routing() {
+    let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
+    let client = client(&routing);
+    // Two records of ONE account are one candidate account.
     let one = listing(vec![
         anthropic("oauth:anthropic", "acct-a"),
         anthropic("oauth:anthropic:again", "acct-a"),
@@ -728,19 +738,26 @@ async fn one_candidate_account_asks_nothing() {
     let choice = choose(&client, "oauth:anthropic", false, Some(one))
         .await
         .unwrap();
-    assert_eq!(path_of(&choice), "single_candidate");
-    assert!(routing.methods().is_empty());
+    assert_eq!(path_of(&choice), "routed");
+    assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
 }
 
+/// An API key with no pool, hint or decision asks routing too, offering every listed key.
 #[tokio::test]
-async fn an_api_key_run_without_hints_is_not_an_account_choice() {
-    let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
+async fn an_api_key_run_without_hints_asks_routing_with_every_key() {
+    let routing = api_key_router("apikey", "key-b");
     let client = client(&routing);
-    let choice = choose(&client, "apikey:anthropic", false, Some(two_accounts()))
+    let choice = choose(&client, "apikey:anthropic", false, Some(api_keys()))
         .await
         .unwrap();
-    assert_eq!(choice, AccountChoice::NotApplicable);
-    assert!(routing.methods().is_empty());
+    assert_eq!(path_of(&choice), "routed");
+    assert_eq!(
+        routing.requests.lock().unwrap()[0]["params"]["candidates"]["accounts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 fn api_keys() -> Arc<ScopedList> {
@@ -954,7 +971,7 @@ async fn apikey_routing_refuses_wrong_method_or_unloadable_pick() {
 }
 
 #[tokio::test]
-async fn apikey_unhinted_and_pinned_keep_the_exact_listed_vault_record() {
+async fn apikey_unhinted_asks_routing_and_pinned_keeps_the_exact_vault_record() {
     use crate::auth_routing::{resolve_credential_id, MethodConfig};
     use crate::vault_config::VaultAddressing;
     let cache = Arc::new(ListingCache::default());
@@ -1002,7 +1019,14 @@ async fn apikey_unhinted_and_pinned_keep_the_exact_listed_vault_record() {
             addressing.vault_id_for(&key).unwrap().as_deref(),
             Some(expected)
         );
-        assert!(routing.methods().is_empty());
+        if account.is_some() {
+            // A pinned paid key with no decision keeps the key without asking.
+            assert_eq!(path_of(&choice), "pinned");
+            assert!(routing.methods().is_empty());
+        } else {
+            // An unhinted key asks; here routing declines to select, so the key is static.
+            assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
+        }
     }
 }
 
@@ -2057,18 +2081,27 @@ async fn wait_for_reporter_release(routing: &Arc<FakeRouting>) {
 
 #[tokio::test]
 async fn static_key_limits_send_nothing_but_routed_limits_name_the_issued_admission() {
+    // A key is static only when routing declines to select (selection disabled): it was asked,
+    // but issued no admission, so a limit on that key reports nothing.
     for routed in [false, true] {
-        let routing = FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
-            "admission":{"id":"run-1","state":"reserved"},
-            "account":{"account_id":"key-b","credential_id":"key-b","method":"apikey"}
-        }}))
-        .unwrap())));
+        let routing = if routed {
+            FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
+                "admission":{"id":"run-1","state":"reserved"},
+                "account":{"account_id":"key-b","credential_id":"key-b","method":"apikey"}
+            }}))
+            .unwrap())))
+        } else {
+            FakeRouting::refusing(
+                SELECTION_DISABLED,
+                json!({ "code": SELECTION_DISABLED, "decision_id": "acd-disabled" }),
+            )
+        };
         let client = Arc::new(client(&routing));
         let choice = choose_api_key(
             &client,
             routed.then_some("key-pool"),
             None,
-            !routed,
+            false,
             Some(api_keys()),
         )
         .await
@@ -2097,7 +2130,7 @@ async fn static_key_limits_send_nothing_but_routed_limits_name_the_issued_admiss
             assert!(reports.is_empty(), "static-key reports: {reports:?}");
             assert!(!started);
             assert_eq!(decision.admission_id, None);
-            assert!(routing.methods().is_empty());
+            assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
         }
     }
 }

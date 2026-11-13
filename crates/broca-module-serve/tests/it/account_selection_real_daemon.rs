@@ -38,7 +38,14 @@ fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
 
 #[derive(Clone)]
 enum RoutingMode {
+    /// Choose this account when broca offered it, else the first offered one, as routing
+    /// chooses only among the offer. Refuse `no_route` when nothing is offered.
     Choose {
+        account_id: &'static str,
+        credential_id: &'static str,
+    },
+    /// Answer this account even when broca didn't offer it, as a faulty routing module might.
+    ChooseUnoffered {
         account_id: &'static str,
         credential_id: &'static str,
     },
@@ -192,7 +199,12 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
             RoutingMode::Choose {
                 account_id,
                 credential_id,
+            }
+            | RoutingMode::ChooseUnoffered {
+                account_id,
+                credential_id,
             } => {
+                let unoffered = matches!(mode, RoutingMode::ChooseUnoffered { .. });
                 // A repeated admission id replays its committed decision when the identity
                 // matches and is a conflict when it does not, as routing does.
                 let identity = admission_identity(&request["params"]);
@@ -211,14 +223,57 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
                         }
                     };
                 }
+                // Like routing, choose only among the offered accounts: the configured account
+                // when broca offered it, else the first offered one. Every run asks, so a run
+                // with one account offers just that one.
+                let offered = request["params"]["candidates"]["accounts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let configured = unoffered
+                    || offered.iter().any(|candidate| {
+                        candidate["account_id"] == account_id
+                            && candidate["credential_id"] == credential_id
+                    });
+                if offered.is_empty() && !unoffered {
+                    return subc_client_rs::HandlerOutcome::ErrorWithDetail {
+                        code: "no_route".into(),
+                        message: "no account was offered".into(),
+                        detail: json!({ "code": "no_route", "retry_after_s": null,
+                            "decision_id": "acd-none", "exclusions": [] }),
+                    };
+                }
+                let (account_id, credential_id, provider) = match offered.first() {
+                    Some(first) if !configured => (
+                        first["account_id"].as_str().unwrap_or_default().to_owned(),
+                        first["credential_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        request["params"]["provider"]
+                            .as_str()
+                            .unwrap_or("anthropic")
+                            .to_owned(),
+                    ),
+                    _ => (
+                        account_id.to_owned(),
+                        credential_id.to_owned(),
+                        "anthropic".to_owned(),
+                    ),
+                };
+                let method = credential_id
+                    .split(':')
+                    .next()
+                    .unwrap_or("oauth")
+                    .to_owned();
                 let reply = json!({ "result": {
                     "admission": { "id": admission, "state": "reserved" },
                     "account": {
-                        "provider": "anthropic",
+                        "provider": provider,
                         "account_id": account_id,
                         "credential_id": credential_id,
-                        "refresh_adapter": "anthropic",
-                        "method": "oauth",
+                        "refresh_adapter": provider,
+                        "method": method,
                     },
                     "pin": { "id": "pin-e2e", "generation": 1, "mode": "run_frozen" },
                     "reason": { "code": "cold_best", "decision_id": "acd-e2e", "policy_version": 2 },
@@ -394,6 +449,7 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "state": "active",
                         "record_version": 1,
                         "operations": ["read"],
+                        "account_id": "acct-m",
                     }),
                     json!({
                         "id": "apikey:xai",
@@ -2222,9 +2278,9 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
         .await;
     assert_eq!(rig.routing.account_for_count(&run_id), 1);
 
-    // 3. A caller pin wins: routing is neither asked nor told. broca holds no routing admission
-    // for a pinned run, so its frozen decision carries no admission id and routing gets no
-    // admission_started, attempt or run_finished report for it.
+    // 3. A caller pin narrows the offer to the pinned account, and routing still admits it:
+    // routing is asked once, with that account alone, and gets the run's reports like any
+    // other admission.
     let client = rig.client("pinned").await;
     let pinned_mark = rig.routing.requests.lock().unwrap().len();
     let run_id = send(
@@ -2234,27 +2290,28 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
             pool: None,
             credential_id: None,
             method: "oauth".into(),
-            account: Some("work".into()),
+            account: Some("spare".into()),
         }),
     )
     .await;
     let frames = rig.finished("pinned").await;
     let chosen = selection(&frames);
-    assert_eq!(chosen["credential_id"], "oauth:anthropic:work");
+    assert_eq!(chosen["credential_id"], "oauth:anthropic:spare");
     assert_eq!(
         chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "pinned" })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e" })
     );
-    let reported = rig.reported_since(pinned_mark).await;
-    assert!(
-        reported.is_empty(),
-        "a pinned run is never reported to routing: {reported:?}"
-    );
+    let offered: Vec<Value> = rig.routing.requests.lock().unwrap()[pinned_mark..]
+        .iter()
+        .filter(|request| request["method"] == "route.account_for")
+        .map(|request| request["params"]["candidates"]["accounts"].clone())
+        .collect();
     assert_eq!(
-        rig.routing.account_for_count(&run_id),
-        0,
-        "a pinned send never asks routing"
+        offered,
+        [json!([{"account_id": "acct-s", "credential_id": "oauth:anthropic:spare"}])]
     );
+    rig.reports(&run_id, &["admission_started", "attempt", "run_finished"])
+        .await;
 
     // 4. A routing refusal refuses the send: typed, nothing written, nothing reported after.
     rig.routing.set(RoutingMode::Refuse {
@@ -2594,7 +2651,7 @@ async fn routing_unavailable_refuses_the_send_with_its_reference_reply() {
         ),
         (
             // A credential broca never offers for an anthropic oauth send.
-            RoutingMode::Choose {
+            RoutingMode::ChooseUnoffered {
                 account_id: "acct-x",
                 credential_id: "apikey:xai",
             },
@@ -4194,6 +4251,8 @@ async fn meta_subscription_quota_status_matches_golden_through_real_serve() {
     assert_eq!(value["error"]["provider_code"], "account_limit_exhausted");
     assert_eq!(value["error"]["status"], 429);
     assert_eq!(value["error"]["credential_id"], "oauth:meta");
+    // The run's account reference comes from the vault's read of the credential, which this
+    // rig's Meta record answers without one.
     assert!(value["error"].get("account_ref").is_none());
     assert_eq!(value["error"]["resets_at_ms"], 1_792_972_800_000_u64);
     assert_eq!(value["error"]["resets_at_source"], "body");
@@ -4205,7 +4264,7 @@ async fn meta_subscription_quota_status_matches_golden_through_real_serve() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn paused_auth_pinned_status_reports_the_frozen_pin() {
+async fn paused_auth_pinned_status_reports_the_pinned_account() {
     let Some(rig) = Rig::start().await else {
         return;
     };
@@ -4235,9 +4294,10 @@ async fn paused_auth_pinned_status_reports_the_frozen_pin() {
             )
         })
         .await;
-    assert_eq!(selection(&frames)["account_decision"]["path"], "pinned");
+    // A pin narrows routing's offer to the pinned account; routing still admits it.
+    assert_eq!(selection(&frames)["account_decision"]["path"], "routed");
     let status = broca_test_support::wait_until(
-        "paused_auth_pinned_status_reports_the_frozen_pin: run status",
+        "paused_auth_pinned_status_reports_the_pinned_account: run status",
         || async {
             let status = client.run_status(&run_id).await.unwrap();
             if matches!(status, broca_wire::RunStatusResponse::Paused { .. }) {
@@ -4250,7 +4310,7 @@ async fn paused_auth_pinned_status_reports_the_frozen_pin() {
     .await;
     assert_eq!(
         serde_json::to_value(status).unwrap()["auth"],
-        json!({"credential_id": "oauth:anthropic:spare", "path": "pinned"})
+        json!({"credential_id": "oauth:anthropic:spare", "path": "routed"})
     );
 }
 

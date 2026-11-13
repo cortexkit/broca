@@ -1078,8 +1078,15 @@ impl Rig {
         } else {
             None
         };
+        // A move refuses a session that owes a usage export, so a movable rig writes exports the
+        // way the module does: one fact per finished run, into the run index's export table.
         let opener = match &runtime {
-            Some(runtime) => opener.with_store_runtime(runtime.clone()),
+            Some(runtime) => opener
+                .with_store_runtime(runtime.clone())
+                .with_export_index(store.clone())
+                .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
+                    (broca_core::ChargeBasis::Unknown, 1)
+                })),
             None => opener,
         };
         #[cfg(feature = "test-clock")]

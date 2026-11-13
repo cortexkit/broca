@@ -915,6 +915,39 @@ impl Candidates {
         }
     }
 
+    /// The one row of `listing` a caller pinned by its credential id, if it is a credential of
+    /// `method`. The id names the row exactly, so its provider metadata is not consulted: a
+    /// pinned key may be listed under another provider id that serves the same models.
+    pub fn pinned(listing: &ScopedList, method: AuthMethod, credential_id: &str) -> Self {
+        let accounts = listing
+            .credentials
+            .iter()
+            .filter(|row| {
+                row.id == credential_id
+                    && row.state == "active"
+                    && row.auth_method.as_deref() == Some(method.as_token())
+            })
+            .filter_map(|row| {
+                let account_id = match method {
+                    AuthMethod::ApiKey => {
+                        Some(row.account_id.clone().unwrap_or_else(|| row.id.clone()))
+                    }
+                    AuthMethod::Oauth | AuthMethod::Antigravity | AuthMethod::Chatgpt => {
+                        row.account_id.clone()
+                    }
+                }?;
+                Some(Candidate {
+                    account_id,
+                    credential_id: row.id.clone(),
+                })
+            })
+            .collect();
+        Self {
+            view_digest: listing.view.clone(),
+            accounts,
+        }
+    }
+
     /// Whether routing's pick is one of these candidates, account and credential together.
     pub fn offers(&self, account_id: &str, credential_id: &str) -> bool {
         self.accounts.iter().any(|candidate| {
@@ -1567,8 +1600,9 @@ impl RoutingClient {
 /// How a fresh run's account was chosen, before its credential is read.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccountChoice {
-    /// Routing has nothing to say about this run: no vault, an unlisted method, or an API key
-    /// without a pool, hint or decision. No decision is recorded.
+    /// Routing has nothing to say about this run: no vault or no routing is configured, the
+    /// run continues one already admitted (it keeps that admission's account), or a test base
+    /// URL replaces the provider. No decision is recorded.
     NotApplicable,
     /// Use the static pick; record `decision`.
     Static(AccountDecision),
@@ -1718,7 +1752,14 @@ where
             class: classify_refusal("invalid_request"),
         }));
     }
-    if inputs.caller_named_account && inputs.decision_id.is_none() && !hinted {
+    // One exception for now: a caller that pins a paid key with no routing decision keeps it
+    // without asking. Routing won't spend a paid key on a model subscriptions also serve unless
+    // a decision names the key, and it can't yet tell such a pin from an unhinted key run.
+    if method == AuthMethod::ApiKey
+        && inputs.caller_named_account
+        && inputs.decision_id.is_none()
+        && !hinted
+    {
         client.counters.bump("pinned");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_PINNED,
@@ -1726,41 +1767,22 @@ where
             None,
         )));
     }
-    // Unpooled API keys retain the configured mapping, even if other keys are listed.
-    // A routing decision or an explicit hint is what opts an API-key run into allocation.
-    if method == AuthMethod::ApiKey && !hinted && inputs.decision_id.is_none() {
-        return Ok(AccountChoice::NotApplicable);
-    }
+    // Every other run asks routing, whatever its method and however many accounts serve it,
+    // so routing's account blocks, the quota it keeps free on each account and its concurrency
+    // caps apply to every run it admits. There is no static fallback: no listing within the budget is a transient refusal, and routing's
+    // own refusal is a wait, never a cue to use an account anyway.
     let Ok(Some(listing)) = tokio::time::timeout_at(deadline, listing).await else {
-        if inputs.decision_id.is_some() || hinted {
-            return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
-        }
-        client.counters.bump("candidates_unknown");
-        tracing::warn!(
-            target: "accounts",
-            "no vault listing within the admission budget; run {} takes the static {} account",
-            inputs.run_id,
-            inputs.static_credential.to_id_string()
-        );
-        return Ok(AccountChoice::Static(decision(
-            broca_wal::ACCOUNT_DECISION_CANDIDATES_UNKNOWN,
-            Some(admission),
-            None,
-        )));
+        return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
     };
-    let candidates = if method == AuthMethod::ApiKey {
+    let candidates = if inputs.caller_named_account && inputs.decision_id.is_none() && !hinted {
+        // A caller that names its account offers routing that account alone: routing still
+        // admits the run, so a pinned run is under the same blocks as any other.
+        Candidates::pinned(&listing, method, &inputs.static_credential.to_id_string())
+    } else if method == AuthMethod::ApiKey {
         Candidates::api_keys(&listing, provider)
     } else {
         Candidates::from_listing(&listing, method, provider)
     };
-    if candidates.distinct_accounts() <= 1 && inputs.decision_id.is_none() && !hinted {
-        client.counters.bump("single_candidate");
-        return Ok(AccountChoice::Static(decision(
-            broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE,
-            Some(admission),
-            None,
-        )));
-    }
     let params = account_for_params(&AccountForRequest {
         account_route: inputs.account_route,
         decision_id: inputs.decision_id,
