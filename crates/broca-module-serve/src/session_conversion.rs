@@ -125,6 +125,10 @@ pub struct Engine {
     archive_inventory: Arc<Mutex<ArchiveInventory>>,
     directories: Arc<Mutex<crate::store_move::PublicationDirs>>,
     pass: Arc<tokio::sync::Mutex<()>>,
+    /// Held while an archive member decides whether its container is ready to move to backup
+    /// and moves it. Members of one container convert in parallel, so without it two members
+    /// finishing together could both find every member done and both move the container.
+    containers: Arc<Mutex<()>>,
     parallelism: usize,
     #[cfg(test)]
     pub(crate) crash: Option<&'static str>,
@@ -264,6 +268,7 @@ impl Engine {
             archive_inventory: Arc::default(),
             directories: Arc::default(),
             pass: Arc::default(),
+            containers: Arc::default(),
             parallelism: parallel::DAEMON_WORKERS,
             inventory,
             #[cfg(test)]
@@ -1362,11 +1367,20 @@ impl Engine {
     }
 
     fn backup_ready(&self, source: &Source) -> Result<(), Failure> {
+        let _container = source
+            .member
+            .is_some()
+            .then(|| self.containers.lock().unwrap_or_else(|p| p.into_inner()));
         if source.member.is_some() && self.ledger.unfinished_path(&source.path).map_err(io)? {
             return Ok(());
         }
         let mut rows = if source.member.is_some() {
-            self.ledger.rows_for_path(&source.path).map_err(io)?
+            let rows = self.ledger.rows_for_path(&source.path).map_err(io)?;
+            // Another member already finished the container's move.
+            if rows.iter().all(|row| row.step == "done") {
+                return Ok(());
+            }
+            rows
         } else {
             vec![self
                 .ledger

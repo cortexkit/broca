@@ -114,9 +114,14 @@ impl Drop for CancelOnDrop {
     }
 }
 
-// Moving an archive container to backup also removes its members' staging directories,
-// including directories named by completed rows. Include every ledger row when connecting
-// paths, backups and addresses. Transitive groups keep overlapping archive snapshots newest-first.
+// Sources that share a session address, a live log's path or a live log's backup convert one
+// after another, in queue order; every other pair may convert at once. Members of one archive
+// container share its path and backup but not their sessions, so they convert in parallel:
+// only the container's move to backup needs every member finished, and the last member to
+// finish makes that move under the engine's container lock (`Engine::backup_ready`). A
+// session snapshotted in several containers is one group, so overlapping snapshots still
+// convert newest-first. Every ledger row is included, completed ones too, so a pending source
+// joins the group of a finished row that shares its address.
 fn pending_work(engine: &Engine, sources: Vec<Source>) -> Result<VecDeque<Work>, String> {
     let rows = engine.ledger.rows()?;
     let mut parents: Vec<_> = (0..rows.len()).collect();
@@ -130,7 +135,11 @@ fn pending_work(engine: &Engine, sources: Vec<Source>) -> Result<VecDeque<Work>,
     }
     for (index, row) in rows.iter().enumerate() {
         let source = &row.source;
-        let mut keys = vec![(0, source.path.clone()), (1, source.backup.clone())];
+        let mut keys = Vec::new();
+        if source.member.is_none() {
+            keys.push((0, source.path.clone()));
+            keys.push((1, source.backup.clone()));
+        }
         if let Some(address) = source_address(source) {
             keys.push((2, address));
         }
@@ -408,7 +417,7 @@ mod tests {
         let third = source("wal/a.wal", None);
         let independent = source("wal/c.wal", None);
         let mut shared_backup = source("wal/d.wal", None);
-        shared_backup.backup = first.backup.clone();
+        shared_backup.backup = independent.backup.clone();
         for source in [
             &completed,
             &first,
@@ -428,8 +437,8 @@ mod tests {
             vec![
                 completed,
                 first.clone(),
-                second,
-                third,
+                second.clone(),
+                third.clone(),
                 independent.clone(),
                 shared_backup,
                 first.clone(),
@@ -442,17 +451,23 @@ mod tests {
             "completed and duplicate sources are not admitted"
         );
         let groups: Vec<_> = pending.iter().map(|work| work.group).collect();
-        assert_eq!(groups[0], groups[1]);
+        // Members of one container are different sessions: `first` shares fold-2000 with
+        // the completed member `a` but no session, so it is free of `a`'s group.
+        assert_ne!(groups[0], groups[1]);
+        // Session `a` is one group across containers and its live log, completed row too.
         assert_eq!(groups[1], groups[2]);
-        assert_eq!(groups[0], groups[4]);
+        // Live logs sharing a backup convert one after another.
+        assert_eq!(groups[3], groups[4]);
         assert_ne!(groups[0], groups[3]);
         let scheduler = Scheduler::default();
         scheduler.queue.lock().unwrap().set_work(pending);
         let stopping = CancellationToken::new();
-        let active = scheduler.next(&stopping).unwrap();
-        assert_eq!(active.source, first);
+        assert_eq!(scheduler.next(&stopping).unwrap().source, first);
+        let snapshot = scheduler.next(&stopping).unwrap();
+        assert_eq!(snapshot.source, second);
         assert_eq!(scheduler.next(&stopping).unwrap().source, independent);
-        scheduler.finish(active.group);
-        assert_eq!(scheduler.next(&stopping).unwrap().group, active.group);
+        // `a`'s live log waits for its snapshot.
+        scheduler.finish(snapshot.group);
+        assert_eq!(scheduler.next(&stopping).unwrap().source, third);
     }
 }

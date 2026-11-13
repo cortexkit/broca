@@ -385,7 +385,7 @@ async fn concurrent_conversion_failed_session_keeps_its_row_and_others_convert()
 }
 
 #[tokio::test]
-async fn concurrent_conversion_archive_containers_parallelize_but_members_never_overlap() {
+async fn concurrent_conversion_converts_one_containers_members_together_and_moves_it_once() {
     let rig = Rig::start("parallel-containers").await;
     let sessions = identities(4);
     write_sessions(&rig, &sessions);
@@ -438,18 +438,23 @@ async fn concurrent_conversion_archive_containers_parallelize_but_members_never_
     };
     entered(&gate, 2).await;
     let first = gate.sources.lock().unwrap().clone();
-    assert_ne!(
+    // The queue holds one container's members first; they are different sessions, so both
+    // workers take them at once rather than one container each.
+    assert_eq!(
         first[0].path, first[1].path,
-        "only independent containers can enter together"
+        "members of one container convert together"
     );
+    assert_ne!(first[0].member, first[1].member);
+    assert!(gate.overlap.load(Ordering::Relaxed));
     assert!(
         broca_core::lease::acquire_archive_pass(&rig.dir).is_err(),
         "external folds remain excluded"
     );
+    // Released together, the members of each container finish together; the container's
+    // lock lets exactly one of them move it, after both are done.
     gate.release.add_permits(4);
     task.await.unwrap().unwrap();
     assert_eq!(gate.sources.lock().unwrap().len(), 4);
-    assert!(!gate.overlap.load(Ordering::Relaxed));
     assert!(gate
         .active
         .lock()
