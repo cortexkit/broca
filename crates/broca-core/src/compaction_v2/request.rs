@@ -95,7 +95,12 @@ pub async fn prepare(
     setup.applied_view = view.as_ref().map(View::applied);
     setup.newest = views::newest(at.entries);
     runtime.observe(at.entries);
-    if !runtime.ensure_setup(plane, &setup).await && view.is_none() {
+    // With no view to fall back on, an unanswered Setup is waited out for a bounded time before
+    // the run ends; a refused one ends it at once.
+    if !runtime.ensure_setup(plane, &setup).await
+        && view.is_none()
+        && !runtime.wait_out_unanswered_setup(plane, &setup).await
+    {
         return Ok(Prepared::CompactionUnavailable);
     }
     // A resumed step that already applied a view keeps exactly the bytes it may have sent, so

@@ -830,29 +830,34 @@ async fn compaction_v2_unfinished_old_plan_refuses_without_writes_but_completed_
     );
 }
 
-#[tokio::test]
+/// A provider that never answers Setup is waited out for `UNANSWERED_SETUP_WAIT`, re-sending
+/// Setup meanwhile; then the run ends before any model call, and the next send sets up again.
+#[tokio::test(start_paused = true)]
 async fn compaction_v2_unavailable_setup_ends_before_the_model_and_retries_next_send() {
     let shared = Shared::default();
     let plane = Arc::new(Plane {
         unavailable: true,
         ..Default::default()
     });
+    let started = tokio::time::Instant::now();
     let (result, model) = drive(&shared, plane.clone()).await;
+    assert!(started.elapsed() >= v2::runtime::UNANSWERED_SETUP_WAIT);
     assert_eq!(
         result.unwrap().reason,
         broca_protocol::RunFinishReason::Error
     );
     assert!(model.0.calls().is_empty());
     assert!(shared.records().iter().any(|record| matches!(record, WalRecord::RunFinished { error:Some(error), .. } if error.provider_code.as_deref() == Some("compaction_unavailable"))));
-    assert_eq!(
+    assert!(
         plane
             .calls
             .lock()
             .unwrap()
             .iter()
             .filter(|(method, _)| method == "compaction.setup")
-            .count(),
-        1
+            .count()
+            > 1,
+        "an unanswered Setup is sent again before the run ends"
     );
     let resumed = Shared::with_records(
         shared

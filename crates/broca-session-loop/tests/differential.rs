@@ -10239,7 +10239,7 @@ async fn crash_at_any_point_of_the_enrolling_run() {
     assert!(crashes > 3, "the run crashed at several points: {crashes}");
 }
 
-/// A compaction provider whose first Setup fails: the run that asks ends unavailable.
+/// A compaction provider that refuses its first Setup: the run that asks ends unavailable.
 struct SetupFailsOnce {
     inner: CompactionSpy,
     failed: std::sync::atomic::AtomicBool,
@@ -10278,7 +10278,15 @@ impl broca_core::CompactionPlane for SetupFailsOnce {
                 .lock()
                 .unwrap()
                 .push((method.into(), params));
-            return Err(broca_core::compaction_v2::runtime::CallError::Unavailable);
+            // A refused Setup ends a run with no view at once; an unanswered one would be
+            // re-sent within the run instead (compaction_v2's own tests cover that).
+            return Err(broca_core::compaction_v2::runtime::CallError::Refused(
+                broca_core::compaction_v2::protocol::wire::Refusal::new(
+                    "unknown_preset",
+                    "refused",
+                    None,
+                ),
+            ));
         }
         self.inner
             .call_v2(module, bind, scope, method, params, deadline)
@@ -10290,8 +10298,8 @@ impl broca_core::CompactionPlane for SetupFailsOnce {
     }
 }
 
-/// A failed Setup on the enrolling run ends it `compaction_unavailable`, never in the old
-/// layout: the session stays enrolled, and the next send asks for Setup again and runs on.
+/// A refused Setup on the enrolling run ends it `compaction_unavailable`; the session stays
+/// enrolled, and the next send asks for Setup again and runs on.
 #[tokio::test]
 async fn a_failed_setup_ends_the_enrolling_run_and_the_next_send_retries_it() {
     in_each_cipher(|| async {

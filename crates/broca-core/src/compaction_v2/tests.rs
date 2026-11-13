@@ -919,15 +919,23 @@ impl runtime::Plane for RecordingPlane {
         params: serde_json::Value,
     ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
         self.calls.lock().unwrap().push((method.into(), params));
-        serde_json::value::to_raw_value(
-            &self
-                .answers
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("scripted answer"),
-        )
-        .map_err(|_| runtime::CallError::Unavailable)
+        let answer = self
+            .answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted answer");
+        // Scripted failures: `{"unanswered": true}` is a call that got no answer (the provider
+        // unreachable or too slow), `{"refused": code}` the provider's refusal.
+        if answer["unanswered"] == true {
+            return Err(runtime::CallError::Unavailable);
+        }
+        if let Some(code) = answer["refused"].as_str() {
+            return Err(runtime::CallError::Refused(
+                super::protocol::wire::Refusal::new(code, "refused", None),
+            ));
+        }
+        serde_json::value::to_raw_value(&answer).map_err(|_| runtime::CallError::Unavailable)
     }
 }
 
@@ -2571,6 +2579,103 @@ async fn compaction_v2_request_setup_failure_stops_before_even_rendering_model_i
             .collect::<Vec<_>>(),
         ["compaction.setup"]
     );
+}
+
+/// The methods `plane` was called with, in order.
+fn methods(plane: &RecordingPlane) -> Vec<String> {
+    plane
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect()
+}
+
+/// Prepares one step of a one-message session with no applied view on `plane`.
+async fn prepare_first_step(plane: &RecordingPlane) -> super::request::Prepared {
+    let messages = vec![text(Role::User, "question")];
+    let entries = project(&messages, &facts(1), &Deliveries::new(), true);
+    let state = tokio::sync::Mutex::new(state::State::default());
+    let conditions = conditions();
+    let current = send_context();
+    super::request::prepare(
+        &state,
+        &runtime::Runtime::default(),
+        &MemoryJournal::default(),
+        plane,
+        request_at(&messages, &entries, &conditions, &current),
+        |_| panic!("no image"),
+        text_estimate,
+    )
+    .await
+    .unwrap()
+}
+
+/// A Setup that gets no answer, as while the compaction provider restarts with the daemon, is
+/// sent again after a pause instead of ending a run that has no view: here the provider answers
+/// the third Setup, 3 s later, and the step goes ahead. Before, the first unanswered Setup ended
+/// the run `compaction_unavailable`, which lost workers resumed at a daemon restart.
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_an_unanswered_setup_is_sent_again_until_the_provider_answers() {
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"unanswered": true}),
+        json!({"unanswered": true}),
+        json!({"answer": "ready"}),
+    ]);
+    let started = tokio::time::Instant::now();
+    let outcome = prepare_first_step(&plane).await;
+    assert!(
+        matches!(outcome, super::request::Prepared::Ready { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        methods(&plane),
+        ["compaction.setup", "compaction.setup", "compaction.setup"]
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+}
+
+/// A refused Setup still ends a run with no view at once, with no second Setup (contract
+/// W1.3a); only an unanswered one is waited out.
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_a_refused_setup_ends_the_run_without_waiting() {
+    let plane = RecordingPlane::default();
+    plane
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(json!({"refused": "unknown_preset"}));
+    let started = tokio::time::Instant::now();
+    let outcome = prepare_first_step(&plane).await;
+    assert!(matches!(
+        outcome,
+        super::request::Prepared::CompactionUnavailable
+    ));
+    assert_eq!(methods(&plane), ["compaction.setup"]);
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+}
+
+/// A provider that never answers ends the run `compaction_unavailable` once the wait is over,
+/// never later.
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_a_setup_that_never_answers_ends_the_run_after_the_wait() {
+    let plane = RecordingPlane::default();
+    plane
+        .answers
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(json!({"unanswered": true}), 64));
+    let started = tokio::time::Instant::now();
+    let outcome = prepare_first_step(&plane).await;
+    assert!(matches!(
+        outcome,
+        super::request::Prepared::CompactionUnavailable
+    ));
+    assert_eq!(started.elapsed(), runtime::UNANSWERED_SETUP_WAIT);
+    let setups = methods(&plane).len();
+    assert!((10..20).contains(&setups), "{setups} Setups");
 }
 
 #[tokio::test]

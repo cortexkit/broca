@@ -26,6 +26,15 @@ use super::{received::ReceivedView, views};
 
 pub const CALL_DEADLINE: Duration = Duration::from_secs(2);
 pub const COLD_RIDE_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a run with no applied view keeps re-sending a Setup that got no answer before it
+/// ends `compaction_unavailable`. When the daemon restarts every module, broca resumes its runs
+/// while the provider may still be starting; it answers again within seconds. A refused Setup
+/// is never re-sent within the run.
+pub const UNANSWERED_SETUP_WAIT: Duration = Duration::from_secs(120);
+/// The pause before each re-send of an unanswered Setup doubles from this, up to
+/// [`UNANSWERED_SETUP_MAX_PAUSE`].
+const UNANSWERED_SETUP_FIRST_PAUSE: Duration = Duration::from_secs(1);
+const UNANSWERED_SETUP_MAX_PAUSE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub enum CallError {
@@ -257,6 +266,10 @@ struct Lane {
     /// didn't declare `compaction-statement-seq/v1`, or no epoch could be minted; the lane then
     /// sends neither the epoch nor the stamp, because a stamp alone is dropped by the provider.
     statement_epoch: Option<String>,
+    /// The latest Setup got no answer (no route to the provider, no reply in time, a reply that
+    /// didn't decode), as opposed to a refusal or an answer other than `ready`. Only such a
+    /// Setup is worth sending again within the run: the provider may be restarting.
+    setup_unanswered: bool,
 }
 
 impl Default for Lane {
@@ -264,6 +277,7 @@ impl Default for Lane {
         Self {
             seq: 0,
             ready: false,
+            setup_unanswered: false,
             setup_due: true,
             detects_cache_expired: false,
             signed_floor_declared: false,
@@ -507,6 +521,46 @@ impl Runtime {
         }
     }
 
+    /// For a run with no applied view, whose Setup just failed: while the failure was an
+    /// unanswered Setup, sends it again after a pause that doubles from 1 s to 10 s, for at most
+    /// [`UNANSWERED_SETUP_WAIT`], and answers whether one was accepted. A refused Setup, or any
+    /// answer other than `ready`, ends the wait at once (compaction contract W1.3a): only the
+    /// provider being unreachable, such as while it restarts, is waited out. The lane stays held
+    /// throughout, so the session's notices wait behind the Setup as they would behind one call.
+    pub async fn wait_out_unanswered_setup(
+        &self,
+        plane: &dyn Plane,
+        request: &SetupRequest,
+    ) -> bool {
+        let mut lane = self.lane.lock().await;
+        let until = tokio::time::Instant::now() + UNANSWERED_SETUP_WAIT;
+        let mut pause = UNANSWERED_SETUP_FIRST_PAUSE;
+        let mut attempts = 0u32;
+        while !lane.ready && lane.setup_unanswered {
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                tracing::warn!(
+                    target: "broca.compaction",
+                    attempts,
+                    "compaction provider still gave no Setup answer after {} s; the run ends compaction_unavailable",
+                    UNANSWERED_SETUP_WAIT.as_secs()
+                );
+                return false;
+            }
+            tokio::time::sleep(pause.min(until - now)).await;
+            pause = (pause * 2).min(UNANSWERED_SETUP_MAX_PAUSE);
+            attempts += 1;
+            if self.setup_on(&mut lane, plane, request).await {
+                tracing::info!(
+                    target: "broca.compaction",
+                    attempts,
+                    "compaction provider accepted Setup after it had given no answer"
+                );
+            }
+        }
+        lane.ready
+    }
+
     /// Acquiring the lane first waits for the in-flight notice. Then every
     /// pending batch is sent before the ride may use this same lane (N3).
     pub async fn flush(
@@ -722,6 +776,7 @@ async fn setup(
     }
     let answer: Result<SetupAnswer, _> =
         call(plane, "compaction.setup", &request, CALL_DEADLINE).await;
+    lane.setup_unanswered = matches!(answer, Err(CallError::Unavailable));
     lane.ready = match answer {
         Ok(SetupAnswer::Ready) => true,
         Ok(_) => {
