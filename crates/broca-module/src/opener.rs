@@ -568,14 +568,16 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             {
                 return Err(OpenError::NotServedOnNewStorage { feature });
             }
+            // A session marked for the new storage starts nowhere else: while the storage's key
+            // hasn't loaded (the first seconds after a start), its creating send is refused as
+            // retryable. Started in today's storage instead, it would stay there, since every
+            // later open finds its log there, and today's storage refuses plan members (such as
+            // `readers`) that the new storage serves.
             let store = match (held, creating) {
                 (Some(store), _) => Some(store),
-                (None, Some(creation)) => match slot.creating_runtime() {
+                (None, Some(_)) => match slot.creating_runtime() {
                     Some(runtime) => Some(runtime),
-                    None if matches!(creation, StoreCreation::Head { .. }) => {
-                        return Err(crate::store_open::key_unavailable(slot.key_id()));
-                    }
-                    None => None,
+                    None => return Err(crate::store_open::key_unavailable(slot.key_id())),
                 },
                 (None, None) => None,
             };

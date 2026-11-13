@@ -3,9 +3,9 @@
 //!
 //! # Admission
 //!
-//! A fresh run whose credential method is a subscription account (`oauth`, `chatgpt`) and whose
-//! provider has more than one candidate account in broca's latest vault listing asks routing
-//! (`route.account_for`) which account to use, before `RunStarted` is written. A candidate is
+//! Every fresh run asks routing (`route.account_for`) which account to use, before its start
+//! record is written, whatever its sign-in method and however many accounts serve it; the one
+//! exception is a caller that pins an API key with no routing decision or hint. A candidate is
 //! a listed credential whose vault metadata names this provider in `provider_ids` and this
 //! method as its `auth_method`; a credential id is an opaque record name and is never parsed
 //! for either. A listed credential missing either field is unmapped: it is never offered, is
@@ -24,13 +24,11 @@
 //!   [`classify_refusal`]. An account refusal writes no run records; the session's lineage
 //!   record may still be initialized.
 //!
-//! API keys opt into routing when the send carries a pool, credential hint or decision id.
-//! Their vault listing need not carry a login account id. Only active, readable API keys for
-//! the credential provider (or legacy rows with no provider ids) can satisfy the answer.
-//! An unpooled API-key send keeps its configured static credential without a routing call.
+//! An API key's vault listing need not carry a login account id. Only active, readable API keys
+//! for the credential provider (or legacy rows with no provider ids) can satisfy the answer.
 //!
-//! A caller that names an account keeps it and routing is not asked: routing's
-//! `requested_account` is a preference it may overrule, and a caller's pin must win.
+//! A caller that names an account offers routing that account alone, so the pinned run is
+//! still admitted under routing's blocks and caps.
 //!
 //! # Reports
 //!
@@ -1716,14 +1714,16 @@ where
         .or(inputs.inherited_conversation_key)
         .unwrap_or(&derived);
     let decision = |path: &str, admission_id, decision_id| {
-        // Only a runner-owned account_for allocation grants an admission to report. Static
-        // fallbacks and login refusals reserve nothing; explicit decisions belong to the caller.
+        // Only an account routing granted holds an admission to report: routing reserves the
+        // admission id this `account_for` names, whether or not the send carried a decision, and
+        // counts the run only once it hears `admission_started`. A pinned key and a login refusal
+        // reserve nothing.
         let mut result = decision(
             path,
-            if inputs.decision_id.is_some() || path != broca_wal::ACCOUNT_DECISION_ROUTED {
-                None
-            } else {
+            if path == broca_wal::ACCOUNT_DECISION_ROUTED {
                 admission_id
+            } else {
+                None
             },
             decision_id,
         );

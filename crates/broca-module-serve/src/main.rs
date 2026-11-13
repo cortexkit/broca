@@ -3221,21 +3221,44 @@ mod executor {
                     return Err(None);
                 }
             };
+            // Routing's answer travels on the run's error, which only the caller reads; the log
+            // keeps it beside the run for an operator.
             match answer {
                 ContinueAnswer::Offer(offer) => Ok(offer),
                 ContinueAnswer::Hold(hold) => {
+                    tracing::info!(
+                        target: "accounts",
+                        run_id = wall.run_id,
+                        routing_code = %hold.routing_code,
+                        until_ms = ?hold.until_ms,
+                        "routing held the run's continue request at its quota wall"
+                    );
                     Err(Some(broca_protocol::error::AccountContinueAnswer {
                         routing_code: hold.routing_code,
                         until_ms: hold.until_ms,
                     }))
                 }
                 ContinueAnswer::Refuse(refusal) => {
+                    tracing::warn!(
+                        target: "accounts",
+                        run_id = wall.run_id,
+                        routing_code = %refusal.routing_code,
+                        "routing refused the run's continue request at its quota wall"
+                    );
                     Err(Some(broca_protocol::error::AccountContinueAnswer {
                         routing_code: refusal.routing_code,
                         until_ms: None,
                     }))
                 }
-                _ => Err(None),
+                other => {
+                    tracing::warn!(
+                        target: "accounts",
+                        run_id = wall.run_id,
+                        answer = ?other,
+                        "routing answered the run's continue request with nothing broca can act on"
+                    );
+                    Err(None)
+                }
             }
         }
 

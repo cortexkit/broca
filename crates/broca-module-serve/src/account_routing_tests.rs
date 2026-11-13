@@ -3143,7 +3143,7 @@ fn any_record() -> broca_wal::WalRecord {
 }
 
 #[tokio::test]
-async fn a_caller_decision_is_forwarded_even_with_a_pin_and_is_not_runner_reportable() {
+async fn a_caller_decision_is_forwarded_even_with_a_pin_and_its_admission_is_reported() {
     let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
     let client = client(&routing);
     let credential = CredentialId::parse("oauth:anthropic").unwrap();
@@ -3178,10 +3178,14 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_is_not_runner_report
     );
     let decision = choice.decision().unwrap();
     assert_eq!(decision.decision_id.as_deref(), Some("acd-7"));
+    // Routing reserves the admission broca's `account_for` named, decision or not, and counts
+    // the run only once broca reports it started; so the run holds that admission and reports.
+    let sent = routing.requests.lock().unwrap()[0]["params"]["admission_id"].clone();
     assert_eq!(
-        decision.admission_id, None,
-        "caller-owned decisions cannot enable any runner reporter"
+        decision.admission_id.as_deref(),
+        Some(admission_id("run-caller").as_str())
     );
+    assert_eq!(sent, json!(admission_id("run-caller")));
 }
 
 #[tokio::test]

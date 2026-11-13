@@ -386,6 +386,62 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
     }
 }
 
+/// A worker or sidekick is held to the same rule as a head: a creating send naming a class that
+/// starts in the new storage, sent before the deployment key loads (the first seconds after a
+/// start), is refused `key_unavailable`, transient, and leaves nothing in either storage. Before,
+/// it started on today's storage, where it stayed, and today's storage refuses plan members it
+/// doesn't serve, such as `readers` (the apps a plan lets read the session). Once the key loads,
+/// the same send starts it in the new storage.
+#[tokio::test]
+async fn a_listed_class_is_refused_transient_until_the_new_storage_can_create_it() {
+    let module = module_placing(
+        "sidekick-early",
+        None,
+        Cipher::XChaCha20Poly1305,
+        |registry| registry.with_store_new_session_classes(["sidekick"]),
+    )
+    .await;
+    module.slot.open_without_key(&module.setup).await.unwrap();
+    let session = BindIdentity::new(module.dir.join("project"), "store-actor", "early-sidekick");
+    let send = || {
+        module.registry.route_submission_with_class(
+            &session,
+            RunId("r1".into()),
+            request("first"),
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            Some("sidekick".into()),
+            false,
+        )
+    };
+    assert_key_unavailable(send().await.expect_err("the sidekick is refused"));
+    let address = broca_core::session_addr(&session);
+    assert_eq!(
+        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        None
+    );
+    let wal = FileWalStore::new(module.dir.join("wal"));
+    for class in broca_wal::StorageClass::ALL {
+        assert!(!wal.class_wal_path(class, &session).exists(), "{class:?}");
+    }
+
+    module.load_key().await;
+    let outcome = send().await.expect("the sidekick opens once the key loads");
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    assert!(broca_wal::session_storage_class(&module.dir, &address)
+        .unwrap()
+        .is_some());
+    for class in broca_wal::StorageClass::ALL {
+        assert!(!wal.class_wal_path(class, &session).exists(), "{class:?}");
+    }
+}
+
 /// Production starts new sessions in the new storage one class at a time: a creating send naming
 /// a listed class starts there, and one naming another class, or none, starts on today's storage.
 #[tokio::test]
