@@ -1847,11 +1847,14 @@ Every other failure to open a session's WAL, corruption included, still answers
 `detail.class`: `transient`, `permanent`, `auth_required`, or `context_overflow`.
 Admission and run-resolution failures use `RunError::admission_error_class`; for example,
 an OpenAI Chat provider that cannot honour cache preferences returns `permanent`.
-Temporary WAL read interruptions return `transient`. Corruption and errors whose causes
-were erased remain unclassified: `detail` is absent and the entire legacy body is unchanged.
-Absent is not a retry recommendation; consumers retain their fallback only for absent classes.
-The served classed bytes are pinned by `open_failed_permanent.json` and
-`open_failed_transient.json` under `crates/broca-wire/tests/golden/`.
+An open that may succeed when repeated is not answered `open_failed`: it takes the contract's
+retryable code `transient`, with `detail.class: "transient"` and `detail.cause` naming the
+cause (`key_unavailable` while the new storage's key is still loading after a start,
+`open_failed` for a temporary WAL read interruption), because callers decide retries by code
+alone. Corruption and errors whose causes were erased remain unclassified: `detail` is absent
+and the entire legacy body is unchanged. Absent is not a retry recommendation; consumers
+retain their fallback only for absent classes. The served bytes are pinned by
+`open_failed_permanent.json` and `open_transient.json` under `crates/broca-wire/tests/golden/`.
 One path keeps its existing code: when the session is already open,
 `session.subscribe` attaches and then replays the WAL in the stream, and a frame it cannot read
 there, a newer writer's included, ends the stream with `subscribe_replay_failed`, as before.

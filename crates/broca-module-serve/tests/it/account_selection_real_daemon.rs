@@ -1920,10 +1920,10 @@ fn refusal_summary(refusal: &Value) -> String {
 }
 
 /// Whether `refusal` is the one a status poll gets while a restarted broca has marked the
-/// session's unsealed run for its crash-orphan seal pass but not yet sealed it: `open_failed`,
-/// classed transient, which the poller is to retry.
+/// session's unsealed run for its crash-orphan seal pass but not yet sealed it: the retryable
+/// code `transient`, which the poller is to retry.
 fn is_pending_crash_orphan_seal(refusal: &Value) -> bool {
-    refusal["code"] == "open_failed"
+    refusal["code"] == "transient"
         && refusal["detail"]["class"] == "transient"
         && refusal["message"]
             .as_str()
@@ -4450,8 +4450,12 @@ async fn held_sessions_across_the_deployment_key(encryption: &str) {
     .await;
 
     let assert_key_unavailable = |what: &str, refusal: &Value| {
-        assert_eq!(refusal["code"], "open_failed", "{what}: {refusal}");
+        assert_eq!(refusal["code"], "transient", "{what}: {refusal}");
         assert_eq!(refusal["detail"]["class"], "transient", "{what}: {refusal}");
+        assert_eq!(
+            refusal["detail"]["cause"], "key_unavailable",
+            "{what}: {refusal}"
+        );
         assert!(
             refusal["message"]
                 .as_str()

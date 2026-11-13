@@ -880,8 +880,9 @@ async fn an_unreadable_reservation_refuses_the_first_send_as_transient() {
         )
         .await;
     let (code, body) = error_body(&import);
-    assert_eq!(code, "open_failed", "{body}");
+    assert_eq!(code, "transient", "{body}");
     assert_eq!(body["detail"]["class"], "transient", "{body}");
+    assert_eq!(body["detail"]["cause"], "open_failed", "{body}");
     assert!(
         !rig.wal_path.exists(),
         "a send or import refused for an unreadable reservation must not create the log"

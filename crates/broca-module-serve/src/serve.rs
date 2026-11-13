@@ -9221,8 +9221,9 @@ mod tests {
             (FrameType::Error, 1)
         );
         let body = serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap();
-        assert_eq!(body["code"], "open_failed", "{body}");
+        assert_eq!(body["code"], "transient", "{body}");
         assert_eq!(body["detail"]["class"], "transient", "{body}");
+        assert_eq!(body["detail"]["cause"], "open_failed", "{body}");
         assert!(
             !ingress.routes.by_channel.contains_key(&7),
             "a bind whose adoption check could not run must not be published"

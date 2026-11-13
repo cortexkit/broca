@@ -87,6 +87,13 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
         ServeError::Upload(error) => {
             return Some(AdmissionRefusal::Other(upload_refusal(error, false)))
         }
+        // An open that may succeed when repeated (the new storage's key still loading after a
+        // start, a temporary read failure) is answered with the contract's retryable code, since
+        // callers decide retries by code alone; the cause names what to wait for.
+        ServeError::Open(reason, Some(ErrorClass::Transient)) => (
+            "transient",
+            Some(json!({"class": "transient", "cause": open_cause(reason)})),
+        ),
         ServeError::Open(_, class) => (
             "open_failed",
             class.map(|class| json!({"class": class.shared_class()})),
@@ -153,6 +160,23 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
         message: error.to_string(),
         detail,
     }))
+}
+
+/// The cause a transient open refusal names: the code its reason starts with (`key_unavailable`
+/// in "key_unavailable: the new storage's deployment key 1 has not loaded yet"), or
+/// `open_failed` for a reason that starts with none.
+fn open_cause(reason: &str) -> &str {
+    match reason.split_once(':') {
+        Some((code, _))
+            if !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_') =>
+        {
+            code
+        }
+        _ => "open_failed",
+    }
 }
 
 pub fn send_field_of(differing: &str) -> Option<&'static str> {
@@ -359,6 +383,45 @@ mod tests {
             assert_eq!(error.retry_after_secs, Some(17.0));
             assert_eq!(error.resets_at_ms, Some(123_456));
         }
+    }
+
+    /// A transient open refusal (the new storage's key still loading after a start) is answered
+    /// with the retryable code `transient` and its cause; a permanent one keeps `open_failed`.
+    /// Callers decide retries by code alone, so `open_failed` made a worker launch in the first
+    /// seconds after a restart fail for good.
+    #[test]
+    fn a_transient_open_refusal_is_answered_transient_with_its_cause() {
+        let key = crate::store_open::key_unavailable(1);
+        let crate::registry::OpenError::Classified { reason, class } = key else {
+            panic!("key_unavailable is a classified open error");
+        };
+        let served = ServeError::Open(reason.clone(), Some(class));
+        let Some(AdmissionRefusal::Other(body)) = admission_refusal(&served) else {
+            panic!("an open refusal has a plain body");
+        };
+        assert_eq!(body.code, "transient");
+        assert_eq!(
+            body.detail,
+            Some(json!({"class": "transient", "cause": "key_unavailable"}))
+        );
+        assert_eq!(body.message, format!("open failed: {reason}"));
+        let worded = ServeError::Open(
+            "a temporary read failed".into(),
+            Some(ErrorClass::Transient),
+        );
+        let Some(AdmissionRefusal::Other(body)) = admission_refusal(&worded) else {
+            panic!("an open refusal has a plain body");
+        };
+        assert_eq!(
+            body.detail,
+            Some(json!({"class": "transient", "cause": "open_failed"}))
+        );
+        let permanent = ServeError::Open("no such model".into(), Some(ErrorClass::Permanent));
+        let Some(AdmissionRefusal::Other(body)) = admission_refusal(&permanent) else {
+            panic!("an open refusal has a plain body");
+        };
+        assert_eq!(body.code, "open_failed");
+        assert_eq!(body.detail, Some(json!({"class": "permanent"})));
     }
 
     #[test]

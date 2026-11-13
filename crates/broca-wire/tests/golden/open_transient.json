@@ -1,0 +1,1 @@
+{"code":"transient","message":"open failed: wal range-read failed: wal io: temporary WAL read interruption","detail":{"cause":"open_failed","class":"transient"}}

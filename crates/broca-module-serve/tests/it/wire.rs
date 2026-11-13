@@ -6965,7 +6965,7 @@ async fn transient_open_failed_wal_refusal_golden() {
     let body = route.expect_error(2, read_request()).await;
     assert_eq!(
         body,
-        include_bytes!("../../../broca-wire/tests/golden/open_failed_transient.json")
+        include_bytes!("../../../broca-wire/tests/golden/open_transient.json")
     );
     route.finish().await;
 }
@@ -6978,7 +6978,7 @@ async fn transient_log_state_probe_preserves_class_and_original_cause() {
     let body = route.expect_error(2, read_request()).await;
     assert_eq!(
         body,
-        include_bytes!("../../../broca-wire/tests/golden/open_failed_transient.json")
+        include_bytes!("../../../broca-wire/tests/golden/open_transient.json")
     );
     assert!(probe.probes.load(std::sync::atomic::Ordering::SeqCst) > 0);
     assert!(probe.reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
