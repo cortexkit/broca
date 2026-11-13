@@ -1044,6 +1044,7 @@ impl Engine {
             if !preconditions::run_rows_settled(
                 &index.session_runs(&session).map_err(io)?,
                 preconditions::paused_for_sign_in(&records).as_deref(),
+                index.session_exports_settled(&session).map_err(io)?,
             ) {
                 return Err(Failure::failed(
                     if background {

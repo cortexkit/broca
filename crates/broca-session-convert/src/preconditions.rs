@@ -115,18 +115,24 @@ fn paused_in(raw: &[WalRecord]) -> Option<String> {
     paused.then_some(latest.0)
 }
 
-/// Whether the session's run-index rows `rows` let it move: each terminal with its usage recorded
-/// and no withdrawal owed, which today's reconcilers would otherwise finish from a WAL the move
-/// takes away. The row of a run the move carries paused for sign-in (`paused`, from
-/// [`paused_for_sign_in`]) is the exception: it is paused, without usage, and nothing finishes it
-/// but the run itself, on the new storage.
-pub fn run_rows_settled(rows: &[broca_core::RunIndexRow], paused: Option<&str>) -> bool {
-    rows.iter().all(|row| {
-        let carried = paused == Some(row.run_id.as_str())
-            && row.state == broca_core::RunIndexState::Paused
-            && !row.withdrawals_owed;
-        carried || (row.state.is_terminal() && row.usage.is_some() && !row.withdrawals_owed)
-    })
+/// Whether the session's run-index rows `rows` let it move: each terminal, with no withdrawal
+/// owed and no missing export. `exports_settled` comes from the export reconciler's exclusions:
+/// a fact exists, the run was imported, or it expired. Usage is not evidence of export debt;
+/// old terminal rows and runs with no model answer can have no usage forever.
+/// The row of a run the move carries paused for sign-in (`paused`, from [`paused_for_sign_in`])
+/// is the exception: only the run itself finishes it, on the new storage.
+pub fn run_rows_settled(
+    rows: &[broca_core::RunIndexRow],
+    paused: Option<&str>,
+    exports_settled: bool,
+) -> bool {
+    exports_settled
+        && rows.iter().all(|row| {
+            let carried = paused == Some(row.run_id.as_str())
+                && row.state == broca_core::RunIndexState::Paused
+                && !row.withdrawals_owed;
+            carried || (row.state.is_terminal() && !row.withdrawals_owed)
+        })
 }
 
 /// The first feature the new run loop refuses that the WAL `records` use, of those the WAL alone

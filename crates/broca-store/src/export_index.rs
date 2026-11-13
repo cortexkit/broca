@@ -649,6 +649,45 @@ impl ExportStore {
     }
 }
 
+// Conversion and catch-up must agree about export debt before the old WAL goes away.
+const MISSING_TERMINAL_EXPORT: &str = "runs.state NOT IN ('active', 'paused')
+    AND runs.expired_at_ms IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM export_facts AS facts WHERE facts.run_id = runs.run_id
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM export_imported_runs AS imported
+        WHERE imported.session = runs.session AND imported.run_id = runs.run_id
+    )";
+
+impl SqliteStore {
+    /// Whether none of this session's terminal runs needs export catch-up. Facts, imported
+    /// runs and expired runs are excluded exactly as they are by `missing_terminal_runs`.
+    /// Select run ids through the session index rather than scanning every run per session.
+    pub fn session_exports_settled(
+        &self,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|error| error.to_string())?;
+        conn.query_row(
+            &format!(
+                "SELECT NOT EXISTS (
+                    SELECT 1 FROM run_index AS runs
+                    WHERE runs.run_id IN ({}) AND {MISSING_TERMINAL_EXPORT}
+                )",
+                Self::session_runs_sql()
+            ),
+            rusqlite::params![
+                session.project_root.to_string_lossy(),
+                session.harness,
+                session.session
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl ExportIndex for SqliteStore {
     fn is_imported_run(
         &self,
@@ -675,20 +714,12 @@ impl ExportIndex for SqliteStore {
             .lock()
             .map_err(|_| storage("store mutex poisoned"))?;
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT runs.run_id, runs.session
                    FROM run_index AS runs
-                  WHERE runs.state NOT IN ('active', 'paused')
-                    AND runs.expired_at_ms IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM export_facts AS facts WHERE facts.run_id = runs.run_id
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM export_imported_runs AS imported
-                        WHERE imported.session = runs.session AND imported.run_id = runs.run_id
-                    )
+                  WHERE {MISSING_TERMINAL_EXPORT}
                   ORDER BY runs.run_id ASC",
-            )
+            ))
             .map_err(storage)?;
         let rows = statement
             .query_map([], |row| {
@@ -1831,6 +1862,70 @@ pub(crate) mod tests {
             "re-emitting a run must not back-stamp or rewrite an immutable existing fact"
         );
         assert_eq!(store.high_water(), 2);
+    }
+
+    #[test]
+    fn session_export_settlement_matches_catch_up_exclusions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = BindIdentity::new("/synthetic/export", "runner", "settlement");
+        let other = BindIdentity::new("/synthetic/export", "runner", "other");
+        let session_json = serde_json::to_string(&session).unwrap();
+        let other_json = serde_json::to_string(&other).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            for (run, state, expired) in [
+                ("fact", "completed", None),
+                ("imported", "error", None),
+                ("expired", "interrupted", Some(10)),
+                ("active", "active", None),
+                ("paused", "paused", None),
+            ] {
+                conn.execute(
+                    "INSERT INTO run_index (run_id, session, state, expired_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![run, session_json, state, expired],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO export_facts (fact_id, run_id, segment_json) VALUES ('fact', 'fact', '{}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO export_imported_runs (session, run_id, cut_id) VALUES (?1, 'imported', 'cut')",
+                [&session_json],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO run_index (run_id, session, state, usage_json)
+                 VALUES ('owed-elsewhere', ?1, 'completed', '{}')",
+                [&other_json],
+            )
+            .unwrap();
+        }
+        assert!(store.session_exports_settled(&session).unwrap());
+        assert!(!store.session_exports_settled(&other).unwrap());
+        assert_eq!(store.missing_terminal_runs().unwrap().len(), 1);
+
+        // An import belonging to a different session cannot settle this session's debt.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM export_imported_runs WHERE run_id='imported'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO export_imported_runs (session, run_id, cut_id) VALUES (?1, 'imported', 'cut')",
+                [&other_json],
+            )
+            .unwrap();
+        }
+        assert!(!store.session_exports_settled(&session).unwrap());
+        let missing = store.missing_terminal_runs().unwrap();
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0].run_id.0, "imported");
     }
 
     #[test]

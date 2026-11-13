@@ -1109,7 +1109,10 @@ impl Rig {
             )
             .with_forget_projection(forget)
             .with_run_rows(Arc::new(move |session: &BindIdentity| {
-                runs.session_runs(session)
+                Ok((
+                    runs.session_runs(session)?,
+                    runs.session_exports_settled(session)?,
+                ))
             }));
             registry.set_store_mover(Arc::new(mover));
         }

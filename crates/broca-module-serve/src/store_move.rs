@@ -94,8 +94,9 @@ pub const REQUIRED_OPERATIONS: &[&str] = &[
 /// request with no parameters.
 pub type Served = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-/// The run-index rows of a session.
-pub type RunRows = Arc<dyn Fn(&BindIdentity) -> Result<Vec<RunIndexRow>, String> + Send + Sync>;
+/// A session's run rows and whether the export reconciler has no work left for them.
+pub type RunRows =
+    Arc<dyn Fn(&BindIdentity) -> Result<(Vec<RunIndexRow>, bool), String> + Send + Sync>;
 
 /// Drops a session's materialized rows (its projected messages, tags, episodes and pages).
 pub type ForgetProjection = Arc<dyn Fn(&BindIdentity) -> Result<(), String> + Send + Sync>;
@@ -561,18 +562,19 @@ impl StoreMove {
         {
             return Err(not_movable(SESSION_BUSY));
         }
-        // Every run-index row must be terminal, have its usage recorded and owe no withdrawal,
+        // Every run-index row must be terminal, owe no export and owe no withdrawal,
         // but for the row of a run the move carries paused for sign-in. A row that isn't is
         // finished later by today's reconcilers, which read the WAL; once the session has moved
         // they'd be refused by today's storage on every attempt.
         let Some(rows) = &self.run_rows else {
             return Err(not_movable("reconcile_owed"));
         };
-        let rows =
+        let (rows, exports_settled) =
             rows(key).map_err(|error| unavailable("the run index couldn't be read", error))?;
         if !broca_session_convert::preconditions::run_rows_settled(
             &rows,
             broca_session_convert::preconditions::paused_for_sign_in(records).as_deref(),
+            exports_settled,
         ) {
             return Err(not_movable("reconcile_owed"));
         }

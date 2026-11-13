@@ -338,9 +338,9 @@ async fn concurrent_conversion_failed_session_keeps_its_row_and_others_convert()
         if session == &bad {
             let mut row = settled_row(session, "r1");
             row.usage = None;
-            Ok(vec![row])
+            Ok((vec![row], false))
         } else {
-            Ok(Vec::new())
+            Ok((Vec::new(), true))
         }
     }));
     let conversion = Engine::configured(

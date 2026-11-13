@@ -170,7 +170,10 @@ impl Rig {
             Arc::new(|_: &str| true),
         )
         .with_run_rows(Arc::new(|session: &BindIdentity| {
-            Ok(RUNS.iter().map(|run| settled_row(session, run)).collect())
+            Ok((
+                RUNS.iter().map(|run| settled_row(session, run)).collect(),
+                true,
+            ))
         }))
         .with_forget_projection(Arc::new(move |_: &BindIdentity| {
             forgotten.fetch_add(1, Ordering::SeqCst);
@@ -821,15 +824,14 @@ async fn each_precondition_refuses_by_name_and_writes_nothing() {
     assert_refused(&rig, rig.mover(), &bytes, "unsupported_feature").await;
     drop(rig);
 
-    // A run-index row still owed reconciliation.
+    // A terminal run-index row whose export is still owed, even with usage recorded.
     let rig = Rig::start("refuse-index").await;
     let bytes = rig.write_session();
     let mover = rig
         .mover()
         .with_run_rows(Arc::new(|session: &BindIdentity| {
-            let mut row = settled_row(session, "r2");
-            row.usage = None;
-            Ok(vec![settled_row(session, "r1"), row])
+            let row = settled_row(session, "r2");
+            Ok((vec![settled_row(session, "r1"), row], false))
         }));
     assert_refused(&rig, mover, &bytes, "reconcile_owed").await;
     drop(rig);
@@ -1688,7 +1690,7 @@ mod cutover {
         let mover = rig.mover().with_run_rows(Arc::new(|session| {
             let mut row = settled_row(session, "r1");
             row.usage = None;
-            Ok(vec![row])
+            Ok((vec![row], false))
         }));
         // Install the unsettled mover on a fresh engine; a configured engine's mover is fixed.
         let engine = Engine::configured(
@@ -1711,6 +1713,18 @@ mod cutover {
         assert_eq!(rows[0].refusal.as_deref(), Some("reconcile_owed"));
         assert_eq!(std::fs::read(rig.wal()).unwrap(), before);
         assert!(!Path::new(&rows[0].source.backup).exists());
+    }
+
+    #[tokio::test]
+    async fn online_move_accepts_exported_terminal_rows_without_usage() {
+        let rig = Rig::start("move-exported-without-usage").await;
+        rig.write_session();
+        let mover = rig.mover().with_run_rows(Arc::new(|session| {
+            let mut row = settled_row(session, "r1");
+            row.usage = None;
+            Ok((vec![row], true))
+        }));
+        mover.move_to_store(&key(), None).await.unwrap();
     }
 
     #[tokio::test]
