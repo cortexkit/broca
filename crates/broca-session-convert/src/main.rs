@@ -49,6 +49,11 @@
 //! logs staged as plain sessions, load alike through today's load and through a reference built
 //! the way loading worked before it streamed its log (see `store_load_check`).
 //!
+//! `session-convert media-check [--dir <scratch>] [--every N] [--out FILE] <path>...`: for every
+//! session log, the image engine fed today's records against the engine fed the converted
+//! session's media events, compared field by field before every run starts and at the end (see
+//! `media_check`). Any difference makes the exit code non-zero.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 //!
@@ -80,6 +85,7 @@ mod calls_check;
 mod entries_check;
 mod heads;
 mod history_check;
+mod media_check;
 mod move_check;
 mod numbering;
 mod pages;
@@ -224,7 +230,8 @@ fn usage() -> ! {
          session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
          session-convert move-check --dir SCRATCH [--inventory-root ROOT] [--all-steps] [--every N] [--out FILE] PATH...\n       \
          session-convert store-load-check [--every N] [--out FILE] STORE...\n       \
-         session-convert store-load-check --from-legacy --dir SCRATCH [--every N] [--keep] [--out FILE] PATH...\n\
+         session-convert store-load-check --from-legacy --dir SCRATCH [--every N] [--keep] [--out FILE] PATH...\n       \
+         session-convert media-check [--dir SCRATCH] [--every N] [--out FILE] PATH...\n\
          Any command takes --plain: store in the plain mode instead of encrypted.\n\
          move-check reads an existing served-history version without writing the source.\n\
          --inventory-root resolves re-keyed addresses and history versions from ROOT read-only.\n\
@@ -382,6 +389,7 @@ fn main() {
         "calls-check" => calls_check::run(&args),
         "move-check" => move_check::run(&args),
         "store-load-check" => store_load_check::run(&args),
+        "media-check" => media_check::run(&args),
         _ => usage(),
     }
 }

@@ -383,19 +383,60 @@ pub(crate) async fn append_batch<B: SessionBackend>(
     batch: &[Record],
     media: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), StageError> {
+    for part in kind_parts(batch) {
+        append_with_media(session, &batch[part], media).await?;
+    }
+    Ok(())
+}
+
+/// The parts [`append_batch`] appends `batch` in: each holds media of one kind only.
+fn kind_parts(batch: &[Record]) -> Vec<std::ops::Range<usize>> {
+    let mut parts = Vec::new();
     let mut from = 0;
     let mut kind = Holds::Nothing;
     for (at, record) in batch.iter().enumerate() {
         let this = holds(record);
         if this != Holds::Nothing && kind != Holds::Nothing && this != kind {
-            append_with_media(session, &batch[from..at], media).await?;
+            parts.push(from..at);
             from = at;
         }
         if this != Holds::Nothing {
             kind = this;
         }
     }
-    append_with_media(session, &batch[from..], media).await
+    parts.push(from..batch.len());
+    parts
+}
+
+/// The batches the staging writer writes `records` in: each ends where the run loop would write
+/// a barrier, or at the last record.
+fn barrier_batches(records: &[Record]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    for (index, record) in records.iter().enumerate() {
+        if crate::measure::barrier_after(record, records.get(index + 1))
+            || index + 1 == records.len()
+        {
+            batches.push(start..index + 1);
+            start = index + 1;
+        }
+    }
+    batches
+}
+
+/// The appends the staging writer writes converted `records` in, as ranges of them, in order:
+/// each batch (see [`barrier_batches`]) in the parts that hold media of one kind (see
+/// [`append_batch`]). The session's media fold hands over what each append's records mean when
+/// the append ends, so a check that folds the records apart from a session folds them in these.
+pub fn appends(records: &[Record]) -> Vec<std::ops::Range<usize>> {
+    barrier_batches(records)
+        .into_iter()
+        .flat_map(|batch| {
+            kind_parts(&records[batch.clone()])
+                .into_iter()
+                .map(move |part| batch.start + part.start..batch.start + part.end)
+        })
+        .collect()
 }
 
 /// Writes the prepared session `stage` names into its staging folder. The folder must not hold
@@ -491,13 +532,9 @@ pub async fn write_with_progress(
     if records.is_empty() {
         append_batch(&mut session, std::slice::from_ref(&moved), &media).await?;
     }
-    let mut start = 0;
-    for (index, record) in records.iter().enumerate() {
-        let last = index + 1 == records.len();
-        if !(crate::measure::barrier_after(record, records.get(index + 1)) || last) {
-            continue;
-        }
-        for part in records[start..=index]
+    for batch in barrier_batches(records) {
+        let last = batch.end == records.len();
+        for part in records[batch.clone()]
             .iter()
             .flat_map(crate::measure::named_parts)
         {
@@ -515,13 +552,12 @@ pub async fn write_with_progress(
             }
         }
         if last {
-            let mut batch = records[start..=index].to_vec();
+            let mut batch = records[batch].to_vec();
             batch.push(moved.clone());
             append_batch(&mut session, &batch, &media).await?;
         } else {
-            append_batch(&mut session, &records[start..=index], &media).await?;
+            append_batch(&mut session, &records[batch], &media).await?;
         }
-        start = index + 1;
     }
     let messages = broca_module::store_read::transcript_len(&session);
     session
