@@ -265,6 +265,13 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.store.as_ref().and_then(|slot| slot.runtime())
     }
+    fn store_creation_pending(&self) -> Option<OpenError> {
+        let slot = self.store.as_ref()?;
+        match slot.creating_runtime() {
+            Some(_) => None,
+            None => Some(crate::store_open::key_unavailable(slot.key_id())),
+        }
+    }
     fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
         self.step_events.clone()
     }

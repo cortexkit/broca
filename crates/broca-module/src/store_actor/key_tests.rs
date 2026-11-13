@@ -442,6 +442,87 @@ async fn a_listed_class_is_refused_transient_until_the_new_storage_can_create_it
     }
 }
 
+/// A plan naming `readers` (the apps it lets read the session), as every worker plan core sends
+/// does, takes the same retryable refusal while the key loads. Its check runs before the session
+/// opens, and it used to read "can't create in the new storage now" as "will stay on today's
+/// storage", refusing the launch for good with `invalid_params` (`plan.readers is not supported
+/// for a session on today's storage`).
+#[tokio::test]
+async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
+    let module = module_placing("mason-early", None, Cipher::XChaCha20Poly1305, |registry| {
+        registry.with_store_new_session_classes(["mason"])
+    })
+    .await;
+    module.slot.open_without_key(&module.setup).await.unwrap();
+    let session = BindIdentity::new(module.dir.join("project"), "store-actor", "early-mason");
+    let composition = serde_json::json!({
+        "providers": [{"provider": "fixture", "tools": []}],
+        "step_transform_items": [],
+    });
+    let plan = serde_json::json!({
+        "tool_items": [],
+        "system_text_items": [{"provider": "fixture", "params": {"text": "you work"}}],
+        "step_transform_items": [],
+        "composition_digest":
+            cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+        "composition": composition,
+        "readers": ["occipital"],
+    });
+    let manifest = Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan_identity: "plan-1".into(),
+        composition_digest: plan["composition_digest"].as_str().unwrap().into(),
+        fetches: vec![],
+        tools: Arc::new(vec![]),
+        system_digest: "you work".into(),
+        system_text: "you work".into(),
+        join_version: 1,
+        role_versions: Default::default(),
+        declarations: vec![],
+    });
+    let send = || {
+        let mut request = request("first");
+        request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+            module_id: "prefrontal-core".into(),
+        });
+        request.tools = None;
+        request.policy_allowed = Default::default();
+        module.registry.route_submission_with_class(
+            &session,
+            RunId("r1".into()),
+            request,
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            Some(crate::actor::SendPlan {
+                identity: "plan-1".into(),
+                manifest: Some(manifest.clone()),
+                model_check: None,
+            }),
+            None,
+            None,
+            None,
+            Some("mason".into()),
+            false,
+        )
+    };
+    assert_key_unavailable(send().await.expect_err("the mason is refused"));
+    let address = broca_core::session_addr(&session);
+    assert_eq!(
+        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        None
+    );
+
+    module.load_key().await;
+    let outcome = send().await.expect("the mason opens once the key loads");
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    assert!(broca_wal::session_storage_class(&module.dir, &address)
+        .unwrap()
+        .is_some());
+}
+
 /// Production starts new sessions in the new storage one class at a time: a creating send naming
 /// a listed class starts there, and one naming another class, or none, starts on today's storage.
 #[tokio::test]

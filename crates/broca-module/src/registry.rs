@@ -659,6 +659,12 @@ pub trait LineageOpener: Send + Sync {
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         None
     }
+    /// Why a session can't be created in the new storage right now although this opener keeps
+    /// one: its deployment key hasn't loaded (the first seconds after a start), answered as the
+    /// retryable `key_unavailable`. `None` when it can create one, or keeps no new storage.
+    fn store_creation_pending(&self) -> Option<OpenError> {
+        None
+    }
     /// Where model calls are published as step events, when this opener publishes them.
     fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
         None
@@ -3850,12 +3856,20 @@ impl LineageRegistry {
             if let Some(policy) = policy.as_object().filter(|policy| {
                 policy.contains_key(cortexkit_role_llm_runner::app_readers::PLAN_READERS)
             }) {
+                let starts_in_store = unserved.is_none()
+                    && self.wal_written(key) == Some(false)
+                    && (session_class.as_deref() == Some(HEAD_SESSION_CLASS)
+                        || self.starts_new_sessions_in_store(session_class.as_deref()));
                 let supported = self.store_holding(key)?.is_some()
-                    || (unserved.is_none()
-                        && self.store_can_create()
-                        && self.wal_written(key) == Some(false)
-                        && (session_class.as_deref() == Some(HEAD_SESSION_CLASS)
-                            || self.starts_new_sessions_in_store(session_class.as_deref())));
+                    || (starts_in_store && self.store_can_create());
+                // A session that starts in the new storage but can't be created there yet (its
+                // key still loading after a start) is refused as retryable, as the opener refuses
+                // it, never as if it would stay on today's storage.
+                if !supported && starts_in_store {
+                    if let Some(pending) = self.inner.opener.store_creation_pending() {
+                        return Err(pending);
+                    }
+                }
                 // A creating send may otherwise fall back to today's storage, for example when
                 // its first prompt carries media. Never freeze a reader policy in that format.
                 if let Err(error) = crate::reader_admission::check_plan(policy, supported) {
