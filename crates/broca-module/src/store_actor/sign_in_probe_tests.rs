@@ -38,8 +38,14 @@ impl RunExecutor for CountAdmissions {
     }
 }
 
-#[tokio::test]
-async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
+struct ProbeFixture {
+    actor: StoreActor<&'static MemoryBackend>,
+    runner: Arc<CountAdmissions>,
+    registry: crate::registry::LineageRegistry,
+    backend: &'static MemoryBackend,
+}
+
+async fn paused_probe(label: &str) -> ProbeFixture {
     let backend: &'static MemoryBackend = Box::leak(Box::default());
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
     let runner = Arc::new(CountAdmissions {
@@ -67,7 +73,7 @@ async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
     assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
 
     let root =
-        broca_test_support::scratch_root().join(format!("sign-in-ready-{}", std::process::id()));
+        broca_test_support::scratch_root().join(format!("sign-in-{label}-{}", std::process::id()));
     let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
     let leases = Arc::new(broca_core::FileLeaseStore::new(root.join("leases")));
     let opener = crate::opener::DefaultOpener::new(leases, wal.clone(), runner.clone());
@@ -77,6 +83,22 @@ async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
         .unwrap();
     let mut actor = StoreActor::new(bind(), session, runner.clone(), Box::new(parts));
     actor.registry = Some(registry.handle());
+    ProbeFixture {
+        actor,
+        runner,
+        registry,
+        backend,
+    }
+}
+
+#[tokio::test]
+async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
+    let ProbeFixture {
+        actor,
+        runner,
+        registry,
+        backend,
+    } = paused_probe("ready").await;
     let (tx, rx) = mpsc::unbounded_channel();
     let commands = Commands::over(tx, backend);
     let task = tokio::spawn(actor.serve(rx));
@@ -86,7 +108,20 @@ async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
         1,
         "opening before readiness must not resolve credentials or ask"
     );
+    commands.send(LineageCmd::IdleTick).unwrap();
+    let (reply, response) = oneshot::channel();
+    commands
+        .send(LineageCmd::Status { reply })
+        .expect("an idle tick must not retire an actor with an owed probe");
+    assert_eq!(
+        response
+            .await
+            .expect("an idle tick must preserve the owed probe"),
+        crate::session_cmd::LineageStatus::Idle
+    );
+    assert!(!task.is_finished());
     registry.enable_restart_resumes();
+    commands.send(LineageCmd::IdleTick).unwrap();
     idle(&commands).await;
     broca_test_support::wait_until("ready actor starts its owed sign-in probe", || async {
         if runner.calls.load(Ordering::SeqCst) == 2 {
@@ -99,4 +134,42 @@ async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
     idle(&commands).await;
     drop(commands);
     drop(task.await.unwrap());
+}
+
+#[tokio::test]
+async fn stopping_before_sign_in_probe_readiness_keeps_the_pause_without_writes() {
+    let ProbeFixture {
+        mut actor,
+        runner,
+        registry: _registry,
+        backend,
+    } = paused_probe("stop-before-ready").await;
+    let before = actor.session.open_log_records().await.unwrap();
+    let stop = CancellationToken::new();
+    let stopping = stop.clone();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let commands = Commands::over(tx, backend);
+    let task = tokio::spawn(async move {
+        let mut receiver = super::Commands::from(rx);
+        let exit = actor
+            .serve_until_exit(&mut receiver, Some(&stopping), None, None, None)
+            .await;
+        assert!(matches!(exit, Exit::Stop));
+        actor.stop_for_shutdown().await;
+        actor.collect_on_exit(&exit).await;
+        actor.into_session()
+    });
+    idle(&commands).await;
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    stop.cancel();
+    let session = task.await.unwrap();
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        session.operations().run.as_ref().unwrap().paused,
+        Some(broca_protocol::PauseReason::AuthRequired)
+    );
+    assert_eq!(
+        serde_json::to_value(session.open_log_records().await.unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
 }

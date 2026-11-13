@@ -641,14 +641,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         crate::actor::SubscribeOutcome::Attached
     }
 
-    /// What keeps the session from closing idle, under the names today's actor gives the
-    /// registry: a run, a warm being sent, an account-limit timer, or a subscriber still attached.
-    /// A subscriber keeps a session open for as long as it holds its stream, as on today's
-    /// storage, so a caller
+    /// Work that keeps this session open past its idle deadline: a run, an owed sign-in
+    /// probe, a warm, an account-limit timer, or a subscriber.
+    /// A subscriber keeps the session open while its stream is attached, so a caller
     /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
     /// the last one has gone closes it. Empty when the session may close.
     fn idle_holds(&mut self) -> Vec<&'static str> {
         let mut holds = Vec::new();
+        if self.sign_in_open_owed {
+            // Readiness is checked on the next actor turn; an idle tick must not discard
+            // the owed probe before that turn. Shutdown still exits independently of holds.
+            holds.push("sign_in_probe");
+        }
         if self.run.is_some() {
             holds.push("active_run");
         }
