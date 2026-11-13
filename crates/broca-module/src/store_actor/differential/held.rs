@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "held/intake.rs"]
 mod intake;
+mod provider_code;
 mod sign_in;
 
 #[tokio::test]
@@ -98,13 +99,13 @@ async fn run_awaits_unknown_error_code_keeps_every_surface_readable() {
             } else {
                 "terminal-unknown-code.before"
             },
-            None,
+            store.then_some(("error", "nobody", None)),
         )
         .await;
         assert_eq!(body["state"], "error");
         assert_eq!(
             body["error"],
-            json!({"class":"permanent", "message":"synthetic error without a provider code", "status":400})
+            json!({"class":"permanent", "message":"synthetic error without a provider code", "status":400, "provider_code":"provider_error"})
         );
         assert!(side.registry.stop_and_seal().await);
     }

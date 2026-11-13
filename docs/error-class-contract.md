@@ -103,6 +103,23 @@ reporting; a 403 must not invalidate a valid credential.
 
 ## Sibling fields and the detail channel
 
+Every served run error includes `class`, `message` and `provider_code`, on both storage
+implementations. Historical stored `ProviderError` records may omit the code; the
+`SharedProviderError` boundary supplies it from the caller-facing class without rewriting
+the record:
+
+| Caller-facing class | Code when the stored error has none |
+|---|---|
+| `transient` | `transient` |
+| `auth_required` | `auth_required` |
+| `context_overflow` | `context_overflow` |
+| `permanent` or an unrecognized class | `provider_error` |
+
+An existing code, including one a reader does not recognize, stays unchanged. The provider's
+finer `provider_subcode` and `provider_details` diagnostics also stay unchanged; they are not
+promoted into the required code. New-storage terminal `error` waits use this served error
+with llm-runner's `ending_awaits`; legacy storage still omits `awaits`.
+
 - `retry_after_secs` (seconds — the only unit) is an optional structured sibling,
   not arm data. Rate-limitedness is a transport phenomenon, not a consumer
   decision: a 429 with `Retry-After` is `transient` + the field; a 429
@@ -115,7 +132,7 @@ reporting; a 403 must not invalidate a valid credential.
   seconds or an HTTP date in `Retry-After`, plus Codex's `try again in` text), not
   `retry-after-ms`. Consumers treat the value as a backoff floor and may cap it —
   capping policy stays consumer-local.
-- Producer detail (broca `provider_code`/`status`, vault `ReadError` name)
+- Finer producer detail (broca `provider_subcode`/`status`, vault `ReadError` name)
   travels alongside for diagnostics, logging, and corroboration ONLY. A consumer
   branching generically on detail is the bug this contract kills.
 - `ProviderError.message` is retained verbatim from the provider on caller and status surfaces. It

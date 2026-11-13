@@ -160,7 +160,9 @@ pub enum ControlUnit {
 /// A provider error on a caller-facing surface.
 ///
 /// Serialization maps the runner-local `ProviderUnavailable` class to the shared `transient`
-/// class. The owned wrapper prevents a caller-facing schema from accidentally storing a raw
+/// class. A missing provider code is derived from that caller-facing class at this boundary;
+/// existing codes and provider-owned diagnostics are preserved. The wrapper prevents a
+/// caller-facing schema from accidentally embedding a raw
 /// [`ProviderError`], while durable WAL records continue to use that raw type. On a caller read,
 /// an unfamiliar class stays available through `class_wire`; `as_inner` uses `permanent` only as
 /// a non-retrying compatibility fallback.
@@ -171,6 +173,25 @@ pub struct SharedProviderError {
 }
 
 impl SharedProviderError {
+    fn from_stored(error: ProviderError, wire_class: Option<OpenErrorClass>) -> Self {
+        let mut shared = Self {
+            inner: Box::new(error),
+            wire_class,
+        };
+        if shared.inner.provider_code.is_none() {
+            // Served errors require a code even when older stored records have none. Readers
+            // accept code values they do not recognize, so the catch-all needs no version bump.
+            let code = match shared.class_wire() {
+                "transient" => "transient",
+                "auth_required" => "auth_required",
+                "context_overflow" => "context_overflow",
+                _ => "provider_error",
+            };
+            shared.inner.provider_code = Some(code.to_owned());
+        }
+        shared
+    }
+
     /// Borrow the provider error retained after deserializing a caller-facing response.
     ///
     /// If a newer caller class is unknown to this process, `inner.class` is the conservative
@@ -223,10 +244,7 @@ impl<'de> Deserialize<'de> for SharedProviderError {
         .is_ok();
         if known {
             let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
-            return Ok(Self {
-                inner: Box::new(inner),
-                wire_class: None,
-            });
+            return Ok(Self::from_stored(inner, None));
         }
 
         let Some(object) = value.as_object_mut() else {
@@ -237,10 +255,10 @@ impl<'de> Deserialize<'de> for SharedProviderError {
             serde_json::Value::String("permanent".into()),
         );
         let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
-        Ok(Self {
-            inner: Box::new(inner),
-            wire_class: Some(OpenErrorClass::from_wire(raw_class)),
-        })
+        Ok(Self::from_stored(
+            inner,
+            Some(OpenErrorClass::from_wire(raw_class)),
+        ))
     }
 }
 
@@ -254,10 +272,7 @@ impl Deref for SharedProviderError {
 
 impl From<ProviderError> for SharedProviderError {
     fn from(error: ProviderError) -> Self {
-        Self {
-            inner: Box::new(error),
-            wire_class: None,
-        }
+        Self::from_stored(error, None)
     }
 }
 
@@ -580,12 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn shared_provider_error_preserves_public_class_json_bytes() {
-        for class in [
-            ErrorClass::Transient,
-            ErrorClass::Permanent,
-            ErrorClass::Auth,
-            ErrorClass::ContextOverflow,
+    fn shared_provider_error_preserves_existing_codes_and_public_class() {
+        for (class, derived_code) in [
+            (ErrorClass::Transient, "transient"),
+            (ErrorClass::Permanent, "provider_error"),
+            (ErrorClass::Auth, "auth_required"),
+            (ErrorClass::ContextOverflow, "context_overflow"),
         ] {
             for raw in [
                 ProviderError {
@@ -625,10 +640,14 @@ mod tests {
                     account_continue: None,
                 },
             ] {
+                let mut expected = raw.clone();
+                if expected.provider_code.is_none() {
+                    expected.provider_code = Some(derived_code.into());
+                }
                 assert_eq!(
                     serde_json::to_string(&SharedProviderError::from(raw.clone())).unwrap(),
-                    serde_json::to_string(&raw).unwrap(),
-                    "{class:?} keeps its established caller JSON"
+                    serde_json::to_string(&expected).unwrap(),
+                    "{class:?} retains its fields and supplies the required code"
                 );
             }
         }
@@ -777,6 +796,40 @@ mod tests {
             serde_json::to_value(&error).unwrap()["class"],
             "future_class"
         );
+        assert_eq!(error.provider_code.as_deref(), Some("provider_error"));
+    }
+
+    #[test]
+    fn shared_provider_code_uses_served_class_and_preserves_finer_diagnostics() {
+        let shared = SharedProviderError::from(unavailable_error());
+        assert_eq!(shared.class_wire(), "transient");
+        assert_eq!(shared.provider_code.as_deref(), Some("transient"));
+        let mut raw = unavailable_error();
+        raw.class = ErrorClass::Permanent;
+        raw.provider_code = Some("future_routable_code".into());
+        raw.provider_subcode = Some("upstream_detail".into());
+        assert_eq!(
+            serde_json::to_value(SharedProviderError::from(raw.clone())).unwrap(),
+            serde_json::to_value(raw).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_provider_code_is_filled_on_legacy_caller_decode_too() {
+        for (class, code) in [
+            ("transient", "transient"),
+            ("auth_required", "auth_required"),
+            ("context_overflow", "context_overflow"),
+            ("permanent", "provider_error"),
+            ("future_class", "provider_error"),
+        ] {
+            let shared: SharedProviderError = serde_json::from_value(
+                serde_json::json!({"class":class,"message":"older served error"}),
+            )
+            .unwrap();
+            assert_eq!(shared.class_wire(), class);
+            assert_eq!(shared.provider_code.as_deref(), Some(code));
+        }
     }
 
     #[test]

@@ -2071,9 +2071,12 @@ The snapshot is cleared before the next attempt and when the step ends.
 
 Terminal errors carry the same ending `awaits` on status, head, error/run-finished controls
 and `run.result`, using the recorded run-end time. Other terminals omit it, and nonterminal
-results never carry it. An error with no provider code also omits `awaits`: its retry/final
-classification is unknown, not a reason to refuse an otherwise readable run. Its existing
-error bytes are unchanged. Terminal reason fields keep each surface's existing encoding.
+results never carry it. When a stored error has no code, the shared served-error boundary
+supplies one from its caller-facing class: `transient`, `auth_required`, or `context_overflow`;
+all other classes use `provider_error`. This applies on both storages and does not rewrite
+stored records. Existing codes and finer provider diagnostics stay unchanged. Error endings
+on `broca-session-store` use that normalized error for `awaits`. Terminal reason fields keep each
+surface's existing encoding.
 An account display name is the frozen credential key's explicit label, else a cached vault
 row's nonblank email, never an opaque account or credential ID. Quoted messages retain their
 known provider/runner origin; unknown provenance and deliberately withheld WebSocket text
