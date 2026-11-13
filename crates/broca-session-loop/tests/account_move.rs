@@ -89,6 +89,7 @@ fn render_config(account: &str) -> Value {
 /// What one account's provider answers for a step.
 #[derive(Clone)]
 enum Reply {
+    Auth,
     /// The model calls `read`.
     Tool,
     /// The model answers in text.
@@ -241,6 +242,10 @@ impl Account {
             ]
         };
         match reply {
+            Reply::Auth => vec![NormalizedEvent::Control(ProviderControl::Error {
+                error: serde_json::from_value(json!({"class":"auth_required","provider_code":"needs_reauth","message":"vault needs sign-in"})).unwrap(),
+                retries_used: 0,
+            })],
             Reply::Tool => finished(true),
             Reply::Answer => finished(false),
             Reply::Wall {
@@ -638,6 +643,9 @@ impl Writer for Logging<'_, '_> {
     }
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        if self.session.operations.run.is_some() {
+            self.log.lock().unwrap().push("open-log-read".into());
+        }
         self.session.open_log_records().await
     }
 
@@ -1362,6 +1370,102 @@ async fn a_fixed_key_does_not_ask() {
     let ran = run_case(case).await;
     assert_eq!(ran.reason(), RunFinishReason::Error);
     assert!(ran.asked.is_empty());
+}
+
+#[tokio::test]
+async fn an_unrouted_auth_pause_does_not_read_the_open_log() {
+    let mut case = Case::new(vec![("A", vec![Reply::Auth])], vec![]);
+    case.selection = Some(
+        serde_json::from_value(json!({"credential_id":"fixed-key","account_ref":"A"})).unwrap(),
+    );
+    let ran = run_case(case).await;
+    assert_eq!(
+        ran.finished.as_ref().unwrap().paused,
+        Some(broca_protocol::PauseReason::AuthRequired)
+    );
+    assert!(ran.asked.is_empty());
+    assert!(
+        !ran.log.iter().any(|entry| entry == "open-log-read"),
+        "{:?}",
+        ran.log
+    );
+}
+
+#[tokio::test]
+async fn a_pause_lift_binds_the_offered_transport_after_its_durable_batch() {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log: Log = Arc::default();
+    let provider: Box<dyn Provider> = Box::new(Account::new("A", vec![Reply::Auth], &sent, &log));
+    let selection = routed("A", "decision-A");
+    let control = broca_core::RunControl {
+        auth_selection: Some(selection.clone()),
+        ..Default::default()
+    };
+    let mut request = request();
+    let admission = broca_session_loop::admit::admission(
+        &mut request,
+        &control,
+        &provider,
+        Writer::operations(&session),
+        Some(NOW),
+    )
+    .unwrap();
+    let tools = StubToolPlane::new();
+    let now = || NOW;
+    let first = seams(
+        &provider,
+        &tools,
+        &now,
+        None,
+        &log,
+        selection.clone(),
+        Default::default(),
+        Default::default(),
+    );
+    let mut writer = Logging {
+        session: &mut session,
+        log: log.clone(),
+        refuse_moves: false,
+        stop_after_batches: None,
+    };
+    let paused = broca_session_loop::run::run(&mut writer, &mut parts, admission, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.paused,
+        Some(broca_protocol::PauseReason::AuthRequired)
+    );
+    drop(first);
+    let routing = moving_routing(&sent, &log);
+    let mut second = seams(
+        &provider,
+        &tools,
+        &now,
+        Some(&routing),
+        &log,
+        selection,
+        Default::default(),
+        Default::default(),
+    );
+    second.pause_for_auth_at_start = Some(serde_json::from_value(json!({"class":"auth_required","provider_code":"needs_reauth","message":"vault needs sign-in"})).unwrap());
+    let finished = broca_session_loop::resume(&mut writer, &parts, &second)
+        .await
+        .unwrap();
+    assert_eq!(finished.reason, RunFinishReason::Completed);
+    let log = log.lock().unwrap();
+    let durable = log
+        .iter()
+        .position(|entry| {
+            entry.starts_with("append durable")
+                && entry.contains("AuthRefrozen")
+                && entry.contains("Resumed")
+        })
+        .unwrap();
+    let bound = log.iter().position(|entry| entry == "bind B").unwrap();
+    assert!(durable < bound, "{log:?}");
 }
 
 #[tokio::test]

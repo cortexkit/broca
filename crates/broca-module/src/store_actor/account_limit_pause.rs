@@ -130,7 +130,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ) = (self.current_sign_in().await, &self.sign_in_check)
             {
                 if current.run_id == expected.run_id && current.pause_seq == expected.pause_seq {
-                    current.resume_not_before_ms = *until;
+                    current.resume_not_before_ms = (*until).max(expected.resume_not_before_ms);
                     self.account_limit_timer = Some(current);
                 }
             }
@@ -168,6 +168,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             )?;
             let mode = self.sign_in_recheck_mode().await;
             self.start_run(start, None, None, mode).await;
+            if let Some(active) = self.run.as_mut() {
+                active.preserve_auth_pause = true;
+            }
             return Ok(());
         }
         let Some(pause) = self.current_account_limit().await? else {
@@ -264,25 +267,86 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 return StoreRunMode::Resume;
             }
         };
+        if self.sign_in_in_flight.as_ref().is_some_and(|reserved| {
+            reserved.run_id == pause.run_id && reserved.pause_seq == pause.pause_seq
+        }) {
+            return StoreRunMode::Resume;
+        }
         let ask = match &self.sign_in_check {
             Some((previous, outcome))
                 if previous.run_id == pause.run_id && previous.pause_seq == pause.pause_seq =>
             {
                 match outcome {
-                    SignInOutcome::Hold(until) => {
-                        until.is_none_or(|until| (self.now_ms)() >= until)
-                    }
+                    SignInOutcome::Hold(until) => until.is_none_or(|until| {
+                        (self.now_ms)() >= until.max(previous.resume_not_before_ms)
+                    }),
                     SignInOutcome::Refuse | SignInOutcome::Unreachable => false,
                 }
             }
             _ => true,
         };
         if ask {
-            // A failed admission is also one attempted re-check, not an invitation to loop.
-            self.sign_in_check = Some((pause, SignInOutcome::Unreachable));
+            self.sign_in_in_flight = Some(pause);
             StoreRunMode::RecheckSignIn
         } else {
             StoreRunMode::Resume
+        }
+    }
+
+    pub(super) async fn finish_sign_in_check(
+        &mut self,
+        outcome: Option<broca_session_loop::account_move::SignInOutcome>,
+    ) {
+        use broca_session_loop::account_move::SignInOutcome;
+        let reservation = self.sign_in_in_flight.take();
+        let Ok(Some(pause)) = self.current_sign_in().await else {
+            return;
+        };
+        if let Some(outcome) = outcome {
+            self.sign_in_check = Some((pause, outcome));
+        } else if reservation.as_ref().is_some_and(|reserved| {
+            reserved.run_id == pause.run_id && reserved.pause_seq == pause.pause_seq
+        }) {
+            if let Some((previous, SignInOutcome::Hold(Some(until)))) = &mut self.sign_in_check {
+                if previous.run_id == pause.run_id && previous.pause_seq == pause.pause_seq {
+                    // Admission failed before an exchange. Preserve the hold, but do not spin
+                    // on its now-expired deadline while the dependency is unavailable.
+                    previous.resume_not_before_ms =
+                        (*until).max((self.now_ms)().saturating_add(30_000));
+                }
+            }
+        }
+    }
+
+    pub(super) async fn probe_sign_in_on_open(&mut self) {
+        if !self.sign_in_open_owed
+            || self.run.is_some()
+            || self.stopping
+            || self
+                .registry
+                .as_ref()
+                .is_some_and(|registry| !registry.restart_resume_ready() || registry.is_stopping())
+        {
+            return;
+        }
+        self.sign_in_open_owed = false;
+        let Some(run) =
+            self.session.operations().run.as_ref().filter(|run| {
+                run.finished.is_none() && run.paused == Some(PauseReason::AuthRequired)
+            })
+        else {
+            return;
+        };
+        let start = match self.recovery_start(run) {
+            Ok(start) => start,
+            Err(error) => {
+                tracing::warn!(target: "broca.store_actor", %error, "sign-in probe could not read its frozen start");
+                return;
+            }
+        };
+        if self.sign_in_recheck_mode().await == StoreRunMode::RecheckSignIn {
+            self.start_run(start, None, None, StoreRunMode::ProbeSignIn)
+                .await;
         }
     }
 

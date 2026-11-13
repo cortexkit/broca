@@ -1815,8 +1815,8 @@ mod executor {
     use broca_protocol::error::{ErrorClass, ProviderError};
     use broca_protocol::{AuthRequest, BindIdentity};
     use broca_provider::credential_refresh::{
-        ExpiringRefresh, ExpiringRefreshFuture, RefreshFuture, RefreshedSecret, SecretRefresher,
-        SharedSecretRefresher,
+        ExpiringRefresh, ExpiringRefreshFuture, RefreshFuture, RefreshedSecret, RejectedRefresh,
+        SecretRefresher, SharedSecretRefresher,
     };
     use broca_provider::{build_provider_http_client, ProviderHttpClient};
     use broca_subc::{SubcToolPlane, VaultError, VaultGet, VaultToken};
@@ -2089,7 +2089,7 @@ mod executor {
                         // The run pauses as it did before in-step refresh existed.
                         if token.record_version <= rejected {
                             tracing::warn!(target: "credentials", "credential reread outcome=same_version vault_id='{}' rejected_version={rejected} served_version={} expires_at_ms={}", self.vault_id, token.record_version, token.expires_at_ms.map_or_else(|| "none".to_string(), |value| value.to_string()));
-                            return None;
+                            return RejectedRefresh::Unavailable;
                         }
                         tracing::warn!(target: "credentials", "credential reread outcome=refreshed vault_id='{}' old_version={rejected} new_version={}", self.vault_id, token.record_version);
                         self.vault
@@ -2098,7 +2098,7 @@ mod executor {
                         self.served_version
                             .store(token.record_version, Ordering::SeqCst);
                         self.set_served_expiry(token.expires_at_ms);
-                        Some(RefreshedSecret {
+                        RejectedRefresh::Token(RefreshedSecret {
                             evidence: broca_protocol::CredentialRefresh {
                                 vault_op: broca_core::VaultReadOp::GetScoped.as_str().to_string(),
                                 min_ttl_ms,
@@ -2114,12 +2114,16 @@ mod executor {
                             secret: token.token,
                         })
                     }
-                    // needs_reauth, a refusal, or no reply: no fresh token, so the 401 stands and
-                    // the run pauses exactly as it did before in-step refresh existed.
+                    // Only the vault's definite sign-in loss can authorize account continuation.
+                    // Other read failures leave the provider's standing rejection unchanged.
                     Err(error) => {
                         self.note_read_failure(&error);
                         tracing::warn!(target: "credentials", "credential reread outcome=reread_failed vault_id='{}' rejected_version={rejected} error_class={:?} vault_replied={}", self.vault_id, lkg_error_class(&error), got.vault_replied);
-                        None
+                        if matches!(error, VaultError::NeedsReauth) {
+                            RejectedRefresh::NeedsReauth
+                        } else {
+                            RejectedRefresh::Unavailable
+                        }
                     }
                 }
             })
@@ -3155,6 +3159,7 @@ mod executor {
         prepared: std::sync::Mutex<Vec<MovedCredential>>,
         adopted: std::sync::Mutex<Option<MovedCredential>>,
         recheck_sign_in: bool,
+        probe_only: bool,
     }
 
     impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
@@ -3173,6 +3178,7 @@ mod executor {
                 prepared: Default::default(),
                 adopted: Default::default(),
                 recheck_sign_in: true,
+                probe_only: false,
             }
         }
 
@@ -3194,16 +3200,16 @@ mod executor {
             use broca_session_loop::account_move::Answer;
             use cortexkit_role_routing::account_continue::ContinueAnswer;
             let Some(routing) = self.executor.routing.as_ref() else {
-                return Err(Answer::Stay(None));
+                return Err(Answer::Ignored);
             };
             let Some(request) = broca_module_serve::account_routing::continue_request(wall) else {
                 tracing::warn!(
                     target: "accounts",
                     run_id = wall.run_id,
                     "the run's selection lacks the admission, conversation key or decision \
-                     routing knows it by; it does not ask to move at its quota wall"
+                     routing knows it by, or no fresh selection id could be made; continuation was not sent"
                 );
-                return Err(Answer::Stay(None));
+                return Err(Answer::Ignored);
             };
             let deadline = *self
                 .deadlines
@@ -3211,15 +3217,27 @@ mod executor {
                 .unwrap()
                 .entry(wall.attempt_seq)
                 .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
-            let answer = match routing.account_continue_if_served(&request, deadline).await {
+            let outcome = routing.account_continue_if_served(&request, deadline).await;
+            if wall.limit_window == "signed_out"
+                && !matches!(
+                    &outcome,
+                    ContinueOutcome::NotAsked | ContinueOutcome::NotDeclared
+                )
+            {
+                tracing::info!(target: "accounts", run_id = wall.run_id, "routing sign-in continuation exchange completed");
+            }
+            let answer = match outcome {
                 ContinueOutcome::Answered(answer) => answer,
-                ContinueOutcome::NotDeclared => return Err(Answer::Stay(None)),
+                ContinueOutcome::NotDeclared | ContinueOutcome::NotAsked => {
+                    return Err(Answer::Ignored)
+                }
                 outcome => {
                     tracing::warn!(
                         target: "accounts",
                         run_id = wall.run_id,
                         ?outcome,
-                        "routing gave no answer to the run's continue request at its quota wall"
+                        limit_window = wall.limit_window,
+                        "routing gave no answer to the run's account-continuation request"
                     );
                     return Err(Answer::Stay(None));
                 }
@@ -3238,7 +3256,7 @@ mod executor {
                         until_ms: None,
                     },
                 ))),
-                _ => Err(Answer::Stay(None)),
+                _ => Err(Answer::Ignored),
             }
         }
 
@@ -3317,10 +3335,11 @@ mod executor {
                     run_id = wall.run_id,
                     step_id = wall.step_id,
                     offered = %offer.account,
-                    "routing offered an account at a quota wall, and the run does not take it: \
+                    limit_window = wall.limit_window,
+                    "routing offered an account for continuation, and the run does not take it: \
                      {reason}"
                 );
-                Answer::Stay(None)
+                Answer::Ignored
             };
             // The loop checks the reservation just before it writes the move, and asks again
             // once if it lapsed; an account that refused this step is never offered usefully.
@@ -3342,6 +3361,22 @@ mod executor {
             else {
                 return refuse("the run's credential names no auth method");
             };
+            let Some(vault) = self.executor.vault.as_ref() else {
+                return refuse("the offered credential's vault metadata is unavailable");
+            };
+            let Some(listing) = latest_listing(Arc::clone(vault)).await else {
+                return refuse("the offered credential's vault metadata is unavailable");
+            };
+            let provider = wall.run_config.model.provider_module_id.as_str();
+            if !listing.credentials.iter().any(|row| {
+                row.id == offer.credential_id
+                    && row.auth_method.as_deref() == Some(method.as_token())
+                    && row.provider_ids.iter().any(|id| id == provider)
+            }) {
+                return refuse(
+                    "the offered credential's provider or auth method does not match the run",
+                );
+            }
             let decision = broca_core::AccountDecision {
                 decision_id: Some(offer.decision_id.clone()),
                 ..previous.clone()
@@ -3454,6 +3489,9 @@ mod executor {
 
         fn recheck_sign_in(&self) -> bool {
             self.recheck_sign_in
+        }
+        fn probe_only(&self) -> bool {
+            self.probe_only
         }
     }
 
@@ -5156,11 +5194,13 @@ mod executor {
                 }
                 return Ok(sealed);
             }
-            if matches!(mode, StoreRunMode::Resume | StoreRunMode::RecheckSignIn)
-                && control
-                    .cancel
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            if matches!(
+                mode,
+                StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
+            ) && control
+                .cancel
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
                 // A caller may cancel because sign-in or provider access is unavailable. Closing
                 // the existing run must not depend on admitting another model call first.
@@ -5353,7 +5393,11 @@ mod executor {
                 None
             };
             let mut moves = AccountMoves::new(self, req, clock.as_ref(), media_renderer);
-            moves.recheck_sign_in = mode == StoreRunMode::RecheckSignIn;
+            moves.recheck_sign_in = matches!(
+                mode,
+                StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
+            );
+            moves.probe_only = mode == StoreRunMode::ProbeSignIn;
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -5847,9 +5891,14 @@ mod executor {
                 broca_core::AuthSelection {
                     billing_vault_facts: None,
                     credential_id: credential_key.clone(),
-                    // Freeze the vault-served account id verbatim alongside the credential id so
-                    // usage export labels spend with the account this run authenticated with.
-                    account_ref: account_id.clone(),
+                    // Keep the vault-served identity when available. A definite sign-in failure
+                    // still needs routing's selected account to identify which account's
+                    // credential is unavailable.
+                    account_ref: account_id.clone().or_else(|| {
+                        matches!(&outcome, Err(VaultError::NeedsReauth))
+                            .then(|| routed.as_ref().map(|(_, account, ..)| account.to_string()))
+                            .flatten()
+                    }),
                     resolved_credential_id: Some(vault_id.clone()),
                     // Present only if the vault replied; see `recorded_vault_request`.
                     vault_request: recorded_request,
@@ -6926,6 +6975,7 @@ mod executor {
         mod signed_out {
             use super::*;
             include!("signed_out_tests.rs");
+            include!("signed_out_audit_tests.rs");
         }
         include!("fork_executor_tests.rs");
 

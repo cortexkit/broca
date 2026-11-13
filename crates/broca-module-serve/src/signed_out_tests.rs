@@ -17,7 +17,9 @@ struct SignedOutRouting {
     requests: std::sync::Mutex<Vec<(u64, Value)>>,
     request_bytes: std::sync::Mutex<Vec<Vec<u8>>>,
     replies: std::sync::Mutex<VecDeque<broca_module_serve::account_routing::RoutingReply>>,
-    missing: Option<&'static str>,
+    missing: std::sync::Mutex<Option<&'static str>>,
+    pending: std::sync::atomic::AtomicBool,
+    before_continue: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[async_trait::async_trait]
@@ -27,9 +29,10 @@ impl broca_module_serve::account_routing::RoutingTransport for SignedOutRouting 
         name: &str,
     ) -> broca_module_serve::routing_capabilities::CapabilitySupport {
         use broca_module_serve::routing_capabilities::CapabilitySupport;
-        if self.missing == Some("unknown") {
+        let missing = *self.missing.lock().unwrap();
+        if missing == Some("unknown") {
             CapabilitySupport::Unknown
-        } else if self.missing == Some(name) {
+        } else if missing == Some(name) {
             CapabilitySupport::NotDeclared
         } else {
             CapabilitySupport::Declared
@@ -45,6 +48,12 @@ impl broca_module_serve::account_routing::RoutingTransport for SignedOutRouting 
         if request["method"] == "route.account_for" {
             if request["params"]["mode"] == "continue" {
                 self.request_bytes.lock().unwrap().push(bytes);
+                if let Some(hook) = self.before_continue.lock().unwrap().take() {
+                    hook();
+                }
+                if self.pending.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
                 return self
                     .replies
                     .lock()
@@ -103,7 +112,9 @@ struct SignedOutRig {
     server: tokio::task::JoinHandle<()>,
     parts: SharedParts,
     status_a: Arc<std::sync::atomic::AtomicU16>,
+    status_b: Arc<std::sync::atomic::AtomicU16>,
     reset_after_s: Arc<std::sync::atomic::AtomicU64>,
+    scripted_b: Arc<std::sync::Mutex<VecDeque<String>>>,
 }
 
 impl SignedOutRig {
@@ -144,8 +155,12 @@ impl SignedOutRig {
             401
         }));
         let status = status_a.clone();
+        let status_b = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let other_status = status_b.clone();
         let reset_after_s = Arc::new(std::sync::atomic::AtomicU64::new(259_200));
         let reset = reset_after_s.clone();
+        let scripted_b: Arc<std::sync::Mutex<VecDeque<String>>> = Arc::default();
+        let body_script = scripted_b.clone();
         let server = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -188,13 +203,22 @@ impl SignedOutRig {
                 captured.lock().unwrap().push(account.clone());
                 let usage_wall = account == A && status.load(Ordering::SeqCst) == 429;
                 let limit_body = json!({"error":{"type":"usage_limit_reached","message":"usage exhausted","resets_in_seconds":reset.load(Ordering::SeqCst)}}).to_string();
-                let (status, content_type, body) = if usage_wall {
+                let scripted = if account == B {
+                    body_script.lock().unwrap().pop_front()
+                } else {
+                    None
+                };
+                let (status, content_type, body) = if let Some(body) = &scripted {
+                    ("200 OK", "text/event-stream", body.as_str())
+                } else if usage_wall {
                     (
                         "429 Too Many Requests",
                         "application/json",
                         limit_body.as_str(),
                     )
-                } else if account == A && status.load(Ordering::SeqCst) == 401 {
+                } else if (account == A && status.load(Ordering::SeqCst) == 401)
+                    || (account == B && other_status.load(Ordering::SeqCst) == 401)
+                {
                     (
                         "401 Unauthorized",
                         "application/json",
@@ -216,7 +240,9 @@ impl SignedOutRig {
             requests: Default::default(),
             request_bytes: Default::default(),
             replies: std::sync::Mutex::new(replies.into()),
-            missing,
+            missing: std::sync::Mutex::new(missing),
+            pending: Default::default(),
+            before_continue: Default::default(),
         });
         let listing = Arc::new(broca_module_serve::account_routing::ListingCache::default());
         let credentials: Vec<_> = [(CRED_A, A), (CRED_B, B)].into_iter().map(|(id, account)| json!({
@@ -257,7 +283,9 @@ impl SignedOutRig {
             server,
             parts: SharedParts::new(Box::new(MemoryParts::default())),
             status_a,
+            status_b,
             reset_after_s,
+            scripted_b,
         }
     }
 
@@ -442,6 +470,7 @@ async fn signed_out_vault_fetch_moves_without_pause() {
 #[tokio::test]
 async fn signed_out_fresh_401_moves_without_pause() {
     let rig = SignedOutRig::new("signed-out-401", false, None, vec![offer()]).await;
+    rig.script_a(vec![token(A, false), versioned_token(A, 2)]);
     let (_, session) = rig.session().await;
     let (commands, task) = rig.actor(session);
     send_signed_out(&commands).await;
@@ -452,7 +481,7 @@ async fn signed_out_fresh_401_moves_without_pause() {
         session.operations().run.as_ref().unwrap().finished,
         Some(broca_protocol::RunFinishReason::Completed)
     );
-    assert_eq!(*rig.sent.lock().unwrap(), [A, B]);
+    assert_eq!(*rig.sent.lock().unwrap(), [A, A, B]);
     assert_signed_out_question(&rig.routing, 1);
     let records = records(&session).await;
     assert!(!records
@@ -525,6 +554,11 @@ async fn signed_out_hold_wakes_at_until_and_relogin_cancels_it() {
         actor_idle(&commands).await;
         assert_signed_out_question(&rig.routing, 1);
         assert!(rig.sent.lock().unwrap().is_empty());
+        if !restored {
+            send_signed_out(&commands).await;
+            actor_idle(&commands).await;
+            assert_signed_out_question(&rig.routing, 1);
+        }
         if restored {
             rig.script_a(vec![token(A, false)]);
             send_signed_out(&commands).await;
@@ -658,7 +692,9 @@ async fn signed_out_actor_open_moves_a_preexisting_pause() {
         requests: Default::default(),
         request_bytes: Default::default(),
         replies: std::sync::Mutex::new(VecDeque::from([offer()])),
-        missing: None,
+        missing: std::sync::Mutex::new(None),
+        pending: Default::default(),
+        before_continue: Default::default(),
     });
     let mut rig = rig;
     Arc::get_mut(&mut rig.executor).unwrap().routing = Some(Arc::new(
@@ -863,7 +899,9 @@ async fn signed_out_actor_open_survives_every_store_write_cut() {
             requests: Default::default(),
             request_bytes: Default::default(),
             replies: std::sync::Mutex::new(VecDeque::from([offer(), offer()])),
-            missing: None,
+            missing: std::sync::Mutex::new(None),
+            pending: Default::default(),
+            before_continue: Default::default(),
         });
         Arc::get_mut(&mut rig.executor).unwrap().routing = Some(Arc::new(
             broca_module_serve::account_routing::RoutingClient::new(
@@ -952,14 +990,20 @@ async fn signed_out_actor_open_survives_every_store_write_cut() {
 
 #[tokio::test]
 async fn signed_out_at_a_due_account_limit_wake_moves_or_pauses_on_refusal() {
-    for offered in [true, false] {
+    for outcome in ["offer", "refuse", "hold"] {
+        let offered = outcome == "offer";
+        let hold_until = now_ms() + 120_000;
         let reply = if offered {
             offer()
+        } else if outcome == "hold" {
+            answer(
+                json!({"kind":"hold","routing_code":"no_compatible_account","detail":{},"until_ms":hold_until}),
+            )
         } else {
             answer(json!({"kind":"refuse","routing_code":"pin_unavailable","detail":{}}))
         };
         let rig = SignedOutRig::new(
-            &format!("signed-out-limit-wake-{offered}"),
+            &format!("signed-out-limit-wake-{outcome}"),
             false,
             None,
             vec![reply],
@@ -1030,6 +1074,20 @@ async fn signed_out_at_a_due_account_limit_wake_moves_or_pauses_on_refusal() {
             assert_eq!(run.paused, Some(broca_protocol::PauseReason::AuthRequired));
             assert_eq!(run.finished, None);
             assert_eq!(auth_pauses, 1);
+            assert_eq!(
+                run.end_error.as_ref().unwrap()["account_continue"]["routing_code"],
+                if outcome == "hold" {
+                    "no_compatible_account"
+                } else {
+                    "pin_unavailable"
+                }
+            );
+            if outcome == "hold" {
+                assert_eq!(
+                    run.end_error.as_ref().unwrap()["account_continue"]["until_ms"],
+                    hold_until
+                );
+            }
             assert_eq!(*rig.sent.lock().unwrap(), [A, A]);
         }
         assert_signed_out_question(&rig.routing, 1);

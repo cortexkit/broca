@@ -306,7 +306,12 @@ pub trait RoutingTransport: Send + Sync {
     /// `names`; `None` when it doesn't, and then nothing was sent. A transport that can reach
     /// another registration of routing between the check and the send checks again against the
     /// route the request actually goes out on.
-    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+    async fn request_where_declared(
+        &self,
+        body: Vec<u8>,
+        names: &[&str],
+        started: &std::sync::atomic::AtomicBool,
+    ) -> Option<RoutingReply> {
         for name in names {
             if self.capability(name).await
                 != crate::routing_capabilities::CapabilitySupport::Declared
@@ -314,6 +319,7 @@ pub trait RoutingTransport: Send + Sync {
                 return None;
             }
         }
+        started.store(true, Ordering::Release);
         Some(self.request(body).await)
     }
 }
@@ -593,7 +599,12 @@ impl RoutingTransport for SubcRoutingTransport {
     /// A stale route is reopened once, as for any request, and the reopened route may reach a
     /// re-registered routing module that declares other capabilities. Its description is read
     /// again (a closed route drops the cached one) before the request is sent there.
-    async fn request_where_declared(&self, body: Vec<u8>, names: &[&str]) -> Option<RoutingReply> {
+    async fn request_where_declared(
+        &self,
+        body: Vec<u8>,
+        names: &[&str],
+        started: &std::sync::atomic::AtomicBool,
+    ) -> Option<RoutingReply> {
         let declared = || async {
             for name in names {
                 if self.capability(name).await
@@ -621,13 +632,20 @@ impl RoutingTransport for SubcRoutingTransport {
                 .await
                 .expect("close test route");
         }
-        match self.conn.route_request_terminal(&route, body.clone()).await {
+        match self
+            .conn
+            .route_request_terminal_observed(&route, body.clone(), || {
+                started.store(true, Ordering::Release)
+            })
+            .await
+        {
             Ok(reply) => return Some(Ok(reply)),
             Err(error) => {
                 self.forget(route);
                 if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
                     return Some(Err(self.request_error(error)));
                 }
+                started.store(false, Ordering::Release);
             }
         }
         // A stale handle fails before the request frame is built, so nothing was delivered.
@@ -640,7 +658,9 @@ impl RoutingTransport for SubcRoutingTransport {
         };
         Some(
             self.conn
-                .route_request_terminal(&route, body)
+                .route_request_terminal_observed(&route, body, || {
+                    started.store(true, Ordering::Release)
+                })
                 .await
                 .map_err(|error| {
                     self.forget(route);
@@ -2697,6 +2717,8 @@ impl ListingCache {
 /// What a continue request came to, as the run acts on it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContinueOutcome {
+    /// Discovery, route opening or the budget ended before a request could be sent.
+    NotAsked,
     /// Routing answered with an offer, a hold or a refusal. A routing error body (an
     /// `invalid_request`, say) reads as a refusal under the error's code.
     Answered(cortexkit_role_routing::account_continue::ContinueAnswer),
@@ -2830,10 +2852,15 @@ impl RoutingClient {
         if request.exhausted.limit_window == "signed_out" {
             declarations.push(cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE_SIGNED_OUT);
         }
-        let sent = self.transport.request_where_declared(body, &declarations);
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let sent = self
+            .transport
+            .request_where_declared(body, &declarations, &started);
         let outcome = match tokio::time::timeout_at(deadline, sent).await {
+            Err(_) if !started.load(Ordering::Acquire) => ContinueOutcome::NotAsked,
             Err(_) => ContinueOutcome::NoAnswerWithinBudget,
             Ok(None) => ContinueOutcome::NotDeclared,
+            Ok(Some(Err(_))) if !started.load(Ordering::Acquire) => ContinueOutcome::NotAsked,
             Ok(Some(Err(cause))) => ContinueOutcome::Unreachable(cause),
             Ok(Some(Ok(reply))) => classify_continue_reply(reply),
         };
@@ -2842,6 +2869,7 @@ impl RoutingClient {
             ContinueOutcome::NotDeclared => "continue_not_declared",
             ContinueOutcome::Unreachable(_) => "continue_unreachable",
             ContinueOutcome::NoAnswerWithinBudget => "continue_no_answer_within_budget",
+            ContinueOutcome::NotAsked => "continue_unreachable",
         });
         outcome
     }

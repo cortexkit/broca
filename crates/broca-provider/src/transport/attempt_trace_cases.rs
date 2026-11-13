@@ -493,7 +493,10 @@ impl CredentialRefresher for Refresher {
     {
         Box::pin(async move {
             attempt_test_hooks::advance(self.elapsed);
-            credential(self.result, true)
+            credential(self.result, true).map_or(
+                crate::credential_refresh::RejectedRefresh::Unavailable,
+                crate::credential_refresh::RejectedRefresh::Token,
+            )
         })
     }
 }
@@ -524,6 +527,7 @@ pub(super) fn recovery(case: &Case) -> Option<StepAuthRecovery<'static>> {
                     pre_calls: AtomicUsize::new(0),
                 }),
                 current: Arc::new(std::sync::RwLock::new(ServedAuth {
+                    definite_auth_failure: None,
                     auth_refreshed: false,
                     revision: 0,
                     auth: sent_auth.clone(),

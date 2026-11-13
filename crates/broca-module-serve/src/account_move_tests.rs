@@ -287,7 +287,7 @@ async fn a_chatgpt_wall_offered_b(
         },
     )
     .await;
-    let mut executor = executor_with_capturing_vault(&root, &daemon).await;
+    let mut executor = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2), listed_credentials([("chatgpt:openai:second", "chatgpt:openai:second")]), supervised_broca_identity()).await;
     let routing = Arc::new(OffersAccount {
         credential_id: "chatgpt:openai:second",
         account: "chatgpt-b",
@@ -400,7 +400,7 @@ async fn the_executor_refuses_an_offer_whose_token_names_another_account() {
     let (answer, _, _) = a_chatgpt_wall_offered_b("move-offer-wrong", "chatgpt-wrong").await;
     assert!(matches!(
         answer,
-        broca_session_loop::account_move::Answer::Stay(None)
+        broca_session_loop::account_move::Answer::Ignored
     ));
 }
 

@@ -354,6 +354,11 @@ pub trait Provider: Send + Sync {
     fn reports_attempt_evidence(&self) -> bool {
         false
     }
+    /// Runtime-only evidence for the terminal auth failure of this step. Implementations
+    /// clear it at each step start; it is never a wire or durable record member.
+    fn definite_auth_failure(&self, _step_id: StepId) -> bool {
+        false
+    }
 
     /// The output-token cap this provider's requests carry and the smallest cap it may be
     /// lowered to, when the run's frozen config controls a cap the request sends. The run loop
@@ -620,6 +625,9 @@ impl Provider for Box<dyn Provider> {
 
     fn reports_attempt_evidence(&self) -> bool {
         (**self).reports_attempt_evidence()
+    }
+    fn definite_auth_failure(&self, step_id: StepId) -> bool {
+        (**self).definite_auth_failure(step_id)
     }
 
     async fn warm(&self, base: &[u8]) -> Result<crate::WarmSent, crate::WarmFailure> {

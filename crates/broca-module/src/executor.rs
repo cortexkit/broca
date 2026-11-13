@@ -423,6 +423,8 @@ pub enum StoreRunMode {
     Resume,
     /// Re-check a sign-in pause, allowing one fresh account-continuation question.
     RecheckSignIn,
+    /// At actor open, inspect sign-in and ask routing only; never resume the original account.
+    ProbeSignIn,
     /// End the session's unfinished run `Interrupted` without calling the model, writing what
     /// today's seal writes (`broca_core::resume::interrupted_seal`): `broca_session_loop::seal`.
     Seal(broca_core::seal::SealCause),

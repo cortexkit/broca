@@ -2288,7 +2288,7 @@ impl crate::credential_refresh::CredentialRefresher for RefreshScript {
     {
         Box::pin(async {
             self.rereads.fetch_add(1, Ordering::SeqCst);
-            self.rejected.lock().unwrap().take()
+            self.rejected.lock().unwrap().take().map_or(crate::credential_refresh::RejectedRefresh::Unavailable, crate::credential_refresh::RejectedRefresh::Token)
         })
     }
 }

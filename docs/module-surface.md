@@ -2360,8 +2360,11 @@ On `broca-session-store` storage only, a routed run may instead move to another 
 through `route.account_for` with `mode: "continue"` and `exhausted.limit_window: "signed_out"`.
 This requires all three current declarations: `account_continue`, `account_continue_resume`
 and `account_continue_signed_out`; unknown support counts as no support. The signal is a vault
-`needs_reauth` with no unexpired held token, or an authentication-class HTTP 401/403 after a
-fresh token. An unreachable vault, transient failure or timeout never triggers the exchange.
+`needs_reauth` with no usable held token, or an authentication-class HTTP 401/403 whose
+post-rejection vault read says `needs_reauth` or supplied a newer token that was also refused.
+A standing 401 after an unavailable read or the same token version is not definite evidence
+and retains today's auth pause without asking. An unreachable vault, transient failure or
+timeout never triggers the exchange.
 A still-unexpired held token remains usable even when its refresh needs sign-in. Legacy
 storage retains its auth pause and never moves an account through this exchange.
 
@@ -2372,8 +2375,13 @@ the auth pause and re-asks with a fresh selection id at `until_ms`, or at the ne
 re-check when no time was supplied. Restoring the original credential first resumes that
 account and cancels the re-ask. A refusal, unreachable router or missing declaration retains
 the auth pause. The actor remembers the typed outcome: refusal/unreachability is not asked
-again for that pause during its life. Opening an actor re-checks an existing sign-in pause
-once, including pauses written before this behavior existed. There is no new storage record
+again for that pause during its life. Discovery that did not send a request, failed admission,
+and an offer rejected locally do not consume that exchange; a prior timed hold survives them.
+A hold time at or before receipt is clamped to a re-ask floor 30 seconds after receipt.
+Opening an actor probes an existing sign-in pause once after dependency routes are ready,
+including pauses written before this behavior existed. Only an offer can lift it during that
+probe; a now-usable original credential or a permanent admission failure leaves it unchanged.
+There is no new storage record
 or reply member.
 
 A timed account-limit pause checks for this sign-in loss once its recorded deadline is due.

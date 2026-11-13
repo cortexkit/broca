@@ -144,6 +144,7 @@ impl<P: Provider> Provider for ObserveStep<P> {
     fn reports_attempt_evidence(&self) -> bool {
         self.inner.reports_attempt_evidence()
     }
+    fn definite_auth_failure(&self, step_id: StepId) -> bool { self.inner.definite_auth_failure(step_id) }
 }
 
 #[derive(Clone, Copy)]

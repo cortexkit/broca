@@ -109,6 +109,8 @@ pub struct StoreActor<B: SessionBackend> {
         account_limit_pause::TimedPause,
         broca_session_loop::account_move::SignInOutcome,
     )>,
+    sign_in_in_flight: Option<account_limit_pause::TimedPause>,
+    sign_in_open_owed: bool,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -262,6 +264,7 @@ struct ActiveRun {
     run_id: RunId,
     one_shot: bool,
     account_limit_resume: bool,
+    preserve_auth_pause: bool,
     /// The actor's end of the run's writer.
     link: RunLink,
     /// Set once the run dropped its writer: it appends nothing more, and its end follows.
@@ -431,6 +434,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             restart_waiters: Vec::new(),
             account_limit_timer: None,
             sign_in_check: None,
+            sign_in_in_flight: None,
+            sign_in_open_owed: false,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -1025,6 +1030,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let clock = self.retention_clock.clone().unwrap_or_default();
         let mut clock_changes = clock.subscribe();
         loop {
+            self.probe_sign_in_on_open().await;
             // What the last event's writes handed over, before anything else reads the index.
             self.absorb_media();
             let expiry_deadline = retention
@@ -2157,8 +2163,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         reply: Option<oneshot::Sender<SendOutcome>>,
         mode: StoreRunMode,
     ) {
+        self.sign_in_open_owed = false;
         self.start_run_under(start, drained, reply, mode, CancellationToken::new())
             .await;
+        if self.run.is_none() && self.sign_in_in_flight.is_some() {
+            self.finish_sign_in_check(None).await;
+            self.arm_account_limit().await;
+        }
     }
 
     /// [`Self::start_run`], under `cancel`, which a caller's cancel trips. A token tripped before
@@ -2337,6 +2348,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             restart_cancelling,
             one_shot: one_shot || self.one_shot_runs.contains(&run_id),
             account_limit_resume: false,
+            preserve_auth_pause: mode == StoreRunMode::ProbeSignIn,
             run_id,
             link,
             writer_gone: false,
@@ -2493,9 +2505,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// - with no unfinished run, the first queued send drains.
     ///
     /// A held run parks until a late result resumes its original batch, even with an interrupt
-    /// queued behind it, as today's held-call recovery does. A sign-in pause waits for its retry,
-    /// unless an interrupt was queued before the process stopped: it ends the paused run now,
-    /// as today's drain does (`end_paused`). A restart pause resumes after dependency routes
+    /// queued behind it, as today's held-call recovery does. After dependency routes are ready,
+    /// a routed sign-in pause gets one probe that may ask routing and move on an offer, but
+    /// never resumes the old account. Other sign-in pauses wait for their retry. A queued
+    /// interrupt ends a paused run now (`end_paused`). A restart pause resumes after routes
     /// register. An account-limit pause rebuilds its timer from its durable evidence.
     async fn recover(&mut self) {
         self.bill_owed().await;
@@ -2540,15 +2553,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     if !routed {
                         return;
                     }
-                    match self.recovery_start(run) {
-                        Ok(start) => {
-                            let mode = self.sign_in_recheck_mode().await;
-                            self.start_run(start, None, None, mode).await;
-                        }
-                        Err(error) => {
-                            tracing::warn!(target: "broca.store_actor", %error, "sign-in pause recovery could not read its frozen start")
-                        }
-                    }
+                    self.sign_in_open_owed = true;
+                    self.probe_sign_in_on_open().await;
                     return;
                 }
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
@@ -3416,7 +3422,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .ok()
             .and_then(|finished| finished.sign_in.clone());
         let loop_failed = match &result {
-            Err(error) if started && restart_error.is_none() && !active.account_limit_resume => {
+            Err(error)
+                if started
+                    && restart_error.is_none()
+                    && !active.account_limit_resume
+                    && !active.preserve_auth_pause =>
+            {
                 let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
                     run.run_id == active.run_id.0
                         && run.finished.is_none()
@@ -3521,11 +3532,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if let Some(message) = loop_failed {
             self.end_failed_run(&active.run_id, message).await;
         }
-        if let Some(outcome) = sign_in_outcome {
-            if let Ok(Some(pause)) = self.current_sign_in().await {
-                self.sign_in_check = Some((pause, outcome));
-            }
-        }
+        self.finish_sign_in_check(sign_in_outcome).await;
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
@@ -4848,6 +4855,8 @@ mod plan_view_tests;
 mod read_cost;
 #[cfg(test)]
 mod reads_tests;
+#[cfg(test)]
+mod sign_in_probe_tests;
 #[cfg(test)]
 mod status_tests;
 #[cfg(test)]

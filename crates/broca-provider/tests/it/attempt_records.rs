@@ -933,6 +933,10 @@ mod gated {
                     auth,
                     evidence: refresh_evidence(),
                 })
+                .map_or(
+                    broca_provider::credential_refresh::RejectedRefresh::Unavailable,
+                    broca_provider::credential_refresh::RejectedRefresh::Token,
+                )
             })
         }
 

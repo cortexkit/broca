@@ -80,13 +80,13 @@ pub enum Answer<P> {
     /// Routing offered an account, and the executor resolved its credential and built the
     /// provider that sends on it.
     Move(Box<Move<P>>),
-    /// No move. `Some` carries routing's hold or refusal, which goes on the run's error; `None`
-    /// when the executor didn't ask (routing doesn't declare the operation, or that couldn't be
-    /// told) or had no usable answer (routing unreachable within the budget, or an offer the
-    /// executor refused).
+    /// An exchange completed without a move. `Some` carries routing's refusal; `None`
+    /// means a request was sent but no usable answer arrived within its budget.
     Stay(Option<AccountContinueAnswer>),
     /// Routing has no compatible account yet; an absent deadline waits for a credential re-check.
     Hold(AccountContinueAnswer),
+    /// No authoritative continuation answer: no exchange, or an offer refused locally.
+    Ignored,
 }
 
 /// Scheduling information for the actor owning a sign-in pause. Never persisted or inferred
@@ -96,6 +96,18 @@ pub enum SignInOutcome {
     Hold(Option<u64>),
     Refuse,
     Unreachable,
+}
+
+impl SignInOutcome {
+    pub fn hold(until_ms: Option<u64>, now_ms: u64) -> Self {
+        Self::Hold(until_ms.map(|until| {
+            if until <= now_ms {
+                now_ms.saturating_add(30_000)
+            } else {
+                until
+            }
+        }))
+    }
 }
 
 /// An account the run may move to, ready to use once the move is durable.
@@ -126,6 +138,9 @@ pub trait AccountContinue<P>: Send + Sync {
     fn recheck_sign_in(&self) -> bool {
         true
     }
+    fn probe_only(&self) -> bool {
+        false
+    }
 }
 
 /// What the loop did at a wall it asked about.
@@ -135,6 +150,7 @@ pub(crate) enum AtWall<P> {
     /// No move; routing's answer, if it gave one, for the run's error.
     Stayed(Option<AccountContinueAnswer>),
     Held(AccountContinueAnswer),
+    Ignored,
     /// The run was cancelled, or the runner asked to stop, while routing was being asked:
     /// nothing was recorded and the question was dropped. The run ends or pauses as it would
     /// at a step's boundary.
@@ -260,6 +276,7 @@ async fn prepare<P, T>(seams: &Seams<'_, P, T>, mut wall: Wall<'_>) -> AtWall<P>
         let moved = match answer {
             Answer::Stay(answer) => return AtWall::Stayed(answer),
             Answer::Hold(answer) => return AtWall::Held(answer),
+            Answer::Ignored => return AtWall::Ignored,
             Answer::Move(moved) => moved,
         };
         // The executor checks these too, before it reads the offered credential, and logs what
@@ -269,14 +286,14 @@ async fn prepare<P, T>(seams: &Seams<'_, P, T>, mut wall: Wall<'_>) -> AtWall<P>
         if wall.refused_accounts.contains(&moved.account)
             || moved.selection.account_ref.as_deref() != Some(moved.account.as_str())
         {
-            return AtWall::Stayed(None);
+            return AtWall::Ignored;
         }
         let now = (seams.now_ms)();
         if now < moved.valid_until_ms {
             break moved;
         }
         if wall.reask {
-            return AtWall::Stayed(None);
+            return AtWall::Ignored;
         }
         wall.reask = true;
     };
@@ -285,7 +302,8 @@ async fn prepare<P, T>(seams: &Seams<'_, P, T>, mut wall: Wall<'_>) -> AtWall<P>
 
 /// Prepare the same account move for a definite sign-in failure. A paused caller appends
 /// the refreezes together with its resume, rather than lifting the pause in a separate batch.
-pub(crate) async fn signed_out<W: Writer, P, T>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn signed_out<W: Writer, P: broca_core::Provider, T>(
     writer: &W,
     parts: &dyn crate::parts::Parts,
     seams: &Seams<'_, P, T>,
@@ -294,32 +312,13 @@ pub(crate) async fn signed_out<W: Writer, P, T>(
     error: &broca_protocol::ProviderError,
     refused: &mut Vec<String>,
 ) -> Result<Option<AtWall<P>>, LoopError> {
-    if seams.account_continue.is_none()
-        || error.class != broca_protocol::ErrorClass::Auth
-        || !(error.provider_code.as_deref() == Some("needs_reauth")
-            || matches!(error.status, Some(401 | 403)))
-    {
-        return Ok(None);
-    }
-    // Keep the run's recorded routing decision and admission id. An unsuccessful vault
-    // read may give the executor only a credential id, which cannot identify the run to routing.
-    let Some(selection) = admission
-        .auth_selection
-        .as_ref()
-        .or(seams.auth_selection.as_ref())
-        .filter(|selection| {
-            selection.account_decision.as_ref().is_some_and(|decision| {
-                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
-                    && decision.decision_id.is_some()
-                    && decision.admission_id.is_some()
-            })
-        })
-    else {
+    let Some(selection) = signed_out_selection(seams, admission, error, step_id) else {
         return Ok(None);
     };
-    let Some(account) = selection.account_ref.as_deref() else {
-        return Ok(None);
-    };
+    let account = selection
+        .account_ref
+        .as_deref()
+        .expect("eligible selection names an account");
     if !refused.iter().any(|id| id == account) {
         refused.push(account.to_owned());
     }
@@ -347,6 +346,37 @@ pub(crate) async fn signed_out<W: Writer, P, T>(
         )
         .await,
     ))
+}
+
+pub(crate) fn signed_out_selection<'a, P: broca_core::Provider, T>(
+    seams: &'a Seams<'_, P, T>,
+    admission: &'a Admission,
+    error: &broca_protocol::ProviderError,
+    step_id: u64,
+) -> Option<&'a broca_wal::AuthSelection> {
+    if seams.account_continue.is_none() || error.class != broca_protocol::ErrorClass::Auth {
+        return None;
+    }
+    // Keep the run's recorded routing decision and admission id. An unsuccessful vault
+    // read may give the executor only a credential id, which cannot identify the run to routing.
+    let selection = admission
+        .auth_selection
+        .as_ref()
+        .or(seams.auth_selection.as_ref())
+        .filter(|selection| {
+            selection.account_decision.as_ref().is_some_and(|decision| {
+                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                    && decision.decision_id.is_some()
+                    && decision.admission_id.is_some()
+            })
+        })
+        .filter(|selection| selection.account_ref.is_some())?;
+    ((error.provider_code.as_deref() == Some("needs_reauth") && error.status.is_none())
+        || (matches!(error.status, Some(401 | 403))
+            && seams
+                .provider
+                .definite_auth_failure(broca_protocol::StepId(step_id))))
+    .then_some(selection)
 }
 
 pub(crate) async fn record_move<W: Writer, P, T>(
@@ -429,39 +459,47 @@ pub fn moved_at_a_wall(run_id: &str, records: &[(u64, Record)]) -> bool {
     })
 }
 
-/// The accounts that refused step `step_id` of run `run_id` at a quota wall and that the run
-/// moved away from, read from its records: for each move at a wall (an `AuthRefrozen` no
-/// resume wrote, see [`moved_at_a_wall`]), the account that served the run's latest attempt
-/// before it, when that attempt belongs to the step. The wall being handled is added by the
-/// caller.
+/// Accounts this unfinished step moved away from, including a move that lifts a sign-in
+/// pause. A resume does not erase the account that already proved unusable for the step.
 pub fn refused_in_step(records: &[(u64, Record)], run_id: &str, step_id: u64) -> Vec<String> {
-    let resumes: Vec<(u64, u64)> = records
-        .iter()
-        .filter_map(|(seq, record)| match record {
-            Record::Resumed(resumed) if resumed.run_id == run_id => {
-                Some((resumed.resumed_from_seq, *seq))
-            }
-            _ => None,
-        })
-        .collect();
     let mut refused = Vec::new();
-    let mut latest: Option<(u64, Option<String>)> = None;
-    for (seq, record) in records {
+    let mut current_account: Option<String> = None;
+    let mut current_step = 1;
+    for (_, record) in records {
         match record {
-            Record::Attempt(attempt) if attempt.run_id == run_id => {
-                latest = Some((attempt.step_id, attempt.served_account_ref.clone()));
+            Record::RunStart(start) if start.run_id == run_id => {
+                current_account = start
+                    .auth_selection
+                    .as_ref()
+                    .and_then(|selection| selection.get("account_ref"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                current_step = 1;
             }
-            Record::AuthRefrozen(refrozen)
-                if refrozen.run_id == run_id
-                    && !resumes
-                        .iter()
-                        .any(|(from, resumed)| from < seq && seq < resumed) =>
-            {
-                if let Some((step, Some(account))) = &latest {
-                    if *step == step_id && !refused.contains(account) {
-                        refused.push(account.clone());
+            Record::StepStart(start) if start.run_id == run_id => current_step = start.step_id,
+            Record::StepEnd(end) if end.run_id == run_id => {
+                current_step = end.step_id.saturating_add(1)
+            }
+            Record::Attempt(attempt) if attempt.run_id == run_id => {
+                current_step = attempt.step_id;
+                if let Some(account) = &attempt.served_account_ref {
+                    current_account = Some(account.clone());
+                }
+            }
+            Record::AuthRefrozen(refrozen) if refrozen.run_id == run_id => {
+                let next = refrozen
+                    .auth_selection
+                    .get("account_ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if current_step == step_id && current_account != next {
+                    if let Some(account) = &current_account {
+                        if !refused.contains(account) {
+                            refused.push(account.clone());
+                        }
                     }
                 }
+                current_account = next;
             }
             _ => {}
         }

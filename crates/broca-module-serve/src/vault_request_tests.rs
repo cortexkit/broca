@@ -1287,7 +1287,7 @@ async fn refresh_after_a_rejection(label: &str, reports: ReportScript, status: u
     );
 
     let (refreshed, logs) = capture_credential_logs(async {
-        refresh.refresher.0.refresh_rejected_secret(status).await
+        refresh.refresher.0.refresh_rejected_secret(status).await.into_token()
     }).await;
     daemon.assert_healthy();
     let cached = executor
@@ -1489,7 +1489,7 @@ async fn pre_send_check(label: &str, expiry: ExpiryScript, then_401: bool) -> Pr
         .map(|token| token.record_version);
     let requests = daemon.requests();
     let after_401 = if then_401 {
-        refresh.refresher.0.refresh_rejected_secret(401).await
+        refresh.refresher.0.refresh_rejected_secret(401).await.into_token()
     } else {
         None
     };
@@ -1644,7 +1644,7 @@ fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
             '_,
             broca_provider::credential_refresh::RefreshedSecret,
         > {
-            Box::pin(async { None })
+            Box::pin(async { broca_provider::credential_refresh::RejectedRefresh::Unavailable })
         }
     }
     let in_run = |served: u64, reported: Option<u64>, unreported: Option<UnreportedRejection>| {
