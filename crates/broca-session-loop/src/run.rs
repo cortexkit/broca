@@ -95,6 +95,9 @@ pub struct Admission {
     /// The session's frozen plan manifest, for a session admitted with a fetch plan: the tools
     /// its providers answered with, its system text and the hooks it declares.
     pub manifest: Option<std::sync::Arc<broca_wal::PlanManifest>>,
+    /// Transport-only differences from the plan, frozen on this run rather than in shared
+    /// setup parts. A resume reads these without consulting the provider again.
+    pub transport: std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations>,
     /// For a session on the current compaction contract, the system text every request renders
     /// above the conversation, which is never part of its transcript: the plan's system text for
     /// a planned run, otherwise the system messages the caller sent, or the previous run's when
@@ -401,6 +404,12 @@ where
     // moves onto it at the first run whose plan names a compaction provider: that run enrolls
     // it (see `crate::enroll`).
     let mut admission = admission;
+    if let Some(manifest) = &admission.manifest {
+        admission.transport = seams
+            .tools
+            .run_transport(&seams.bind, admission.send.scope.as_ref(), manifest)
+            .await;
+    }
     let contract =
         crate::admit::session_contract(writer.operations(), admission.compaction_plan_version);
     let enrolling =
@@ -1715,6 +1724,14 @@ pub fn admission_of_start(
         compaction_plan_version: start.compaction_plan_version,
         context_limit: start.context_limit,
         manifest,
+        transport: decode(
+            start
+                .run_choices
+                .as_ref()
+                .and_then(|choices| choices.get("transport"))
+                .cloned(),
+        )?
+        .unwrap_or_default(),
         render_tags: member("render_tags")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
@@ -2195,6 +2212,7 @@ where
             .with_plan_manifest(plan)
             .map_err(|error| LoopError::Parts(format!("the run's frozen plan: {error}")))?;
     }
+    manifest = manifest.with_run_transport(&admission.transport);
     // As today's loop asks once per run: a provider whose media renderer tags its own copy of
     // each request takes the run's tag choice here, and the loop leaves media-holding messages
     // untagged, since preparing their media needs the parts where the model put them.
@@ -3409,6 +3427,9 @@ async fn admit<W: Writer>(
     }
     let mut choices = serde_json::Map::new();
     choices.insert("config".into(), Value::Object(config));
+    if !admission.transport.is_empty() {
+        choices.insert("transport".into(), json!(admission.transport));
+    }
     if let Some(rest) = manifest_rest {
         choices.insert("manifest".into(), rest);
     }

@@ -56,6 +56,8 @@ use crate::tool_deadline::tool_reply_deadline;
 
 use crate::route_close::{CloseTarget, RouteCloser};
 
+mod run_transport;
+
 #[cfg(all(feature = "test-route-close", not(debug_assertions)))]
 compile_error!("test-route-close must never be enabled in a shipping build");
 
@@ -800,9 +802,9 @@ impl Drop for SubcToolPlane {
 }
 
 /// What the batch's frozen plan declared about one provider: result formats, keepalives,
-/// and whether it may settle a call after its reply. Read from the session's
-/// admitted plan alone, never from a live catalog or caller-declared tools, so a provider whose
-/// catalog changed after admission cannot change how a resumed run reads a reply.
+/// and whether it may settle a call after its reply. Read from the run's frozen manifest
+/// and transport override, never from a live catalog at dispatch or caller-declared tools,
+/// so provider changes cannot alter how a resumed run reads a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrozenContract {
     pub call_keepalive: bool,
@@ -2852,6 +2854,7 @@ impl SubcToolPlane {
     /// can invalidate explicitly; the dispatch path invalidates on a transport error.)
     pub fn invalidate_route(&self, bind: &BindIdentity) {
         if let Some(module_id) = self.default_module_id.as_deref() {
+            run_transport::invalidate(module_id);
             // This entry point is for an externally observed route teardown, so the daemon has
             // already released the channel and no second GOODBYE should be sent. Frozen decisions
             // targeting that dead module are removed from only this session's inner batch maps.
@@ -2874,6 +2877,7 @@ impl SubcToolPlane {
         module_id: &str,
         refused: RouteHandle,
     ) -> Option<RouteHandle> {
+        run_transport::invalidate(module_id);
         let key = Self::route_key(bind, scope, module_id);
         let removed = self
             .take_route_if_owned(&key, refused)
@@ -3872,6 +3876,15 @@ impl SubcToolPlane {
 
 #[async_trait]
 impl ToolPlane for SubcToolPlane {
+    async fn run_transport(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        manifest: &broca_core::tool_plane::PlanManifest,
+    ) -> BTreeMap<String, broca_core::tool_plane::FrozenProviderDeclarations> {
+        self.refresh_run_transport(bind, scope, manifest).await
+    }
+
     async fn batch_started(
         &self,
         ctx: &BatchCtx,
@@ -4480,6 +4493,7 @@ fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod run_transport_tests;
     mod aft_harness {
         include!("subc_plane/tests/aft_harness_tests.rs");
     }

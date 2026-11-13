@@ -47,9 +47,8 @@ pub struct ToolManifest {
     provider_presets: HashMap<String, String>,
     provider_replies:
         HashMap<String, HashMap<String, cortexkit_role_tool_provider::catalog::Reply>>,
-    /// Per-tool result formats and session capabilities, frozen from the plan at admission.
-    /// Empty for a session admitted without one, and never filled from a live catalog: a
-    /// resumed run must read replies by what its session actually admitted.
+    /// Per-tool result formats and session capabilities frozen for this run. A resume uses
+    /// the run's recorded override, or its plan when the run recorded none.
     provider_declarations: HashMap<String, broca_wal::FrozenProviderDeclarations>,
     /// The providers whose catalog the plan fetch answered at admission. Each was fetched over
     /// a route declaring `tool-provider: v1`, so its dispatch route declares the same role.
@@ -160,8 +159,29 @@ impl ToolManifest {
         Ok(self)
     }
 
-    /// The declarations `provider` froze into the session's plan, or `None` when it froze none
-    /// (including a session admitted without a plan manifest).
+    /// Apply a run's recorded transport facts without changing schema pins or request inputs.
+    pub fn with_run_transport(
+        mut self,
+        transport: &std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations>,
+    ) -> Self {
+        for (provider, facts) in transport {
+            if !self.fetched_providers.contains(provider) {
+                continue;
+            }
+            let frozen = self
+                .provider_declarations
+                .entry(provider.clone())
+                .or_default();
+            frozen.call_keepalive = facts.call_keepalive;
+            frozen.late_results = facts.late_results;
+            frozen.result_formats.clone_from(&facts.result_formats);
+            frozen.yield_tools.clone_from(&facts.yield_tools);
+        }
+        self
+    }
+
+    /// The provider's frozen declarations for this run: its recorded transport override over
+    /// the session plan, or just the plan when there is no override.
     pub fn provider_declarations(
         &self,
         provider: &str,
