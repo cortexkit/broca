@@ -113,11 +113,6 @@ impl RunWait {
                     .as_ref()
                     .and_then(broca_protocol::provider::await_message);
                 let error = match error {
-                    Some(error) if error.provider_code.is_none() => {
-                        // Without a code the contract cannot identify who may act. Omit the wait
-                        // rather than invent a final/retryable classification or refuse the error.
-                        None
-                    }
                     Some(error) => Some(
                         serde_json::to_value(broca_protocol::caller::SharedProviderError::from(
                             error,

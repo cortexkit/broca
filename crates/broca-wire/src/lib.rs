@@ -5027,7 +5027,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string(&state).unwrap(),
-            r#"{"last_run_id":"run-1","state":"error","reason":"error","error":{"class":"transient","message":"provider stream disconnected"}}"#
+            r#"{"last_run_id":"run-1","state":"error","reason":"error","error":{"class":"transient","message":"provider stream disconnected","provider_code":"transient"}}"#
         );
     }
 
@@ -5469,7 +5469,7 @@ mod tests {
             "state": "paused",
             "retries_used": 0,
             "reason": "auth_required",
-            "error": {"class": "auth_required", "message": "reauth"}
+            "error": {"class": "auth_required", "message": "reauth", "provider_code": "auth_required"}
         });
         assert_run_status_round_trip(with_cause.clone());
 
