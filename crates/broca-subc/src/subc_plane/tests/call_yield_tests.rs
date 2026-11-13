@@ -7,6 +7,8 @@ use subc_protocol::FrameType;
 struct Wire {
     conn: SubcConnection,
     route: RouteHandle,
+    catalog: Mutex<Option<serde_json::Value>>,
+    catalog_reads: AtomicUsize,
 }
 
 #[async_trait]
@@ -15,7 +17,13 @@ impl ToolPlaneConnection for Wire {
         Some("broca")
     }
     async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
-        Ok(Vec::new())
+        if self.catalog.lock().unwrap().is_some() {
+            Ok(crate::subc_plane::tests::run_transport_tests::inventory(
+                "aft",
+            ))
+        } else {
+            Ok(Vec::new())
+        }
     }
     async fn route_open(
         &self,
@@ -47,18 +55,25 @@ impl ToolPlaneConnection for Wire {
         true
     }
     async fn server_capabilities(&self) -> Result<Vec<String>, ConnError> {
-        Ok(Vec::new())
+        Ok(vec![CAP_SCOPES_V1.into()])
     }
     async fn tool_call(
         &self,
         _: &RouteHandle,
-        _: &str,
+        name: &str,
         _: &serde_json::Value,
         _: Option<&str>,
         _: Duration,
-        _: Option<&str>,
+        preset: Option<&str>,
     ) -> Result<serde_json::Value, ConnError> {
-        unreachable!()
+        assert_eq!(name, "tool.catalog");
+        assert_eq!(
+            preset,
+            Some("worker"),
+            "AFT catalog calls need the item preset on the envelope too"
+        );
+        self.catalog_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.catalog.lock().unwrap().clone().unwrap())
     }
     async fn tool_call_staged(
         &self,
@@ -90,8 +105,18 @@ impl ToolPlaneConnection for Wire {
 
 fn wire() -> (Arc<Wire>, InProcessModuleEnd) {
     let (conn, route, module) = SubcConnection::in_process_for_test(7, 1);
-    (Arc::new(Wire { conn, route }), module)
+    (
+        Arc::new(Wire {
+            conn,
+            route,
+            catalog: Mutex::default(),
+            catalog_reads: AtomicUsize::new(0),
+        }),
+        module,
+    )
 }
+
+mod run_transport_store;
 
 #[tokio::test]
 async fn stop_yields_once_on_the_original_route_and_held_final_never_cancels() {

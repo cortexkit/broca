@@ -47,11 +47,11 @@ pub struct FrozenResultFormat(pub String);
 
 /// Session-level declarations of one tool provider, frozen with the plan.
 ///
-/// A run routes and decodes a tool reply by what its provider declared when the session was
-/// admitted, never by what a later catalog says: a provider that starts (or stops) supporting a
-/// result format or late results between admission and a resumed step must not change how
-/// broca reads a reply. Everything here is optional and absent when the provider did not
-/// declare it, so a manifest from a provider with no such declarations keeps its exact bytes.
+/// These are the baseline declarations. New-storage runs may freeze transport-only overrides
+/// on their own start, without changing this plan or its schema pins. A resumed run uses its
+/// recorded facts, never a later catalog, so provider changes cannot alter reply decoding in
+/// flight. Everything here is optional and absent when the provider did not declare it, so a
+/// manifest from a provider with no such declarations keeps its exact bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenProviderDeclarations {
     /// The provider promised call keepalives in its manifest at admission. Missing on

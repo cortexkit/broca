@@ -64,6 +64,7 @@ pub fn admission<P: Provider>(
         ts_ms: now_ms,
         written_at_ms: fresh_start::written_at_ms(req, || now_ms),
         manifest: control.manifest.clone(),
+        transport: Default::default(),
         // `run` decides it from the input and the session, by the shared rule.
         global_system: Arc::default(),
         context_limit: control.admitted_context_limit,

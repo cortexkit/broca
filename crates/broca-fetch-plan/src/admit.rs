@@ -770,6 +770,9 @@ async fn catalog_with_optional_keepalive(
                 keepalive = Some(supported);
             }
             promise = &mut yield_promise, if call_yield.is_none() => {
+                if promise.is_err() {
+                    crate::yield_discovery::observe(provider, "lookup_failed");
+                }
                 call_yield = Some(promise.unwrap_or(false));
             }
             answer = &mut catalog => {
@@ -777,12 +780,19 @@ async fn catalog_with_optional_keepalive(
                 if keepalive.is_none() {
                     observe(provider, Outcome::Unfinished, started.elapsed());
                 }
+                if call_yield.is_none() {
+                    crate::yield_discovery::observe(provider, "lookup_unfinished");
+                }
                 return answer.map(|answer| (answer, keepalive.unwrap_or(false), call_yield.unwrap_or(false)))
                     .map_err(FetchMiss::from_error);
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "yield_discovery_tests.rs"]
+mod yield_discovery_tests;
 
 /// A provider's decoded catalog answer.
 #[derive(Debug, Clone)]
@@ -894,6 +904,37 @@ pub fn decode_tool_catalog(provider: &str, value: Value) -> Result<ToolCatalog, 
             .collect(),
         schema_pins,
     })
+}
+
+/// Decode transport discovery with admission's validation, without using any returned request
+/// inputs. Schema pins are retained only to check that the frozen tools still name these tools.
+pub fn decode_transport_catalog(
+    provider: &str,
+    mut value: Value,
+    call_keepalive: bool,
+    call_yield: bool,
+) -> Result<(ToolCatalog, FrozenProviderDeclarations), FetchError> {
+    // Older catalogs may not publish pins. Missing identities must reach definition
+    // comparison, not make an otherwise usable transport read fail forever.
+    for tool in value
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(tool) = tool.as_object_mut() {
+            tool.entry("schema_digest")
+                .or_insert_with(|| Value::String(String::new()));
+            tool.entry("semantics").or_insert_with(|| Value::from(0));
+        }
+    }
+    let catalog = decode_tool_catalog(provider, value.clone())?;
+    let fetched = decode_answer(value, false)
+        .map_err(|_| FetchError::Lost("invalid tool.catalog answer".into()))?;
+    let declarations = frozen_provider_declarations(&fetched.answer, call_keepalive, call_yield)
+        .map(|declarations| *declarations)
+        .unwrap_or_default();
+    Ok((catalog, declarations))
 }
 
 /// Refuse a catalog whose reference slots break the catalog's own rules

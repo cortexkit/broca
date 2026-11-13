@@ -403,9 +403,22 @@ impl ToolOpenGuard {
     }
 }
 
+pub use broca_wal::{FrozenProviderDeclarations, PlanManifest};
+
 /// The tool-dispatch contract. One batch = one assistant turn's tool calls.
 #[async_trait]
 pub trait ToolPlane: Send + Sync {
+    /// Read only transport declarations for a fresh run. Legacy storage and resumed runs do
+    /// not call this hook; adapters without discovery retain the plan's frozen declarations.
+    async fn run_transport(
+        &self,
+        _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+        _manifest: &broca_wal::PlanManifest,
+    ) -> std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations> {
+        Default::default()
+    }
+
     /// Prepare routing state for this batch before dispatch starts. `calls` is
     /// the full set in this batch, and `manifest` is the immutable tool manifest captured when
     /// the run was admitted. On `Err` the loop synthesizes `is_error` results for every

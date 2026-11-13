@@ -5,7 +5,8 @@
 //! under one deadline. If an optional tool provider is absent, it recomposes system text
 //! against the surviving tools. It checks the answers and freezes exactly what it got
 //! in the session's `RunStarted` (`broca_wal::PlanManifest`). Every later episode and every
-//! resume renders from that manifest and never fetches again.
+//! resume renders from that manifest. New-storage fresh runs separately re-read transport
+//! declarations; they never replace the manifest's request inputs.
 //!
 //! [`plan::parse_plan`] reads and checks the plan before anything is fetched; [`admit::admit`]
 //! fetches and checks the answers through a [`admit::Fetcher`] and returns the manifest or a
@@ -13,6 +14,7 @@
 
 pub mod admit;
 mod keepalive_discovery;
+mod yield_discovery;
 pub use keepalive_discovery::health as keepalive_discovery_health;
 pub mod plan;
 pub mod refusal;
