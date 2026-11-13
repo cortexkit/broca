@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_core::capability::ToolManifest;
+use broca_core::output_events::OutputEvent;
 use broca_core::tool_media::MediaCapture;
 use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
@@ -33,7 +34,9 @@ use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, StopCondition, Tool, ToolChoice,
 };
-use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
+use broca_protocol::{
+    DisplayEvent, FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage,
+};
 use broca_session_loop::shared::{ActorWriter, Request};
 use broca_session_loop::{
     resume, run, seal, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
@@ -307,10 +310,14 @@ impl Provider for ScriptedProvider {
             event
         });
         let script: Vec<_> = script.collect();
+        let hold = HOLD_STREAM.try_with(|hold| *hold).unwrap_or(false);
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             for event in script {
                 let _ = tx.send(event).await;
+            }
+            if hold {
+                tx.closed().await;
             }
         });
         rx
@@ -2613,6 +2620,13 @@ fn bind() -> broca_protocol::BindIdentity {
     broca_protocol::BindIdentity::new("/differential/project", "differential", "s1")
 }
 
+tokio::task_local! {
+    static DISPLAY_OUT: mpsc::Sender<OutputEvent>;
+    static HOLD_STREAM: bool;
+    static TEST_CANCEL: CancellationToken;
+    static EXPECT_UNSUPPORTED: bool;
+}
+
 async fn new_loop(scenario: &Scenario) -> Outcome {
     new_from(scenario, None, scenario.steps.clone()).await
 }
@@ -2691,12 +2705,13 @@ async fn new_from(
         media: Default::default(),
     };
     let now = harness_now;
-    let cancel = CancellationToken::new();
+    let cancel = TEST_CANCEL.try_with(Clone::clone).unwrap_or_default();
+    let display_out = DISPLAY_OUT.try_with(Clone::clone).ok();
     let seams = Seams {
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
-        out: None,
+        out: display_out.as_ref(),
         cancel: cancel.clone(),
         stop: Default::default(),
         held: Some(&*lifecycle),
@@ -2725,7 +2740,7 @@ async fn new_from(
     let sealing = SEALING.try_with(|cause| *cause).ok();
     // A crash-cut comparison nests this driver several frames deep. Heap-own the loop bodies,
     // as the production executor does for run and resume, rather than copying them there.
-    through!(
+    let result = through!(
         writer,
         |w| if let (true, Some(cause)) = (resuming, sealing) {
             seal(w, &parts, &seams, cause).await
@@ -2734,8 +2749,25 @@ async fn new_from(
         } else {
             Box::pin(run(w, &mut parts, scenario.admission(&provider), &seams)).await
         }
-    )
-    .expect("the new loop runs");
+    );
+    if EXPECT_UNSUPPORTED
+        .try_with(|expected| *expected)
+        .unwrap_or(false)
+    {
+        assert!(
+            matches!(
+                result,
+                Err(broca_session_loop::run::LoopError::Unsupported(_))
+            ),
+            "{result:?}"
+        );
+        return Outcome {
+            records: Vec::new(),
+            requests: Vec::new(),
+            calls: Vec::new(),
+        };
+    }
+    result.expect("the new loop runs");
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
@@ -9030,6 +9062,258 @@ async fn every_cut_of_a_step_with_a_cut_call_resumes_alike() {
         &["c2"],
     ))
     .await;
+}
+
+fn text_delta(id: &str, text: &str) -> NormalizedEvent {
+    NormalizedEvent::Display(DisplayEvent::TextDelta {
+        mid: None,
+        part: None,
+        message_id: MessageId(id.into()),
+        tool_call_id: None,
+        delta: text.into(),
+    })
+}
+
+fn display_events(events: &mut mpsc::Receiver<OutputEvent>) -> Vec<DisplayEvent> {
+    let mut display = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let OutputEvent::Display(event) = event {
+            display.push(event);
+        }
+    }
+    display
+}
+
+fn expected_delta(id: &str, text: &str) -> DisplayEvent {
+    match text_delta(id, text) {
+        NormalizedEvent::Display(event) => event,
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn cancelled_stream_is_reset() {
+    let (out, mut events) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let scenario = single(vec![vec![text_delta("a0", "abandoned")]]);
+    let run = DISPLAY_OUT.scope(
+        out,
+        HOLD_STREAM.scope(
+            true,
+            TEST_CANCEL.scope(cancel.clone(), async {
+                new_loop(&scenario).await;
+            }),
+        ),
+    );
+    let observe = async {
+        let mut display = Vec::new();
+        while let Some(event) = events.recv().await {
+            if let OutputEvent::Display(event) = event {
+                if matches!(event, DisplayEvent::TextDelta { .. }) {
+                    cancel.cancel();
+                }
+                display.push(event);
+            }
+        }
+        display
+    };
+    let (_, display) = tokio::join!(run, observe);
+    assert_eq!(
+        display,
+        vec![
+            expected_delta("a0", "abandoned"),
+            DisplayEvent::DisplayReset
+        ]
+    );
+}
+
+async fn check_errored_stream(retries: u32) {
+    let (out, mut events) = mpsc::channel(64);
+    let mut failure = grammar_refused();
+    if let NormalizedEvent::Control(ProviderControl::Error { retries_used, .. }) = &mut failure[0] {
+        *retries_used = retries;
+    }
+    failure.insert(0, text_delta("a0", "abandoned"));
+    DISPLAY_OUT
+        .scope(out, async {
+            new_loop(&single(vec![failure])).await;
+        })
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            expected_delta("a0", "abandoned"),
+            DisplayEvent::DisplayReset
+        ]
+    );
+}
+
+#[tokio::test]
+async fn permanent_error_stream_is_reset() {
+    check_errored_stream(0).await;
+}
+
+#[tokio::test]
+async fn exhausted_retries_stream_is_reset() {
+    check_errored_stream(3).await;
+}
+
+#[tokio::test]
+async fn stored_stream_is_not_reset() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut answer = text_step("a0", "saved");
+    answer.insert(0, text_delta("a0", "saved"));
+    DISPLAY_OUT
+        .scope(out, async {
+            new_loop(&single(vec![answer])).await;
+        })
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![expected_delta("a0", "saved")]
+    );
+}
+
+#[tokio::test]
+async fn provider_reset_is_not_duplicated_on_error() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut failure = grammar_refused();
+    failure.insert(0, NormalizedEvent::Display(DisplayEvent::DisplayReset));
+    failure.insert(0, text_delta("a0", "abandoned"));
+    DISPLAY_OUT
+        .scope(out, async {
+            new_loop(&single(vec![failure])).await;
+        })
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            expected_delta("a0", "abandoned"),
+            DisplayEvent::DisplayReset
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unsupported_cut_stream_is_reset() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut cut = cut_call(
+        answer(
+            "a0",
+            vec![call("c1", "read", json!({}))],
+            FinishReason::ToolCalls,
+        ),
+        "c1",
+        "read",
+    );
+    cut.insert(0, text_delta("a0", "abandoned"));
+    DISPLAY_OUT
+        .scope(
+            out,
+            EXPECT_UNSUPPORTED.scope(
+                true,
+                STRUCTURED.scope(Some(unconstrained("final_text")), async {
+                    new_loop(&single(vec![cut])).await;
+                }),
+            ),
+        )
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            expected_delta("a0", "abandoned"),
+            DisplayEvent::DisplayReset
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unsupported_stopped_cut_stream_is_reset() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut cut = cut_call(
+        answer(
+            "a0",
+            vec![call("c1", "read", json!({}))],
+            FinishReason::ToolCalls,
+        ),
+        "c1",
+        "read",
+    );
+    cut.insert(0, text_delta("a0", "abandoned"));
+    let mut scenario = single(vec![cut]);
+    scenario.stop_when = vec![StopCondition::StepCount { n: 1 }];
+    DISPLAY_OUT
+        .scope(
+            out,
+            EXPECT_UNSUPPORTED.scope(true, async {
+                new_loop(&scenario).await;
+            }),
+        )
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            expected_delta("a0", "abandoned"),
+            DisplayEvent::DisplayReset
+        ]
+    );
+}
+
+#[tokio::test]
+async fn grammar_downgrade_stream_is_reset_before_resend() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut failure = grammar_refused();
+    failure.insert(0, text_delta("a0", "abandoned"));
+    let mut answer = text_step("a1", r#"{"answer":5}"#);
+    answer.insert(0, text_delta("a1", "replacement"));
+    DISPLAY_OUT
+        .scope(
+            out,
+            STRUCTURED.scope(Some(strict("final_text")), async {
+                new_loop(&single(vec![failure, answer])).await;
+            }),
+        )
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            expected_delta("a0", "abandoned"),
+            DisplayEvent::DisplayReset,
+            expected_delta("a1", "replacement")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn refused_stream_is_reset_before_fallback_stream() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut refused = refusal("a0");
+    refused.insert(0, text_delta("a0", "refused words"));
+    let mut fallback = text_step("a1", "fallback words");
+    fallback.insert(0, text_delta("a1", "fallback words"));
+    let scenario = Scenario {
+        input: vec![user("hello")],
+        tools: Vec::new(),
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![refused, fallback],
+    };
+    DISPLAY_OUT
+        .scope(
+            out,
+            compare_with_fallback(None, async {
+                new_loop(&scenario).await;
+            }),
+        )
+        .await;
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            expected_delta("a0", "refused words"),
+            DisplayEvent::DisplayReset,
+            expected_delta("a1", "fallback words"),
+        ]
+    );
 }
 
 /// The run's own model refuses a step: the refusal is durable, the same step goes to the
