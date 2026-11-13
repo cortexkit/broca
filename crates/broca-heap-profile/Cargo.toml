@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 description = "Opt-in Linux allocation-site accounting for the broca memory load harness"
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 serde.workspace = true
 serde_json.workspace = true
 
