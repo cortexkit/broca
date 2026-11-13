@@ -24,6 +24,9 @@ use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
 use crate::serve::ServeHandler;
 
+#[path = "cache_write_split_tests.rs"]
+mod cache_write_split;
+
 /// One module over a scratch folder: on today's storage, or on the new one (`store`).
 struct Side {
     dir: std::path::PathBuf,

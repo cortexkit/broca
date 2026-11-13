@@ -939,6 +939,8 @@ pub fn session_usage(
         ]
     }
     let mut run = RunUsage::new();
+    // Session totals omit lifetime splits because durable totals do not preserve whether every
+    // counted step had a complete split. Scanning history on every head is too costly.
     run.steps = fold.totals.steps;
     run.unreported_steps = fold.totals.unreported_steps;
     [

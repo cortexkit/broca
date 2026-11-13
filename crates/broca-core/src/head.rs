@@ -254,6 +254,9 @@ impl HeadProjection {
                         model.variant.as_deref(),
                         record,
                     ) {
+                        // Session totals omit lifetime splits because durable totals do not
+                        // preserve whether every counted step had a complete split. Scanning
+                        // history on head is too expensive; an absent split means unknown.
                         self.usage
                             .get_or_insert_with(|| SessionUsage::new(&run_id.0))
                             .record_step(

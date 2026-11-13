@@ -810,7 +810,11 @@ async fn head_run_error_matches_status(storage: &str, move_to_store: bool) {
                 "retry_after_secs":120.5, "resets_at_ms":1800000120500_u64}),
             ),
         ),
-        ("permanent_no_code", Some(json!({"class":"permanent"}))),
+        // A codeless permanent error is served with the contract's catch-all code.
+        (
+            "permanent_no_code",
+            Some(json!({"class":"permanent","provider_code":"provider_error"})),
+        ),
         ("completed", None),
     ];
     let mut observed = Vec::new();

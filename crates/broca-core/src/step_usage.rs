@@ -196,10 +196,57 @@ impl RunUsageSteps {
                 by_model,
             );
             for (provider, model, variant, step) in by_model {
+                let run_split =
+                    extend_cache_write_split(usage.steps, usage.cache_write_split(), step);
+                let model_index = usage.by_model.iter().position(|entry| {
+                    entry.provider == *provider
+                        && entry.model == *model
+                        && entry.variant.as_deref() == *variant
+                });
+                let model_split = match model_index {
+                    Some(index) => {
+                        let entry = &usage.by_model[index];
+                        extend_cache_write_split(entry.steps, entry.cache_write_split(), step)
+                    }
+                    None => extend_cache_write_split(0, None, step),
+                };
                 usage.record_step(provider, model, *variant, reported_step_usage(step));
+                // The run and each model carry the 5-minute and 1-hour split only while every
+                // counted step reported a complete one that sums to its cache-write total.
+                let run_split = summing_cache_write_split(run_split, usage.cache_write_tokens);
+                usage.cache_write_5m_tokens = run_split.map(|split| split.0);
+                usage.cache_write_1h_tokens = run_split.map(|split| split.1);
+                let index = model_index.unwrap_or(usage.by_model.len() - 1);
+                let entry = &mut usage.by_model[index];
+                let model_split = summing_cache_write_split(model_split, entry.cache_write_tokens);
+                entry.cache_write_5m_tokens = model_split.map(|split| split.0);
+                entry.cache_write_1h_tokens = model_split.map(|split| split.1);
             }
         }
     }
+}
+
+fn extend_cache_write_split(
+    steps: u64,
+    previous: Option<(u64, u64)>,
+    step: &Usage,
+) -> Option<(u64, u64)> {
+    let step = step.with_complete_cache_write_lifetimes();
+    let pair = step.cache_write_5m_tokens.zip(step.cache_write_1h_tokens)?;
+    // An absent total is unmeasured, not a zero contribution. Once a counted step lacked a
+    // complete pair, later reports cannot turn the aggregate's partial sum into a breakdown.
+    let previous = if steps == 0 { (0, 0) } else { previous? };
+    Some((
+        previous.0.checked_add(pair.0)?,
+        previous.1.checked_add(pair.1)?,
+    ))
+}
+
+fn summing_cache_write_split(split: Option<(u64, u64)>, total: Option<u64>) -> Option<(u64, u64)> {
+    split.filter(|(five, hour)| {
+        five.checked_add(*hour)
+            .is_some_and(|sum| Some(sum) == total)
+    })
 }
 
 fn abstract_served_tier(tier: &str) -> String {
