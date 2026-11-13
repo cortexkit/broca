@@ -2165,8 +2165,53 @@ async fn drive_from<W, P, T>(
     admission: &Admission,
     seams: &Seams<'_, P, T>,
     compaction: Option<&crate::compaction::Ctx>,
+    reentry: Option<crate::account_move::Reentry>,
+    moving: &mut Option<crate::account_move::Moving<P>>,
+) -> Result<Finished, LoopError>
+where
+    W: Writer,
+    P: Provider,
+    T: ToolPlane,
+{
+    // A return before the assistant is stored leaves its streamed display without a replacement.
+    let mut live_display = false;
+    let result = drive_from_inner(
+        writer,
+        parts,
+        admission,
+        seams,
+        compaction,
+        reentry,
+        moving,
+        &mut live_display,
+    )
+    .await;
+    reset_live_display(seams.out, &mut live_display).await;
+    result
+}
+
+async fn reset_live_display(out: Option<&mpsc::Sender<OutputEvent>>, live: &mut bool) {
+    if std::mem::take(live) {
+        if let Some(out) = out {
+            let _ = out
+                .send(OutputEvent::Display(
+                    broca_protocol::DisplayEvent::DisplayReset,
+                ))
+                .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_from_inner<W, P, T>(
+    writer: &mut W,
+    parts: &dyn Parts,
+    admission: &Admission,
+    seams: &Seams<'_, P, T>,
+    compaction: Option<&crate::compaction::Ctx>,
     mut reentry: Option<crate::account_move::Reentry>,
     moving: &mut Option<crate::account_move::Moving<P>>,
+    live_display: &mut bool,
 ) -> Result<Finished, LoopError>
 where
     W: Writer,
@@ -2752,8 +2797,13 @@ where
                 admission.account_limit_pause,
                 first_attempt,
                 run_selection(seams, admission),
+                live_display,
             )
             .await?;
+            // A failed call may be retried on a downgraded grammar or another account.
+            if outcome.is_err() {
+                reset_live_display(seams.out, live_display).await;
+            }
             if let Err(StepFailure::Error(error, retries_used, _)) = &outcome {
                 // The provider decides: it answers yes only for its own strict schema's refusal.
                 if !downgraded_now && seams.provider.structured_output_grammar_rejection(error) {
@@ -2823,6 +2873,8 @@ where
                             true,
                         )
                         .await?;
+                    // The refused attempt's deltas already reached display subscribers.
+                    reset_live_display(seams.out, live_display).await;
                     refusal_retries = step.retries_used;
                     route.reroute(seams.provider);
                     let mut again = Arc::unwrap_or_clone(opts);
@@ -3127,6 +3179,7 @@ where
                 calls.is_empty(),
             )
             .await?;
+        *live_display = false;
         if let Some(ctx) = compaction {
             crate::compaction::notice(writer, admission, seams, ctx, episodes.signed_floor).await?;
         }
@@ -4094,6 +4147,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     account_limit_pause: bool,
     first_attempt: u32,
     selection: Option<&broca_wal::AuthSelection>,
+    live_display: &mut bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     // The step is in flight from here until the call's stream ends: published for the session's
@@ -4173,6 +4227,13 @@ async fn model_step<W: Writer, P: Provider, T>(
         };
         match event {
             Some(NormalizedEvent::Display(display)) => {
+                if matches!(display, broca_protocol::DisplayEvent::DisplayReset) {
+                    *live_display = false;
+                } else if display.delta().is_some()
+                    || matches!(display, broca_protocol::DisplayEvent::DisplayGap { .. })
+                {
+                    *live_display = true;
+                }
                 if let Some(out) = seams.out {
                     let _ = out.send(OutputEvent::Display(display)).await;
                 }
