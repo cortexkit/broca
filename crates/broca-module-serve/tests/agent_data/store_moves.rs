@@ -441,7 +441,12 @@ async fn store_prepare_refuses_an_unverifiable_next_request_before_freezing() {
         })
         .unwrap();
     start.run_id = "no-render".into();
-    start.setup.clear();
+    // Drop only the render config: prepare reads the run's other setup parts earlier, when it
+    // checks what the latest run waits on, and a run start missing them is refused there, before
+    // the render-config check this test is about.
+    start
+        .setup
+        .retain(|part| part.kind != broca_session_store::record::PartKind::RenderConfig);
     end.run_id = start.run_id.clone();
     writer
         .append(
