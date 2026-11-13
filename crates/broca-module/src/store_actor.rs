@@ -254,6 +254,7 @@ enum Exit {
 /// The run the session is running.
 struct ActiveRun {
     restart_from_seq: Option<u64>,
+    restart_cancelling: bool,
     run_id: RunId,
     one_shot: bool,
     account_limit_resume: bool,
@@ -2317,9 +2318,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 });
             }
         }
+        let restart_cancelling = resume
+            && cancel.is_cancelled()
+            && self
+                .session
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.paused == Some(broca_protocol::PauseReason::Restart));
         let done = tokio::spawn(async move { executor.execute_on_store(job, out).await });
         self.run = Some(ActiveRun {
             restart_from_seq: self.restart_admitting.then(|| self.session.next_seq()),
+            restart_cancelling,
             one_shot: one_shot || self.one_shot_runs.contains(&run_id),
             account_limit_resume: false,
             run_id,
@@ -3273,11 +3283,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 });
             }
         }
+        if active.restart_cancelling
+            && self
+                .session
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.finished == Some(broca_protocol::RunFinishReason::Cancelled))
+        {
+            tracing::info!(target: "lifecycle", session = %broca_core::session_addr(&self.key),
+                run_id = %active.run_id.0, outcome = "cancelled",
+                "store restart resume outcome");
+            active.restart_cancelling = false;
+        }
         if self.restart_admitting
             && self.session.operations().run.as_ref().is_some_and(|run| {
                 run.paused != Some(broca_protocol::PauseReason::Restart) || run.finished.is_some()
             })
         {
+            tracing::info!(target: "lifecycle", session = %broca_core::session_addr(&self.key),
+                run_id = %active.run_id.0, outcome = "continued",
+                "store restart resume outcome");
             self.finish_restart_waiters(Ok(()));
         }
     }

@@ -539,10 +539,11 @@ async fn expected(dir: &Path, key: &BindIdentity, cipher: Cipher) -> Expected {
 
 /// What a starting process does once its routes are registered: it sweeps the new storage for
 /// sessions a crash or a shutdown left unfinished, sealing crash orphans and resuming runs that
-/// paused for the restart (`LineageRegistry::resume_restart_pauses`).
+/// paused for the restart, after enabling admission once dependency routes are ready.
 async fn restart(side: &Side) {
     let wal: Arc<dyn broca_core::WalStore> = Arc::new(FileWalStore::new(side.dir.join("wal")));
     side.registry.resume_restart_pauses(wal, Vec::new()).await;
+    side.registry.recover_store_crash_orphans().await.unwrap();
 }
 
 /// Cuts a copy of `snapshot` at `cut` bytes of its open log `file`, makes its saved index as

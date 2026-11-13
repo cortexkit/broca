@@ -6375,6 +6375,14 @@ impl LineageRegistry {
         (opened, failed)
     }
 
+    /// Allows restart admission after dependency routes are registered. Store discovery is owned
+    /// by the deployment-key loader; WAL discovery may proceed independently.
+    pub fn enable_restart_resumes(&self) {
+        self.inner
+            .restart_resume_ready
+            .store(true, Ordering::Release);
+    }
+
     /// Rebuild WAL-confirmed restart and timed-account continuations after routes are registered.
     /// Candidate index rows may lag; only the latest durable pause authorizes continuation.
     pub async fn resume_restart_pauses(
@@ -6382,15 +6390,7 @@ impl LineageRegistry {
         wal_store: Arc<dyn broca_core::WalStore>,
         candidates: Vec<(String, LineageKey)>,
     ) -> (usize, usize) {
-        self.inner
-            .restart_resume_ready
-            .store(true, Ordering::Release);
-        // Store sessions have no legacy run-index row. Their durable candidate set also
-        // reaches actors opened before readiness, which must receive ResumeRestart now.
-        let store_recovery = self.store_runtime().map(|_| {
-            let registry = self.clone();
-            tokio::spawn(async move { registry.recover_store_crash_orphans().await })
-        });
+        self.enable_restart_resumes();
         let mut seen = HashSet::new();
         let mut resumed = 0;
         let mut sealed = 0;
@@ -6489,16 +6489,6 @@ impl LineageRegistry {
                 Ok(_) => resumed += 1,
                 Err(error) => {
                     tracing::warn!(target: "lifecycle", "restart resume: refused session '{}': {error}", key.session)
-                }
-            }
-        }
-        if let Some(store_recovery) = store_recovery {
-            match store_recovery.await {
-                Ok(Ok(sweep)) => {
-                    tracing::info!(target: "lifecycle", ?sweep, "store restart resume candidate sweep complete")
-                }
-                error => {
-                    tracing::warn!(target: "lifecycle", ?error, "store restart resume recovery failed")
                 }
             }
         }

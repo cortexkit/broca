@@ -367,6 +367,7 @@ impl Side {
         };
         registry.set_retention_service(service);
         registry.resume_restart_pauses(wal, Vec::new()).await;
+        registry.recover_store_crash_orphans().await.unwrap();
         Self {
             dir,
             key,
