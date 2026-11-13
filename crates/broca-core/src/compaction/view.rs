@@ -1141,22 +1141,17 @@ pub fn account_label(account_ref: &str) -> String {
 /// The account label for a run's frozen auth selection, or `None` when broca has no
 /// account fact and must send neither the ride cause nor the event.
 ///
-/// Known only for subscription accounts (`oauth`, `chatgpt`) whose selection carries a
+/// Known only for subscription accounts (every method but `apikey`) whose selection carries a
 /// routing decision and a vault-served account id. No routing selection (no selection at
-/// all, as on the mock path; no `account_decision`, as on old records and on runs whose
-/// credential method routing does not select between) or an unrouted credential (an
-/// `apikey` or `antigravity` method, an unknown method token, or no vault account id) is
-/// unknown. A placeholder is never sent: unknown stays `None`.
+/// all, as on the mock path; no `account_decision`, as on old records) or an unknown account
+/// (an `apikey` method, an unknown method token, or no vault account id) is unknown. A
+/// placeholder is never sent: unknown stays `None`.
 pub fn selection_account_label(selection: &broca_wal::AuthSelection) -> Option<String> {
-    let subscription = match selection.auth_method.as_deref() {
-        Some("oauth") | Some("chatgpt") => true,
-        Some(_) => return None,
-        None => match selection.credential_id.split_once(':') {
-            Some((method, _)) => matches!(method, "oauth" | "chatgpt"),
-            None => return None,
-        },
+    let method = match selection.auth_method.as_deref() {
+        Some(method) => method,
+        None => selection.credential_id.split_once(':')?.0,
     };
-    if !subscription {
+    if !broca_protocol::AuthMethod::from_token(method)?.is_subscription() {
         return None;
     }
     selection.account_decision.as_ref()?;

@@ -39,6 +39,7 @@ pub fn serialized_json_bytes(value: &impl serde::Serialize) -> u64 {
 }
 
 pub mod approval;
+pub mod auth_method;
 pub mod caller;
 pub mod caller_message;
 pub mod canonical;
@@ -64,6 +65,7 @@ mod media_tests;
 
 // Convenience re-exports for the common wire surface.
 pub use approval::{ApprovalRequest, ApprovalResponse};
+pub use auth_method::AuthMethod;
 pub use caller::{
     ControlUnit, OpenPauseReason, OpenRunFinishReason, OpenState, PauseReason, RunFinishReason,
 };

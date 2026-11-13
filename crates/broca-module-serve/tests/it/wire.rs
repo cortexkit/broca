@@ -7812,7 +7812,8 @@ async fn account_route_wire_refusals_write_nothing() {
             "invalid account_route created a WAL"
         );
     }
-    for method in ["antigravity", "unknown"] {
+    // Every known sign-in method takes account_route; a method broca doesn't know is refused.
+    for method in ["unknown"] {
         let reply = account_route_send(
             &mut rig,
             serde_json::json!({

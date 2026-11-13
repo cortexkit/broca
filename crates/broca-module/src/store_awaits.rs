@@ -228,9 +228,7 @@ fn account_label(selection: &serde_json::Value) -> Option<String> {
     let mut parts = id.splitn(3, ':');
     let method = parts.next()?;
     parts.next()?;
-    if !matches!(method, "oauth" | "chatgpt" | "apikey" | "antigravity") {
-        return None;
-    }
+    broca_protocol::AuthMethod::from_token(method)?;
     let label = parts.next()?.trim();
     (1..=120)
         .contains(&label.chars().count())

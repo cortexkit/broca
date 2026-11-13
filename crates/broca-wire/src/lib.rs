@@ -318,7 +318,7 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
         if params
             .pointer("/auth/method")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|method| !matches!(method, "oauth" | "chatgpt" | "apikey"))
+            .is_some_and(|method| broca_protocol::AuthMethod::from_token(method).is_none())
         {
             return Err("account_route".into());
         }

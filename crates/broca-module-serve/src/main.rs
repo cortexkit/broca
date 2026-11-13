@@ -6377,7 +6377,7 @@ mod executor {
                     )
                 })
                 .ok_or("account_unknown")?;
-            if !matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt) {
+            if !method.is_subscription() {
                 return Ok(());
             }
             let routing = self.routing.as_deref().unwrap_or_else(|| {

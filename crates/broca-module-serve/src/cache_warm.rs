@@ -65,11 +65,10 @@ pub fn automatic_warm_prices(
     prefix_tokens: u64,
     ttl_ms: u64,
 ) -> Result<broca_core::keep_warm::WarmCosts, String> {
-    use crate::auth_routing::AuthMethod;
     let frozen =
         frozen_render_config(config).map_err(|error| format!("pricing_unavailable: {error}"))?;
     let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
-    let subscription = matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt);
+    let subscription = method.is_subscription();
     broca_catalog::keep_warm::warm_prices(
         &config.model.provider_module_id,
         &config.model.model_id,
@@ -85,7 +84,6 @@ pub fn responses_warm_cost(
     config: &broca_wal::RunConfig,
     usage: broca_protocol::Usage,
 ) -> Result<f64, String> {
-    use crate::auth_routing::AuthMethod;
     let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
     broca_catalog::keep_warm::responses_warm_cost(
         &config.model.provider_module_id,
@@ -97,7 +95,7 @@ pub fn responses_warm_cost(
                 .ok_or("pricing_unavailable: usage")?,
             usage.output_tokens.ok_or("pricing_unavailable: usage")?,
         ),
-        matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt),
+        method.is_subscription(),
     )
     .map_err(|error| error.to_string())
 }

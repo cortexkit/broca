@@ -977,7 +977,7 @@ pub fn metadata_in_chooser_scope(row: &ScopedCredential) -> bool {
         && row.auth_method
         .as_deref()
         .and_then(AuthMethod::from_token)
-        .map(|method| matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt))
+        .map(AuthMethod::is_subscription)
         .unwrap_or(true)
         && !row
             .refresh_adapter

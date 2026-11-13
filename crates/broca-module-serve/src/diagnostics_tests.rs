@@ -606,9 +606,12 @@ fn diagnostics_unmapped_credentials_use_chooser_scope_and_name_vault_fixes() {
     evidence.unmapped_credentials = unmapped_credentials();
     let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
     let keys: Vec<_> = reply.findings.iter().map(|f| f.key.as_str()).collect();
+    // An Antigravity account is routed like every subscription, so it lacking provider ids is
+    // a finding; API keys, which may be provider-unmapped, and Cursor's quota-only row are not.
     assert_eq!(
         keys,
         [
+            "antigravity-work",
             "missing-method",
             "no-adapter",
             "opaque-chatgpt",

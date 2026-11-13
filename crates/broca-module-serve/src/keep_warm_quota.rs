@@ -106,7 +106,7 @@ pub async fn automatic_warm_quota(
     family: WireFamilyId,
     latest_headers: &BTreeMap<String, String>,
 ) -> QuotaDecision {
-    if !matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt) {
+    if !method.is_subscription() {
         return QuotaDecision::Allow;
     }
     let Some(account_id) = account_ref.filter(|id| !id.is_empty()) else {

@@ -33,42 +33,7 @@ pub use broca_provider::wire::{
     MarkerSyntax,
 };
 
-/// How a provider authenticates for a run. The stable token is also the first segment of the
-/// credential id used by the vault-backed module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AuthMethod {
-    /// A static API key. Anthropic uses this method to select API-key-specific body policies.
-    ApiKey,
-    /// Provider OAuth, including Anthropic's Claude-subscription request shape.
-    Oauth,
-    /// Google Antigravity / Code-Assist OAuth.
-    Antigravity,
-    /// OpenAI ChatGPT-subscription OAuth.
-    Chatgpt,
-}
-
-impl AuthMethod {
-    /// The stable credential-id token for this method.
-    pub fn as_token(self) -> &'static str {
-        match self {
-            Self::ApiKey => "apikey",
-            Self::Oauth => "oauth",
-            Self::Antigravity => "antigravity",
-            Self::Chatgpt => "chatgpt",
-        }
-    }
-
-    /// Parse the first credential-id segment.
-    pub fn from_token(token: &str) -> Option<Self> {
-        match token {
-            "apikey" => Some(Self::ApiKey),
-            "oauth" => Some(Self::Oauth),
-            "antigravity" => Some(Self::Antigravity),
-            "chatgpt" => Some(Self::Chatgpt),
-            _ => None,
-        }
-    }
-}
+pub use broca_protocol::AuthMethod;
 
 /// Variant admission must use the same immutable snapshot that selected the default route.
 struct CodeAssistRoute<'a> {

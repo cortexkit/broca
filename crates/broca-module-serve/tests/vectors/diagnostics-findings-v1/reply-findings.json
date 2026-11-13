@@ -133,6 +133,22 @@
         "count": 1,
         "first_seen_ms": 200000000,
         "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
+        "key": "antigravity-work",
+        "last_seen_ms": 200000000,
+        "samples": [
+          {
+            "credential_id": "antigravity-work",
+            "missing_fields": "provider_ids"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A listed model credential lacks recognized routing metadata required for account selection."
+      },
+      {
+        "check": "credential_metadata_missing",
+        "count": 1,
+        "first_seen_ms": 200000000,
+        "hint": "Fix the credential in the vault: set its provider ids and authentication method, or use a non-model credential type if routed model selection must not use it.",
         "key": "missing-method",
         "last_seen_ms": 200000000,
         "samples": [
