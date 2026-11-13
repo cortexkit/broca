@@ -2855,6 +2855,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             plan.last_model.as_deref(),
             model,
         );
+        // A pending change that doesn't apply yet may still lend this run its newer rich UI
+        // stamp, when the stamp was declared for the system text the run keeps.
+        let current = match applying {
+            Some(_) => current,
+            None => crate::plan_change::with_newer_stamp(current, pending.as_ref()),
+        };
         let manifest = crate::plan_change::run_manifest(current, applying, false, model, variant)
             .map_err(SendOutcome::PlanRefused)?;
         let applies = applying.map(|pending| {

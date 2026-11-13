@@ -4,6 +4,7 @@
 //! its sessions in another storage: each reads what a rule asks about the session its own way,
 //! as [`ChangeFacts`], and both decide alike.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use broca_fetch_plan::session_change::{self, PendingState, SessionChangeState};
@@ -357,6 +358,49 @@ pub(crate) fn run_manifest(
     }
 }
 
+/// The manifest a new run freezes when a pending change doesn't apply at it yet: `current`, the
+/// latest run's manifest, carrying the pending change's rich UI stamp when that stamp was
+/// declared for exactly the system text `current` already holds (llm-runner 9.17, "same text,
+/// newer stamp"). That holds when both plans have the same system-text providers and each one's
+/// answered text is byte-identical. Only the stamp moves: the tools, the system text and the
+/// rest of the change wait until the change itself applies (at its policy's moment, such as a
+/// prefix rebuild), and the session's applied generation doesn't change.
+/// The run's start records the manifest it froze, so the stamp survives a restart and later runs
+/// keep it. Otherwise `current` is returned as it is.
+pub(crate) fn with_newer_stamp(
+    current: Option<Arc<PlanManifest>>,
+    pending: Option<&PendingState>,
+) -> Option<Arc<PlanManifest>> {
+    use broca_wal::FetchOutcome;
+    let (Some(effective), Some(pending)) = (current.as_ref(), pending) else {
+        return current;
+    };
+    let newer = &pending.manifest.rich_ui;
+    if newer.is_none() || *newer == effective.rich_ui {
+        return current;
+    }
+    /// Each system-text provider's answered text, by provider.
+    fn texts(manifest: &PlanManifest) -> BTreeMap<&str, &str> {
+        manifest
+            .fetches
+            .iter()
+            .filter_map(|fetch| match &fetch.outcome {
+                FetchOutcome::Answered {
+                    text: Some(text), ..
+                } => Some((fetch.provider.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+    let effective_texts = texts(effective);
+    if effective_texts.is_empty() || effective_texts != texts(&pending.manifest) {
+        return current;
+    }
+    let mut stamped = (**effective).clone();
+    stamped.rich_ui = newer.clone();
+    Some(Arc::new(stamped))
+}
+
 /// Whether a later send's plan, of identity `sent`, may run on the session. Before any refresh
 /// it must be the plan the first run froze, `frozen`. Once a refresh was accepted
 /// (`refreshed`), it may be the plan the latest run froze or the latest accepted one, given in
@@ -539,6 +583,76 @@ mod tests {
             manifest: Arc::new(manifest("plan-2", &["a"], "text")),
         });
         assert_eq!(check_policy(&facts, 2, "immediately", "p"), Ok(false));
+    }
+
+    /// A manifest whose provider `ui` answered `text` as system text, stamped `stamp` (a digest
+    /// character), and whose tools are `tools`.
+    fn taught(identity: &str, tools: &[&str], text: &str, stamp: Option<char>) -> PlanManifest {
+        let mut manifest = manifest(identity, tools, text);
+        manifest.fetches = serde_json::from_value(serde_json::json!([
+            {"provider": "tools", "catalog_digest": "t", "tools": []},
+            {"provider": "ui", "catalog_digest": "u", "tools": [], "text": text},
+        ]))
+        .unwrap();
+        manifest.rich_ui = stamp.map(|digit| {
+            broca_protocol::RichUiStamp::new("1.0", digit.to_string().repeat(64)).unwrap()
+        });
+        manifest
+    }
+
+    fn pending_of(manifest: PlanManifest) -> PendingState {
+        PendingState {
+            generation: 4,
+            policy: "on_prefix_rebuild".into(),
+            manifest: Arc::new(manifest),
+        }
+    }
+
+    /// A pending change whose system text is byte-identical to the latest run's lends the next
+    /// run its newer stamp, and only that: the tools and every other member stay the latest
+    /// run's, so nothing the model sees changes. A changed text, a provider added or gone, or
+    /// an older or equal stamp leave the latest run's manifest as it is.
+    #[test]
+    fn a_newer_stamp_on_the_same_text_moves_and_nothing_else_does() {
+        let current = Arc::new(taught("gen-3", &["a"], "teach", Some('b')));
+        let newer = pending_of(taught("gen-4", &["a", "b"], "teach", Some('4')));
+        let moved = with_newer_stamp(Some(current.clone()), Some(&newer)).unwrap();
+        assert_eq!(moved.rich_ui, newer.manifest.rich_ui);
+        let mut expected = (*current).clone();
+        expected.rich_ui = newer.manifest.rich_ui.clone();
+        assert_eq!(*moved, expected, "only the stamp moves");
+
+        // A stamp first declared on the same text also moves onto an unstamped manifest.
+        let unstamped = Arc::new(taught("gen-3", &["a"], "teach", None));
+        let moved = with_newer_stamp(Some(unstamped), Some(&newer)).unwrap();
+        assert_eq!(moved.rich_ui, newer.manifest.rich_ui);
+
+        let kept = |pending: PendingState| {
+            let kept = with_newer_stamp(Some(current.clone()), Some(&pending)).unwrap();
+            assert!(
+                Arc::ptr_eq(&kept, &current),
+                "the latest run's manifest is kept"
+            );
+        };
+        kept(pending_of(taught("gen-4", &["a"], "teach more", Some('4'))));
+        kept(pending_of(taught("gen-4", &["a"], "teach", None)));
+        kept(pending_of(taught("gen-4", &["a"], "teach", Some('b'))));
+        let mut gone = taught("gen-4", &["a"], "teach", Some('4'));
+        gone.fetches.retain(|fetch| fetch.provider != "ui");
+        kept(pending_of(gone));
+        let mut added = taught("gen-4", &["a"], "teach", Some('4'));
+        added.fetches = serde_json::from_value(serde_json::json!([
+            {"provider": "other", "catalog_digest": "o", "tools": [], "text": "more"},
+            {"provider": "ui", "catalog_digest": "u", "tools": [], "text": "teach"},
+        ]))
+        .unwrap();
+        kept(pending_of(added));
+        // No pending change, or no latest manifest, changes nothing.
+        assert!(Arc::ptr_eq(
+            &with_newer_stamp(Some(current.clone()), None).unwrap(),
+            &current
+        ));
+        assert_eq!(with_newer_stamp(None, Some(&newer)), None);
     }
 
     #[test]

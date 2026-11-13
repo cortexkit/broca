@@ -24,6 +24,7 @@ use crate::serve::ServeHandler;
 cipher_tests!(
     a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike,
     only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider,
+    a_pending_stamp_on_the_same_text_moves_to_the_next_run_and_stays,
 );
 
 /// A plan whose system text is `text`, offering the tools `tools` from one provider. With
@@ -756,6 +757,85 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
             answers[0]
         );
     }
+}
+
+/// [`manifest`], with its provider's system text answer stamped `digit` repeated (a Rich UI
+/// catalog digest).
+fn stamped(plan: &Value, identity: &str, digit: char) -> broca_wal::PlanManifest {
+    let mut manifest = manifest(plan, identity);
+    manifest.fetches = serde_json::from_value(json!([{
+        "provider": "fixture", "catalog_digest": "d", "tools": [],
+        "text": manifest.system_text,
+    }]))
+    .unwrap();
+    manifest.rich_ui =
+        Some(broca_protocol::RichUiStamp::new("1.0", digit.to_string().repeat(64)).unwrap());
+    manifest
+}
+
+/// llm-runner 9.17, "same text, newer stamp": a refresh waiting for a prefix rebuild whose
+/// system text is byte-identical to the effective plan's lends the next run its newer Rich UI
+/// stamp. The refresh itself doesn't apply (no applied record, generation still pending), the
+/// run keeps the effective plan, and the stamp stays on later runs once the session's actor is
+/// opened again, because the run's start recorded it.
+async fn a_pending_stamp_on_the_same_text_moves_to_the_next_run_and_stays(
+    cipher: broca_session_store::keys::Cipher,
+) {
+    let taught = plan("you are taught", &["read"], None, None);
+    let first = stamped(&taught, "plan-1", 'b');
+    let steps = [
+        send("r1", "plan-1"),
+        Step::Refresh {
+            generation: 1,
+            policy: "on_prefix_rebuild",
+            manifest: stamped(&taught, "plan-1", '4'),
+        },
+        send("r2", "plan-1"),
+        send("r3", "plan-1"),
+    ];
+    let (_, store) = super::head::both_in(
+        (0..steps.len())
+            .map(|n| text_step(&format!("a{n}"), "hello"))
+            .collect(),
+        cipher,
+    )
+    .await;
+    let (answers, _) = drive(&store, &first, &steps).await;
+    assert_eq!(answers[0], "active");
+    assert_eq!(answers[2], "active");
+    assert_eq!(answers[3], "active");
+    let (runs, applied) = store_runs(&store).await;
+    assert!(
+        applied.is_empty(),
+        "the refresh is still pending: {applied:?}"
+    );
+    assert_eq!(runs.len(), 3);
+    let session = store.load().await;
+    assert_eq!(
+        session
+            .operations
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.pending.as_ref())
+            .map(|pending| pending.generation),
+        Some(1)
+    );
+    // Each run's reply carries its run's stamp: the first run's, then the newer one twice, the
+    // last after the actor reopened the session from storage.
+    let stamps: Vec<char> = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            Record::EntryFacts(facts) => facts
+                .rich_ui
+                .as_ref()
+                .map(|stamp| stamp.catalog_digest.chars().next().unwrap()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stamps, vec!['b', '4', '4'], "{stamps:?}");
 }
 
 /// A refresh that adds a compaction provider: today's storage refuses it with today's exact
