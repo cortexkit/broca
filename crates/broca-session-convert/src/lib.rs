@@ -41,6 +41,8 @@ pub mod counting;
 pub mod entry_facts;
 pub mod identity;
 pub mod load_check;
+pub mod media_compare;
+pub mod media_today;
 /// The inverse lives with the new run loop, where a session's media fold reads it too.
 pub use broca_session_loop::inverse;
 pub mod measure;
@@ -77,6 +79,10 @@ pub struct Converted {
     /// count from `FIRST_SEQ`, the destination's first converted record.
     first_seq: Option<u64>,
     pub records: Vec<Record>,
+    /// For each old record, in order: the position in `records` of the first record converted
+    /// from it. The records converted from it run up to the next old record's position, so the
+    /// record that holds what an old record captured can be found (see `media_today`).
+    pub origins: Vec<usize>,
     /// Every setup part this log's runs named, by digest, with its canonical bytes.
     pub parts: BTreeMap<Digest, Vec<u8>>,
     /// Bytes of setup parts as today's runs store them, summed over runs.
@@ -352,6 +358,7 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             .observe(&framed.record, framed.seq)
             .map(|(_, copy)| copy);
         let before = out.records.len();
+        out.origins.push(before);
         let applied = plan_changes.record(&framed.record).map(refresh_applied);
         convert_one(&framed.record, &mut state, &mut out)?;
         out.records.extend(applied.map(Record::RefreshApplied));
@@ -1911,6 +1918,8 @@ mod enrolled_entries_tests;
 mod inverse_tests;
 #[cfg(test)]
 mod marks_tests;
+#[cfg(test)]
+mod media_compare_tests;
 #[cfg(test)]
 mod media_parity_tests;
 
