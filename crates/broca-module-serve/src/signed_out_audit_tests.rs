@@ -399,7 +399,7 @@ async fn a_timed_hold_survives_a_permanent_admission_failure() {
 
 async fn held_recheck_survives_admission(code: &str) {
     let until = now_ms() + 3_000;
-    let rig = SignedOutRig::new(&format!("hold-admission-can-recover-{code}"), true, None, vec![answer(json!({"kind":"hold","routing_code":"no_compatible_account","detail":{},"until_ms":until})), offer()]).await;
+    let rig = SignedOutRig::new(&format!("hold-admission-can-recover-{code}"), true, None, vec![answer(json!({"kind":"hold","routing_code":"no_compatible_account","detail":{},"until_ms":until}))]).await;
     let (backend, session) = rig.session().await;
     let (commands, task) = rig.actor(session);
     send_signed_out(&commands).await;
@@ -430,6 +430,7 @@ async fn held_recheck_survives_admission(code: &str) {
         "automatic failed admission must preserve its hold"
     );
     rig.script_a(vec![needs_reauth()]);
+    rig.routing.replies.lock().unwrap().push_back(offer());
     wait_questions(&rig, 2).await;
     actor_idle(&commands).await;
     drop(commands);

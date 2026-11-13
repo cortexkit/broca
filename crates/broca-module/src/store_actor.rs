@@ -105,12 +105,10 @@ pub struct StoreActor<B: SessionBackend> {
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     account_limit_timer: Option<account_limit_pause::TimedPause>,
-    sign_in_check: Option<(
-        account_limit_pause::TimedPause,
-        broca_session_loop::account_move::SignInOutcome,
-    )>,
+    sign_in_check: Option<account_limit_pause::SignInCheck>,
     sign_in_in_flight: Option<account_limit_pause::TimedPause>,
     sign_in_open_owed: bool,
+    sign_in_open_deadline: Option<tokio::time::Instant>,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -436,6 +434,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             sign_in_check: None,
             sign_in_in_flight: None,
             sign_in_open_owed: false,
+            sign_in_open_deadline: None,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -648,9 +647,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// the last one has gone closes it. Empty when the session may close.
     fn idle_holds(&mut self) -> Vec<&'static str> {
         let mut holds = Vec::new();
-        if self.sign_in_open_owed {
-            // Readiness is checked on the next actor turn; an idle tick must not discard
-            // the owed probe before that turn. Shutdown still exits independently of holds.
+        if self.sign_in_open_owed
+            && self
+                .sign_in_open_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+        {
+            // Waiting for readiness may hold an idle actor for at most two minutes.
+            // Shutdown still exits independently of idle holds.
             holds.push("sign_in_probe");
         }
         if self.run.is_some() {
@@ -1011,9 +1014,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let never = CancellationToken::new();
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
+        self.sign_in_open_deadline =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(120));
         // The session feeds its media from before its first write here.
         self.media_open().await;
         self.recover().await;
+        if !self.sign_in_open_owed {
+            self.sign_in_open_deadline = None;
+        }
         self.retire_recovery();
         if !self
             .registry
@@ -1062,6 +1070,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             let built = media_built(&mut self.media_build);
+            let probe_wake = self
+                .sign_in_open_deadline
+                .filter(|_| self.sign_in_open_owed)
+                .map(|deadline| {
+                    deadline
+                        .min(tokio::time::Instant::now() + std::time::Duration::from_millis(250))
+                });
             let timed_pause = self.account_limit_timer.clone().filter(|_| {
                 self.registry.as_ref().is_none_or(|registry| {
                     registry.restart_resume_ready() && !registry.is_stopping()
@@ -1098,6 +1113,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     biased;
                     _ = seal.cancelled() => return Exit::Stop,
                     _ = clock_changes.changed() => continue,
+                    _ = async {
+                        match probe_wake {
+                            Some(wake) => tokio::time::sleep_until(wake).await,
+                            None => std::future::pending().await,
+                        }
+                    } => continue,
                     _ = expiry::wait(expiry_deadline, &clock) => continue,
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
@@ -2168,6 +2189,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mode: StoreRunMode,
     ) {
         self.sign_in_open_owed = false;
+        self.sign_in_open_deadline = None;
         self.start_run_under(start, drained, reply, mode, CancellationToken::new())
             .await;
         if self.run.is_none() && self.sign_in_in_flight.is_some() {
@@ -2558,6 +2580,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         return;
                     }
                     self.sign_in_open_owed = true;
+                    self.sign_in_open_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(120)
+                    });
                     self.probe_sign_in_on_open().await;
                     return;
                 }
@@ -3426,15 +3451,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .ok()
             .and_then(|finished| finished.sign_in.clone());
         let loop_failed = match &result {
-            Err(error)
-                if started
-                    && restart_error.is_none()
-                    && !active.account_limit_resume
-                    && !active.preserve_auth_pause =>
-            {
+            Err(error) if started && restart_error.is_none() && !active.account_limit_resume => {
                 let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
                     run.run_id == active.run_id.0
                         && run.finished.is_none()
+                        && !(active.preserve_auth_pause && run.paused == Some(broca_protocol::PauseReason::AuthRequired))
                         && (run.paused.is_none()
                             || matches!(error, StoreRunError::Admission(error)
                                 if error.admission_error_class() == broca_protocol::ErrorClass::Permanent))
@@ -4861,6 +4882,8 @@ mod read_cost;
 mod reads_tests;
 #[cfg(test)]
 mod sign_in_probe_tests;
+#[cfg(all(test, feature = "test-clock"))]
+mod sign_in_schedule_tests;
 #[cfg(test)]
 mod status_tests;
 #[cfg(test)]

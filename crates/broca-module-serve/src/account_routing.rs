@@ -645,7 +645,6 @@ impl RoutingTransport for SubcRoutingTransport {
                 if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
                     return Some(Err(self.request_error(error)));
                 }
-                started.store(false, Ordering::Release);
             }
         }
         // A stale handle fails before the request frame is built, so nothing was delivered.
@@ -2877,11 +2876,9 @@ impl RoutingClient {
 
 /// Reads one continue reply: `result` is the tagged answer. An error body under one of the
 /// codes routing's contract names for its own refusals (`RefusalCode`) is routing refusing the
-/// question, read as a refusal under that code. Any other error body says routing wasn't reached
-/// or can't be read, so it is `Unreachable`: no move, and no routing answer on the run's error.
-/// Such bodies are written by the daemon for a route it couldn't serve (`target_unavailable`,
-/// `module_warming`, `unknown_module`), by broca when it finds no single routing provider
-/// (`routing_unavailable`, `routing_ambiguous`), or carry a code this build doesn't know.
+/// question, read as a refusal under that code. Known message-plane errors mean routing did
+/// not receive the request, so they are `NotAsked`, even if the frame reached the daemon.
+/// Other unreadable answers are `Unreachable`, with no continuation answer on the run's error.
 pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutcome {
     use cortexkit_role_routing::account_continue::{ContinueAnswer, ContinueRefusal};
     match reply {
@@ -2898,6 +2895,7 @@ pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutco
             }
         }
         Err(body) => match serde_json::from_slice::<ErrorBodyView>(&body) {
+            Ok(error) if is_message_plane_code(&error.code) => ContinueOutcome::NotAsked,
             Ok(error) if is_routing_refusal(&error.code) => {
                 ContinueOutcome::Answered(ContinueAnswer::Refuse(ContinueRefusal::new(
                     error.code,

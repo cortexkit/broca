@@ -173,3 +173,72 @@ async fn stopping_before_sign_in_probe_readiness_keeps_the_pause_without_writes(
         serde_json::to_value(before).unwrap()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_open_probe_readiness_hold_expires_two_minutes_after_open() {
+    let ProbeFixture {
+        actor,
+        runner,
+        registry: _registry,
+        backend,
+    } = paused_probe("readiness-deadline").await;
+    let before = actor.session.open_log_records().await.unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let commands = Commands::over(tx, backend);
+    let mut task = tokio::spawn(actor.serve(rx));
+    idle(&commands).await;
+    tokio::time::advance(std::time::Duration::from_secs(119)).await;
+    commands.send(LineageCmd::IdleTick).unwrap();
+    let (reply, answer) = oneshot::channel();
+    commands.send(LineageCmd::Status { reply }).unwrap();
+    answer
+        .await
+        .expect("the hold still applies before two minutes");
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    commands.send(LineageCmd::IdleTick).unwrap();
+    let session = tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+        .await
+        .expect("an expired readiness hold must allow normal idle retirement")
+        .unwrap();
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        session.operations().run.as_ref().unwrap().paused,
+        Some(broca_protocol::PauseReason::AuthRequired)
+    );
+    assert_eq!(
+        serde_json::to_value(session.open_log_records().await.unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_wakes_an_owed_open_probe_without_a_caller_command() {
+    let ProbeFixture {
+        actor,
+        runner,
+        registry,
+        backend,
+    } = paused_probe("readiness-poll").await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let commands = Commands::over(tx, backend);
+    let task = tokio::spawn(actor.serve(rx));
+    idle(&commands).await;
+    registry.enable_restart_resumes();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        broca_test_support::wait_until("ready probe wakes promptly", || async {
+            if runner.calls.load(Ordering::SeqCst) == 2 {
+                Ok(())
+            } else {
+                Err("probe is asleep".into())
+            }
+        }),
+    )
+    .await
+    .expect("readiness must be noticed without a command or a long idle deadline");
+    idle(&commands).await;
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    drop(commands);
+    drop(task.await.unwrap());
+}

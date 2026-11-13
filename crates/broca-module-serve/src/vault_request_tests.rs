@@ -1663,22 +1663,22 @@ fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
         record_version,
     };
     // In-step refresh reported v1 and moved the run to v2, which was never rejected.
-    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), 1, 401), None);
+    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), ReportedTokenVersion::Admitted(1), 401), None);
     // In-step refresh reported v1 and the vault had nothing newer.
-    assert_eq!(run_end_report_target(Some(&in_run(1, Some(1), None)), 1, 401), None);
+    assert_eq!(run_end_report_target(Some(&in_run(1, Some(1), None)), ReportedTokenVersion::Admitted(1), 401), None);
     // The refreshed v2 was rejected too: report v2 alone, with its own status.
     assert_eq!(
-        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(401, 2)))), 1, 401),
+        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(401, 2)))), ReportedTokenVersion::Admitted(1), 401),
         Some(rejection(401, 2))
     );
     // A refresher that never ran: report the version the run holds now (3), with the status the
     // run's terminal error carries.
     assert_eq!(
-        run_end_report_target(Some(&in_run(3, None, None)), 1, 401),
+        run_end_report_target(Some(&in_run(3, None, None)), ReportedTokenVersion::Admitted(1), 401),
         Some(rejection(401, 3))
     );
     // A run with no in-step refresher reports the version admission served it (7).
-    assert_eq!(run_end_report_target(None, 7, 401), Some(rejection(401, 7)));
+    assert_eq!(run_end_report_target(None, ReportedTokenVersion::Admitted(7), 401), Some(rejection(401, 7)));
 }
 
 struct ChatgptRouting {
@@ -2064,7 +2064,7 @@ async fn chatgpt_refresh_run_rejecting(
         report_rejection_after_run(
             executor.vault.as_ref().unwrap(),
             &credential_key,
-            admitted_version,
+            ReportedTokenVersion::Admitted(admitted_version),
             auth.in_run_refresh.as_ref(),
             status,
         )

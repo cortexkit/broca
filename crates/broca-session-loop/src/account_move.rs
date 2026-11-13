@@ -93,20 +93,20 @@ pub enum Answer<P> {
 /// from the public error detail, which does not distinguish an untimed hold from a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInOutcome {
-    Hold(Option<u64>),
+    Hold {
+        until_ms: Option<u64>,
+        answered_at_ms: u64,
+    },
     Refuse,
     Unreachable,
 }
 
 impl SignInOutcome {
     pub fn hold(until_ms: Option<u64>, now_ms: u64) -> Self {
-        Self::Hold(until_ms.map(|until| {
-            if until <= now_ms {
-                now_ms.saturating_add(30_000)
-            } else {
-                until
-            }
-        }))
+        Self::Hold {
+            until_ms,
+            answered_at_ms: now_ms,
+        }
     }
 }
 

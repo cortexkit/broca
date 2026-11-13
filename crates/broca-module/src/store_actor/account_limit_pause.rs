@@ -11,6 +11,44 @@ pub(super) struct TimedPause {
     sign_in: bool,
 }
 
+/// Routing's completed sign-in continuation answer and retry schedule for one durable pause.
+#[derive(Debug, Clone)]
+pub(super) struct SignInCheck {
+    pause: TimedPause,
+    outcome: broca_session_loop::account_move::SignInOutcome,
+    failed_checks: u32,
+    retry_not_before_ms: u64,
+}
+
+impl SignInCheck {
+    fn answer_floor(&self) -> u64 {
+        match self.outcome {
+            broca_session_loop::account_move::SignInOutcome::Hold { answered_at_ms, .. } => {
+                answered_at_ms.saturating_add(30_000)
+            }
+            _ => 0,
+        }
+    }
+    fn wake_ms(&self) -> Option<u64> {
+        match self.outcome {
+            broca_session_loop::account_move::SignInOutcome::Hold {
+                until_ms: Some(until),
+                ..
+            } => Some(until.max(self.answer_floor()).max(self.retry_not_before_ms)),
+            _ => None,
+        }
+    }
+    fn may_ask(&self, now: u64) -> bool {
+        match self.outcome {
+            broca_session_loop::account_move::SignInOutcome::Hold { until_ms, .. } => {
+                now >= self.answer_floor().max(self.retry_not_before_ms)
+                    && until_ms.is_none_or(|until| now >= until)
+            }
+            _ => false,
+        }
+    }
+}
+
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     pub(super) async fn current_account_limit(&self) -> Result<Option<TimedPause>, String> {
         let Some(run) = self.session.operations().run.as_ref().filter(|run| {
@@ -121,16 +159,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         if self.account_limit_timer.is_none() {
-            if let (
-                Ok(Some(mut current)),
-                Some((
-                    expected,
-                    broca_session_loop::account_move::SignInOutcome::Hold(Some(until)),
-                )),
-            ) = (self.current_sign_in().await, &self.sign_in_check)
-            {
+            let Some(check) = &self.sign_in_check else {
+                return;
+            };
+            let Some(wake) = check.wake_ms() else {
+                return;
+            };
+            let expected = check.pause.clone();
+            if let Ok(Some(mut current)) = self.current_sign_in().await {
                 if current.run_id == expected.run_id && current.pause_seq == expected.pause_seq {
-                    current.resume_not_before_ms = (*until).max(expected.resume_not_before_ms);
+                    current.resume_not_before_ms = wake;
                     self.account_limit_timer = Some(current);
                 }
             }
@@ -258,7 +296,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     pub(super) async fn sign_in_recheck_mode(&mut self) -> StoreRunMode {
-        use broca_session_loop::account_move::SignInOutcome;
         let pause = match self.current_sign_in().await {
             Ok(Some(pause)) => pause,
             Ok(None) => return StoreRunMode::Resume,
@@ -273,15 +310,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return StoreRunMode::Resume;
         }
         let ask = match &self.sign_in_check {
-            Some((previous, outcome))
-                if previous.run_id == pause.run_id && previous.pause_seq == pause.pause_seq =>
+            Some(check)
+                if check.pause.run_id == pause.run_id
+                    && check.pause.pause_seq == pause.pause_seq =>
             {
-                match outcome {
-                    SignInOutcome::Hold(until) => until.is_none_or(|until| {
-                        (self.now_ms)() >= until.max(previous.resume_not_before_ms)
-                    }),
-                    SignInOutcome::Refuse | SignInOutcome::Unreachable => false,
-                }
+                check.may_ask((self.now_ms)())
             }
             _ => true,
         };
@@ -299,28 +332,57 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ) {
         use broca_session_loop::account_move::SignInOutcome;
         let reservation = self.sign_in_in_flight.take();
+        if reservation.is_none() && outcome.is_none() {
+            return;
+        }
         let Ok(Some(pause)) = self.current_sign_in().await else {
             return;
         };
         if let Some(outcome) = outcome {
-            self.sign_in_check = Some((pause, outcome));
+            self.sign_in_check = Some(SignInCheck {
+                pause,
+                outcome,
+                failed_checks: 0,
+                retry_not_before_ms: 0,
+            });
         } else if reservation.as_ref().is_some_and(|reserved| {
             reserved.run_id == pause.run_id && reserved.pause_seq == pause.pause_seq
         }) {
-            if let Some((previous, SignInOutcome::Hold(Some(until)))) = &mut self.sign_in_check {
-                if previous.run_id == pause.run_id && previous.pause_seq == pause.pause_seq {
-                    // Admission failed before an exchange. Preserve the hold, but do not spin
-                    // on its now-expired deadline while the dependency is unavailable.
-                    previous.resume_not_before_ms =
-                        (*until).max((self.now_ms)().saturating_add(30_000));
+            if let Some(check) = &mut self.sign_in_check {
+                if check.pause.run_id == pause.run_id
+                    && check.pause.pause_seq == pause.pause_seq
+                    && matches!(
+                        check.outcome,
+                        SignInOutcome::Hold {
+                            until_ms: Some(_),
+                            ..
+                        }
+                    )
+                {
+                    // Keep routing's hold when admission fails, no question can be sent, or
+                    // an offered credential is refused locally. Back off from 30 seconds to
+                    // at most ten minutes without recording a new routing answer.
+                    check.failed_checks = check.failed_checks.saturating_add(1);
+                    let delay = (30_000u64 << (check.failed_checks - 1).min(5)).min(600_000);
+                    check.retry_not_before_ms = (self.now_ms)().saturating_add(delay);
                 }
             }
         }
     }
 
     pub(super) async fn probe_sign_in_on_open(&mut self) {
-        if !self.sign_in_open_owed
-            || self.run.is_some()
+        if !self.sign_in_open_owed {
+            return;
+        }
+        if self
+            .sign_in_open_deadline
+            .is_none_or(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.sign_in_open_owed = false;
+            self.sign_in_open_deadline = None;
+            return;
+        }
+        if self.run.is_some()
             || self.stopping
             || self
                 .registry
@@ -330,6 +392,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return;
         }
         self.sign_in_open_owed = false;
+        self.sign_in_open_deadline = None;
         let Some(run) =
             self.session.operations().run.as_ref().filter(|run| {
                 run.finished.is_none() && run.paused == Some(PauseReason::AuthRequired)

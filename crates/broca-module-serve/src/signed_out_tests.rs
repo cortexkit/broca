@@ -20,6 +20,7 @@ struct SignedOutRouting {
     missing: std::sync::Mutex<Option<&'static str>>,
     pending: std::sync::atomic::AtomicBool,
     before_continue: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    replay_b: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -61,9 +62,10 @@ impl broca_module_serve::account_routing::RoutingTransport for SignedOutRouting 
                     .pop_front()
                     .expect("one scripted continuation per ask");
             }
+            let (account, credential, decision) = if self.replay_b.load(Ordering::SeqCst) { (B, CRED_B, "decision-b") } else { (A, CRED_A, "decision-a") };
             return Ok(Ok(serde_json::to_vec(&json!({"result": {
-                "account": {"provider":"openai","method":"chatgpt","account_id":A,"credential_id":CRED_A},
-                "reason": {"decision_id":"decision-a"}
+                "account": {"provider":"openai","method":"chatgpt","account_id":account,"credential_id":credential},
+                "reason": {"decision_id":decision}
             }})).unwrap()));
         }
         Ok(Ok(br#"{"result":{}}"#.to_vec()))
@@ -243,6 +245,7 @@ impl SignedOutRig {
             missing: std::sync::Mutex::new(missing),
             pending: Default::default(),
             before_continue: Default::default(),
+            replay_b: Default::default(),
         });
         let listing = Arc::new(broca_module_serve::account_routing::ListingCache::default());
         let credentials: Vec<_> = [(CRED_A, A), (CRED_B, B)].into_iter().map(|(id, account)| json!({
@@ -614,6 +617,14 @@ async fn signed_out_untimed_hold_reasks_only_on_keyed_retry() {
     send_signed_out(&commands).await;
     actor_idle(&commands).await;
     assert_signed_out_question(&rig.routing, 1);
+    let held_at = std::time::Instant::now();
+    send_signed_out(&commands).await;
+    actor_idle(&commands).await;
+    assert_signed_out_question(&rig.routing, 1);
+    broca_test_support::wait_until("untimed hold answer-time floor", || async {
+        (held_at.elapsed() >= Duration::from_secs(30)).then_some(()).ok_or_else(|| "hold floor has not elapsed".into())
+    }).await;
+    assert_signed_out_question(&rig.routing, 1);
     send_signed_out(&commands).await;
     actor_idle(&commands).await;
     drop(commands);
@@ -695,6 +706,7 @@ async fn signed_out_actor_open_moves_a_preexisting_pause() {
         missing: std::sync::Mutex::new(None),
         pending: Default::default(),
         before_continue: Default::default(),
+        replay_b: Default::default(),
     });
     let mut rig = rig;
     Arc::get_mut(&mut rig.executor).unwrap().routing = Some(Arc::new(
@@ -902,6 +914,7 @@ async fn signed_out_actor_open_survives_every_store_write_cut() {
             missing: std::sync::Mutex::new(None),
             pending: Default::default(),
             before_continue: Default::default(),
+            replay_b: Default::default(),
         });
         Arc::get_mut(&mut rig.executor).unwrap().routing = Some(Arc::new(
             broca_module_serve::account_routing::RoutingClient::new(

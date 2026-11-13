@@ -3078,12 +3078,13 @@ mod executor {
         })
     }
 
-    /// The error of a store session's newest run end or pause, read from its open log as
-    /// `terminal_provider_error` reads it from a WAL. A run's end is always in the open log:
+    /// This execution's newest run-end or pause error, never a previous invocation's pause.
+    /// A run's end is always in the open log:
     /// sealing never moves an unfinished run's records, and a run's end is written before any
     /// later seal.
     async fn store_terminal_error(
         writer: &broca_session_loop::shared::ActorWriter,
+        execution_start_seq: u64,
     ) -> Option<ProviderError> {
         use broca_session_loop::writer::Writer as _;
         use broca_session_store::record::Record;
@@ -3091,6 +3092,7 @@ mod executor {
         records
             .iter()
             .rev()
+            .take_while(|(seq, _)| *seq >= execution_start_seq)
             .find_map(|(_, record)| match record {
                 Record::RunEnd(end) => Some(end.error.clone()),
                 Record::Pause(pause) => Some(pause.error.clone()),
@@ -3099,13 +3101,67 @@ mod executor {
             .and_then(|error| serde_json::from_value(error).ok())
     }
 
-    /// A store run's account reports, handed to today's routing reporter. Its events are named
-    /// as the loop names them, `<session id>:<seq>`, from the session id the reporter holds.
-    struct StoreAccountReports(Arc<broca_module_serve::account_routing::RunReporter>);
+    type CredentialUseKey = (String, Option<String>, Option<String>);
+
+    /// Versions prepared for this execution are not used until an attempt records them.
+    #[derive(Default)]
+    struct SentCredentials {
+        versions: HashMap<CredentialUseKey, u64>,
+        last: Option<(broca_core::AuthSelection, u64)>,
+    }
+
+    impl SentCredentials {
+        fn key(selection: &broca_core::AuthSelection) -> CredentialUseKey {
+            (
+                selection.credential_id.clone(),
+                selection.account_ref.clone(),
+                selection
+                    .account_decision
+                    .as_ref()
+                    .and_then(|decision| decision.decision_id.clone()),
+            )
+        }
+        fn prepared(
+            &mut self,
+            selection: Option<&broca_core::AuthSelection>,
+            version: Option<u64>,
+        ) {
+            if let (Some(selection), Some(version)) = (selection, version) {
+                self.versions.insert(Self::key(selection), version);
+            }
+        }
+        fn attempted(
+            &mut self,
+            selection: Option<&broca_core::AuthSelection>,
+            attempt: &broca_protocol::ModelAttempt,
+        ) {
+            let Some(selection) = selection else {
+                return;
+            };
+            let key = Self::key(selection);
+            let version = attempt
+                .credential_refresh
+                .as_ref()
+                .and_then(|refresh| refresh.record_version)
+                .or_else(|| self.versions.get(&key).copied());
+            if let Some(version) = version {
+                self.versions.insert(key, version);
+                self.last = Some((selection.clone(), version));
+            }
+        }
+    }
+
+    /// Forward routing observations and retain the credential version of actual attempts.
+    struct StoreAccountReports {
+        routing: Option<Arc<broca_module_serve::account_routing::RunReporter>>,
+        sent: Arc<std::sync::Mutex<SentCredentials>>,
+    }
 
     impl broca_session_loop::AccountReports for StoreAccountReports {
         fn run_started(&self, _event_id: &str, seq: u64) {
-            broca_core::AccountReporter::run_started(&*self.0, None, seq);
+            if let Some(reporter) = &self.routing {
+                broca_core::AccountReporter::run_started(&**reporter, None, seq);
+            }
         }
 
         fn attempt_recorded(
@@ -3114,7 +3170,9 @@ mod executor {
             seq: u64,
             attempt: &broca_protocol::ModelAttempt,
         ) {
-            broca_core::AccountReporter::attempt_recorded(&*self.0, None, seq, attempt);
+            if let Some(reporter) = &self.routing {
+                broca_core::AccountReporter::attempt_recorded(&**reporter, None, seq, attempt);
+            }
         }
 
         fn attempt_recorded_on(
@@ -3124,11 +3182,16 @@ mod executor {
             attempt: &broca_protocol::ModelAttempt,
             selection: Option<&broca_core::AuthSelection>,
         ) {
-            self.0.attempt_recorded_on(None, seq, attempt, selection);
+            self.sent.lock().unwrap().attempted(selection, attempt);
+            if let Some(reporter) = &self.routing {
+                reporter.attempt_recorded_on(None, seq, attempt, selection);
+            }
         }
 
         fn account_moved(&self, _event_id: &str, seq: u64, selection: &broca_core::AuthSelection) {
-            self.0.moved(None, seq, selection);
+            if let Some(reporter) = &self.routing {
+                reporter.moved(None, seq, selection);
+            }
         }
     }
 
@@ -3160,6 +3223,7 @@ mod executor {
         adopted: std::sync::Mutex<Option<MovedCredential>>,
         recheck_sign_in: bool,
         probe_only: bool,
+        sent: Option<Arc<std::sync::Mutex<SentCredentials>>>,
     }
 
     impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
@@ -3179,6 +3243,7 @@ mod executor {
                 adopted: Default::default(),
                 recheck_sign_in: true,
                 probe_only: false,
+                sent: None,
             }
         }
 
@@ -3364,6 +3429,10 @@ mod executor {
             let Some(vault) = self.executor.vault.as_ref() else {
                 return refuse("the offered credential's vault metadata is unavailable");
             };
+            // Credential ids encode <method>:<provider>:<label>; changing a row's type is an
+            // operator edit bounded by the listing refresh, not ordinary token renewal.
+            // Use the last-known listing while its normal background refresh runs; refuse
+            // without a listing or compatible row. Provider-unmapped API keys cannot move.
             let Some(listing) = latest_listing(Arc::clone(vault)).await else {
                 return refuse("the offered credential's vault metadata is unavailable");
             };
@@ -3482,7 +3551,13 @@ mod executor {
                 .iter()
                 .position(|moved| moved.selection == *selection)
             {
-                *self.adopted.lock().unwrap() = Some(prepared.swap_remove(position));
+                let moved = prepared.swap_remove(position);
+                if let Some(sent) = &self.sent {
+                    sent.lock()
+                        .unwrap()
+                        .prepared(Some(selection), moved.record_version);
+                }
+                *self.adopted.lock().unwrap() = Some(moved);
             }
             prepared.clear();
         }
@@ -3772,9 +3847,18 @@ mod executor {
             .await
     }
 
+    #[derive(Clone, Copy)]
+    enum ReportedTokenVersion {
+        Admitted(u64),
+        Sent(u64),
+    }
+
     /// The rejection a run that ended on a wire auth error still owes the vault, if any: ONE
     /// REPORT PER REJECTION, naming the version the provider actually rejected.
     ///
+    /// An execution supplying `Sent` measures it from recorded attempts, so neither
+    /// an unused admission token nor a newer token fetched after a rejection can be reported.
+    /// The legacy `Admitted` path retains its existing refresher-based accounting:
     /// - Without an in-step refresher (`in_run` is `None`) nothing has reported anything, and
     ///   the run only ever held its admitted version: report that, with the terminal status.
     /// - When the provider rejected a token the step had already refreshed, the refresher
@@ -3787,9 +3871,37 @@ mod executor {
     /// - A refresher that never ran leaves the run on the version it holds now.
     fn run_end_report_target(
         in_run: Option<&InRunRefresh>,
-        admitted_version: u64,
+        version: ReportedTokenVersion,
         terminal_status: u16,
     ) -> Option<UnreportedRejection> {
+        let admitted_version = match version {
+            ReportedTokenVersion::Sent(sent) => {
+                if let Some(in_run) = in_run {
+                    if let Some(unreported) = *in_run
+                        .unreported_rejection
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                    {
+                        if unreported.record_version == sent {
+                            return Some(unreported);
+                        }
+                    }
+                    if *in_run
+                        .reported_version
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        == Some(sent)
+                    {
+                        return None;
+                    }
+                }
+                return Some(UnreportedRejection {
+                    status: terminal_status,
+                    record_version: sent,
+                });
+            }
+            ReportedTokenVersion::Admitted(admitted) => admitted,
+        };
         let Some(in_run) = in_run else {
             return Some(UnreportedRejection {
                 status: terminal_status,
@@ -3823,12 +3935,11 @@ mod executor {
     async fn report_rejection_after_run(
         vault: &VaultAuth,
         selection: &broca_core::AuthSelection,
-        admitted_version: u64,
+        version: ReportedTokenVersion,
         in_run: Option<&InRunRefresh>,
         terminal_status: u16,
     ) {
-        let Some(rejection) = run_end_report_target(in_run, admitted_version, terminal_status)
-        else {
+        let Some(rejection) = run_end_report_target(in_run, version, terminal_status) else {
             return;
         };
         // Provider rejection is authoritative even if the best-effort vault report cannot be
@@ -5026,7 +5137,7 @@ mod executor {
             summary: &Result<RunSummary, RunError>,
             account_reporter: Option<&broca_module_serve::account_routing::RunReporter>,
             report_selection: Option<broca_core::AuthSelection>,
-            used_credential: Option<(broca_core::AuthSelection, u64)>,
+            used_credential: Option<(broca_core::AuthSelection, ReportedTokenVersion)>,
             in_run_refresh: Option<&InRunRefresh>,
             terminal_error: impl Fn() -> F,
             lineage: Option<broca_wal::WalLineageId>,
@@ -5366,18 +5477,18 @@ mod executor {
                 Some(writer.session_id()),
             );
             req.context_management = Some(episode_context_management);
-            let used_credential = used_credential_for_report(
-                &resolution.pause,
-                resolution.selection.clone(),
-                resolution.record_version,
-            );
+            let sent = Arc::new(std::sync::Mutex::new(SentCredentials::default()));
+            sent.lock()
+                .unwrap()
+                .prepared(resolution.selection.as_ref(), resolution.record_version);
             resolved
                 .provider
                 .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
-            let reports = account_reporter.clone().map(|reporter| {
-                Arc::new(StoreAccountReports(reporter))
-                    as Arc<dyn broca_session_loop::AccountReports>
-            });
+            let reports = Some(Arc::new(StoreAccountReports {
+                routing: account_reporter.clone(),
+                sent: sent.clone(),
+            })
+                as Arc<dyn broca_session_loop::AccountReports>);
             let fresh_admission = if fresh_episode {
                 match broca_session_loop::admit::admission(
                     req,
@@ -5398,6 +5509,7 @@ mod executor {
                 StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
             );
             moves.probe_only = mode == StoreRunMode::ProbeSignIn;
+            moves.sent = Some(sent.clone());
             let mut seams = store_seams(
                 &resolved.provider,
                 tools,
@@ -5417,6 +5529,7 @@ mod executor {
                 .provider
                 .set_cache_predecessor_loader(writer.cache_predecessor_loader());
             seams.account_continue = Some(&moves);
+            let execution_start_seq = writer.next_seq();
             let finished = match fresh_admission {
                 Some(admission) => {
                     // Keep the loop body off the executor's poll frame, as the legacy loop
@@ -5428,21 +5541,23 @@ mod executor {
             // A run that moved to another account at a quota wall reports its end under the
             // credential it moved to.
             let moved = moves.moved();
-            let (report_selection, used_credential, in_run_refresh) = match &moved {
-                Some(moved) => (
-                    Some(moved.selection.clone()),
-                    used_credential_for_report(
-                        &None,
-                        Some(moved.selection.clone()),
-                        moved.record_version,
-                    ),
-                    moved.in_run_refresh.as_ref(),
-                ),
-                None => (
-                    report_selection,
-                    used_credential,
-                    resolution.in_run_refresh.as_ref(),
-                ),
+            let report_selection = moved
+                .as_ref()
+                .map(|moved| moved.selection.clone())
+                .or(report_selection);
+            let used_credential = sent
+                .lock()
+                .unwrap()
+                .last
+                .clone()
+                .map(|(selection, version)| (selection, ReportedTokenVersion::Sent(version)));
+            let in_run_refresh = match moved.as_ref().filter(|moved| {
+                used_credential
+                    .as_ref()
+                    .is_some_and(|(selection, _)| *selection == moved.selection)
+            }) {
+                Some(moved) => moved.in_run_refresh.as_ref(),
+                None => resolution.in_run_refresh.as_ref(),
             };
             // The run's end, for routing and the vault, as `execute` reports it. The reports
             // read only how the run ended or paused.
@@ -5464,7 +5579,7 @@ mod executor {
                 report_selection,
                 used_credential,
                 in_run_refresh,
-                || store_terminal_error(reader),
+                || store_terminal_error(reader, execution_start_seq),
                 None,
                 &durable_head,
                 &req.session,
@@ -6860,7 +6975,9 @@ mod executor {
                 &summary,
                 account_reporter.as_deref(),
                 report_selection,
-                used_credential,
+                used_credential.map(|(selection, version)| {
+                    (selection, ReportedTokenVersion::Admitted(version))
+                }),
                 in_run_refresh.as_ref(),
                 || terminal_provider_error(self.wal_store.clone(), session.clone()),
                 job.writer.lineage_id(),
@@ -6976,6 +7093,7 @@ mod executor {
             use super::*;
             include!("signed_out_tests.rs");
             include!("signed_out_audit_tests.rs");
+            include!("signed_out_reaudit_tests.rs");
         }
         include!("fork_executor_tests.rs");
 

@@ -704,14 +704,16 @@ where
                 .is_some_and(|continuer| continuer.recheck_sign_in()));
     let moved = if may_ask {
         if let Some(error) = &mut sign_in_error {
+            let step_id = run_state(writer).completed_steps.saturating_add(1);
+            let mut refused = sign_in_refused(writer, seams, &admission, error, step_id).await?;
             match crate::account_move::signed_out(
                 writer,
                 parts,
                 seams,
                 &admission,
-                0,
+                step_id,
                 error,
-                &mut Vec::new(),
+                &mut refused,
             )
             .await?
             {
@@ -6937,6 +6939,23 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
     }
 }
 
+async fn sign_in_refused<W: Writer, P: Provider, T>(
+    writer: &W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    error: &ProviderError,
+    step_id: u64,
+) -> Result<Vec<String>, LoopError> {
+    if crate::account_move::signed_out_selection(seams, admission, error, step_id).is_none() {
+        return Ok(Vec::new());
+    }
+    Ok(crate::account_move::refused_in_step(
+        &writer.open_log_records().await?,
+        &admission.run_id,
+        step_id,
+    ))
+}
+
 async fn sign_in_at_start<W: Writer, P: Provider, T: ToolPlane>(
     writer: &mut W,
     parts: &dyn Parts,
@@ -6945,14 +6964,16 @@ async fn sign_in_at_start<W: Writer, P: Provider, T: ToolPlane>(
     compaction: Option<&crate::compaction::Ctx>,
     mut error: ProviderError,
 ) -> Result<Finished, LoopError> {
+    let step_id = run_state(writer).completed_steps.saturating_add(1);
+    let mut refused = sign_in_refused(writer, seams, admission, &error, step_id).await?;
     let sign_in = match crate::account_move::signed_out(
         writer,
         parts,
         seams,
         admission,
-        0,
+        step_id,
         &error,
-        &mut Vec::new(),
+        &mut refused,
     )
     .await?
     {
