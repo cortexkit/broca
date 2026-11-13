@@ -438,7 +438,7 @@ impl StoreRuntime {
     }
 
     /// Where spend facts are written, when this runtime writes them.
-    pub(crate) fn billing(&self) -> Option<&crate::store_billing::StoreBilling> {
+    pub fn billing(&self) -> Option<&crate::store_billing::StoreBilling> {
         self.billing.as_ref()
     }
 

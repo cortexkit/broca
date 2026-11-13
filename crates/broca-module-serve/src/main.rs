@@ -927,7 +927,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(legacy) = &run_index {
             let legacy = legacy.clone();
             mover = mover.with_run_rows(Arc::new(move |session: &broca_protocol::BindIdentity| {
-                legacy.session_runs(session)
+                Ok((
+                    legacy.session_runs(session)?,
+                    legacy.session_exports_settled(session)?,
+                ))
             }));
         }
         let mover = Arc::new(mover);

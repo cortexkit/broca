@@ -576,6 +576,7 @@ pub async fn seal_at_cut<W: Writer, P, T>(
     seams: &Seams<'_, P, T>,
     ctx: &Ctx,
     first_kept_ordinal: u64,
+    after_input: bool,
 ) -> Result<(), LoopError> {
     if writer.operations().view_applied.is_none() {
         return Err(LoopError::Parts(
@@ -583,7 +584,11 @@ pub async fn seal_at_cut<W: Writer, P, T>(
         ));
     }
     let carry = carried_views(&*ctx.session.state.lock().await, writer.operations())?;
-    let window_repetition = spanning_repetition(writer.conversation(), first_kept_ordinal)?;
+    let window_repetition = spanning_repetition(
+        writer.conversation(),
+        first_kept_ordinal,
+        after_input.then_some(writer.session_id()).as_deref(),
+    )?;
     writer
         .seal_at_entry(
             first_kept_ordinal,
@@ -735,6 +740,7 @@ pub fn view_record(
 fn spanning_repetition(
     conversation: &broca_session_store::fold::conversation::Conversation,
     first_kept: u64,
+    corrected_session: Option<&str>,
 ) -> Result<Option<serde_json::Value>, LoopError> {
     let window_start = conversation.window_start();
     let episodes = &conversation.episodes;
@@ -769,8 +775,18 @@ fn spanning_repetition(
             _ => None,
         };
     // Counting starts at the run's first step; its input before that has nothing to count.
+    let corrected_start = match corrected_session {
+        Some(session) => {
+            match crate::repetition::first_answer(conversation, run.start as usize - 1, session) {
+                Some(first) => Some((first as u64 + 1).saturating_sub(from) as usize),
+                None => return Ok(None),
+            }
+        }
+        None => None,
+    };
     let steps = match &seed {
         Some(_) => &below[..],
+        None if corrected_start.is_some() => &below[corrected_start.unwrap().min(below.len())..],
         None => match below
             .iter()
             .position(|message| message.role == broca_protocol::content::Role::Assistant)

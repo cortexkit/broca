@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+tracing.workspace = true
 broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
 # The image engine's aging state, which `media_index` saves with a session.

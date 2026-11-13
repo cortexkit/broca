@@ -470,10 +470,47 @@ pub(crate) fn retain_run_identities(
                 let choices = start
                     .run_choices
                     .get_or_insert_with(|| serde_json::json!({}));
+                let inventory = choices.pointer("/record/session/inventory").cloned();
                 choices["record"]["session"] = serde_json::to_value(recorded)
                     .map_err(|error| StageError::Failed(format!("encode run identity: {error}")))?;
+                if let Some(inventory) = inventory {
+                    choices["record"]["session"]["inventory"] = inventory;
+                }
             }
         }
+    }
+    Ok(())
+}
+
+/// Retain old-root recovery evidence inside the existing identity bag. Its original identity
+/// fields stay at the top level so readers of the historical BindIdentity keep seeing it.
+pub fn retain_inventory_identities(
+    converted: &mut Converted,
+    records: &[FramedRecord],
+    inventory: &[BindIdentity],
+) -> Result<(), StageError> {
+    if inventory.is_empty() {
+        return Ok(());
+    }
+    for record in &mut converted.records {
+        let Record::RunStart(start) = record else {
+            continue;
+        };
+        let Some(recorded) = records.iter().find_map(|frame| match &frame.record {
+            WalRecord::RunStarted {
+                run_id, session, ..
+            } if run_id.0 == start.run_id => Some(session),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let mut identity = serde_json::to_value(recorded)
+            .map_err(|error| StageError::Failed(format!("encode run identity: {error}")))?;
+        identity["inventory"] = serde_json::to_value(inventory)
+            .map_err(|error| StageError::Failed(format!("encode inventory identities: {error}")))?;
+        start
+            .run_choices
+            .get_or_insert_with(|| serde_json::json!({}))["record"]["session"] = identity;
     }
     Ok(())
 }

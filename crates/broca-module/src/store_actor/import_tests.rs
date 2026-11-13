@@ -31,6 +31,8 @@ use crate::store_import::{
 mod inline;
 
 // Imports staged and published on the new storage's class roots.
+#[path = "import_repetition_tests.rs"]
+mod repetition;
 #[path = "import_stage_tests.rs"]
 mod staged;
 

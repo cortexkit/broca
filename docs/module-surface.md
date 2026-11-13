@@ -726,6 +726,43 @@ Each failed attempt logs a WARN with source path, class
 and detail. The standalone `--convert-clone` command, which tests conversion on an
 operator-supplied state-root copy without starting the daemon, writes these warnings to stderr.
 
+Verification reports historical provider-rejected requests separately as
+`provider_rejected_request`, with a count and run/step examples in the report and ledger detail.
+This category requires a step with no successful `ModelStepFinished` in a run that ended with a
+permanent `request_invalid`; it never exempts a successful step. Read, history, head and fresh
+next-send verification still run. Import markers are not provider runs to resume: verification
+admits a fresh synthetic next send with one config supplied to the legacy WAL renderer and the
+new session loop, leaving the marker and its imported history unchanged.
+
+Fresh admissions freeze `repetition_after_input` in the render config: repetition warnings start
+at each run's first model answer, not at assistant messages supplied as its input. A seeded import
+with no model steps therefore adds no warning. Configs without the flag retain the previous
+boundary, including on resume and offline request reconstruction; recorded request bytes are not
+retroactively corrected. The conversation checkpoint may retain a derived, optional first-answer
+ordinal, which older readers ignore. Older checkpoints use each message's entry facts to distinguish
+model answers from caller-supplied input when available; when neither attribution nor the original
+input boundary survives, rendering keeps the legacy
+boundary and logs a warning naming the session rather than refusing the run.
+
+An inventory re-key first filters named candidates by both stored and derived source address,
+then requires one distinct identity in a complete inventory. An otherwise unservable live log
+can also recover its filename identity from inventoried project roots, `runner`/`broca` harnesses,
+and recorded or inventoried session names. Exactly one candidate must hash to the filename, and
+no new-store head may occupy it. Historical and inventory identities remain provenance in
+`run_choices.record.session`; they do not change the head's serving address. An archived alias
+is `superseded_alias` only when a canonical converted source has the identical prefix and its
+published session still serves the source pages. The ledger names the canonical address, no
+second session is published, and the original archive bytes remain in the backup.
+
+An unfinished archived crash-orphan run is sealed `Interrupted` only on a staging-owned copy.
+The recovery is persisted separately from disposable conversion staging, so retries reuse its
+exact tail without writing the archive container. The configured usage export bills the recovered
+run's own steps through `StoreBilling` before `Billed` is appended and before verification or
+publication. Existing facts deduplicate by their normal fact id. A failed or unavailable export
+is a visible `billing_failed` conversion failure, never an unbilled conversion. Only the recovered
+run's withdrawal-free active legacy row is carried; other reconciliation debt still refuses the
+conversion. The converted store owns the recovered run and leaves its legacy index row alone.
+
 For an operator-supplied **clone only**, `ck-broca --convert-clone ROOT --converted-sources BACKUP`
 runs the same conversion in plain mode without starting a daemon or reading the vault. It prints
 JSON counts, live-pass and total milliseconds, and session addresses whose legacy run-index rows

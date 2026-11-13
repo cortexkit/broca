@@ -96,6 +96,87 @@ fn result_ids(message: &Message) -> Vec<&str> {
 }
 
 #[test]
+fn the_first_model_answer_excludes_assistant_input_and_survives_a_window_cut() {
+    use crate::codec::Message as _;
+    let mut imported = input("import", Placement::RunInput);
+    let Record::Input(value) = &mut imported else {
+        unreachable!()
+    };
+    std::sync::Arc::make_mut(&mut value.message).role = Role::Assistant;
+    let mut conversation = fold(
+        &[input("hi", Placement::RunInput), imported, assistant(&[])],
+        false,
+    )
+    .unwrap();
+    assert_eq!(conversation.episodes[0].first_model_answer, Some(3));
+    let bytes = conversation.encode();
+    let decoded = Conversation::decode(&bytes).unwrap();
+    assert_eq!(decoded.episodes[0].first_model_answer, Some(3));
+    conversation.seal_window(4, None).unwrap();
+    assert_eq!(conversation.episodes[0].first_model_answer, Some(3));
+}
+
+#[test]
+fn the_master_episode_decoder_skips_the_new_checkpoint_boundary() {
+    use crate::codec::{Fields, Message as _, Value as _};
+    // The Episode declaration from master 77ccd4b85, using the same unchanged codec macros.
+    // Keeping its real old field set exercises the old generated decoder, not the new one.
+    crate::message! {
+        #[derive(Debug,PartialEq)]
+        struct MasterEpisode {
+            1 req run_id: String,
+            2 req start: u64,
+            3 opt first_user: u64,
+            4 opt render_config: crate::record::PartRef,
+            5 opt render_key: crate::codec::Digest,
+        }
+    }
+    let conversation = fold(&[input("hi", Placement::RunInput), assistant(&[])], false).unwrap();
+    let checkpoint = crate::checkpoint::Checkpoint {
+        covers_through: 3,
+        next_seq: 4,
+        conversation,
+        operational: crate::fold::operations::Operations::default(),
+        transcript_base: None,
+        ledger_base: None,
+        activity_ms: None,
+        media: None,
+    };
+    let bytes = checkpoint.encode();
+    let conversation = Fields::new(&bytes, "Checkpoint")
+        .find_map(|field| {
+            let field = field.unwrap();
+            (field.number == 3).then_some(field.raw)
+        })
+        .unwrap();
+    let body = crate::codec::len_payload(conversation, "Conversation").unwrap();
+    let mut decoded = 0;
+    for field in Fields::new(body, "Conversation") {
+        let field = field.unwrap();
+        if field.number == 10 || field.number == 12 {
+            let before = crate::codec::skipped_unknown_fields();
+            let old = MasterEpisode::read(field.raw).unwrap();
+            assert_eq!(old.run_id, "r");
+            assert_eq!(old.start, 1);
+            assert_eq!(crate::codec::skipped_unknown_fields(), before + 1);
+            decoded += 1;
+        }
+    }
+    assert_eq!(
+        decoded, 1,
+        "a real checkpoint included the extended episode"
+    );
+    assert_eq!(
+        crate::checkpoint::Checkpoint::decode(&bytes)
+            .unwrap()
+            .conversation
+            .episodes[0]
+            .first_model_answer,
+        Some(2)
+    );
+}
+
+#[test]
 fn a_tool_turn_enters_once_every_call_is_answered_with_results_in_call_order() {
     let mut conversation = Conversation::new(false);
     for record in [

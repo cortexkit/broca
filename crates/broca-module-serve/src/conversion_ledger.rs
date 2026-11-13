@@ -185,6 +185,20 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// A published canonical source with exactly the alias's prefix, not merely a matching name.
+    pub fn converted_prefix(
+        &self,
+        address: &str,
+        digest: &str,
+        class: &str,
+    ) -> Result<bool, String> {
+        self.connection.lock().map_err(|error| error.to_string())?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE outcome='converted' AND source_sha256=?2
+             AND storage_class=?3 AND (member=?1 OR (member IS NULL AND source_path LIKE '%/'||?1||'.wal')))",
+            rusqlite::params![address, digest, class], |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
+
     /// SQL aggregation keeps a health read bounded by the ledger, not by WAL replay.
     pub fn progress(&self) -> Result<Progress, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;

@@ -53,6 +53,7 @@ pub mod parts;
 pub mod plan;
 pub mod queue;
 mod refusal;
+mod repetition;
 pub mod run;
 pub mod shared;
 pub mod today;

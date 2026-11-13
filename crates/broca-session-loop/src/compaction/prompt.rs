@@ -49,11 +49,13 @@ struct Key {
     enrolled_through: Option<u64>,
     /// The window's runs, by the list the run holds.
     episodes: Arc<RenderHistory>,
+    after_input: bool,
 }
 
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.session == other.session
+            && self.after_input == other.after_input
             && self.window_start == other.window_start
             && self.enrolled_through == other.enrolled_through
             && Arc::ptr_eq(&self.episodes, &other.episodes)
@@ -111,6 +113,8 @@ pub(crate) fn contract_prompt(
     conversation: &Conversation,
     episodes: &[EpisodeRenderInput],
     enrollment: Option<&EnrollmentOverlay>,
+    after_input: bool,
+    session: &str,
 ) -> Result<Vec<Message>, LoopError> {
     let mut prompt: Vec<Message> = conversation
         .messages
@@ -123,6 +127,7 @@ pub(crate) fn contract_prompt(
         episodes,
         first,
         conversation.window_repetition.as_ref(),
+        after_input.then_some((conversation, session.to_owned())),
     )?;
     // Each message keeps its place in the session, which the window starts after once history
     // is sealed: the window's first message has the 0-based position `window_start - 1`.
@@ -205,6 +210,7 @@ impl KeptPrompt {
         writer: &W,
         episodes: &Arc<RenderHistory>,
         enrollment: Option<&EnrollmentOverlay>,
+        after_input: bool,
     ) -> Result<(), LoopError> {
         let conversation = writer.conversation();
         let key = Key {
@@ -212,6 +218,7 @@ impl KeptPrompt {
             window_start: conversation.window_start(),
             enrolled_through: enrollment.map(EnrollmentOverlay::through_ordinal),
             episodes: Arc::clone(episodes),
+            after_input,
         };
         let keeps = self.0.as_ref().is_some_and(|kept| {
             kept.key == key
@@ -235,6 +242,18 @@ impl KeptPrompt {
         kept.seen = conversation.changes.mark();
         let first = conversation.window_start() - 1;
         let from = kept.taken;
+        let corrected_starts = after_input.then(|| {
+            episodes
+                .iter()
+                .map(|episode| {
+                    crate::repetition::first_answer(
+                        conversation,
+                        episode.prompt_start,
+                        &kept.key.session,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         for (index, placed) in conversation.messages.iter().enumerate().skip(from) {
             let mut message = Message::clone(placed);
             kept.guide(
@@ -243,6 +262,7 @@ impl KeptPrompt {
                 episodes,
                 first,
                 conversation.window_repetition.as_ref(),
+                corrected_starts.as_deref(),
             )?;
             let position = first + index as u64;
             message.ordinal = Some(position);
@@ -259,7 +279,14 @@ impl KeptPrompt {
             .map_err(overflow)?;
         #[cfg(debug_assertions)]
         assert!(
-            kept.prompt[front..] == contract_prompt(conversation, episodes, enrollment)?[..],
+            kept.prompt[front..]
+                == contract_prompt(
+                    conversation,
+                    episodes,
+                    enrollment,
+                    after_input,
+                    &writer.session_id()
+                )?[..],
             "the kept stored prompt differs from the window's derived whole"
         );
         Ok(())
@@ -308,6 +335,7 @@ impl Kept {
         episodes: &[EpisodeRenderInput],
         first: u64,
         spanning: Option<&serde_json::Value>,
+        corrected: Option<&[Option<usize>]>,
     ) -> Result<(), LoopError> {
         let start =
             |episode: &EpisodeRenderInput| episode.prompt_start.saturating_sub(first as usize);
@@ -323,6 +351,14 @@ impl Kept {
         let Some(at) = run else {
             return Ok(());
         };
+        if let Some(starts) = corrected {
+            let Some(first_answer) = starts[at] else {
+                return Ok(());
+            };
+            if index < first_answer.saturating_sub(first as usize) {
+                return Ok(());
+            }
+        }
         if run != self.run {
             self.run = run;
             self.guidance = match spanning.filter(|_| episodes[at].prompt_start < first as usize) {

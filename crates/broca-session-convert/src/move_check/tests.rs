@@ -294,7 +294,7 @@ fn inventory_rekeys_are_checked_read_only_and_unresolved_identities_are_named() 
     assert!(report
         .examples
         .keys()
-        .any(|key| key.contains("differs from source address")));
+        .any(|key| key.contains("no inventory row hashes to the source address")));
     // Without an inventory the historical first-run identity remains the rehearsal default.
     assert_eq!(checked(&root, vec![different.clone()]).verified, 1);
     let connection = rusqlite::Connection::open(&index).unwrap();

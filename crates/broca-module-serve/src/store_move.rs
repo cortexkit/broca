@@ -94,8 +94,9 @@ pub const REQUIRED_OPERATIONS: &[&str] = &[
 /// request with no parameters.
 pub type Served = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-/// The run-index rows of a session.
-pub type RunRows = Arc<dyn Fn(&BindIdentity) -> Result<Vec<RunIndexRow>, String> + Send + Sync>;
+/// A session's run rows and whether the export reconciler has no work left for them.
+pub type RunRows =
+    Arc<dyn Fn(&BindIdentity) -> Result<(Vec<RunIndexRow>, bool), String> + Send + Sync>;
 
 /// Drops a session's materialized rows (its projected messages, tags, episodes and pages).
 pub type ForgetProjection = Arc<dyn Fn(&BindIdentity) -> Result<(), String> + Send + Sync>;
@@ -539,6 +540,18 @@ impl StoreMove {
         records: &[FramedRecord],
         lineage: Option<WalLineageId>,
     ) -> Result<(), MoveRefusal> {
+        self.check_idle_for_recovery(key, records, lineage, None)
+    }
+
+    /// A recovered archive run belongs to the staged store. Its stale active index row may be
+    /// carried only without withdrawals; all other rows and export debt keep the normal gate.
+    pub(crate) fn check_idle_for_recovery(
+        &self,
+        key: &BindIdentity,
+        records: &[FramedRecord],
+        lineage: Option<WalLineageId>,
+        recovered: Option<&str>,
+    ) -> Result<(), MoveRefusal> {
         use broca_session_convert::preconditions::{wal_refusal, SESSION_BUSY};
         if let Some(reason) = wal_refusal(records, lineage) {
             return Err(not_movable(reason));
@@ -561,18 +574,24 @@ impl StoreMove {
         {
             return Err(not_movable(SESSION_BUSY));
         }
-        // Every run-index row must be terminal, have its usage recorded and owe no withdrawal,
+        // Every run-index row must be terminal, owe no export and owe no withdrawal,
         // but for the row of a run the move carries paused for sign-in. A row that isn't is
         // finished later by today's reconcilers, which read the WAL; once the session has moved
         // they'd be refused by today's storage on every attempt.
         let Some(rows) = &self.run_rows else {
             return Err(not_movable("reconcile_owed"));
         };
-        let rows =
+        let (mut rows, exports_settled) =
             rows(key).map_err(|error| unavailable("the run index couldn't be read", error))?;
+        rows.retain(|row| {
+            !(recovered == Some(row.run_id.as_str())
+                && row.state == broca_core::RunIndexState::Active
+                && !row.withdrawals_owed)
+        });
         if !broca_session_convert::preconditions::run_rows_settled(
             &rows,
             broca_session_convert::preconditions::paused_for_sign_in(records).as_deref(),
+            exports_settled,
         ) {
             return Err(not_movable("reconcile_owed"));
         }
@@ -845,6 +864,13 @@ impl StoreMove {
                 legacy_replay_limit = verified.legacy_replay_limit,
                 examples = ?verified.legacy_replay_limit_examples,
                 "converted requests match today's offline replay, which cannot reproduce every historical request digest");
+        }
+        if verified.provider_rejected_request > 0 {
+            tracing::warn!(
+                provider_rejected_request = verified.provider_rejected_request,
+                examples = ?verified.provider_rejected_request_examples,
+                "historical requests rejected by their provider are not successful replay promises"
+            );
         }
         // The runtime serving the session reads its setup parts from memory: hold the staged
         // ones there, already stored in the destination root.

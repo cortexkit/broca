@@ -776,6 +776,130 @@ fn conversion_rebasing_keeps_legacy_views_at_their_storage_sequences() {
 }
 
 #[test]
+fn an_import_only_session_verifies_a_fresh_next_send_without_resuming_its_marker() {
+    let root = scratch("import-marker-next-send");
+    let mut marker =
+        serde_json::to_value(run_started("import-marker", 1_000, "Imported history.")).unwrap();
+    marker["origin"] =
+        json!({"kind": "seeded_from", "origin_kind": "import", "source_ref": "synthetic:import"});
+    marker["config"]["renderer_version"] = json!(0);
+    marker["config"]["frozen_render_config"] = serde_json::Value::Null;
+    marker["input"] = json!([
+        {"role": "user", "content": [{"type": "text", "text": "Imported prompt."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Imported reply."}]},
+    ]);
+    let records = framed(vec![
+        record(marker),
+        record(
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_001,
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "retries_used": 0}),
+        ),
+    ]);
+    let before = records.clone();
+    let staged = staged(&root, &records, None);
+    let checked = verified(&root, &records, None, &staged.converted, Mode::Offline).unwrap();
+    assert!(checked.checks.contains(&crate::verify::NEXT_REQUEST));
+    assert!(checked.checks.contains(&crate::verify::READ));
+    assert!(checked.checks.contains(&crate::verify::HISTORY_RAW));
+    assert!(checked.checks.contains(&crate::verify::HEAD));
+    assert_eq!(records, before);
+    assert_eq!(checked.runs, 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_import_markers_repeated_tools_do_not_become_the_next_runs_repetition_history() {
+    let root = scratch("import-repeated-tools-next-send");
+    let mut marker =
+        serde_json::to_value(run_started("import-marker", 1_000, "Imported history.")).unwrap();
+    marker["origin"] = json!({"kind":"seeded_from","origin_kind":"import","source_ref":"synthetic:repeated-tools"});
+    marker["config"]["renderer_version"] = json!(0);
+    marker["config"]["frozen_render_config"] = serde_json::Value::Null;
+    let mut input =
+        vec![json!({"role":"user","content":[{"type":"text","text":"Imported prompt."}]})];
+    for index in 0..8 {
+        let id = format!("call-{index}");
+        input.push(json!({"role":"assistant","content":[{"type":"tool_call","tool_call_id":id,"tool_name":"read","input":{"path":"fixture.txt"}}]}));
+        input.push(json!({"role":"tool","content":[{"type":"tool_result","tool_call_id":id,"output":{"kind":"text","text":""},"is_error":false}]}));
+    }
+    marker["input"] = json!(input);
+    let records = framed(vec![
+        record(marker),
+        record(
+            json!({"type":"run_finished","reason":"completed","ts_ms":1_001,"usage":{},"retries_used":0}),
+        ),
+    ]);
+    let staged = staged(&root, &records, None);
+    let checked = verified(&root, &records, None, &staged.converted, Mode::Offline).unwrap();
+    assert!(checked.checks.contains(&crate::verify::NEXT_REQUEST));
+    assert!(checked.checks.contains(&crate::verify::READ));
+    assert!(checked.checks.contains(&crate::verify::HISTORY_RAW));
+    assert!(checked.checks.contains(&crate::verify::HEAD));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_provider_rejected_request_is_counted_without_skipping_the_fresh_next_send() {
+    let root = scratch("provider-rejected-request");
+    let (mut records, lineage) = written(&root);
+    records.retain(|frame| {
+        !matches!(&frame.record,
+        WalRecord::ModelStepFinished { step_id, .. } if step_id.0 == 2)
+    });
+    records.last_mut().unwrap().record = record(json!({
+        "type": "run_finished", "reason": "error", "ts_ms": 2_003,
+        "usage": {}, "retries_used": 0,
+        "error": {"class": "permanent", "provider_code": "request_invalid", "message": "Synthetic invalid request."},
+    }));
+    let staged = staged(&root, &records, lineage);
+    let summary = verified(&root, &records, lineage, &staged.converted, Mode::Offline).unwrap();
+    assert!(summary.checks.contains(&crate::verify::NEXT_REQUEST));
+    assert!(summary.checks.contains(&crate::verify::READ));
+    assert!(summary.checks.contains(&crate::verify::HISTORY_RAW));
+    assert!(summary.checks.contains(&crate::verify::HEAD));
+    assert!(summary
+        .request_limits_detail()
+        .unwrap()
+        .contains("provider_rejected_request: 1"));
+    let summary = serde_json::to_value(summary).unwrap();
+    assert_eq!(summary["provider_rejected_request"], 1);
+    assert_eq!(
+        summary["provider_rejected_request_examples"],
+        json!([{"run_id": "r2", "step": 2}])
+    );
+    assert_eq!(summary["legacy_replay_limit"], 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn successful_steps_and_other_errors_are_not_provider_rejected_requests() {
+    for (name, successful, class, code) in [
+        ("successful", true, "permanent", "request_invalid"),
+        ("transient", false, "transient", "request_invalid"),
+        ("other-code", false, "permanent", "other_error"),
+    ] {
+        let root = scratch(name);
+        let (mut records, lineage) = written(&root);
+        if !successful {
+            records.retain(|frame| {
+                !matches!(&frame.record,
+                WalRecord::ModelStepFinished { step_id, .. } if step_id.0 == 2)
+            });
+        }
+        records.last_mut().unwrap().record = record(json!({
+            "type": "run_finished", "reason": "error", "ts_ms": 2_003,
+            "usage": {}, "retries_used": 0,
+            "error": {"class": class, "provider_code": code, "message": "Synthetic terminal error."},
+        }));
+        let staged = staged(&root, &records, lineage);
+        let summary = verified(&root, &records, lineage, &staged.converted, Mode::Offline).unwrap();
+        assert_eq!(summary.provider_rejected_request, 0, "{name}");
+        assert!(summary.checks.contains(&crate::verify::NEXT_REQUEST));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn a_legacy_request_replay_limit_is_verified_and_counted_once() {
     let root = scratch("legacy-replay-limit");
     let (mut records, lineage) = written(&root);
@@ -1536,9 +1660,8 @@ fn a_run_paused_for_sign_in_moves_and_resumes_alike() {
     assert_eq!(paused_for_sign_in(&restart), None);
 }
 
-/// The run-index rows that let a session move: every row terminal with its usage and no
-/// withdrawal owed, and, as the one exception, the paused row of the run the move carries paused
-/// for sign-in.
+/// The run-index rows that let a session move: every row terminal with its export settled and
+/// no withdrawal owed, and, as the one exception, the paused row of the run carried for sign-in.
 #[test]
 fn only_the_carried_paused_runs_row_may_be_unfinished() {
     use crate::preconditions::run_rows_settled;
@@ -1557,22 +1680,81 @@ fn only_the_carried_paused_runs_row_may_be_unfinished() {
     };
     let finished = row("r0", RunIndexState::Completed, true);
     let paused = row("r1", RunIndexState::Paused, false);
-    assert!(run_rows_settled(std::slice::from_ref(&finished), None));
+    assert!(run_rows_settled(
+        std::slice::from_ref(&finished),
+        None,
+        true
+    ));
     assert!(run_rows_settled(
         &[finished.clone(), paused.clone()],
-        Some("r1")
+        Some("r1"),
+        true
     ));
-    assert!(!run_rows_settled(&[finished.clone(), paused.clone()], None));
-    assert!(!run_rows_settled(std::slice::from_ref(&paused), Some("r2")));
+    assert!(!run_rows_settled(
+        &[finished.clone(), paused.clone()],
+        None,
+        true
+    ));
+    assert!(!run_rows_settled(
+        std::slice::from_ref(&paused),
+        Some("r2"),
+        true
+    ));
     let active = row("r1", RunIndexState::Active, false);
-    assert!(!run_rows_settled(&[active], Some("r1")));
+    assert!(!run_rows_settled(&[active], Some("r1"), true));
     let owing = RunIndexRow {
         withdrawals_owed: true,
         ..paused
     };
-    assert!(!run_rows_settled(&[owing], Some("r1")));
-    let unreconciled = row("r0", RunIndexState::Completed, false);
-    assert!(!run_rows_settled(&[unreconciled], Some("r1")));
+    assert!(!run_rows_settled(&[owing], Some("r1"), true));
+    let without_usage = row("r0", RunIndexState::Completed, false);
+    assert!(run_rows_settled(&[without_usage], Some("r1"), true));
+}
+
+#[test]
+fn terminal_rows_without_usage_are_settled_only_after_export() {
+    use crate::preconditions::run_rows_settled;
+    use broca_core::{RunIndex, RunIndexRow, RunIndexState};
+    let mut row = RunIndexRow {
+        run_id: "terminal-without-answer".into(),
+        session: session(),
+        submission_id: None,
+        request_identity_digest: None,
+        state: RunIndexState::Error,
+        usage: None,
+        final_step_finish_reason: None,
+        retries_used: 0,
+        title: None,
+        withdrawals_owed: false,
+    };
+    let root = scratch("terminal-export-settled");
+    let db = root.join("run-index.db");
+    let index = broca_store::SqliteStore::open(&db).unwrap();
+    index.index_run_active(&row).unwrap();
+    let settled = || index.session_exports_settled(&row.session).unwrap();
+    assert!(!run_rows_settled(
+        std::slice::from_ref(&row),
+        None,
+        settled()
+    ));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO export_facts (fact_id, run_id, segment_json) VALUES (?1, ?2, '{}')",
+            ["terminal-export-fact", &row.run_id],
+        )
+        .unwrap();
+    assert!(run_rows_settled(
+        std::slice::from_ref(&row),
+        None,
+        settled()
+    ));
+    row.usage = Some(Default::default());
+    assert!(!run_rows_settled(std::slice::from_ref(&row), None, false));
+    row.withdrawals_owed = true;
+    assert!(!run_rows_settled(std::slice::from_ref(&row), None, true));
+    drop(index);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A session compacted under the first compaction protocol moves read-only: it stages and

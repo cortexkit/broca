@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversion_ledger::{Ledger, Progress, Row, Source};
 
+mod aliases;
+mod archive_recovery;
 pub(crate) mod parallel;
 
 /// Cutover-only switches, removed with legacy storage. Deploying the converter alone does
@@ -895,7 +897,8 @@ impl Engine {
                 error
             }
         };
-        let (records, _, _) = read_source(&path, source.member.as_deref()).map_err(unidentified)?;
+        let (records, alias_lineage, alias_digest) =
+            read_source(&path, source.member.as_deref()).map_err(unidentified)?;
         let session = records
             .iter()
             .find_map(|frame| match &frame.record {
@@ -905,14 +908,67 @@ impl Engine {
             .ok_or_else(|| {
                 unidentified(Failure::refused("damaged", "source contains no RunStarted"))
             })?;
-        let session = broca_session_convert::identity::effective_identity(
+        let identity = broca_session_convert::identity::effective_identity(
             &session,
             &address,
             self.source_index
                 .as_ref()
                 .map(|index| index.as_ref() as &dyn broca_core::SessionRefResolver),
-        )
-        .map_err(|error| match error {
+        );
+        let mut identity_provenance = Vec::new();
+        if source.member.is_some()
+            && matches!(
+                &identity,
+                Err(broca_session_convert::identity::IdentityError::Unresolved(
+                    _
+                ))
+            )
+        {
+            if let Some(canonical) = self
+                .superseded_alias(source, &records, alias_lineage, &alias_digest, deployment)
+                .await?
+            {
+                self.ledger
+                    .bind_source(&source.id, &alias_digest)
+                    .map_err(io)?;
+                self.step_with_detail(source, "awaiting_backup", Some("superseded_alias"), None, Some(&format!("canonical_address: {canonical}; identical prefix and canonical session.read verified")))?;
+                return self.backup_ready(source);
+            }
+        }
+        let mut recovered_identity = false;
+        let identity = match identity {
+            Err(broca_session_convert::identity::IdentityError::Unresolved(_))
+                if source.member.is_none() =>
+            {
+                if let Some(index) = &self.source_index {
+                    let (roots, complete) = index.session_ref_project_roots().map_err(io)?;
+                    let recorded: Vec<_> = records
+                        .iter()
+                        .filter_map(|frame| match &frame.record {
+                            WalRecord::RunStarted { session, .. } => Some(session.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    broca_session_convert::identity::old_root_identity(
+                        &recorded,
+                        &address,
+                        (&roots, complete),
+                        index.as_ref(),
+                        broca_wal::session_storage_head(&self.root, class(source)?, &address)
+                            .exists(),
+                    )
+                    .map(|(identity, provenance)| {
+                        recovered_identity = true;
+                        identity_provenance = provenance;
+                        identity
+                    })
+                } else {
+                    identity
+                }
+            }
+            identity => identity,
+        };
+        let session = identity.map_err(|error| match error {
             broca_session_convert::identity::IdentityError::Unresolved(detail) => {
                 unidentified(Failure::refused("identity_unresolved", detail))
             }
@@ -961,6 +1017,14 @@ impl Engine {
         } else {
             None
         };
+        if recovered_identity
+            && broca_wal::session_storage_head(&self.root, class(source)?, &address).exists()
+        {
+            return Err(unidentified(Failure::refused(
+                "identity_unresolved",
+                "a new-storage head already occupies the source address",
+            )));
+        }
         // Re-read under the fence: a send may have restored an archive member to a live WAL
         // between discovery and this member's turn.
         if source.member.is_some()
@@ -1000,10 +1064,11 @@ impl Engine {
                 ));
             }
         }
-        if matches!(
+        if (matches!(
             row.step.as_str(),
             "staging" | "verifying" | "verified" | "publishing"
-        ) && row.source_sha256 != source_sha256
+        ) || (source.member.is_some() && row.step == "recovering"))
+            && row.source_sha256 != source_sha256
         {
             return Err(Failure::failed(
                 "source_changed",
@@ -1021,12 +1086,17 @@ impl Engine {
             recover_live(&self.root, &path, &records)?;
             (records, lineage, source_sha256) = read_source(&path, None)?;
         }
+        let recovered_run = if source.member.is_some() {
+            self.recover_archive(source, &path, &mut records, lineage, &source_sha256)?
+        } else {
+            None
+        };
         if let Some(reason) = preconditions::wal_refusal(&records, lineage) {
             return Err(Failure::failed(reason, "source still has unfinished work"));
         }
         if let Some(mover) = self.mover.get() {
             mover
-                .check_idle(&session, &records, lineage)
+                .check_idle_for_recovery(&session, &records, lineage, recovered_run.as_deref())
                 .map_err(|error| {
                     let class = error
                         .detail
@@ -1041,9 +1111,16 @@ impl Engine {
                 })?;
         }
         if let Some(index) = &self.source_index {
+            let mut rows = index.session_runs(&session).map_err(io)?;
+            rows.retain(|row| {
+                !(recovered_run.as_deref() == Some(row.run_id.as_str())
+                    && row.state == broca_core::RunIndexState::Active
+                    && !row.withdrawals_owed)
+            });
             if !preconditions::run_rows_settled(
-                &index.session_runs(&session).map_err(io)?,
+                &rows,
                 preconditions::paused_for_sign_in(&records).as_deref(),
+                index.session_exports_settled(&session).map_err(io)?,
             ) {
                 return Err(Failure::failed(
                     if background {
@@ -1060,9 +1137,21 @@ impl Engine {
             .map_err(|error| io(error.message))?;
         let media_bytes = media.as_ref().map(|media| &media.store as &dyn MediaBytes);
         let lineage_text = lineage.map(|lineage| lineage.to_string());
-        let prepared =
+        let mut prepared =
             broca_session_convert::stage::prepare(&records, lineage_text.as_deref(), media_bytes)
                 .map_err(stage_failure)?;
+        broca_session_convert::stage::retain_inventory_identities(
+            &mut prepared.converted,
+            &records,
+            &identity_provenance,
+        )
+        .map_err(stage_failure)?;
+        if let Some(run) = &recovered_run {
+            prepared.converted.records.retain(|record| {
+                !matches!(record,
+                broca_session_store::record::Record::Billed(billed) if &billed.run_id == run)
+            });
+        }
         // A session compacted under the first compaction protocol moves read-only: its reads
         // move, and the new run loop refuses a new send to it (`converted_refusal` names it). The
         // verifier rebuilds none of its
@@ -1138,7 +1227,18 @@ impl Engine {
             if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Failure::failed("crash", "staging interrupted"));
             }
-            let staged = staged.map_err(stage_failure)?;
+            let mut staged = staged.map_err(stage_failure)?;
+            if let Some(run) = &recovered_run {
+                archive_recovery::bill_recovered(
+                    &staging,
+                    &session,
+                    deployment,
+                    runtime,
+                    &mut staged.converted,
+                    run,
+                )
+                .await?;
+            }
             self.step(source, "verifying", None, None)?;
             #[cfg(test)]
             let verification_records = {
@@ -1178,26 +1278,14 @@ impl Engine {
             }
             let verified =
                 verified.map_err(|error| Failure::failed("verification_failed", error))?;
-            // A converted session whose requests match today's offline replay, where that replay
-            // can't reproduce a historical request digest, still converts. The ledger keeps the
-            // affected steps so the limit stays visible after the conversion.
-            let replay_limit = (verified.legacy_replay_limit > 0).then(|| {
-                let steps: Vec<String> = verified
-                    .legacy_replay_limit_examples
-                    .iter()
-                    .map(|limit| format!("{} step {}", limit.run_id, limit.step))
-                    .collect();
-                format!(
-                    "legacy_replay_limit: {} step(s) match today's offline replay but not their recorded request digest ({})",
-                    verified.legacy_replay_limit,
-                    steps.join(", ")
-                )
-            });
-            if let Some(detail) = &replay_limit {
+            // Keep historical replay limits and provider-rejected requests visible after
+            // publication; neither category skips read, history or fresh-send verification.
+            let request_limits = verified.request_limits_detail();
+            if let Some(detail) = &request_limits {
                 tracing::warn!(target: "session_conversion", source = %source.id, "{detail}");
             }
             let read_only = verified.read_only.then_some(READ_ONLY_DETAIL);
-            let detail = match (replay_limit, read_only) {
+            let detail = match (request_limits, read_only) {
                 (Some(limit), Some(read_only)) => Some(format!("{read_only}; {limit}")),
                 (limit, read_only) => limit.or(read_only.map(str::to_owned)),
             };
@@ -1375,7 +1463,8 @@ impl Engine {
         }
         for row in rows {
             if let Some(address) = source_address(&row.source) {
-                remove_staging(&self.root.join("conversion-staging").join(address))?;
+                remove_staging(&self.root.join("conversion-staging").join(&address))?;
+                remove_staging(&self.root.join("conversion-recovery").join(address))?;
             }
             self.step(
                 &row.source,
