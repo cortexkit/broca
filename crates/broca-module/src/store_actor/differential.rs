@@ -274,13 +274,13 @@ impl Today {
     }
 
     async fn idle(&self) {
-        for _ in 0..500 {
-            if self.registry.route_status(&self.key).await.unwrap() == LineageStatus::Idle {
-                return;
+        broca_test_support::wait_until("today's session goes idle", || async {
+            match self.registry.route_status(&self.key).await.unwrap() {
+                LineageStatus::Idle => Ok(()),
+                status => Err(format!("{status:?}")),
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("today's session never went idle");
+        })
+        .await
     }
 
     /// What each run's start recorded about its send, in the shape [`store_starts`] reads from
@@ -1586,13 +1586,13 @@ impl Module {
 
     /// Waits until the session is idle, then until its actor has closed and left the registry.
     async fn closed(&self) {
-        for _ in 0..1000 {
-            if self.registry.slot_state(&self.key).is_none() {
-                return;
+        broca_test_support::wait_until("the session's actor closes", || async {
+            match self.registry.slot_state(&self.key) {
+                None => Ok(()),
+                Some(state) => Err(format!("{state:?}")),
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the session's actor never closed");
+        })
+        .await
     }
 
     fn head(&self) -> std::path::PathBuf {

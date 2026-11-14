@@ -470,16 +470,16 @@ async fn cancels_alike(
 
 /// Lets every model step of `module` through until its runs are over and its actor has closed.
 async fn run_out(module: &Module, gate: &Option<Arc<Notify>>) {
-    for _ in 0..1000 {
+    broca_test_support::wait_until("the session's actor closes", || async {
         if let Some(gate) = gate {
             gate.notify_one();
         }
-        if module.registry.slot_state(&module.key).is_none() {
-            return;
+        match module.registry.slot_state(&module.key) {
+            None => Ok(()),
+            Some(state) => Err(format!("{state:?}")),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!("the session's actor never closed");
+    })
+    .await
 }
 
 /// A cancel from a module other than the session's owner is checked against the session as it
