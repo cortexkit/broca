@@ -48,6 +48,42 @@ fn only_routed_cases_get_a_runner_and_a_restart_stops_only_its_own() {
     }
 }
 
+/// A scripted turn as a Google Code Assist stream: one SSE event per part, each wrapping a
+/// Gemini chunk in `response`, the last carrying the finish reason and usage.
+pub(super) fn code_assist_stream(
+    turn: &cortexkit_role_llm_runner_conformance::ScriptedTurn,
+) -> String {
+    use cortexkit_role_llm_runner_conformance::ScriptedPart;
+    let mut parts: Vec<Value> = turn
+        .parts
+        .iter()
+        .map(|part| match part {
+            ScriptedPart::Text(text) => json!({"text": text}),
+            ScriptedPart::Reasoning(text) => json!({"text": text, "thought": true}),
+            ScriptedPart::ToolCall(call) => {
+                json!({"functionCall": {"name": call.tool, "args": call.arguments}})
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        parts.push(json!({"text": ""}));
+    }
+    let last = parts.len() - 1;
+    let mut body = String::new();
+    for (index, part) in parts.into_iter().enumerate() {
+        let mut candidate = json!({"content": {"role": "model", "parts": [part]}});
+        let mut chunk = json!({});
+        if index == last {
+            candidate["finishReason"] = json!("STOP");
+            chunk["usageMetadata"] =
+                json!({"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2});
+        }
+        chunk["candidates"] = json!([candidate]);
+        body.push_str(&format!("data: {}\n\n", json!({"response": chunk})));
+    }
+    body
+}
+
 pub(super) fn runner_declaration() -> Value {
     json!({"follows_account_choice":true})
 }
@@ -198,6 +234,17 @@ pub(super) fn seed_catalog(
                 json!({"value":"completions","from":"fixture"});
         }
     }
+    // Antigravity signs in to Google Code Assist, which names its backend model per reasoning
+    // tier. The tier's model id carries the session, so the stand-in finds the session's script
+    // from the Code Assist request's model, as it does from the plan model elsewhere.
+    value["models"][format!("google/{PLAN_MODEL_PREFIX}{session}")] = json!({
+        "existence":"present","limit.context":128000,"capability.tool_call":true,
+        "capability.reasoning":true,"capability.attachment":false,
+        "wire.npm":{"value":"@ai-sdk/google","from":"fixture"},
+        "wire.api":{"value":model_url,"from":"fixture"},
+        "route.reasoning_wire_ids":{"high":format!("{PLAN_MODEL_PREFIX}{session}")},
+        "route.reasoning_default":"high"
+    });
     std::fs::write(path, serde_json::to_vec(&value)?)
 }
 
@@ -220,7 +267,7 @@ pub(super) fn configure(
     daemon["modules"]["broca"]["env"]["BROCA_AUTH_METHODS_PATH"] = json!(methods);
     settings["account_selection"] = json!({"routing_module":ROUTER});
     settings["providers"] = json!({"anthropic":{"base_url":model_url.trim_end_matches("/v1")},
-        "openai":{"base_url":model_url}});
+        "openai":{"base_url":model_url}, "google":{"base_url":model_url}});
     Ok(())
 }
 
@@ -422,10 +469,13 @@ impl Vault {
                     .into_iter()
                     .find(|row| row["id"] == request["params"]["credential_id"])
                     .ok_or_else(|| HarnessError::new("fixture credential not found"))?;
-                Ok(
-                    json!({"result":{"payload":credential_payload(row["id"].as_str().unwrap()),
-                    "expires_at_ms":null,"record_version":1,"credential_id":row["id"],"account_id":row["account_id"]}}),
-                )
+                let mut reply = json!({"result":{"payload":credential_payload(row["id"].as_str().unwrap()),
+                    "expires_at_ms":null,"record_version":1,"credential_id":row["id"],"account_id":row["account_id"]}});
+                // A Code Assist sign-in carries the Google Cloud project its requests name.
+                if row["auth_method"] == "antigravity" {
+                    reply["result"]["project_id"] = json!("fixture-project");
+                }
+                Ok(reply)
             }
             _ => Err(HarnessError::new("unsupported fixture vault method")),
         }

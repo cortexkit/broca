@@ -905,10 +905,19 @@ async fn serve_model_request(
         .and_then(|session| shared.failure_turns.lock().unwrap().get(session).copied())
         .or(counted)
         .unwrap_or_else(|| {
-            messages
-                .iter()
-                .filter(|message| message["role"] == "assistant")
-                .count()
+            // A Google Code Assist request carries its turns under `request.contents`, the
+            // model's own as role `model`.
+            let contents = request["request"]["contents"].as_array();
+            match contents {
+                Some(contents) if messages.is_empty() => contents
+                    .iter()
+                    .filter(|content| content["role"] == "model")
+                    .count(),
+                _ => messages
+                    .iter()
+                    .filter(|message| message["role"] == "assistant")
+                    .count(),
+            }
         });
     let turn = session.as_ref().and_then(|session| {
         shared
@@ -1063,6 +1072,17 @@ async fn serve_model_request(
             .lock()
             .unwrap()
             .contains_key(&session);
+    let code_assist = headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(":streamgeneratecontent"));
+    if code_assist {
+        let body = routed_accounts::code_assist_stream(&turn);
+        let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body.as_bytes()).await?;
+        return stream.shutdown().await;
+    }
     let media_fixture = model.ends_with(MEDIA_FIXTURE_MODEL);
     if model.ends_with(output_refs::MODEL) || native_messages || media_fixture {
         let body = if native_messages || media_fixture {
