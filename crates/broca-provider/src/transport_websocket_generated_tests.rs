@@ -127,7 +127,10 @@ fn chatgpt_wire_generated_request_and_identity_round_trips() {
                     let mut body = Value::Object(fields.into_iter().collect());
                     body["model"] = json!(text);
                     body["input"] = json!([{"type":"message","role":"user","content":text}]);
-                    let encoded = crate::chatgpt_wire::request_bytes(&body);
+                    let encoded = crate::chatgpt_wire::request_bytes(
+                        &broca_protocol::canonical_json_bytes(&body),
+                    )
+                    .unwrap();
                     prop_assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), body);
                     let mut changed = identity.clone();
                     changed.thread_id = text.clone();

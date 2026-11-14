@@ -26,35 +26,57 @@ pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     out
 }
 
-fn write_canonical(out: &mut Vec<u8>, v: &Value) {
+pub(crate) fn write_canonical<W: std::io::Write>(out: &mut W, v: &Value) {
     match v {
         Value::Object(map) => {
-            out.push(b'{');
+            put(out, b"{");
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort_unstable();
             for (i, k) in keys.iter().enumerate() {
                 if i > 0 {
-                    out.push(b',');
+                    put(out, b",");
                 }
                 // Serialize the key as a properly-escaped JSON string.
                 serde_json::to_writer(&mut *out, k).expect("string key never fails");
-                out.push(b':');
+                put(out, b":");
                 write_canonical(out, &map[*k]);
             }
-            out.push(b'}');
+            put(out, b"}");
         }
         Value::Array(arr) => {
-            out.push(b'[');
+            put(out, b"[");
             for (i, e) in arr.iter().enumerate() {
                 if i > 0 {
-                    out.push(b',');
+                    put(out, b",");
                 }
                 write_canonical(out, e);
             }
-            out.push(b']');
+            put(out, b"]");
         }
         // Scalars (null/bool/number/string) have a single canonical serde_json form.
         other => serde_json::to_writer(&mut *out, other).expect("scalar never fails"),
+    }
+}
+
+/// Writes `bytes` to a sink that can't fail: memory, or a [`ByteCount`].
+pub(crate) fn put<W: std::io::Write>(out: &mut W, bytes: &[u8]) {
+    out.write_all(bytes)
+        .expect("the canonical writers write to memory or count");
+}
+
+/// A sink that keeps no bytes, only how many were written: the length of a request without
+/// writing it.
+#[derive(Default)]
+pub(crate) struct ByteCount(pub usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

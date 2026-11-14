@@ -28,6 +28,7 @@ use crate::wire::{
     AuthHandle, FrozenRenderConfig, HttpMethod, HttpRequest, NormalizeError, StreamNormalizer,
     WireFamily,
 };
+use broca_protocol::wire_node::Node;
 
 /// The ChatGPT codex backend base. A `base_url` override replaces only the base (e.g. a mock
 /// in tests); the `/responses` path is appended. base_url lives in the endpoint, not the
@@ -178,81 +179,81 @@ pub(crate) fn effort_plan(
     Some((anchor, updates))
 }
 
-fn build_request_body_with_media(
+/// Hands `use_body` the ChatGPT request body: the shared Responses body with the codex
+/// backend's adjustments.
+fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> serde_json::Value {
-    build_request_body_with_media_and_provenance(frozen, opts, media, None)
-}
-
-fn build_request_body_with_media_and_provenance(
-    frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> serde_json::Value {
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
     // The body STARTS from the shared OpenAI-Responses builder, then applies the codex
     // backend's deltas — the ways the codex/responses backend is STRICTER than the
-    // platform /responses API (mirrors opencode's codex transform exactly):
-    let PreparedRequestBody {
-        mut body,
-        prepared,
-        effort_anchor,
-    } = super::openai_responses::build_prepared_request_body_with_media_and_provenance(
+    // platform /responses API:
+    super::openai_responses::with_prepared_request_body(
         frozen,
         opts,
         media,
-        provenance.as_deref_mut(),
-    );
-    // store:false — the codex backend REJECTS a request without it ("Store must be set
-    // to false"). The platform Responses API defaults store on the server side; codex
-    // enforces it in the body.
-    body["store"] = serde_json::Value::Bool(false);
-    // The codex backend rejects platform-only output and sampling controls as unsupported.
-    // They must be absent rather than defaulted, even when the caller supplied them.
-    // Because ChatGPT cannot enforce that cap, broca does not declare max_output_tokens.
-    if let Some(obj) = body.as_object_mut() {
-        for field in ["max_output_tokens", "temperature", "top_p"] {
-            obj.remove(field);
-        }
-    }
-    // prompt_cache_key — the run's session id, for codex backend-side prompt-cache
-    // locality across the run's turns. A per-run constant frozen into the render config,
-    // so a resume reproduces it from the frozen blob (deterministic, in the hash domain).
-    if let Some(key) = &frozen.prompt_cache_key {
-        body["prompt_cache_key"] = serde_json::Value::String(key.clone());
-    }
-    // The backend carries the frozen reasoning-effort value under reasoning.effort.
-    // Preserve any independently configured fields in the reasoning object.
-    if let Some(effort) = &frozen.reasoning_effort {
-        let reasoning = body
-            .as_object_mut()
-            .expect("OpenAI Responses body is an object")
-            .entry("reasoning")
-            .or_insert_with(|| serde_json::json!({}));
-        if !reasoning.is_object() {
-            *reasoning = serde_json::json!({});
-        }
-        reasoning["effort"] = serde_json::Value::String(effort.clone());
-    }
-    // Start with the planned effort; the shared builder has already placed later episode
-    // effort changes into the prepared input items.
-    if let Some(anchor) = effort_anchor {
-        body["reasoning"]["effort"] = serde_json::json!(anchor);
-    }
-    if let Some(service_tier) = &frozen.service_tier {
-        body["service_tier"] = serde_json::Value::String(service_tier.clone());
-    }
-    if let Some(wire) = &frozen.chatgpt_wire {
-        wire.apply_with_provenance(
-            &mut body,
-            prepared.as_ref(),
-            &frozen.tool_name_aliases,
-            provenance,
-        );
-    }
-    body
+        provenance,
+        |PreparedRequestBody {
+             body: mut whole,
+             prepared,
+             effort_anchor,
+         },
+         provenance| {
+            let body = &mut whole.rest;
+            // store:false — the codex backend REJECTS a request without it ("Store must be
+            // set to false"). The platform Responses API defaults store on the server side;
+            // codex enforces it in the body.
+            body["store"] = serde_json::Value::Bool(false);
+            // The codex backend rejects platform-only output and sampling controls as
+            // unsupported. They must be absent rather than defaulted, even when the caller
+            // supplied them. Because ChatGPT cannot enforce that cap, broca does not declare
+            // max_output_tokens.
+            if let Some(obj) = body.as_object_mut() {
+                for field in ["max_output_tokens", "temperature", "top_p"] {
+                    obj.remove(field);
+                }
+            }
+            // prompt_cache_key — the run's session id, for codex backend-side prompt-cache
+            // locality across the run's turns. A per-run constant frozen into the render
+            // config, so a resume reproduces it from the frozen blob.
+            if let Some(key) = &frozen.prompt_cache_key {
+                body["prompt_cache_key"] = serde_json::Value::String(key.clone());
+            }
+            // The backend carries the frozen reasoning-effort value under reasoning.effort.
+            // Preserve any independently configured fields in the reasoning object.
+            if let Some(effort) = &frozen.reasoning_effort {
+                let reasoning = body
+                    .as_object_mut()
+                    .expect("OpenAI Responses body is an object")
+                    .entry("reasoning")
+                    .or_insert_with(|| serde_json::json!({}));
+                if !reasoning.is_object() {
+                    *reasoning = serde_json::json!({});
+                }
+                reasoning["effort"] = serde_json::Value::String(effort.clone());
+            }
+            // Start with the planned effort; the shared builder has already placed later
+            // episode effort changes into the prepared input items.
+            if let Some(anchor) = effort_anchor {
+                body["reasoning"]["effort"] = serde_json::json!(anchor);
+            }
+            if let Some(service_tier) = &frozen.service_tier {
+                body["service_tier"] = serde_json::Value::String(service_tier.clone());
+            }
+            if let Some(wire) = &frozen.chatgpt_wire {
+                wire.apply_with_provenance(
+                    &mut whole,
+                    prepared,
+                    &frozen.tool_name_aliases,
+                    provenance,
+                );
+            }
+            use_body(&whole.into_node())
+        },
+    )
 }
 
 impl WireFamily for OpenAiResponsesChatgpt {
@@ -261,7 +262,11 @@ impl WireFamily for OpenAiResponsesChatgpt {
     }
 
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> serde_json::Value {
-        build_request_body_with_media(frozen, opts, None)
+        self.shape_with_provenance(frozen, opts, None)
+    }
+
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -270,7 +275,18 @@ impl WireFamily for OpenAiResponsesChatgpt {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> serde_json::Value {
-        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        with_request_body(frozen, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
     }
 
     fn shape_with_media(
@@ -290,11 +306,29 @@ impl WireFamily for OpenAiResponsesChatgpt {
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> serde_json::Value {
         let media = crate::media_render::MediaRender { frozen, payloads };
-        build_request_body_with_media_and_provenance(
+        with_request_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
+            |body| body.to_value(),
+        )
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        with_request_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| body.canonical_bytes(),
         )
     }
 

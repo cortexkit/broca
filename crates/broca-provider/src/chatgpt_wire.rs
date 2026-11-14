@@ -1,5 +1,6 @@
 //! Durable opt-in to the released Codex wire policy. Missing profiles remain legacy.
 
+use broca_protocol::wire_node::{Node, NodeRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -72,27 +73,28 @@ impl ChatgptWire {
 
     pub(crate) fn apply_with_provenance(
         &self,
-        body: &mut Value,
+        whole: &mut crate::families::openai_responses::ResponsesBody<'_>,
         opts: &broca_protocol::CallOptions,
         aliases: &std::collections::BTreeMap<String, String>,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) {
+        let body = &mut whole.rest;
         let instructions = body.as_object_mut().unwrap().remove("instructions");
         if let Some(text) = instructions
             .as_ref()
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            body["input"].as_array_mut().unwrap().insert(0, json!({
+            whole.input.insert(0, Node::value(json!({
                 "type":"message", "id":self.instruction_id(text), "role":"developer",
                 "content":[{"type":"input_text","text":text}],
                 "internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}
-            }));
+            })));
             if let Some(sink) = provenance {
                 sink.prepend_synthetic_message();
             }
         }
-        typed_message_content(body["input"].as_array_mut().unwrap());
+        typed_message_nodes(&mut whole.input);
         body["parallel_tool_calls"] = json!(true);
         let includes = body
             .as_object_mut()
@@ -172,52 +174,83 @@ pub(crate) fn typed_message_content(items: &mut [Value]) {
     }
 }
 
+/// [`typed_message_content`] for input items written as nodes. A message's string content is
+/// moved into its typed part, not copied.
+pub(crate) fn typed_message_nodes(items: &mut [Node<'_>]) {
+    for item in items {
+        if let Node::Value(value) = item {
+            typed_message_content(std::slice::from_mut(value.to_mut()));
+            continue;
+        }
+        if item.get("type").and_then(NodeRef::as_str) != Some("message") {
+            continue;
+        }
+        let kind = if item.get("role").and_then(NodeRef::as_str) == Some("assistant") {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        let Some(content) = item.get_mut("content") else {
+            continue;
+        };
+        if content.as_str().is_none() {
+            continue;
+        }
+        let text = std::mem::replace(content, Node::Array(Vec::new()));
+        *content = Node::Array(vec![Node::object([
+            ("type", Node::str(kind)),
+            ("text", text),
+        ])]);
+    }
+}
+
 /// Routing fields precede large input only in the transport encoding. Canonical rendering
 /// still uses sorted JSON, so retry and resume hashes do not acquire framing policy.
 #[cfg(any(feature = "live", test))]
-pub(crate) fn request_bytes(body: &Value) -> Vec<u8> {
-    let order = [
-        "type",
-        "model",
-        "stream",
-        "service_tier",
-        "previous_response_id",
-        "input",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "reasoning",
-        "store",
-        "stream_options",
-        "include",
-        "prompt_cache_key",
-        "text",
-        "generate",
-        "client_metadata",
-        "access_programs",
-    ];
-    let object = body.as_object().expect("Responses requests are objects");
-    let fields = order
-        .iter()
-        .copied()
-        .filter(|key| object.contains_key(*key))
-        .chain(
-            object
-                .keys()
-                .map(String::as_str)
-                .filter(|key| !order.contains(key)),
-        );
-    let mut bytes = vec![b'{'];
-    for key in fields {
-        if bytes.len() > 1 {
-            bytes.push(b',');
-        }
-        bytes.extend(broca_protocol::canonical_json_bytes(&json!(key)));
-        bytes.push(b':');
-        bytes.extend(broca_protocol::canonical_json_bytes(&object[key]));
-    }
-    bytes.push(b'}');
-    bytes
+const ROUTING_ORDER: [&str; 18] = [
+    "type",
+    "model",
+    "stream",
+    "service_tier",
+    "previous_response_id",
+    "input",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning",
+    "store",
+    "stream_options",
+    "include",
+    "prompt_cache_key",
+    "text",
+    "generate",
+    "client_metadata",
+    "access_programs",
+];
+
+/// A request's members, each a key name and its value's canonical text, written as one JSON
+/// object: the routing fields first in [`ROUTING_ORDER`], the rest by key. With
+/// `routing: false`, every member by key: the canonical object.
+#[cfg(any(feature = "live", test))]
+pub(crate) fn object_bytes(
+    members: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>,
+    routing: bool,
+) -> Vec<u8> {
+    crate::json_text::object_bytes(members, if routing { &ROUTING_ORDER } else { &[] })
+}
+
+/// A rendered request's canonical `body` in the backend's routing order, written from the
+/// body's text without parsing it. `None` when `body` is not a JSON object.
+#[cfg(any(feature = "live", test))]
+pub(crate) fn request_bytes(body: &[u8]) -> Option<Vec<u8>> {
+    let members = crate::json_text::top_level_members(std::str::from_utf8(body).ok()?)?;
+    Some(object_bytes(
+        members
+            .into_iter()
+            .map(|(key, value)| (crate::json_text::key_name(key), value.into()))
+            .collect(),
+        true,
+    ))
 }
 
 #[cfg(any(feature = "live", test))]
@@ -413,10 +446,13 @@ mod tests {
         let canonical = OpenAiResponsesChatgpt.render(&frozen, &opts);
         assert_eq!(canonical, broca_protocol::canonical_json_bytes(&body));
         assert!(canonical.starts_with(b"{\"client_metadata\":"));
-        assert!(request_bytes(&body)
+        assert!(request_bytes(&canonical)
+            .unwrap()
             .starts_with(b"{\"model\":\"gpt-5.3-codex\",\"stream\":true,\"input\":"));
         let mut frame = body;
         frame["type"] = json!("response.create");
-        assert!(request_bytes(&frame).starts_with(b"{\"type\":\"response.create\",\"model\":"));
+        assert!(request_bytes(&broca_protocol::canonical_json_bytes(&frame))
+            .unwrap()
+            .starts_with(b"{\"type\":\"response.create\",\"model\":"));
     }
 }

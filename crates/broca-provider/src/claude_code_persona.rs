@@ -16,6 +16,9 @@
 //! - the `anthropic-beta` list, chosen from the final body's shape and the model.
 //! - `metadata.user_id`, and the body's key order.
 
+use broca_protocol::wire_node::Node;
+
+use crate::json_text::{array_items, key_name, top_level_members};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -352,6 +355,63 @@ pub fn sign_body(body: &str) -> String {
     signed
 }
 
+/// A request body's top-level members other than `messages`, as a JSON object: what
+/// [`select_betas`] and [`select_legacy_betas`] read. The transcript is skipped, not parsed, so
+/// choosing the betas for a request doesn't build a tree of its messages. A body this scanner
+/// can't read is parsed whole.
+pub fn body_without_messages(body: &[u8]) -> Value {
+    let members = std::str::from_utf8(body).ok().and_then(top_level_members);
+    let Some(members) = members else {
+        return serde_json::from_slice(body).unwrap_or(Value::Null);
+    };
+    let mut object = Map::new();
+    for (key, value) in members {
+        if key == "\"messages\"" {
+            continue;
+        }
+        let (Ok(key), Ok(value)) = (
+            serde_json::from_str::<String>(key),
+            serde_json::from_str::<Value>(value),
+        ) else {
+            return serde_json::from_slice(body).unwrap_or(Value::Null);
+        };
+        object.insert(key, value);
+    }
+    Value::Object(object)
+}
+
+/// [`sign_body`] in place: writes the signature into `body` itself, hashing the canonical bytes
+/// as they stream rather than copying the body twice. Bytes equal to `sign_body`'s.
+pub fn sign_body_in_place(body: &mut String) {
+    let Some(offset) = cch_placeholder_offset(body) else {
+        return;
+    };
+    body.replace_range(offset..offset + CCH_PLACEHOLDER.len(), CCH_PLACEHOLDER);
+    let Some(members) = top_level_members(body) else {
+        return;
+    };
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(CCH_SEED);
+    hasher.update(b"{");
+    let mut first = true;
+    for (key, value) in members {
+        let value = match key {
+            "\"max_tokens\"" => continue,
+            "\"model\"" => "\"\"",
+            _ => value,
+        };
+        if !first {
+            hasher.update(b",");
+        }
+        first = false;
+        hasher.update(key.as_bytes());
+        hasher.update(b":");
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(b"}");
+    let cch = format!("{:05x}", hasher.digest() & 0xF_FFFF);
+    body.replace_range(offset..offset + CCH_PLACEHOLDER.len(), &cch);
+}
+
 /// The `metadata.user_id` value: a JSON string with `device_id`, `account_uuid` (omitted when
 /// unknown) and `session_id`, in that order.
 pub fn metadata_user_id(device_id: &str, account_uuid: Option<&str>, session_id: &str) -> String {
@@ -534,6 +594,124 @@ pub fn to_persona_json(body: &Value) -> String {
     out
 }
 
+/// [`to_persona_json`] for a request written as a [`Node`]: the same bytes for the same value.
+/// Strings are escaped straight into the output, never into a string of their own first.
+pub fn to_persona_json_node(body: &Node<'_>) -> String {
+    let hint = body.len_hint();
+    // A sixteenth over the hint covers the escapes of ordinary text.
+    let mut out = Vec::with_capacity(hint + hint / 16);
+    write_node(&mut out, body, Some(&TOP_LEVEL_KEY_ORDER));
+    String::from_utf8(out).expect("the persona writer writes UTF-8")
+}
+
+/// A string as JSON, escaped as serde_json escapes it, appended to `out`.
+fn write_json_string(out: &mut Vec<u8>, text: &str) {
+    serde_json::to_writer(&mut *out, text).expect("writing a string to memory never fails");
+}
+
+/// [`write_value`] appending to bytes. For the request's small JSON values.
+fn write_value_bytes(out: &mut Vec<u8>, value: &Value, order: Option<&[&str]>) {
+    let mut text = String::new();
+    write_value(&mut text, value, order);
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn write_node(out: &mut Vec<u8>, node: &Node<'_>, order: Option<&[&str]>) {
+    match node {
+        Node::Value(value) => write_value_bytes(out, value, order),
+        Node::Str(text) => write_json_string(out, text),
+        // Persona order applies inside JSON values too. The value's text is reordered as it is
+        // written, without parsing it into a tree; text the scanner can't read (none that a
+        // `Json` holds) is parsed and written as any other value.
+        Node::Json(json) => {
+            let start = out.len();
+            if write_json_text(out, json.text(), order).is_none() {
+                out.truncate(start);
+                write_value_bytes(out, &json.parse(), order);
+            }
+        }
+        Node::Array(items) => {
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_node(out, item, None);
+            }
+            out.push(b']');
+        }
+        Node::Object(members) => {
+            let order = order.unwrap_or(&NESTED_KEY_ORDER);
+            let mut sorted: Vec<&(std::borrow::Cow<'_, str>, Node<'_>)> = members.iter().collect();
+            sorted.sort_by(|(left, _), (right, _)| key_order(order, left, right));
+            out.push(b'{');
+            for (index, (key, value)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_json_string(out, key);
+                out.push(b':');
+                write_node(out, value, None);
+            }
+            out.push(b'}');
+        }
+    }
+}
+
+/// Writes the compact JSON `text` in the persona's key order, as [`write_value`] writes the value
+/// it holds: objects reordered, numbers in JavaScript's spelling, strings and keys as they are
+/// (both writers escape as serde_json does). `None`, with `out` partly written, when `text`
+/// isn't JSON this scanner reads.
+fn write_json_text(out: &mut Vec<u8>, text: &str, order: Option<&[&str]>) -> Option<()> {
+    match text.as_bytes().first()? {
+        b'{' => {
+            let order = order.unwrap_or(&NESTED_KEY_ORDER);
+            let mut members = top_level_members(text)?;
+            members.sort_by(|(left, _), (right, _)| {
+                key_order(order, &key_name(left), &key_name(right))
+            });
+            out.push(b'{');
+            for (index, (key, value)) in members.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(key.as_bytes());
+                out.push(b':');
+                write_json_text(out, value, None)?;
+            }
+            out.push(b'}');
+        }
+        b'[' => {
+            out.push(b'[');
+            for (index, item) in array_items(text)?.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_json_text(out, item, None)?;
+            }
+            out.push(b']');
+        }
+        b'"' | b't' | b'f' | b'n' => out.extend_from_slice(text.as_bytes()),
+        _ => {
+            let number: serde_json::Number = serde_json::from_str(text).ok()?;
+            write_value_bytes(out, &Value::Number(number), None);
+        }
+    }
+    Some(())
+}
+
+/// How two keys of an object compare in the persona's `order`: listed keys first, in their
+/// listed order, then the rest by byte order.
+fn key_order(order: &[&str], left: &str, right: &str) -> std::cmp::Ordering {
+    let rank = |key: &str| order.iter().position(|known| *known == key);
+    match (rank(left), rank(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
 fn write_value(out: &mut String, value: &Value, order: Option<&[&str]>) {
     match value {
         Value::Object(map) => write_object(out, map, order.unwrap_or(&NESTED_KEY_ORDER)),
@@ -565,13 +743,7 @@ fn write_value(out: &mut String, value: &Value, order: Option<&[&str]>) {
 
 fn write_object(out: &mut String, map: &Map<String, Value>, order: &[&str]) {
     let mut keys: Vec<&String> = map.keys().collect();
-    let rank = |key: &str| order.iter().position(|known| *known == key);
-    keys.sort_by(|left, right| match (rank(left), rank(right)) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.cmp(right),
-    });
+    keys.sort_by(|left, right| key_order(order, left, right));
     out.push('{');
     for (index, key) in keys.into_iter().enumerate() {
         if index > 0 {
@@ -582,109 +754,6 @@ fn write_object(out: &mut String, map: &Map<String, Value>, order: &[&str]) {
         write_value(out, &map[key], None);
     }
     out.push('}');
-}
-
-/// The members of a top-level JSON object as `(key, value)` text slices, the key with its
-/// quotes. `None` when `text` is not a single JSON object.
-fn top_level_members(text: &str) -> Option<Vec<(&str, &str)>> {
-    let bytes = text.as_bytes();
-    let mut at = skip_whitespace(bytes, 0);
-    if bytes.get(at) != Some(&b'{') {
-        return None;
-    }
-    at += 1;
-    let mut members = Vec::new();
-    loop {
-        at = skip_whitespace(bytes, at);
-        match bytes.get(at) {
-            Some(b'}') if members.is_empty() => {
-                at += 1;
-                break;
-            }
-            Some(b'"') => {}
-            _ => return None,
-        }
-        let key_end = string_end(bytes, at)?;
-        let key = &text[at..key_end];
-        at = skip_whitespace(bytes, key_end);
-        if bytes.get(at) != Some(&b':') {
-            return None;
-        }
-        at = skip_whitespace(bytes, at + 1);
-        let value_end = value_end(bytes, at)?;
-        members.push((key, &text[at..value_end]));
-        at = skip_whitespace(bytes, value_end);
-        match bytes.get(at) {
-            Some(b',') => at += 1,
-            Some(b'}') => {
-                at += 1;
-                break;
-            }
-            _ => return None,
-        }
-    }
-    (skip_whitespace(bytes, at) == bytes.len()).then_some(members)
-}
-
-fn skip_whitespace(bytes: &[u8], mut at: usize) -> usize {
-    while bytes
-        .get(at)
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-    {
-        at += 1;
-    }
-    at
-}
-
-/// The end (exclusive) of the JSON string starting at the quote at `at`.
-fn string_end(bytes: &[u8], at: usize) -> Option<usize> {
-    let mut index = at + 1;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => index += 2,
-            b'"' => return Some(index + 1),
-            _ => index += 1,
-        }
-    }
-    None
-}
-
-/// The end (exclusive) of the JSON value starting at `at`.
-fn value_end(bytes: &[u8], at: usize) -> Option<usize> {
-    match bytes.get(at)? {
-        b'"' => string_end(bytes, at),
-        b'{' | b'[' => {
-            let mut depth = 0usize;
-            let mut index = at;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'"' => {
-                        index = string_end(bytes, index)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(index + 1);
-                        }
-                    }
-                    _ => {}
-                }
-                index += 1;
-            }
-            None
-        }
-        _ => {
-            let length = bytes[at..]
-                .iter()
-                .take_while(|byte| {
-                    !matches!(byte, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
-                })
-                .count();
-            (length > 0).then_some(at + length)
-        }
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -700,3 +769,84 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[path = "claude_code_persona_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod node_writer_tests {
+    use super::*;
+    use broca_protocol::json::Json;
+    use serde_json::json;
+
+    /// JSON text reordered as it is written gives the bytes the tree writer gives the parsed
+    /// value, for objects whose keys the persona orders, nested arrays, escaped keys, and
+    /// numbers JavaScript spells differently.
+    #[test]
+    fn json_text_is_written_as_its_parsed_value_is() {
+        for value in [
+            json!({"command": "ls", "description": "list", "timeout": 1.0}),
+            json!({"type": "x", "text": "t", "a": [{"z": 2, "name": "n", "id": 3.5e2}, [], {}]}),
+            json!({"k\u{1}": 1, "k\"": 2, "role": "user", "content": [1e300, -0.0, 12, 1.25]}),
+            json!([{"input": {"b": null, "a": true}}, "s\\n", false]),
+            json!(7),
+            json!("only a string"),
+            json!({}),
+        ] {
+            let json = Json::from(&value);
+            for order in [None, Some(&TOP_LEVEL_KEY_ORDER[..])] {
+                let mut from_text = Vec::new();
+                write_json_text(&mut from_text, json.text(), order).unwrap();
+                let mut from_tree = String::new();
+                write_value(&mut from_tree, &value, order);
+                assert_eq!(String::from_utf8(from_text).unwrap(), from_tree, "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn signing_in_place_gives_the_bytes_signing_by_copy_gives() {
+        let body = format!(
+            "{{\"model\":\"claude-opus-4-8\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"system\":[{{\"type\":\"text\",\"text\":\"{}\"}}],\"max_tokens\":32000,\"stream\":true}}",
+            billing_header_text("2.1.302", "abc", "1a2b3", None, None, None)
+        );
+        let mut in_place = body.clone();
+        sign_body_in_place(&mut in_place);
+        assert_eq!(in_place, sign_body(&body));
+        assert_ne!(in_place, body, "the body carried a signature to replace");
+        let mut unsigned = String::from("{\"model\":\"m\"}");
+        sign_body_in_place(&mut unsigned);
+        assert_eq!(unsigned, sign_body("{\"model\":\"m\"}"));
+    }
+}
+
+#[cfg(test)]
+mod beta_view_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The betas chosen from a body without its messages are the betas chosen from the whole
+    /// body, for bodies that select each base list.
+    #[test]
+    fn betas_from_the_body_without_messages_match_the_whole_body() {
+        for body in [
+            json!({"model": "m", "messages": [{"role": "user", "content": "x"}], "system": [], "tools": [{"name": "t"}],
+                   "thinking": {"type": "adaptive"}, "context_management": {}, "output_config": {}, "diagnostics": {},
+                   "speed": "fast", "fallbacks": "default"}),
+            json!({"model": "m", "messages": [], "output_config": {"format": {"type": "json_schema"}}}),
+            json!({"model": "m", "messages": [{"role": "user", "content": [{"type": "text", "text": "y"}]}],
+                   "thinking": {"block_binding": {"prefix_mismatch_behavior": "error"}}}),
+        ] {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            let view = body_without_messages(&bytes);
+            assert!(view.get("messages").is_none());
+            for model in ["claude-opus-5-5", "claude-fable-5-1", "claude-haiku-5-5"] {
+                assert_eq!(
+                    select_betas(&view, model, &[]),
+                    select_betas(&body, model, &[])
+                );
+                assert_eq!(
+                    select_legacy_betas(&view, model, &[]),
+                    select_legacy_betas(&body, model, &[])
+                );
+            }
+        }
+    }
+}

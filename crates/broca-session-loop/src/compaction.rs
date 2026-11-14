@@ -1102,8 +1102,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             let view = finish(&opts, prompt.to_vec(), admission)?;
             seams
                 .provider
-                .try_render_request(&view)
-                .map(|bytes| broca_core::compaction::request_estimate(bytes.len(), &history).0)
+                .request_len(&view)
+                .map(|bytes| broca_core::compaction::request_estimate(bytes, &history).0)
                 .map_err(|error| error.message.clone())
         },
     )

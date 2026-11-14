@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use broca_protocol::wire_node::Node;
 use broca_protocol::{
     content::{
         AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
@@ -36,7 +37,9 @@ use broca_protocol::{
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Map, Value};
 
-use crate::families::{apply_generation_controls, merge_inclusive_input_tokens_with_writes};
+use crate::families::{
+    apply_generation_controls, merge_inclusive_input_tokens_with_writes, TextRun,
+};
 use crate::policy::{ReasoningPolicy, SystemPromptPolicy};
 use crate::spec::WireFamilyId;
 use crate::sse::SseDecoder;
@@ -59,7 +62,11 @@ impl WireFamily for OpenAiResponses {
     }
 
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        finish_platform_body(frozen, build_request_body(frozen, opts))
+        self.shape_with_provenance(frozen, opts, None)
+    }
+
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_platform_body(frozen, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -68,11 +75,18 @@ impl WireFamily for OpenAiResponses {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        finish_platform_body(
-            frozen,
-            build_prepared_request_body_with_media_and_provenance(frozen, opts, None, provenance)
-                .body,
-        )
+        with_platform_body(frozen, opts, None, provenance, |body| body.to_value())
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        with_platform_body(frozen, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
     }
 
     fn shape_with_media(
@@ -92,14 +106,30 @@ impl WireFamily for OpenAiResponses {
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
         let media = crate::media_render::MediaRender { frozen, payloads };
-        let body = build_prepared_request_body_with_media_and_provenance(
+        with_platform_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
+            |body| body.to_value(),
         )
-        .body;
-        finish_platform_body(frozen, body)
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        with_platform_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| body.canonical_bytes(),
+        )
     }
 
     fn endpoint(
@@ -150,54 +180,79 @@ impl WireFamily for OpenAiResponses {
     }
 }
 
-/// Build the base OpenAI `/responses` request body. The ChatGPT (codex) family
-/// starts from this base body too, then applies its backend-specific fields; platform
-/// cache hints are applied by `OpenAiResponses::shape` so the codex backend can keep
-/// its own run-session cache key as the single cache-key authority.
-pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-    build_prepared_request_body(frozen, opts).body
+/// A `/responses` request body in two parts: its `input` items, written from the messages as
+/// nodes that borrow their text, and every other member as one JSON object. The other members
+/// are small, so the platform and the ChatGPT backend shape them in place as JSON; the input,
+/// which holds the conversation, is never copied into a tree.
+pub(crate) struct ResponsesBody<'a> {
+    /// Every member but `input`, as a JSON object.
+    pub rest: Value,
+    pub input: Vec<Node<'a>>,
 }
 
-fn finish_platform_body(frozen: &FrozenRenderConfig, mut body: Value) -> Value {
-    apply_prompt_cache_hints(&mut body, frozen);
+impl<'a> ResponsesBody<'a> {
+    /// The whole body as one node.
+    pub fn into_node(self) -> Node<'a> {
+        let Value::Object(rest) = self.rest else {
+            unreachable!("the Responses body is built as an object");
+        };
+        let mut members: Vec<(Cow<'a, str>, Node<'a>)> = rest
+            .into_iter()
+            .map(|(key, value)| (Cow::Owned(key), Node::value(value)))
+            .collect();
+        members.push(("input".into(), Node::Array(self.input)));
+        Node::Object(members)
+    }
+}
+
+/// Hands `use_body` the platform request body: the shared body with the platform's cache
+/// hints.
+fn with_platform_body<R>(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
+    with_prepared_request_body(frozen, opts, media, provenance, |prepared, _| {
+        let mut body = prepared.body;
+        finish_platform_body(frozen, &mut body.rest);
+        use_body(&body.into_node())
+    })
+}
+
+fn finish_platform_body(frozen: &FrozenRenderConfig, body: &mut Value) {
+    apply_prompt_cache_hints(body, frozen);
     if let Some(cache_key) = &frozen.prompt_cache_key {
         body["prompt_cache_key"] = Value::String(cache_key.clone());
     }
-    body
 }
 
 /// The shared Responses body together with the inputs it was rendered from, so the ChatGPT
 /// wrapper can finish the body without preparing the request or planning effort a second
 /// time: each of those clones the prompt or parses every episode's frozen config.
 pub(crate) struct PreparedRequestBody<'a> {
-    pub body: Value,
+    pub body: ResponsesBody<'a>,
     /// The request as structured output prepares it.
-    pub prepared: Cow<'a, CallOptions>,
+    pub prepared: &'a CallOptions,
     /// The ChatGPT effort anchor planned over `prepared`; `None` when no plan applies.
     pub effort_anchor: Option<String>,
 }
 
-pub(crate) fn build_prepared_request_body<'a>(
+/// Hands `use_body` the shared Responses body. When the caller asks for `provenance` (where
+/// each rendered input item came from), it is filled in while the body is built and handed to
+/// `use_body` complete. The body borrows the prompt's content, and the request prepared from
+/// `opts` lives only in this call, so the body is used here rather than returned.
+pub(crate) fn with_prepared_request_body<R>(
     frozen: &FrozenRenderConfig,
-    opts: &'a CallOptions,
-) -> PreparedRequestBody<'a> {
-    build_prepared_request_body_with_media(frozen, opts, None)
-}
-
-pub(crate) fn build_prepared_request_body_with_media<'a>(
-    frozen: &FrozenRenderConfig,
-    opts: &'a CallOptions,
+    opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> PreparedRequestBody<'a> {
-    build_prepared_request_body_with_media_and_provenance(frozen, opts, media, None)
-}
-
-pub(crate) fn build_prepared_request_body_with_media_and_provenance<'a>(
-    frozen: &FrozenRenderConfig,
-    opts: &'a CallOptions,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> PreparedRequestBody<'a> {
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    use_body: impl FnOnce(
+        PreparedRequestBody<'_>,
+        Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> R,
+) -> R {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -208,29 +263,31 @@ pub(crate) fn build_prepared_request_body_with_media_and_provenance<'a>(
             Some((anchor, updates)) => (Some(anchor), updates),
             None => (None, Vec::new()),
         };
-    let body = render_prepared_body_with_provenance(
+    let view = crate::families::compaction_view(frozen.family_id, prepared.as_ref());
+    let body = render_prepared_body(
         frozen,
-        prepared.as_ref(),
+        view.as_ref(),
         &updates,
         media,
-        provenance,
+        provenance.as_deref_mut(),
     );
-    PreparedRequestBody {
-        body,
-        prepared,
-        effort_anchor,
-    }
+    use_body(
+        PreparedRequestBody {
+            body,
+            prepared: prepared.as_ref(),
+            effort_anchor,
+        },
+        provenance,
+    )
 }
 
-fn render_prepared_body_with_provenance(
+fn render_prepared_body<'a>(
     frozen: &FrozenRenderConfig,
-    prepared: &CallOptions,
+    opts: &'a CallOptions,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Value {
-    let view = crate::families::compaction_view(frozen.family_id, prepared);
-    let opts = view.as_ref();
+) -> ResponsesBody<'a> {
     let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
         &opts.tools,
         &opts.prompt,
@@ -254,10 +311,8 @@ fn render_prepared_body_with_provenance(
     let mut body = json!({
         "model": frozen.wire_model_id,
         "stream": true,
-        "input": input,
     });
     body[frozen.token_limit_field.key()] = json!(frozen.max_output_tokens);
-
     if let Some(instructions) = instructions_from_policy(&opts.prompt, frozen.system_prompt.clone())
     {
         body["instructions"] = Value::String(instructions);
@@ -323,7 +378,7 @@ fn render_prepared_body_with_provenance(
             body[key] = value.clone();
         }
     }
-    body
+    ResponsesBody { rest: body, input }
 }
 
 fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
@@ -352,7 +407,7 @@ fn instructions_from_policy(prompt: &[Message], policy: SystemPromptPolicy) -> O
     let mut parts = Vec::new();
     for m in prompt {
         if m.role == Role::System && !m.turn_system {
-            let t = text_content(&m.content);
+            let t = text_string(&m.content);
             if !t.is_empty() {
                 parts.push(t);
             }
@@ -387,7 +442,7 @@ pub(crate) fn completed_output_as_input(
     let mut message = Message::new(Role::Assistant, assistant.content.clone());
     message.origin = target_model.cloned();
     let stateless = frozen.static_options.get("store") == Some(&Value::Bool(false));
-    let mut items = convert_assistant_items(
+    let mut items: Vec<Value> = convert_assistant_items(
         &message,
         name_map,
         &ReplayPolicy {
@@ -396,22 +451,25 @@ pub(crate) fn completed_output_as_input(
             provider_text_state: frozen.provider_text_state,
             stateless,
         },
-    );
+    )
+    .iter()
+    .map(Node::to_value)
+    .collect();
     if frozen.chatgpt_wire.is_some() {
         crate::chatgpt_wire::typed_message_content(&mut items);
     }
     items
 }
 
-fn convert_input_items_with_provenance(
-    prompt: &[Message],
+fn convert_input_items_with_provenance<'a>(
+    prompt: &'a [Message],
     system_policy: SystemPromptPolicy,
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     replay: &ReplayPolicy<'_>,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     let skip_system = matches!(system_policy, SystemPromptPolicy::InstructionsField);
     let mut out = Vec::new();
     let mut updates = updates.iter().peekable();
@@ -462,13 +520,22 @@ fn convert_input_items_with_provenance(
 }
 
 fn append_effort_update(
-    out: &mut Vec<Value>,
+    out: &mut Vec<Node<'_>>,
     update: &super::openai_responses_chatgpt::EffortUpdate,
     user_follows: bool,
 ) {
-    out.push(json!({"type": "configuration_update", "reasoning": {"effort": update.effort}}));
+    out.push(Node::value(
+        json!({"type": "configuration_update", "reasoning": {"effort": update.effort}}),
+    ));
     if update.synthetic_user || !user_follows {
-        out.push(json!({"type": "message", "role": "user", "content": "Continue with the updated reasoning effort."}));
+        out.push(Node::object([
+            ("type", Node::str("message")),
+            ("role", Node::str("user")),
+            (
+                "content",
+                Node::str("Continue with the updated reasoning effort."),
+            ),
+        ]));
     }
 }
 
@@ -511,23 +578,26 @@ fn reasoning_request_item(raw_response_item: &str, stateless: bool) -> Option<Va
 }
 
 // Preserve user block boundaries as input_text parts, retaining scalars for single text blocks.
-fn user_text_content(
-    blocks: &[ContentBlock],
+fn user_text_content<'a>(
+    blocks: &'a [ContentBlock],
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
+) -> Node<'a> {
+    let input_text = |text: &'a str| {
+        Node::object([("type", Node::str("input_text")), ("text", Node::str(text))])
+    };
     if blocks
         .iter()
         .any(|block| matches!(block, ContentBlock::Media(_)))
     {
-        return Value::Array(
+        return Node::Array(
             blocks
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                        Some(json!({"type":"input_text", "text":text}))
+                        Some(input_text(text))
                     }
                     ContentBlock::Media(reference) => {
-                        Some(responses_media_block(reference, media, false))
+                        Some(Node::value(responses_media_block(reference, media, false)))
                     }
                     ContentBlock::Reasoning { .. }
                     | ContentBlock::RedactedReasoning { .. }
@@ -539,7 +609,7 @@ fn user_text_content(
                 .collect(),
         );
     }
-    let texts: Vec<&str> = blocks
+    let texts: Vec<&'a str> = blocks
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
@@ -549,26 +619,27 @@ fn user_text_content(
         })
         .collect();
     if texts.len() > 1 {
-        Value::Array(
-            texts
-                .into_iter()
-                .map(|text| json!({"type": "input_text", "text": text}))
-                .collect(),
-        )
+        Node::Array(texts.into_iter().map(input_text).collect())
     } else {
-        Value::String(text_content(blocks))
+        text_content(blocks)
     }
 }
 
-fn convert_easy_message(
-    m: &Message,
+fn convert_easy_message<'a>(
+    m: &'a Message,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
+) -> Node<'a> {
     if m.turn_system {
-        return json!({
-            "role": "developer",
-            "content": [{"type": "input_text", "text": crate::turn_system::text(m)}],
-        });
+        return Node::object([
+            ("role", Node::str("developer")),
+            (
+                "content",
+                Node::Array(vec![Node::object([
+                    ("type", Node::str("input_text")),
+                    ("text", Node::string(crate::turn_system::text(m))),
+                ])]),
+            ),
+        ]);
     }
     let role = match m.role {
         Role::System => "system",
@@ -576,31 +647,34 @@ fn convert_easy_message(
         Role::Assistant => "assistant",
         Role::Tool => "user",
     };
-    json!({
-        "type": "message",
-        "role": role,
-        "content": if m.role == Role::User {
-            user_text_content(&m.content, media)
-        } else {
-            Value::String(text_content(&m.content))
-        },
-    })
+    Node::object([
+        ("type", Node::str("message")),
+        ("role", Node::str(role)),
+        (
+            "content",
+            if m.role == Role::User {
+                user_text_content(&m.content, media)
+            } else {
+                text_content(&m.content)
+            },
+        ),
+    ])
 }
 
-fn convert_assistant_items(
-    message: &Message,
+fn convert_assistant_items<'a>(
+    message: &'a Message,
     name_map: &crate::tool_name_alias::ToolNameMap,
     replay: &ReplayPolicy<'_>,
-) -> Vec<Value> {
-    fn flush_text(out: &mut Vec<Value>, text: &mut String) {
+) -> Vec<Node<'a>> {
+    fn flush_text<'a>(out: &mut Vec<Node<'a>>, text: &mut TextRun<'a>) {
         if text.is_empty() {
             return;
         }
-        out.push(json!({
-            "type": "message",
-            "role": "assistant",
-            "content": std::mem::take(text),
-        }));
+        out.push(Node::object([
+            ("type", Node::str("message")),
+            ("role", Node::str("assistant")),
+            ("content", text.take()),
+        ]));
     }
 
     let echo_safe = crate::families::signed_reasoning_is_echo_safe(
@@ -608,41 +682,47 @@ fn convert_assistant_items(
         replay.target_model,
     );
     let mut out = Vec::new();
-    let mut text = String::new();
+    let mut text = TextRun::default();
     for block in &message.content {
         match block {
             ContentBlock::Media(media) => {
-                text.push_str(&broca_protocol::content::media_not_shown_marker(
+                text.push(Cow::Owned(broca_protocol::content::media_not_shown_marker(
                     media,
                     broca_protocol::MediaMarkerReason::Carrier,
-                ))
+                )))
             }
-            ContentBlock::Text { text: part } => text.push_str(part),
+            ContentBlock::Text { text: part } => text.push(Cow::Borrowed(part)),
             ContentBlock::TextWithState {
                 text: part,
                 provider_state,
             } => {
                 if replay.provider_text_state {
                     flush_text(&mut out, &mut text);
-                    let mut item = json!({"type":"message", "role":"assistant", "content":part});
+                    let mut item = Node::object([
+                        ("type", Node::str("message")),
+                        ("role", Node::str("assistant")),
+                        ("content", Node::str(part)),
+                    ]);
+                    let mut has_phase = false;
                     if super::text_state_is_echo_safe(
                         message,
                         replay.target_model,
                         provider_state.format,
                         replay.target_family,
                     ) {
-                        if let Ok(state) = serde_json::from_str::<Value>(&provider_state.data) {
-                            if let Some(phase) = state.get("phase") {
-                                item["phase"] = phase.clone();
+                        if let Ok(mut state) = serde_json::from_str::<Value>(&provider_state.data) {
+                            if let Some(phase) = state.get_mut("phase") {
+                                item.insert("phase", Node::value(phase.take()));
+                                has_phase = true;
                             }
                         }
                     }
                     // Each block is one output item; never merge adjacent items with equal phases.
-                    if !part.is_empty() || item.get("phase").is_some() {
+                    if !part.is_empty() || has_phase {
                         out.push(item);
                     }
                 } else {
-                    text.push_str(part);
+                    text.push(Cow::Borrowed(part));
                 }
             }
             ContentBlock::RedactedReasoning {
@@ -653,18 +733,22 @@ fn convert_assistant_items(
             {
                 flush_text(&mut out, &mut text);
                 if let Some(item) = reasoning_request_item(data, replay.stateless) {
-                    out.push(item);
+                    out.push(Node::value(item));
                 }
             }
             ContentBlock::ToolCall(call) => {
                 flush_text(&mut out, &mut text);
-                out.push(json!({
-                    "type": "function_call",
-                    "call_id": call.tool_call_id.0,
-                    "name": name_map.wire_name(&call.tool_name),
-                    "arguments": serde_json::to_string(&call.input)
-                        .unwrap_or_else(|_| "{}".into()),
-                }));
+                // The arguments are the input's JSON text: the text `Json` holds is what
+                // serializing the input writes.
+                out.push(Node::object([
+                    ("type", Node::str("function_call")),
+                    ("call_id", Node::str(&call.tool_call_id.0)),
+                    (
+                        "name",
+                        Node::string(name_map.wire_name(&call.tool_name).to_owned()),
+                    ),
+                    ("arguments", Node::str(call.input.text())),
+                ]));
             }
             ContentBlock::Reasoning { .. }
             | ContentBlock::RedactedReasoning { .. }
@@ -677,43 +761,47 @@ fn convert_assistant_items(
     out
 }
 
-fn convert_tool_output_items(
-    m: &Message,
+fn convert_tool_output_items<'a>(
+    m: &'a Message,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     let mut out = Vec::new();
     for b in &m.content {
         if let ContentBlock::ToolResult(tr) = b {
-            out.push(json!({
-                "type": "function_call_output",
-                "call_id": tr.tool_call_id.0,
-                "output": tool_output_content(&tr.output, media),
-            }));
+            out.push(Node::object([
+                ("type", Node::str("function_call_output")),
+                ("call_id", Node::str(&tr.tool_call_id.0)),
+                ("output", tool_output_content(&tr.output, media)),
+            ]));
         }
     }
     out
 }
 
-fn tool_output_content(
-    out: &ToolOutput,
+fn tool_output_content<'a>(
+    out: &'a ToolOutput,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
-    if let (ToolOutput::Parts { parts }, Some(media)) = (out, media) {
-        return Value::Array(
+) -> Node<'a> {
+    match (out, media) {
+        (ToolOutput::Parts { parts }, Some(media)) => Node::Array(
             parts
                 .iter()
                 .map(|part| match part {
                     broca_protocol::ToolOutputPart::Text { text } => {
-                        super::openai_media::Grammar::Responses.text(text)
+                        Node::value(super::openai_media::Grammar::Responses.text(text))
                     }
                     broca_protocol::ToolOutputPart::Media { media: reference } => {
-                        responses_media_block(reference, Some(media), true)
+                        Node::value(responses_media_block(reference, Some(media), true))
                     }
                 })
                 .collect(),
-        );
+        ),
+        // The two outputs that carry their text as it is: written from the message, not
+        // copied.
+        (ToolOutput::Text { text }, _) => Node::str(text),
+        (ToolOutput::Json { value }, _) => Node::str(value.text()),
+        _ => Node::string(tool_output_text(out)),
     }
-    Value::String(tool_output_text(out))
 }
 
 fn responses_media_block(
@@ -732,7 +820,8 @@ fn responses_media_block(
         .unwrap_or_else(|reason| grammar.marker(reference, reason))
 }
 
-fn text_content(blocks: &[ContentBlock]) -> String {
+/// The text of `blocks`' text blocks, joined into a string.
+fn text_string(blocks: &[ContentBlock]) -> String {
     let mut s = String::new();
     for b in blocks {
         if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
@@ -740,6 +829,20 @@ fn text_content(blocks: &[ContentBlock]) -> String {
         }
     }
     s
+}
+
+/// The text of `blocks`' text blocks, joined: borrowed when a single block holds it all.
+fn text_content(blocks: &[ContentBlock]) -> Node<'_> {
+    let mut run = TextRun::default();
+    for b in blocks {
+        if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
+            run.push(Cow::Borrowed(text));
+        }
+    }
+    if run.is_empty() {
+        return Node::str("");
+    }
+    run.take()
 }
 
 fn convert_tool(

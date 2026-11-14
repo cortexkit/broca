@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 
+use broca_protocol::wire_node::Node;
 use broca_protocol::{
     content::{
         AssistantMessage, ContentBlock, FinishReason, Message, Role, ToolCall, ToolOutput,
@@ -55,7 +56,13 @@ pub struct Gemini;
 
 impl WireFamily for Gemini {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        build_request_body(frozen, opts)
+        self.shape_with_provenance(frozen, opts, None)
+    }
+
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_request_body(frozen, opts, None, None, |body| {
+            body.into_node().canonical_len()
+        })
     }
 
     fn shape_with_provenance(
@@ -64,7 +71,20 @@ impl WireFamily for Gemini {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+        with_request_body(frozen, opts, None, provenance, |body| {
+            body.into_node().to_value()
+        })
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        with_request_body(frozen, opts, None, provenance, |body| {
+            body.into_node().canonical_bytes()
+        })
     }
 
     fn shape_with_media(
@@ -84,11 +104,29 @@ impl WireFamily for Gemini {
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
         let media = MediaRender { frozen, payloads };
-        build_request_body_with_media_and_provenance(
+        with_request_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
+            |body| body.into_node().to_value(),
+        )
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let media = MediaRender { frozen, payloads };
+        with_request_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| body.into_node().canonical_bytes(),
         )
     }
 
@@ -139,28 +177,47 @@ impl WireFamily for Gemini {
     }
 }
 
-/// Build the Gemini `generateContent` request body as a JSON value. Shared with the
-/// Google Antigravity / Code-Assist family, which nests this exact body inside its
-/// `cloudcode-pa` envelope's `request` field — so the inner body is byte-identical to a
-/// direct Gemini request by construction.
-pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-    build_request_body_with_media(frozen, opts, None)
+/// A Gemini `generateContent` request body in two parts: the members written from the
+/// prompt's content (its `contents` and system instruction) as nodes that borrow their text,
+/// and every other member as one JSON object. The other members are small, so this family and
+/// Code Assist shape them in place as JSON.
+pub(crate) struct GeminiBody<'a> {
+    /// Every member but `contents` and `systemInstruction`, as a JSON object.
+    pub rest: Value,
+    contents: Vec<Node<'a>>,
+    system_instruction: Option<Node<'a>>,
 }
 
-pub(crate) fn build_request_body_with_media(
-    frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
-    media: Option<&MediaRender<'_>>,
-) -> Value {
-    build_request_body_with_media_and_provenance(frozen, opts, media, None)
+impl<'a> GeminiBody<'a> {
+    /// The whole body as one node.
+    pub fn into_node(self) -> Node<'a> {
+        let Value::Object(rest) = self.rest else {
+            unreachable!("the Gemini body is built as an object");
+        };
+        let mut members: Vec<(std::borrow::Cow<'a, str>, Node<'a>)> = rest
+            .into_iter()
+            .map(|(key, value)| (std::borrow::Cow::Owned(key), Node::value(value)))
+            .collect();
+        members.push(("contents".into(), Node::Array(self.contents)));
+        if let Some(instruction) = self.system_instruction {
+            members.push(("systemInstruction".into(), instruction));
+        }
+        Node::Object(members)
+    }
 }
 
-pub(crate) fn build_request_body_with_media_and_provenance(
+/// Hands `use_body` the Gemini `generateContent` request body. Shared with the Google
+/// Antigravity / Code-Assist family, which nests this exact body inside its `cloudcode-pa`
+/// envelope's `request` field — so the inner body is byte-identical to a direct Gemini request
+/// by construction. The body borrows the prompt's content, and the options the step prepares
+/// from `opts` live in this call, so the body is used here.
+pub(crate) fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     media: Option<&MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Value {
+    use_body: impl FnOnce(GeminiBody<'_>) -> R,
+) -> R {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let turn_system = crate::turn_system::prepare(frozen, opts);
@@ -183,12 +240,13 @@ pub(crate) fn build_request_body_with_media_and_provenance(
         provenance,
     );
 
-    let mut body = json!({ "contents": contents });
+    let mut body = json!({});
 
+    let mut system_instruction = None;
     if let SystemPromptPolicy::SystemInstructionField = frozen.system_prompt {
         let parts = system_instruction_parts(&opts.prompt);
         if !parts.is_empty() {
-            body["systemInstruction"] = json!({ "parts": parts });
+            system_instruction = Some(Node::object([("parts", Node::Array(parts))]));
         }
     }
 
@@ -247,7 +305,11 @@ pub(crate) fn build_request_body_with_media_and_provenance(
         &mut body,
         name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
     );
-    body
+    use_body(GeminiBody {
+        rest: body,
+        contents,
+        system_instruction,
+    })
 }
 
 fn merge_static_options(body: &mut Value, static_options: &Value) {
@@ -265,7 +327,7 @@ fn merge_static_options(body: &mut Value, static_options: &Value) {
     }
 }
 
-fn system_instruction_parts(prompt: &[Message]) -> Vec<Value> {
+fn system_instruction_parts(prompt: &[Message]) -> Vec<Node<'_>> {
     let mut out = Vec::new();
     for m in prompt {
         if m.role != Role::System {
@@ -276,7 +338,7 @@ fn system_instruction_parts(prompt: &[Message]) -> Vec<Value> {
             // against foreign input; the owned normalizers never emit empty text.
             if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
                 if !text.is_empty() {
-                    out.push(json!({ "text": text }));
+                    out.push(Node::object([("text", Node::str(text))]));
                 }
             }
         }
@@ -293,17 +355,20 @@ fn convert_contents(
     media: Option<&MediaRender<'_>>,
 ) -> Vec<Value> {
     convert_contents_with_provenance(prompt, frozen, target_model, name_map, media, None)
+        .iter()
+        .map(Node::to_value)
+        .collect()
 }
 
-fn convert_contents_with_provenance(
-    prompt: &[Message],
+fn convert_contents_with_provenance<'a>(
+    prompt: &'a [Message],
     frozen: &FrozenRenderConfig,
     target_model: Option<&ModelHandle>,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
+) -> Vec<Node<'a>> {
+    let mut out: Vec<Node<'a>> = Vec::new();
     let non_system: Vec<&Message> = prompt.iter().filter(|m| m.role != Role::System).collect();
     let mut current_tool_call_names = BTreeMap::new();
 
@@ -319,10 +384,10 @@ fn convert_contents_with_provenance(
                     if let Some(sink) = provenance.as_deref_mut() {
                         sink.record_message(out.len(), m.ordinal);
                     }
-                    out.push(json!({
-                        "role": "user",
-                        "parts": parts,
-                    }));
+                    out.push(Node::object([
+                        ("role", Node::str("user")),
+                        ("parts", Node::Array(parts)),
+                    ]));
                 }
                 i += 1;
             }
@@ -350,15 +415,15 @@ fn convert_contents_with_provenance(
                     if let Some(sink) = provenance.as_deref_mut() {
                         sink.record_message(out.len(), m.ordinal);
                     }
-                    out.push(json!({
-                        "role": "model",
-                        "parts": parts,
-                    }));
+                    out.push(Node::object([
+                        ("role", Node::str("model")),
+                        ("parts", Node::Array(parts)),
+                    ]));
                 }
                 i += 1;
             }
             Role::Tool => {
-                let mut parts: Vec<Value> = Vec::new();
+                let mut parts: Vec<Node<'a>> = Vec::new();
                 while i < non_system.len() && non_system[i].role == Role::Tool {
                     let start = provenance.as_ref().map(|_| parts.len());
                     parts.extend(convert_tool_result_parts(
@@ -373,7 +438,10 @@ fn convert_contents_with_provenance(
                 }
                 current_tool_call_names.clear();
                 if !parts.is_empty() {
-                    out.push(json!({ "role": "user", "parts": parts }));
+                    out.push(Node::object([
+                        ("role", Node::str("user")),
+                        ("parts", Node::Array(parts)),
+                    ]));
                 }
             }
             Role::System => {
@@ -385,15 +453,17 @@ fn convert_contents_with_provenance(
     out
 }
 
-fn convert_user_parts(
-    blocks: &[ContentBlock],
+fn convert_user_parts<'a>(
+    blocks: &'a [ContentBlock],
     id_to_name: &BTreeMap<String, String>,
     media: Option<&MediaRender<'_>>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Media(reference) => Some(media_part(reference, false, media)),
+            ContentBlock::Media(reference) => {
+                Some(Node::value(media_part(reference, false, media)))
+            }
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
                 if text.is_empty() =>
@@ -401,7 +471,7 @@ fn convert_user_parts(
                 None
             }
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                Some(json!({ "text": text }))
+                Some(text_part(text))
             }
             ContentBlock::ToolResult(result) => {
                 Some(convert_tool_result_part(result, id_to_name, media))
@@ -411,38 +481,51 @@ fn convert_user_parts(
         .collect()
 }
 
-fn convert_model_parts(
-    blocks: &[ContentBlock],
+/// A `{"text": ...}` part.
+fn text_part(text: &str) -> Node<'_> {
+    Node::object([("text", Node::str(text))])
+}
+
+fn convert_model_parts<'a>(
+    blocks: &'a [ContentBlock],
     tool_id: ToolIdPolicy,
     signed_calls_are_echo_safe: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     text_state_is_echo_safe: impl Fn(broca_protocol::content::TextProviderFormat) -> bool,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     use crate::reasoning::{decide_reasoning, ReasoningDecision, SerializerProfile};
 
-    let mut parts: Vec<Value> = Vec::new();
+    let mut parts: Vec<Node<'a>> = Vec::new();
     let mut call_index: u32 = 0;
     for (idx, b) in blocks.iter().enumerate() {
         match b {
-            ContentBlock::Media(media) => parts.push(json!({"text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
+            ContentBlock::Media(media) => parts.push(Node::object([(
+                "text",
+                Node::string(broca_protocol::content::media_not_shown_marker(
+                    media,
+                    broca_protocol::MediaMarkerReason::Carrier,
+                )),
+            )])),
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } if text.is_empty() => {}
-            ContentBlock::Text { text } => parts.push(json!({ "text": text })),
+            ContentBlock::Text { text } => parts.push(text_part(text)),
             ContentBlock::TextWithState {
                 text,
                 provider_state,
             } => {
-                let mut part = json!({"text":text});
+                let mut part = text_part(text);
+                let mut signed = false;
                 if text_state_is_echo_safe(provider_state.format) {
                     if let Ok(state) = serde_json::from_str::<Value>(&provider_state.data) {
                         if let Some(signature) =
                             state.get("thoughtSignature").and_then(Value::as_str)
                         {
-                            part["thoughtSignature"] = json!(signature);
+                            part.insert("thoughtSignature", Node::string(signature.to_owned()));
+                            signed = true;
                         }
                     }
                 }
-                if !text.is_empty() || part.get("thoughtSignature").is_some() {
+                if !text.is_empty() || signed {
                     parts.push(part);
                 }
             }
@@ -456,11 +539,11 @@ fn convert_model_parts(
                 ) == ReasoningDecision::Keep;
                 if keep {
                     if let Some(signature) = signature {
-                        parts.push(json!({
-                            "thought": true,
-                            "text": text,
-                            "thoughtSignature": signature,
-                        }));
+                        parts.push(Node::object([
+                            ("thought", Node::value(Value::Bool(true))),
+                            ("text", Node::str(text)),
+                            ("thoughtSignature", Node::str(signature)),
+                        ]));
                     }
                 }
             }
@@ -477,26 +560,29 @@ fn convert_model_parts(
                         SerializerProfile::SourceOrder,
                     ) == ReasoningDecision::Keep;
                 if keep && !data.is_empty() {
-                    parts.push(json!({
-                        "thought": true,
-                        "thoughtSignature": data,
-                    }));
+                    parts.push(Node::object([
+                        ("thought", Node::value(Value::Bool(true))),
+                        ("thoughtSignature", Node::str(data)),
+                    ]));
                 }
             }
             ContentBlock::ToolCall(tc) => {
                 let wire_id = wire_tool_call_id(&tc.tool_call_id, tool_id, call_index);
                 call_index = call_index.saturating_add(1);
-                let mut fc = json!({
-                    "name": name_map.wire_name(&tc.tool_name),
-                    "args": tc.input,
-                });
+                let mut fc = Node::object([
+                    (
+                        "name",
+                        Node::string(name_map.wire_name(&tc.tool_name).to_owned()),
+                    ),
+                    ("args", Node::Json(&tc.input)),
+                ]);
                 if tool_id == ToolIdPolicy::Passthrough {
-                    fc["id"] = json!(wire_id);
+                    fc.insert("id", Node::string(wire_id));
                 }
-                let mut part = json!({ "functionCall": fc });
+                let mut part = Node::object([("functionCall", fc)]);
                 if signed_calls_are_echo_safe {
                     if let Some(signature) = &tc.thought_signature {
-                        part["thoughtSignature"] = json!(signature);
+                        part.insert("thoughtSignature", Node::str(signature));
                     }
                 }
                 parts.push(part);
@@ -533,11 +619,11 @@ fn tool_call_names_in_message(
         .collect()
 }
 
-fn convert_tool_result_parts(
-    m: &Message,
+fn convert_tool_result_parts<'a>(
+    m: &'a Message,
     id_to_name: &BTreeMap<String, String>,
     media: Option<&MediaRender<'_>>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     m.content
         .iter()
         .filter_map(|block| match block {
@@ -549,21 +635,15 @@ fn convert_tool_result_parts(
         .collect()
 }
 
-fn convert_tool_result_part(
-    result: &ToolResult,
+fn convert_tool_result_part<'a>(
+    result: &'a ToolResult,
     id_to_name: &BTreeMap<String, String>,
     media: Option<&MediaRender<'_>>,
-) -> Value {
+) -> Node<'a> {
     let name = id_to_name
         .get(&result.tool_call_id.0)
         .cloned()
         .unwrap_or_default();
-    let mut part = json!({
-        "functionResponse": {
-            "name": name,
-            "response": function_response_payload(&result.output),
-        }
-    });
     if let (Some(media), ToolOutput::Parts { parts }) = (media, &result.output) {
         let mut text = Vec::new();
         let mut inline = Vec::new();
@@ -583,12 +663,22 @@ fn convert_tool_result_part(
         // FunctionResponsePart accepts inlineData, not text. Keep ordered text and fallback
         // markers in the response object, and native media in the sibling parts array.
         let key = if result.is_error { "error" } else { "result" };
-        part["functionResponse"]["response"] = json!({key: text.join("\n")});
+        let mut function_response = json!({
+            "name": name,
+            "response": {key: text.join("\n")},
+        });
         if !inline.is_empty() {
-            part["functionResponse"]["parts"] = json!(inline);
+            function_response["parts"] = json!(inline);
         }
+        return Node::value(json!({ "functionResponse": function_response }));
     }
-    part
+    Node::object([(
+        "functionResponse",
+        Node::object([
+            ("name", Node::string(name)),
+            ("response", function_response_payload(&result.output)),
+        ]),
+    )])
 }
 
 fn media_part(reference: &MediaRef, tool: bool, media: Option<&MediaRender<'_>>) -> Value {
@@ -610,17 +700,19 @@ fn media_part(reference: &MediaRef, tool: bool, media: Option<&MediaRender<'_>>)
     }
 }
 
-fn function_response_payload(out: &ToolOutput) -> Value {
-    match out {
+/// A tool output as `FunctionResponse.response`. Text and JSON are written from the message,
+/// not copied.
+fn function_response_payload(out: &ToolOutput) -> Node<'_> {
+    Node::value(match out {
         ToolOutput::Parts { parts } => {
             json!({"result": broca_protocol::content::media_parts_text(parts, broca_protocol::MediaMarkerReason::Carrier)})
         }
-        ToolOutput::Text { text } => json!({ "result": text }),
+        ToolOutput::Text { text } => return Node::object([("result", Node::str(text))]),
         // Gemini models FunctionResponse.response as a protobuf Struct, so it must be a JSON
         // object. Keep objects unchanged and give every other JSON value the same `result`
         // envelope used for text output.
-        ToolOutput::Json { value } if value.is_object() => value.clone().parse(),
-        ToolOutput::Json { value } => json!({ "result": value }),
+        ToolOutput::Json { value } if value.is_object() => return Node::Json(value),
+        ToolOutput::Json { value } => return Node::object([("result", Node::Json(value))]),
         ToolOutput::Denied { reason } => json!({ "error": format!("denied: {reason}") }),
         ToolOutput::Error {
             message,
@@ -639,7 +731,7 @@ fn function_response_payload(out: &ToolOutput) -> Value {
                 retry.as_deref(),
             )
         }),
-    }
+    })
 }
 
 fn convert_tool(t: &Tool, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {
@@ -1452,7 +1544,13 @@ mod tests {
         ];
 
         assert_eq!(
-            serde_json::to_vec(&convert_user_parts(&blocks, &BTreeMap::new(), None)).unwrap(),
+            serde_json::to_vec(
+                &convert_user_parts(&blocks, &BTreeMap::new(), None)
+                    .iter()
+                    .map(Node::to_value)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
             serde_json::to_vec(&legacy_convert_user_parts(&blocks)).unwrap()
         );
     }

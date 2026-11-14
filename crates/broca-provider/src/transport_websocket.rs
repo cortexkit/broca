@@ -1171,26 +1171,37 @@ async fn drive_socket(
         .lock()
         .unwrap()
         .map(|completed| now.saturating_duration_since(completed));
-    let logical: Value = serde_json::from_slice(&request.body).map_err(|_| {
+    // The socket message is written from the rendered body's text: its members are copied as
+    // they are, and only `client_metadata` is parsed to add to it. Parsing the whole body into a
+    // tree would cost several times the request.
+    let invalid = || {
         AttemptFailure::decode(
             transport_error("invalid rendered Responses socket request"),
             AttemptOutcome::DecodeError,
         )
-    })?;
-    let mut payload = if request.codex_wire {
-        Value::Object(
-            logical
-                .as_object()
-                .unwrap()
-                .iter()
-                .filter(|(key, _)| !matches!(key.as_str(), "input" | "previous_response_id"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        )
-    } else {
-        logical.clone()
     };
+    let body_text = std::str::from_utf8(&request.body).map_err(|_| invalid())?;
+    let members = crate::json_text::top_level_members(body_text).ok_or_else(invalid)?;
+    let input = crate::json_text::member(&members, "input");
+    let mut payload: Vec<(Cow<'_, str>, Cow<'_, str>)> = members
+        .iter()
+        .map(|(key, value)| (crate::json_text::key_name(key), Cow::Borrowed(*value)))
+        .filter(|(key, _)| {
+            !request.codex_wire || !matches!(key.as_ref(), "input" | "previous_response_id")
+        })
+        .collect();
+    fn set<'t>(
+        payload: &mut Vec<(Cow<'t, str>, Cow<'t, str>)>,
+        name: &'static str,
+        value: Cow<'t, str>,
+    ) {
+        match payload.iter_mut().find(|(key, _)| key == name) {
+            Some((_, slot)) => *slot = value,
+            None => payload.push((Cow::Borrowed(name), value)),
+        }
+    }
     let mut continuation = false;
+    let mut suffix_item_count = 0;
     let mut full_input_reason = session
         .state
         .lock()
@@ -1202,34 +1213,73 @@ async fn drive_socket(
         // A completion receipt is one-shot, including when compatibility fails. Never
         // fall back to an older successful response after starting another stream.
         if let Some(previous) = socket.continuation.lock().unwrap().take() {
-            match previous.suffix_start(&logical) {
+            match previous.suffix_start(body_text) {
                 Ok(start) => {
-                    payload["input"] =
-                        Value::Array(logical["input"].as_array().unwrap()[start..].to_vec());
-                    payload["previous_response_id"] = Value::String(previous.response_id);
+                    // `suffix_start` read the input as an array to answer.
+                    let items = input
+                        .and_then(crate::json_text::array_items)
+                        .expect("the continued input is an array");
+                    suffix_item_count = (items.len() - start) as u64;
+                    set(
+                        &mut payload,
+                        "input",
+                        Cow::Owned(format!("[{}]", items[start..].join(","))),
+                    );
+                    set(
+                        &mut payload,
+                        "previous_response_id",
+                        Cow::Owned(
+                            serde_json::to_string(&previous.response_id)
+                                .expect("writing a string never fails"),
+                        ),
+                    );
                     continuation = true;
                 }
                 Err(reason) => full_input_reason = reason,
             }
         }
     }
-    if payload.get("input").is_none() {
-        payload["input"] = logical["input"].clone();
+    if !payload.iter().any(|(key, _)| key == "input") {
+        set(
+            &mut payload,
+            "input",
+            Cow::Borrowed(input.unwrap_or("null")),
+        );
     }
-    payload["type"] = Value::String("response.create".into());
-    if let Some(turn_state) = session.state.lock().unwrap().turn_state.clone() {
-        payload["client_metadata"]["x-codex-turn-state"] = Value::String(turn_state);
-    }
+    set(&mut payload, "type", Cow::Borrowed("\"response.create\""));
+    let turn_state = session.state.lock().unwrap().turn_state.clone();
     let send_started_at_ms = now_millis();
-    if request.codex_wire {
-        payload["client_metadata"]["x-codex-ws-stream-request-start-ms"] =
-            Value::String(send_started_at_ms.to_string());
+    if turn_state.is_some() || request.codex_wire {
+        // An absent `client_metadata` starts as an empty object, as indexing a missing member
+        // of a JSON value makes one.
+        let mut metadata = payload
+            .iter()
+            .find(|(key, _)| key == "client_metadata")
+            .map_or(Value::Null, |(_, text)| {
+                serde_json::from_str(text).unwrap_or(Value::Null)
+            });
+        if let Some(turn_state) = turn_state {
+            metadata["x-codex-turn-state"] = Value::String(turn_state);
+        }
+        if request.codex_wire {
+            metadata["x-codex-ws-stream-request-start-ms"] =
+                Value::String(send_started_at_ms.to_string());
+        }
+        set(
+            &mut payload,
+            "client_metadata",
+            Cow::Owned(
+                String::from_utf8(broca_protocol::canonical_json_bytes(&metadata))
+                    .expect("canonical JSON is UTF-8"),
+            ),
+        );
     }
-    let text = if request.codex_wire {
-        String::from_utf8(crate::chatgpt_wire::request_bytes(&payload)).expect("JSON is UTF-8")
-    } else {
-        serde_json::to_string(&payload).expect("a rendered JSON value serializes")
-    };
+    let previous_response_id_present = payload.iter().any(|(key, _)| key == "previous_response_id");
+    let text = String::from_utf8(crate::chatgpt_wire::object_bytes(
+        payload,
+        request.codex_wire,
+    ))
+    .expect("JSON is UTF-8");
     let digest = RequestDigest::of(text.as_bytes());
     trace.transport = Some("websocket".into());
     trace.http_status = Some(101);
@@ -1239,15 +1289,9 @@ async fn drive_socket(
         codex: request.codex_wire.then(|| {
             Box::new(broca_protocol::provider::ChatgptContinuationTrace {
                 continuation,
-                suffix_item_count: if continuation {
-                    payload["input"]
-                        .as_array()
-                        .map_or(0, |input| input.len() as u64)
-                } else {
-                    0
-                },
+                suffix_item_count,
                 connection_generation: socket.generation,
-                previous_response_id_present: payload.get("previous_response_id").is_some(),
+                previous_response_id_present,
                 physical_send_count: 0,
                 full_input_reason: (!continuation).then(|| full_input_reason.into()),
             })
@@ -1370,11 +1414,11 @@ async fn drive_socket(
                 }) {
                     let output = render_output(assistant);
                     *socket.continuation.lock().unwrap() =
-                        Some(crate::chatgpt_continuation::CompletedResponse {
-                            request: logical,
-                            output,
+                        Some(crate::chatgpt_continuation::CompletedResponse::new(
+                            request.body.clone(),
+                            &output,
                             response_id,
-                        });
+                        ));
                 }
             }
         }
@@ -2345,11 +2389,11 @@ async fn codex_failed_send_retires_socket_and_consumes_receipt() {
         credential_id: None,
         account_ref: None,
         url: request.url.clone(),
-        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
-            request: logical,
-            output: vec![],
-            response_id: "resp_prior".into(),
-        })),
+        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse::new(
+            Bytes::from(broca_protocol::canonical_json_bytes(&logical)),
+            &[],
+            "resp_prior".into(),
+        ))),
         send,
         recv: tokio::sync::Mutex::new(records),
         shutdown: CancellationToken::new(),
@@ -2491,11 +2535,11 @@ async fn codex_completed_write_is_counted_when_cancelled_before_acknowledgement(
         credential_id: None,
         account_ref: None,
         url: request.url.clone(),
-        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse {
-            request: logical,
-            output: vec![],
-            response_id: "resp_prior".into(),
-        })),
+        continuation: Mutex::new(Some(crate::chatgpt_continuation::CompletedResponse::new(
+            Bytes::from(broca_protocol::canonical_json_bytes(&logical)),
+            &[],
+            "resp_prior".into(),
+        ))),
         send,
         recv: tokio::sync::Mutex::new(records),
         shutdown: CancellationToken::new(),

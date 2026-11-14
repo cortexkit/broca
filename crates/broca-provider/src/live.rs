@@ -158,6 +158,10 @@ impl Provider for LiveAnthropicProvider {
         self.inner.try_render_request(opts)
     }
 
+    fn request_len(&self, opts: &CallOptions) -> Result<usize, Box<broca_protocol::ProviderError>> {
+        self.inner.request_len(opts)
+    }
+
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         self.inner.output_limits()
     }

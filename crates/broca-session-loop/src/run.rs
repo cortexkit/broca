@@ -2849,9 +2849,9 @@ where
                     .unwrap_or_default();
                 let bytes = seams
                     .provider
-                    .try_render_request(&opts)
+                    .request_len(&opts)
                     .map_err(|error| LoopError::Parts(error.message))?;
-                Some(broca_core::compaction::request_estimate(bytes.len(), &history).0)
+                Some(broca_core::compaction::request_estimate(bytes, &history).0)
             }
             _ => None,
         };

@@ -25,6 +25,7 @@ pub mod conformance;
 pub mod credential_refresh;
 pub mod families;
 pub mod hash;
+mod json_text;
 pub mod media_profile;
 pub mod media_render;
 #[cfg(feature = "live")]

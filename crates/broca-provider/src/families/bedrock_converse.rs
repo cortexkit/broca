@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use base64::Engine;
+use broca_protocol::wire_node::{Node, NodeRef};
 use broca_protocol::{
     content::{AssistantMessage, ContentBlock, FinishReason, Message, Role, ToolCall, ToolOutput},
     display::DisplayEvent,
@@ -19,6 +20,7 @@ use broca_protocol::{
 };
 use bytes::{Bytes, BytesMut};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 
 use crate::cache_markers::{plan_markers, MarkerPlan, MarkerViewMessage};
 use crate::policy::SystemPromptPolicy;
@@ -39,7 +41,11 @@ pub struct BedrockConverse;
 
 impl WireFamily for BedrockConverse {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        build_request_body(frozen, opts)
+        self.shape_with_provenance(frozen, opts, None)
+    }
+
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -48,7 +54,18 @@ impl WireFamily for BedrockConverse {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        with_request_body(frozen, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
     }
 
     fn shape_with_media(
@@ -71,11 +88,32 @@ impl WireFamily for BedrockConverse {
             frozen,
             payloads: media,
         };
-        build_request_body_with_media_and_provenance(
+        with_request_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
+            |body| body.to_value(),
+        )
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let media = crate::media_render::MediaRender {
+            frozen,
+            payloads: media,
+        };
+        with_request_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| body.canonical_bytes(),
         )
     }
 
@@ -167,24 +205,17 @@ impl WireFamily for BedrockConverse {
 
 // ───────────────────────── request body ─────────────────────────
 
-fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-    build_request_body_with_media(frozen, opts, None)
-}
-
-fn build_request_body_with_media(
-    frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
-    build_request_body_with_media_and_provenance(frozen, opts, media, None)
-}
-
-fn build_request_body_with_media_and_provenance(
+/// Hands `use_body` the request body, its system blocks and messages written as nodes that
+/// borrow the prompt's content. Every other member is small and is shaped as one JSON object.
+/// The body only lives inside this call, because the options prepared from `opts`, which it
+/// borrows, are local to this call too.
+fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Value {
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let turn_system = crate::turn_system::prepare(frozen, opts);
@@ -217,11 +248,6 @@ fn build_request_body_with_media_and_provenance(
     let messages =
         convert_messages_with_provenance(frozen, opts, &name_map, &id_map, media, provenance);
 
-    if !system.is_empty() {
-        body.insert("system".to_string(), Value::Array(system));
-    }
-
-    body.insert("messages".to_string(), Value::Array(messages));
     body.insert(
         "inferenceConfig".to_string(),
         convert_inference_config(frozen, opts),
@@ -235,30 +261,82 @@ fn build_request_body_with_media_and_provenance(
 
     merge_top_level_options(&mut body, &frozen.static_options);
     merge_top_level_options(&mut body, &opts.provider_options);
+    // A caller's options may replace the system blocks or the messages outright.
+    let system_option = body.remove("system");
+    let messages_option = body.remove("messages");
 
-    if let Some((ttl, max_breakpoints, lookback_blocks, tail)) = marker_policy {
-        apply_bedrock_marker_policy_to_body(
-            &mut body,
-            frozen,
-            ttl,
-            max_breakpoints,
-            lookback_blocks,
-            tail,
-            opts.marker_order_version,
-        );
+    let (system, messages) =
+        if let Some((ttl, max_breakpoints, lookback_blocks, tail)) = marker_policy {
+            let mut system = system_option.map_or(system, owned_items);
+            let mut messages = messages_option.map_or(messages, owned_items);
+            apply_bedrock_marker_policy(
+                &mut system,
+                &mut messages,
+                frozen,
+                ttl,
+                max_breakpoints,
+                lookback_blocks,
+                tail,
+                opts.marker_order_version,
+            );
+            (
+                (!system.is_empty()).then_some(Node::Array(system)),
+                Node::Array(messages),
+            )
+        } else {
+            (
+                system_option
+                    .map(Node::value)
+                    .or_else(|| (!system.is_empty()).then_some(Node::Array(system))),
+                messages_option.map_or_else(|| Node::Array(messages), Node::value),
+            )
+        };
+
+    let mut members: Vec<(Cow<'_, str>, Node<'_>)> = body
+        .into_iter()
+        .map(|(key, value)| (Cow::Owned(key), Node::value(value)))
+        .collect();
+    if let Some(system) = system {
+        members.push(("system".into(), system));
     }
-
-    Value::Object(body)
+    members.push(("messages".into(), messages));
+    use_body(&Node::Object(members))
 }
 
-fn convert_system(
-    frozen: &FrozenRenderConfig,
-    prompt: &[Message],
+/// The items of an array a caller's options supplied, as nodes the marker plan can change in
+/// place; anything but an array reads as no items.
+fn owned_items<'a>(value: Value) -> Vec<Node<'a>> {
+    fn owned<'a>(value: Value) -> Node<'a> {
+        match value {
+            Value::Object(members) => Node::Object(
+                members
+                    .into_iter()
+                    .map(|(key, value)| (Cow::Owned(key), owned(value)))
+                    .collect(),
+            ),
+            Value::Array(items) => Node::Array(items.into_iter().map(owned).collect()),
+            other => Node::value(other),
+        }
+    }
+    match value {
+        Value::Array(items) => items.into_iter().map(owned).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A `{"text": ...}` block.
+fn text_block(text: Node<'_>) -> Node<'_> {
+    Node::object([("text", text)])
+}
+
+fn convert_system<'a>(
+    frozen: &'a FrozenRenderConfig,
+    prompt: &'a [Message],
     coalesce_instruction_tail: bool,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     let mut system = Vec::new();
     if let SystemPromptPolicy::RequiredIdentityLead { identity } = &frozen.system_prompt {
-        system.push(json!({ "text": identity }));
+        system.push(text_block(Node::str(identity)));
     }
     for message in prompt {
         if message.role == Role::System {
@@ -270,7 +348,7 @@ fn convert_system(
                     block
                 {
                     if !text.is_empty() {
-                        system.push(json!({ "text": text }));
+                        system.push(text_block(Node::str(text)));
                     }
                 }
             }
@@ -283,7 +361,7 @@ fn convert_system(
     system
 }
 
-fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
+fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Node<'_>>) {
     let tail_start = system_tail_start(frozen);
     if tail_start >= system.len().saturating_sub(1) {
         return;
@@ -291,7 +369,7 @@ fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
 
     let merged = system[tail_start..]
         .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter_map(|block| block.get("text").and_then(NodeRef::as_str))
         .collect::<Vec<_>>()
         .join("\n");
     if merged.is_empty() {
@@ -299,7 +377,7 @@ fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
     }
 
     system.truncate(tail_start);
-    system.push(json!({ "text": merged }));
+    system.push(text_block(Node::string(merged)));
 }
 
 fn system_tail_start(frozen: &FrozenRenderConfig) -> usize {
@@ -313,7 +391,7 @@ fn system_tail_start(frozen: &FrozenRenderConfig) -> usize {
     }
 }
 
-fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Value]) -> usize {
+fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Node<'_>]) -> usize {
     system
         .get(system_tail_start(frozen)..)
         .unwrap_or_default()
@@ -322,8 +400,10 @@ fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Value]) -> usi
         .count()
 }
 
-fn apply_bedrock_marker_policy_to_body(
-    body: &mut Map<String, Value>,
+#[allow(clippy::too_many_arguments)]
+fn apply_bedrock_marker_policy(
+    system: &mut Vec<Node<'_>>,
+    messages: &mut [Node<'_>],
     frozen: &FrozenRenderConfig,
     ttl: CacheTtl,
     max_breakpoints: u32,
@@ -331,79 +411,61 @@ fn apply_bedrock_marker_policy_to_body(
     tail: Option<CacheTail>,
     marker_order_version: Option<u32>,
 ) {
-    let mut system = take_array(body, "system");
-    let mut messages = take_array(body, "messages");
-    strip_bedrock_inbound_markers(&mut system, &mut messages);
-    coalesce_system_tail(frozen, &mut system);
+    strip_bedrock_inbound_markers(system, messages);
+    coalesce_system_tail(frozen, system);
 
     // Marker positions are based on the merged rendered body, so passthrough
     // options cannot reintroduce unplanned cache points or shift breakpoints.
-    let marker_view = bedrock_marker_view(&messages);
+    let marker_view = bedrock_marker_view(messages);
     debug_assert_eq!(marker_view.len(), messages.len());
     let plan = plan_markers(
         lookback_blocks,
         max_breakpoints,
-        system_tail_block_count(frozen, &system),
+        system_tail_block_count(frozen, system),
         tail,
         &marker_view,
         marker_order_version,
         &[],
     );
-    apply_bedrock_marker_plan(&mut system, &mut messages, frozen, ttl, &plan);
-
-    if system.is_empty() {
-        body.remove("system");
-    } else {
-        body.insert("system".to_string(), Value::Array(system));
-    }
-    body.insert("messages".to_string(), Value::Array(messages));
+    apply_bedrock_marker_plan(system, messages, frozen, ttl, &plan);
 }
 
-fn take_array(body: &mut Map<String, Value>, key: &str) -> Vec<Value> {
-    match body.remove(key) {
-        Some(Value::Array(values)) => values,
-        _ => Vec::new(),
-    }
-}
-
-fn strip_bedrock_inbound_markers(system: &mut Vec<Value>, messages: &mut [Value]) {
+fn strip_bedrock_inbound_markers(system: &mut Vec<Node<'_>>, messages: &mut [Node<'_>]) {
     strip_bedrock_marker_blocks(system);
     for message in messages {
-        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(content) = message.get_mut("content").and_then(Node::as_array_mut) {
             strip_bedrock_marker_blocks(content);
         }
     }
 }
 
-fn strip_bedrock_marker_blocks(blocks: &mut Vec<Value>) {
+fn strip_bedrock_marker_blocks(blocks: &mut Vec<Node<'_>>) {
     blocks.retain(|block| block.get("cachePoint").is_none());
     for block in blocks {
-        if let Some(object) = block.as_object_mut() {
-            object.remove("cache_control");
-            object.remove("cacheControl");
-        }
+        block.remove("cache_control");
+        block.remove("cacheControl");
     }
 }
 
-fn bedrock_marker_view(messages: &[Value]) -> Vec<MarkerViewMessage> {
+fn bedrock_marker_view(messages: &[Node<'_>]) -> Vec<MarkerViewMessage> {
     messages
         .iter()
         .map(|message| {
-            let role = match message.get("role").and_then(Value::as_str) {
+            let role = match message.get("role").and_then(NodeRef::as_str) {
                 Some("user") => Role::User,
                 Some("assistant") => Role::Assistant,
                 _ => Role::Assistant,
             };
-            let block_count = message
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|content| {
+            let block_count = match message.get("content") {
+                Some(NodeRef::Node(content)) => content.as_array().map(|content| {
                     content
                         .iter()
                         .filter(|block| is_bedrock_cacheable_block(block))
                         .count()
-                })
-                .unwrap_or(0);
+                }),
+                _ => None,
+            }
+            .unwrap_or(0);
             MarkerViewMessage {
                 role,
                 block_count,
@@ -435,8 +497,8 @@ fn bedrock_marker_policy(
 }
 
 fn apply_bedrock_marker_plan(
-    system: &mut Vec<Value>,
-    messages: &mut [Value],
+    system: &mut Vec<Node<'_>>,
+    messages: &mut [Node<'_>],
     frozen: &FrozenRenderConfig,
     ttl: CacheTtl,
     plan: &MarkerPlan,
@@ -459,11 +521,11 @@ fn apply_bedrock_marker_plan(
     }
 }
 
-fn insert_bedrock_message_marker(messages: &mut [Value], index: usize, ttl: CacheTtl) {
+fn insert_bedrock_message_marker(messages: &mut [Node<'_>], index: usize, ttl: CacheTtl) {
     let Some(content) = messages
         .get_mut(index)
         .and_then(|message| message.get_mut("content"))
-        .and_then(Value::as_array_mut)
+        .and_then(Node::as_array_mut)
     else {
         return;
     };
@@ -472,24 +534,24 @@ fn insert_bedrock_message_marker(messages: &mut [Value], index: usize, ttl: Cach
     }
 }
 
-fn is_bedrock_cacheable_block(block: &Value) -> bool {
+fn is_bedrock_cacheable_block(block: &Node<'_>) -> bool {
     block.get("text").is_some()
         || block.get("toolUse").is_some()
         || block.get("toolResult").is_some()
 }
 
-fn bedrock_cache_point(ttl: CacheTtl) -> Value {
-    json!({ "cachePoint": { "type": "default", "ttl": ttl.as_str() } })
+fn bedrock_cache_point<'a>(ttl: CacheTtl) -> Node<'a> {
+    Node::value(json!({ "cachePoint": { "type": "default", "ttl": ttl.as_str() } }))
 }
 
-fn convert_messages_with_provenance(
+fn convert_messages_with_provenance<'a>(
     frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
+    opts: &'a CallOptions,
     name_map: &crate::tool_name_alias::ToolNameMap,
-    id_map: &crate::tool_id_alias::ToolIdMap,
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     let mut wire_index = 0;
     opts.prompt
         .iter()
@@ -501,42 +563,45 @@ fn convert_messages_with_provenance(
                     message.origin.as_ref(),
                     opts.target_model.as_ref(),
                 );
-            let rendered = convert_message(message, name_map, id_map, echo_reasoning, media)?;
-            if rendered
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| content.is_empty())
-            {
+            let (role, content) =
+                convert_message(message, name_map, id_map, echo_reasoning, media)?;
+            if content.is_empty() {
                 return None;
             }
             if let Some(sink) = provenance.as_deref_mut() {
                 sink.record_message(wire_index, message.ordinal);
                 wire_index += 1;
             }
-            Some(rendered)
+            Some(Node::object([
+                ("role", Node::str(role)),
+                ("content", Node::Array(content)),
+            ]))
         })
         .collect()
 }
 
-fn convert_message(
-    message: &Message,
+/// A message's wire role and content blocks; `None` for a system message, which renders in the
+/// `system` member.
+fn convert_message<'a>(
+    message: &'a Message,
     name_map: &crate::tool_name_alias::ToolNameMap,
-    id_map: &crate::tool_id_alias::ToolIdMap,
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
     echo_reasoning: bool,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Option<Value> {
+) -> Option<(&'static str, Vec<Node<'a>>)> {
     match message.role {
         Role::System => None,
-        Role::User => Some(json!({
-            "role": "user",
-            "content": convert_content(&message.content, name_map, id_map, false, media),
-        })),
-        Role::Assistant => Some(json!({
-            "role": "assistant",
-            "content": convert_content(&message.content, name_map, id_map, echo_reasoning, None),
-        })),
-        Role::Tool => {
-            let content: Vec<Value> = message
+        Role::User => Some((
+            "user",
+            convert_content(&message.content, name_map, id_map, false, media),
+        )),
+        Role::Assistant => Some((
+            "assistant",
+            convert_content(&message.content, name_map, id_map, echo_reasoning, None),
+        )),
+        Role::Tool => Some((
+            "user",
+            message
                 .content
                 .iter()
                 .filter_map(|block| match block {
@@ -545,23 +610,24 @@ fn convert_message(
                     }
                     _ => None,
                 })
-                .collect();
-            Some(json!({ "role": "user", "content": content }))
-        }
+                .collect(),
+        )),
     }
 }
 
-fn convert_content(
-    blocks: &[ContentBlock],
+fn convert_content<'a>(
+    blocks: &'a [ContentBlock],
     name_map: &crate::tool_name_alias::ToolNameMap,
-    id_map: &crate::tool_id_alias::ToolIdMap,
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
     echo_reasoning: bool,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Media(reference) => Some(media_block(reference, media, false)),
+            ContentBlock::Media(reference) => {
+                Some(Node::value(media_block(reference, media, false)))
+            }
             // Drop an empty text part (Bedrock rejects `text:""`). Defensive against foreign input; the owned normalizers never emit empty text.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
                 if text.is_empty() =>
@@ -569,30 +635,40 @@ fn convert_content(
                 None
             }
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                Some(json!({ "text": text }))
+                Some(text_block(Node::str(text)))
             }
-            ContentBlock::ToolCall(call) => Some(json!({
-                "toolUse": {
-                    "toolUseId": id_map.wire_id(&call.tool_call_id.0),
-                    "name": name_map.wire_name(&call.tool_name),
-                    "input": call.input,
-                }
-            })),
+            ContentBlock::ToolCall(call) => Some(Node::object([(
+                "toolUse",
+                Node::object([
+                    ("toolUseId", Node::str(id_map.wire_id(&call.tool_call_id.0))),
+                    (
+                        "name",
+                        Node::string(name_map.wire_name(&call.tool_name).to_owned()),
+                    ),
+                    ("input", Node::Json(&call.input)),
+                ]),
+            )])),
             ContentBlock::ToolResult(result) => Some(convert_tool_result(result, id_map, media)),
             // AWS ReasoningTextBlock, Contents/signature: multi-turn reasoning text and its
             // signature must be returned unmodified. Keep empty signed blocks and source order.
             // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ReasoningTextBlock.html
             ContentBlock::Reasoning { text, signature } if echo_reasoning => {
-                let mut reasoning = json!({"text": text});
+                let mut reasoning = text_block(Node::str(text));
                 if let Some(signature) = signature {
-                    reasoning["signature"] = json!(signature);
+                    reasoning.insert("signature", Node::str(signature));
                 }
-                Some(json!({"reasoningContent": {"reasoningText": reasoning}}))
+                Some(Node::object([(
+                    "reasoningContent",
+                    Node::object([("reasoningText", reasoning)]),
+                )]))
             }
             ContentBlock::RedactedReasoning {
                 data,
                 provider_format: None,
-            } if echo_reasoning => Some(json!({"reasoningContent": {"redactedContent": data}})),
+            } if echo_reasoning => Some(Node::object([(
+                "reasoningContent",
+                Node::object([("redactedContent", Node::str(data))]),
+            )])),
             ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => None,
             // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
             ContentBlock::ProviderFallback { .. } => None,
@@ -600,41 +676,51 @@ fn convert_content(
         .collect()
 }
 
-fn convert_tool_result(
-    result: &broca_protocol::content::ToolResult,
-    id_map: &crate::tool_id_alias::ToolIdMap,
+fn convert_tool_result<'a>(
+    result: &'a broca_protocol::content::ToolResult,
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
-    json!({
-        "toolResult": {
-            "toolUseId": id_map.wire_id(&result.tool_call_id.0),
-            "content": convert_tool_output_with_media(&result.output, media),
-            "status": if result.is_error { "error" } else { "success" },
-        }
-    })
+) -> Node<'a> {
+    Node::object([(
+        "toolResult",
+        Node::object([
+            (
+                "toolUseId",
+                Node::str(id_map.wire_id(&result.tool_call_id.0)),
+            ),
+            (
+                "content",
+                Node::Array(convert_tool_output_with_media(&result.output, media)),
+            ),
+            (
+                "status",
+                Node::str(if result.is_error { "error" } else { "success" }),
+            ),
+        ]),
+    )])
 }
 
-fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
-    match output {
+fn convert_tool_output(output: &ToolOutput) -> Vec<Node<'_>> {
+    let block = match output {
         ToolOutput::Parts { parts } => {
             let text = broca_protocol::content::media_parts_text(
                 parts,
                 broca_protocol::MediaMarkerReason::Carrier,
             );
             if text.is_empty() {
-                vec![json!({"json": text})]
+                Node::object([("json", Node::string(text))])
             } else {
-                vec![json!({"text": text})]
+                text_block(Node::string(text))
             }
         }
         // Bedrock rejects blank text blocks. A JSON empty string preserves an empty tool result
         // without inventing prose for the model; `toolResult.status` still carries error state.
-        ToolOutput::Text { text } if text.is_empty() => vec![json!({ "json": text })],
-        ToolOutput::Text { text } => vec![json!({ "text": text })],
-        ToolOutput::Json { value } => vec![json!({ "json": value })],
-        ToolOutput::Denied { reason } => vec![json!({ "text": format!("denied: {reason}") })],
+        ToolOutput::Text { text } if text.is_empty() => Node::object([("json", Node::str(text))]),
+        ToolOutput::Text { text } => text_block(Node::str(text)),
+        ToolOutput::Json { value } => Node::object([("json", Node::Json(value))]),
+        ToolOutput::Denied { reason } => text_block(Node::string(format!("denied: {reason}"))),
         ToolOutput::Error { message, .. } if message.is_empty() => {
-            vec![json!({ "json": message })]
+            Node::object([("json", Node::str(message))])
         }
         ToolOutput::Error {
             message,
@@ -643,31 +729,32 @@ fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
             detail,
             nothing_sent,
             retry,
-        } => vec![json!({ "text": ToolOutput::error_model_text(
+        } => text_block(Node::string(ToolOutput::error_model_text(
             message,
             module.as_deref(),
             code.as_deref(),
             detail.as_deref(),
             *nothing_sent,
             retry.as_deref(),
-        ) })],
-    }
+        ))),
+    };
+    vec![block]
 }
 
-fn convert_tool_output_with_media(
-    output: &ToolOutput,
+fn convert_tool_output_with_media<'a>(
+    output: &'a ToolOutput,
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     if let (ToolOutput::Parts { parts }, Some(media)) = (output, media) {
         return parts
             .iter()
             .map(|part| match part {
                 broca_protocol::ToolOutputPart::Text { text } if text.is_empty() => {
-                    json!({"json":text})
+                    Node::object([("json", Node::str(text))])
                 }
-                broca_protocol::ToolOutputPart::Text { text } => json!({"text":text}),
+                broca_protocol::ToolOutputPart::Text { text } => text_block(Node::str(text)),
                 broca_protocol::ToolOutputPart::Media { media: reference } => {
-                    media_block(reference, Some(media), true)
+                    Node::value(media_block(reference, Some(media), true))
                 }
             })
             .collect();
@@ -1853,6 +1940,14 @@ mod tests {
             .any(|(name, value)| name == "x-amz-date" && value == "20260102T030405Z"));
     }
 
+    /// The blocks a tool output renders, as JSON values.
+    fn tool_output_values(output: &ToolOutput) -> Vec<Value> {
+        convert_tool_output(output)
+            .iter()
+            .map(Node::to_value)
+            .collect()
+    }
+
     fn legacy_convert_tool_output(output: &ToolOutput) -> Vec<Value> {
         match output {
             // Multipart output had no representation in the legacy model.
@@ -1936,7 +2031,7 @@ mod tests {
             ToolOutput::error("failed"),
         ] {
             assert_eq!(
-                serde_json::to_vec(&convert_tool_output(&output)).unwrap(),
+                serde_json::to_vec(&tool_output_values(&output)).unwrap(),
                 serde_json::to_vec(&legacy_convert_tool_output(&output)).unwrap(),
                 "nonempty tool output changed bytes: {output:?}"
             );
@@ -1945,7 +2040,7 @@ mod tests {
 
     #[test]
     fn denied_tool_output_is_never_empty_text() {
-        let output = convert_tool_output(&ToolOutput::Denied {
+        let output = tool_output_values(&ToolOutput::Denied {
             reason: String::new(),
         });
         let text = output[0]["text"].as_str().unwrap();

@@ -757,6 +757,13 @@ pub trait WireFamily: Send + Sync {
         self.render_with_provenance(frozen, opts, None)
     }
 
+    /// About how many bytes `render` gives, counted without writing them where the family can.
+    /// Exact for a body that is its canonical form; the Claude subscription body, written in
+    /// its own key order and number spelling, may differ by those few bytes.
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        self.render(frozen, opts).len()
+    }
+
     /// Emit the same request bytes while optionally collecting durable source coordinates.
     fn render_with_provenance(
         &self,

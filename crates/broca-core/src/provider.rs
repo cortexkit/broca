@@ -292,6 +292,15 @@ pub trait Provider: Send + Sync {
         Ok(self.render_request(opts))
     }
 
+    /// About how many bytes `try_render_request` gives for `opts`, for a size estimate. A
+    /// provider that can count its request without writing it overrides this, so an estimate
+    /// doesn't render the request a second time. Exact for every request whose bytes are its
+    /// canonical form; a body written in another key order or number spelling may differ by
+    /// those few bytes, which no estimate can see.
+    fn request_len(&self, opts: &CallOptions) -> Result<usize, Box<broca_protocol::ProviderError>> {
+        self.try_render_request(opts).map(|bytes| bytes.len())
+    }
+
     /// This provider's renderer version (recorded in `run_config`; a change busts
     /// resume). Defaults to the shared canonical renderer's version.
     fn renderer_version(&self) -> u32 {
@@ -589,6 +598,10 @@ impl Provider for Box<dyn Provider> {
         opts: &CallOptions,
     ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
         (**self).try_render_request(opts)
+    }
+
+    fn request_len(&self, opts: &CallOptions) -> Result<usize, Box<broca_protocol::ProviderError>> {
+        (**self).request_len(opts)
     }
 
     fn output_limits(&self) -> Option<crate::output_reservation::OutputLimits> {

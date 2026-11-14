@@ -1643,6 +1643,15 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         Ok(self.family.render(&frozen, opts))
     }
 
+    fn request_len(&self, opts: &CallOptions) -> Result<usize, Box<ProviderError>> {
+        // A request carrying media is rendered: its payloads are read and placed as it is sent.
+        if self.media_renderer.read().unwrap().is_some() {
+            return self.try_render_request(opts).map(|bytes| bytes.len());
+        }
+        let route = self.route_frozen();
+        Ok(self.family.rendered_len(&route.for_step(opts), opts))
+    }
+
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         self.route_frozen().output_limits()
     }
@@ -4469,9 +4478,10 @@ async fn send_attempt(
     let compressed = gzip.is_some();
     let body = gzip.unwrap_or_else(|| {
         if request.codex_wire {
-            let payload: Value =
-                serde_json::from_slice(&request.body).expect("rendered Responses JSON");
-            Bytes::from(crate::chatgpt_wire::request_bytes(&payload))
+            Bytes::from(
+                crate::chatgpt_wire::request_bytes(&request.body)
+                    .expect("a rendered Responses body is a JSON object"),
+            )
         } else {
             request.body.clone()
         }

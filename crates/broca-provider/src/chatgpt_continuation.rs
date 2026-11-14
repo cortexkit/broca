@@ -1,51 +1,60 @@
 //! Tracks per-connection continuation without changing canonical rendering or tool dispatch.
 
+use bytes::Bytes;
 use serde_json::Value;
 
+use crate::json_text::{array_items, member, top_level_members};
+
+/// A completed response kept so the next request on its socket can continue it. Both parts are
+/// canonical JSON text, never parsed trees: a tree of a large request costs several times its
+/// text, and the comparison below reads the text directly.
 #[derive(Clone)]
 pub(crate) struct CompletedResponse {
-    pub request: Value,
-    pub output: Vec<Value>,
+    /// The request's canonical body, shared with the request that sent it.
+    pub request: Bytes,
+    /// The response's output items as request input, each as its canonical text.
+    pub output: Vec<String>,
     pub response_id: String,
 }
 
 impl CompletedResponse {
-    /// Conservatively charge owned receipt storage, including spare string/array capacity.
-    /// Map entries get extra room for tree/hash nodes and unused node slots; this is a
-    /// retention budget, not a claim to measure allocator or process RSS exactly.
+    /// The receipt for `request`'s canonical body and the input items its response adds.
+    pub(crate) fn new(request: Bytes, output: &[Value], response_id: String) -> Self {
+        let output = output
+            .iter()
+            .map(|item| {
+                String::from_utf8(broca_protocol::canonical_json_bytes(item))
+                    .expect("canonical JSON is UTF-8")
+            })
+            .collect();
+        Self {
+            request,
+            output,
+            response_id,
+        }
+    }
+
+    /// The bytes this receipt keeps alive, spare capacity included.
     #[cfg(feature = "live")]
     pub(crate) fn retained_bytes(&self) -> usize {
-        fn allocations(value: &Value) -> usize {
-            match value {
-                Value::String(text) => text.capacity(),
-                Value::Array(items) => {
-                    items.capacity() * std::mem::size_of::<Value>()
-                        + items.iter().map(allocations).sum::<usize>()
-                }
-                Value::Object(items) => {
-                    items.len()
-                        * 12
-                        * (std::mem::size_of::<String>()
-                            + std::mem::size_of::<Value>()
-                            + 4 * std::mem::size_of::<usize>())
-                        + items
-                            .iter()
-                            .map(|(key, value)| key.capacity() + allocations(value))
-                            .sum::<usize>()
-                }
-                _ => 0,
-            }
-        }
         std::mem::size_of::<Self>()
+            + self.request.len()
             + self.response_id.capacity()
-            + self.output.capacity() * std::mem::size_of::<Value>()
-            + allocations(&self.request)
-            + self.output.iter().map(allocations).sum::<usize>()
+            + self.output.capacity() * std::mem::size_of::<String>()
+            + self.output.iter().map(String::capacity).sum::<usize>()
     }
 
     /// Codex 0.163.0 compares these eleven request properties before reusing a response.
     /// Delivery options, client metadata and access programs deliberately do not participate.
-    pub fn suffix_start(&self, current: &Value) -> Result<usize, &'static str> {
+    /// `current` is the next request's canonical body. Two canonical texts are equal exactly
+    /// when their values are, so properties and items compare as text; only two items whose
+    /// texts differ are parsed, to check whether they differ only in annotations.
+    pub fn suffix_start(&self, current: &str) -> Result<usize, &'static str> {
+        let previous = std::str::from_utf8(&self.request)
+            .ok()
+            .and_then(top_level_members)
+            .ok_or("input_shape")?;
+        let current = top_level_members(current).ok_or("input_shape")?;
         for (field, reason) in [
             ("model", "model_changed"),
             ("tools", "tools_changed"),
@@ -59,21 +68,26 @@ impl CompletedResponse {
             ("prompt_cache_key", "prompt_cache_key_changed"),
             ("text", "text_changed"),
         ] {
-            if self.request.get(field) != current.get(field) {
+            if member(&previous, field) != member(&current, field) {
                 return Err(reason);
             }
         }
-        let previous = self.request["input"].as_array().ok_or("input_shape")?;
-        let current = current["input"].as_array().ok_or("input_shape")?;
+        let previous = member(&previous, "input")
+            .and_then(array_items)
+            .ok_or("input_shape")?;
+        let current = member(&current, "input")
+            .and_then(array_items)
+            .ok_or("input_shape")?;
         let prefix_len = previous.len() + self.output.len();
         if current.len() < prefix_len {
             return Err("input_shortened");
         }
         if !previous
             .iter()
-            .chain(&self.output)
+            .copied()
+            .chain(self.output.iter().map(String::as_str))
             .zip(current)
-            .all(|(a, b)| items_equal(a, b))
+            .all(|(a, b)| a == b || items_equal(&parse(a), &parse(b)))
         {
             return Err("input_mismatch");
         }
@@ -82,6 +96,11 @@ impl CompletedResponse {
         }
         Ok(prefix_len)
     }
+}
+
+/// One input item's value, from the canonical text a scanner found.
+fn parse(item: &str) -> Value {
+    serde_json::from_str(item).unwrap_or(Value::Null)
 }
 
 fn items_equal(previous: &Value, current: &Value) -> bool {
@@ -127,7 +146,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixture() -> (CompletedResponse, Value) {
+    /// A completed response as values, so a test can change one; its receipt is built from
+    /// their canonical text when it compares.
+    struct Previous {
+        request: Value,
+        output: Vec<Value>,
+        response_id: String,
+    }
+
+    impl Previous {
+        fn suffix_start(&self, current: &Value) -> Result<usize, &'static str> {
+            let receipt = CompletedResponse::new(
+                Bytes::from(broca_protocol::canonical_json_bytes(&self.request)),
+                &self.output,
+                self.response_id.clone(),
+            );
+            let current = broca_protocol::canonical_json_bytes(current);
+            receipt.suffix_start(std::str::from_utf8(&current).unwrap())
+        }
+    }
+
+    fn fixture() -> (Previous, Value) {
         let request = json!({"model":"m","tools":[],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"scope","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hi"}]}]});
         let output = vec![
             json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}),
@@ -138,7 +177,7 @@ mod tests {
             .unwrap()
             .extend(output.clone());
         (
-            CompletedResponse {
+            Previous {
                 request,
                 output,
                 response_id: "resp_one".into(),

@@ -48,13 +48,12 @@ pub async fn reserve<W: Writer, P: Provider>(
     let recorded = history.recorded_for(StepId(step_id));
     let mut fresh = None;
     if let (Some(limits), Some(context_limit)) = (provider.output_limits(), context_limit) {
-        // The estimate costs a render of the whole request, so it is made only when a measured
-        // earlier step on this model makes one possible.
+        // The estimate sizes the whole request, so it is made only when a measured earlier step
+        // on this model makes one possible.
         let estimate = if renders && history.has_measurement(model) {
             let bytes = provider
-                .try_render_request(&opts)
-                .map_err(|error| LoopError::Parts(error.message))?
-                .len();
+                .request_len(&opts)
+                .map_err(|error| LoopError::Parts(error.message))?;
             history.estimate(bytes, model)
         } else {
             None

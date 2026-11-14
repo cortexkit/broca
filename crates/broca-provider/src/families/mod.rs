@@ -1080,3 +1080,28 @@ mod inclusive_usage_tests {
         );
     }
 }
+
+/// Text gathered from consecutive blocks into one item: borrowed while it is a single block's
+/// text, joined into a string only when several pieces meet.
+#[derive(Default)]
+pub(super) struct TextRun<'a>(Vec<std::borrow::Cow<'a, str>>);
+
+impl<'a> TextRun<'a> {
+    pub(super) fn push(&mut self, piece: std::borrow::Cow<'a, str>) {
+        if !piece.is_empty() {
+            self.0.push(piece);
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(super) fn take(&mut self) -> broca_protocol::wire_node::Node<'a> {
+        let mut pieces = std::mem::take(&mut self.0);
+        if pieces.len() == 1 {
+            return broca_protocol::wire_node::Node::Str(pieces.pop().expect("one piece"));
+        }
+        broca_protocol::wire_node::Node::string(pieces.concat())
+    }
+}

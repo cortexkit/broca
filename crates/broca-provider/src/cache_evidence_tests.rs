@@ -287,12 +287,14 @@ fn chatgpt_continuation_compares_canonical_full_input_not_the_socket_suffix() {
     new["input"].as_array_mut().unwrap().push(
         json!({"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}),
     );
-    let receipt = crate::chatgpt_continuation::CompletedResponse {
-        request: old.clone(),
-        output: vec![output],
-        response_id: "resp_one".into(),
-    };
-    assert!(receipt.suffix_start(&new).is_ok());
+    let receipt = crate::chatgpt_continuation::CompletedResponse::new(
+        bytes::Bytes::from(broca_protocol::canonical_json_bytes(&old)),
+        &[output],
+        "resp_one".into(),
+    );
+    assert!(receipt
+        .suffix_start(std::str::from_utf8(&broca_protocol::canonical_json_bytes(&new)).unwrap())
+        .is_ok());
     assert!(
         compare_rendered_requests(
             id,

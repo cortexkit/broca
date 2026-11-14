@@ -8,10 +8,7 @@
 //! thinking, effort, speed) stays byte-identical: a changed byte before the marker makes the warm
 //! read a different prefix and pay to write it rather than reuse the existing cache.
 
-use broca_protocol::{
-    canonical_json_bytes,
-    request::{ResponseFormat, ToolChoice},
-};
+use broca_protocol::request::{ResponseFormat, ToolChoice};
 use serde_json::Value;
 
 use crate::policy::ReasoningPolicy;
@@ -262,48 +259,75 @@ fn is_manual_thinking(thinking: &Value) -> bool {
 /// The body is re-emitted with the same canonical JSON encoding every family renders with, so
 /// each member left alone keeps its exact bytes.
 pub fn anthropic_warm_body(base: &[u8]) -> Result<Vec<u8>, String> {
-    let mut body: Value = serde_json::from_slice(base)
-        .map_err(|error| format!("the request to warm is not JSON: {error}"))?;
-    let object = body
-        .as_object_mut()
-        .ok_or("the request to warm is not a JSON object")?;
-    if object.get("thinking").is_some_and(is_manual_thinking) {
+    let members = warm_members(base)?;
+    let small = |name: &str| {
+        crate::json_text::member(&members, name)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    };
+    if small("thinking").is_some_and(|thinking| is_manual_thinking(&thinking)) {
         return Err(MANUAL_THINKING.into());
     }
-    if object
-        .get("tool_choice")
-        .and_then(|choice| choice.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "any" | "tool"))
+    if small("tool_choice")
+        .and_then(|choice| {
+            choice
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|kind| matches!(kind.as_str(), "any" | "tool"))
     {
         return Err(FORCED_TOOL_CHOICE.into());
     }
-    if object.contains_key("output_format")
-        || object
-            .get("output_config")
-            .is_some_and(|config| config.get("format").is_some())
+    if crate::json_text::member(&members, "output_format").is_some()
+        || small("output_config").is_some_and(|config| config.get("format").is_some())
     {
         return Err(STRUCTURED_OUTPUT.into());
     }
-    if !object.contains_key("max_tokens") {
+    if crate::json_text::member(&members, "max_tokens").is_none() {
         return Err("the request to warm carries no max_tokens".into());
     }
-    object.insert("max_tokens".into(), Value::from(0u32));
-    object.remove("stream");
-    object.remove("fallbacks");
-    Ok(canonical_json_bytes(&body))
+    Ok(warm_bytes(
+        &members,
+        &["stream", "fallbacks"],
+        ("max_tokens", "0"),
+    ))
+}
+
+/// The top-level members of the canonical request `base`, read from its text: a warm changes
+/// one or two small members, so the conversation is copied as it is, never parsed.
+fn warm_members(base: &[u8]) -> Result<Vec<(&str, &str)>, String> {
+    std::str::from_utf8(base)
+        .ok()
+        .and_then(crate::json_text::top_level_members)
+        .ok_or_else(|| match serde_json::from_slice::<Value>(base) {
+            Err(error) => format!("the request to warm is not JSON: {error}"),
+            Ok(_) => "the request to warm is not a JSON object".into(),
+        })
+}
+
+/// `members` written as the canonical object, without the members named in `removed` and with
+/// `set` (a key and its value's text) replacing or adding one. Every other member keeps its
+/// bytes.
+fn warm_bytes(members: &[(&str, &str)], removed: &[&str], set: (&str, &str)) -> Vec<u8> {
+    let mut written: Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)> = members
+        .iter()
+        .map(|(key, value)| {
+            (
+                crate::json_text::key_name(key),
+                std::borrow::Cow::Borrowed(*value),
+            )
+        })
+        .filter(|(key, _)| !removed.contains(&key.as_ref()) && key != set.0)
+        .collect();
+    written.push((set.0.into(), set.1.into()));
+    crate::json_text::object_bytes(written, &[])
 }
 
 /// The warm body for Responses, including the subscription backend: cap output without
 /// changing streaming, reasoning effort, or any other prefix-affecting field.
 pub fn responses_warm_body(base: &[u8]) -> Result<Vec<u8>, String> {
-    let mut body: Value = serde_json::from_slice(base)
-        .map_err(|error| format!("the request to warm is not JSON: {error}"))?;
-    let object = body
-        .as_object_mut()
-        .ok_or("the request to warm is not a JSON object")?;
-    object.insert("max_output_tokens".into(), Value::from(16u32));
-    Ok(canonical_json_bytes(&body))
+    let members = warm_members(base)?;
+    Ok(warm_bytes(&members, &[], ("max_output_tokens", "16")))
 }
 
 /// Read only usage from the bounded Responses answer; generated content is discarded.
@@ -677,6 +701,49 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    /// The warm bodies are written from the request's text. They must equal the body a parsed
+    /// tree gives, whatever the conversation holds: escapes, non-ASCII text, nested arrays,
+    /// numbers, and keys that sort around the changed ones.
+    #[test]
+    fn warm_bodies_written_from_text_equal_the_parsed_body() {
+        let base = serde_json::json!({
+            "max_tokens": 32000,
+            "fallbacks": "default",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "quote \" and \\ and \u{1} and \u{e9}\u{1f600}"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "n", "input": {"b": [1.5, -0.0, 1e300], "a": null}}]},
+            ],
+            "max_tokens_extra": true,
+            "model": "claude",
+            "stream": true,
+            "system": [{"type": "text", "text": "line\nbreak"}],
+            "thinking": {"type": "adaptive"},
+        });
+        let bytes = broca_protocol::canonical_json_bytes(&base);
+        let mut expected = base.clone();
+        let object = expected.as_object_mut().unwrap();
+        object.insert("max_tokens".into(), Value::from(0u32));
+        object.remove("stream");
+        object.remove("fallbacks");
+        assert_eq!(
+            anthropic_warm_body(&bytes).unwrap(),
+            broca_protocol::canonical_json_bytes(&expected)
+        );
+        let mut expected = base;
+        expected["max_output_tokens"] = Value::from(16u32);
+        assert_eq!(
+            responses_warm_body(&bytes).unwrap(),
+            broca_protocol::canonical_json_bytes(&expected)
+        );
+        assert_eq!(
+            anthropic_warm_body(b"[1]"),
+            Err("the request to warm is not a JSON object".to_string())
+        );
+        assert!(anthropic_warm_body(b"{")
+            .unwrap_err()
+            .starts_with("the request to warm is not JSON"));
     }
 
     #[test]

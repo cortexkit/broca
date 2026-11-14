@@ -36,13 +36,14 @@
 use broca_protocol::{provider::NormalizedEvent, request::CallOptions, StepContext, StepId};
 use serde_json::{json, Value};
 
-use crate::families::gemini::{build_request_body, GeminiNormalizer};
+use crate::families::gemini::{with_request_body, GeminiBody, GeminiNormalizer};
 use crate::media_render::{InlineMedia, MediaRender};
 use crate::sse::SseDecoder;
 use crate::wire::{
     AuthHandle, FrozenRenderConfig, HttpMethod, HttpRequest, NormalizeError, StreamNormalizer,
     WireFamily,
 };
+use broca_protocol::wire_node::Node;
 
 /// The daily Code-Assist endpoint observed in Antigravity requests, selected for its Gemini
 /// 3.x tiers. A `base_url` override replaces only the base (e.g. a mock in tests); the path
@@ -69,10 +70,15 @@ const ENVELOPE_REQUEST_TYPE: &str = "agent";
 
 pub struct GoogleCodeAssist;
 
-fn build_envelope(frozen: &FrozenRenderConfig, opts: &CallOptions, mut inner: Value) -> Value {
+fn build_envelope<'a>(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    mut body: GeminiBody<'a>,
+) -> Node<'a> {
+    let inner = &mut body.rest;
     // Start with the shared Gemini body, then apply the generation defaults selected by the
     // frozen Antigravity wire tier. Different Gemini families use different thinking knobs.
-    apply_antigravity_generation_defaults(&mut inner, frozen);
+    apply_antigravity_generation_defaults(inner, frozen);
 
     // requestId MUST be deterministic — REQUIRE the run/step identity. A missing
     // step_context is a precondition violation (the loop always populates it); rendering
@@ -109,24 +115,29 @@ fn build_envelope(frozen: &FrozenRenderConfig, opts: &CallOptions, mut inner: Va
     let project = frozen.project_id.clone().unwrap_or_else(|| {
         panic!("google_codeassist render requires FrozenRenderConfig.project_id; it was missing")
     });
-    let envelope = json!({
-        "project": project,
-        "requestId": request_id,
-        "request": inner,
-        "model": frozen.wire_model_id,
-        "userAgent": ENVELOPE_USER_AGENT,
-        "requestType": ENVELOPE_REQUEST_TYPE,
-    });
-    // The shaped envelope value. `render` emits it with canonical (sorted-key) bytes —
-    // the same determinism mechanism every JSON family uses. The backend parses JSON without
-    // depending on object-key order. Sorting keys gives equivalent envelopes stable bytes for
+    // The shaped envelope. `render` emits it with canonical (sorted-key) bytes — the same
+    // determinism mechanism every JSON family uses. The backend parses JSON without depending
+    // on object-key order. Sorting keys gives equivalent envelopes stable bytes for
     // cache/resume hashing.
-    envelope
+    Node::object([
+        ("project", Node::string(project)),
+        ("requestId", Node::string(request_id)),
+        ("request", body.into_node()),
+        ("model", Node::string(frozen.wire_model_id.clone())),
+        ("userAgent", Node::str(ENVELOPE_USER_AGENT)),
+        ("requestType", Node::str(ENVELOPE_REQUEST_TYPE)),
+    ])
 }
 
 impl WireFamily for GoogleCodeAssist {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        build_envelope(frozen, opts, build_request_body(frozen, opts))
+        self.shape_with_provenance(frozen, opts, None)
+    }
+
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_request_body(frozen, opts, None, None, |body| {
+            build_envelope(frozen, opts, body).canonical_len()
+        })
     }
 
     fn shape_with_provenance(
@@ -135,13 +146,20 @@ impl WireFamily for GoogleCodeAssist {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        build_envelope(
-            frozen,
-            opts,
-            super::gemini::build_request_body_with_media_and_provenance(
-                frozen, opts, None, provenance,
-            ),
-        )
+        with_request_body(frozen, opts, None, provenance, |body| {
+            build_envelope(frozen, opts, body).to_value()
+        })
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        with_request_body(frozen, opts, None, provenance, |body| {
+            build_envelope(frozen, opts, body).canonical_bytes()
+        })
     }
 
     fn shape_with_media(
@@ -161,13 +179,30 @@ impl WireFamily for GoogleCodeAssist {
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
         let media = MediaRender { frozen, payloads };
-        let inner = super::gemini::build_request_body_with_media_and_provenance(
+        with_request_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
-        );
-        build_envelope(frozen, opts, inner)
+            |body| build_envelope(frozen, opts, body).to_value(),
+        )
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let media = MediaRender { frozen, payloads };
+        with_request_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| build_envelope(frozen, opts, body).canonical_bytes(),
+        )
     }
 
     fn endpoint(

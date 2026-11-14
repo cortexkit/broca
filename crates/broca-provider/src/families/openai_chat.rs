@@ -20,6 +20,7 @@
 //!    tool-call argument fragments, ends with a `[DONE]` sentinel, and has no
 //!    in-band terminal event — the assembled message is emitted on `finish()`.
 
+use broca_protocol::wire_node::Node;
 use broca_protocol::{
     content::{
         AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
@@ -34,10 +35,11 @@ use broca_protocol::{
     StepId,
 };
 use serde_json::{json, Value};
+use std::borrow::Cow;
 
 use crate::families::{
     apply_generation_controls, merge_inclusive_input_tokens,
-    merge_inclusive_input_tokens_with_writes,
+    merge_inclusive_input_tokens_with_writes, TextRun,
 };
 use crate::normalize::classify_error_with_status_defaults;
 use crate::policy::{ReasoningEchoFormat, ReasoningEchoPolicy, ReasoningEchoTurns, UsagePolicy};
@@ -58,7 +60,11 @@ pub struct OpenAiChat;
 
 impl WireFamily for OpenAiChat {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        build_request_body(frozen, opts)
+        self.shape_with_provenance(frozen, opts, None)
+    }
+
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -67,7 +73,18 @@ impl WireFamily for OpenAiChat {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        with_request_body(frozen, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
     }
 
     fn shape_with_media(
@@ -87,11 +104,29 @@ impl WireFamily for OpenAiChat {
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
         let media = crate::media_render::MediaRender { frozen, payloads };
-        build_request_body_with_media_and_provenance(
+        with_request_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
+            |body| body.to_value(),
+        )
+    }
+
+    fn render_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        with_request_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| body.canonical_bytes(),
         )
     }
 
@@ -147,24 +182,16 @@ impl WireFamily for OpenAiChat {
 
 // ───────────────────────── request body ─────────────────────────
 
-fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-    build_request_body_with_media(frozen, opts, None)
-}
-
-fn build_request_body_with_media(
-    frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
-    build_request_body_with_media_and_provenance(frozen, opts, media, None)
-}
-
-fn build_request_body_with_media_and_provenance(
+/// Hands `use_body` the request body, its messages written as nodes that borrow the prompt's
+/// content. Every other member is small and is shaped as one JSON object. The body only lives
+/// inside this call, because the options the step prepares from `opts` live here too.
+fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Value {
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let turn_system = crate::turn_system::prepare(frozen, opts);
@@ -197,7 +224,6 @@ fn build_request_body_with_media_and_provenance(
         // request opts in. Without this, some providers stream a clean answer but report
         // zero tokens at step/run finish.
         "stream_options": { "include_usage": true },
-        "messages": messages,
     });
     // The output-token limit field name is a typed policy (max_tokens vs
     // max_completion_tokens for reasoning models).
@@ -253,7 +279,15 @@ fn build_request_body_with_media_and_provenance(
         &mut body,
         name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
     );
-    body
+    let Value::Object(rest) = body else {
+        unreachable!("the OpenAI Chat body is built as an object");
+    };
+    let mut members: Vec<(Cow<'_, str>, Node<'_>)> = rest
+        .into_iter()
+        .map(|(key, value)| (Cow::Owned(key), Node::value(value)))
+        .collect();
+    members.push(("messages".into(), Node::Array(messages)));
+    use_body(&Node::Object(members))
 }
 
 fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
@@ -279,15 +313,15 @@ fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
     }
 }
 
-fn convert_messages_with_provenance(
-    prompt: &[Message],
+fn convert_messages_with_provenance<'a>(
+    prompt: &'a [Message],
     reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
     opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     let mut out = Vec::new();
     let mut follow_up = Vec::new();
     let mut follow_up_origins = Vec::new();
@@ -300,16 +334,18 @@ fn convert_messages_with_provenance(
                     sink.record_parts(out.len(), start, end, ordinal);
                 }
             }
-            out.push(json!({"role":"user", "content":std::mem::take(&mut follow_up)}));
+            out.push(follow_up_message(std::mem::take(&mut follow_up)));
         }
         let origin_start = provenance.as_ref().map(|_| out.len());
         match m.role {
-            Role::System => {
-                out.push(json!({ "role": "system", "content": text_content(&m.content) }))
-            }
-            Role::User => {
-                out.push(json!({ "role": "user", "content": user_text_content(&m.content, media) }))
-            }
+            Role::System => out.push(Node::object([
+                ("role", Node::str("system")),
+                ("content", text_content(&m.content)),
+            ])),
+            Role::User => out.push(Node::object([
+                ("role", Node::str("user")),
+                ("content", user_text_content(&m.content, media)),
+            ])),
             Role::Assistant => out.push(convert_assistant(
                 m,
                 reasoning_echo,
@@ -321,11 +357,11 @@ fn convert_messages_with_provenance(
                 for b in &m.content {
                     if let ContentBlock::ToolResult(tr) = b {
                         let part_start = provenance.as_ref().map(|_| follow_up.len());
-                        out.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tr.tool_call_id.0,
-                            "content": tool_output_with_media(tr, media, &mut follow_up),
-                        }));
+                        out.push(Node::object([
+                            ("role", Node::str("tool")),
+                            ("tool_call_id", Node::str(&tr.tool_call_id.0)),
+                            ("content", tool_output_with_media(tr, media, &mut follow_up)),
+                        ]));
                         if let Some(start) = part_start.filter(|start| *start < follow_up.len()) {
                             follow_up_origins.push((start, follow_up.len(), m.ordinal));
                         }
@@ -344,18 +380,32 @@ fn convert_messages_with_provenance(
                 sink.record_parts(out.len(), start, end, ordinal);
             }
         }
-        out.push(json!({"role":"user", "content":follow_up}));
+        out.push(follow_up_message(follow_up));
     }
     out
 }
 
-fn tool_output_with_media(
-    result: &broca_protocol::ToolResult,
+/// The user message that carries a tool round's media, which a tool message can't.
+fn follow_up_message<'a>(content: Vec<Value>) -> Node<'a> {
+    Node::object([
+        ("role", Node::str("user")),
+        ("content", Node::value(Value::Array(content))),
+    ])
+}
+
+fn tool_output_with_media<'a>(
+    result: &'a broca_protocol::ToolResult,
     media: Option<&crate::media_render::MediaRender<'_>>,
     follow_up: &mut Vec<Value>,
-) -> String {
+) -> Node<'a> {
     let (ToolOutput::Parts { parts }, Some(media)) = (&result.output, media) else {
-        return tool_output_text(&result.output);
+        // The two outputs that carry their text as it is are written from the message, not
+        // copied.
+        return match &result.output {
+            ToolOutput::Text { text } => Node::str(text),
+            ToolOutput::Json { value } => Node::str(value.text()),
+            output => Node::string(tool_output_text(output)),
+        };
     };
     let grammar = super::openai_media::Grammar::Chat;
     let mut text = Vec::new();
@@ -386,7 +436,7 @@ fn tool_output_with_media(
         follow_up.push(grammar.text(&format!("Media from tool call {}:", result.tool_call_id.0)));
         follow_up.extend(blocks);
     }
-    text.join("\n")
+    Node::string(text.join("\n"))
 }
 
 /// An assistant turn: text content (or null) + any tool calls. Reasoning blocks are
@@ -416,52 +466,59 @@ fn tool_output_with_media(
 ///
 /// When `tool_call_content_empty_string` is set (ollama OpenAI-compat), a text-less turn uses
 /// `"content": ""` instead of `null`.
-fn convert_assistant(
-    m: &Message,
+fn convert_assistant<'a>(
+    m: &'a Message,
     reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
     opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
-) -> Value {
-    let mut text = String::new();
-    let mut reasoning = String::new();
+) -> Node<'a> {
+    let mut text = TextRun::default();
+    let mut reasoning = TextRun::default();
     let mut opencode_go_reasoning = false;
-    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<Node<'a>> = Vec::new();
     for b in &m.content {
         match b {
             ContentBlock::Text { text: t } | ContentBlock::TextWithState { text: t, .. } => {
-                text.push_str(t)
+                text.push(Cow::Borrowed(t))
             }
             ContentBlock::Reasoning { text, .. }
                 if reasoning_echo
                     .is_some_and(|p| p.format == ReasoningEchoFormat::ReasoningContent) =>
             {
-                reasoning.push_str(text);
+                reasoning.push(Cow::Borrowed(text));
             }
             ContentBlock::Reasoning { text, signature }
                 if opencode_go && signature.as_deref() == Some("reasoning") =>
             {
-                reasoning.push_str(text);
+                reasoning.push(Cow::Borrowed(text));
                 opencode_go_reasoning = true;
             }
-            ContentBlock::ToolCall(tc) => tool_calls.push(json!({
-                "id": tc.tool_call_id.0,
-                "type": "function",
-                "function": {
-                    "name": name_map.wire_name(&tc.tool_name),
-                    // OpenAI wants the arguments as a JSON-encoded STRING.
-                    "arguments": serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".into()),
-                },
-            })),
+            ContentBlock::ToolCall(tc) => tool_calls.push(Node::object([
+                ("id", Node::str(&tc.tool_call_id.0)),
+                ("type", Node::str("function")),
+                (
+                    "function",
+                    Node::object([
+                        (
+                            "name",
+                            Node::string(name_map.wire_name(&tc.tool_name).to_owned()),
+                        ),
+                        // OpenAI wants the arguments as a JSON-encoded STRING: the input's
+                        // JSON text, which is what serializing the input writes.
+                        ("arguments", Node::str(tc.input.text())),
+                    ]),
+                ),
+            ])),
             // Structured continuation state is handled separately under its own format tag;
             // tool results never belong in an assistant message.
             _ => {}
         }
     }
-    let mut msg = json!({ "role": "assistant" });
+    let mut msg: Vec<(Cow<'a, str>, Node<'a>)> = vec![("role".into(), Node::str("assistant"))];
     // OpenAI requires `content` present; it is null when the turn is only tool calls (unless
     // the provider opts into an empty string for that case).
-    msg["content"] = if text.is_empty() {
+    let content = if text.is_empty() {
         // The quirk is NOT scoped to tool-call turns, though it was written that way. What the
         // opted-in providers reject is `content: null` at all, and an assistant turn can be
         // empty with no tool calls: a step that bills output tokens and assembles neither text
@@ -477,41 +534,46 @@ fn convert_assistant(
         // provider -- so no run that ever worked renders differently, and the failure mode of
         // not bumping is a resumed run that now succeeds where it used to 400.
         if tool_call_content_empty_string {
-            Value::String(String::new())
+            Node::str("")
         } else {
-            Value::Null
+            Node::value(Value::Null)
         }
     } else {
-        Value::String(text)
+        text.take()
     };
-    if !tool_calls.is_empty() {
-        msg["tool_calls"] = Value::Array(tool_calls);
+    msg.push(("content".into(), content));
+    let has_tool_calls = !tool_calls.is_empty();
+    if has_tool_calls {
+        msg.push(("tool_calls".into(), Node::Array(tool_calls)));
     }
     // Coverage belongs to the frozen policy, not the current turn's contents. Scalar APIs
     // receive an empty string when no reasoning was stored; OpenRouter omits missing details.
-    if let Some(policy) = reasoning_echo.filter(|p| {
-        p.turns == ReasoningEchoTurns::EveryAssistant || msg.get("tool_calls").is_some()
-    }) {
+    if let Some(policy) =
+        reasoning_echo.filter(|p| p.turns == ReasoningEchoTurns::EveryAssistant || has_tool_calls)
+    {
         match policy.format {
             ReasoningEchoFormat::ReasoningContent => {
-                msg["reasoning_content"] = Value::String(reasoning);
+                msg.push(("reasoning_content".into(), reasoning.take()));
             }
             ReasoningEchoFormat::OpenRouterDetails => {
-                echo_openrouter_details(m, &mut msg);
+                if let Some((key, value)) = openrouter_details(m) {
+                    msg.push((key.into(), Node::value(value)));
+                }
             }
         }
     } else if opencode_go_reasoning {
         // OpenCode Go's OpenAI-compatible endpoint expects Pi's `reasoning` signature as
         // `reasoning_content` on the next request, rather than under the original field name.
-        msg["reasoning_content"] = Value::String(reasoning);
+        msg.push(("reasoning_content".into(), reasoning.take()));
     }
-    msg
+    Node::Object(msg)
 }
 
 /// OpenRouter: "pass the reasoning_details array back ... without any modifications".
 /// https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning-blocks
 /// The format tag prevents encrypted gateway state from becoming another API's signed thinking.
-fn echo_openrouter_details(message: &Message, wire: &mut Value) {
+/// The member to echo, when the message holds any.
+fn openrouter_details(message: &Message) -> Option<(&'static str, Value)> {
     let mut details = Vec::new();
     let mut reasoning = String::new();
     for block in &message.content {
@@ -531,32 +593,36 @@ fn echo_openrouter_details(message: &Message, wire: &mut Value) {
         }
     }
     if !details.is_empty() {
-        wire["reasoning_details"] = Value::Array(details);
+        Some(("reasoning_details", Value::Array(details)))
     } else if !reasoning.is_empty() {
         // OpenRouter also documents the scalar field for models returning only raw strings.
-        wire["reasoning"] = Value::String(reasoning);
+        Some(("reasoning", Value::String(reasoning)))
+    } else {
+        None
     }
 }
 
 // Preserve user block boundaries without changing the legacy scalar form for one text block.
-fn user_text_content(
-    blocks: &[ContentBlock],
+fn user_text_content<'a>(
+    blocks: &'a [ContentBlock],
     media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
+) -> Node<'a> {
+    let text_part =
+        |text: &'a str| Node::object([("type", Node::str("text")), ("text", Node::str(text))]);
     if blocks
         .iter()
         .any(|block| matches!(block, ContentBlock::Media(_)))
     {
-        return Value::Array(
+        return Node::Array(
             blocks
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                        Some(json!({"type":"text", "text":text}))
+                        Some(text_part(text))
                     }
                     ContentBlock::Media(reference) => {
                         let grammar = super::openai_media::Grammar::Chat;
-                        Some(
+                        Some(Node::value(
                             grammar
                                 .block(
                                     reference,
@@ -565,7 +631,7 @@ fn user_text_content(
                                     crate::media_profile::MediaCarrier::Native,
                                 )
                                 .unwrap_or_else(|reason| grammar.marker(reference, reason)),
-                        )
+                        ))
                     }
                     ContentBlock::Reasoning { .. }
                     | ContentBlock::RedactedReasoning { .. }
@@ -577,7 +643,7 @@ fn user_text_content(
                 .collect(),
         );
     }
-    let texts: Vec<&str> = blocks
+    let texts: Vec<&'a str> = blocks
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
@@ -587,25 +653,21 @@ fn user_text_content(
         })
         .collect();
     if texts.len() > 1 {
-        Value::Array(
-            texts
-                .into_iter()
-                .map(|text| json!({"type": "text", "text": text}))
-                .collect(),
-        )
+        Node::Array(texts.into_iter().map(text_part).collect())
     } else {
-        Value::String(text_content(blocks))
+        text_content(blocks)
     }
 }
 
-fn text_content(blocks: &[ContentBlock]) -> String {
-    let mut s = String::new();
+/// The text of `blocks`' text blocks, joined: borrowed when a single block holds it all.
+fn text_content(blocks: &[ContentBlock]) -> Node<'_> {
+    let mut run = TextRun::default();
     for b in blocks {
         if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
-            s.push_str(text);
+            run.push(Cow::Borrowed(text));
         }
     }
-    s
+    run.take()
 }
 
 /// `type_enums` adds a `type` to each typeless `enum` node of the schema, for providers whose

@@ -5,6 +5,7 @@
 //! incremental SSE splitter + `AnthropicNormalizer`. The live HTTP/SSE driver
 //! (the `live` feature) attaches a token and reqwest around this family.
 
+use broca_protocol::wire_node::{Node, NodeRef};
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolOutput},
     request::{CallOptions, Tool, ToolChoice},
@@ -120,17 +121,16 @@ fn persona(frozen: &FrozenRenderConfig) -> Option<&ClaudeCodePersona> {
 /// reference client adds the block only then). Its text depends only on the frozen persona
 /// (with the session's pinned `cc_version` suffix) and, for a persona recorded before the
 /// suffix was pinned, the first user message, so it is the same on every step of a run.
-fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Value> {
-    if !messages
+fn billing_block<'a>(persona: &ClaudeCodePersona, messages: &[Node<'_>]) -> Option<Node<'a>> {
+    let first_user = messages
         .iter()
-        .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-    {
-        return None;
-    }
+        .find(|message| message.get("role").and_then(NodeRef::as_str) == Some("user"))?;
     let suffix = match &persona.cc_version_suffix {
         Some(pinned) => pinned.clone(),
+        // Only a persona recorded before the suffix was pinned reads the message, and only the
+        // first user message: that one is copied into a JSON value, never the transcript.
         None => persona_rules::cc_version_suffix(
-            &persona_rules::first_user_message_text(messages),
+            &persona_rules::first_user_message_text(std::slice::from_ref(&first_user.to_value())),
             &persona.version,
         ),
     };
@@ -146,7 +146,7 @@ fn billing_block(persona: &ClaudeCodePersona, messages: &[Value]) -> Option<Valu
             persona.prompt_ordinal
         },
     );
-    Some(json!({ "type": "text", "text": text }))
+    Some(text_block(Node::string(text)))
 }
 
 /// The `cc_version` suffix for a transcript under client `version`: computed from its first user
@@ -159,7 +159,7 @@ pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> 
     let id_map = crate::tool_id_alias::ToolIdMap::build(single, &id_grammar());
     let name_map = crate::tool_name_alias::ToolNameMap::build(&[], single);
     // The first user message carries no handoff block, so the fallback echo decision is moot.
-    let wire = convert_message(first_user, false, false, &id_map, &name_map, None);
+    let wire = convert_message(first_user, false, false, &id_map, &name_map, None).to_value();
     Some(persona_rules::cc_version_suffix(
         &persona_rules::first_user_message_text(std::slice::from_ref(&wire)),
         version,
@@ -168,11 +168,19 @@ pub fn cc_version_suffix_for_transcript(messages: &[Message], version: &str) -> 
 
 /// A persona body's bytes: written in the persona's key order, then signed (`cch`). These are
 /// the bytes the run records, retries and dumps, so every copy carries the same signature.
-fn persona_bytes(body: &Value) -> Vec<u8> {
-    persona_rules::sign_body(&persona_rules::to_persona_json(body)).into_bytes()
+fn persona_bytes(body: &Node<'_>) -> Vec<u8> {
+    signed(persona_rules::to_persona_json_node(body))
 }
 
-fn render_body(frozen: &FrozenRenderConfig, opts: &CallOptions, body: &Value) -> Vec<u8> {
+/// A persona body signed in place, its buffer sized to its bytes: the request keeps them for
+/// as long as it can be retried.
+fn signed(mut body: String) -> Vec<u8> {
+    persona_rules::sign_body_in_place(&mut body);
+    body.shrink_to_fit();
+    body.into_bytes()
+}
+
+fn render_body(frozen: &FrozenRenderConfig, opts: &CallOptions, body: &Node<'_>) -> Vec<u8> {
     let fragments: Vec<_> = if frozen.server_side_fallback {
         opts.prompt
             .iter()
@@ -190,19 +198,18 @@ fn render_body(frozen: &FrozenRenderConfig, opts: &CallOptions, body: &Value) ->
         return if persona(frozen).is_some() {
             persona_bytes(body)
         } else {
-            broca_protocol::canonical_json_bytes(body)
+            body.canonical_bytes()
         };
     }
     if persona(frozen).is_some() {
         // Sign only after restoring the raw blocks: cch covers the body actually sent.
         let bytes = raw_fallback::splice(
-            persona_rules::to_persona_json(body).into_bytes(),
+            persona_rules::to_persona_json_node(body).into_bytes(),
             &fragments,
         );
-        persona_rules::sign_body(std::str::from_utf8(&bytes).expect("serialized JSON is UTF-8"))
-            .into_bytes()
+        signed(String::from_utf8(bytes).expect("serialized JSON is UTF-8"))
     } else {
-        raw_fallback::splice(broca_protocol::canonical_json_bytes(body), &fragments)
+        raw_fallback::splice(body.canonical_bytes(), &fragments)
     }
 }
 
@@ -260,7 +267,8 @@ fn persona_endpoint(
 ) -> HttpRequest {
     let base = frozen.base_url.as_deref().unwrap_or(DEFAULT_BASE);
     let url = format!("{}/v1/messages?beta=true", base.trim_end_matches('/'));
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // The betas depend only on the body's other members, never its transcript.
+    let parsed = persona_rules::body_without_messages(&body);
     let legacy = persona.version == "2.1.280";
     let betas = if legacy {
         persona_rules::select_legacy_betas(&parsed, &frozen.wire_model_id, &[])
@@ -359,13 +367,17 @@ impl WireFamily for AnthropicMessages {
         build_request_body(frozen, opts)
     }
 
+    fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
+        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
+    }
+
     fn shape_with_provenance(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        build_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
     }
 
     fn shape_with_media(
@@ -388,11 +400,12 @@ impl WireFamily for AnthropicMessages {
             frozen,
             payloads: media,
         };
-        build_request_body_with_media_and_provenance(
+        with_request_body(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
+            |body| body.to_value(),
         )
     }
 
@@ -412,8 +425,17 @@ impl WireFamily for AnthropicMessages {
         media: &[crate::media_render::InlineMedia<'_>],
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        let body = self.shape_with_media_and_provenance(frozen, opts, media, provenance);
-        render_body(frozen, opts, &body)
+        let media = crate::media_render::MediaRender {
+            frozen,
+            payloads: media,
+        };
+        with_request_body(
+            frozen,
+            opts,
+            frozen.media.as_ref().map(|_| &media),
+            provenance,
+            |body| render_body(frozen, opts, body),
+        )
     }
 
     /// A persona run's bytes are the persona's key order with the `cch` signature written in;
@@ -428,8 +450,9 @@ impl WireFamily for AnthropicMessages {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        let body = self.shape_with_provenance(frozen, opts, provenance);
-        render_body(frozen, opts, &body)
+        with_request_body(frozen, opts, None, provenance, |body| {
+            render_body(frozen, opts, body)
+        })
     }
 
     fn endpoint(
@@ -613,26 +636,24 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 
 // ───────────────────────── request body ─────────────────────────
 
-/// Build the Anthropic Messages request body from the frozen config + this step's
-/// `CallOptions`. A pure function of its inputs.
+/// The Anthropic Messages request body for the frozen config and this step's `CallOptions`, as
+/// a JSON value. A pure function of its inputs. The render paths don't build it: they write
+/// bytes from [`with_request_body`] directly.
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-    build_request_body_with_media(frozen, opts, None)
+    with_request_body(frozen, opts, None, None, |body| body.to_value())
 }
 
-fn build_request_body_with_media(
-    frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
-    build_request_body_with_media_and_provenance(frozen, opts, media, None)
-}
-
-fn build_request_body_with_media_and_provenance(
+/// Hands `use_body` the request body, written as a [`Node`] that borrows the prompt's content:
+/// its texts, signatures and tool inputs are written from the messages themselves, never
+/// copied into a JSON tree first. The body only lives inside this call, because the options the
+/// step's preparations derive from `opts` live here too.
+fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-) -> Value {
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let turn_system = crate::turn_system::prepare(frozen, opts);
@@ -686,7 +707,7 @@ fn build_request_body_with_media_and_provenance(
     // (`first_echoed_message`) so the request body and the tests' reference renderer read the
     // same positional cutoff and cannot drift.
     let first_echoed = echo_scope.and_then(|scope| first_echoed_message(scope, &non_system));
-    let rendered_messages: Vec<(Value, Option<u32>, usize)> = opts
+    let rendered_messages: Vec<(Node<'_>, Option<u32>, usize)> = opts
         .prompt
         .iter()
         .enumerate()
@@ -719,17 +740,14 @@ fn build_request_body_with_media_and_provenance(
         })
         // A cross-model reasoning gate can strip a turn's only block; Anthropic rejects an
         // empty message, so marker planning must see the filtered rendered-message indices.
-        .filter(|(message, _, _)| {
-            message
-                .get("content")
-                .and_then(Value::as_array)
-                .is_none_or(|content| !content.is_empty())
-        })
+        .filter(
+            |(message, _, _)| !matches!(content_of(message), Some(content) if content.is_empty()),
+        )
         .collect();
     // Keep only surviving message identities. System messages are coalesced into the
     // separate system field, and an empty rendered message has no wire-message index.
     let mut rendered_indices = vec![None; opts.prompt.len()];
-    let (mut messages, cache_prefix_blocks): (Vec<Value>, Vec<Option<u32>>) = rendered_messages
+    let (mut messages, cache_prefix_blocks): (Vec<Node<'_>>, Vec<Option<u32>>) = rendered_messages
         .into_iter()
         .enumerate()
         .map(|(wire_index, (message, prefix_blocks, prompt_index))| {
@@ -784,16 +802,16 @@ fn build_request_body_with_media_and_provenance(
         apply_anthropic_marker_plan(&mut system, &mut messages, frozen, ttl, &plan);
     }
 
-    let mut body = json!({
+    // Every other member is small: built as a JSON object, so the controls and structured
+    // output shared with the other families shape it as they shape theirs.
+    let mut rest = json!({
         "model": frozen.wire_model_id,
         "max_tokens": frozen.max_output_tokens,
         "stream": true,
-        "system": system,
-        "messages": messages,
     });
 
     if let ReasoningPolicy::AnthropicInterleaved { budget_tokens, .. } = frozen.reasoning {
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
+        rest["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
     }
     // A caller's reasoning variant replaces the policy's default thinking request outright:
     // its own `thinking` object, or none at all, plus the effort when it sets one.
@@ -803,29 +821,29 @@ fn build_request_body_with_media_and_provenance(
     }) = &frozen.variant
     {
         match thinking {
-            Some(thinking) => body["thinking"] = thinking.clone(),
+            Some(thinking) => rest["thinking"] = thinking.clone(),
             None => {
-                body.as_object_mut()
+                rest.as_object_mut()
                     .expect("Anthropic body is an object")
                     .remove("thinking");
             }
         }
         if let Some(effort) = effort {
-            body["output_config"] = json!({ "effort": effort });
+            rest["output_config"] = json!({ "effort": effort });
         }
     }
 
     if !opts.tools.is_empty() {
-        body["tools"] = Value::Array(
+        rest["tools"] = Value::Array(
             opts.tools
                 .iter()
                 .map(|tool| convert_tool(tool, &name_map))
                 .collect(),
         );
-        body["tool_choice"] = convert_tool_choice(&opts.tool_choice, &name_map);
+        rest["tool_choice"] = convert_tool_choice(&opts.tool_choice, &name_map);
     }
     apply_generation_controls(
-        body.as_object_mut()
+        rest.as_object_mut()
             .expect("Anthropic request body must stay a JSON object"),
         opts,
         "temperature",
@@ -835,7 +853,7 @@ fn build_request_body_with_media_and_provenance(
     // Fast mode, which is how a caller's `priority` tier renders on Anthropic. The matching
     // beta header is added in `anthropic_beta_header`. Absent leaves the body unchanged.
     if let Some(speed) = &frozen.speed {
-        body["speed"] = Value::String(speed.clone());
+        rest["speed"] = Value::String(speed.clone());
     }
     // A run admitted with server-side fallback asks the runtime to hand a content-filter
     // refusal to another model itself. The persona then appends the fallback beta and places
@@ -843,10 +861,10 @@ fn build_request_body_with_media_and_provenance(
     // flag and the version together (see `families::anthropic_renderer_version`), so a recorded
     // config never pairs an opt-in with a version that does not describe these bytes.
     if frozen.server_side_fallback {
-        body["fallbacks"] = Value::String("default".to_string());
+        rest["fallbacks"] = Value::String("default".to_string());
     }
     if let Some(persona) = persona(frozen) {
-        body["metadata"] = json!({
+        rest["metadata"] = json!({
             "user_id": persona_rules::metadata_user_id(
                 &persona.device_id,
                 persona.account_uuid.as_deref(),
@@ -856,20 +874,42 @@ fn build_request_body_with_media_and_provenance(
     }
     crate::structured_output::finish(
         frozen,
-        &mut body,
+        &mut rest,
         name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
     );
-    body
+    let Value::Object(rest) = rest else {
+        unreachable!("the Anthropic body is built as an object");
+    };
+    let mut members: Vec<(std::borrow::Cow<'_, str>, Node<'_>)> = rest
+        .into_iter()
+        .map(|(key, value)| (std::borrow::Cow::Owned(key), Node::value(value)))
+        .collect();
+    members.push(("system".into(), Node::Array(system)));
+    members.push(("messages".into(), Node::Array(messages)));
+    use_body(&Node::Object(members))
 }
 
-fn build_system(
-    frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
+/// The items of a rendered message's `content`, when it is an array.
+fn content_of<'n, 'a>(message: &'n Node<'a>) -> Option<&'n [Node<'a>]> {
+    match message.get("content") {
+        Some(NodeRef::Node(node)) => node.as_array(),
+        _ => None,
+    }
+}
+
+/// A `{"type":"text","text":...}` block.
+fn text_block(text: Node<'_>) -> Node<'_> {
+    Node::object([("type", Node::str("text")), ("text", text)])
+}
+
+fn build_system<'a>(
+    frozen: &'a FrozenRenderConfig,
+    opts: &'a CallOptions,
     coalesce_instruction_tail: bool,
-) -> Vec<Value> {
+) -> Vec<Node<'a>> {
     let mut system = Vec::new();
     if let SystemPromptPolicy::RequiredIdentityLead { identity } = &frozen.system_prompt {
-        system.push(json!({ "type": "text", "text": identity }));
+        system.push(text_block(Node::str(identity)));
     }
     for m in &opts.prompt {
         if m.role == Role::System && !m.turn_system {
@@ -879,7 +919,7 @@ fn build_system(
                 // emit empty text, so it changes no current render.
                 if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = b {
                     if !text.is_empty() {
-                        system.push(json!({ "type": "text", "text": text }));
+                        system.push(text_block(Node::str(text)));
                     }
                 }
             }
@@ -892,7 +932,7 @@ fn build_system(
     system
 }
 
-fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
+fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Node<'_>>) {
     let tail_start = system_tail_start(frozen, system);
     if tail_start >= system.len().saturating_sub(1) {
         return;
@@ -900,7 +940,7 @@ fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
 
     let merged = system[tail_start..]
         .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter_map(|block| block.get("text").and_then(NodeRef::as_str))
         .collect::<Vec<_>>()
         .join("\n");
     if merged.is_empty() {
@@ -908,13 +948,13 @@ fn coalesce_system_tail(frozen: &FrozenRenderConfig, system: &mut Vec<Value>) {
     }
 
     system.truncate(tail_start);
-    system.push(json!({ "type": "text", "text": merged }));
+    system.push(text_block(Node::string(merged)));
 }
 
 /// Where the caller's system text starts: after the required identity block and, on a
 /// persona run, after the billing block before it. Neither lead block ever carries a cache
 /// breakpoint or is merged into the caller's text.
-fn system_tail_start(frozen: &FrozenRenderConfig, system: &[Value]) -> usize {
+fn system_tail_start(frozen: &FrozenRenderConfig, system: &[Node<'_>]) -> usize {
     if !matches!(
         frozen.system_prompt,
         SystemPromptPolicy::RequiredIdentityLead { .. }
@@ -925,12 +965,12 @@ fn system_tail_start(frozen: &FrozenRenderConfig, system: &[Value]) -> usize {
         && system
             .first()
             .and_then(|block| block.get("text"))
-            .and_then(Value::as_str)
+            .and_then(NodeRef::as_str)
             .is_some_and(|text| text.starts_with(persona_rules::BILLING_HEADER_PREFIX));
     1 + usize::from(billing_leads)
 }
 
-fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Value]) -> usize {
+fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Node<'_>]) -> usize {
     system
         .get(system_tail_start(frozen, system)..)
         .unwrap_or_default()
@@ -940,21 +980,19 @@ fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Value]) -> usi
 }
 
 fn anthropic_marker_view(
-    messages: &[Value],
+    messages: &[Node<'_>],
     cache_prefix_blocks: &[Option<u32>],
 ) -> Vec<MarkerViewMessage> {
     messages
         .iter()
         .zip(cache_prefix_blocks)
         .map(|(message, cache_prefix_blocks)| {
-            let role = match message.get("role").and_then(Value::as_str) {
+            let role = match message.get("role").and_then(NodeRef::as_str) {
                 Some("user") => Role::User,
                 Some("assistant") => Role::Assistant,
                 _ => Role::Assistant,
             };
-            let block_count = message
-                .get("content")
-                .and_then(Value::as_array)
+            let block_count = content_of(message)
                 .map(|content| {
                     content
                         .iter()
@@ -972,9 +1010,9 @@ fn anthropic_marker_view(
         .collect()
 }
 
-fn is_anthropic_cacheable_block(block: &Value) -> bool {
+fn is_anthropic_cacheable_block(block: &Node<'_>) -> bool {
     matches!(
-        block.get("type").and_then(Value::as_str),
+        block.get("type").and_then(NodeRef::as_str),
         Some("text" | "tool_use" | "tool_result")
     )
 }
@@ -1004,8 +1042,8 @@ fn anthropic_marker_policy(
 }
 
 fn apply_anthropic_marker_plan(
-    system: &mut [Value],
-    messages: &mut [Value],
+    system: &mut [Node<'_>],
+    messages: &mut [Node<'_>],
     frozen: &FrozenRenderConfig,
     ttl: Option<CacheTtl>,
     plan: &MarkerPlan,
@@ -1029,14 +1067,14 @@ fn apply_anthropic_marker_plan(
 }
 
 fn set_anthropic_message_marker(
-    messages: &mut [Value],
+    messages: &mut [Node<'_>],
     target: MarkerTarget,
     ttl: Option<CacheTtl>,
 ) {
     let Some(content) = messages
         .get_mut(target.message_index)
         .and_then(|message| message.get_mut("content"))
-        .and_then(Value::as_array_mut)
+        .and_then(Node::as_array_mut)
     else {
         return;
     };
@@ -1057,15 +1095,15 @@ fn set_anthropic_message_marker(
 
 /// Write one breakpoint. With no `ttl` the marker is the bare `{"type":"ephemeral"}`, which
 /// Anthropic reads as its default 5-minute lifetime.
-fn set_anthropic_cache_control(block: &mut Value, ttl: Option<CacheTtl>) {
-    if let Some(object) = block.as_object_mut() {
-        object.remove("cacheControl");
-        object.remove("cache_control");
+fn set_anthropic_cache_control(block: &mut Node<'_>, ttl: Option<CacheTtl>) {
+    if block.is_object() {
+        block.remove("cacheControl");
+        block.remove("cache_control");
         let marker = match ttl {
             Some(ttl) => json!({ "type": "ephemeral", "ttl": ttl.as_str() }),
             None => json!({ "type": "ephemeral" }),
         };
-        object.insert("cache_control".to_string(), marker);
+        block.insert("cache_control", Node::value(marker));
     }
 }
 
@@ -1118,32 +1156,34 @@ fn first_echoed_message(scope: ThinkingEchoScope, non_system: &[&Message]) -> Op
 /// each canonical tool-call id to its Anthropic wire id (identity unless aliased).
 /// `echo_fallback` is true only when the request's frozen config opted into server-side
 /// fallback, which is the only case Anthropic's handoff block may be echoed back.
-fn convert_message(
-    m: &Message,
+fn convert_message<'a>(
+    m: &'a Message,
     keep_thinking: bool,
     echo_fallback: bool,
-    id_map: &crate::tool_id_alias::ToolIdMap,
-    name_map: &crate::tool_name_alias::ToolNameMap,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
+) -> Node<'a> {
     if m.turn_system {
-        return json!({
-            "role": if m.role == Role::System { "system" } else { "user" },
-            "content": crate::turn_system::text(m),
-        });
+        return Node::object([
+            (
+                "role",
+                Node::str(if m.role == Role::System {
+                    "system"
+                } else {
+                    "user"
+                }),
+            ),
+            ("content", Node::string(crate::turn_system::text(m))),
+        ]);
     }
-    match m.role {
+    let (role, content) = match m.role {
         Role::Tool => {
-            let mut content: Vec<Value> = m
+            let mut content: Vec<Node<'a>> = m
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolResult(tr) => Some(json!({
-                        "type": "tool_result",
-                        "tool_use_id": id_map.wire_id(&tr.tool_call_id.0),
-                        "content": tool_output_content(&tr.output, media),
-                        "is_error": tr.is_error,
-                    })),
+                    ContentBlock::ToolResult(tr) => Some(tool_result_block(tr, id_map, media)),
                     _ => None,
                 })
                 .collect();
@@ -1154,37 +1194,56 @@ fn convert_message(
                 m.tags
                     .rides_after_results()
                     .iter()
-                    .map(|text| json!({ "type": "text", "text": text })),
+                    .map(|text| text_block(Node::str(text))),
             );
-            json!({ "role": "user", "content": content })
+            ("user", content)
         }
-        Role::User => {
-            json!({ "role": "user", "content": convert_user_content(&m.content, id_map, name_map, media) })
-        }
-        Role::Assistant => {
-            json!({ "role": "assistant", "content": convert_content(&m.content, keep_thinking, echo_fallback, id_map, name_map, None) })
-        }
-        Role::System => {
-            json!({ "role": "user", "content": convert_content(&m.content, false, echo_fallback, id_map, name_map, None) })
-        }
-    }
+        Role::User => (
+            "user",
+            convert_user_content(&m.content, id_map, name_map, media),
+        ),
+        Role::Assistant => (
+            "assistant",
+            convert_content(
+                &m.content,
+                keep_thinking,
+                echo_fallback,
+                id_map,
+                name_map,
+                None,
+            ),
+        ),
+        Role::System => (
+            "user",
+            convert_content(&m.content, false, echo_fallback, id_map, name_map, None),
+        ),
+    };
+    Node::object([("role", Node::str(role)), ("content", Node::Array(content))])
 }
 
-fn convert_user_content(
-    blocks: &[ContentBlock],
-    id_map: &crate::tool_id_alias::ToolIdMap,
-    name_map: &crate::tool_name_alias::ToolNameMap,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Vec<Value> {
+fn tool_result_block<'a>(
+    tr: &'a broca_protocol::ToolResult,
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
+) -> Node<'a> {
+    Node::object([
+        ("type", Node::str("tool_result")),
+        ("tool_use_id", Node::str(id_map.wire_id(&tr.tool_call_id.0))),
+        ("content", tool_output_content(&tr.output, media)),
+        ("is_error", Node::value(Value::Bool(tr.is_error))),
+    ])
+}
+
+fn convert_user_content<'a>(
+    blocks: &'a [ContentBlock],
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
+) -> Vec<Node<'a>> {
     let mut content = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::ToolResult(tr) => content.push(json!({
-                "type": "tool_result",
-                "tool_use_id": id_map.wire_id(&tr.tool_call_id.0),
-                "content": tool_output_content(&tr.output, media),
-                "is_error": tr.is_error,
-            })),
+            ContentBlock::ToolResult(tr) => content.push(tool_result_block(tr, id_map, media)),
             _ => content.extend(convert_content(
                 std::slice::from_ref(block),
                 false,
@@ -1200,14 +1259,14 @@ fn convert_user_content(
     content
 }
 
-fn convert_content(
-    blocks: &[ContentBlock],
+fn convert_content<'a>(
+    blocks: &'a [ContentBlock],
     keep_thinking: bool,
     echo_fallback: bool,
-    id_map: &crate::tool_id_alias::ToolIdMap,
-    name_map: &crate::tool_name_alias::ToolNameMap,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Vec<Value> {
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
+) -> Vec<Node<'a>> {
     use crate::reasoning::{decide_reasoning, ReasoningDecision, SerializerProfile};
     blocks
         .iter()
@@ -1222,7 +1281,7 @@ fn convert_content(
                 None
             }
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                Some(json!({ "type": "text", "text": text }))
+                Some(text_block(Node::str(text)))
             }
             // The reasoning keep/clear decision routes through the SHARED decide_reasoning so
             // the reordering plugin/MITM legs inherit the §6.1.1 segmentation guard from the
@@ -1240,9 +1299,13 @@ fn convert_content(
                     SerializerProfile::SourceOrder,
                 ) == ReasoningDecision::Keep;
                 if keep {
-                    signature.as_ref().map(
-                        |sig| json!({ "type": "thinking", "thinking": text, "signature": sig }),
-                    )
+                    signature.as_ref().map(|sig| {
+                        Node::object([
+                            ("type", Node::str("thinking")),
+                            ("thinking", Node::str(text)),
+                            ("signature", Node::str(sig)),
+                        ])
+                    })
                 } else {
                     None
                 }
@@ -1259,14 +1322,19 @@ fn convert_content(
                         blocks,
                         SerializerProfile::SourceOrder,
                     ) == ReasoningDecision::Keep;
-                keep.then(|| json!({ "type": "redacted_thinking", "data": data }))
+                keep.then(|| {
+                    Node::object([
+                        ("type", Node::str("redacted_thinking")),
+                        ("data", Node::str(data)),
+                    ])
+                })
             }
-            ContentBlock::ToolCall(tc) => Some(json!({
-                "type": "tool_use",
-                "id": id_map.wire_id(&tc.tool_call_id.0),
-                "name": name_map.wire_name(&tc.tool_name),
-                "input": tc.input,
-            })),
+            ContentBlock::ToolCall(tc) => Some(Node::object([
+                ("type", Node::str("tool_use")),
+                ("id", Node::str(id_map.wire_id(&tc.tool_call_id.0))),
+                ("name", Node::str(name_map.wire_name(&tc.tool_name))),
+                ("input", Node::Json(&tc.input)),
+            ])),
             // A tool_result inside a non-Tool message is unusual; the Tool-role path
             // above handles results.
             ContentBlock::ToolResult(_) => None,
@@ -1279,11 +1347,14 @@ fn convert_content(
                 from_model,
                 to_model,
                 raw,
-            } => echo_fallback.then(|| raw_fallback::shape(from_model, to_model, raw.as_deref())),
+            } => echo_fallback
+                .then(|| Node::value(raw_fallback::shape(from_model, to_model, raw.as_deref()))),
         })
         .collect()
 }
 
+/// A tool output as the text a `tool_result` carries, when it is not one of the outputs
+/// written from the message itself (text and JSON).
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
         ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
@@ -1311,34 +1382,38 @@ fn tool_output_text(out: &ToolOutput) -> String {
     }
 }
 
-fn tool_output_content(
-    out: &ToolOutput,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-) -> Value {
-    if let (ToolOutput::Parts { parts }, Some(media)) = (out, media) {
-        return Value::Array(
+fn tool_output_content<'a>(
+    out: &'a ToolOutput,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
+) -> Node<'a> {
+    match (out, media) {
+        (ToolOutput::Parts { parts }, Some(media)) => Node::Array(
             parts
                 .iter()
                 .filter_map(|part| match part {
                     broca_protocol::ToolOutputPart::Text { text } if text.is_empty() => None,
                     broca_protocol::ToolOutputPart::Text { text } => {
-                        Some(json!({"type":"text", "text":text}))
+                        Some(text_block(Node::str(text)))
                     }
                     broca_protocol::ToolOutputPart::Media { media: reference } => {
                         Some(media_block(reference, Some(media), true))
                     }
                 })
                 .collect(),
-        );
+        ),
+        // The two outputs that carry their text as it is: written from the message, not
+        // copied.
+        (ToolOutput::Text { text }, _) => Node::str(text),
+        (ToolOutput::Json { value }, _) => Node::str(value.text()),
+        _ => Node::string(tool_output_text(out)),
     }
-    Value::String(tool_output_text(out))
 }
 
-fn media_block(
-    reference: &broca_protocol::MediaRef,
-    media: Option<&crate::media_render::MediaRender<'_>>,
+fn media_block<'a>(
+    reference: &'a broca_protocol::MediaRef,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
     tool: bool,
-) -> Value {
+) -> Node<'a> {
     use broca_protocol::{MediaKind, MediaMarkerReason};
     let payload = media
         .ok_or(MediaMarkerReason::Carrier)
@@ -1349,14 +1424,31 @@ fn media_block(
                 MediaKind::Image => "image",
                 MediaKind::Document => "document",
                 MediaKind::Audio | MediaKind::Video => {
-                    return json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(reference, MediaMarkerReason::Carrier)})
+                    return text_block(Node::string(
+                        broca_protocol::content::media_not_shown_marker(
+                            reference,
+                            MediaMarkerReason::Carrier,
+                        ),
+                    ))
                 }
             };
-            return json!({"type":kind, "source":{"type":"base64", "media_type":reference.mime, "data":base64}});
+            return Node::object([
+                ("type", Node::str(kind)),
+                (
+                    "source",
+                    Node::object([
+                        ("type", Node::str("base64")),
+                        ("media_type", Node::str(&reference.mime)),
+                        ("data", Node::str(base64)),
+                    ]),
+                ),
+            ]);
         }
         Err(reason) => reason,
     };
-    json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(reference, reason)})
+    text_block(Node::string(
+        broca_protocol::content::media_not_shown_marker(reference, reason),
+    ))
 }
 
 #[cfg(test)]
@@ -1596,6 +1688,7 @@ mod tests {
                     &name_map,
                     None,
                 )
+                .to_value()
             })
             .collect()
     }

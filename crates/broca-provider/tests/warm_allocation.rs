@@ -284,11 +284,13 @@ async fn legacy_warm_allocations_match_base_path() {
         "the counter must observe allocations during the warm"
     );
     // Distinct lengths isolate request parsing, response metadata and account copies from
-    // unrelated network buffer allocations. The reference is the original legacy path.
+    // unrelated network buffer allocations. The reference is the original legacy path. The warm
+    // body is edited in the request's text, never parsed, so the request's long string is never
+    // copied; the response's metadata and the account are each read once.
     assert_eq!(
         &reference.1[1..],
-        &[1, 1, 1],
-        "the original warm path visits each marked string once"
+        &[0, 1, 1],
+        "the warm path copies no request string and visits each response string once"
     );
     assert_eq!(&actual.1[1..], &reference.1[1..]);
     let bodies = server.await.unwrap();
@@ -328,7 +330,7 @@ async fn legacy_success_total_allocations_include_digest_and_all_boxes() {
     assert_eq!(actual.0.unwrap().usage.cached_input_tokens, Some(4000));
     assert_eq!(
         reference.1,
-        [66, 1, 1, 1],
+        [48, 0, 1, 1],
         "pin the original ready-success path, including its digest and box allocations"
     );
     assert_eq!(actual.1, reference.1, "with network scheduling removed, any digest clone or success-only box adds a counted allocation");
