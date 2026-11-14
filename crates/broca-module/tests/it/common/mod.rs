@@ -442,6 +442,7 @@ impl FakeExecutor {
             session: job.req.session.clone(),
             config: Box::new(broca_wal::RunConfig {
                 route_decision_id: job.req.route_decision_id.clone(),
+                served_provider: None,
                 account_route: job.req.account_route.clone(),
                 account_limit_pause: false,
                 turn_directives_v1: job.req.directives.clone(),
@@ -549,6 +550,7 @@ fn min_config() -> broca_wal::RunConfig {
         account_route: None,
         global_system: None,
         route_decision_id: None,
+        served_provider: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

@@ -130,6 +130,10 @@ pub struct Admission {
     pub account_limit_pause: bool,
     /// The routing decision the run was admitted under.
     pub route_decision_id: Option<String>,
+    /// The catalog provider whose rows the run borrowed, for a model whose provider the catalog
+    /// doesn't carry (`RunConfig::served_provider`). Stored in the run's config members, so a
+    /// resume and the run's spend read it back and never resolve it again.
+    pub served_provider: Option<String>,
     /// The service tier the send asked for. The provider's frozen render config holds the tier
     /// requests are sent at; this is what the attempt records and compaction conditions name.
     pub service_tier: Option<broca_protocol::request::ServiceTier>,
@@ -1842,6 +1846,7 @@ pub fn admission_of_start(
         budget: decode::<broca_protocol::request::BudgetConfig>(member("budget"))?
             .filter(|budget| *budget != broca_protocol::request::BudgetConfig::default()),
         route_decision_id: start.route_decision_id.clone(),
+        served_provider: None,
         service_tier: decode(start.service_tier.clone().map(Value::String))?,
         variant: decode(member("variant"))?,
         work_class: decode(member("work_class"))?,
@@ -3680,6 +3685,10 @@ async fn admit<W: Writer>(
             to_value(admission.directives.as_ref())?,
         ),
         ("work_class", to_value(admission.work_class.as_ref())?),
+        (
+            "served_provider",
+            to_value(admission.served_provider.as_ref())?,
+        ),
         ("variant", to_value(admission.variant.as_ref())?),
         (
             "context_management",

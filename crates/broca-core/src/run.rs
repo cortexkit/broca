@@ -774,6 +774,10 @@ pub struct RunControl {
     /// catalog. A fresh run freezes it onto `RunConfig.context_limit`; a resume ignores this
     /// and keeps the value already frozen in the WAL. `None` means neither source had one.
     pub admitted_context_limit: Option<u64>,
+    /// The catalog provider whose rows admission borrowed for a model whose provider the
+    /// catalog doesn't carry (`RunConfig::served_provider`). A fresh run freezes it; a resume
+    /// keeps the value already frozen.
+    pub served_provider: Option<String>,
     /// Admission identity bit for the optional tool surface. It is frozen in `RunConfig` but
     /// never supplied to a provider renderer.
     pub tools_were_omitted: bool,
@@ -967,6 +971,7 @@ impl Default for RunControl {
             pause_for_auth_at_start: None,
             auth_selection: None,
             admitted_context_limit: None,
+            served_provider: None,
             tools_were_omitted: false,
             shutdown_seal: None,
             stop_requested: None,
@@ -13705,6 +13710,7 @@ mod tests {
             global_system: None,
             account_route: None,
             route_decision_id: None,
+            served_provider: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -15735,6 +15741,7 @@ mod tests {
             global_system: None,
             account_route: None,
             route_decision_id: None,
+            served_provider: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

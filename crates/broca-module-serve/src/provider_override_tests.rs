@@ -234,7 +234,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         inherit_frozen_cache: false, structured_output: None,
     };
     assert!(executor
-        .cache_policy_for_episode(true, None, &req, None)
+        .cache_policy_for_episode(true, None, &req, req.model.provider_module_id.as_str(), None)
         .unwrap()
         .is_none());
     // DeepSeek caches automatically. Switch to the overridden Anthropic provider and
@@ -248,7 +248,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         mode: None,
     });
     assert!(executor
-        .cache_policy_for_episode(true, Some(WireFamilyId::AnthropicMessages), &req, None)
+        .cache_policy_for_episode(true, Some(WireFamilyId::AnthropicMessages), &req, req.model.provider_module_id.as_str(), None)
         .unwrap()
         .is_some());
     assert_resume_replays_the_admitted_cache_policy(&executor, req.clone());
@@ -274,7 +274,7 @@ fn assert_resume_replays_the_admitted_cache_policy(
     req.cache = None;
     let family = Some(WireFamilyId::AnthropicMessages);
     let fresh = executor
-        .cache_policy_for_episode(true, family, &req, None)
+        .cache_policy_for_episode(true, family, &req, req.model.provider_module_id.as_str(), None)
         .unwrap();
     assert!(
         matches!(
@@ -309,14 +309,14 @@ fn assert_resume_replays_the_admitted_cache_policy(
 
     assert_eq!(
         executor
-            .cache_policy_for_episode(false, family, &req, Some(&admitted_with(None)))
+            .cache_policy_for_episode(false, family, &req, req.model.provider_module_id.as_str(), Some(&admitted_with(None)))
             .unwrap(),
         None,
         "a run admitted before the default froze no policy and resumes with no markers"
     );
     assert_eq!(
         executor
-            .cache_policy_for_episode(false, family, &req, Some(&admitted_with(fresh.clone())))
+            .cache_policy_for_episode(false, family, &req, req.model.provider_module_id.as_str(), Some(&admitted_with(fresh.clone())))
             .unwrap(),
         fresh,
         "a run admitted with the default resumes with it"
@@ -453,7 +453,7 @@ fn drift_run_config(
     req: &broca_core::RunRequest,
     started: &broca_catalog::live::ProviderResolution,
 ) -> broca_wal::RunConfig {
-    broca_wal::RunConfig { account_route: None, global_system: None, route_decision_id: None, account_limit_pause: false, turn_directives_v1: None, render_tags: false, computed_tags: None,
+    broca_wal::RunConfig { account_route: None, global_system: None, route_decision_id: None, served_provider: None, account_limit_pause: false, turn_directives_v1: None, render_tags: false, computed_tags: None,
         model: req.model.clone(),
         tools: req.tools.clone().into(),
         tool_choice: req.tool_choice.clone(),
@@ -1345,6 +1345,11 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
 /// "run ended before admission", an unclassified infrastructure failure that hides the cause.
 #[tokio::test]
 async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
+    // Admission reads the process-wide catalog before the prompt history, and other tests
+    // replace that catalog while they run, so this one runs in a child process of its own.
+    if !run_catalog_drift_child("an_unreadable_prompt_history_is_refused_through_the_admission_ack") {
+        return;
+    }
     use broca_core::WalStore as _;
     let root = broca_test_support::scratch_root()
         .join(format!("broca-prompt-ack-{}", std::process::id()));

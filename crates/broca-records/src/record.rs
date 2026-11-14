@@ -4004,6 +4004,13 @@ pub struct RunConfig {
     /// Caller-owned decision fixed for the run; AuthSelection holds routing's own decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_decision_id: Option<String>,
+    /// The catalog provider whose rows a run borrowed, when its model's provider is one the
+    /// catalog doesn't carry (`anthropic-platform`, a company gateway): the provider its vault
+    /// credentials serve. The run's facts and render config came from that provider's row, and
+    /// it is billed and reported as it; `model` keeps the provider the caller named. Absent for
+    /// a provider the catalog carries. A resume reads it from here and never resolves it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_provider: Option<String>,
     /// Routing's account namespace, frozen independently of the model-call names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_route: Option<broca_protocol::request::AccountRoute>,
@@ -4101,6 +4108,16 @@ pub struct RunConfig {
     /// ignore this optional member and continue to read only transcript input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_system: Option<Arc<Vec<Message>>>,
+}
+
+impl RunConfig {
+    /// The provider a run is billed and reported as: the catalog provider whose rows it
+    /// borrowed (`served_provider`), else its model's provider.
+    pub fn billed_provider(&self) -> &str {
+        self.served_provider
+            .as_deref()
+            .unwrap_or(self.model.provider_module_id.as_str())
+    }
 }
 
 /// A run's frozen computed tag rules (`runner-tags/v2`).

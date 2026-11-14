@@ -2373,3 +2373,76 @@ fn listed_credentials<const N: usize>(pairs: [(&str, &str); N]) -> Arc<broca_mod
     cache.store(broca_subc::vault::ScopedList { credentials, grants:1, grant_tuples:vec![], view:"fixture".into() });
     cache
 }
+
+/// A listing of paid Anthropic keys filed the way the vault files them: under the
+/// `anthropic-platform` route, serving the catalog's `anthropic` rows. `extra` adds rows as JSON.
+fn pool_listing(extra: &[serde_json::Value]) -> Arc<broca_module_serve::account_routing::ListingCache> {
+    let mut rows: Vec<serde_json::Value> = ["acct1", "acct2"].iter().map(|label| serde_json::json!({
+        "id": format!("apikey:anthropic:{label}"), "type": "apikey", "categories": ["llm"],
+        "serves": ["anthropic"], "state": "active", "record_version": 1, "operations": ["read"],
+        "auth_method": "apikey", "provider_ids": ["anthropic-platform"]})).collect();
+    rows.extend(extra.iter().cloned());
+    let credentials = rows.into_iter().map(|row| serde_json::from_value(row).unwrap()).collect();
+    let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+    cache.store(broca_subc::vault::ScopedList { credentials, grants: 1, grant_tuples: vec![], view: "fixture".into() });
+    cache
+}
+
+/// A run on a provider the catalog lacks borrows the rows of the one catalog provider its
+/// credentials serve; a provider the catalog carries borrows nothing; credentials naming no
+/// catalog provider, or several, refuse; and an unread listing is retryable, never "no rows".
+#[tokio::test]
+async fn a_provider_outside_the_catalog_borrows_the_rows_its_credentials_serve() {
+    // It replaces the process-wide catalog, so it runs in a child process of its own.
+    if !run_catalog_drift_child("a_provider_outside_the_catalog_borrows_the_rows_its_credentials_serve") {
+        return;
+    }
+    install_test_catalog();
+    let root = fresh_vault_root("served-provider");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let other = serde_json::json!({"id": "apikey:corp:gw", "type": "apikey", "categories": ["llm"],
+        "serves": ["anthropic", "openai"], "state": "active", "record_version": 1,
+        "operations": ["read"], "auth_method": "apikey", "provider_ids": ["corp"]});
+    let unserved = serde_json::json!({"id": "apikey:nowhere", "type": "apikey", "categories": ["llm"],
+        "serves": ["not-a-catalog-provider"], "state": "active", "record_version": 1,
+        "operations": ["read"], "auth_method": "apikey", "provider_ids": ["nowhere"]});
+    let executor = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2),
+        pool_listing(&[other, unserved]), supervised_broca_identity()).await;
+
+    assert_eq!(executor.served_provider_for("anthropic-platform").await.unwrap().as_deref(), Some("anthropic"));
+    assert_eq!(executor.served_provider_for("anthropic").await.unwrap(), None);
+    for (provider, why) in [("corp", "several catalog providers"), ("nowhere", "name no catalog provider"),
+        ("unlisted", "no active credential")] {
+        match executor.served_provider_for(provider).await {
+            Err(RunError::Config(message)) => assert!(message.contains(why), "{provider}: {message}"),
+            other => panic!("{provider}: {other:?}"),
+        }
+    }
+
+    drop(executor);
+
+    // The serving check reads the same answer: a plan naming the pool route is checked against
+    // Anthropic's rows and accepted, where the catalog alone has no such provider. One key, so
+    // the check needs no routing to find it; a model Anthropic lacks is still refused.
+    let one_key = pool_listing(&[]);
+    let mut list = one_key.get().unwrap().0.as_ref().clone();
+    list.credentials.truncate(1);
+    one_key.store(list);
+    let mut single = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2), one_key,
+        supervised_broca_identity()).await;
+    single.provider_base_url = None;
+    let plan = |model: &str| serde_json::json!({"model": {"provider": "anthropic-platform", "model": model}});
+    let selected = single.check_plan_selection(&plan("claude-haiku-4-5")).await;
+    assert!(matches!(&selected, Ok(Some(model)) if model.provider == "anthropic-platform"), "{selected:?}");
+    assert_eq!(single.check_plan_selection(&plan("not-an-anthropic-model")).await,
+        Err(cortexkit_role_llm_runner::head_selection::PlanModelProblem::UnsupportedModel));
+    drop(single);
+    let unread = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2),
+        Arc::new(broca_module_serve::account_routing::ListingCache::default()),
+        supervised_broca_identity()).await;
+    assert!(matches!(unread.served_provider_for("anthropic-platform").await,
+        Err(RunError::CredentialsUnavailable)));
+    drop(unread);
+    daemon.assert_healthy();
+    std::fs::remove_dir_all(root).unwrap();
+}

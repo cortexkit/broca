@@ -53,6 +53,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
             global_system: None,
             account_route: None,
             route_decision_id: None,
+            served_provider: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

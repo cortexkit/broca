@@ -249,6 +249,94 @@ async fn a_store_session_runs_through_the_production_executor() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// On the new storage, a run on a paid key filed under `anthropic-platform` stores the provider
+/// whose rows it borrowed with its config, so the next admission (and a resume, and the run's
+/// spend) reads `anthropic` back rather than resolving it again; both runs go to Anthropic's
+/// endpoint with the key in `x-api-key`.
+#[tokio::test]
+async fn a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed() {
+    // It replaces the process-wide catalog, so it runs in a child process of its own.
+    if !run_catalog_drift_child("a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed") {
+        return;
+    }
+    let server = resume_http_fixture().await;
+    let root = broca_test_support::scratch_root()
+        .join(format!("store-run-borrowed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    install_test_catalog();
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let pool = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+    pool.store(broca_subc::vault::ScopedList {
+        credentials: vec![serde_json::from_value(serde_json::json!({
+            "id": "apikey:anthropic:acct1", "type": "apikey", "categories": ["llm"],
+            "serves": ["anthropic"], "state": "active", "record_version": 1,
+            "operations": ["read"], "auth_method": "apikey",
+            "provider_ids": ["anthropic-platform"]}))
+        .unwrap()],
+        grants: 1,
+        grant_tuples: vec![],
+        view: "fixture".into(),
+    });
+    let executor = executor_with_vault_addressing(
+        &root,
+        &daemon,
+        Duration::from_secs(2),
+        pool,
+        supervised_broca_identity(),
+    )
+    .await
+    .with_provider_overrides(runtime_overrides(&server.url));
+    let mut session = store_session().await;
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    for (run, text) in [("pool-run-1", "hello"), ("pool-run-2", "again")] {
+        let mut req = drift_request(&root);
+        req.model = broca_protocol::request::ModelHandle::new("anthropic-platform", "claude-haiku-4-5");
+        req.generation.max_output_tokens = Some(1024);
+        req.run_id = broca_protocol::RunId(run.into());
+        req.input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text: text.into() }],
+        )];
+        let end = serve_store_run(
+            &executor,
+            &mut session,
+            &parts,
+            req,
+            broca_module::executor::StoreRunMode::Fresh,
+        )
+        .await;
+        match end.result {
+            Ok(finished) => assert_eq!(finished.reason, RunFinishReason::Completed, "{run}"),
+            Err(error) => panic!("{run} ends: {error:?}"),
+        }
+        let (writer, _link) = broca_session_loop::shared::ActorWriter::new(&session, None);
+        let prior = store_history(&writer, &parts)
+            .await
+            .unwrap()
+            .prior_run
+            .expect("the session's latest run");
+        assert_eq!(prior.run_id.0, run);
+        assert_eq!(prior.config.model.provider_module_id, "anthropic-platform");
+        assert_eq!(prior.config.served_provider.as_deref(), Some("anthropic"), "{run}");
+        assert_eq!(prior.config.billed_provider(), "anthropic");
+    }
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request.headers.lines().next().unwrap().contains("/messages "));
+        assert!(request.headers.to_ascii_lowercase().contains("x-api-key:"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "claude-haiku-4-5");
+    }
+    drop(requests);
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A leftover trial selection file must not change fresh runs, even in the listed project.
 /// Check the config persisted by the production executor, not just the catalog's default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -276,3 +276,119 @@ async fn production_executor_preserves_unverifiable_blob_code_and_class() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+/// Admit and run one fresh episode of `claude-haiku-4-5` under `provider` through the
+/// production executor, its vault (`listing`) and an HTTP stand-in for Anthropic's host.
+/// Returns the request the stand-in received and the session's records.
+async fn borrowed_rows_run(
+    label: &str,
+    provider: &str,
+    listing: Arc<broca_module_serve::account_routing::ListingCache>,
+) -> (CapturedResumeRequest, Vec<broca_wal::FramedRecord>) {
+    let root = fresh_vault_root(label);
+    let server = resume_http_fixture().await;
+    let vault = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_vault_addressing(&root, &vault, Duration::from_secs(2), listing,
+        supervised_broca_identity()).await
+        .with_provider_overrides(broca_module_serve::provider_overrides::ProviderOverrides::parse(
+            &serde_json::json!({"providers": {"anthropic": {"base_url": server.url}}}).to_string(),
+        ).unwrap());
+    let mut req = drift_request(&root);
+    req.run_id = broca_protocol::RunId("borrowed".into());
+    req.model = broca_protocol::request::ModelHandle::new(provider, "claude-haiku-4-5");
+    req.generation.max_output_tokens = Some(1024);
+    req.input = vec![broca_protocol::Message::new(broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text { text: "hello".into() }])];
+    let store = Arc::clone(&executor.wal_store);
+    let writer = Arc::new(broca_core::WalHandle::spawn(store.open(&req.session).unwrap(), 0).unwrap());
+    let prior_snapshot = broca_core::load_prior_wal_snapshot(store.as_ref(), &req.session,
+        writer.durable_head().load(Ordering::Acquire), None::<&broca_store::SqliteStore>).unwrap();
+    let session = req.session.clone();
+    let job = RunJob { queued_service_tier: None, media: Vec::new(), media_profile: None, req,
+        auth: Some(broca_protocol::AuthRequest { method: "apikey".into(), account: None, pool: None,
+            credential_id: None }),
+        conversation_key: None, writer: Arc::clone(&writer), kind: RunKind::FreshOrResume,
+        skip_materialization: true, control: Default::default(), prior_snapshot, on_admitted: None };
+    let (out, mut events) = mpsc::channel(128);
+    let summary = tokio::time::timeout(Duration::from_secs(15), executor.execute(job, out)).await
+        .expect("the run must end");
+    Arc::try_unwrap(writer).unwrap_or_else(|_| panic!("executor released the session writer"))
+        .shutdown().await.unwrap();
+    vault.assert_healthy();
+    let summary = summary.unwrap_or_else(|error| panic!("{provider}: {error:?}"));
+    assert_eq!(summary.reason, RunFinishReason::Completed, "{provider}");
+    while events.recv().await.is_some() {}
+    let records = store.read_records(&session).unwrap();
+    let request = server.requests.lock().unwrap().pop().expect("one model call");
+    drop(executor);
+    let _ = std::fs::remove_dir_all(root);
+    (request, records)
+}
+
+/// A paid Anthropic key filed under `anthropic-platform`, a provider the catalog lacks, runs on
+/// Anthropic's rows: the provider receives the same request a plain `anthropic` key run sends,
+/// with the key in `x-api-key` and no Claude Code persona, the run freezes the borrowed provider
+/// and its spend names `anthropic` with the pool key that paid.
+#[tokio::test]
+async fn a_pool_key_run_borrows_anthropic_rows_and_renders_the_same_request() {
+    // It replaces the process-wide catalog, so it runs in a child process of its own.
+    if !run_catalog_drift_child("a_pool_key_run_borrows_anthropic_rows_and_renders_the_same_request") {
+        return;
+    }
+    install_test_catalog();
+    let pool = {
+        let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+        cache.store(broca_subc::vault::ScopedList { credentials: vec![serde_json::from_value(
+            serde_json::json!({"id": "apikey:anthropic:acct1", "type": "apikey", "categories": ["llm"],
+                "serves": ["anthropic"], "state": "active", "record_version": 1,
+                "operations": ["read"], "auth_method": "apikey",
+                "provider_ids": ["anthropic-platform"]})).unwrap()],
+            grants: 1, grant_tuples: vec![], view: "fixture".into() });
+        cache
+    };
+    let (borrowed, records) = borrowed_rows_run("pool-borrowed", "anthropic-platform", pool).await;
+    let (plain, _) = borrowed_rows_run("pool-plain", "anthropic",
+        listed_credentials([("apikey:anthropic", "apikey:anthropic")])).await;
+
+    assert_eq!(borrowed.body, plain.body, "the borrowed run renders Anthropic's request");
+    let body: serde_json::Value = serde_json::from_slice(&borrowed.body).unwrap();
+    assert_eq!(body["model"], "claude-haiku-4-5");
+    let headers = borrowed.headers.to_ascii_lowercase();
+    assert!(borrowed.headers.lines().next().unwrap().contains("/messages "), "{headers}");
+    assert!(headers.contains("x-api-key:"), "a paid key goes in x-api-key");
+    assert!(!headers.contains("authorization:"), "and never as a bearer token");
+    assert!(!String::from_utf8_lossy(&borrowed.body).contains("Claude Code"),
+        "a paid key run carries no Claude Code persona");
+
+    let config = records.iter().find_map(|record| match &record.record {
+        broca_wal::WalRecord::RunStarted { config, .. } => Some(config.as_ref().clone()),
+        _ => None,
+    }).expect("the run started");
+    assert_eq!(config.model.provider_module_id, "anthropic-platform", "the caller's provider is kept");
+    assert_eq!(config.served_provider.as_deref(), Some("anthropic"));
+    let selection = config.auth_selection.as_ref().expect("a vault run freezes its selection");
+    assert_eq!(selection.credential_id, "apikey:anthropic-platform", "keyed on the caller's route");
+    assert_eq!(selection.resolved_credential_id.as_deref(), Some("apikey:anthropic:acct1"),
+        "and paid by the pool key the vault lists");
+    let segments = broca_core::billing::compute_segments(&records, "instance",
+        &broca_module_serve::ChargeBasisTable::shipped_defaults());
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].provider, "anthropic");
+    assert_eq!(segments[0].charge_basis, broca_core::ChargeBasis::MeteredApi);
+    // Reader samples, written only when asked: the pool run's usage fact segment and its frozen
+    // run config, through the serializers the export and the run log use.
+    if let Some(dir) = std::env::var_os("BROCA_DESIGN32_SAMPLES") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pool-run-export-fact-segment.json"),
+            serde_json::to_vec_pretty(&segments[0]).unwrap()).unwrap();
+        std::fs::write(dir.join("pool-run-frozen-run-config.json"),
+            serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        std::fs::write(dir.join("pool-run-request-body.json"), &borrowed.body).unwrap();
+        let steps: Vec<_> = records.iter().filter(|record| matches!(record.record,
+            broca_wal::WalRecord::ModelStepFinished { .. } | broca_wal::WalRecord::RunFinished { .. }))
+            .map(|record| &record.record).collect();
+        std::fs::write(dir.join("pool-run-step-and-finish-records.json"),
+            serde_json::to_vec_pretty(&steps).unwrap()).unwrap();
+    }
+}

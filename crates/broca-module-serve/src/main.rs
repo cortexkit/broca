@@ -2818,6 +2818,9 @@ mod executor {
         routing_decision_error: Option<ProviderError>,
         mode: broca_core::StartMode,
         resolved: broca_catalog::live::ProviderResolution,
+        /// The catalog provider whose rows the run borrowed, when its model's provider is one
+        /// the catalog doesn't carry (`RunConfig::served_provider`).
+        served_provider: Option<String>,
     }
 
     /// The prompt ordinal a fresh persona freezes: the session's earlier prompt count plus one
@@ -4477,15 +4480,27 @@ mod executor {
             // The run's model id is `<provider>/<model>` from the wire request. A base_url
             // override for the mock endpoint (`BROCA_PROVIDER_BASE_URL`) sends the model
             // verbatim as OpenAI-compatible.
-            let model_id = format!(
-                "{}/{}",
-                job.req.model.provider_module_id, job.req.model.model_id
-            );
             let prior_run = &history.prior_run;
             let fresh_episode = matches!(job.kind, RunKind::AppendEpisode)
                 || prior_run
                     .as_ref()
                     .is_none_or(|prior| prior.idle && prior.run_id != job.req.run_id);
+            // A provider the catalog doesn't carry (`anthropic-platform`, a company gateway)
+            // takes the rows of the catalog provider its vault credentials serve: the run's
+            // facts, wire family and quirks come from that row, under the provider the caller
+            // named. A resume keeps what its run froze and never resolves it again.
+            let served_provider = if fresh_episode {
+                self.served_provider_for(job.req.model.provider_module_id.as_str())
+                    .await?
+            } else {
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.served_provider.clone())
+            };
+            let catalog_provider = served_provider
+                .as_deref()
+                .unwrap_or(job.req.model.provider_module_id.as_str());
+            let model_id = format!("{catalog_provider}/{}", job.req.model.model_id);
             // Context management is decided before auth so a refused value costs no credential
             // read. The last episode's config is read from `history.last_config` because an
             // appended episode has no `prior_run` view, yet is exactly the case that inherits.
@@ -4743,6 +4758,7 @@ mod executor {
                     fresh_episode,
                     family_override,
                     job.req,
+                    catalog_provider,
                     prior_run.as_ref(),
                 ),
             };
@@ -4755,7 +4771,7 @@ mod executor {
             let prompt_cache_key = if let Some((_, key)) = inherited {
                 key
             } else if fresh_episode {
-                self.prompt_cache_key_for_fresh_episode(job.req)
+                self.prompt_cache_key_for_fresh_episode(job.req, catalog_provider)
             } else {
                 prior_run
                     .as_ref()
@@ -4764,8 +4780,8 @@ mod executor {
             // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
             // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
             // its episode recorded, or its recorded absence, below.
-            let speaks_as_claude_code = job.req.model.provider_module_id.as_str() == "anthropic"
-                && resolution.method != Some(AuthMethod::ApiKey);
+            let speaks_as_claude_code =
+                catalog_provider == "anthropic" && resolution.method != Some(AuthMethod::ApiKey);
             let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
                 (Some(install_id), true) if speaks_as_claude_code => {
                     let last_frozen = history
@@ -4851,9 +4867,9 @@ mod executor {
             } else {
                 None
             };
-            let alias_route = resolution.method.map(|method| {
-                format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
-            });
+            let alias_route = resolution
+                .method
+                .map(|method| format!("{}:{catalog_provider}", method.as_token()));
             let mut admitted_tools: Vec<_> = job
                 .req
                 .tools
@@ -4928,10 +4944,7 @@ mod executor {
                 refusal_fallback_model: self
                     .anthropic_fallbacks
                     .refusal_resend
-                    .offer_for(
-                        job.req.model.provider_module_id.as_str(),
-                        job.req.model.model_id.as_str(),
-                    )
+                    .offer_for(catalog_provider, job.req.model.model_id.as_str())
                     .filter(|_| fresh_episode),
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
@@ -5026,8 +5039,7 @@ mod executor {
                         codeassist_identity: codeassist_identity.as_ref(),
                         chatgpt_wire: chatgpt_wire.as_ref(),
                         base_url: if fresh_episode {
-                            self.provider_overrides
-                                .base_url(job.req.model.provider_module_id.as_str())
+                            self.provider_overrides.base_url(catalog_provider)
                         } else {
                             None
                         },
@@ -5079,6 +5091,7 @@ mod executor {
                 routing_decision_error,
                 mode,
                 resolved,
+                served_provider,
             })
         }
 
@@ -5098,6 +5111,7 @@ mod executor {
             resolution: &AuthResolution,
             account_choice: &AccountChoice,
             frozen_context_limit: Option<u64>,
+            served_provider: Option<String>,
             store_session: Option<String>,
         ) -> (
             broca_core::run::RunControl,
@@ -5156,6 +5170,7 @@ mod executor {
             // Freeze the context limit onto a fresh run's RunStarted. A fresh run prefers the
             // caller override over the catalog; a resume uses only the WAL value.
             control.admitted_context_limit = frozen_context_limit;
+            control.served_provider = served_provider;
             (control, account_reporter)
         }
 
@@ -5425,6 +5440,7 @@ mod executor {
                 routing_decision_error,
                 mode: _,
                 resolved,
+                served_provider,
             } = admitted;
             if fresh_episode != (mode == StoreRunMode::Fresh) {
                 return Err(StoreRunError::Admission(RunError::Config(format!(
@@ -5506,6 +5522,7 @@ mod executor {
                 &resolution,
                 &account_choice,
                 frozen_context_limit,
+                served_provider,
                 Some(writer.session_id()),
             );
             req.context_management = Some(episode_context_management);
@@ -5618,6 +5635,38 @@ mod executor {
             )
             .await;
             finished.map_err(StoreRunError::Loop)
+        }
+
+        /// The catalog provider whose rows a fresh run on `provider` borrows: `None` when the
+        /// catalog carries `provider` itself, when no vault lists credentials, or on the mock
+        /// endpoint (`BROCA_PROVIDER_BASE_URL`), which serves every provider as named. Else the
+        /// one catalog provider its active vault credentials serve. Refused when they name none
+        /// or several, and as transient while the vault listing hasn't loaded.
+        async fn served_provider_for(&self, provider: &str) -> Result<Option<String>, RunError> {
+            use broca_module_serve::auth_routing::{catalog_provider, CatalogProvider};
+            let Some(vault) = &self.vault else {
+                return Ok(None);
+            };
+            if self.provider_base_url.is_some() {
+                return Ok(None);
+            }
+            // With no catalog loaded nothing can be resolved: leave the provider as named, so
+            // the provider resolution below refuses the run with the catalog's own error, in the
+            // order admission has always refused it.
+            let Ok(catalog) = broca_catalog::catalog() else {
+                return Ok(None);
+            };
+            if catalog.serves_provider(provider) {
+                return Ok(None);
+            }
+            let listing = latest_listing(Arc::clone(vault))
+                .await
+                .ok_or(RunError::CredentialsUnavailable)?;
+            match catalog_provider(&listing, provider, |id| catalog.serves_provider(id)) {
+                CatalogProvider::Own => Ok(None),
+                CatalogProvider::Borrowed(served) => Ok(Some(served)),
+                CatalogProvider::Unresolved(why) => Err(RunError::Config(why.describe(provider))),
+            }
         }
 
         async fn choose_account_for_episode(
@@ -5737,6 +5786,7 @@ mod executor {
             fresh_episode: bool,
             family_override: Option<WireFamilyId>,
             req: &broca_core::RunRequest,
+            provider: &str,
             prior_run: Option<&PriorRunView>,
         ) -> Result<Option<CachePolicy>, String> {
             Ok(if self.provider_base_url.is_some() {
@@ -5744,27 +5794,20 @@ mod executor {
             } else if fresh_episode {
                 let family_for_cache = family_override.or_else(|| {
                     broca_catalog::catalog().ok().and_then(|catalog| {
-                        catalog.wire_family(
-                            req.model.provider_module_id.as_str(),
-                            req.model.model_id.as_str(),
-                        )
+                        catalog.wire_family(provider, req.model.model_id.as_str())
                     })
                 });
                 match family_for_cache {
                     Some(family) => {
                         let policy = broca_module_serve::resolve_cache_policy(
                             family,
-                            req.model.provider_module_id.as_str(),
+                            provider,
                             req.cache.as_ref(),
                             &self.cache_table,
                             &req.session,
                         )?;
                         warn_single_call_cache_markers(&policy, &req.tools);
-                        warn_dropped_cache_tail(
-                            req.cache.as_ref(),
-                            &policy,
-                            req.model.provider_module_id.as_str(),
-                        );
+                        warn_dropped_cache_tail(req.cache.as_ref(), &policy, provider);
                         policy
                     }
                     None => None,
@@ -5782,12 +5825,13 @@ mod executor {
         fn prompt_cache_key_for_fresh_episode(
             &self,
             req: &broca_core::RunRequest,
+            provider: &str,
         ) -> Option<String> {
             if self.provider_base_url.is_some() {
                 return broca_module_serve::resolve_caller_cache_key(req.cache.as_ref());
             }
             broca_module_serve::resolve_prompt_cache_key(
-                req.model.provider_module_id.as_str(),
+                provider,
                 req.cache.as_ref(),
                 &self.cache_table,
                 &req.session,
@@ -6284,6 +6328,27 @@ mod executor {
             } else {
                 None
             };
+            // A provider the catalog doesn't carry is checked against the rows of the catalog
+            // provider its vault credentials serve, as admission resolves it.
+            let catalog_model =
+                |model: &head_selection::PlanModel| -> Option<head_selection::PlanModel> {
+                    use broca_module_serve::auth_routing::{catalog_provider, CatalogProvider};
+                    if self.provider_base_url.is_some() {
+                        return Some(model.clone());
+                    }
+                    let catalog = broca_catalog::catalog().ok()?;
+                    match catalog_provider(listing.as_ref()?, &model.provider, |id| {
+                        catalog.serves_provider(id)
+                    }) {
+                        CatalogProvider::Own => Some(model.clone()),
+                        CatalogProvider::Borrowed(served) => {
+                            let mut served_model = model.clone();
+                            served_model.provider = served;
+                            Some(served_model)
+                        }
+                        CatalogProvider::Unresolved(_) => None,
+                    }
+                };
             let selection = head_selection::check_plan(
                 plan,
                 &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
@@ -6299,40 +6364,38 @@ mod executor {
                         );
                         let resolved = vault.addressing.vault_id_for(&key);
                         let listing = listing.as_ref()?;
+                        // Every run asks routing for its account, so any active row routing could
+                        // pick serves the plan. A subscription row needs its account id; an API
+                        // key is offered by its credential id when it has none.
                         let routed = self.routing.is_some()
-                            && key.method != AuthMethod::ApiKey
-                            && broca_module_serve::account_routing::Candidates::from_listing(
-                                listing,
-                                key.method,
-                                &model.provider,
-                            )
-                            .distinct_accounts()
-                                > 1;
-                        let available = resolved.ok().flatten().is_some_and(|id| {
-                            listing.credentials.iter().any(|row| {
-                                row.id == id && row.operations.iter().any(|op| op == "read")
-                            })
-                        }) || (routed
                             && listing.credentials.iter().any(|row| {
                                 row.state == "active"
                                     && row.operations.iter().any(|op| op == "read")
-                                    && row.account_id.is_some()
+                                    && (key.method == AuthMethod::ApiKey
+                                        || row.account_id.is_some())
                                     && row.provider_ids.contains(&model.provider)
                                     && row.auth_method.as_deref() == Some(key.method.as_token())
-                            }));
+                            });
+                        let available = routed
+                            || resolved.ok().flatten().is_some_and(|id| {
+                                listing.credentials.iter().any(|row| {
+                                    row.id == id && row.operations.iter().any(|op| op == "read")
+                                })
+                            });
                         if !available {
                             return None;
                         }
                     }
-                    self.head_selection_wire(model)
+                    self.head_selection_wire(&catalog_model(model)?)
                 },
             )?;
             if let Some(model) = &selection {
                 if let Some(tier) = model.service_tier.filter(|tier| !tier.is_standard()) {
                     let catalog =
                         broca_catalog::catalog().map_err(|_| PlanModelProblem::UnsupportedModel)?;
+                    let model = catalog_model(model).ok_or(PlanModelProblem::UnsupportedModel)?;
                     broca_catalog::live::check_service_tier_level(
-                        self.selection_family(model)
+                        self.selection_family(&model)
                             .ok_or(PlanModelProblem::UnsupportedModel)?,
                         tier.as_str(),
                         &model.provider,
@@ -6738,6 +6801,7 @@ mod executor {
                 routing_decision_error,
                 mode,
                 resolved,
+                served_provider,
             } = match admitted {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -6926,6 +6990,7 @@ mod executor {
                 &resolution,
                 &account_choice,
                 frozen_context_limit,
+                served_provider,
                 None,
             );
             // What a new episode freezes onto RunStarted; core ignores it on a resume.
@@ -7125,6 +7190,7 @@ mod executor {
                 account_route: None,
                 global_system: None,
                 route_decision_id: None,
+                served_provider: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
@@ -8353,6 +8419,7 @@ mod executor {
                         account_route: None,
                         global_system: None,
                         route_decision_id: None,
+                        served_provider: None,
                         account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,

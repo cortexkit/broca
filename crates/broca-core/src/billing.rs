@@ -423,8 +423,8 @@ impl OpenRun {
             .map(|decision| decision.path.clone());
         let work_class = self.config.work_class.clone();
         let method = credential_id.as_deref().and_then(credential_id_method);
-        let (charge_basis, mapping_version) = resolver
-            .resolve_charge_basis(&self.config.model.provider_module_id, method.unwrap_or(""));
+        let (charge_basis, mapping_version) =
+            resolver.resolve_charge_basis(self.config.billed_provider(), method.unwrap_or(""));
         let charge_basis_overrides = resolver.charge_basis_overrides();
         let segment_ordinal = self.segments.len() as u64;
         let pricing_at_ms = self.freeze_ts_ms.or(self.terminal_ts_ms);
@@ -446,12 +446,10 @@ impl OpenRun {
             session: self.session.clone(),
             segment_ordinal,
             fact_id,
-            provider: self
-                .serving
-                .as_ref()
-                .unwrap_or(&self.config.model)
-                .provider_module_id
-                .clone(),
+            provider: self.serving.as_ref().map_or_else(
+                || self.config.billed_provider().to_owned(),
+                |serving| serving.provider_module_id.to_string(),
+            ),
             model: self
                 .serving
                 .as_ref()
@@ -855,7 +853,7 @@ fn warm_segment<R: ChargeBasisResolver>(
     let credential_id = selection.map(|selection| selection.credential_id.clone());
     let method = credential_id.as_deref().and_then(credential_id_method);
     let (charge_basis, mapping_version) =
-        resolver.resolve_charge_basis(&config.model.provider_module_id, method.unwrap_or(""));
+        resolver.resolve_charge_basis(config.billed_provider(), method.unwrap_or(""));
     SpendSegment {
         agent_id: None,
         agent_run_id: None,
@@ -863,7 +861,7 @@ fn warm_segment<R: ChargeBasisResolver>(
         session: session.clone(),
         segment_ordinal: wal_seq,
         fact_id: warm_fact_id(source_instance_id, session, run_id, wal_seq),
-        provider: config.model.provider_module_id.clone(),
+        provider: config.billed_provider().into(),
         model: config.model.model_id.clone(),
         auth_selection: credential_id,
         account_ref: selection.and_then(|selection| selection.account_ref.clone()),
@@ -945,6 +943,7 @@ mod tests {
             global_system: None,
             account_route: None,
             route_decision_id: None,
+            served_provider: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -2060,6 +2059,48 @@ mod tests {
         // The label itself still differs — proving it is stamped, just identity-neutral.
         assert_eq!(with_segments[0].account_ref.as_deref(), Some("acct-uuid-1"));
         assert_eq!(without_segments[0].account_ref, None);
+    }
+
+    #[test]
+    fn segment_bills_a_borrowed_provider_as_the_catalog_provider_it_served() {
+        // A run on `anthropic-platform`, a provider the catalog lacks, took Anthropic's rows: its
+        // spend names `anthropic`, the provider pricing knows, and resolves its charge basis
+        // there, while its credential still names the pool key that paid.
+        let mut config = config(
+            "anthropic-platform",
+            "claude-haiku-5-5",
+            Some("apikey:anthropic:pool-key"),
+        );
+        config.served_provider = Some("anthropic".into());
+        let seen = std::sync::Mutex::new(Vec::new());
+        let charge = |provider: &str, method: &str| {
+            seen.lock()
+                .unwrap()
+                .push((provider.to_owned(), method.to_owned()));
+            resolver(provider, method)
+        };
+        let mut started = started_with_account(1, "run", Some(100), None, None);
+        match &mut started.record {
+            WalRecord::RunStarted { config: frozen, .. } => **frozen = config,
+            other => unreachable!("{other:?}"),
+        }
+        let records = vec![
+            started,
+            step(2, 1, usage(10, 2), 0),
+            terminal(3, Some(200), usage(10, 2)),
+        ];
+        let segments = compute_segments(&records, "instance-a", &charge);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].provider, "anthropic");
+        assert_eq!(segments[0].model, "claude-haiku-5-5");
+        assert_eq!(
+            segments[0].auth_selection.as_deref(),
+            Some("apikey:anthropic:pool-key")
+        );
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            [("anthropic".to_owned(), "apikey".to_owned())]
+        );
     }
 
     #[test]

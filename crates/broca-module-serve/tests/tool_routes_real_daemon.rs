@@ -131,6 +131,7 @@ fn config() -> RunConfig {
         global_system: None,
         account_route: None,
         route_decision_id: None,
+        served_provider: None,
         account_limit_pause: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         generation: Default::default(),

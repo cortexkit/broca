@@ -88,6 +88,87 @@ impl CredentialId {
     }
 }
 
+/// Where the catalog rows of a route's provider come from. Routing offers some providers the
+/// model catalog doesn't carry, such as `anthropic-platform` (the paid Anthropic API keys) or a
+/// company gateway; such a provider borrows the rows of the one catalog provider its vault
+/// credentials name in `serves`. This mirrors routing's own rule, so broca and routing agree on
+/// which providers are servable and with which rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogProvider {
+    /// The catalog serves the provider itself.
+    Own,
+    /// The catalog lacks the provider, and its active credentials all name this one catalog
+    /// provider: the run takes that provider's rows (limits, wire family, quirks) and is billed
+    /// as it.
+    Borrowed(String),
+    /// The catalog lacks the provider and no single catalog provider stands in for it.
+    Unresolved(Unresolved),
+}
+
+/// Why a provider the catalog lacks has no rows to borrow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    /// No active credential is listed under the provider.
+    NoCredential,
+    /// Its active credentials name no catalog provider in `serves`.
+    NoServedProvider,
+    /// Its active credentials name more than one catalog provider.
+    SeveralServedProviders(Vec<String>),
+}
+
+impl Unresolved {
+    /// The refusal text naming why `provider` can't be served.
+    pub fn describe(&self, provider: &str) -> String {
+        match self {
+            Self::NoCredential => format!(
+                "provider '{provider}' is not in the model catalog and no active credential is \
+                 listed under it"
+            ),
+            Self::NoServedProvider => format!(
+                "provider '{provider}' is not in the model catalog and its credentials name no \
+                 catalog provider they serve"
+            ),
+            Self::SeveralServedProviders(served) => format!(
+                "provider '{provider}' is not in the model catalog and its credentials serve \
+                 several catalog providers ({}), so none stands in for it",
+                served.join(", ")
+            ),
+        }
+    }
+}
+
+/// Where the catalog rows of `provider` come from, given whether the catalog serves a provider
+/// id (`catalog_serves`) and the vault's listing. Only active rows listed under the provider
+/// (`provider_ids`) count, and only `serves` values the catalog itself serves.
+pub fn catalog_provider(
+    listing: &ScopedList,
+    provider: &str,
+    catalog_serves: impl Fn(&str) -> bool,
+) -> CatalogProvider {
+    if catalog_serves(provider) {
+        return CatalogProvider::Own;
+    }
+    let rows: Vec<&ScopedCredential> = listing
+        .credentials
+        .iter()
+        .filter(|row| row.state == "active" && row.provider_ids.iter().any(|id| id == provider))
+        .collect();
+    if rows.is_empty() {
+        return CatalogProvider::Unresolved(Unresolved::NoCredential);
+    }
+    let served: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .flat_map(|row| row.serves.iter().map(String::as_str))
+        .filter(|served| *served != provider && catalog_serves(served))
+        .collect();
+    let mut served: Vec<String> = served.into_iter().map(str::to_owned).collect();
+    match served.len() {
+        0 => CatalogProvider::Unresolved(Unresolved::NoServedProvider),
+        1 => CatalogProvider::Borrowed(served.pop().expect("one served provider")),
+        _ => CatalogProvider::Unresolved(Unresolved::SeveralServedProviders(served)),
+    }
+}
+
 /// Subscription credentials precede metered API keys when a provider has several methods.
 /// Keep the policy in one place so changing the default never depends on listing order.
 pub const DEFAULT_METHOD_ORDER: [AuthMethod; 4] = [
@@ -352,6 +433,89 @@ pub(crate) fn row_listing() -> ScopedList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listing of rows `(id, state, provider_ids, serves)`.
+    fn served_listing(rows: &[(&str, &str, &[&str], &[&str])]) -> ScopedList {
+        ScopedList {
+            credentials: rows
+                .iter()
+                .map(|(id, state, providers, serves)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "type": "apikey", "categories": ["llm"], "serves": serves,
+                        "state": state, "record_version": 1, "operations": ["read"],
+                        "auth_method": "apikey", "provider_ids": providers,
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+            grants: 1,
+            grant_tuples: vec![],
+            view: "synthetic".into(),
+        }
+    }
+
+    /// The catalog this test pretends to have: anthropic and openai only.
+    fn served(provider: &str) -> bool {
+        matches!(provider, "anthropic" | "openai")
+    }
+
+    /// A provider the catalog carries is its own. One it lacks borrows the single catalog
+    /// provider its active rows name in `serves`, whatever its id looks like (a gateway id
+    /// needn't start with its provider's name). It's unresolved, naming why, when it has no
+    /// active row, its rows name no catalog provider, or they name several.
+    #[test]
+    fn a_provider_the_catalog_lacks_borrows_the_one_provider_its_credentials_serve() {
+        let listing = served_listing(&[
+            (
+                "apikey:anthropic:a",
+                "active",
+                &["anthropic-platform"],
+                &["anthropic"],
+            ),
+            (
+                "apikey:anthropic:b",
+                "active",
+                &["anthropic-platform"],
+                &["anthropic"],
+            ),
+            ("gateway:acme", "active", &["corp-llm"], &["anthropic"]),
+            ("apikey:mixed:a", "active", &["mixed"], &["anthropic"]),
+            ("apikey:mixed:b", "active", &["mixed"], &["openai"]),
+            ("apikey:gone:a", "needs_reauth", &["gone"], &["anthropic"]),
+            ("apikey:odd:a", "active", &["odd"], &["not-in-catalog"]),
+        ]);
+        assert_eq!(
+            catalog_provider(&listing, "anthropic", served),
+            CatalogProvider::Own
+        );
+        assert_eq!(
+            catalog_provider(&listing, "anthropic-platform", served),
+            CatalogProvider::Borrowed("anthropic".into())
+        );
+        assert_eq!(
+            catalog_provider(&listing, "corp-llm", served),
+            CatalogProvider::Borrowed("anthropic".into())
+        );
+        assert_eq!(
+            catalog_provider(&listing, "mixed", served),
+            CatalogProvider::Unresolved(Unresolved::SeveralServedProviders(vec![
+                "anthropic".into(),
+                "openai".into()
+            ]))
+        );
+        assert_eq!(
+            catalog_provider(&listing, "gone", served),
+            CatalogProvider::Unresolved(Unresolved::NoCredential)
+        );
+        assert_eq!(
+            catalog_provider(&listing, "odd", served),
+            CatalogProvider::Unresolved(Unresolved::NoServedProvider)
+        );
+        assert_eq!(
+            catalog_provider(&listing, "nobody", served),
+            CatalogProvider::Unresolved(Unresolved::NoCredential)
+        );
+    }
 
     #[test]
     fn method_token_round_trips() {

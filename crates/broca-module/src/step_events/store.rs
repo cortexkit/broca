@@ -10,11 +10,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 struct Run {
     model: broca_protocol::ModelHandle,
+    /// The catalog provider the run borrowed rows from (`RunConfig::served_provider`), which
+    /// its steps are reported as.
+    served_provider: Option<String>,
     work_class: Option<String>,
     context_limit: Option<u64>,
     route_decision_id: Option<String>,
     frozen_render_config: serde_json::Value,
     keep_warm: Option<broca_protocol::request::KeepWarm>,
+}
+
+impl Run {
+    /// The provider the run's steps are reported as: the borrowed catalog provider, else its
+    /// model's.
+    fn billed_provider(&self) -> &str {
+        self.served_provider
+            .as_deref()
+            .unwrap_or(self.model.provider_module_id.as_str())
+    }
 }
 
 fn apply_step_end(event: &mut StepFinished, end: &broca_session_store::record::StepEnd) {
@@ -137,6 +150,13 @@ impl Observer {
             start.run_id.clone(),
             Run {
                 model: start.model.clone(),
+                served_provider: start
+                    .run_choices
+                    .as_ref()
+                    .and_then(|v| v.get("config"))
+                    .and_then(|v| v.get("served_provider"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
                 context_limit: start.context_limit,
                 route_decision_id: start.route_decision_id.clone(),
                 frozen_render_config: broca_session_loop::run::run_config_of_start(
@@ -177,7 +197,7 @@ impl Observer {
         let run = self.runs.get(&event.run_id)?;
         let stops = self.warm_stops.lock().ok();
         // A fallback on another provider did not necessarily use this run's frozen route.
-        let frozen = if event.provider == run.model.provider_module_id {
+        let frozen = if event.provider == run.billed_provider() {
             &run.frozen_render_config
         } else {
             &serde_json::Value::Null
@@ -269,7 +289,7 @@ impl Observer {
                     status,
                     harness: &self.bind.harness,
                     session: &self.bind.session,
-                    provider: &run.model.provider_module_id,
+                    provider: run.billed_provider(),
                     model: &run.model.model_id,
                     started_at_ms,
                     finished_at_ms: attempt.ts_ms,
@@ -353,7 +373,7 @@ impl Observer {
                     status: "completed",
                     harness: &self.bind.harness,
                     session: &self.bind.session,
-                    provider: &run.model.provider_module_id,
+                    provider: run.billed_provider(),
                     model: &run.model.model_id,
                     started_at_ms: warmed.sent_at_ms,
                     finished_at_ms,

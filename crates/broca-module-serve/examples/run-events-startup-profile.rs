@@ -204,6 +204,7 @@ fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
             account_route: None,
             global_system: None,
             route_decision_id: None,
+            served_provider: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

@@ -552,6 +552,7 @@ fn complete_import_records_for_test(
         account_route: None,
         global_system: None,
         route_decision_id: None,
+        served_provider: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

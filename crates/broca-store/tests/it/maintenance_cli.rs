@@ -59,6 +59,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
                     account_route: None,
                     global_system: None,
                     route_decision_id: None,
+                    served_provider: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,

@@ -199,6 +199,7 @@ fn min_config() -> RunConfig {
         global_system: None,
         account_route: None,
         route_decision_id: None,
+        served_provider: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

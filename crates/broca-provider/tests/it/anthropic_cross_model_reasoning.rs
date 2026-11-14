@@ -349,6 +349,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
                 account_route: None,
                 global_system: None,
                 route_decision_id: None,
+                served_provider: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

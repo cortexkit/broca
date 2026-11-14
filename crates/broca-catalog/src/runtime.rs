@@ -797,6 +797,12 @@ impl CatalogSnapshot {
         self.0.catalog.model_for_serving(provider_id, model_id)
     }
 
+    /// Whether the catalog serves `provider_id` itself: it has a wire family and rows for it. A
+    /// provider it doesn't serve may still be reachable by borrowing another provider's rows.
+    pub fn serves_provider(&self, provider_id: &str) -> bool {
+        self.0.catalog.providers.contains_key(provider_id)
+    }
+
     /// Resolve a model using a previously recorded family instead of today's overlay pin.
     pub(crate) fn model_for_serving_with_family(
         &self,
