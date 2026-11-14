@@ -129,11 +129,14 @@ impl Drop for Witness {
     }
 }
 
+/// Appends `records` in one write. The live watchdog appends its own lines to the same file
+/// while a test runs, and `writeln!` on an unbuffered file issues a write per formatted piece
+/// (about 40 for one record), so a watchdog line could land inside a record and make it
+/// unreadable.
 fn append_snapshots(witness: &Witness, records: &[serde_json::Value]) {
+    let lines: String = records.iter().map(|record| format!("{record}\n")).collect();
     let mut file = OpenOptions::new().append(true).open(&witness.path).unwrap();
-    for record in records {
-        writeln!(file, "{record}").unwrap();
-    }
+    file.write_all(lines.as_bytes()).unwrap();
 }
 
 fn phase_snapshot(phase: Phase, heartbeat_age: u64, kind: &str) -> serde_json::Value {

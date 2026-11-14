@@ -741,6 +741,10 @@ crate::require_process_kill!();
 
 /// Run `request` through the real run loop against the log under `state_root`: a fresh start
 /// on an empty log, a resume on one that holds an unfinished episode.
+///
+/// Each run loop it awaits is boxed. Held inline, the several run-loop futures this function
+/// awaits make its own future large enough that, in a debug build, polling it overflows the
+/// 2 MiB stack of a test thread.
 pub async fn drive<W: WalStore>(
     request: RunRequest,
     control: RunControl,
@@ -807,7 +811,7 @@ pub async fn drive<W: WalStore>(
                 state_root,
                 false,
             ));
-            let paused = run_loop_with_control(
+            let paused = Box::pin(run_loop_with_control(
                 request.clone(),
                 provider,
                 plane,
@@ -817,7 +821,7 @@ pub async fn drive<W: WalStore>(
                 None,
                 initial,
                 &tx,
-            )
+            ))
             .await
             .expect("pause before resolving credentials");
             assert_eq!(paused.paused, Some(reason));
@@ -840,9 +844,9 @@ pub async fn drive<W: WalStore>(
                 state_root,
                 true,
             ));
-            broca_core::run_loop_resume_after_auth_with_control(
+            Box::pin(broca_core::run_loop_resume_after_auth_with_control(
                 request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
-            )
+            ))
             .await
         } else {
             invocations.push(next_invocation(
@@ -852,9 +856,9 @@ pub async fn drive<W: WalStore>(
                 state_root,
                 false,
             ));
-            run_loop_with_control(
+            Box::pin(run_loop_with_control(
                 request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
-            )
+            ))
             .await
         }
     } else if provider.render == Render::DeferredAuthResume {
@@ -867,7 +871,7 @@ pub async fn drive<W: WalStore>(
         ));
         let first = broca_test_support::event_timeout(
             "deferred approval turn",
-            run_loop_with_control(
+            Box::pin(run_loop_with_control(
                 request.clone(),
                 provider,
                 plane,
@@ -877,7 +881,7 @@ pub async fn drive<W: WalStore>(
                 None,
                 control.clone(),
                 &tx,
-            ),
+            )),
             || format!("{:?}", wal_store.read_records(&request.session)),
         )
         .await
@@ -896,9 +900,9 @@ pub async fn drive<W: WalStore>(
             ));
             broca_test_support::event_timeout(
                 "late approval admission",
-                broca_core::run_loop_resume_after_auth_with_control(
+                Box::pin(broca_core::run_loop_resume_after_auth_with_control(
                     request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
-                ),
+                )),
                 || "late admission did not complete".to_owned(),
             )
             .await
@@ -914,9 +918,9 @@ pub async fn drive<W: WalStore>(
             state_root,
             false,
         ));
-        run_loop_with_control(
+        Box::pin(run_loop_with_control(
             request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
-        )
+        ))
         .await
     }
     .unwrap_or_else(|error| {
