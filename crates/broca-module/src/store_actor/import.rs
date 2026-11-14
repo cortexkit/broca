@@ -489,6 +489,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             );
         }
         if let Some(marker) = marker {
+            // The image index is brought up to every record now, so the seal saves it: an
+            // imported head seals again only at its provider's next cut, and until a seal saves
+            // the index, each opening of the session builds it again from every record before
+            // its first request can go out.
+            self.media_current_now().await;
             // The view is installed whether or not the seal succeeds; a session left unsealed
             // is sealed at its first step instead.
             if let Err(error) = broca_session_loop::compaction::seal_installed_cut(

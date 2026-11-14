@@ -326,10 +326,34 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
             .and_then(serde_json::Value::as_u64),
     });
     if let Some(last) = &mut reply.last_run_state {
-        let facts = crate::store_status::run_facts(session, parts, &last.run_id, live, None)
-            .await
-            .map_err(|error| StoreHeadError::Setup(format!("the latest run's wait: {error:?}")))?;
-        if let Some(mut facts) = facts {
+        let finished = latest
+            .filter(|run| run.run_id == last.run_id)
+            .is_some_and(|run| run.finished.is_some());
+        if finished {
+            // A finished run waits on nothing but what its end says, so only its end is read,
+            // through the id index: walking a long run's records, such as an import's seeded run
+            // that spans the whole imported history, took seconds.
+            let mut wait = crate::store_awaits::RunWait::default();
+            for (_, record) in session
+                .find_id(IdKind::RunId, &last.run_id)
+                .await
+                .map_err(StoreHeadError::Session)?
+            {
+                if matches!(record, Record::RunEnd(_)) {
+                    wait.record(&record).map_err(StoreHeadError::Setup)?;
+                }
+            }
+            wait.set_labels(labels);
+            last.awaits = wait
+                .snapshot(crate::store_awaits::now_ms(), retry, None, None)
+                .awaits;
+        } else if let Some(mut facts) =
+            crate::store_status::run_facts(session, parts, &last.run_id, live, None)
+                .await
+                .map_err(|error| {
+                    StoreHeadError::Setup(format!("the latest run's wait: {error:?}"))
+                })?
+        {
             facts.wait.set_labels(labels);
             let wait = facts.wait.snapshot(
                 crate::store_awaits::now_ms(),

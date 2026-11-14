@@ -1909,6 +1909,7 @@ mod photo_sends;
 mod refresh;
 #[cfg(feature = "test-clock")]
 mod retention;
+mod scale_gate;
 mod scopes;
 mod step_events;
 mod streams;

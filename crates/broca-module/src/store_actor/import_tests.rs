@@ -1465,6 +1465,44 @@ fn as_read(opts: &broca_protocol::request::CallOptions) -> (serde_json::Value, S
     )
 }
 
+/// Installing a cutting view on an imported head that holds an image saves the session's image
+/// index with the seal, so a later opening loads it instead of building it again from every
+/// record before its first request.
+#[tokio::test]
+async fn an_installed_cut_saves_the_image_index() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::new("installed-cut-media");
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    let cut = view_of(
+        1,
+        vec![(
+            1,
+            EditOp::Cut {
+                through: "msg_a1".into(),
+            },
+        )],
+    );
+    assert!(matches!(
+        ask(&commands, install_view(&cut)).await,
+        StoreOutcome::ViewInstalled(_)
+    ));
+    drop(commands);
+    let session = served.await.unwrap();
+    assert!(Writer::conversation(&session).window_start() > 1, "sealed");
+    drop(session);
+    let mut session = load(backend).await.unwrap();
+    let loaded = session.feed_media().await.unwrap();
+    assert!(
+        matches!(
+            loaded.saved,
+            broca_session_store::session::SavedIndex::Saved(_)
+        ),
+        "{:?}",
+        loaded.saved
+    );
+}
+
 /// A view that cuts, installed before the first step, seals the history before its cut when it is
 /// installed, so the imported session is no larger to open, read or run than the history its
 /// requests render. Its first request is the one a session that recorded the same view without

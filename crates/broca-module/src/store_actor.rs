@@ -2449,6 +2449,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.media.absorb(&mut self.session, &parts);
     }
 
+    /// Brings the session's image index up to every record written, for a seal that must save
+    /// it: built here and now from all the records when it never was and no build is running,
+    /// then given what the writes since handed over. A build that fails leaves the index failed,
+    /// as a background build's failure does, and the seal saves none.
+    pub(super) async fn media_current_now(&mut self) {
+        self.media_open().await;
+        if let Some(through) = self.media.start_build() {
+            let history = self.session.media_history(through).await.map_err(|error| {
+                format!("the session's media index couldn't be built from its records: {error:?}")
+            });
+            let last = self.session.next_seq().saturating_sub(1);
+            let parts = self.parts.clone();
+            self.media.built(history, last, &parts);
+        }
+        self.absorb_media();
+    }
+
     /// Starts building the session's image index from its records, read over a handle of its
     /// own, on a blocking thread, when it waits for that build.
     fn build_media(&mut self) {
