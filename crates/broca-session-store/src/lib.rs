@@ -59,6 +59,7 @@ pub mod codec;
 pub mod content;
 pub mod damage;
 pub mod directory;
+pub mod durable;
 pub mod expired;
 pub mod fold;
 pub mod frame;

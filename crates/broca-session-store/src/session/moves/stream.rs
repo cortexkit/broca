@@ -110,7 +110,7 @@ pub fn append_stream_file(path: &Path, prefix: u64, latest: &[u8]) -> Result<(u6
             .get(STREAM.len()..)
             .ok_or_else(|| invalid("latest frame header"))?
     })?;
-    file.sync_all()?;
+    crate::durable::sync(&file)?;
     super::files::sync(parent)?;
     let end = file.stream_position()?;
     file.seek(std::io::SeekFrom::Start(0))?;

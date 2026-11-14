@@ -111,6 +111,49 @@ pub async fn served_compaction_entries<B: SessionBackend>(
     Ok(held_back(session, entries))
 }
 
+/// [`served_compaction_entries`] of the entries whose message ids `mids` lists, in ordinal order:
+/// each found by its id (`Session::entries_by_mid`), so a read of a few named entries reads only
+/// those, however long the session is.
+pub async fn served_compaction_entries_by_mid<B: SessionBackend>(
+    session: &Session<B>,
+    mids: &[String],
+) -> Result<Vec<StoredEntry>, SessionError> {
+    let entries = session.entries_by_mid(mids).await?;
+    Ok(held_back(session, entries))
+}
+
+/// [`served_compaction_entries`] around the entries that number `tags` as `session.entries`
+/// serves them, in ordinal order: for each part number, the message the search over the
+/// numbering bases finds (`Session::compaction_tagged_entry`) and the one before it, since the
+/// message found may be the results half of a tool turn, which is served with its call. Whether
+/// an entry's parts take a number is the caller's to check, by projecting it.
+pub async fn served_compaction_entries_by_tag<B: SessionBackend>(
+    session: &Session<B>,
+    tags: &[u64],
+) -> Result<Vec<StoredEntry>, SessionError> {
+    let mut ordinals = std::collections::BTreeSet::new();
+    for tag in tags {
+        if let Some(entry) = session.compaction_tagged_entry(*tag).await? {
+            ordinals.insert(entry.ordinal.saturating_sub(1).max(1));
+            ordinals.insert(entry.ordinal);
+        }
+    }
+    let mut entries: Vec<StoredEntry> = Vec::with_capacity(ordinals.len());
+    for ordinal in ordinals {
+        if entries.last().is_some_and(|last| last.ordinal >= ordinal) {
+            continue;
+        }
+        entries.extend(
+            session
+                .compaction_entries(ordinal, 1)
+                .await?
+                .into_iter()
+                .filter(|entry| entry.ordinal == ordinal),
+        );
+    }
+    Ok(held_back(session, entries))
+}
+
 /// The zero-based ordinals of every assistant message of `session` whose entry facts say its run
 /// cleans replies (`EntryFacts::clean_reply`): the messages every read serves cleaned of tag
 /// notation (`crate::store_exposure::served_message`). Reads the whole transcript, a page at a

@@ -33,6 +33,7 @@ cipher_tests!(
     a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history,
     ledger_tail_stops_before_older_segments_and_reads_the_open_log_once,
     a_sealed_message_read_fetches_its_block_not_the_segment,
+    the_entry_numbering_a_compaction_tag_is_found_by_a_search,
 );
 
 fn triple() -> SessionTriple {
@@ -243,6 +244,99 @@ fn every_message_reads_back_by_ordinal_after_two_cuts(cipher: Cipher) {
                 );
             }
         }
+    });
+}
+
+/// Under the numbering `session.entries` serves (`EntryFacts::tag_base`), the entry holding a
+/// part number is the last one whose base is below it, sealed or in the window, as under the
+/// runner's own numbering; the two numberings are found apart. Here the compaction bases are ten
+/// times the ordinal and no message carries a runner base, so only the compaction search finds an
+/// entry. Finding one in sealed history reads directory pages and a few blocks, never every
+/// block: a search, not a scan.
+fn the_entry_numbering_a_compaction_tag_is_found_by_a_search(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let numbered = |record: Record| match record {
+            Record::EntryFacts(facts) => {
+                let mut facts = EntryFacts::clone(&facts);
+                facts.runner_tag_base = None;
+                facts.tag_base = 10 * facts.ordinal;
+                Record::EntryFacts(std::sync::Arc::new(facts))
+            }
+            other => other,
+        };
+        let mut cut = 0;
+        for n in 0..80usize {
+            for (part, batch) in round(n).into_iter().enumerate() {
+                let batch: Vec<Record> = batch.into_iter().map(numbered).collect();
+                let seq = session.append(&batch, true).await.unwrap();
+                if part == 0 && n == 70 {
+                    cut = seq;
+                }
+            }
+        }
+        session.seal(Some(cut), 0).await.unwrap();
+        session.close().await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        let placed = loaded.conversation.placed;
+        assert!(
+            loaded.conversation.window_start() > 200,
+            "history is sealed"
+        );
+        // Tool messages (every fourth, from the third) have no facts, so they number nothing.
+        let holder = |tag: u64| {
+            (1..=placed)
+                .rev()
+                .find(|ordinal| ordinal % 4 != 3 && 10 * ordinal < tag)
+        };
+        for tag in [
+            1,
+            10,
+            11,
+            25,
+            31,
+            1_000,
+            2_000,
+            2_811,
+            3_201,
+            10 * placed + 5,
+        ] {
+            let found = loaded.compaction_tagged_entry(tag).await.unwrap();
+            assert_eq!(found.map(|entry| entry.ordinal), holder(tag), "tag {tag}");
+            assert_eq!(
+                loaded
+                    .tagged_entry(tag)
+                    .await
+                    .unwrap()
+                    .map(|entry| entry.ordinal),
+                None,
+                "no message carries a runner base, tag {tag}"
+            );
+        }
+        // Each read gets its own freshly loaded session, so neither is served from the pages and
+        // segment indexes the other read left cached in its session.
+        let (triple, deployment) = (triple(), deployment(cipher));
+        let fresh = || Session::load(&backend, addr(), &triple, &deployment);
+        let searching = fresh().await.unwrap();
+        let objects = backend.object_reads();
+        let found = searching.compaction_tagged_entry(1_235).await.unwrap();
+        assert_eq!(found.map(|entry| entry.ordinal), holder(1_235));
+        let search = backend.object_reads() - objects;
+        let scanning = fresh().await.unwrap();
+        let objects = backend.object_reads();
+        let all = scanning.entries(1, usize::MAX).await.unwrap();
+        assert_eq!(all.len() as u64, placed);
+        let scan = backend.object_reads() - objects;
+        println!("a search read {search} objects; reading every entry read {scan}");
+        assert!(
+            search * 3 <= scan,
+            "a search read {search} objects against {scan} for reading every entry"
+        );
     });
 }
 

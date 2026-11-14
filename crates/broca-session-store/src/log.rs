@@ -39,14 +39,13 @@ mod tests;
 
 /// Where a log is written: its bytes, and a barrier that makes them durable.
 pub trait LogFile: Write {
-    /// Returns once every byte written so far is durable. On macOS, `File::sync_all` issues
-    /// `F_FULLFSYNC`, which survives power loss; a plain `fsync` there does not.
+    /// Returns once every byte written so far is durable (see `crate::durable`).
     fn barrier(&mut self) -> io::Result<()>;
 }
 
 impl LogFile for std::fs::File {
     fn barrier(&mut self) -> io::Result<()> {
-        self.sync_all()
+        crate::durable::sync(self)
     }
 }
 

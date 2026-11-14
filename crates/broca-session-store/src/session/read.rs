@@ -537,14 +537,37 @@ impl<B: SessionBackend> Session<B> {
     /// no computed numbering placed, or converted from a session that predates the field) is
     /// taken to number nothing.
     pub async fn tagged_entry(&self, tag: u64) -> Result<Option<StoredEntry>, SessionError> {
-        let base = |entry: &StoredEntry| {
+        self.entry_numbering(tag, |facts| facts.runner_tag_base)
+            .await
+    }
+
+    /// [`Self::tagged_entry`] under the numbering `session.entries` serves
+    /// (`EntryFacts::tag_base`): the entry that numbers `tag` there, if any, is the last one
+    /// whose base is below it, found by the same search. Whether its parts reach `tag` is the
+    /// caller's to check, by projecting the entry.
+    pub async fn compaction_tagged_entry(
+        &self,
+        tag: u64,
+    ) -> Result<Option<StoredEntry>, SessionError> {
+        self.entry_numbering(tag, |facts| Some(facts.tag_base))
+            .await
+    }
+
+    /// The last entry whose numbering base, as `base` reads it from the entry's facts, is below
+    /// `tag` (see [`Self::tagged_entry`]).
+    async fn entry_numbering(
+        &self,
+        tag: u64,
+        base: fn(&crate::record::EntryFacts) -> Option<u64>,
+    ) -> Result<Option<StoredEntry>, SessionError> {
+        let below = |entry: &StoredEntry| {
             entry
                 .state
                 .facts
                 .as_ref()
-                .and_then(|facts| facts.runner_tag_base)
+                .and_then(|facts| base(facts))
+                .is_some_and(|base| base < tag)
         };
-        let below = |entry: &StoredEntry| base(entry).is_some_and(|base| base < tag);
         if let Some((ordinal, message, state)) = self.conversation.open_entry() {
             let held = StoredEntry {
                 ordinal,
@@ -563,7 +586,7 @@ impl<B: SessionBackend> Session<B> {
                 .conversation
                 .window_entry(ordinal)
                 .and_then(|(_, state)| state.facts.as_ref())
-                .and_then(|facts| facts.runner_tag_base);
+                .and_then(|facts| base(facts));
             if base.is_some_and(|base| base < tag) {
                 return Ok(window_entries(&self.conversation, ordinal, 1).pop());
             }
@@ -577,27 +600,24 @@ impl<B: SessionBackend> Session<B> {
             fanout: crate::directory::FANOUT,
         };
         let mut memo = self.take_pages();
-        let searched = self.search_tagged(tag, &pages, &mut memo, window).await;
+        let searched = self
+            .search_numbering(tag, base, &pages, &mut memo, window)
+            .await;
         self.keep_pages(memo);
         searched
     }
 
-    /// The sealed part of [`Self::tagged_entry`]'s search, over ordinals before `window`,
+    /// The sealed part of [`Self::entry_numbering`]'s search, over ordinals before `window`,
     /// reading directory pages through `memo`.
-    async fn search_tagged(
+    async fn search_numbering(
         &self,
         tag: u64,
+        base: fn(&crate::record::EntryFacts) -> Option<u64>,
         pages: &Pages<'_, B>,
         memo: &mut crate::directory::PageMemo,
         window: u64,
     ) -> Result<Option<StoredEntry>, SessionError> {
-        let base = |entry: &StoredEntry| {
-            entry
-                .state
-                .facts
-                .as_ref()
-                .and_then(|facts| facts.runner_tag_base)
-        };
+        let base = |entry: &StoredEntry| entry.state.facts.as_ref().and_then(|facts| base(facts));
         let below = |entry: &StoredEntry| base(entry).is_some_and(|base| base < tag);
         let key = self.key.frame_key();
         let (mut low, mut high) = (1, window.saturating_sub(1));

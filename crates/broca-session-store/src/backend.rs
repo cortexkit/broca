@@ -753,8 +753,8 @@ impl SessionBackend for MemoryBackend {
 ///   next to them, which the operator's restore (see `restore`) can choose. A version is deleted
 ///   once the version after it has existed for [`HEAD_VERSION_KEEP_MS`], and the newest two are
 ///   always kept.
-/// - `<root>/logs/<addr>/<change id>`: one append-only file per log. A barrier syncs it with
-///   `sync_all`, which issues `F_FULLFSYNC` on macOS and survives power loss.
+/// - `<root>/logs/<addr>/<change id>`: one append-only file per log. A barrier syncs it
+///   (`crate::durable::sync`).
 /// - `<root>/objects/<addr>/<change id>/<name>`: immutable objects, one folder per change, so
 ///   undoing a change deletes one folder.
 /// - `<root>/setup/<name>`: setup parts of encrypted sessions, shared by every session. Written to
@@ -960,10 +960,10 @@ impl LocalBackend {
             .create_new(true)
             .open(&sidecar)?;
         kept.write_all(&tail)?;
-        kept.sync_all()?;
+        crate::durable::sync(&kept)?;
         sync_dir(&dir)?;
         file.set_len(to)?;
-        file.sync_all()?;
+        crate::durable::sync(&file)?;
         Ok(sidecar)
     }
 
@@ -1028,11 +1028,7 @@ fn read_head_at(path: &Path) -> Result<Option<(Vec<u8>, Version)>, BackendError>
 /// Makes a folder's entries durable. Windows has no folder sync; durability of renames there is
 /// unproven and is tested before the Windows backend is relied on.
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    crate::durable::sync_dir(path)
 }
 
 /// Writes a head file, its version then its bytes, as `name` in `dir`: to the temporary file
@@ -1058,7 +1054,7 @@ fn write_file(dir: &Path, temp: &str, name: &str, parts: &[&[u8]]) -> io::Result
     for part in parts {
         file.write_all(part)?;
     }
-    file.sync_all()?;
+    crate::durable::sync(&file)?;
     drop(file);
     std::fs::rename(&temp, dir.join(name))?;
     sync_dir(dir)
@@ -1169,7 +1165,7 @@ impl SessionBackend for LocalBackend {
             .read(true)
             .write(true)
             .open(self.log_path(s, log))?;
-        file.sync_all()?;
+        crate::durable::sync(&file)?;
         sync_dir(&dir)?;
         self.open_logs
             .lock()
@@ -1225,7 +1221,7 @@ impl SessionBackend for LocalBackend {
             file.write_all(bytes)?;
             if barrier {
                 let timing = crate::metrics::Phase::Sync.start();
-                let synced = file.sync_all();
+                let synced = crate::durable::sync(file);
                 timing.finish(Some(&s.0));
                 synced?;
             }
@@ -1247,7 +1243,7 @@ impl SessionBackend for LocalBackend {
                 return Err(BackendError::Fenced);
             }
             file.set_len(to)?;
-            file.sync_all()?;
+            crate::durable::sync(file)?;
             Ok(())
         })
     }
@@ -1287,7 +1283,7 @@ impl SessionBackend for LocalBackend {
             .truncate(true)
             .open(&path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::durable::sync(&file)?;
         Ok(())
     }
 

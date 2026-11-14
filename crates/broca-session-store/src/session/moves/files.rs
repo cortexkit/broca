@@ -154,7 +154,7 @@ fn checked_path(root: &Path, path: &str) -> Result<std::path::PathBuf, Error> {
 
 pub(super) fn sync(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
-    std::fs::File::open(path)?.sync_all()?;
+    crate::durable::sync(&std::fs::File::open(path)?)?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
@@ -189,7 +189,7 @@ fn publish(root: &Path, path: &str, bytes: &[u8]) -> Result<(), Error> {
         .create_new(true)
         .open(&temp)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    crate::durable::sync(&file)?;
     drop(file);
     std::fs::rename(&temp, &path)?;
     sync(parent)?;

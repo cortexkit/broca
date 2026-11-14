@@ -416,23 +416,32 @@ pub async fn entries_page<B: SessionBackend>(
         .start()
         .with_session(|| Some(session.address().0.clone()));
     let len = transcript_len(session);
-    let (from, count) = match &request.select {
+    // A read by ids or by part numbers reads only the entries it names, found by their ids or by
+    // a search over the numbering, never the whole transcript. A compaction provider asks for a
+    // few named entries this way when a session starts with it, and on a head with hundreds of
+    // thousands of messages a whole-transcript read took tens of seconds.
+    let stored = match &request.select {
         Select::After {
             after_ordinal,
             limit,
-        } => (
-            after_ordinal.unwrap_or(0).saturating_add(1),
-            limit.map_or(usize::MAX, |limit| {
+        } => {
+            let from = after_ordinal.unwrap_or(0).saturating_add(1);
+            let count = limit.map_or(usize::MAX, |limit| {
                 usize::try_from(limit)
                     .unwrap_or(usize::MAX)
                     .saturating_add(1)
-            }),
-        ),
-        _ => (1, usize::MAX),
-    };
-    let stored = crate::store_read::served_compaction_entries(session, from, count)
-        .await
-        .map_err(|error| format!("{error:?}"))?;
+            });
+            crate::store_read::served_compaction_entries(session, from, count).await
+        }
+        Select::Mids { mids } => {
+            crate::store_read::served_compaction_entries_by_mid(session, mids).await
+        }
+        Select::Tags { tags } => {
+            crate::store_read::served_compaction_entries_by_tag(session, tags).await
+        }
+        _ => crate::store_read::served_compaction_entries(session, 1, usize::MAX).await,
+    }
+    .map_err(|error| format!("{error:?}"))?;
     let entries = stored.iter().map(project).collect::<Result<Vec<_>, _>>()?;
     let newest = match entries.last() {
         Some(last) if last.ordinal >= len => Some(cursor(last)),

@@ -187,7 +187,7 @@ pub fn write(
         .truncate(true)
         .open(&temp)?;
     file.write_all(&bytes)?;
-    file.sync_all()?;
+    crate::durable::sync(&file)?;
     drop(file);
     std::fs::rename(temp, dir.join(name))?;
     sync_dir(&dir)?;

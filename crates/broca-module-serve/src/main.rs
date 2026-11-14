@@ -169,6 +169,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
+    // Before any session opens: every sync the new storage makes follows it.
+    broca_session_store::durable::configure_full_flush(
+        broca_module_serve::config::StorageSyncConfig::load_default()
+            .map_err(ServeIoError)?
+            .full_flush,
+    );
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
     let bus_event_config =

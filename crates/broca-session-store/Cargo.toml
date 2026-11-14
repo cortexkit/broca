@@ -42,3 +42,7 @@ synthetic = []
 # `cargo fuzz` builds with `--cfg fuzzing`, which exposes the `fuzzing` module to the targets in
 # `fuzz/` (a separate workspace, never built by the normal build).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# A plain fsync on macOS, where `File::sync_all` is the much slower F_FULLFSYNC (see `durable`).
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }

@@ -440,9 +440,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // part it names is one the import wrote, by its source id. Rendering filters out an edit
         // naming a message it doesn't hold, so a view naming an id the import never had would
         // otherwise lose that edit silently.
-        if let Err(message) = self.fits_history(view).await {
-            return refuse("invalid_params", &message);
-        }
+        let entries = match self.fits_history(view).await {
+            Ok(entries) => entries,
+            Err(message) => return refuse("invalid_params", &message),
+        };
         let reply = InstallViewReply {
             version: view.version,
             checksum: view.checksum.to_string(),
@@ -466,7 +467,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(record) => record,
             Err(error) => return refuse("invalid_params", &error),
         };
-        let records = [
+        let carry = vec![
             view_record,
             // No step has run: the view is the one the session's first step applies.
             Record::ViewApplied(ViewApplied {
@@ -475,13 +476,37 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 checksum: reply.checksum.clone(),
             }),
         ];
-        match self.session.append(&records, true).await {
-            Ok(_) => StoreOutcome::ViewInstalled(reply),
-            Err(error) => refuse(
+        // The cut's marker, as the first step would write it when it applies the view
+        // (`State::recover_marker`), so the history before the cut is sealed now rather than at
+        // the first step: until then every open and read of the session would hold all of it.
+        let marker = cut_marker(view, &entries, &self.key);
+        let mut records = carry.clone();
+        records.extend(marker.clone().map(Record::Marker));
+        if let Err(error) = self.session.append(&records, true).await {
+            return refuse(
                 "install_view_failed",
                 &format!("the view could not be written: {error:?}"),
-            ),
+            );
         }
+        if let Some(marker) = marker {
+            // The view is installed whether or not the seal succeeds; a session left unsealed
+            // is sealed at its first step instead.
+            if let Err(error) = broca_session_loop::compaction::seal_installed_cut(
+                &mut self.session,
+                marker.first_kept_ordinal,
+                &carry,
+                (self.now_ms)(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    session = %self.session.address().0,
+                    ?error,
+                    "an installed view's cut could not be sealed; the first step seals it"
+                );
+            }
+        }
+        StoreOutcome::ViewInstalled(reply)
     }
 
     /// Whether `view` fits the session's history as a compaction provider reads it: each
@@ -490,7 +515,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     async fn fits_history(
         &self,
         view: &broca_core::compaction_v2::protocol::view::View,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<broca_core::compaction_v2::protocol::read::Entry>, String> {
         let placed = self.session.conversation.placed;
         let stored = self
             .session
@@ -502,7 +527,39 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .map(broca_session_loop::entries::project)
             .collect::<Result<Vec<_>, _>>()?;
         cortexkit_compaction_view::render::plan(&entries, &view.edits)
-            .map(|_| ())
-            .map_err(|refusal| format!("the view doesn't fit the imported history: {refusal:?}"))
+            .map_err(|refusal| format!("the view doesn't fit the imported history: {refusal:?}"))?;
+        Ok(entries)
     }
+}
+
+/// The marker of `view`'s cut over `entries`, the session's compaction entries in order: the
+/// entry after the one the cut goes through is the first kept, and the provider's numbering
+/// resumes after the highest part number up to the cut. `None` when the view cuts nothing, or
+/// cuts through the newest entry, whose next message has no id yet.
+fn cut_marker(
+    view: &broca_core::compaction_v2::protocol::view::View,
+    entries: &[broca_core::compaction_v2::protocol::read::Entry],
+    key: &broca_protocol::BindIdentity,
+) -> Option<broca_session_store::record::Marker> {
+    use broca_core::compaction_v2::protocol::view::EditOp;
+    let through = view.edits.iter().find_map(|edit| match &edit.op {
+        EditOp::Cut { through } => Some(through),
+        _ => None,
+    })?;
+    let position = entries.iter().position(|entry| &entry.mid == through)?;
+    let next = entries.get(position + 1)?;
+    let checkpoint = entries[..=position]
+        .iter()
+        .flat_map(|entry| &entry.parts)
+        .filter_map(|part| part.tag)
+        .max()
+        .unwrap_or(0);
+    Some(broca_session_store::record::Marker {
+        view_version: view.version,
+        first_kept_mid: next.mid.clone(),
+        first_kept_ordinal: next.ordinal,
+        checkpoint,
+        harness: Some(key.harness.clone()),
+        session: Some(key.session.clone()),
+    })
 }

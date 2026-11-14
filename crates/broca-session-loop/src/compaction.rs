@@ -624,6 +624,36 @@ pub async fn seal_at_cut<W: Writer, P, T>(
     Ok(())
 }
 
+/// Seals an imported session's history before the cut of the view its owner installed, before the
+/// session runs any step, as its first step would have sealed it: the window then starts at the
+/// first kept entry, so the session is no larger to open, read or run than the history its
+/// requests render. `carry` is the installed view and the record applying it, which the new open
+/// log must hold. Repetition counters are kept as a run starting now counts them, from its first
+/// model answer after its input, which an import's seeded run never has.
+pub async fn seal_installed_cut<W: Writer>(
+    writer: &mut W,
+    first_kept_ordinal: u64,
+    carry: &[Record],
+    now_ms: u64,
+) -> Result<(), LoopError> {
+    let window_repetition = spanning_repetition(
+        writer.conversation(),
+        first_kept_ordinal,
+        Some(writer.session_id()).as_deref(),
+    )?;
+    writer
+        .seal_at_entry(
+            first_kept_ordinal,
+            &broca_session_store::session::Carry {
+                records: carry,
+                window_repetition,
+            },
+            now_ms,
+        )
+        .await?;
+    Ok(())
+}
+
 /// The request step `step` sent, rebuilt from stored state without calling the compaction
 /// provider: the views the session recorded replace its answers. The compaction state is restored
 /// from the open log, and the prompt is rendered from the view the session recorded as applied for

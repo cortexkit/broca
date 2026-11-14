@@ -71,6 +71,81 @@ mod classifier_routing_config_tests {
     }
 }
 
+/// How the new session storage makes its writes durable (`storage_sync` in broca.jsonc). Off by
+/// default: on macOS each sync is a plain `fsync`, which survives a broca crash, kill or restart
+/// but not a power loss or kernel panic before the drive empties its cache. `full_flush` makes
+/// each sync a full flush of the drive's cache (`F_FULLFSYNC`) instead, about 4 ms each, for a
+/// machine that can lose power. Other platforms sync fully either way (see
+/// `broca_session_store::durable`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageSyncConfig {
+    pub full_flush: bool,
+}
+
+impl StorageSyncConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read storage_sync from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&text).map_err(|error| format!("parse storage_sync: {error}"))?;
+        match file.remove("storage_sync") {
+            None => Ok(Self::default()),
+            Some(value) => {
+                serde_json::from_value(value).map_err(|error| format!("storage_sync: {error}"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod storage_sync_config_tests {
+    use super::StorageSyncConfig;
+    #[test]
+    fn storage_sync_defaults_to_the_plain_sync_and_is_strict() {
+        for text in [
+            "{}",
+            r#"{"storage_sync":{}}"#,
+            r#"{"storage_sync":{"full_flush":false}}"#,
+        ] {
+            assert!(!StorageSyncConfig::parse(text).unwrap().full_flush);
+        }
+        assert!(
+            StorageSyncConfig::parse(r#"{"storage_sync":{"full_flush":true}}"#)
+                .unwrap()
+                .full_flush
+        );
+        for text in [
+            r#"{"storage_sync":{"full_flush":1}}"#,
+            r#"{"storage_sync":{"fullflush":true}}"#,
+        ] {
+            assert!(StorageSyncConfig::parse(text)
+                .unwrap_err()
+                .contains("storage_sync"));
+        }
+    }
+}
+
 /// Operator-selected wire names, keyed by credential routing key rather than account identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolNameAliasesConfig(pub std::collections::BTreeMap<String, ToolAliasRoute>);

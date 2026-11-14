@@ -1475,17 +1475,13 @@ fn as_read(opts: &broca_protocol::request::CallOptions) -> (serde_json::Value, S
     )
 }
 
-/// A view that cuts and applies at the start of a step (here the view installed when the head was
-/// imported; a view the provider pushes between steps applies the same way) seals the history
-/// before its cut at that step, as a cut the provider returns while the request is prepared does:
-/// the open session keeps only the window its requests render from. A later step with no new view
-/// doesn't seal again, and a reload finds the window where the seal left it.
+/// A view that cuts, installed before the first step, seals the history before its cut when it is
+/// installed, so the imported session is no larger to open, read or run than the history its
+/// requests render. Its first request is the one a session that recorded the same view without
+/// sealing renders (and seals at that step, as a view applied at a step's start does). A later
+/// step with no new view doesn't seal again, and a reload finds the window where the seal left it.
 #[tokio::test]
-async fn a_cut_applied_at_the_boundary_seals_the_history_before_it() {
-    let backend: &'static MemoryBackend = Box::leak(Box::default());
-    let source = Source::of("boundary-cut", exchanges(), None);
-    let (commands, served) = serve(create(backend).await.unwrap());
-    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+async fn an_installed_cut_seals_the_history_before_the_first_step() {
     let cut = view_of(
         1,
         vec![(
@@ -1495,16 +1491,52 @@ async fn a_cut_applied_at_the_boundary_seals_the_history_before_it() {
             },
         )],
     );
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("installed-cut", exchanges(), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
     assert!(matches!(
         ask(&commands, install_view(&cut)).await,
         StoreOutcome::ViewInstalled(_)
     ));
     drop(commands);
     let mut session = served.await.unwrap();
+    // msg_u3, the first kept entry, has ordinal 5.
+    assert_eq!(
+        Writer::conversation(&session).window_start(),
+        5,
+        "the installed cut sealed the history before it"
+    );
+
+    // The same import with the same view recorded as applied and nothing sealed.
+    let whole_backend: &'static MemoryBackend = Box::leak(Box::default());
+    let whole_source = Source::of("installed-cut-whole", exchanges(), None);
+    let (commands, served) = serve(create(whole_backend).await.unwrap());
+    imported(ask(&commands, whole_source.import(whole_source.params("imp-1"))).await);
+    drop(commands);
+    let mut whole = served.await.unwrap();
+    let received = broca_core::compaction_v2::received::ReceivedView::parse(
+        &serde_json::value::to_raw_value(&cut).unwrap(),
+    )
+    .unwrap();
+    whole
+        .append(
+            &[
+                broca_session_loop::compaction::view_record(None, &received, None).unwrap(),
+                Record::ViewApplied(broca_session_store::record::ViewApplied {
+                    step_id: 0,
+                    version: 1,
+                    checksum: cut.checksum.to_string(),
+                }),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(Writer::conversation(&whole).window_start(), 1);
+
     let mut parts = MemoryParts::default();
     let compactor = Compactor::default();
-    assert_eq!(Writer::conversation(&session).window_start(), 1);
-
     let first = run_once(
         &mut session,
         &mut parts,
@@ -1513,15 +1545,21 @@ async fn a_cut_applied_at_the_boundary_seals_the_history_before_it() {
         "Question 5.",
     )
     .await;
+    let (mut whole_parts, whole_compactor) = (MemoryParts::default(), Compactor::default());
+    let expected = run_once(
+        &mut whole,
+        &mut whole_parts,
+        &whole_compactor,
+        ("r1", "m"),
+        "Question 5.",
+    )
+    .await;
+    assert_eq!(as_read(&first), as_read(&expected));
     let (_, body) = as_read(&first);
     assert!(!body.contains("Question 2."), "{body}");
     assert!(body.contains("Question 3."), "{body}");
-    // msg_u3, the first kept entry, has ordinal 5.
-    assert_eq!(
-        Writer::conversation(&session).window_start(),
-        5,
-        "the boundary's cut sealed the history before it"
-    );
+    assert_eq!(Writer::conversation(&whole).window_start(), 5);
+    assert_eq!(Writer::conversation(&session).window_start(), 5);
 
     run_once(
         &mut session,

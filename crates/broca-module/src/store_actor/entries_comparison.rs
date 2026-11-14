@@ -1260,6 +1260,34 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
         },
         Detail::Compact,
     ));
+    // Reads by ids and by part numbers find each named entry instead of reading every entry, so
+    // every id and every number is read alone, and all of them together, against the same page
+    // over the whole transcript: a tool turn's results are numbered with its call.
+    for entry in &all {
+        requests.push(ReadRequest::new(
+            Select::Mids {
+                mids: vec![entry.mid.clone()],
+            },
+            Detail::Full,
+        ));
+    }
+    requests.push(ReadRequest::new(
+        Select::Mids {
+            mids: all.iter().rev().map(|entry| entry.mid.clone()).collect(),
+        },
+        Detail::Full,
+    ));
+    let highest = tags.iter().copied().max().unwrap();
+    for tag in 0..=highest + 1 {
+        requests.push(ReadRequest::new(
+            Select::Tags { tags: vec![tag] },
+            Detail::Full,
+        ));
+    }
+    requests.push(ReadRequest::new(
+        Select::Tags { tags: tags.clone() },
+        Detail::Full,
+    ));
     for request in &requests {
         let served = store
             .compaction(

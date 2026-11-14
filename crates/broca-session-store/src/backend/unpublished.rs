@@ -117,11 +117,12 @@ impl<'a> UnpublishedBackend<'a> {
             if kind.is_dir() {
                 self.sync_tree(&entry.path())?;
             } else if kind.is_file() {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(entry.path())?
-                    .sync_all()?;
+                crate::durable::sync(
+                    &OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(entry.path())?,
+                )?;
                 self.step(Step::FileSynced)?;
             } else {
                 return Err(BackendError::Corrupt(
