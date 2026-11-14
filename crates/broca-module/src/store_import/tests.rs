@@ -143,6 +143,7 @@ fn params(harness: ImportHarness, path: &Path, sha256: String) -> FileImportPara
             source_ref: "thalamus:ses_head".into(),
         },
         tag_floor: Some(100),
+        moves_from: None,
     }
 }
 
@@ -302,6 +303,93 @@ fn facts(seed: &Seed) -> Vec<&broca_session_store::record::EntryFacts> {
             _ => None,
         })
         .collect()
+}
+
+/// A reply whose move list holds `rows` rows, each about 60 bytes on the wire.
+fn reply_with_rows(rows: u64) -> broca_wire::head_import::FileImportReply {
+    broca_wire::head_import::FileImportReply {
+        moves: broca_wire::head_import::MoveList {
+            shape: broca_wire::head_import::MoveListShape::Plugin,
+            rows: (1..=rows)
+                .map(|n| broca_wire::head_import::MoveRow {
+                    mid: format!("msg_{n:026}"),
+                    entry: Some(n),
+                    finished_summary: None,
+                    added: false,
+                })
+                .collect(),
+            total: None,
+            next_from: None,
+        },
+        newest: broca_wire::head_import::ImportNewest {
+            ordinal: rows,
+            mid: format!("msg_{rows:026}"),
+            digest: "synthetic-digest".into(),
+        },
+        history_version: 1,
+        incarnation: "abcd".into(),
+        imported_messages: rows,
+        dropped_system_messages: 0,
+    }
+}
+
+/// Walking a list too large for one page from row 0 by `next_from` serves every row once, in
+/// order, each page within the page budget and each with the list's total; the last page names
+/// no next one. A page past the end is refused.
+#[test]
+fn paging_a_large_move_list_serves_every_row_once_within_the_budget() {
+    let rows = 100_000;
+    let whole = reply_with_rows(rows);
+    let mut walked = Vec::new();
+    let mut pages = 0;
+    let mut from = Some(0);
+    while let Some(at) = from {
+        let page = page_moves(whole.clone(), at).unwrap();
+        pages += 1;
+        assert_eq!(page.moves.total, Some(rows));
+        assert!(serde_json::to_vec(&page.moves.rows).unwrap().len() <= MOVES_PAGE_BYTES + 1);
+        assert!(!page.moves.rows.is_empty());
+        assert_eq!(
+            (page.newest.clone(), page.imported_messages),
+            (whole.newest.clone(), rows)
+        );
+        walked.extend(page.moves.rows);
+        from = page.moves.next_from;
+        if let Some(next) = from {
+            assert_eq!(
+                next,
+                walked.len() as u64,
+                "the next page starts after this one"
+            );
+        }
+    }
+    assert!(pages > 1, "a list this size takes several pages");
+    assert_eq!(walked, whole.moves.rows);
+    let end = page_moves(whole.clone(), rows).unwrap();
+    assert!(end.moves.rows.is_empty());
+    assert_eq!((end.moves.total, end.moves.next_from), (Some(rows), None));
+    assert_eq!(
+        page_moves(whole, rows + 1).unwrap_err().code,
+        "invalid_params"
+    );
+}
+
+/// The page a call asks for is not part of the import's payload, so its digest is the same
+/// whatever page is asked for.
+#[test]
+fn the_payload_digest_leaves_out_the_page_asked_for() {
+    let dir = scratch("digest");
+    let mut params = params(
+        ImportHarness::OpenCode2,
+        &dir.join("head.json"),
+        "ab".into(),
+    );
+    let unpaged = payload_digest(&params);
+    params.moves_from = Some(17);
+    assert_eq!(payload_digest(&params), unpaged);
+    params.tag_floor = Some(1);
+    assert_ne!(payload_digest(&params), unpaged);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

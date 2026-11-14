@@ -57,6 +57,12 @@ pub struct FileImportParams {
     /// numbered above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_floor: Option<u64>,
+    /// Asks for the move list in pages: the reply's `moves` holds the rows from this index (zero
+    /// based) and says how many there are and where the next page starts. Not part of the
+    /// import's payload, so repeats asking for other pages match the same import. Without it the
+    /// reply carries every row, and a list too large for one reply frame isn't served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moves_from: Option<u64>,
 }
 
 /// Which move-list shape a reply carries, decided by where the head was.
@@ -93,6 +99,13 @@ pub struct MoveRow {
 pub struct MoveList {
     pub shape: MoveListShape,
     pub rows: Vec<MoveRow>,
+    /// In a paged reply (one asked for with `moves_from`) only: how many rows the whole list
+    /// has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// In a paged reply only, while rows remain: the `moves_from` that asks for the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_from: Option<u64>,
 }
 
 /// The last entry placed by this import, using the compaction entry's exact identity/digest.

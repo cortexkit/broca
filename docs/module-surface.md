@@ -2981,6 +2981,19 @@ that original immutable entry and its facts through the same stored-entry code a
 runs do not change it. No extra receipt field is needed; a missing/replaced original entry
 refuses recovery instead of answering with another entry.
 
+A long head's move list does not fit one reply frame (4 MiB, about 60,000 rows). The import's
+optional `moves_from` asks for the list in pages: the reply's `moves` holds the rows from that
+zero-based index, up to 2 MiB of rows, with `total` (the rows in the whole list) and, while rows
+remain, `next_from` (the `moves_from` of the next page): `moves: {shape, rows, total,
+next_from?}`. Every other reply member is the same on every page, and the pages concatenated are
+the list an unpaged reply carries. `moves_from` is not part of the payload digest, so a repeat
+asking for any page matches the import's receipt and is answered from it without importing
+again. A caller sends `moves_from: 0` with the import and repeats with each `next_from` until it
+is absent. Without `moves_from` the reply carries the whole list, and one too large for the frame
+is refused `response_too_large`, though the import itself is durable. A `moves_from` past the
+list's end is `invalid_params`. Like the import, a page is refused `session_busy` while the
+session runs a run.
+
 OpenCode 1 source rows cover every session message, ordered by `time_created`, then id, even
 when a row projects nothing and has `entry: null`. The extract preserves both ordering columns.
 `finished_summary` is true when summary is true/numeric 1 and finish is `stop`, regardless of

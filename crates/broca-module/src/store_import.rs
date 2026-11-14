@@ -219,9 +219,14 @@ pub enum StoreOutcome {
     Reopen,
 }
 
-/// The digest an import's retry is compared by: its key and every member of its payload.
+/// The digest an import's retry is compared by: its key and every member of its payload. Which
+/// page of the move list a call asks for is not payload, so it is left out.
 pub fn payload_digest(params: &FileImportParams) -> String {
-    let body = serde_json::to_vec(params).expect("import params serialize");
+    let payload = FileImportParams {
+        moves_from: None,
+        ..params.clone()
+    };
+    let body = serde_json::to_vec(&payload).expect("import params serialize");
     format!("{:x}", Sha256::digest(body))
 }
 
@@ -855,12 +860,52 @@ pub fn reply_of(
                     added: broca_session_store::session::is_broca_id_form(&row.mid),
                 })
                 .collect(),
+            total: None,
+            next_from: None,
         },
         history_version,
         incarnation,
         imported_messages: receipt.imported_messages,
         dropped_system_messages: receipt.dropped_system_messages,
     })
+}
+
+/// The most bytes of move rows one page of a paged import reply holds. A reply frame holds at
+/// most 4 MiB, and the page leaves room for the reply's other members.
+pub const MOVES_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// The page of `reply`'s move list that starts at row `from` (zero based): as many rows as fit
+/// in [`MOVES_PAGE_BYTES`], and always at least one while rows remain, with how many rows the
+/// whole list has and, while rows remain after the page, the row the next page starts at.
+pub fn page_moves(mut reply: FileImportReply, from: u64) -> Result<FileImportReply, ImportRefusal> {
+    let total = reply.moves.rows.len() as u64;
+    if from > total {
+        return Err(ImportRefusal::new(
+            "invalid_params",
+            format!("moves_from {from} is past the end of the move list's {total} rows"),
+        ));
+    }
+    let mut rows = reply.moves.rows.split_off(from as usize);
+    let mut bytes = 0;
+    let mut taken = 0;
+    for row in &rows {
+        // A row's bytes in the page's array, its separating comma included.
+        let size = serde_json::to_vec(row)
+            .expect("a move row serializes")
+            .len()
+            + 1;
+        if taken > 0 && bytes + size > MOVES_PAGE_BYTES {
+            break;
+        }
+        bytes += size;
+        taken += 1;
+    }
+    rows.truncate(taken);
+    let next = from + taken as u64;
+    reply.moves.rows = rows;
+    reply.moves.total = Some(total);
+    reply.moves.next_from = (next < total).then_some(next);
+    Ok(reply)
 }
 
 #[cfg(test)]

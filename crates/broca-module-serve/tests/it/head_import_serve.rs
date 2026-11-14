@@ -579,6 +579,16 @@ fn assert_imported_newest(imported: &serde_json::Value, page: &serde_json::Value
 }
 
 fn opencode1_source(rig: &Rig, name: &str, count: Option<usize>) -> serde_json::Value {
+    opencode1_source_with_text(rig, name, count, 256)
+}
+
+/// Like [`opencode1_source`], with each synthetic message's text repeated `repeat` times.
+fn opencode1_source_with_text(
+    rig: &Rig,
+    name: &str,
+    count: Option<usize>,
+    repeat: usize,
+) -> serde_json::Value {
     let db_path = rig.dir.join(format!("{name}-host.db"));
     let mut db = rusqlite::Connection::open(&db_path).unwrap();
     db.execute_batch(include_str!(
@@ -598,7 +608,7 @@ fn opencode1_source(rig: &Rig, name: &str, count: Option<usize>) -> serde_json::
             let mut part = transaction
                 .prepare("INSERT INTO part VALUES (?1,?1,'ses_synthetic',?2,?3)")
                 .unwrap();
-            let text = "Synthetic history. ".repeat(256);
+            let text = "Synthetic history. ".repeat(repeat);
             for index in 0..count {
                 let mid = format!("msg_synthetic_{index:06}");
                 message
@@ -893,6 +903,93 @@ async fn opencode1_extract_import_25k_timing() {
         started.elapsed().as_millis()
     );
     assert_eq!(imported["imported_messages"], 25_000);
+}
+
+/// A move list too large for one reply frame: asked for whole, the reply isn't served; asked for
+/// in pages, every page fits a frame and the pages hold every row once, in source order, each
+/// row naming the entry its message became. With `BROCA_IMPORT_MOVES_SAMPLES` naming a folder,
+/// the requests and replies are kept there as wire samples.
+#[tokio::test]
+async fn a_move_list_too_large_for_one_frame_is_served_in_pages_through_serve() {
+    let samples = std::env::var_os("BROCA_IMPORT_MOVES_SAMPLES").map(PathBuf::from);
+    let mut rig = Rig::start("opencode1-paged-moves", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let count = 100_000;
+    let params = opencode1_source_with_text(&rig, "paged-moves", Some(count), 1);
+    let mut pages = Vec::new();
+    let mut from = Some(0u64);
+    while let Some(at) = from {
+        let mut asked = params.clone();
+        asked["moves_from"] = serde_json::json!(at);
+        let frame = match (&samples, at, pages.len()) {
+            (Some(folder), 0, _) => {
+                rig.sample(folder, 1, "session.import", "paged_first", asked)
+                    .await
+            }
+            (Some(folder), _, 1) => {
+                rig.sample(folder, 1, "session.import", "paged_repeat", asked)
+                    .await
+            }
+            _ => {
+                rig.request(
+                    1,
+                    serde_json::json!({"method":"session.import","params":asked}),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        assert!(frame.body.len() as u64 <= broca_wire::SUBC_MAX_FRAME_BYTES);
+        let reply =
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone();
+        assert_eq!(reply["moves"]["total"], count as u64);
+        assert_eq!(reply["imported_messages"], count as u64);
+        from = reply["moves"]["next_from"].as_u64();
+        pages.push(reply);
+    }
+    assert!(pages.len() > 1, "the list takes several pages");
+    let rows: Vec<_> = pages
+        .iter()
+        .flat_map(|page| page["moves"]["rows"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(rows.len(), count);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row["mid"], format!("msg_synthetic_{index:06}"));
+        assert_eq!(row["entry"], index as u64 + 1);
+    }
+    if let Some(folder) = &samples {
+        // The last page again, asked for by the index the page before it named, as a sample.
+        let mut asked = params.clone();
+        asked["moves_from"] = pages[pages.len() - 2]["moves"]["next_from"].clone();
+        let last = rig
+            .sample(folder, 1, "session.import", "paged_last", asked)
+            .await;
+        let last = serde_json::from_slice::<serde_json::Value>(&last.body).unwrap();
+        assert_eq!(last["result"], pages[pages.len() - 1]);
+    }
+    let whole = match &samples {
+        Some(folder) => {
+            rig.sample(folder, 1, "session.import", "unpaged_too_large", params)
+                .await
+        }
+        None => {
+            rig.request(
+                1,
+                serde_json::json!({"method":"session.import","params":params}),
+            )
+            .await
+        }
+    };
+    assert_eq!(whole.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&whole.body).unwrap()["code"],
+        "response_too_large"
+    );
 }
 
 /// Save the actual request and terminal frame bodies, not reconstructed typed responses.

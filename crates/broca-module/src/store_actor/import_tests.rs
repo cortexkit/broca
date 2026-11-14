@@ -173,6 +173,7 @@ impl Source {
                 source_ref: "thalamus:ses_head".into(),
             },
             tag_floor: Some(40),
+            moves_from: None,
         }
     }
 
@@ -247,6 +248,39 @@ fn refused(outcome: StoreOutcome) -> &'static str {
         StoreOutcome::Refused(refusal) => refusal.code,
         other => panic!("not refused: {other:?}"),
     }
+}
+
+/// An import asked for a page of its move list answers that page, on the import itself and on
+/// every repeat, each repeat asking for any page; the rest of the reply is the unpaged reply's.
+#[tokio::test]
+async fn an_import_asked_for_a_page_answers_that_page_of_its_move_list() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::new("paged");
+    let (commands, served) = serve(create(backend).await.unwrap());
+    let page = |from: u64| {
+        let mut params = source.params("imp-1");
+        params.moves_from = Some(from);
+        source.import(params)
+    };
+    let first = imported(ask(&commands, page(0)).await);
+    let whole = imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    assert_eq!(whole.moves.rows.len(), 5);
+    assert_eq!((whole.moves.total, whole.moves.next_from), (None, None));
+    let mut unpaged = first.clone();
+    unpaged.moves.total = None;
+    assert_eq!(unpaged, whole, "the first page is the whole short list");
+    assert_eq!((first.moves.total, first.moves.next_from), (Some(5), None));
+
+    let rest = imported(ask(&commands, page(3)).await);
+    assert_eq!(rest.moves.rows, whole.moves.rows[3..]);
+    assert_eq!((rest.moves.total, rest.moves.next_from), (Some(5), None));
+    assert_eq!(rest.newest, whole.newest);
+    let end = imported(ask(&commands, page(5)).await);
+    assert!(end.moves.rows.is_empty());
+    assert_eq!((end.moves.total, end.moves.next_from), (Some(5), None));
+    assert_eq!(refused(ask(&commands, page(6)).await), "invalid_params");
+    drop(commands);
+    served.await.unwrap();
 }
 
 /// An import writes the whole history as one seeded run and answers its move list; its source

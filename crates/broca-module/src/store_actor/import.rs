@@ -8,8 +8,8 @@ use broca_wire::head_import::InstallViewReply;
 
 use super::StoreActor;
 use crate::store_import::{
-    delete_sources, newest_of_entry, payload_digest, read_source, reply_of, seed, ImportCommand,
-    ImportRefusal, InstallViewCommand, SeedFacts, StoreCommand, StoreOutcome,
+    delete_sources, newest_of_entry, page_moves, payload_digest, read_source, reply_of, seed,
+    ImportCommand, ImportRefusal, InstallViewCommand, SeedFacts, StoreCommand, StoreOutcome,
 };
 use crate::store_import_stage::ImportStaging;
 
@@ -35,7 +35,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             );
         }
         match command {
-            StoreCommand::Import(command) => self.import(*command).await,
+            StoreCommand::Import(command) => {
+                // A call asking for a page of the move list gets that page of whichever reply the
+                // import answers: a new import's, or the receipt's on a repeat.
+                let page = command.params.moves_from;
+                let (outcome, retire) = self.import(*command).await;
+                let outcome = match (outcome, page) {
+                    (StoreOutcome::Imported(reply), Some(from)) => match page_moves(reply, from) {
+                        Ok(reply) => StoreOutcome::Imported(reply),
+                        Err(refusal) => StoreOutcome::Refused(refusal),
+                    },
+                    (outcome, _) => outcome,
+                };
+                (outcome, retire)
+            }
             StoreCommand::InstallView(command) => (self.install_view(*command).await, false),
             // Served by the command loop, which applies a view while a run runs too.
             StoreCommand::ApplyView(_) => (
