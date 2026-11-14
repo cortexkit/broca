@@ -508,6 +508,23 @@ async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
             false,
         )
     };
+    // The send's front check, which runs before its admission, refuses it the same way.
+    let front = || {
+        crate::serve::ServeHandler::plan_readers_supported(
+            &module.registry,
+            &session,
+            Some("mason"),
+        )
+    };
+    match front() {
+        Err(crate::serve::ServeError::Open(
+            reason,
+            Some(broca_protocol::ErrorClass::Transient),
+        )) => {
+            assert!(reason.starts_with("key_unavailable:"), "{reason}")
+        }
+        other => panic!("expected the transient key_unavailable refusal, got {other:?}"),
+    }
     assert_key_unavailable(send().await.expect_err("the mason is refused"));
     let address = broca_core::session_addr(&session);
     assert_eq!(
@@ -516,6 +533,10 @@ async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
     );
 
     module.load_key().await;
+    assert!(
+        matches!(front(), Ok(true)),
+        "readers are supported once the key loads"
+    );
     let outcome = send().await.expect("the mason opens once the key loads");
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     assert!(broca_wal::session_storage_class(&module.dir, &address)

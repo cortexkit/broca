@@ -3449,10 +3449,18 @@ impl ServeHandler for crate::LineageRegistry {
         if self.store_holding(session)?.is_some() {
             return Ok(true);
         }
-        Ok(self.store_can_create()
-            && self.wal_written(session) == Some(false)
+        let starts_in_store = self.wal_written(session) == Some(false)
             && (class == Some(crate::registry::HEAD_SESSION_CLASS)
-                || self.starts_new_sessions_in_store(class)))
+                || self.starts_new_sessions_in_store(class));
+        // A session that starts in the new storage but can't be created there yet (its key
+        // still loading after a start) is refused as retryable, as the opener and the send's own
+        // admission refuse it, never answered "not supported", which refuses the plan for good.
+        if starts_in_store && !self.store_can_create() {
+            if let Some(pending) = self.store_creation_pending() {
+                return Err(pending.into());
+            }
+        }
+        Ok(starts_in_store && self.store_can_create())
     }
     async fn authorize_session_read(
         &self,

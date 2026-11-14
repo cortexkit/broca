@@ -2193,6 +2193,12 @@ impl LineageRegistry {
             })
     }
 
+    /// Why a session can't be created in the new storage right now, when it can't: the
+    /// retryable `key_unavailable` while its deployment key still loads.
+    pub(crate) fn store_creation_pending(&self) -> Option<OpenError> {
+        self.inner.opener.store_creation_pending()
+    }
+
     pub(crate) fn store_can_create(&self) -> bool {
         self.inner
             .opener
@@ -3866,7 +3872,7 @@ impl LineageRegistry {
                 // key still loading after a start) is refused as retryable, as the opener refuses
                 // it, never as if it would stay on today's storage.
                 if !supported && starts_in_store {
-                    if let Some(pending) = self.inner.opener.store_creation_pending() {
+                    if let Some(pending) = self.store_creation_pending() {
                         return Err(pending);
                     }
                 }
