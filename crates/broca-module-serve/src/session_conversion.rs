@@ -1332,6 +1332,19 @@ impl Engine {
         if self.crash == Some("publish_head") {
             return Err(Failure::failed("crash", "publish_head"));
         }
+        // Publishing registered the session for recovery at the next boot. Actors stay off it
+        // until `_idle_fence` drops below, so the registration can be retired now when the
+        // converted state needs no recovery. A registration left behind only costs one open.
+        if let Err(error) = broca_module::store_open::recovery::retire_settled_install(
+            &destination,
+            &broca_session_store::backend::SessionAddr(address.to_string()),
+            deployment,
+        )
+        .await
+        {
+            tracing::warn!(target: "session_conversion", source = %source.id, %error,
+                "a converted session's recovery registration was kept");
+        }
         if let Some(registry) = registry {
             registry.forget_moved_session(&session);
         }

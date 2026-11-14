@@ -18,6 +18,41 @@ async fn converted(rig: &Rig, records: &[WalRecord]) -> (crate::conversion_ledge
     (rows[0].clone(), before)
 }
 
+/// Whether the converted session is registered for recovery at the next boot.
+fn registered_for_recovery(rig: &Rig) -> bool {
+    StorageClass::Ordinary
+        .store_root(&rig.dir)
+        .join("recovery-candidates")
+        .join(broca_core::session_addr(&key()))
+        .exists()
+}
+
+/// A converted session with no open work is not registered for recovery: the next boot opens
+/// only sessions it has something to recover for, however many sessions converted.
+#[tokio::test]
+async fn cutover_leaves_a_finished_session_unregistered_for_recovery() {
+    let rig = Rig::start("cutover-settled").await;
+    let (row, _) = converted(
+        &rig,
+        &[
+            run_started("r1", 1_000),
+            record(json!({"type": "step_started", "step_id": 1})),
+            record(json!({"type": "model_step_finished", "step_id": 1,
+                "assistant_message": {"message_id": "m1",
+                    "content": [{"type": "text", "text": "Done."}]},
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "finish_reason": "stop", "retries_used": 0})),
+            record(
+                json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+                "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(row.outcome.as_deref(), Some("converted"), "{row:?}");
+    assert!(!registered_for_recovery(&rig));
+}
+
 /// A live session whose latest run paused for sign-in converts with the run still paused: the
 /// recovery before the conversion appends nothing to its log, as today's open appends nothing,
 /// and the converted session holds the pause, so the run's own send resumes it.
@@ -45,6 +80,8 @@ async fn cutover_carries_a_run_paused_for_sign_in_paused() {
     assert_eq!(run.run_id, "r1");
     assert_eq!(run.paused, Some(broca_protocol::PauseReason::AuthRequired));
     assert_eq!(run.finished, None);
+    // Its paused run is open work, so the next boot still opens it.
+    assert!(registered_for_recovery(&rig));
 }
 
 /// A live session holding an ordered send that waits for a tool result converts with the send
@@ -87,6 +124,7 @@ async fn cutover_carries_an_ordered_send_waiting_for_a_tool_result_queued() {
             .unwrap(),
         Some(broca_core::delivery_order::QueuedSendFate::Pending)
     );
+    assert!(registered_for_recovery(&rig));
 }
 
 /// A live session compacted under the first compaction protocol converts read-only: its ledger

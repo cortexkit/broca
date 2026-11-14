@@ -18,6 +18,57 @@ pub fn register_candidate(root: &Path, addr: &SessionAddr) -> std::io::Result<()
     super::recovery_index::insert(root, addr)
 }
 
+/// Whether a session's stored state leaves its open-time recovery anything to do: an unfinished
+/// run, queued sends, usage billing still owed (when `billing` runs), or a durable head that
+/// warms itself and so opens once at boot to rebuild its warming timer.
+fn needs_recovery(
+    operations: &broca_session_store::fold::operations::Operations,
+    billing: bool,
+) -> bool {
+    !operations.queue.is_empty()
+        || (billing && !operations.billing_owed.is_empty())
+        || operations.run.as_ref().is_some_and(|run| {
+            run.finished.is_none()
+                || run.start.as_ref().is_some_and(|start| {
+                    start.session_class.as_deref() == Some("head")
+                        && start.keep_warm.as_ref() == Some(&serde_json::json!("auto"))
+                })
+        })
+}
+
+/// Retires the recovery registration of an installed session (see [`register_candidate`]) once
+/// its published state leaves recovery nothing to do, so a boot doesn't open it to find that
+/// out. Conversion installs every old session this way; registered and left, each converted
+/// session was opened at the next boot (29,840 at one restart). The installer must still keep
+/// actors off the session, so no run can have registered it since the install did. A session
+/// whose state can't be read keeps its registration. Returns whether it was retired.
+pub async fn retire_settled_install(
+    root: &Path,
+    addr: &SessionAddr,
+    deployment: &DeploymentKey,
+) -> Result<bool, String> {
+    let backend = LocalBackend::new(root);
+    let Some((head, _)) = backend
+        .read_stored_head(addr)
+        .map_err(|error| format!("read head: {error:?}"))?
+    else {
+        return Ok(false);
+    };
+    let triple = broca_session_store::head::stored_triple(&head)
+        .map_err(|error| format!("decode head identity: {error:?}"))?;
+    let view = match Session::view(backend, addr.clone(), &triple, deployment).await {
+        Ok(view) => view,
+        Err(_) => return Ok(false),
+    };
+    // Billing is taken to run: a session that still owes it stays registered either way.
+    if needs_recovery(&view.operations, true) {
+        return Ok(false);
+    }
+    super::recovery_index::remove(root, addr)
+        .map_err(|error| format!("retire recovery: {error}"))?;
+    Ok(true)
+}
+
 /// Only missing coverage or durable-head warming may enumerate all stored heads. Keep the
 /// inventory lazy so a complete worker-root index never pays for its idle session count.
 pub(crate) fn candidate_addresses(
@@ -119,17 +170,7 @@ impl crate::registry::LineageRegistry {
                     {
                         Ok(view)
                             if !registered.contains(&addr.0)
-                                && view.operations.queue.is_empty()
-                                && (runtime.billing.is_none()
-                                    || view.operations.billing_owed.is_empty())
-                                && !view.operations.run.as_ref().is_some_and(|run| {
-                                    run.finished.is_none()
-                                        || run.start.as_ref().is_some_and(|start| {
-                                            start.session_class.as_deref() == Some("head")
-                                                && start.keep_warm.as_ref()
-                                                    == Some(&serde_json::json!("auto"))
-                                        })
-                                }) =>
+                                && !needs_recovery(&view.operations, runtime.billing.is_some()) =>
                         {
                             return Ok(())
                         }
