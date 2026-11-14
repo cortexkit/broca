@@ -2953,7 +2953,11 @@ the root holding a session's head is authoritative afterwards, and a head found 
 two roots is refused `session_in_two_classes`. A file import (`session.import` with a
 file source, which brings an OpenCode 1, OpenCode 2 or Pi agent head onto broca) carries no
 label and is placed durable by the same rule: ephemeral if it carries a retention
-policy, else `session-store-durable/`, whatever `backup_classes` lists.
+policy, else `session-store-durable/`, whatever `backup_classes` lists. Its optional
+`retention` (seconds, with a send's limits; a larger value is `invalid_params`) is that policy:
+the seeded run records it, and the session is deleted once that long passes after its last
+activity with no run active or paused. The import's own time counts as activity. `retention`
+is part of the import's payload, so a repeat must carry the same value.
 `session.move_to_store` (operator only)
 places a moved session in the root matching its WAL's folder; its optional
 `class: "durable"` places a session from `wal/` in the durable root, and any other

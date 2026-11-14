@@ -781,7 +781,7 @@ fn seed_start(
         ts_ms: Some(at.now_ms),
         written_at_ms: Some(at.now_ms),
         session_class: None,
-        retention_secs: None,
+        retention_secs: at.params.retention,
         title: None,
         context_limit: None,
         service_tier: None,

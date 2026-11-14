@@ -1947,6 +1947,7 @@ async fn dump_head_import_entries() {
                         source_ref: format!("thalamus:{session_id}"),
                     },
                     tag_floor: thalamus_reply["tag_floor"].as_u64(),
+                    retention: None,
                     moves_from: None,
                 },
                 principal: broca_protocol::BindPrincipal::Reserved {

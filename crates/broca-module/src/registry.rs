@@ -4010,6 +4010,12 @@ impl LineageRegistry {
         use crate::actor::LineageCmd;
         use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
         let creates = matches!(command, StoreCommand::Import(_));
+        // An import that asks for retention creates its session in the ephemeral store, as a
+        // send that does.
+        let retention = match &command {
+            StoreCommand::Import(import) => import.params.retention,
+            _ => None,
+        };
         let served = if creates {
             self.store_runtime().is_some()
         } else {
@@ -4030,7 +4036,7 @@ impl LineageRegistry {
                     .unwrap()
                     .insert(key.clone(), StoreCreation::Import);
             }
-            let handle = self.actor_for_mode(key, None, None, false).await;
+            let handle = self.actor_for_mode(key, retention, None, false).await;
             // A mark the open didn't take, because the session was already open, must not
             // decide a later open.
             self.inner.store_eligible.lock().unwrap().remove(key);

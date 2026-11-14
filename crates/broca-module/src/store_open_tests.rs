@@ -676,3 +676,84 @@ async fn a_head_in_two_roots_is_refused_by_name() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// An import's own retention decides where its session is created, through the registry's
+/// import route: in the ephemeral root when the import asks for retention, in the durable root
+/// otherwise.
+#[tokio::test]
+async fn an_import_asking_for_retention_creates_its_session_in_the_ephemeral_root() {
+    use crate::store_import::{ImportCommand, ImportRoots, StoreCommand, StoreOutcome};
+    use sha2::Digest as _;
+    let root = state_root("import-retention");
+    let runtime = self::runtime(&root).await;
+    let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+    let (_, registry) = module(&root, wal_store, runtime.clone());
+    let folder = root.join("imports");
+    std::fs::create_dir_all(&folder).unwrap();
+    let export = serde_json::to_vec(&serde_json::json!({
+        "info": {"id": "ses_head"},
+        "messages": [
+            {"id": "msg_u1", "type": "user", "time": {"created": 1000}, "text": "Hello."},
+            {"id": "msg_a1", "type": "assistant", "time": {"created": 2000, "completed": 3000},
+             "content": [{"type": "text", "text": "Hi."}]}
+        ]
+    }))
+    .unwrap();
+    let core = broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    for (name, retention, expected) in [
+        ("kept", None, StorageClass::Durable),
+        ("retained", Some(3_600), StorageClass::Ephemeral),
+    ] {
+        let path = folder.join(format!("{name}.json"));
+        std::fs::write(&path, &export).unwrap();
+        let params = serde_json::from_value(serde_json::json!({
+            "import_id": name,
+            "source": {
+                "harness": "opencode2",
+                "path": path.display().to_string(),
+                "session": "ses_head",
+                "sha256": format!("{:x}", sha2::Sha256::digest(&export)),
+            },
+            "origin": {"kind": "import", "source_ref": "thalamus:ses_head"},
+            "retention": retention,
+        }))
+        .unwrap();
+        let session = key(&root, name);
+        let outcome = registry
+            .route_store_command(
+                &session,
+                StoreCommand::Import(Box::new(ImportCommand {
+                    params,
+                    principal: core.clone(),
+                    // An import arrives on a route scoped to its owner's head.
+                    scope: Some(broca_protocol::SessionScope {
+                        owner: core.clone(),
+                        scope_ref: format!("head-{name}"),
+                        scope_epoch: 1,
+                        flow_id: None,
+                        sender: None,
+                        agent_id: None,
+                        run_id: None,
+                        agent_id_frozen: false,
+                    }),
+                    roots: Arc::new(ImportRoots::new(vec![folder.clone()], Some(folder.clone()))),
+                    // Now, so the retained session isn't already past its deadline.
+                    now_ms: broca_core::clock::epoch_millis().unwrap(),
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, StoreOutcome::Imported(_)),
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(
+            runtime.class_of(&session).unwrap(),
+            Some(expected),
+            "{name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

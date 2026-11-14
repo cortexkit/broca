@@ -57,6 +57,12 @@ pub struct FileImportParams {
     /// numbered above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_floor: Option<u64>,
+    /// How long, in seconds, the imported session is kept after its last activity, as a
+    /// send's `retention` says: the session is placed in the ephemeral store, is never backed up,
+    /// and is deleted once that long passes with no run active or paused. Absent, the session is
+    /// kept. Part of the import's payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<u64>,
     /// Asks for the move list in pages: the reply's `moves` holds the rows from this index (zero
     /// based) and says how many there are and where the next page starts. Not part of the
     /// import's payload, so repeats asking for other pages match the same import. Without it the

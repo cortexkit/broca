@@ -1242,6 +1242,43 @@ async fn opencode1_capture_head_import_wire_samples() {
 /// leaves broca's import folder, a retry is answered the same, the head reads back from the new
 /// storage under the source's message ids, and the owner installs the first view. Another
 /// principal's install is refused.
+/// The seeded run an import writes is stamped with wall-clock time, which retention counts the
+/// session's deadline from; a retention past the limit a send has is refused before anything is
+/// read or written.
+#[tokio::test]
+async fn an_import_is_stamped_with_wall_clock_time_and_its_retention_is_checked() {
+    use sha2::Digest as _;
+    let mut rig = Rig::start("import-time", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let mut params = rig.import_params("imp-time");
+    params["retention"] = serde_json::json!(broca_module::retention::MAX_RETENTION_SECONDS + 1);
+    assert_eq!(
+        rig.refused(1, "session.import", params.clone()).await,
+        "invalid_params"
+    );
+    assert!(
+        rig.import_folder().join("imp-time.json").exists(),
+        "a refused import leaves its source"
+    );
+    params.as_object_mut().unwrap().remove("retention");
+    let before = broca_core::clock::epoch_millis().unwrap();
+    rig.result(1, "session.import", params).await;
+    let after = broca_core::clock::epoch_millis().unwrap();
+    let digest = format!("{:x}", sha2::Sha256::digest("imp-time".as_bytes()));
+    let admission = rig
+        .result(
+            1,
+            "run.admission",
+            serde_json::json!({"run_id": format!("import-{}", &digest[..32])}),
+        )
+        .await;
+    let started = admission["started_at_ms"].as_u64().unwrap();
+    assert!(
+        (before..=after).contains(&started),
+        "{before} <= {started} <= {after}: {admission}"
+    );
+}
+
 #[tokio::test]
 async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
     let mut rig = Rig::start("import", true).await;
@@ -1739,7 +1776,9 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     let mut rig = Rig::start("gate", true).await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = rig.import_params("imp-1");
+    let before = broca_core::clock::epoch_millis().unwrap();
     rig.result(1, "session.import", params).await;
+    let after = broca_core::clock::epoch_millis().unwrap();
 
     assert_eq!(
         rig.refused(1, "run.event.get", serde_json::json!({"run_id": "r1"}))
@@ -1774,7 +1813,7 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
         .await;
     assert_eq!(describe.header.ty, FrameType::Response);
     // The head is served from the store. The import's own completed run is the last run, and
-    // the head's time is the newest imported message's.
+    // the head's time is the import's, the newest time its log carries.
     let head = rig.result(1, "session.head", serde_json::json!({})).await;
     assert_eq!(head["last_run_state"]["state"], "completed", "{head}");
     assert!(
@@ -1783,7 +1822,8 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
             .is_some_and(|run| run.starts_with("import-")),
         "{head}"
     );
-    assert_eq!(head["updated_at"], 4000, "{head}");
+    let updated = head["updated_at"].as_u64().unwrap();
+    assert!((before..=after).contains(&updated), "{head}");
     assert_eq!(
         (head["first_ordinal"].clone(), head["last_ordinal"].clone()),
         (1.into(), 4.into()),

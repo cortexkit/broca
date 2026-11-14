@@ -173,6 +173,7 @@ impl Source {
                 source_ref: "thalamus:ses_head".into(),
             },
             tag_floor: Some(40),
+            retention: None,
             moves_from: None,
         }
     }

@@ -3859,6 +3859,14 @@ where
                 )
                 .await;
             };
+            // An import's retention is checked against the same limits as a send's. A repeat of
+            // the import is matched against its receipt, which compares the retention too.
+            if let Err(detail) =
+                broca_module::retention::validate_retention(params.retention, None, false)
+            {
+                let error = ServeError::RetentionInvalid(detail);
+                return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
+            }
             let Some(roots) = handler.import_roots() else {
                 return send_error(
                     writer,
@@ -3880,7 +3888,9 @@ where
                         _ => None,
                     },
                     roots,
-                    now_ms: broca_diagnostics::now_ms(),
+                    // Wall-clock time: it stamps the seeded run's records, and retention counts
+                    // the session's deadline from it.
+                    now_ms: broca_core::clock::epoch_millis().unwrap_or(0),
                 },
             ));
             send_store_outcome(

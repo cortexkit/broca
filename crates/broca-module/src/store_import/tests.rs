@@ -143,6 +143,7 @@ fn params(harness: ImportHarness, path: &Path, sha256: String) -> FileImportPara
             source_ref: "thalamus:ses_head".into(),
         },
         tag_floor: Some(100),
+        retention: None,
         moves_from: None,
     }
 }
@@ -303,6 +304,36 @@ fn facts(seed: &Seed) -> Vec<&broca_session_store::record::EntryFacts> {
             _ => None,
         })
         .collect()
+}
+
+/// An import asking for retention records it on the completed run that holds the imported
+/// history, so the retention sweep gives the imported session a deadline counted from the
+/// import; without it the session has none.
+#[test]
+fn an_imports_retention_gives_the_session_a_deadline() {
+    let deadline = |retention: Option<u64>| {
+        let mut params = params(ImportHarness::OpenCode2, Path::new("/x"), "ab".into());
+        params.retention = retention;
+        let seed = seed(
+            history(),
+            &SeedFacts {
+                params: &params,
+                principal: &core(),
+                scope: None,
+                now_ms: 5_000,
+                prefix: "gfeed",
+                first_seq: 10,
+            },
+        )
+        .unwrap();
+        let records: Vec<(u64, Record)> = (10..).zip(seed.records).collect();
+        crate::retention::store::store_policy(&records)
+    };
+    assert_eq!(
+        deadline(Some(3_600)),
+        Some((3_600, 5_000, Some(5_000 + 3_600_000)))
+    );
+    assert_eq!(deadline(None), None);
 }
 
 /// A reply whose move list holds `rows` rows, each about 60 bytes on the wire.
