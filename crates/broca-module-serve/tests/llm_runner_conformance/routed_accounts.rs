@@ -927,6 +927,7 @@ mod tests {
         let chosen = broca_module_serve::account_routing::choose_account(
             &client,
             ChoiceInputs {
+                catalog_serves: &|_: &str| true,
                 account_route: None,
                 decision_id: None,
                 service_tier: None,
@@ -1173,7 +1174,11 @@ mod tests {
             let auth = broca_catalog::live::AuthMethod::from_token(method).unwrap();
             assert_eq!(ids.as_object().unwrap().len(), 3);
             let candidates = if auth == broca_catalog::live::AuthMethod::ApiKey {
-                broca_module_serve::account_routing::Candidates::api_keys(&listing, provider)
+                broca_module_serve::account_routing::Candidates::api_keys(
+                    &listing,
+                    provider,
+                    &|_| true,
+                )
             } else {
                 broca_module_serve::account_routing::Candidates::from_listing(
                     &listing, auth, provider,

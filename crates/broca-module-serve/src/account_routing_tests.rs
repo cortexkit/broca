@@ -321,6 +321,7 @@ async fn choose(
     choose_account(
         client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -479,6 +480,7 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero() {
         choose_account(
             &client,
             ChoiceInputs {
+                catalog_serves: &|_: &str| true,
                 account_route: None,
                 pool: None,
                 credential_id: None,
@@ -616,6 +618,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -674,6 +677,7 @@ async fn a_slow_listing_shares_the_admission_budget_and_is_refused_as_unreachabl
     let refusal = choose_account(
         &client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -790,6 +794,7 @@ async fn choose_api_key_with_decision(
     choose_account(
         client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             static_credential: &key,
             caller_named_account: pinned,
@@ -810,6 +815,105 @@ async fn choose_api_key_with_decision(
         tokio::time::Instant::now() + ADMISSION_BUDGET,
     )
     .await
+}
+
+/// A paid-key run on a catalog model, routed through a pool its keys are filed under, offers
+/// routing the pool's keys: the provider the request names, not the one the run's model names.
+#[tokio::test]
+async fn an_account_route_offers_the_keys_of_the_provider_it_names() {
+    let routing = api_key_router("apikey", "apikey:anthropic:acct1");
+    let pool_key = |id: &str| {
+        let mut key = row(id, None, "anthropic-platform", "apikey");
+        key.serves = vec!["anthropic".into()];
+        key.refresh_adapter = None;
+        key
+    };
+    let mut catalog_key = row("apikey:anthropic", None, "anthropic", "apikey");
+    catalog_key.refresh_adapter = None;
+    // Keys that list no provider ids and serve several catalog providers, or none, belong to
+    // no provider: routing excludes them, so they are never offered.
+    let unlisted = |id: &str, serves: &[&str]| {
+        let mut key = row(id, None, "unused", "apikey");
+        key.provider_ids.clear();
+        key.serves = serves.iter().map(|vendor| (*vendor).to_owned()).collect();
+        key.refresh_adapter = None;
+        key
+    };
+    let rows = listing(vec![
+        pool_key("apikey:anthropic:acct1"),
+        pool_key("apikey:anthropic:acct2"),
+        catalog_key,
+        unlisted("apikey:gateway", &["google", "deepseek"]),
+        unlisted("apikey:nothing", &[]),
+    ]);
+    let route =
+        broca_protocol::request::AccountRoute::new("anthropic-platform", "claude-haiku-5-5");
+    let key = CredentialId::parse("apikey:anthropic").unwrap();
+    let choice = choose_account(
+        &client(&routing),
+        ChoiceInputs {
+            catalog_serves: &|_: &str| true,
+            account_route: Some(&route),
+            static_credential: &key,
+            caller_named_account: false,
+            pool: Some("anthropic-platform"),
+            credential_id: None,
+            decision_id: Some("acd_1"),
+            service_tier: None,
+            conversation_key: None,
+            inherited_conversation_key: None,
+            hold_cap: Default::default(),
+            model: "claude-haiku-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 42,
+        },
+        async { Some(rows) },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    )
+    .await
+    .unwrap();
+    assert_eq!(path_of(&choice), "routed");
+    let params = routing.requests.lock().unwrap()[0]["params"].clone();
+    assert_eq!(params["provider"], "anthropic-platform");
+    let offered: Vec<_> = params["candidates"]["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|account| account["credential_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        offered,
+        ["apikey:anthropic:acct1", "apikey:anthropic:acct2"]
+    );
+}
+
+/// A key belongs to a provider by routing's rule: its `provider_ids` when it lists any, else the
+/// one catalog provider among the vendors it serves.
+#[test]
+fn a_key_belongs_to_providers_by_routing_rule() {
+    use crate::account_routing::key_belongs_to;
+    let catalog = |id: &str| ["anthropic", "google", "deepseek"].contains(&id);
+    let key = |provider_ids: &[&str], serves: &[&str]| {
+        let mut key = row("apikey:k", None, "unused", "apikey");
+        key.provider_ids = provider_ids.iter().map(|id| (*id).to_owned()).collect();
+        key.serves = serves.iter().map(|vendor| (*vendor).to_owned()).collect();
+        key
+    };
+    // Listed provider ids decide alone, whatever the key serves.
+    let pool = key(&["anthropic-platform"], &["anthropic"]);
+    assert!(key_belongs_to(&pool, "anthropic-platform", &catalog));
+    assert!(!key_belongs_to(&pool, "anthropic", &catalog));
+    // No provider ids: the one catalog provider it serves, ignoring vendors the catalog lacks.
+    let one = key(&[], &["deepseek", "deepseek-internal"]);
+    assert!(key_belongs_to(&one, "deepseek", &catalog));
+    assert!(!key_belongs_to(&one, "deepseek-internal", &catalog));
+    // Several catalog providers, or none: no provider.
+    let several = key(&[], &["google", "deepseek"]);
+    assert!(!key_belongs_to(&several, "google", &catalog));
+    assert!(!key_belongs_to(&several, "deepseek", &catalog));
+    assert!(!key_belongs_to(&key(&[], &[]), "anthropic", &catalog));
 }
 
 fn api_key_router(method: &str, credential_id: &str) -> Arc<FakeRouting> {
@@ -993,6 +1097,7 @@ async fn apikey_unhinted_asks_routing_and_pinned_keeps_the_exact_vault_record() 
         let choice = choose_account(
             &client(&routing),
             ChoiceInputs {
+                catalog_serves: &|_: &str| true,
                 account_route: None,
                 static_credential: &key,
                 caller_named_account: account.is_some(),
@@ -1134,6 +1239,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -1402,7 +1508,9 @@ async fn an_uncategorized_exact_grant_record_is_not_judged_for_routing_metadata(
             credential_id: "oauth:anthropic".into()
         }]
     );
-    assert!(Candidates::api_keys(&rows, "anthropic").accounts.is_empty());
+    assert!(Candidates::api_keys(&rows, "anthropic", &|_| true)
+        .accounts
+        .is_empty());
 }
 
 /// `health.check` reports the unmapped count inside the account-selection block.
@@ -1545,6 +1653,7 @@ async fn refusal_log_names_send_and_routing_decision() {
     let (result, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -3151,6 +3260,7 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_its_admission_is_rep
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -3197,6 +3307,7 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
     let result = choose_account(
         &client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             pool: None,
             credential_id: None,
@@ -3232,6 +3343,7 @@ async fn choose_with_auth_hints(
     choose_account(
         client,
         ChoiceInputs {
+            catalog_serves: &|_: &str| true,
             account_route: None,
             decision_id: None,
             service_tier: None,

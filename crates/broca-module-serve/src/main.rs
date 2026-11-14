@@ -5733,9 +5733,18 @@ mod executor {
                 .unwrap_or_default();
             let deadline =
                 tokio::time::Instant::now() + broca_module_serve::account_routing::ADMISSION_BUDGET;
+            // With no catalog loaded no provider is a catalog provider, so a key listing no
+            // provider ids belongs to none: it is left out rather than offered on a guess.
+            let catalog = broca_catalog::catalog().ok();
+            let catalog_serves = move |id: &str| {
+                catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.serves_provider(id))
+            };
             broca_module_serve::account_routing::choose_account(
                 routing,
                 broca_module_serve::account_routing::ChoiceInputs {
+                    catalog_serves: &catalog_serves,
                     account_route: req.account_route.as_ref(),
                     decision_id: req.route_decision_id.as_deref(),
                     service_tier,

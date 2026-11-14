@@ -881,10 +881,36 @@ pub struct Candidate {
     pub credential_id: String,
 }
 
+/// Whether an API key belongs to `provider`, by routing's rule, so broca never offers routing a
+/// key it must exclude: the key's `provider_ids` decide when it lists any; a key that lists none
+/// belongs to a provider only when exactly one of the vendors it `serves` is a catalog provider
+/// (`catalog_serves`), and then to that one.
+pub fn key_belongs_to(
+    row: &broca_subc::vault::ScopedCredential,
+    provider: &str,
+    catalog_serves: &dyn Fn(&str) -> bool,
+) -> bool {
+    if !row.provider_ids.is_empty() {
+        return row.provider_ids.iter().any(|id| id == provider);
+    }
+    let served: std::collections::BTreeSet<&str> = row
+        .serves
+        .iter()
+        .map(String::as_str)
+        .filter(|vendor| catalog_serves(vendor))
+        .collect();
+    served.len() == 1 && served.contains(provider)
+}
+
 impl Candidates {
-    /// Only keys the runner can read and send with are eligible. When the vault has no
-    /// account metadata, routing identifies the pool account by the public credential id.
-    pub fn api_keys(listing: &ScopedList, provider: &str) -> Self {
+    /// Only keys the runner can read and send with, and that belong to `provider` by routing's
+    /// rule (see [`key_belongs_to`]), are eligible. When the vault has no account metadata,
+    /// routing identifies the pool account by the public credential id.
+    pub fn api_keys(
+        listing: &ScopedList,
+        provider: &str,
+        catalog_serves: &dyn Fn(&str) -> bool,
+    ) -> Self {
         let mut accounts: Vec<_> = listing
             .credentials
             .iter()
@@ -892,8 +918,7 @@ impl Candidates {
                 row.state == "active"
                     && row.operations.iter().any(|op| op == "read")
                     && row.auth_method.as_deref() == Some("apikey")
-                    && (row.provider_ids.is_empty()
-                        || row.provider_ids.iter().any(|id| id == provider))
+                    && key_belongs_to(row, provider, catalog_serves)
             })
             .map(|row| Candidate {
                 account_id: row.account_id.clone().unwrap_or_else(|| row.id.clone()),
@@ -1680,6 +1705,9 @@ pub struct ChoiceInputs<'a> {
     pub service_tier: Option<&'a str>,
     pub pool: Option<&'a str>,
     pub credential_id: Option<&'a str>,
+    /// Whether the model catalog carries a provider id: an API key that lists no provider ids
+    /// belongs to the one catalog provider it serves (see [`key_belongs_to`]).
+    pub catalog_serves: &'a (dyn Fn(&str) -> bool + Send + Sync),
     /// Caller affinity for this admission; an explicit key always wins.
     pub conversation_key: Option<&'a str>,
     /// Affinity frozen by the latest episode in the durable admission snapshot.
@@ -1814,14 +1842,21 @@ where
     let Ok(Some(listing)) = tokio::time::timeout_at(deadline, listing).await else {
         return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
     };
+    // The candidates are credentials of the provider the request names: the account route's,
+    // when the caller gave one. A paid-key run on `anthropic/<model>` routed through the
+    // `anthropic-platform` pool asks for `anthropic-platform`, and its keys are filed under that
+    // provider, not under the catalog provider the run's model names.
+    let requested = inputs
+        .account_route
+        .map_or(provider, |route| route.provider.as_str());
     let candidates = if inputs.caller_named_account && inputs.decision_id.is_none() && !hinted {
         // A caller that names its account offers routing that account alone: routing still
         // admits the run, so a pinned run is under the same blocks as any other.
         Candidates::pinned(&listing, method, &inputs.static_credential.to_id_string())
     } else if method == AuthMethod::ApiKey {
-        Candidates::api_keys(&listing, provider)
+        Candidates::api_keys(&listing, requested, inputs.catalog_serves)
     } else {
-        Candidates::from_listing(&listing, method, provider)
+        Candidates::from_listing(&listing, method, requested)
     };
     let params = account_for_params(&AccountForRequest {
         account_route: inputs.account_route,

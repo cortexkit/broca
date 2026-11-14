@@ -54,7 +54,8 @@ pub(super) fn classifier_candidates(
     bound
         .credentials
         .retain(|row| row.provider_ids.iter().any(|id| id == provider));
-    Candidates::api_keys(&bound, provider)
+    // Every key left lists the provider, so the catalog never decides membership here.
+    Candidates::api_keys(&bound, provider, &|_| false)
 }
 
 #[async_trait]
