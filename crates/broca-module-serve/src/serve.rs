@@ -2932,8 +2932,9 @@ where
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
         // Only the operator's own connection reads a session's tag map, refused before anything
-        // reads the session and before the request is counted.
+        // reads the session. The refused request is counted, as every management operation's is.
         if method == OP_TAG_MAP && !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+            count_management_operation(OP_TAG_MAP);
             return send_error(
                 &writer,
                 ver,

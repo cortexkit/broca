@@ -126,7 +126,11 @@ fn worker_acceptance_scope_authorizes_broca_for_aft() {
 async fn worker_admission_acceptance_reads_real_run_started_gates() {
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
     let model = ScopeModel::start().await;
-    let Some(rig) = Rig::start_configured(None, None, Some(&model.url)).await else {
+    // A mason starts in the new storage, which refuses a new session until its deployment key
+    // loads; plain sessions need no key, so the rig needs no vault.
+    let storage = serde_json::json!({"session_storage": {"encryption": "off"}});
+    let Some(rig) = Rig::start_with_broca_config(None, None, Some(&model.url), Some(storage)).await
+    else {
         return;
     };
     let manifest =
@@ -241,60 +245,39 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
     let run = admitted["result"]["run_id"].as_str().unwrap();
     completed_run(&owner, &route, run).await;
 
-    let mut storage = session.clone();
-    storage.project_root = checkout;
-    let wal = std::fs::read(rig.wal_path(&storage)).unwrap();
-    let starts = run_started_frame_requires(&wal);
-    assert_eq!(starts.len(), 1, "only the refreshed plan was admitted");
-    let requires = starts[0].as_ref().expect("RunStarted is feature-gated");
-    for feature in ["session-class/v1", "provider-declarations/v1", "scope/v1"] {
-        assert!(
-            requires.iter().any(|name| name == feature),
-            "missing {feature}"
-        );
-    }
-    let records = broca_wal::replay_file(rig.wal_path(&storage), broca_wal::DEFAULT_MAX_READ_BYTES)
-        .expect("read the daemon-written worker WAL");
-    let (frozen_scope, class, manifest) = records
-        .iter()
-        .find_map(|framed| match &framed.record {
-            broca_wal::WalRecord::RunStarted {
-                scope,
-                session_class,
-                manifest,
-                ..
-            } => Some((scope, session_class, manifest)),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(frozen_scope.as_ref(), Some(&scope));
-    assert_eq!(class.as_deref(), Some("mason"));
-    let aft = manifest
-        .as_ref()
-        .unwrap()
-        .fetches
-        .iter()
-        .find(|fetch| fetch.provider == "aft")
+    // A mason runs in the new storage; its run start is read back through `run.admission`, the
+    // same read the acceptance script makes.
+    let admission = scope_request(
+        &owner,
+        &route,
+        "run.admission",
+        serde_json::json!({"run_id": run}),
+    )
+    .await
+    .expect("read the worker run's admission");
+    let admission = &admission["result"];
+    assert_eq!(admission["storage"], "store", "{admission}");
+    assert_eq!(admission["session_class"], "mason", "{admission}");
+    let frozen = serde_json::to_value(&scope).unwrap();
+    assert_eq!(admission["scope"]["owner"], frozen["owner"], "{admission}");
+    assert_eq!(admission["scope"]["ref"], frozen["ref"], "{admission}");
+    assert_eq!(
+        admission["scope"]["epoch"], frozen["scope_epoch"],
+        "{admission}"
+    );
+    let aft = admission["fetches"]
+        .as_array()
+        .and_then(|fetches| fetches.iter().find(|fetch| fetch["provider"] == "aft"))
         .expect("admission froze the AFT fetch");
-    let broca_wal::FetchOutcome::Answered {
-        declarations_frozen: Some(declarations),
-        ..
-    } = &aft.outcome
-    else {
-        panic!("the admitted AFT fetch has no frozen declarations");
-    };
-    assert_eq!(declarations.late_results, Some(true));
-    assert!(declarations
-        .result_formats
-        .as_ref()
-        .is_some_and(|formats| !formats.is_empty()));
-    assert!(records.iter().any(|framed| matches!(
-        framed.record,
-        broca_wal::WalRecord::RunFinished {
-            reason: broca_protocol::RunFinishReason::Completed,
-            ..
-        }
-    )));
+    let declarations = &aft["declarations_frozen"];
+    assert_eq!(declarations["late_results"], true, "{admission}");
+    assert!(
+        declarations["result_formats"]
+            .as_object()
+            .is_some_and(|formats| !formats.is_empty()),
+        "{admission}"
+    );
+    let _ = checkout;
 
     let output = Command::new("python3")
         .arg(root.join("scripts/acceptance-worker-turn.py"))
