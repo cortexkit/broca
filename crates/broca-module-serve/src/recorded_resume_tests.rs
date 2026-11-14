@@ -285,6 +285,16 @@ async fn borrowed_rows_run(
     provider: &str,
     listing: Arc<broca_module_serve::account_routing::ListingCache>,
 ) -> (CapturedResumeRequest, Vec<broca_wal::FramedRecord>) {
+    borrowed_rows_run_with(label, provider, listing, None).await
+}
+
+/// [`borrowed_rows_run`] with the reasoning variant the send names.
+async fn borrowed_rows_run_with(
+    label: &str,
+    provider: &str,
+    listing: Arc<broca_module_serve::account_routing::ListingCache>,
+    variant: Option<&str>,
+) -> (CapturedResumeRequest, Vec<broca_wal::FramedRecord>) {
     let root = fresh_vault_root(label);
     let server = resume_http_fixture().await;
     let vault = CapturingVaultDaemon::start(&root).await;
@@ -296,7 +306,9 @@ async fn borrowed_rows_run(
     let mut req = drift_request(&root);
     req.run_id = broca_protocol::RunId("borrowed".into());
     req.model = broca_protocol::request::ModelHandle::new(provider, "claude-haiku-4-5");
-    req.generation.max_output_tokens = Some(1024);
+    req.variant = variant.map(str::to_owned);
+    // A variant's thinking budget needs an output cap above it.
+    req.generation.max_output_tokens = Some(if variant.is_some() { 32_000 } else { 1024 });
     req.input = vec![broca_protocol::Message::new(broca_protocol::Role::User,
         vec![broca_protocol::ContentBlock::Text { text: "hello".into() }])];
     let store = Arc::clone(&executor.wal_store);
@@ -391,4 +403,33 @@ async fn a_pool_key_run_borrows_anthropic_rows_and_renders_the_same_request() {
         std::fs::write(dir.join("pool-run-step-and-finish-records.json"),
             serde_json::to_vec_pretty(&steps).unwrap()).unwrap();
     }
+}
+
+/// A send on the paid-key pool route that names a reasoning variant sends it: the borrowed rows'
+/// reasoning options resolve it as they do for the same send on `anthropic`.
+#[tokio::test]
+async fn a_pool_key_run_sends_the_variant_it_was_asked_for() {
+    if !run_catalog_drift_child("a_pool_key_run_sends_the_variant_it_was_asked_for") {
+        return;
+    }
+    install_test_catalog();
+    let pool = {
+        let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+        cache.store(broca_subc::vault::ScopedList { credentials: vec![serde_json::from_value(
+            serde_json::json!({"id": "apikey:anthropic:acct1", "type": "apikey", "categories": ["llm"],
+                "serves": ["anthropic"], "state": "active", "record_version": 1,
+                "operations": ["read"], "auth_method": "apikey",
+                "provider_ids": ["anthropic-platform"]})).unwrap()],
+            grants: 1, grant_tuples: vec![], view: "fixture".into() });
+        cache
+    };
+    let (borrowed, _) =
+        borrowed_rows_run_with("pool-variant", "anthropic-platform", pool, Some("high")).await;
+    let (plain, _) = borrowed_rows_run_with("plain-variant", "anthropic",
+        listed_credentials([("apikey:anthropic", "apikey:anthropic")]), Some("high")).await;
+    let body: serde_json::Value = serde_json::from_slice(&borrowed.body).unwrap();
+    let plain_body: serde_json::Value = serde_json::from_slice(&plain.body).unwrap();
+    assert!(plain_body["thinking"].is_object(), "the plain run sends the variant: {plain_body}");
+    assert_eq!(body["thinking"], plain_body["thinking"]);
+    assert_eq!(body["output_config"], plain_body["output_config"]);
 }
