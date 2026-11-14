@@ -5179,6 +5179,17 @@ mod executor {
                 }
                 _ => None,
             };
+            if let (
+                Some(reporter),
+                AccountChoice::Routed {
+                    account_id,
+                    credential_id,
+                    ..
+                },
+            ) = (&account_reporter, &account_choice)
+            {
+                reporter.admitted_on(account_id.clone(), credential_id.clone());
+            }
             control.account_reporter = account_reporter
                 .clone()
                 .map(|reporter| reporter as Arc<dyn broca_core::AccountReporter>);

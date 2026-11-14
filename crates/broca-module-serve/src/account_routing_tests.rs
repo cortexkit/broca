@@ -3845,3 +3845,165 @@ async fn a_continue_request_needs_both_capabilities_declared() {
         }
     }
 }
+
+/// The attempt reports one run sends: an attempt with `status` on credential `vault-key`, its
+/// selection naming `account_ref`, after routing admitted the run on `admitted` and, with
+/// `moved_to`, after the run moved to that account. Routing declares `declared`.
+async fn served_attempt_reports(
+    declared: Option<Vec<&'static str>>,
+    admitted: Option<&str>,
+    account_ref: Option<&str>,
+    status: u16,
+    moved_to: Option<&str>,
+) -> Vec<Value> {
+    let routing = Arc::new(FakeRouting {
+        declared,
+        ..FakeRouting::default()
+    });
+    let reporter = RunReporter::start(
+        Arc::new(client(&routing)),
+        "adm-served".into(),
+        "run-served".into(),
+        None,
+        Arc::new(AtomicU64::new(10)),
+    );
+    if let Some(account) = admitted {
+        reporter.admitted_on(account.into(), "vault-key".into());
+    }
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    let selection = |account: Option<&str>| -> broca_wal::AuthSelection {
+        serde_json::from_value(json!({
+            "credential_id": "vault-key",
+            "account_ref": account,
+            "auth_method": "apikey",
+        }))
+        .unwrap()
+    };
+    let mut seq = 2;
+    if let Some(account) = moved_to {
+        reporter.moved(Some(lineage), seq, &selection(Some(account)));
+        seq += 1;
+    }
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        seq,
+        &attempt(Some(status), AttemptAccountObservation::default()),
+        Some(&selection(account_ref)),
+    );
+    reporter.finish(Some(lineage), seq + 1, RunFinishReason::Completed);
+    broca_test_support::wait_until("the run's reports", || async {
+        let reports = routing.observed();
+        if reports
+            .last()
+            .is_some_and(|body| body["kind"] == "run_finished")
+        {
+            Ok(reports)
+        } else {
+            Err(format!("reports: {reports:?}"))
+        }
+    })
+    .await
+    .into_iter()
+    .filter(|body| body["kind"] == "attempt")
+    .collect()
+}
+
+const OBSERVE_SUCCESS: &str = cortexkit_role_routing::capabilities::ACCOUNT_OBSERVE_SUCCESS;
+
+#[tokio::test]
+async fn a_served_attempt_names_the_admitted_account_as_a_typed_success() {
+    let reports =
+        served_attempt_reports(Some(vec![OBSERVE_SUCCESS]), Some("acct-1"), None, 200, None).await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(report["attempt_outcome"], json!({"status": "served"}));
+    assert_eq!(report["admission_id"], "adm-served");
+    assert_eq!(report["served_account_id"], "acct-1");
+    assert_eq!(report["credential_id"], "vault-key");
+    // Routing's own reader takes it, with every companion it requires.
+    let parsed = cortexkit_role_routing::observe::parse_account_observe_request_serving(
+        report,
+        &[OBSERVE_SUCCESS],
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.attempt_outcome.map(|outcome| outcome.status),
+        Some(cortexkit_role_routing::attempt::AttemptStatus::Served)
+    );
+}
+
+#[tokio::test]
+async fn a_typed_success_goes_only_to_a_router_that_declares_it() {
+    for declared in [None, Some(vec![])] {
+        let reports =
+            served_attempt_reports(declared.clone(), Some("acct-1"), None, 200, None).await;
+        assert_eq!(reports.len(), 1, "{declared:?}: {reports:?}");
+        assert!(
+            reports[0].get("attempt_outcome").is_none(),
+            "{declared:?}: {reports:?}"
+        );
+        // The attempt itself is still reported.
+        assert_eq!(reports[0]["credential_id"], "vault-key", "{declared:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_attempt_the_provider_did_not_serve_carries_no_success() {
+    for status in [429, 503] {
+        let reports = served_attempt_reports(
+            Some(vec![OBSERVE_SUCCESS]),
+            Some("acct-1"),
+            None,
+            status,
+            None,
+        )
+        .await;
+        assert_eq!(reports.len(), 1, "{status}: {reports:?}");
+        assert!(
+            reports[0].get("attempt_outcome").is_none(),
+            "{status}: {reports:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_success_never_guesses_the_account() {
+    // A run resumed after a restart doesn't hold routing's answer: it names the account its
+    // record holds, and with none it reports the attempt without a success.
+    let named = served_attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        None,
+        Some("acct-rec"),
+        200,
+        None,
+    )
+    .await;
+    assert_eq!(
+        named[0]["attempt_outcome"],
+        json!({"status": "served"}),
+        "{named:?}"
+    );
+    assert_eq!(named[0]["served_account_id"], "acct-rec");
+    let unknown = served_attempt_reports(Some(vec![OBSERVE_SUCCESS]), None, None, 200, None).await;
+    assert!(unknown[0].get("attempt_outcome").is_none(), "{unknown:?}");
+    assert!(unknown[0].get("served_account_id").is_none(), "{unknown:?}");
+}
+
+#[tokio::test]
+async fn after_a_move_a_success_names_the_offered_account() {
+    let reports = served_attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        Some("acct-1"),
+        None,
+        200,
+        Some("acct-2"),
+    )
+    .await;
+    assert_eq!(
+        reports[0]["attempt_outcome"],
+        json!({"status": "served"}),
+        "{reports:?}"
+    );
+    assert_eq!(reports[0]["served_account_id"], "acct-2");
+}

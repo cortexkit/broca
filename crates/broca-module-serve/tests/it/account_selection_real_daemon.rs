@@ -2182,6 +2182,55 @@ async fn explicit_routing_id_selects_accounts_and_receives_reports_through_the_r
     );
 }
 
+/// A served attempt on a routed API key carries routing's typed success, naming the account
+/// routing admitted the run on. An API key's selection holds no account, so that name can only
+/// come from routing's answer: the success shows the admission's answer reached the reporter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_served_attempt_reports_a_typed_success_on_the_admitted_account_through_the_real_daemon()
+{
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    rig.routing.continuations.declare_success(true);
+    rig.vault
+        .anthropic_apikey_listed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = rig.client("served-success").await;
+    let run_id = send(
+        &client,
+        "send-served-success",
+        Some(broca_wire::AuthParams {
+            pool: None,
+            credential_id: None,
+            method: "apikey".into(),
+            account: None,
+        }),
+    )
+    .await;
+    let frames = rig.finished("served-success").await;
+    let chosen = selection(&frames);
+    assert_eq!(chosen["credential_id"], "apikey:anthropic:work");
+    assert!(chosen.get("account_ref").is_none(), "{chosen}");
+    let reports = rig
+        .reports(&run_id, &["admission_started", "attempt", "run_finished"])
+        .await;
+    let attempts: Vec<_> = reports
+        .iter()
+        .filter(|(_, kind, _)| kind == "attempt")
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(attempts.len(), 1, "{reports:?}");
+    let attempt = attempts[0];
+    assert_eq!(
+        attempt["attempt_outcome"],
+        json!({"status": "served"}),
+        "{attempt}"
+    );
+    assert_eq!(attempt["admission_id"], run_id);
+    assert_eq!(attempt["credential_id"], "apikey:anthropic:work");
+    assert_eq!(attempt["served_account_id"], "apikey:anthropic:work");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn routing_decides_reports_and_never_blocks_admission_through_the_real_daemon() {
     let Some(mut rig) = Rig::start().await else {

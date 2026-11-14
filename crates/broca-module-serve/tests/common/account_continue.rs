@@ -41,6 +41,7 @@ struct Reports {
 pub struct Continuations {
     declared: AtomicBool,
     resume_declared: AtomicBool,
+    success_declared: AtomicBool,
     scripts: Mutex<Scripts>,
     requests: Mutex<Vec<Vec<u8>>>,
     reports: Mutex<Reports>,
@@ -56,6 +57,11 @@ impl Continuations {
         self.resume_declared.store(declared, Ordering::SeqCst);
     }
 
+    /// Declare `account_observe_success`, so broca's served attempts carry a typed success.
+    pub fn declare_success(&self, declared: bool) {
+        self.success_declared.store(declared, Ordering::SeqCst);
+    }
+
     pub fn describe(&self) -> RoleDescribe {
         let mut describe = RoleDescribe::new(vec![], false);
         if self.declared.load(Ordering::SeqCst) {
@@ -63,6 +69,10 @@ impl Continuations {
         }
         if self.resume_declared.load(Ordering::SeqCst) {
             describe = describe.with_capability(ACCOUNT_CONTINUE_RESUME);
+        }
+        if self.success_declared.load(Ordering::SeqCst) {
+            describe = describe
+                .with_capability(cortexkit_role_routing::capabilities::ACCOUNT_OBSERVE_SUCCESS);
         }
         describe
     }

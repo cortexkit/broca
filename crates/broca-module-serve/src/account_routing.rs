@@ -35,6 +35,12 @@
 //! Every run that has an admission id (every decision path broca writes) is reported
 //! through `route.account_observe`: `admission_started` once `RunStarted` is durable, one report
 //! per provider attempt once its record is durable, and `run_finished` once the terminal is.
+//! An attempt the provider served carries `attempt_outcome: {status: "served"}` with the
+//! account and credential it was served on, when routing declares `account_observe_success`.
+//! While routing holds an account (a quota wall) or a credential (no credit, a refused key, a
+//! backoff) blocked, it lets one admission through now and then as a test; this typed success
+//! is what tells routing the test worked, so it lifts that block. A plain attempt report or
+//! `run_finished` never lifts one.
 //! Reports are sent once, in order, from a task of their own: they never block a run and are
 //! never resent after possible delivery. `run_finished` also ends the run's lease in routing,
 //! so broca never sends `route.account_release`.
@@ -1529,6 +1535,21 @@ impl RoutingClient {
                 }
             }
         }
+        let mut params = params;
+        if params.get("attempt_outcome").is_some()
+            && tokio::time::timeout_at(
+                deadline,
+                self.capability(cortexkit_role_routing::capabilities::ACCOUNT_OBSERVE_SUCCESS),
+            )
+            .await
+                != Ok(crate::routing_capabilities::CapabilitySupport::Declared)
+        {
+            // A router that doesn't declare the group refuses the member by name, and an
+            // unknown description is not a declaration: the attempt goes out without it.
+            if let Some(object) = params.as_object_mut() {
+                object.remove("attempt_outcome");
+            }
+        }
         if params["kind"] == "credential_refused" {
             match tokio::time::timeout_at(
                 deadline,
@@ -2113,6 +2134,42 @@ pub fn attempt_body_on(
     named(body)
 }
 
+/// Whether the provider served `attempt`: a 2xx response that streamed to a complete step.
+/// Every other outcome, including a 2xx body cut short, is not a success to report.
+pub fn attempt_served(attempt: &ModelAttempt) -> bool {
+    attempt
+        .http_status
+        .is_some_and(|status| (200..300).contains(&status))
+        && matches!(
+            attempt.outcome,
+            AttemptOutcome::Complete | AttemptOutcome::ToolArgsTrailingGarbage
+        )
+}
+
+/// [`attempt_body_on`] for an attempt the provider served on `credential_id` and `account_id`,
+/// the account routing admitted: a typed success (`attempt_outcome.status: "served"`). When
+/// this admission was routing's test of a blocked account or credential (see the module docs),
+/// it lifts that block. Always `served`, never `served_empty`: the attempt record can't tell an
+/// empty reply from one whose content wasn't measured.
+pub fn served_attempt_body(
+    event_id: &str,
+    admission_id: &str,
+    attempt: &ModelAttempt,
+    view_digest: Option<&str>,
+    credential_id: &str,
+    account_id: &str,
+) -> Value {
+    let served = ServedOn {
+        credential_id: credential_id.to_owned(),
+        account: Some(account_id.to_owned()),
+    };
+    let mut body = attempt_body_on(event_id, admission_id, attempt, view_digest, Some(&served));
+    if body["kind"] == "attempt" {
+        body["attempt_outcome"] = json!({ "status": "served" });
+    }
+    body
+}
+
 /// `run_finished`: the run's terminal is durable. Carries the latest rate-limit headers the
 /// run saw, when it saw any. Routing ends the run's lease on it.
 pub fn run_finished_body(
@@ -2170,6 +2227,12 @@ enum ReportEvent {
     Started {
         lineage: Option<WalLineageId>,
         wal_seq: u64,
+    },
+    /// The account and credential routing admitted the run on, from its `route.account_for`
+    /// answer.
+    Admitted {
+        account_id: String,
+        credential_id: String,
     },
     Attempt {
         lineage: Option<WalLineageId>,
@@ -2269,10 +2332,24 @@ impl RunReporter {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
             let mut view_digest = view_digest;
+            // The credential and account routing knows the run by, which a typed success must
+            // name. Known when this process asked routing (the admission's answer, then any
+            // move's offer); unknown for a run resumed after a restart, which then names what the
+            // attempt's own record holds, if that names an account.
+            let mut routed: Option<ServedOn> = None;
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
             let mut last_failed_attempt_at_ms: Option<u64> = None;
             while let Some(event) = rx.recv().await {
                 match event {
+                    ReportEvent::Admitted {
+                        account_id,
+                        credential_id,
+                    } => {
+                        routed = Some(ServedOn {
+                            credential_id,
+                            account: Some(account_id),
+                        })
+                    }
                     ReportEvent::Started { lineage, wal_seq } => {
                         let Some(id) =
                             event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
@@ -2380,15 +2457,33 @@ impl RunReporter {
                         )
                         .then_some(attempt.account_observation.failure_received_at_ms)
                         .flatten();
-                        client
-                            .observe(attempt_body_on(
+                        let success = routed
+                            .as_ref()
+                            .or(served.as_ref())
+                            .filter(|_| attempt_served(&attempt))
+                            .and_then(|on| {
+                                on.account
+                                    .as_deref()
+                                    .map(|account| (on.credential_id.as_str(), account))
+                            });
+                        let body = match success {
+                            Some((credential_id, account_id)) => served_attempt_body(
+                                &id,
+                                &admission_id,
+                                &attempt,
+                                view_digest.as_deref(),
+                                credential_id,
+                                account_id,
+                            ),
+                            None => attempt_body_on(
                                 &id,
                                 &admission_id,
                                 &attempt,
                                 view_digest.as_deref(),
                                 served.as_ref(),
-                            ))
-                            .await;
+                            ),
+                        };
+                        client.observe(body).await;
                     }
                     ReportEvent::Moved {
                         lineage,
@@ -2402,6 +2497,10 @@ impl RunReporter {
                         // credential was offered by routing, not chosen from a listing here.
                         latest_headers = None;
                         view_digest = None;
+                        routed = Some(ServedOn {
+                            credential_id: credential_id.clone(),
+                            account: account.clone(),
+                        });
                         if let Some(id) =
                             event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
                         {
@@ -2545,6 +2644,15 @@ impl broca_core::AccountReporter for RunReporter {
 }
 
 impl RunReporter {
+    /// Routing admitted the run on `account_id` with `credential_id`: a served attempt's typed
+    /// success names them. Sent before the run's first report.
+    pub fn admitted_on(&self, account_id: String, credential_id: String) {
+        let _ = self.tx.send(ReportEvent::Admitted {
+            account_id,
+            credential_id,
+        });
+    }
+
     /// An attempt's record, at `wal_seq`, sent on the credential `selection` names. The report
     /// names that credential and the account that served the attempt: the one the attempt's own
     /// record names, else the selection's.
