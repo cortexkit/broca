@@ -2134,12 +2134,18 @@ pub fn attempt_body_on(
     named(body)
 }
 
-/// Whether the provider served `attempt`: a 2xx response that streamed to a complete step.
-/// Every other outcome, including a 2xx body cut short, is not a success to report.
+/// Whether the provider served `attempt`: a response that streamed to a complete step, over
+/// HTTPS with a 2xx status or over a Responses socket. A socket attempt records its upgrade's
+/// 101 as its status, since the socket has no status line per request. Every other outcome,
+/// including a response cut short, is not a success to report.
 pub fn attempt_served(attempt: &ModelAttempt) -> bool {
-    attempt
-        .http_status
-        .is_some_and(|status| (200..300).contains(&status))
+    let answered = match attempt.transport.as_deref() {
+        Some("websocket") => attempt.http_status == Some(101),
+        _ => attempt
+            .http_status
+            .is_some_and(|status| (200..300).contains(&status)),
+    };
+    answered
         && matches!(
             attempt.outcome,
             AttemptOutcome::Complete | AttemptOutcome::ToolArgsTrailingGarbage

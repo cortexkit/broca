@@ -3856,6 +3856,18 @@ async fn served_attempt_reports(
     status: u16,
     moved_to: Option<&str>,
 ) -> Vec<Value> {
+    let recorded = attempt(Some(status), AttemptAccountObservation::default());
+    attempt_reports(declared, admitted, account_ref, recorded, moved_to).await
+}
+
+/// [`served_attempt_reports`] for the attempt `recorded`.
+async fn attempt_reports(
+    declared: Option<Vec<&'static str>>,
+    admitted: Option<&str>,
+    account_ref: Option<&str>,
+    recorded: ModelAttempt,
+    moved_to: Option<&str>,
+) -> Vec<Value> {
     let routing = Arc::new(FakeRouting {
         declared,
         ..FakeRouting::default()
@@ -3885,12 +3897,7 @@ async fn served_attempt_reports(
         reporter.moved(Some(lineage), seq, &selection(Some(account)));
         seq += 1;
     }
-    reporter.attempt_recorded_on(
-        Some(lineage),
-        seq,
-        &attempt(Some(status), AttemptAccountObservation::default()),
-        Some(&selection(account_ref)),
-    );
+    reporter.attempt_recorded_on(Some(lineage), seq, &recorded, Some(&selection(account_ref)));
     reporter.finish(Some(lineage), seq + 1, RunFinishReason::Completed);
     broca_test_support::wait_until("the run's reports", || async {
         let reports = routing.observed();
@@ -3946,6 +3953,80 @@ async fn a_typed_success_goes_only_to_a_router_that_declares_it() {
         // The attempt itself is still reported.
         assert_eq!(reports[0]["credential_id"], "vault-key", "{declared:?}");
     }
+}
+
+/// A step a Responses socket streamed to completion was served, though its status is the
+/// socket's upgrade (101) rather than a 2xx; a socket attempt cut short was not. A resumed
+/// socket run types a step only when its own record names the account.
+#[tokio::test]
+async fn a_step_served_over_a_socket_is_a_typed_success() {
+    let socket = |outcome: AttemptOutcome| {
+        let mut recorded = attempt(Some(101), AttemptAccountObservation::default());
+        recorded.transport = Some("websocket".into());
+        recorded.outcome = outcome;
+        recorded
+    };
+    let served = attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        Some("acct-1"),
+        None,
+        socket(AttemptOutcome::Complete),
+        None,
+    )
+    .await;
+    assert_eq!(
+        served[0]["attempt_outcome"],
+        json!({"status": "served"}),
+        "{served:?}"
+    );
+    assert_eq!(served[0]["served_account_id"], "acct-1");
+    let cut = attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        Some("acct-1"),
+        None,
+        socket(AttemptOutcome::EofBeforeCompletion),
+        None,
+    )
+    .await;
+    assert!(cut[0].get("attempt_outcome").is_none(), "{cut:?}");
+    // A socket run resumed after a restart holds no answer from routing: it names the account
+    // its own record holds, and with none it types no step.
+    let resumed = attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        None,
+        Some("acct-rec"),
+        socket(AttemptOutcome::Complete),
+        None,
+    )
+    .await;
+    assert_eq!(
+        resumed[0]["attempt_outcome"],
+        json!({"status": "served"}),
+        "{resumed:?}"
+    );
+    assert_eq!(resumed[0]["served_account_id"], "acct-rec");
+    let untied = attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        None,
+        None,
+        socket(AttemptOutcome::Complete),
+        None,
+    )
+    .await;
+    assert!(untied[0].get("attempt_outcome").is_none(), "{untied:?}");
+    assert!(untied[0].get("served_account_id").is_none(), "{untied:?}");
+    // A 101 over HTTPS is no answer to a request.
+    let mut https = socket(AttemptOutcome::Complete);
+    https.transport = Some("https".into());
+    let https = attempt_reports(
+        Some(vec![OBSERVE_SUCCESS]),
+        Some("acct-1"),
+        None,
+        https,
+        None,
+    )
+    .await;
+    assert!(https[0].get("attempt_outcome").is_none(), "{https:?}");
 }
 
 #[tokio::test]
