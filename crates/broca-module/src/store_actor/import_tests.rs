@@ -389,16 +389,6 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
     assert_eq!(user.client_message_id.as_deref(), Some("cm-1"));
     assert_eq!(user.sender.as_deref(), Some("prefrontal-core"));
     assert_eq!(user.send_id.as_deref(), Some("s1"));
-    let mut older = entries.clone();
-    std::sync::Arc::make_mut(older[0].state.facts.as_mut().unwrap()).send_id = None;
-    assert!(
-        !session
-            .older_entry_send_ids(&older)
-            .await
-            .unwrap()
-            .contains_key(&1),
-        "an older import's missing source id must not become the import id"
-    );
     let reply_facts = crate::store_read::display_facts(&entries[1]);
     assert_eq!(reply_facts.calls[0].call_key, "msg_a1/call_1");
     assert_eq!(

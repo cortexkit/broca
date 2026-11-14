@@ -32,8 +32,6 @@ use crate::segment::{SegmentLayout, FOOTER, OPEN_PREFIX};
 
 use super::{Session, SessionError};
 
-mod send_ids;
-
 /// One message as `session.entries` reads it. A window entry shares its message and facts with
 /// the conversation, so serving it copies no content.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,8 +120,6 @@ pub(super) struct SealedCaches {
     /// A value a reader derived from sealed history and asked the session to keep (see
     /// `keep_sealed_derived`).
     derived: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-    /// Exact send ids derived from records written before entry facts carried them.
-    send_ids: Option<Box<send_ids::SendIdIndex>>,
     /// What reads of sealed history keep for the reads after them: segment layouts and
     /// directory pages. Boxed, so a session that never reads sealed history carries one pointer
     /// for both.
@@ -1246,8 +1242,7 @@ impl SealedCaches {
     /// What the session keeps of its sealed history, estimated by walking it (see
     /// `crate::held`). A reader's derived value is opaque here, so only its pointer counts.
     pub(super) fn held_bytes(&self) -> usize {
-        use crate::held::HeldBytes;
-        self.entries.held_bytes() + self.send_ids.heap_bytes() + self.kept_held_bytes()
+        self.entries.held_bytes() + self.kept_held_bytes()
     }
 
     /// What sealed reads keep: each kept segment layout's index entries, its leading or

@@ -240,14 +240,13 @@ pub async fn read_page<B: SessionBackend>(
     from_ordinal: Option<u64>,
     limit: Option<u64>,
 ) -> Result<StorePage, StoreReadError> {
-    read_page_with_facts(session, from_ordinal, limit, true).await
+    read_page_with_facts(session, from_ordinal, limit).await
 }
 
 async fn read_page_with_facts<B: SessionBackend>(
     session: &Session<B>,
     from_ordinal: Option<u64>,
     limit: Option<u64>,
-    include_display_facts: bool,
 ) -> Result<StorePage, StoreReadError> {
     let capped_limit = limit
         .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
@@ -267,11 +266,6 @@ async fn read_page_with_facts<B: SessionBackend>(
         .then(|| entries.pop())
         .flatten();
     let latest = session.operations.run.as_ref();
-    let send_ids = if include_display_facts {
-        session.entry_send_ids(&entries).await?
-    } else {
-        BTreeMap::new()
-    };
     let mut messages = Vec::with_capacity(entries.len());
     let mut mids = Vec::with_capacity(entries.len());
     let mut turns = Vec::with_capacity(entries.len());
@@ -286,9 +280,6 @@ async fn read_page_with_facts<B: SessionBackend>(
         messages.push(page_message(entry, next, latest)?);
         turns.push(crate::store_calls::TurnOf::of(entry));
         let mut served = display_facts(entry).served();
-        if let Some(id) = send_ids.get(&entry.ordinal) {
-            served.send_id = id.clone();
-        }
         served.notices.extend(
             imported_notices(
                 session,
@@ -663,14 +654,9 @@ pub(crate) async fn page<B: SessionBackend>(
         stamps,
         numbering,
         clean_replies,
-    } = read_page_with_facts(
-        session,
-        from_ordinal,
-        request.limit,
-        request.include_display_facts,
-    )
-    .await
-    .map_err(refused)?;
+    } = read_page_with_facts(session, from_ordinal, request.limit)
+        .await
+        .map_err(refused)?;
     crate::store_entries::attach_part_tags(session, parts, &mut page.messages, &numbering)
         .await
         .map_err(|error| {

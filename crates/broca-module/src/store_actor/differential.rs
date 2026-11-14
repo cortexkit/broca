@@ -1920,6 +1920,99 @@ pub(super) mod temperature;
 mod account_limit_pause;
 mod held;
 
+/// An unkeyed ordered send that waits behind a running run is answered with its submission id,
+/// so the message its own run places keeps that id as its send id, on both storages. The new
+/// storage writes it into the entry's facts, which reads serve as stored.
+#[tokio::test]
+async fn an_ordered_send_queued_behind_a_run_keeps_its_submission_id_on_both_storages() {
+    use crate::serve::ServeHandler;
+
+    for on in [false, true] {
+        let gate = Arc::new(Notify::new());
+        let mut steps = hello();
+        steps.extend(hello());
+        let module = module_options(on, steps, None, None, IDLE, Some(gate.clone())).await;
+        let mut first = request("the running run");
+        from_core(&mut first);
+        let outcome = module.send_request("running", first, None).await;
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+
+        let mut behind = request("ordered behind a run");
+        from_core(&mut behind);
+        behind.tools = None;
+        behind.policy_allowed = Default::default();
+        let outcome = module
+            .registry
+            .route_submission_with_order(
+                &module.key,
+                RunId("behind".into()),
+                behind,
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(serde_json::from_value(serde_json::json!({"modes": ["idle_start"]})).unwrap()),
+            )
+            .await
+            .unwrap();
+        let SendOutcome::Pending { submission_id } = outcome else {
+            panic!("a send behind a running run waits: {outcome:?}")
+        };
+        broca_test_support::wait_until("both runs finish and the actor closes", || {
+            gate.notify_one();
+            let state = module.registry.slot_state(&module.key);
+            async move {
+                match state {
+                    None => Ok(()),
+                    Some(state) => Err(format!("{state:?}")),
+                }
+            }
+        })
+        .await;
+
+        let read = module
+            .registry
+            .read(opted_request(
+                &module.key,
+                (Some(1), Some(100)),
+                (true, false, false),
+            ))
+            .await
+            .unwrap();
+        let placed = read
+            .messages
+            .iter()
+            .find(|entry| {
+                entry.message.content.iter().any(|part| {
+                    matches!(part, broca_protocol::ContentBlock::Text { text } if text == "ordered behind a run")
+                })
+            })
+            .expect("the ordered send's run placed its message");
+        assert_eq!(
+            placed.send_id.as_deref(),
+            Some(submission_id.0.as_str()),
+            "storage on: {on}"
+        );
+        if on {
+            let session = module.load().await;
+            let stored = session.entries(1, 100).await.unwrap();
+            let facts = stored
+                .iter()
+                .find(|entry| entry.ordinal == placed.ordinal)
+                .and_then(|entry| entry.state.facts.as_ref())
+                .unwrap();
+            assert_eq!(facts.send_id.as_deref(), Some(submission_id.0.as_str()));
+        }
+        assert!(module.registry.stop_and_seal().await);
+    }
+}
+
 #[tokio::test]
 async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
     use crate::serve::ServeHandler;
@@ -1992,24 +2085,6 @@ async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
         for (input, raw) in inputs.into_iter().zip(raw) {
             assert_eq!(input.sender.as_deref(), Some("prefrontal-core"));
             observed.push((on, input.send_id.clone(), raw.get("send_id").cloned()));
-        }
-        if on {
-            let session = module.load().await;
-            let mut entries = session.entries(1, 100).await.unwrap();
-            for entry in &mut entries {
-                if let Some(facts) = entry
-                    .state
-                    .facts
-                    .as_mut()
-                    .filter(|facts| facts.sender.is_some())
-                {
-                    std::sync::Arc::make_mut(facts).send_id =
-                        Some("older-writer-internal-id".into());
-                }
-            }
-            let ids = session.entry_send_ids(&entries).await.unwrap();
-            assert_eq!(ids.len(), 2);
-            assert!(ids.values().all(Option::is_none), "{ids:?}");
         }
         assert!(module.registry.stop_and_seal().await);
     }
@@ -2108,18 +2183,6 @@ async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storage
                 )).unwrap();
                 assert_eq!(entry.sender.as_deref(), Some("prefrontal-core"));
                 assert_eq!(entry.send_id.as_deref(), Some(id), "{text}");
-            }
-        }
-        let mut entries = session.entries(1, 100).await.unwrap();
-        for entry in &mut entries {
-            if let Some(facts) = &mut entry.state.facts {
-                std::sync::Arc::make_mut(facts).send_id = None;
-            }
-        }
-        let recovered = session.older_entry_send_ids(&entries).await.unwrap();
-        for entry in &new.messages {
-            if let Some(id) = &entry.send_id {
-                assert_eq!(recovered.get(&entry.ordinal), Some(id));
             }
         }
         assert!(today.registry.stop_and_seal().await);

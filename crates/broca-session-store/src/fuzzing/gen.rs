@@ -1292,7 +1292,9 @@ mod operations {
         plan,
         enrolled,
         tag_high_water,
-        source_lineage
+        source_lineage,
+        run_going,
+        ordered_next_starts_run
     });
     crate::fuzzing::gen::fields!(Enrollment {
         through_ordinal,

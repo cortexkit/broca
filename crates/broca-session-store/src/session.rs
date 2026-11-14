@@ -1080,7 +1080,6 @@ impl<B: SessionBackend> Session<B> {
             }
             self.window.note(seq, record);
         }
-        self.advance_send_ids(first, records);
         self.poisoned = false;
         drop(timing);
         self.observed(Appended::Records {

@@ -155,8 +155,10 @@ fn sends() -> Vec<FramedRecord> {
         .collect()
 }
 
+/// A converted session sealed into history serves the same raw history pages as today's WAL,
+/// newest first and oldest first.
 #[test]
-fn paged_raw_history_keeps_one_sealed_send_id_index() {
+fn paged_raw_history_of_a_sealed_conversion_matches_todays() {
     let old = sends();
     let mut converted = crate::convert(&old, Some(LINEAGE)).unwrap();
     converted.start_at(crate::FIRST_SEQ);
@@ -179,49 +181,6 @@ fn paged_raw_history_keeps_one_sealed_send_id_index() {
         let view = Session::view(&backend, addr, &triple, &deployment)
             .await
             .unwrap();
-        let entries = view.entries(1, 100).await.unwrap();
-        assert!(entries.iter().any(|entry| entry
-            .state
-            .facts
-            .as_ref()
-            .is_some_and(|facts| facts.sender.is_some())));
-        backend.take();
-        let mut all_ids = std::collections::BTreeMap::new();
-        for entry in &entries {
-            all_ids.extend(
-                view.entry_send_ids(std::slice::from_ref(entry))
-                    .await
-                    .unwrap(),
-            );
-        }
-        let first = backend.take();
-        assert!(
-            !first.objects.is_empty(),
-            "the first sender page must reach sealed history"
-        );
-        for entry in &entries {
-            let ids = view
-                .entry_send_ids(std::slice::from_ref(entry))
-                .await
-                .unwrap();
-            for (ordinal, id) in ids {
-                assert_eq!(all_ids.get(&ordinal), Some(&id));
-            }
-        }
-        let repeated = backend.take();
-        assert_eq!(repeated.log_reads, 0, "{repeated:?}");
-        assert!(
-            repeated.objects.is_empty(),
-            "later pages must reuse the send index: {repeated:?}"
-        );
-        eprintln!(
-            "sealed send index: first log_reads={} objects={}, later log_reads={} objects={}",
-            first.log_reads,
-            first.objects.len(),
-            repeated.log_reads,
-            repeated.objects.len()
-        );
-
         let parts = MemoryParts {
             parts: converted.parts,
         };
@@ -249,67 +208,6 @@ fn paged_raw_history_keeps_one_sealed_send_id_index() {
     });
 }
 
-#[test]
-fn a_requested_send_id_index_stays_current_across_appends() {
-    let mut converted = crate::convert(&sends(), Some(LINEAGE)).unwrap();
-    converted.start_at(crate::FIRST_SEQ);
-    let backend = Counting::new(MemoryBackend::default());
-    block_on(async {
-        let mut session = Session::create(
-            &backend,
-            SessionAddr("appended-send-ids".into()),
-            SessionTriple {
-                project_root: "/synthetic".into(),
-                harness: "send-ids".into(),
-                session: "sample".into(),
-            },
-            &DeploymentKey::new(1, &[0x5a; 32]),
-            false,
-        )
-        .await
-        .unwrap();
-        // Start with one complete run, then request the index before later starts discard
-        // that run's records from the writer's retained suffix.
-        let split = converted
-            .records
-            .iter()
-            .position(|record| matches!(record, Record::RunEnd(_)))
-            .unwrap()
-            + 1;
-        session
-            .append(&converted.records[..split], true)
-            .await
-            .unwrap();
-        let entries = session.entries(1, 100).await.unwrap();
-        // The first run is a direct user turn, so add a sender only to the read copy to
-        // request the same admission index that a module-authored input would need.
-        let mut entries = entries;
-        std::sync::Arc::make_mut(entries[0].state.facts.as_mut().unwrap()).sender =
-            Some("sample-sender".into());
-        assert_eq!(
-            session.entry_send_ids(&entries).await.unwrap().get(&1),
-            Some(&None)
-        );
-        session
-            .append(&converted.records[split..], true)
-            .await
-            .unwrap();
-        let entries = session.entries(1, 100).await.unwrap();
-        backend.take();
-        let memory = session.in_memory();
-        let ids = session.entry_send_ids(&entries).await.unwrap();
-        assert!(!memory.refused());
-        assert!(ids.values().any(|id| id.as_deref() == Some("queued-send")));
-        assert!(
-            ids.values().any(Option::is_none),
-            "known absence must survive append"
-        );
-        let reads = backend.take();
-        assert_eq!(reads.log_reads, 0, "{reads:?}");
-        assert!(reads.objects.is_empty(), "{reads:?}");
-    });
-}
-
 struct Bodies {
     wal_read: Value,
     store_read: Value,
@@ -319,7 +217,6 @@ struct Bodies {
     store_history: Value,
     compaction: Value,
     descriptor_digests: Vec<Value>,
-    reads_after_warmup: crate::counting::Reads,
 }
 
 fn bodies(change: impl Fn(&mut Vec<Record>)) -> Bodies {
@@ -380,10 +277,6 @@ fn bodies(change: impl Fn(&mut Vec<Record>)) -> Bodies {
         let store_read = serde_json::to_value(store.read(req.clone()).await.unwrap()).unwrap();
         let again = serde_json::to_value(store.read(req.clone()).await.unwrap()).unwrap();
         assert_eq!(again, store_read);
-        let entries = session.entries(1, 100).await.unwrap();
-        backend.take();
-        session.older_entry_send_ids(&entries).await.unwrap();
-        let reads_after_warmup = backend.take();
         req.media = cortexkit_role_llm_runner::read::MediaMode::Descriptors;
         let descriptors = serde_json::to_value(store.read(req).await.unwrap()).unwrap();
         let descriptor_digests = descriptors["messages"]
@@ -414,7 +307,6 @@ fn bodies(change: impl Fn(&mut Vec<Record>)) -> Bodies {
             store_history,
             compaction,
             descriptor_digests,
-            reads_after_warmup,
         }
     })
 }
@@ -499,29 +391,26 @@ fn send_ids_match_across_storages_for_every_placement() {
     }
 }
 
+/// Reads serve the send ids entry facts store, and nothing else: facts without one serve none.
+/// Send ids are metadata, so content digests and compaction entries don't change with them.
 #[test]
-fn older_send_ids_are_exact_cached_and_do_not_change_content_digests() {
+fn send_ids_are_served_as_stored_and_do_not_change_content_digests() {
     let current = bodies(|_| {});
-    let older = bodies(|records| {
+    let without = bodies(|records| {
         for record in records {
             if let Record::EntryFacts(facts) = record {
                 std::sync::Arc::make_mut(facts).send_id = None;
             }
         }
     });
-    let mut expected = current.store_read["messages"].clone();
-    for entry in expected.as_array_mut().unwrap() {
-        if entry["send_id"] == "steer-send" {
-            entry.as_object_mut().unwrap().remove("send_id");
-        }
-    }
-    assert_eq!(
-        expected, older.store_read["messages"],
-        "converted steer receipts alone cannot prove their send id"
-    );
+    assert!(without.store_read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.get("send_id").is_none()));
     assert_eq!(
         current.store_read["history_version"],
-        older.store_read["history_version"]
+        without.store_read["history_version"]
     );
     assert!(!current.descriptor_digests.is_empty());
     assert!(current
@@ -535,16 +424,11 @@ fn older_send_ids_are_exact_cached_and_do_not_change_content_digests() {
         .iter()
         .all(|entry| entry["digest"].is_string()));
     assert_eq!(
-        current.compaction, older.compaction,
+        current.compaction, without.compaction,
         "compaction entries and entry_digest are content identities"
     );
     assert_eq!(
-        current.descriptor_digests, older.descriptor_digests,
+        current.descriptor_digests, without.descriptor_digests,
         "read digests exclude send metadata"
-    );
-    assert!(older.reads_after_warmup.objects.is_empty());
-    assert_eq!(
-        older.reads_after_warmup.log_reads, 0,
-        "another page must reuse the send index"
     );
 }

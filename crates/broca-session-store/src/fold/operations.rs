@@ -721,7 +721,9 @@ crate::message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         7 opt [must] named_speaker: bool,
-        /// The caller's send id, or the returned submission id for an unkeyed queued send.
+        /// The id the send's caller knows it by, which reads serve on the messages it places: its
+        /// send id, else the submission id it was answered with. An unkeyed send that started its
+        /// run at once was answered without one, and has none.
         8 opt send_id: String,
     }
 }
@@ -928,6 +930,20 @@ state! {
         27 opt pub [must] source_lineage: String => {
             owner: "Moved",
             reset: "Moved",
+            bound: Bound::Fixed,
+        },
+        /// Whether a run is going: started or resumed, and not yet ended or paused. A resumed run
+        /// counts from its `Resumed` record, before its first step clears the pause.
+        28 req pub run_going: bool => {
+            owner: "queue",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// True, and present, when the send `ordered_next` names asked to start a run and no run
+        /// was going: admission starts its run at once and answers without a submission id.
+        29 opt pub ordered_next_starts_run: bool => {
+            owner: "queue",
+            reset: "queued_send",
             bound: Bound::Fixed,
         },
     }
@@ -1540,18 +1556,29 @@ impl Operations {
         let removed = match record {
             Record::DeliveryOrdered(ordered) => {
                 self.ordered_next = Some(ordered.submission_id.clone());
+                let starts_run = !self.run_going
+                    && ordered
+                        .order
+                        .get("modes")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|modes| modes.iter().any(|mode| mode == "idle_start"));
+                self.ordered_next_starts_run = starts_run.then_some(true);
                 return;
             }
             Record::QueuedSend(send) => {
                 let ordered =
                     self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
+                let started_at_once =
+                    ordered && self.ordered_next_starts_run.take().unwrap_or(false);
                 let receipt = send.receipt.as_ref().map(broca_protocol::json::Json::parse);
                 let pending = Pending {
-                    send_id: Some(
-                        send.send_id
-                            .clone()
-                            .unwrap_or_else(|| send.submission_id.clone()),
-                    ),
+                    // An unkeyed send that started its run at once was answered without its
+                    // submission id (when that start failed and the answer was Pending instead,
+                    // the log can't tell, so the id stays unserved there too).
+                    send_id: send
+                        .send_id
+                        .clone()
+                        .or_else(|| (!started_at_once).then(|| send.submission_id.clone())),
                     submission_id: send.submission_id.clone(),
                     interrupt: send.delivery.as_deref() == Some("interrupt"),
                     ordered,
@@ -1578,7 +1605,18 @@ impl Operations {
                 self.queue.insert(at, pending);
                 return;
             }
-            Record::RunStart(start) => start.submission_id.as_deref(),
+            Record::RunStart(start) => {
+                self.run_going = true;
+                start.submission_id.as_deref()
+            }
+            Record::Resumed(_) => {
+                self.run_going = true;
+                None
+            }
+            Record::RunEnd(_) | Record::Pause(_) => {
+                self.run_going = false;
+                None
+            }
             Record::Retraction(retraction) => Some(retraction.submission_id.as_str()),
             Record::SendEnded(ended) => Some(ended.submission_id.as_str()),
             Record::Delivery(delivery) => Some(delivery.submission_id.as_str()),
