@@ -58,10 +58,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MEMORY_REPORT,
-    OP_MOVE_TO_STORE, OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT,
-    OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS,
-    OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP,
-    OP_VAULT_AUDIT, OP_WARM,
+    OP_MOVE_TO_STORE, OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_REQUEST_DUMP,
+    OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET,
+    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS,
+    OP_SUBSCRIBE, OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -2931,10 +2931,13 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
-        // Only the operator's own connection reads a session's tag map, refused before anything
-        // reads the session. The refused request is counted, as every management operation's is.
-        if method == OP_TAG_MAP && !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
-            count_management_operation(OP_TAG_MAP);
+        // Only the operator's own connection reads a session's tag map or its request bodies,
+        // refused before anything reads the session. The refused request is counted, as every
+        // management operation's is.
+        if matches!(method, OP_TAG_MAP | OP_REQUEST_DUMP)
+            && !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct))
+        {
+            count_management_operation(method);
             return send_error(
                 &writer,
                 ver,
@@ -2942,7 +2945,7 @@ where
                 epoch,
                 corr,
                 "operator_required",
-                "session.tag_map is for the operator only",
+                &format!("{method} is for the operator only"),
             )
             .await;
         }
@@ -2984,7 +2987,7 @@ where
             OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | OP_TAG_MAP | broca_wire::plan_view::OP_SESSION_PLAN_VIEW | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | OP_TAG_MAP | OP_REQUEST_DUMP | broca_wire::plan_view::OP_SESSION_PLAN_VIEW | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
@@ -4032,6 +4035,54 @@ where
                         corr,
                         NOT_SERVED_ON_OLD_STORAGE,
                         "session.tag_map serves sessions kept in the new storage only, and this session is kept on today's storage",
+                    )
+                    .await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        OP_REQUEST_DUMP => {
+            // Checked again here so no path reaches the rebuild without the operator's own
+            // connection.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.request_dump is for the operator only",
+                )
+                .await;
+            }
+            let params: broca_wire::request_dump::RequestDumpParams =
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            match handler.request_dump(session, &params.run_id).await {
+                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(None) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        NOT_SERVED_ON_OLD_STORAGE,
+                        "session.request_dump serves sessions kept in the new storage only, and this session is kept on today's storage",
                     )
                     .await
                 }
@@ -5707,6 +5758,8 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         OP_RESTORE_FROM_BACKUP => true,
         // The tag map reads the store's own entry facts (`store_tag_map`).
         OP_TAG_MAP => true,
+        // Request dumps rebuild a run's requests from the store's records (`store_request_dump`).
+        OP_REQUEST_DUMP => true,
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
         OP_WARM => true,

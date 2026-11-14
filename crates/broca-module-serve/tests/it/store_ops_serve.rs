@@ -118,6 +118,8 @@ struct StoreLoop {
     compaction: Arc<ReadyProvider>,
     /// The display marks every send's run records, as admission would have checked them.
     marks: Option<broca_protocol::MessageMarks>,
+    /// Whether each step records the attempt a transport would (see `GatedProvider::attempts`).
+    attempts: bool,
 }
 
 impl StoreLoop {
@@ -180,6 +182,7 @@ impl RunExecutor for StoreLoop {
                 provider: &self.provider,
                 gate: self.gate.as_deref(),
                 requests: &self.requests,
+                attempts: self.attempts,
             };
             let seams = broca_session_loop::run::Seams {
                 provider: &provider,
@@ -308,6 +311,12 @@ impl Rig {
         Self::start_with(tag, steps, ReadyProvider::default(), None).await
     }
 
+    /// [`Rig::start`] with each step recording the attempt a transport would, so its request can
+    /// be rebuilt and checked against the digest it recorded.
+    async fn start_attempting(tag: &str, steps: Vec<Vec<NormalizedEvent>>) -> Self {
+        Self::start_gated(tag, steps, ReadyProvider::default(), None, None, true).await
+    }
+
     /// [`Rig::start`] with `compaction` as the compaction provider, and every run recording
     /// `marks` as its send's display marks.
     async fn start_with(
@@ -316,7 +325,7 @@ impl Rig {
         compaction: ReadyProvider,
         marks: Option<broca_protocol::MessageMarks>,
     ) -> Self {
-        Self::start_gated(tag, steps, compaction, marks, None).await
+        Self::start_gated(tag, steps, compaction, marks, None, false).await
     }
 
     async fn start_gated(
@@ -325,6 +334,7 @@ impl Rig {
         compaction: ReadyProvider,
         marks: Option<broca_protocol::MessageMarks>,
         gate: Option<Arc<app_readers::RunGate>>,
+        attempts: bool,
     ) -> Self {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-store-ops-serve-{}-{tag}",
@@ -340,6 +350,7 @@ impl Rig {
             gate,
             requests: requests.clone(),
             compaction: Arc::new(compaction),
+            attempts,
             marks,
         });
         let runtime = broca_module::store_open::StoreRuntime::open(
@@ -1062,6 +1073,102 @@ async fn plan_view_wire_no_plan_and_too_large_are_named_refusals() {
             .len(),
         1,
         "the oversize refusal preserves the connection"
+    );
+}
+
+/// A step that asks for the `read` tool, which the scripted tool plane answers.
+fn read_step(id: &str) -> Vec<NormalizedEvent> {
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId(id.into()),
+                content: vec![ContentBlock::ToolCall(broca_protocol::content::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+                    tool_name: "read".into(),
+                    input: json!({"path": "notes.md"}).into(),
+                    thought_signature: None,
+                })],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ]
+}
+
+/// `session.request_dump` reaches the store through the serve path on the operator's own route
+/// only. It writes each step's request exactly as the provider received it, one file per step
+/// named by the step, privately, and each file's SHA-256 is the digest that step recorded. Another
+/// caller is refused before anything reads the session; a run the session never attempted, and an
+/// option the operation doesn't have, are refused.
+#[tokio::test]
+async fn request_dump_writes_each_steps_request_for_the_operator_only() {
+    let mut rig = Rig::start_attempting(
+        "request-dump",
+        vec![read_step("a1"), text_step("a2", "done")],
+    )
+    .await;
+    rig.send("r1", "first", Some(compacting_plan())).await;
+    rig.assert_store_only();
+    let sent: Vec<Vec<u8>> = rig.requests.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "the run took two steps");
+    assert_ne!(sent[0], sent[1], "the second step carries the tool turn");
+
+    rig.bind_session(1, core()).await;
+    assert_eq!(
+        rig.refused(1, "session.request_dump", json!({"run_id": "r1"}))
+            .await,
+        "operator_required"
+    );
+
+    rig.bind_session(2, Principal::Direct).await;
+    let reply = rig
+        .result(2, "session.request_dump", json!({"run_id": "r1"}))
+        .await;
+    assert_eq!(reply["run_id"], "r1", "{reply}");
+    let folder = PathBuf::from(reply["folder"].as_str().unwrap());
+    assert!(folder.starts_with(&rig.dir), "{reply}");
+    let steps = reply["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2, "{reply}");
+    for (step, body) in steps.iter().zip(&sent) {
+        assert_eq!(step["outcome"], "written", "{reply}");
+        assert_eq!(step["bytes"], body.len(), "{reply}");
+        assert_eq!(
+            step["recorded_sha256"],
+            broca_core::render::request_digest_hex(body),
+            "the step recorded the digest of what the provider received"
+        );
+        let file = folder.join(format!("s{}.json", step["step"]));
+        assert_eq!(&std::fs::read(&file).unwrap(), body, "{}", file.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+            let mode = std::fs::metadata(&folder).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", folder.display());
+        }
+    }
+
+    assert_eq!(
+        rig.refused(2, "session.request_dump", json!({"run_id": "r9"}))
+            .await,
+        broca_wire::UNKNOWN_RUN
+    );
+    assert_eq!(
+        rig.refused(
+            2,
+            "session.request_dump",
+            json!({"run_id": "r1", "content": true})
+        )
+        .await,
+        "invalid_params"
     );
 }
 

@@ -334,6 +334,15 @@ enum Cmd {
         #[arg(long, default_value = "{}")]
         params: String,
     },
+    /// `session.request_dump`: rebuild the request each step of run `run_id` of this session
+    /// sent, and write the bodies that match their recorded SHA-256 to a private folder under
+    /// broca's state root. Operator only, for a session kept in the new storage. Stdout is the
+    /// reply (the folder and each step's outcome, never any content) or the refusal as the
+    /// daemon sent it, which exits 1. The daemon gets up to ten minutes to answer.
+    RequestDump {
+        #[arg(long)]
+        run_id: String,
+    },
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
     /// Diagnose recorded prompt-cache prefixes without a daemon connection.
@@ -907,6 +916,7 @@ async fn run(args: Args) -> Result<i32, String> {
             | Cmd::Describe { .. }
             | Cmd::EventGet { .. }
             | Cmd::TagMap { .. }
+            | Cmd::RequestDump { .. }
     );
     if !raw_output {
         emit(
@@ -1213,6 +1223,28 @@ async fn run(args: Args) -> Result<i32, String> {
             write_raw_reply_to(
                 &body,
                 Some(elapsed_ms),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            Ok(exit)
+        }
+        Cmd::RequestDump { run_id } => {
+            // One rebuild and render per step of the run: a long run takes longer than a read.
+            let reply = client
+                .management_raw_with_deadline(
+                    broca_wire::request_dump::OP_SESSION_REQUEST_DUMP,
+                    &serde_json::json!({ "run_id": run_id }),
+                    std::time::Duration::from_secs(600),
+                )
+                .await
+                .map_err(|error| format!("request-dump transport: {error}"))?;
+            let (body, exit) = match reply {
+                Ok(body) => (body, 0),
+                Err(body) => (body, 1),
+            };
+            write_raw_reply_to(
+                &body,
+                None,
                 &mut std::io::stdout().lock(),
                 &mut std::io::stderr().lock(),
             )?;

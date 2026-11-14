@@ -2813,6 +2813,17 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
+    /// `session.request_dump`: rebuilds the request each step of run `run_id` sent and writes
+    /// the bodies that match their recorded digests (see `store_request_dump`). `None` for a
+    /// session today's storage keeps, which the operation doesn't serve.
+    async fn request_dump(
+        &self,
+        _session: &LineageKey,
+        _run_id: &str,
+    ) -> Result<Option<broca_wire::request_dump::RequestDumpResponse>, ServeError> {
+        Ok(None)
+    }
+
     /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
     /// the new storage, from the files the store holds after a backup came back (see
     /// `registry::store_restore`). A handler without the new storage refuses by name.
@@ -4246,6 +4257,17 @@ impl ServeHandler for crate::LineageRegistry {
             return Ok(Some(broca_wire::tag_map::TagMapResponse::unnumbered()));
         }
         Ok(None)
+    }
+
+    async fn request_dump(
+        &self,
+        session: &LineageKey,
+        run_id: &str,
+    ) -> Result<Option<broca_wire::request_dump::RequestDumpResponse>, ServeError> {
+        match self.store_holding(session)? {
+            Some(store) => crate::store_request_dump::serve(&store, session, run_id).await,
+            None => Ok(None),
+        }
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

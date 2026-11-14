@@ -70,6 +70,7 @@ pub mod store_plan_view;
 pub mod store_publish;
 pub mod store_read;
 pub mod store_reads;
+pub mod store_request_dump;
 pub mod store_status;
 pub mod store_tag_map;
 pub mod store_tool_calls;

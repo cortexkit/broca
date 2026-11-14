@@ -469,6 +469,23 @@ impl SessionClient {
             .await
     }
 
+    /// [`Self::management_raw`] with the caller's own reply budget, for an operation that does
+    /// more work than a read.
+    pub async fn management_raw_with_deadline(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        deadline: std::time::Duration,
+    ) -> Result<Result<Vec<u8>, Vec<u8>>, ConnError> {
+        self.conn
+            .route_request_terminal_with_deadline(
+                &self.cmd_route,
+                request_body(method, params)?,
+                deadline,
+            )
+            .await
+    }
+
     /// Return the response body unchanged so callers that need byte fidelity can read it before
     /// any JSON decoding takes place.
     async fn request_raw<P: serde::Serialize>(

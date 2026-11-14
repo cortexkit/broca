@@ -3094,6 +3094,35 @@ The command prints one line per session (`--json-events`: one JSON object, the l
   can do without; nothing changed;
 - `refused`, `busy`, `key_unavailable` or `failed`: why it wasn't restored; nothing changed.
 
+### Request bodies of one run
+
+`session.request_dump` (operator only, like `session.tag_map`, and not one of the runner role's
+operations) rebuilds the request each step of one run sent, for a session kept in the new
+storage. That storage keeps each attempt's request digest, not its bytes. Each step is rebuilt
+from the session's records the way a warm-up rebuilds a recorded request, rendered with the
+run's frozen render config, and written only when its SHA-256 equals the digest the step's last
+attempt recorded. A written file is therefore the body the provider received. Another caller is
+refused `operator_required` before anything reads the session; a session today's storage keeps
+is refused `not_served_on_old_storage`.
+
+Request: `{"run_id": "<run id>"}`. A run the session holds no attempt of is refused
+`unknown_run`; an unknown field is refused `invalid_params`. The bodies go to
+`request-dumps/<session address>/<run id>/s<step>.json` under the state root, in a folder and
+files only the owner can read. The reply names the folder and each step, never any content:
+
+```json
+{"run_id": "r1", "folder": "<state root>/request-dumps/<address>/r1",
+ "steps": [{"step": 1, "recorded_sha256": "<hex>", "outcome": "written", "bytes": 1834},
+           {"step": 2, "recorded_sha256": "<hex>", "outcome": "digest_mismatch",
+            "detail": "rebuilt to <hex>"}]}
+```
+
+`outcome` is `written`, `digest_mismatch` (rebuilt to other bytes; nothing written) or
+`not_rebuilt` (with `detail` saying why; for example, a request carrying media isn't rendered,
+since that needs the media delivery a running run's actor holds). A step outside the session's
+current window, behind a later compaction seal, may not rebuild. `broca-session request-dump
+--run-id <id>` calls it with a ten-minute reply budget.
+
 ### Part number map
 
 `session.tag_map` (operator only: only a direct operator connection may call it, and it is

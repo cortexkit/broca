@@ -24,6 +24,9 @@ pub(super) struct GatedProvider<'a> {
     pub provider: &'a broca_core::provider::StubProvider,
     pub gate: Option<&'a RunGate>,
     pub requests: &'a std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Whether each step reports the attempt a transport would, carrying the digest of the bytes
+    /// the provider renders, so the step's request can be rebuilt and checked against it.
+    pub attempts: bool,
 }
 
 #[async_trait]
@@ -40,11 +43,44 @@ impl broca_core::Provider for GatedProvider<'_> {
             gate.entered.add_permits(1);
             gate.release.acquire().await.unwrap().forget();
         }
-        self.requests
-            .lock()
-            .unwrap()
-            .push(self.provider.render_request(options));
-        self.provider.step(step, options).await
+        let body = self.provider.render_request(options);
+        let digest = broca_core::render::request_digest_hex(&body);
+        self.requests.lock().unwrap().push(body);
+        let inner = self.provider.step(step, options).await;
+        if !self.attempts {
+            return inner;
+        }
+        let attempt = serde_json::from_value(serde_json::json!({
+            "attempt": 0,
+            "request_body_len": 10,
+            "request_body_sha256": digest,
+            "http_status": 200,
+            "response_body_len": 0,
+            "response_body_sha256": "0".repeat(64),
+            "outcome": "complete",
+            "ts_ms": 1,
+            "sent_at_ms": 1,
+        }))
+        .unwrap();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let mut inner = inner;
+            if tx
+                .send(NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::AttemptFinished { attempt },
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Some(event) = inner.recv().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
     }
 }
 const READS: [&str; 7] = [
@@ -453,6 +489,7 @@ async fn requests_around_reader_switch(policy: Option<&str>) -> Vec<Vec<u8>> {
         ReadyProvider::default(),
         None,
         Some(gate.clone()),
+        false,
     )
     .await;
     rig.registry.set_plan_admitter(Arc::new(SurfaceAdmitter));
@@ -752,6 +789,7 @@ async fn app_readers_never_fall_back_to_legacy_storage_on_creation() {
                 requests: Default::default(),
                 compaction: Arc::new(ReadyProvider::default()),
                 marks: None,
+                attempts: false,
             });
             let opener = DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(rig.dir.join("no-runtime-leases"))),
@@ -924,6 +962,7 @@ async fn app_readers_refresh_is_immediate_and_revokes_only_the_removed_stream() 
         ReadyProvider::default(),
         None,
         Some(gate.clone()),
+        false,
     )
     .await;
     rig.registry.set_plan_admitter(Arc::new(EmptyAdmitter));
