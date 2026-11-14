@@ -174,6 +174,26 @@ impl<B: SessionBackend> SessionBackend for Counting<B> {
         Ok(bytes)
     }
 
+    // A sealed segment is read a range at a time. Forwarding keeps that, so a range costs its
+    // own bytes here as in production, not a fetch of the whole object, which the trait's
+    // default makes.
+    async fn object_size(&self, s: &SessionAddr, name: &str) -> Result<Option<u64>, BackendError> {
+        self.inner.object_size(s, name).await
+    }
+
+    async fn get_object_range(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let bytes = self.inner.get_object_range(s, name, range).await?;
+        let mut reads = self.reads.lock().expect("counts lock");
+        reads.objects.push(name.to_owned());
+        reads.object_bytes += bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
+        Ok(bytes)
+    }
+
     async fn delete_object(
         &self,
         s: &SessionAddr,

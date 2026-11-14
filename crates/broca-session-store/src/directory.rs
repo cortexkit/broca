@@ -150,6 +150,58 @@ fn holds_ordinal(first: Option<u64>, last: Option<u64>, ordinal: u64) -> bool {
 }
 
 /// Reads and writes one session's directory pages.
+/// Directory pages one operation has read, by object name, so the operation reads each page
+/// once. Kept only for the operation: a later change writes new pages under new names.
+#[derive(Default)]
+pub struct PageMemo(std::collections::HashMap<String, std::sync::Arc<Page>>);
+
+impl PageMemo {
+    /// How many pages it holds.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether it holds no page.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The pages' size in memory, estimated from their entries and children.
+    pub fn held_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|(name, page)| {
+                name.capacity()
+                    + std::mem::size_of::<Page>()
+                    + page
+                        .entries
+                        .iter()
+                        .map(|entry| std::mem::size_of::<DirEntry>() + entry.object.capacity())
+                        .sum::<usize>()
+                    + page
+                        .children
+                        .iter()
+                        .map(|child| std::mem::size_of::<PageRef>() + child.object.capacity())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    async fn read<B: SessionBackend>(
+        &mut self,
+        pages: &Pages<'_, B>,
+        page: &PageRef,
+    ) -> Result<std::sync::Arc<Page>, DirectoryError> {
+        if let Some(read) = self.0.get(&page.object) {
+            return Ok(std::sync::Arc::clone(read));
+        }
+        let read = std::sync::Arc::new(pages.read(page).await?);
+        self.0
+            .insert(page.object.clone(), std::sync::Arc::clone(&read));
+        Ok(read)
+    }
+}
+
 pub struct Pages<'a, B: SessionBackend> {
     pub backend: &'a B,
     pub addr: &'a SessionAddr,
@@ -464,15 +516,29 @@ impl<B: SessionBackend> Pages<'_, B> {
         root: Option<&PageRef>,
         ordinal: u64,
     ) -> Result<Option<DirEntry>, DirectoryError> {
+        self.find_ordinal_in(root, ordinal, &mut PageMemo::default())
+            .await
+    }
+
+    /// [`Self::find_ordinal`], reading each page through `memo`: a search that looks up many
+    /// ordinals walks the same few pages, and reads each of them once.
+    pub async fn find_ordinal_in(
+        &self,
+        root: Option<&PageRef>,
+        ordinal: u64,
+        memo: &mut PageMemo,
+    ) -> Result<Option<DirEntry>, DirectoryError> {
         let Some(root) = root else {
             return Ok(None);
         };
-        let mut page = self.read(root).await?;
+        let mut page = memo.read(self, root).await?;
         loop {
             if page.level == 0 {
-                return Ok(page.entries.into_iter().find(|entry| {
-                    holds_ordinal(entry.first_ordinal, entry.last_ordinal, ordinal)
-                }));
+                return Ok(page
+                    .entries
+                    .iter()
+                    .find(|entry| holds_ordinal(entry.first_ordinal, entry.last_ordinal, ordinal))
+                    .cloned());
             }
             let Some(child) = page
                 .children
@@ -482,7 +548,7 @@ impl<B: SessionBackend> Pages<'_, B> {
             else {
                 return Ok(None);
             };
-            page = self.read(&child).await?;
+            page = memo.read(self, &child).await?;
         }
     }
 
@@ -524,16 +590,28 @@ impl<B: SessionBackend> Pages<'_, B> {
         root: Option<&PageRef>,
         seq: u64,
     ) -> Result<Option<DirEntry>, DirectoryError> {
+        self.find_in(root, seq, &mut PageMemo::default()).await
+    }
+
+    /// [`Self::find`], reading each page through `memo`, so a lookup of many seqs reads each
+    /// page once.
+    pub async fn find_in(
+        &self,
+        root: Option<&PageRef>,
+        seq: u64,
+        memo: &mut PageMemo,
+    ) -> Result<Option<DirEntry>, DirectoryError> {
         let Some(root) = root else {
             return Ok(None);
         };
-        let mut page = self.read(root).await?;
+        let mut page = memo.read(self, root).await?;
         loop {
             if page.level == 0 {
                 return Ok(page
                     .entries
-                    .into_iter()
-                    .find(|entry| entry.first_seq <= seq && seq <= entry.last_seq));
+                    .iter()
+                    .find(|entry| entry.first_seq <= seq && seq <= entry.last_seq)
+                    .cloned());
             }
             let Some(child) = page
                 .children
@@ -543,7 +621,7 @@ impl<B: SessionBackend> Pages<'_, B> {
             else {
                 return Ok(None);
             };
-            page = self.read(&child).await?;
+            page = memo.read(self, &child).await?;
         }
     }
 

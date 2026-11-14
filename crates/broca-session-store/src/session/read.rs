@@ -124,18 +124,35 @@ pub(super) struct SealedCaches {
     derived: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Exact send ids derived from records written before entry facts carried them.
     send_ids: Option<Box<send_ids::SendIdIndex>>,
+    /// What reads of sealed history keep for the reads after them: segment layouts and
+    /// directory pages. Boxed, so a session that never reads sealed history carries one pointer
+    /// for both.
+    kept: Option<Box<KeptReads>>,
+}
+
+/// What reads of sealed history keep for the reads after them.
+#[derive(Default)]
+struct KeptReads {
     /// The layouts (header and index) of the sealed segments read most recently, by object
     /// name, at most [`SEALED_LAYOUTS_KEPT`]: a page reads only its blocks after the first.
-    /// Boxed, so a session that never reads sealed history carries one pointer for it.
-    layouts: Option<Box<KeptLayouts>>,
+    layouts: KeptLayouts,
+    /// Directory pages read before, by object name, at most [`DIRECTORY_PAGES_KEPT`]. A page's
+    /// name is minted for the change that wrote it and never names other content, so a kept
+    /// page is never stale. A search walks the same few pages for every probe and each read
+    /// takes them from here.
+    pages: crate::directory::PageMemo,
 }
+
+/// How many directory pages a session keeps while open: enough for the transcript and ledger
+/// directories' paths that one page read walks.
+const DIRECTORY_PAGES_KEPT: usize = 32;
 
 /// Sealed segments' layouts, by object name, oldest read first.
 type KeptLayouts = Vec<(String, Arc<SegmentLayout>)>;
 
 /// How many sealed segments' layouts a session keeps while open. A layout holds one index entry
 /// per block (a few tens of bytes per 16 KiB of history), so a session's largest segments fit.
-const SEALED_LAYOUTS_KEPT: usize = 8;
+const SEALED_LAYOUTS_KEPT: usize = 32;
 
 pub(super) type SealedEntries = std::sync::Mutex<SealedCaches>;
 
@@ -240,9 +257,9 @@ impl<B: SessionBackend> Session<B> {
     ) -> Result<Option<Arc<SegmentLayout>>, SessionError> {
         let kept = self
             .sealed_caches()
-            .layouts
+            .kept
             .as_deref()
-            .and_then(|layouts| layouts.iter().find(|(name, _)| name == object))
+            .and_then(|kept| kept.layouts.iter().find(|(name, _)| name == object))
             .map(|(_, layout)| Arc::clone(layout));
         if kept.is_some() {
             return Ok(kept);
@@ -274,7 +291,7 @@ impl<B: SessionBackend> Session<B> {
         );
         let mut caches = self.sealed_caches();
         if caches.version == version {
-            let layouts = caches.layouts.get_or_insert_with(Box::default);
+            let layouts = &mut caches.kept.get_or_insert_with(Box::default).layouts;
             if layouts.len() == SEALED_LAYOUTS_KEPT {
                 layouts.remove(0);
             }
@@ -301,6 +318,27 @@ impl<B: SessionBackend> Session<B> {
         layout
             .block(position, &sealed, key, object.as_bytes())
             .map_err(SessionError::Segment)
+    }
+
+    /// The directory pages the session keeps, taken for one read, which hands them back with
+    /// [`Self::keep_pages`] when it's done. A read running at the same time starts with none.
+    fn take_pages(&self) -> crate::directory::PageMemo {
+        self.sealed_caches()
+            .kept
+            .as_mut()
+            .map(|kept| std::mem::take(&mut kept.pages))
+            .unwrap_or_default()
+    }
+
+    /// Keeps the pages a read took and added to, unless they've grown past
+    /// [`DIRECTORY_PAGES_KEPT`]; then the next read starts again with none.
+    fn keep_pages(&self, pages: crate::directory::PageMemo) {
+        if pages.len() <= DIRECTORY_PAGES_KEPT {
+            self.sealed_caches()
+                .kept
+                .get_or_insert_with(Box::default)
+                .pages = pages;
+        }
     }
 
     /// The sealed caches, emptied first when the history version moved since they were filled.
@@ -488,10 +526,11 @@ impl<B: SessionBackend> Session<B> {
     /// ordinal order, whose base is below `tag`, since a message's parts take the numbers after
     /// its base, in order. Those numbers never repeat in a session and only grow with the
     /// ordinal, so the entry is found by a search, never a scan: the held assistant message and
-    /// the window from memory, then sealed history a segment at a time. Each probe reads the one
-    /// segment the transcript directory names for an ordinal and rules out every ordinal that
-    /// segment places, so a search reads O(log n) segments of a session with n sealed segments,
-    /// and the directory's pages above each.
+    /// the window from memory, then sealed history a block at a time. Each probe reads the one
+    /// block that places an ordinal (found through the transcript directory and the segment's
+    /// index) and rules out every ordinal that block places, so a search reads O(log n) blocks
+    /// of a session with n sealed messages, and the directory's pages and segment indexes above
+    /// them.
     ///
     /// Which of the entry's parts are numbered, and so whether its parts reach `tag`, depends on
     /// the rules its run numbered under, which the caller checks. An entry without a base (one
@@ -537,6 +576,30 @@ impl<B: SessionBackend> Session<B> {
             key: &key,
             fanout: crate::directory::FANOUT,
         };
+        let mut memo = self.take_pages();
+        let searched = self.search_tagged(tag, &pages, &mut memo, window).await;
+        self.keep_pages(memo);
+        searched
+    }
+
+    /// The sealed part of [`Self::tagged_entry`]'s search, over ordinals before `window`,
+    /// reading directory pages through `memo`.
+    async fn search_tagged(
+        &self,
+        tag: u64,
+        pages: &Pages<'_, B>,
+        memo: &mut crate::directory::PageMemo,
+        window: u64,
+    ) -> Result<Option<StoredEntry>, SessionError> {
+        let base = |entry: &StoredEntry| {
+            entry
+                .state
+                .facts
+                .as_ref()
+                .and_then(|facts| facts.runner_tag_base)
+        };
+        let below = |entry: &StoredEntry| base(entry).is_some_and(|base| base < tag);
+        let key = self.key.frame_key();
         let (mut low, mut high) = (1, window.saturating_sub(1));
         // The last entry below `tag` in the sealed segments searched so far, all before `low`.
         let mut found = None;
@@ -546,15 +609,11 @@ impl<B: SessionBackend> Session<B> {
             let damaged =
                 || SessionError::Fold(format!("no sealed segment places message {middle}"));
             let segment = pages
-                .find_ordinal(self.head.transcript_dir.as_ref(), middle)
+                .find_ordinal_in(self.head.transcript_dir.as_ref(), middle, memo)
                 .await
                 .map_err(SessionError::Directory)?
                 .ok_or_else(damaged)?;
-            let (first, last) = (
-                segment.first_ordinal.unwrap_or(middle),
-                segment.last_ordinal.unwrap_or(middle),
-            );
-            let entries = self.segment_entries(&segment, &key).await?;
+            let (first, last, entries) = self.block_entries_at(&segment, middle, &key).await?;
             let numbered: Vec<&StoredEntry> = entries
                 .iter()
                 .filter(|entry| base(entry).is_some())
@@ -587,38 +646,62 @@ impl<B: SessionBackend> Session<B> {
         Ok(found)
     }
 
-    /// Every entry the sealed transcript segment `segment` places on the session's branch.
-    async fn segment_entries(
+    /// The entries the one block of sealed transcript segment `segment` that places ordinal
+    /// `ordinal` puts on the session's branch, with the first and last ordinals that block
+    /// places. Only that block is fetched, so a search probe costs one block, not a segment.
+    /// A segment none of whose blocks places a message gives no entries over the segment's own
+    /// ordinals.
+    async fn block_entries_at(
         &self,
         segment: &crate::directory::DirEntry,
+        ordinal: u64,
         key: &crate::frame::FrameKey,
-    ) -> Result<Vec<StoredEntry>, SessionError> {
+    ) -> Result<(u64, u64, Vec<StoredEntry>), SessionError> {
         let damaged =
             || SessionError::Fold(format!("sealed segment {} is missing", segment.object));
-        let opened = self
+        let layout = self
             .sealed_layout(&segment.object, key)
             .await?
             .ok_or_else(damaged)?;
-        let mut out = Vec::new();
-        for position in 0..opened.index.blocks.len() {
-            let Some(first) = opened.index.blocks[position].first_ordinal else {
-                continue;
-            };
-            let mut conversation = self.block_conversation();
-            conversation.placed = first - 1;
-            for (_, record) in self
-                .sealed_block(&segment.object, &opened, position, key)
-                .await?
-                .into_iter()
-                .filter(|(seq, _)| segment.keeps(*seq))
-            {
-                conversation
-                    .apply(&record)
-                    .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
-            }
-            out.extend(window_entries(&conversation, first, usize::MAX));
+        let starts: Vec<(usize, u64)> = layout
+            .index
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(position, block)| block.first_ordinal.map(|first| (position, first)))
+            .collect();
+        let segment_first = segment.first_ordinal.unwrap_or(ordinal);
+        let segment_last = segment.last_ordinal.unwrap_or(ordinal);
+        if starts.is_empty() {
+            return Ok((segment_first, segment_last, Vec::new()));
         }
-        Ok(out)
+        // The last block whose first message is at or before `ordinal`; a block places the
+        // ordinals from its first up to the next block's first.
+        let at = starts
+            .iter()
+            .rposition(|(_, first)| *first <= ordinal)
+            .unwrap_or(0);
+        let (position, first) = starts[at];
+        let last = starts
+            .get(at + 1)
+            .map_or(segment_last, |(_, next)| next.saturating_sub(1));
+        let mut conversation = self.block_conversation();
+        conversation.placed = first - 1;
+        for (_, record) in self
+            .sealed_block(&segment.object, &layout, position, key)
+            .await?
+            .into_iter()
+            .filter(|(seq, _)| segment.keeps(*seq))
+        {
+            conversation
+                .apply(&record)
+                .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
+        }
+        Ok((
+            first,
+            last,
+            window_entries(&conversation, first, usize::MAX),
+        ))
     }
 
     /// The ordinal of the message with id `mid`, if it's on the current branch. The id tells
@@ -1015,26 +1098,52 @@ impl<B: SessionBackend> Session<B> {
             fanout: crate::directory::FANOUT,
         };
         let damaged = |seq: u64| SessionError::Fold(format!("no sealed ledger record {seq}"));
-        // Group by segment, so each segment is fetched once.
+        // Group by segment and then by block, so each block that holds a wanted record is
+        // fetched once however many of the records it holds.
         let mut by_object: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut memo = self.take_pages();
+        let mut located = Ok(());
         for &seq in seqs {
-            let entry = pages
-                .find(self.head.ledger_dir.as_ref(), seq)
+            match pages
+                .find_in(self.head.ledger_dir.as_ref(), seq, &mut memo)
                 .await
-                .map_err(SessionError::Directory)?
-                .ok_or_else(|| damaged(seq))?;
-            by_object.entry(entry.object).or_default().push(seq);
-        }
-        let mut records = Vec::new();
-        for (object, seqs) in by_object {
-            for seq in seqs {
-                let record = self
-                    .sealed_record(&object, seq, &key)
-                    .await?
-                    .ok_or_else(|| damaged(seq))?;
-                records.push((seq, record));
+            {
+                Ok(Some(entry)) => by_object.entry(entry.object).or_default().push(seq),
+                Ok(None) => {
+                    located = Err(damaged(seq));
+                    break;
+                }
+                Err(error) => {
+                    located = Err(SessionError::Directory(error));
+                    break;
+                }
             }
         }
+        self.keep_pages(memo);
+        located?;
+        let mut records = Vec::new();
+        for (object, seqs) in by_object {
+            let layout = self.sealed_layout(&object, &key).await?.ok_or_else(|| {
+                SessionError::Fold(format!("the directory names a missing segment {object}"))
+            })?;
+            let mut by_block: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+            for seq in seqs {
+                let position = layout.block_for_seq(seq).ok_or_else(|| damaged(seq))?;
+                by_block.entry(position).or_default().push(seq);
+            }
+            for (position, wanted) in by_block {
+                let block = self.sealed_block(&object, &layout, position, &key).await?;
+                for seq in wanted {
+                    let record = block
+                        .iter()
+                        .find(|(found, _)| *found == seq)
+                        .map(|(_, record)| record.clone())
+                        .ok_or_else(|| damaged(seq))?;
+                    records.push((seq, record));
+                }
+            }
+        }
+        records.sort_by_key(|(seq, _)| *seq);
         Ok(records)
     }
 
@@ -1118,21 +1227,22 @@ impl SealedCaches {
     /// `crate::held`). A reader's derived value is opaque here, so only its pointer counts.
     pub(super) fn held_bytes(&self) -> usize {
         use crate::held::HeldBytes;
-        self.entries.held_bytes() + self.send_ids.heap_bytes() + self.layouts_held_bytes()
+        self.entries.held_bytes() + self.send_ids.heap_bytes() + self.kept_held_bytes()
     }
 
-    /// The kept segment layouts: each one's index entries, its leading or trailing state and
-    /// its header, plus the list holding them.
-    fn layouts_held_bytes(&self) -> usize {
-        let Some(layouts) = &self.layouts else {
+    /// What sealed reads keep: each kept segment layout's index entries, its leading or
+    /// trailing state and its header, the kept directory pages, and the box holding them.
+    fn kept_held_bytes(&self) -> usize {
+        let Some(kept) = &self.kept else {
             return 0;
         };
-        let each = layouts.iter().map(|(name, layout)| {
+        let layouts = kept.layouts.iter().map(|(name, layout)| {
             name.capacity() + std::mem::size_of::<SegmentLayout>() + layout.held_bytes()
         });
-        std::mem::size_of::<KeptLayouts>()
-            + layouts.capacity() * std::mem::size_of::<(String, Arc<SegmentLayout>)>()
-            + each.sum::<usize>()
+        std::mem::size_of::<KeptReads>()
+            + kept.layouts.capacity() * std::mem::size_of::<(String, Arc<SegmentLayout>)>()
+            + layouts.sum::<usize>()
+            + kept.pages.held_bytes()
     }
 }
 
