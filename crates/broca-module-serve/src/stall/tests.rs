@@ -51,9 +51,11 @@ impl Witness {
             now_ms(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // Append, as the daemon opens its stall log: tests add records through a second
+        // handle, and a write at this handle's own offset would overwrite them.
         let file = OpenOptions::new()
             .create_new(true)
-            .write(true)
+            .append(true)
             .open(&path)
             .unwrap();
         let state = Arc::new(state);
