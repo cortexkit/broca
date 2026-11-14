@@ -30,9 +30,9 @@ fn sync_marker(root: &Path, name: &str) -> Result<(), String> {
     std::fs::OpenOptions::new()
         .write(true)
         .open(marker)
-        .and_then(|file| file.sync_all())
+        .and_then(|file| broca_session_store::durable::sync(&file))
         .map_err(|error| error.to_string())?;
-    crate::retention::sync_dir(root)
+    broca_session_store::durable::sync_dir(root).map_err(|error| error.to_string())
 }
 
 /// Missing projections are harmless only on roots with no evidence of prior held intake.

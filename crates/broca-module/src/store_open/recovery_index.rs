@@ -29,13 +29,13 @@ std::thread_local! {
 fn sync_file(file: &std::fs::File) -> io::Result<()> {
     #[cfg(all(test, feature = "test-clock"))]
     SYNC_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
-    file.sync_all()
+    broca_session_store::durable::sync(file)
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(all(test, feature = "test-clock"))]
     SYNC_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
-    broca_wal::fs_ops::sync_dir(path)
+    broca_session_store::durable::sync_dir(path)
 }
 
 #[cfg(all(test, feature = "test-clock"))]
