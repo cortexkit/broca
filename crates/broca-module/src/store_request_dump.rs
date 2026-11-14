@@ -47,17 +47,15 @@ pub async fn serve(
     };
     let readers = runtime.class_backend(class);
     let parts = runtime.parts_for(class, view.head().cipher());
-    // The run's records are in the open log unless history was sealed past its start.
-    let mut records = view
-        .open_log_records()
+    // A step is rebuilt as the session stood then, from every record before it (see
+    // `recorded_warm::request_as_of`), so the whole history is read, sealed segments included.
+    let records = view
+        .stored_records(&readers)
+        .records_between(1, view.next_seq().saturating_sub(1))
         .await
-        .map_err(|error| unreadable("read the session's log", format!("{error:?}")))?;
+        .map_err(|error| unreadable("read the session's history", format!("{error:?}")))?;
     if !starts(&records, run_id) {
-        records = view
-            .stored_records(&readers)
-            .records_between(1, view.next_seq().saturating_sub(1))
-            .await
-            .map_err(|error| unreadable("read the session's history", format!("{error:?}")))?;
+        return Err(ServeError::UnknownRun(run_id.to_owned()));
     }
     let steps = attempted_steps(&records, run_id);
     if steps.is_empty() {
@@ -93,8 +91,8 @@ pub async fn serve(
     }))
 }
 
-/// Rebuild step `step` of run `run_id` from `records`, which reach from the run's start through
-/// its last attempt, and write it when it renders to `recorded_sha256`.
+/// Rebuild step `step` of run `run_id` from `records`, the session's whole history, as the session
+/// stood when the step sent, and write it when it renders to `recorded_sha256`.
 #[allow(clippy::too_many_arguments)]
 async fn dump_step(
     view: &crate::store_read::StoredView<broca_session_store::backend::LocalBackend>,
@@ -113,14 +111,10 @@ async fn dump_step(
         bytes: None,
         detail: Some(detail),
     };
-    let request = match crate::store_actor::recorded_warm::request(
-        // The session itself, under its stored view, which is what the rebuild reads.
-        &***view,
-        records,
-        parts,
-        key,
-        run_id,
-        Some(step),
+    let request = match crate::store_actor::recorded_warm::request_as_of(
+        // The session itself, under its stored view: the rebuild takes the conversation from it,
+        // and everything else from `records` as of the step.
+        &***view, records, parts, key, run_id, step,
     )
     .await
     {

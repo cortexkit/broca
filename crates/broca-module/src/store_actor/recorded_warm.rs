@@ -22,6 +22,35 @@ pub(crate) async fn request<W: Writer>(
     run_id: &str,
     step: Option<u64>,
 ) -> Result<RecordedRequest, String> {
+    rebuild(writer, records, parts, bind, run_id, step, false).await
+}
+
+/// Build the request step `step` of run `run_id` sent, as the session stood when it sent it, for
+/// a step that may be long past: the views it renders with and the session's other state are
+/// folded from `records`, which must be the session's whole history through the step's attempt,
+/// not taken from the session as it stands now. Only the conversation comes from `writer`, cut
+/// before the step's tool turn. A view applied since, or a seal since that moved the step's
+/// records out of the open log, therefore doesn't change the rebuild.
+pub(crate) async fn request_as_of<W: Writer>(
+    writer: &W,
+    records: &[(u64, Record)],
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+    run_id: &str,
+    step: u64,
+) -> Result<RecordedRequest, String> {
+    rebuild(writer, records, parts, bind, run_id, Some(step), true).await
+}
+
+async fn rebuild<W: Writer>(
+    writer: &W,
+    records: &[(u64, Record)],
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+    run_id: &str,
+    step: Option<u64>,
+    as_of: bool,
+) -> Result<RecordedRequest, String> {
     let (attempt_at, attempt) = records
         .iter()
         .enumerate()
@@ -48,6 +77,25 @@ pub(crate) async fn request<W: Writer>(
         })
         .ok_or("the recorded step has no assistant message id")?;
     let conversation = writer.conversation();
+    if as_of {
+        // The step's request began at the cut its views had marked by then. A seal since that
+        // cut deeper moved those messages out of the conversation this rebuild reads.
+        let first_kept = records[..=attempt_at]
+            .iter()
+            .rev()
+            .find_map(|(_, record)| match record {
+                Record::Marker(marker) => Some(marker.first_kept_ordinal),
+                _ => None,
+            })
+            .unwrap_or(1);
+        if first_kept < conversation.window_start() {
+            return Err(format!(
+                "the step's request began at message {first_kept}, and a later seal moved the \
+                 history up to message {} out of the conversation it is rebuilt from",
+                conversation.window_start()
+            ));
+        }
+    }
     let ordinal = conversation
         .open_entry()
         .filter(|(_, _, entry)| entry.facts.as_ref().is_some_and(|facts| facts.mid == mid))
@@ -66,22 +114,61 @@ pub(crate) async fn request<W: Writer>(
             |(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id),
         )
         .ok_or("the recorded run's start is outside the readable history")?;
+    // As of the step, every ledger record before it is folded, and the compaction views come
+    // from those records too. A seal's change records mark where one log closed and the next
+    // began, which a fold over records read across logs skips; and a seal carries a copy of the
+    // compaction records into the log it opens, which this history holds beside the originals.
+    let (fold_from, ledger) = if as_of {
+        let mut compaction: Vec<&Record> = Vec::new();
+        let ledger: Vec<(u64, Record)> = records[..=attempt_at]
+            .iter()
+            .filter(|(_, record)| {
+                if record.stream() != Stream::Ledger
+                    || matches!(record, Record::ChangeIntent(_) | Record::ChangeAborted(_))
+                {
+                    return false;
+                }
+                if matches!(
+                    record,
+                    Record::View(_) | Record::ViewApplied(_) | Record::Marker(_)
+                ) {
+                    if compaction.contains(&record) {
+                        return false;
+                    }
+                    compaction.push(record);
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        (0, Some(ledger))
+    } else {
+        (run_at, None)
+    };
     let mut prefix = Operations::default();
-    for (seq, record) in &records[run_at..=attempt_at] {
-        if record.stream() == Stream::Ledger {
+    for (seq, record) in &records[fold_from..=attempt_at] {
+        if record.stream() == Stream::Ledger
+            && !(as_of && matches!(record, Record::ChangeIntent(_) | Record::ChangeAborted(_)))
+        {
             prefix
                 .apply_at(Some(*seq), record)
                 .map_err(|error| format!("the recorded step's state: {error:?}"))?;
         }
     }
-    let mut operations = writer.operations().clone();
-    operations.run = prefix.run;
+    let operations = if as_of {
+        prefix
+    } else {
+        let mut operations = writer.operations().clone();
+        operations.run = prefix.run;
+        operations
+    };
     let before = Before {
         writer,
         conversation: conversation
             .before_entry(ordinal)
             .ok_or("the recorded step is outside the window")?,
         operations,
+        ledger,
     };
     let run = before
         .operations
@@ -252,6 +339,7 @@ async fn predecessor<W: Writer>(
         writer,
         conversation: writer.conversation().clone(),
         operations,
+        ledger: None,
     };
     let request = request(
         &snapshot,
@@ -300,6 +388,9 @@ struct Before<'a, W> {
     writer: &'a W,
     conversation: Conversation,
     operations: Operations,
+    /// The ledger records through the step, served in place of the writer's open log for a
+    /// rebuild as of the step (see [`request_as_of`]).
+    ledger: Option<Vec<(u64, Record)>>,
 }
 
 impl<W: Writer> Writer for Before<'_, W> {
@@ -335,7 +426,10 @@ impl<W: Writer> Writer for Before<'_, W> {
         self.writer.retired_tag_floor()
     }
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
-        self.writer.open_log_records().await
+        match &self.ledger {
+            Some(ledger) => Ok(ledger.clone()),
+            None => self.writer.open_log_records().await,
+        }
     }
     async fn run_start(
         &self,

@@ -1353,8 +1353,60 @@ async fn run_once<W: Writer>(
     writer: &mut W,
     parts: &mut MemoryParts,
     compactor: &Compactor,
+    run: (&str, &str),
+    text: &str,
+) -> broca_protocol::request::CallOptions {
+    run_once_with(writer, parts, compactor, run, text, false).await
+}
+
+/// The stub provider; when `.1` is set, it reports the attempt a transport would before the
+/// step's events, so the session records the step's request digest.
+struct Attempting<'a>(&'a broca_core::provider::StubProvider, bool);
+
+#[async_trait::async_trait]
+impl broca_core::Provider for Attempting<'_> {
+    async fn step(
+        &self,
+        step: broca_protocol::StepId,
+        options: &broca_protocol::CallOptions,
+    ) -> mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        let digest = broca_core::render::request_digest_hex(&self.0.render_request(options));
+        let mut inner = self.0.step(step, options).await;
+        if !self.1 {
+            return inner;
+        }
+        let attempt = serde_json::from_value(serde_json::json!({
+            "attempt": 0, "request_body_len": 10, "request_body_sha256": digest,
+            "http_status": 200, "response_body_len": 0,
+            "response_body_sha256": "0".repeat(64), "outcome": "complete",
+            "ts_ms": 1, "sent_at_ms": 1,
+        }))
+        .unwrap();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::AttemptFinished { attempt },
+                ))
+                .await;
+            while let Some(event) = inner.recv().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+}
+
+/// [`run_once`], with each step recording its attempt when `attempts` is set.
+async fn run_once_with<W: Writer>(
+    writer: &mut W,
+    parts: &mut MemoryParts,
+    compactor: &Compactor,
     (run_id, model): (&str, &str),
     text: &str,
+    attempts: bool,
 ) -> broca_protocol::request::CallOptions {
     let provider =
         broca_core::provider::StubProvider::new(vec![reply_step(&format!("m-{run_id}"), text)]);
@@ -1386,8 +1438,9 @@ async fn run_once<W: Writer>(
     .unwrap();
     let tools = broca_core::stub_plane::StubToolPlane::new();
     let now = || 10_000;
+    let attempting = Attempting(&provider, attempts);
     let seams = broca_session_loop::run::Seams {
-        provider: &provider,
+        provider: &attempting,
         tools: &tools,
         bind: bind(),
         out: None,
@@ -1601,6 +1654,133 @@ async fn an_installed_cut_seals_the_history_before_the_first_step() {
     drop(session);
     let session = load(backend).await.unwrap();
     assert_eq!(Writer::conversation(&session).window_start(), 5);
+}
+
+/// A step rebuilt as of its own time renders the request it sent: the request dump reads the views
+/// and state recorded up to the step, not the session as it stands now. The install's seal before
+/// the step, and a later view that changes what the session renders, don't change the rebuild. A
+/// later seal that cut deeper refuses it by name, since the step's messages left the conversation.
+#[tokio::test]
+async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("as-of", exchanges(), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    let cut_a1 = |version, mut edits: Vec<(u64, EditOp)>| {
+        edits.push((
+            1,
+            EditOp::Cut {
+                through: "msg_a1".into(),
+            },
+        ));
+        view_of(version, edits)
+    };
+    assert!(matches!(
+        ask(
+            &commands,
+            install_view(&cut_a1(1, vec![(1, drop_part("msg_a3", "0"))]))
+        )
+        .await,
+        StoreOutcome::ViewInstalled(_)
+    ));
+    drop(commands);
+    let mut session = served.await.unwrap();
+    assert_eq!(
+        Writer::conversation(&session).window_start(),
+        3,
+        "installed seal"
+    );
+    let cutter = Compactor::default();
+    let mut parts = MemoryParts::default();
+    let first = run_once_with(
+        &mut session,
+        &mut parts,
+        &cutter,
+        ("r1", "m"),
+        "Question 5.",
+        true,
+    )
+    .await;
+    // The next view drops a part the first one kept, with the same cut.
+    cutter.answer_next_ride(cut_a1(
+        2,
+        vec![(1, drop_part("msg_a3", "0")), (2, drop_part("msg_a4", "0"))],
+    ));
+    run_once(
+        &mut session,
+        &mut parts,
+        &cutter,
+        ("r2", "m2"),
+        "Question 6.",
+    )
+    .await;
+    drop(session);
+    let session = load(backend).await.unwrap();
+    let records = |session: &Session<&'static MemoryBackend>| {
+        let stored = session.stored_records(backend);
+        let last = session.next_seq() - 1;
+        async move { stored.records_between(1, last).await.unwrap() }
+    };
+    let history = records(&session).await;
+    let rebuilt = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r1", 1)
+        .await
+        .unwrap();
+    assert_eq!(as_read(&rebuilt.opts), as_read(&first));
+    // Read from the session as it stands now, the same step takes the later view.
+    let current = super::recorded_warm::request(&session, &history, &parts, &bind(), "r1", Some(1))
+        .await
+        .map(|request| as_read(&request.opts));
+    assert_ne!(current.ok(), Some(as_read(&first)));
+
+    // A view that cuts deeper seals the history through `msg_a3` at the next step.
+    let mut session = session;
+    cutter.answer_next_ride(view_of(
+        3,
+        vec![
+            (1, drop_part("msg_a3", "0")),
+            (2, drop_part("msg_a4", "0")),
+            (
+                3,
+                EditOp::Cut {
+                    through: "msg_a3".into(),
+                },
+            ),
+        ],
+    ));
+    run_once(
+        &mut session,
+        &mut parts,
+        &cutter,
+        ("r3", "m3"),
+        "Question 7.",
+    )
+    .await;
+    let applied = Writer::operations(&session)
+        .view_applied
+        .as_ref()
+        .map(|applied| applied.view.version);
+    let accepted = Writer::operations(&session)
+        .view_accepted
+        .as_ref()
+        .map(|accepted| accepted.version);
+    assert_eq!(
+        Writer::conversation(&session).window_start(),
+        7,
+        "deeper seal: applied {applied:?}, accepted {accepted:?}, calls {:?}",
+        cutter
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, _)| method.clone())
+            .collect::<Vec<_>>()
+    );
+    let history = records(&session).await;
+    let refused = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r1", 1)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(refused.contains("a later seal"), "{refused}");
 }
 
 /// The compaction provider's view names imported messages by their source ids. Installed, it applies at
