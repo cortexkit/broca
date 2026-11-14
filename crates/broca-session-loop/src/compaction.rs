@@ -686,7 +686,10 @@ pub async fn offline_prompt<W: Writer>(
         &transcript.entries,
         &rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
-        |_| Err("a compaction view's inserted images aren't stored yet".into()),
+        // A view's inserted image isn't a medium the session captured, so the request shows
+        // its provenance marker in its place, as today's storage renders it; only its reference
+        // is needed, checked as the view was when accepted.
+        v2::host::image_reference,
     )
     .map_err(LoopError::Parts)?;
     finish(&opts, prompt, admission).map_err(LoopError::Parts)
@@ -1127,7 +1130,10 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             next_mid: NEXT_MID,
             render: Some(rendered),
         },
-        |_| Err("a compaction view's inserted images aren't stored yet".into()),
+        // A view's inserted image isn't a medium the session captured, so the request shows
+        // its provenance marker in its place, as today's storage renders it; only its reference
+        // is needed, checked as the view was when accepted.
+        v2::host::image_reference,
         |prompt| {
             let view = finish(&opts, prompt.to_vec(), admission)?;
             seams

@@ -39,6 +39,7 @@ cipher_tests!(
     an_input_photo_and_a_tool_image_render_offline_as_sent,
     a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent,
     a_run_after_a_view_drops_a_photo_renders_alike,
+    a_view_inserting_an_image_renders_alike,
     a_setup_covering_a_photo_teaches_its_id_without_a_notice,
     a_photo_between_numbered_messages_renders_alike,
     an_ordered_steer_photo_lands_with_its_bytes_alike,
@@ -1321,6 +1322,60 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
         carried,
         [false, true, false],
         "only the photo's own run sent its bytes; the view dropped it from the next"
+    );
+}
+
+/// A view that inserts a user message carrying an image, as Magic Context inserts the image it
+/// draws of its memories, renders alike. The image isn't a medium the session captured, so on
+/// both storages the request shows its provenance marker in its place, never its bytes. Until
+/// the new storage rendered it, such a view applied there and then failed every request.
+async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
+    let plan = super::controls::compacting_plan();
+    let png = base64(&bytes_of(PNG));
+    let mut sides = Vec::new();
+    for store in [false, true] {
+        let compactor = Arc::new(super::controls::Compactor::default());
+        let side = Rendered::with_compactor(
+            store,
+            three_texts(),
+            false,
+            Some(Arc::clone(&compactor)),
+            cipher,
+        )
+        .await;
+        let sent = send_planned(&side, "r1", planned(text("first")), &plan).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.idle().await;
+        compactor.insert_image_at_next_ride(png.clone());
+        // Another model loses the prompt cache, so the run's first request rides.
+        let mut next = planned(text("next"));
+        next.model = broca_protocol::request::ModelHandle::new("stub", "another");
+        let sent = send_planned(&side, "r2", next, &plan).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.idle().await;
+        assert_eq!(compactor.views(), 1, "a ride handed the view");
+        sides.push(side);
+    }
+    let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
+    let (old, new) = (today.sent(), store.sent());
+    assert_eq!(new.len(), old.len(), "how many requests");
+    for (index, (old, new)) in old.iter().zip(&new).enumerate() {
+        assert!(
+            old == new,
+            "request {index} differs\ntoday's: {:?}\nstore's: {:?}",
+            old.as_ref()
+                .map(|body| String::from_utf8_lossy(body).into_owned()),
+            new.as_ref()
+                .map(|body| String::from_utf8_lossy(body).into_owned()),
+        );
+    }
+    let last = String::from_utf8_lossy(new.last().unwrap().as_ref().unwrap()).into_owned();
+    assert!(last.contains("Memories."), "the view applied: {last}");
+    assert!(!last.contains(&png), "the image's bytes were sent: {last}");
+    assert!(
+        last.contains("[media not shown: kind=image mime=image/png")
+            && last.contains("reason=provenance]"),
+        "its marker stands in its place: {last}"
     );
 }
 

@@ -651,21 +651,22 @@ impl RunMedia {
             let slot = locked(&self.slot);
             (slot.index.clone(), slot.broken.clone())
         };
-        let refused = broken.or_else(|| self.unreadable.clone()).or_else(|| {
-            index
-                .is_none()
-                .then(|| "the session has captured no media to render".to_owned())
-        });
-        match (refused, index) {
+        match (broken.or_else(|| self.unreadable.clone()), index) {
             (None, Some(index)) => {
                 index.render_with_provenance(config, opts, render_tags, provenance)
             }
-            (reason, _) => broca_provider::media_request::render_without_index(
+            // The session captured no media, so no medium the prompt names is one of its own: a
+            // compaction view's inserted image, say. Each renders as an index holding nothing
+            // places it, as its provenance marker, the way today's storage renders it.
+            (None, None) => uncaptured()
+                .map_err(|reason| Box::new(refusal(reason)))?
+                .render_with_provenance(config, opts, render_tags, provenance),
+            (Some(reason), _) => broca_provider::media_request::render_without_index(
                 config,
                 opts,
                 provenance,
                 "store_media_unavailable",
-                reason.as_deref().unwrap_or_default(),
+                &reason,
             ),
         }
     }
@@ -678,6 +679,24 @@ impl RunMedia {
             media.render(config, opts, tags, provenance)
         })
     }
+}
+
+/// The index of a session that captured no media. It reads no bytes: a prompt can only name media
+/// it doesn't hold, and those render as markers.
+fn uncaptured() -> Result<MediaIndex, String> {
+    #[derive(Debug)]
+    struct Nothing;
+    impl MediaBytes for Nothing {
+        fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
+            Err(MediaReadError::Corrupt(reference.sha256.clone()))
+        }
+    }
+    Ok(MediaIndex::new(
+        SessionMedia::from_index_state(Default::default(), Nothing)?,
+        MediaAging::default(),
+        None,
+        false,
+    ))
 }
 
 /// How a run gets its [`RunMedia`]: the actor sends it once the session's index is built, which
