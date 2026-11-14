@@ -537,7 +537,15 @@ impl Vault {
             }
             "credential.get_scoped" => {
                 let id = request["params"]["credential_id"].as_str().unwrap();
-                assert!(ACCOUNTS.contains(&id));
+                // broca reads its new storage's deployment key from the vault at startup, as in
+                // production; a synthetic key lets that storage open.
+                if id.starts_with("opaque:broca-deployment:") {
+                    return json!({"payload":"07".repeat(32).as_bytes(),"expires_at_ms":null,"record_version":1,"credential_id":id,"account_id":null});
+                }
+                assert!(
+                    ACCOUNTS.contains(&id),
+                    "vault asked for {id}; accounts {ACCOUNTS:?}"
+                );
                 json!({"payload":format!("synthetic-classifier-key-{id}").as_bytes(),"expires_at_ms":null,"record_version":1,"credential_id":id,"account_id":null})
             }
             method => panic!("unsupported classifier vault method {method}"),
