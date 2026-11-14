@@ -19,6 +19,7 @@ cipher_tests!(
     an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal,
     a_damaged_id_map_reads_as_damage,
     turn_facts_attach_to_their_message,
+    an_imported_tool_turn_reads_with_its_results_after_a_seal,
     an_import_larger_than_one_batch_reads_back_whole,
     a_replacement_keeps_the_session_and_takes_its_place_once_published,
 );
@@ -455,6 +456,86 @@ fn turn_facts_attach_to_their_message(cipher: Cipher) {
         let entry = loaded.entries(1, 1).await.unwrap().remove(0);
         assert_eq!(entry.state.turn.as_deref(), Some(&turn));
         assert_eq!(entry.state.facts.unwrap().mid, "msg_a");
+    });
+}
+
+/// An imported tool turn's results are their own input record. Sealed, the call and a large
+/// result can't share a block unless the seal keeps them in one group; either way the call's
+/// entry reads with its tool message, by ordinal, by id and after a reload, so its calls never
+/// read as still running.
+fn an_imported_tool_turn_reads_with_its_results_after_a_seal(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    let call: ContentBlock = serde_json::from_value(serde_json::json!({
+        "type": "tool_call", "tool_call_id": "c1", "tool_name": "read", "input": {}
+    }))
+    .unwrap();
+    // Larger than a sealed block, so the result can't join a block that already holds the call.
+    let result: ContentBlock = serde_json::from_value(serde_json::json!({
+        "type": "tool_result", "tool_call_id": "c1",
+        "output": {"kind": "text", "text": "x".repeat(64 * 1024)}, "is_error": false
+    }))
+    .unwrap();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), true)
+            .await
+            .unwrap();
+        let ids = ["msg_u1", "msg_a1", "msg_t1", "msg_u2", "msg_a2"];
+        let records = vec![
+            start("seed", true),
+            input("seed", Placement::Imported, Role::User, vec![text("q")]),
+            facts(1, ids[0]),
+            input("seed", Placement::Imported, Role::Assistant, vec![call]),
+            facts(2, ids[1]),
+            input("seed", Placement::Imported, Role::Tool, vec![result]),
+            facts(3, ids[2]),
+            input("seed", Placement::Imported, Role::User, vec![text("next")]),
+            facts(4, ids[3]),
+            input(
+                "seed",
+                Placement::Imported,
+                Role::Assistant,
+                vec![text("done")],
+            ),
+            facts(5, ids[4]),
+            end("seed"),
+        ];
+        let first = session.next_seq();
+        let named = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| ((*id).to_owned(), index as u64 + 1))
+            .collect();
+        session
+            .append_import(&records, Vec::new(), named, &receipt())
+            .await
+            .unwrap();
+        // The log starts again at the second user input: the tool turn is sealed.
+        session.seal(Some(first + 7), 0).await.unwrap();
+        assert_eq!(session.conversation.window_start(), 4);
+        let results = |entry: &crate::session::StoredEntry| {
+            entry
+                .next
+                .as_deref()
+                .map(|next| (next.role, next.content.len()))
+        };
+        let by_ordinal = session.entries(2, 1).await.unwrap();
+        assert_eq!(by_ordinal[0].ordinal, 2);
+        assert_eq!(results(&by_ordinal[0]), Some((Role::Tool, 1)), "by ordinal");
+        let all = session.entries(1, 10).await.unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(results(&all[1]), Some((Role::Tool, 1)), "in a page");
+        let by_id = session.entries_by_mid(&["msg_a1".into()]).await.unwrap();
+        assert_eq!(results(&by_id[0]), Some((Role::Tool, 1)), "by id");
+        session.close().await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        let reloaded = loaded.entries(2, 1).await.unwrap();
+        assert_eq!(
+            results(&reloaded[0]),
+            Some((Role::Tool, 1)),
+            "after a reload"
+        );
     });
 }
 

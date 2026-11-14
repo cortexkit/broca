@@ -146,8 +146,9 @@ pub struct SegmentMeta {
 }
 
 /// Splits transcript records into groups that must share a block: each user input or assistant
-/// message starts a group, and the records after it (its tool results, text delivered with a tool
-/// result, its turn's facts, markers, entry facts) join it. Ledger records are grouped one by one.
+/// message starts a group, and the records after it (its tool results, an imported tool message,
+/// text delivered with a tool result, its turn's facts, markers, entry facts) join it. Ledger
+/// records are grouped one by one.
 ///
 /// A message whose `EntryFacts` hasn't come yet keeps its group open. Messages placed together,
 /// such as a run's several input messages, are written before all their facts, and a block
@@ -164,6 +165,12 @@ pub fn groups(records: &[(u64, Record)]) -> Vec<Range<usize>> {
     let mut owed = 0usize;
     for (index, (_, record)) in records.iter().enumerate() {
         let starts = match record {
+            // An imported tool message is an input record of its own; it joins its call's
+            // group, as a `ToolReply` does for a run broca made itself.
+            Record::Input(input) if input.message.role == broca_protocol::content::Role::Tool => {
+                owed += usize::from(tracks_facts);
+                false
+            }
             Record::Input(_) | Record::Assistant(_) => {
                 let starts = owed == 0;
                 owed += usize::from(tracks_facts);

@@ -81,6 +81,16 @@ pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
     entries
 }
 
+/// Whether `message` is an assistant message that called tools, whose results the tool message
+/// after it holds.
+fn called_tools(message: &broca_protocol::content::Message) -> bool {
+    message.role == broca_protocol::content::Role::Assistant
+        && message
+            .content
+            .iter()
+            .any(|block| matches!(block, broca_protocol::content::ContentBlock::ToolCall(_)))
+}
+
 /// The entries of `conversation`'s window from `from` on, at most `limit` of them: one per
 /// window message, so a request's prompt and its entries line up.
 pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {
@@ -89,10 +99,7 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
         .take(limit)
         .filter_map(|ordinal| {
             let (message, state) = conversation.window_entry(ordinal)?;
-            let called = message.role == broca_protocol::content::Role::Assistant
-                && message.content.iter().any(|block| {
-                    matches!(block, broca_protocol::content::ContentBlock::ToolCall(_))
-                });
+            let called = called_tools(message);
             let next = conversation
                 .window_message(ordinal + 1)
                 .filter(|next| called && next.role == broca_protocol::content::Role::Tool);
@@ -445,6 +452,54 @@ impl<B: SessionBackend> Session<B> {
     /// conversation: sealed history a block at a time, then the window, then the held assistant
     /// message, if any.
     pub async fn entries(&self, from: u64, limit: usize) -> Result<Vec<StoredEntry>, SessionError> {
+        let entries = self.unjoined_entries(from, limit).await?;
+        self.join_split_turns(entries).await
+    }
+
+    /// Sealed history can hold an assistant message that called tools at the end of one block
+    /// and its tool message at the start of the next: an imported tool message is its own input
+    /// record, and sealed before `segment::groups` kept it with its call. Read a block at a time,
+    /// such an entry has no results, and its calls would read as still running. Attach each such
+    /// sealed entry's tool message from the entry after it in `entries`, or read that one entry
+    /// when `entries` stops before it.
+    async fn join_split_turns(
+        &self,
+        mut entries: Vec<StoredEntry>,
+    ) -> Result<Vec<StoredEntry>, SessionError> {
+        let window = self.conversation.window_start();
+        for index in 0..entries.len() {
+            let entry = &entries[index];
+            if entry.open
+                || entry.next.is_some()
+                || entry.ordinal >= window
+                || !called_tools(&entry.message)
+            {
+                continue;
+            }
+            let ordinal = entry.ordinal + 1;
+            let next = match entries
+                .get(index + 1)
+                .filter(|next| next.ordinal == ordinal)
+            {
+                Some(next) => Some(Arc::clone(&next.message)),
+                None => self
+                    .unjoined_entries(ordinal, 1)
+                    .await?
+                    .into_iter()
+                    .find(|next| next.ordinal == ordinal)
+                    .map(|next| next.message),
+            };
+            entries[index].next =
+                next.filter(|next| next.role == broca_protocol::content::Role::Tool);
+        }
+        Ok(entries)
+    }
+
+    async fn unjoined_entries(
+        &self,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEntry>, SessionError> {
         let mut out = Vec::new();
         let mut next = from.max(1);
         let key = self.key.frame_key();
@@ -600,7 +655,10 @@ impl<B: SessionBackend> Session<B> {
             .search_numbering(tag, base, &pages, &mut memo, window)
             .await;
         self.keep_pages(memo);
-        searched
+        match searched? {
+            Some(found) => Ok(self.join_split_turns(vec![found]).await?.pop()),
+            None => Ok(None),
+        }
     }
 
     /// The sealed part of [`Self::entry_numbering`]'s search, over ordinals before `window`,
