@@ -76,10 +76,11 @@ async fn rebuild<W: Writer>(
             _ => None,
         })
         .ok_or("the recorded step has no assistant message id")?;
-    let conversation = writer.conversation();
-    if as_of {
-        // The step's request began at the cut its views had marked by then. A seal since that
-        // cut deeper moved those messages out of the conversation this rebuild reads.
+    // As of the step, the conversation is folded from the step's own records, sealed at the cut
+    // its views had marked by then: a seal since may have cut deeper, moving the step's messages
+    // out of the session's window.
+    let folded;
+    let conversation = if as_of {
         let first_kept = records[..=attempt_at]
             .iter()
             .rev()
@@ -88,14 +89,35 @@ async fn rebuild<W: Writer>(
                 _ => None,
             })
             .unwrap_or(1);
-        if first_kept < conversation.window_start() {
-            return Err(format!(
-                "the step's request began at message {first_kept}, and a later seal moved the \
-                 history up to message {} out of the conversation it is rebuilt from",
-                conversation.window_start()
-            ));
-        }
-    }
+        let enrolled = {
+            let mut operations = Operations::default();
+            for (seq, record) in &records[..=attempt_at] {
+                if record.stream() == Stream::Ledger
+                    && !matches!(record, Record::ChangeIntent(_) | Record::ChangeAborted(_))
+                {
+                    operations
+                        .apply_at(Some(*seq), record)
+                        .map_err(|error| format!("the recorded step's state: {error:?}"))?;
+                }
+            }
+            operations.enrolled_through()
+        };
+        // Through the facts that place the step's own assistant message, so the fold knows its
+        // ordinal; nothing later, so a later cut's marker never reaches it.
+        let placed_at = records[attempt_at..]
+            .iter()
+            .position(|(_, record)| matches!(record, Record::EntryFacts(facts) if facts.mid == mid))
+            .map_or(records.len() - 1, |at| attempt_at + at);
+        folded = conversation_as_of(
+            &records[..=placed_at],
+            writer.conversation().appends_in_conversation,
+            enrolled,
+            first_kept,
+        )?;
+        &folded
+    } else {
+        writer.conversation()
+    };
     let ordinal = conversation
         .open_entry()
         .filter(|(_, _, entry)| entry.facts.as_ref().is_some_and(|facts| facts.mid == mid))
@@ -384,6 +406,50 @@ pub(super) fn media(
 
 /// Offline rendering reads the snapshot's conversation and the session's durable lookups. No
 /// write is permitted through this adapter, including a compaction seal.
+/// The conversation as a step saw it: the transcript records before its attempt (`records`, the
+/// session's history from its first record) folded in order, with the window sealed at the
+/// step's cut, `first_kept`, as the session had sealed it by then. History below the cut is
+/// sealed every [`AS_OF_SEAL_EVERY`] messages on the way, so the fold holds about that many
+/// messages besides the step's window, whatever the session's length.
+fn conversation_as_of(
+    records: &[(u64, Record)],
+    appends_in_conversation: bool,
+    enrolled_through: Option<u64>,
+    first_kept: u64,
+) -> Result<Conversation, String> {
+    let mut conversation = Conversation::new(appends_in_conversation);
+    conversation.enrolled(enrolled_through);
+    let fold = |error| format!("the recorded step's conversation: {error:?}");
+    for (_, record) in records {
+        if record.stream() != Stream::Transcript {
+            continue;
+        }
+        // A log starts, and so a seal falls, only at an input or an assistant message with no
+        // tool turn open before it.
+        let next = conversation.placed + 1;
+        let at_boundary = matches!(record, Record::Input(_) | Record::Assistant(_))
+            && conversation.open_tool_turn().is_none();
+        if at_boundary && next <= first_kept && next > conversation.window_start() {
+            if next == first_kept {
+                let starts_run = match record {
+                    Record::Input(input) => Some(input.run_id.as_str()),
+                    _ => None,
+                };
+                conversation
+                    .seal_window(first_kept, starts_run)
+                    .map_err(fold)?;
+            } else if conversation.messages.len() >= AS_OF_SEAL_EVERY {
+                conversation.seal_window(next, None).map_err(fold)?;
+            }
+        }
+        conversation.apply(record).map_err(fold)?;
+    }
+    Ok(conversation)
+}
+
+/// How many messages below a step's cut [`conversation_as_of`] holds before sealing them.
+const AS_OF_SEAL_EVERY: usize = 4096;
+
 struct Before<'a, W> {
     writer: &'a W,
     conversation: Conversation,

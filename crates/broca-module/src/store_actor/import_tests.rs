@@ -1658,8 +1658,8 @@ async fn an_installed_cut_seals_the_history_before_the_first_step() {
 
 /// A step rebuilt as of its own time renders the request it sent: the request dump reads the views
 /// and state recorded up to the step, not the session as it stands now. The install's seal before
-/// the step, and a later view that changes what the session renders, don't change the rebuild. A
-/// later seal that cut deeper refuses it by name, since the step's messages left the conversation.
+/// the step, a later view that changes what the session renders, and a later seal that cut deeper
+/// than the step's own cut, moving its messages out of the session's window, don't change it.
 #[tokio::test]
 async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
     let backend: &'static MemoryBackend = Box::leak(Box::default());
@@ -1755,32 +1755,16 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
         "Question 7.",
     )
     .await;
-    let applied = Writer::operations(&session)
-        .view_applied
-        .as_ref()
-        .map(|applied| applied.view.version);
-    let accepted = Writer::operations(&session)
-        .view_accepted
-        .as_ref()
-        .map(|accepted| accepted.version);
     assert_eq!(
         Writer::conversation(&session).window_start(),
         7,
-        "deeper seal: applied {applied:?}, accepted {accepted:?}, calls {:?}",
-        cutter
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(method, _)| method.clone())
-            .collect::<Vec<_>>()
+        "deeper seal"
     );
     let history = records(&session).await;
-    let refused = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r1", 1)
+    let rebuilt = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r1", 1)
         .await
-        .map(|_| ())
-        .unwrap_err();
-    assert!(refused.contains("a later seal"), "{refused}");
+        .unwrap();
+    assert_eq!(as_read(&rebuilt.opts), as_read(&first));
 }
 
 /// The compaction provider's view names imported messages by their source ids. Installed, it applies at
