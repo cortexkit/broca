@@ -341,6 +341,8 @@ struct Vault {
     /// The value of the new storage's deployment-key record (`opaque:broca-deployment:<id>`).
     /// `None` answers `not_found`, as a vault without the record or its grant does.
     deployment_key: Mutex<Option<Vec<u8>>>,
+    /// Once set, the Antigravity sign-in is served without its Google Cloud project.
+    antigravity_without_project: std::sync::atomic::AtomicBool,
 }
 
 /// The prefix of the new storage's deployment-key records, which the daemon reads at boot.
@@ -570,7 +572,11 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                     if let Some(account_id) = self.account_ids.lock().unwrap().get(id) {
                         reply["account_id"] = json!(account_id);
                     }
-                    if id == "antigravity:google" {
+                    if id == "antigravity:google"
+                        && !self
+                            .antigravity_without_project
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
                         reply["project_id"] = json!("fixture-project");
                     }
                     reply
@@ -1235,6 +1241,7 @@ impl Rig {
             openai_apikey_listed: Default::default(),
             openrouter_listed: Default::default(),
             deployment_key: Mutex::new(None),
+            antigravity_without_project: Default::default(),
         });
         let routing_task = register(
             &connection_file,
@@ -4131,6 +4138,39 @@ async fn transient_rate_limited_credential_status_matches_golden_through_real_se
     assert!(value["error"].get("account_ref").is_none());
     assert_eq!(value["retries_used"], sends - 1);
     assert_golden_file(&bytes, "run_status.transient_rate_limited_credential.json");
+}
+
+/// A Code Assist request names its Google Cloud project, which comes with the Antigravity
+/// sign-in. A sign-in served without one is refused at admission by name, before any run record
+/// or model call, instead of ending the run on a render failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_antigravity_sign_in_without_a_project_is_refused_at_admission() {
+    let rig = Rig::start()
+        .await
+        .expect("the Code Assist project check requires the real daemon");
+    rig.vault
+        .antigravity_without_project
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let client = rig.client("codeassist-no-project").await;
+    let mut google_spec = spec("send-codeassist-no-project", None);
+    google_spec.provider = "google";
+    google_spec.model = "gemini-3.8-flash-high";
+    let refusal = match client.send(google_spec).await {
+        Err(error) => error.to_string(),
+        Ok(SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. }) => {
+            let status = client.run_status(&run_id).await.unwrap();
+            panic!("the send started run {run_id}: {status:?}")
+        }
+        Ok(other) => panic!("unexpected send outcome {other:?}"),
+    };
+    assert!(
+        refusal.contains("came without a Google Cloud project"),
+        "refusal names the missing project: {refusal}"
+    );
+    assert!(
+        rig.upstream.authorized_as.lock().unwrap().is_empty(),
+        "no model call was made"
+    );
 }
 
 #[cfg(feature = "test-clock")]

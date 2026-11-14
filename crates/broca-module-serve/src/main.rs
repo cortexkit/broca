@@ -5082,6 +5082,21 @@ mod executor {
                     }
                 }
             }
+            // A Code Assist request names the Google Cloud project that comes with the
+            // Antigravity sign-in, and its renderer cannot write one without it. Refuse a fresh
+            // run whose sign-in came without a project here, by name and before any run record,
+            // rather than letting its first request fail to render. A run paused for sign-in has
+            // no token yet and is checked when it resumes.
+            if fresh_episode
+                && resolution.pause.is_none()
+                && resolved.family_id == WireFamilyId::GoogleCodeAssist
+                && resolution.project_id.is_none()
+            {
+                return Err(RunError::Config(format!(
+                    "the Antigravity sign-in for model '{model_id}' came without a Google Cloud \
+                     project, and Code Assist requests name one; sign in to Antigravity again"
+                )));
+            }
 
             Ok(EpisodeAdmission {
                 fresh_episode,
