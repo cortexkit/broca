@@ -87,6 +87,7 @@ pub(crate) fn remove_retained_lineage(root: &Path, lineage: &str) -> Result<(), 
         connection: Mutex::new(connection),
         path,
         held_history: std::sync::atomic::AtomicBool::new(false),
+        tombstones_pruned: std::sync::atomic::AtomicU8::new(PRUNED_WITH_WITHDRAWALS),
     }
     .remove_lineage(lineage)
 }
@@ -166,10 +167,18 @@ pub struct RegistrationRow {
     pub state: RegistrationState,
 }
 
+const PRUNED_NONE: u8 = 0;
+const PRUNED_REGISTRATIONS: u8 = 1;
+const PRUNED_WITH_WITHDRAWALS: u8 = 2;
+
 pub struct LateResultsStore {
     connection: Mutex<Connection>,
     path: PathBuf,
     held_history: std::sync::atomic::AtomicBool,
+    /// How far this process has already removed the rows of lineages retention tombstoned
+    /// before it started (see [`Self::prune_tombstoned`]): `PRUNED_NONE`, `PRUNED_REGISTRATIONS`
+    /// or `PRUNED_WITH_WITHDRAWALS`.
+    tombstones_pruned: std::sync::atomic::AtomicU8,
 }
 
 impl LateResultsStore {
@@ -268,6 +277,7 @@ impl LateResultsStore {
             connection: Mutex::new(connection),
             path,
             held_history: std::sync::atomic::AtomicBool::new(false),
+            tombstones_pruned: std::sync::atomic::AtomicU8::new(PRUNED_NONE),
         };
         // Older projections may have registrations but no withdrawal outbox yet. Backfill
         // only those rows; ordinary roots with no registration history remain write-free.
@@ -865,7 +875,35 @@ impl LateResultsStore {
     /// A tombstone is durable before WAL removal. Reuse the surviving registration snapshot
     /// for backfill, and inspect the outbox only after an existing registration/feed read
     /// has proved history. An ordinary root performs no additional schema lookup.
+    ///
+    /// The walk, one file read per registration and withdrawal, runs once per process: it
+    /// catches a deletion that a crash interrupted after its tombstone was written and before
+    /// the deletion completed. A deletion this
+    /// process makes removes the lineage's rows itself as it completes
+    /// (`remove_retained_lineage`), so later calls only read the rows.
+    ///
+    /// Withdrawals are walked only once a read has proved held history, so a walk made before
+    /// that runs again, once, when the history appears.
     pub(crate) fn prune_tombstoned(&self) -> Result<Vec<RegistrationRow>, String> {
+        let needed = if self.has_held_history() {
+            PRUNED_WITH_WITHDRAWALS
+        } else {
+            PRUNED_REGISTRATIONS
+        };
+        if self
+            .tombstones_pruned
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= needed
+        {
+            return self.unpruned_registration_rows();
+        }
+        let rows = self.prune_tombstones_now()?;
+        self.tombstones_pruned
+            .fetch_max(needed, std::sync::atomic::Ordering::AcqRel);
+        Ok(rows)
+    }
+
+    fn prune_tombstones_now(&self) -> Result<Vec<RegistrationRow>, String> {
         let root = self.path.parent().ok_or("intake store has no state root")?;
         let wal = broca_core::FileWalStore::new(root.join("wal"));
         let mut rows = self.unpruned_registration_rows()?;
@@ -1010,6 +1048,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // A tombstone retention never completed is found by the next process: the walk runs
+        // once per process, and this process's own deletions remove their rows as they complete.
+        drop(store);
+        let store = std::sync::Arc::new(LateResultsStore::open(&path).unwrap());
+        // As at startup, the runtime's snapshot finds the held history before recovery runs.
+        store.recovery_snapshot().unwrap();
+        assert!(store.has_held_history());
         let service = crate::held_withdrawals::HeldWithdrawals::new(
             store.clone(),
             wal,
