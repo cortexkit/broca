@@ -109,7 +109,7 @@ pub fn restore(
             Record::View(view) => WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
                 version: view.version,
                 checksum: view.checksum.clone(),
-                edits: serde_json::from_value(view.edits.clone())
+                edits: serde_json::from_value(view.edits.clone().parse())
                     .map_err(|error| format!("a stored compaction view's edits: {error}"))?,
                 built_through: view.built_through.clone(),
                 new_signed: view.new_signed.clone(),
@@ -748,7 +748,7 @@ pub fn view_record(
     Ok(Record::View(View {
         version: sealed.version,
         checksum: sealed.checksum.to_string(),
-        edits,
+        edits: edits.into(),
         built_through: sealed.built_through.clone(),
         new_signed: sealed.new_signed.clone(),
         applied_by: applied_by.map(str::to_owned),

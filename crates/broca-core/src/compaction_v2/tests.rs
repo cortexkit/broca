@@ -100,7 +100,7 @@ fn call() -> Message {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call".into()),
                 tool_name: "read".into(),
-                input: json!({"path":"a"}),
+                input: json!({"path":"a"}).into(),
                 thought_signature: Some("thought".into()),
             }),
         ],
@@ -177,7 +177,7 @@ fn rides_after_results_are_held_beside_the_tool_message() {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId(id.into()),
             tool_name: "read".into(),
-            input: json!({ "path": path }),
+            input: json!({ "path": path }).into(),
             thought_signature: None,
         })
     };
@@ -334,7 +334,7 @@ fn compaction_v2_entries_merge_results_without_merging_delivered_text() {
         text(Role::User, "question"),
         call(),
         result(ToolOutput::Json {
-            value: json!({"z":2,"a":1}),
+            value: json!({"z":2,"a":1}).into(),
         }),
     ];
     let delivered = Delivered::new("ck-mc", "remember").with_template("reminder");
@@ -504,7 +504,7 @@ fn compaction_v2_render_keeps_provider_blocks_and_applies_delivered_after_output
         text(Role::User, "question"),
         call(),
         result(ToolOutput::Json {
-            value: json!({"a":1}),
+            value: json!({"a":1}).into(),
         }),
     ];
     // The signed call is kept unchanged; only its result's unsigned text is numbered.
@@ -2272,7 +2272,7 @@ fn compaction_v2_storage_bad_reference_and_checksum_refuse_by_name() {
 fn compaction_v2_every_final_result_kind_is_a_delivery_carrier() {
     for output in [
         ToolOutput::Json {
-            value: json!({"a":1}),
+            value: json!({"a":1}).into(),
         },
         ToolOutput::Denied {
             reason: "no".into(),
@@ -2299,7 +2299,9 @@ fn compaction_v2_every_final_result_kind_is_a_delivery_carrier() {
     }
     let json = ToolResult {
         tool_call_id: ToolCallId("json".into()),
-        output: ToolOutput::Json { value: json!(1) },
+        output: ToolOutput::Json {
+            value: json!(1).into(),
+        },
         is_error: false,
     };
     assert_eq!(

@@ -112,8 +112,9 @@ pub(crate) async fn request<W: Writer>(
             }
             _ => None,
         })
-        .and_then(|fallback| fallback.get("route"))
-        .map(|route| serde_json::from_value::<broca_wal::StepRoute>(route.clone()))
+        .map(broca_protocol::json::Json::parse)
+        .and_then(|fallback| fallback.get("route").cloned())
+        .map(serde_json::from_value::<broca_wal::StepRoute>)
         .transpose()
         .map_err(|error| format!("the recorded step's route: {error}"))?;
     if let Some(route) = &route {

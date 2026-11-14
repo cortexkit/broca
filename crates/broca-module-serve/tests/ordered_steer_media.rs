@@ -78,7 +78,7 @@ impl Provider for Model {
                         content: vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
                             tool_call_id: broca_protocol::ToolCallId("work-call".into()),
                             tool_name: "work".into(),
-                            input: json!({}),
+                            input: json!({}).into(),
                             thought_signature: None,
                         })],
                     },

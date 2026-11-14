@@ -771,7 +771,7 @@ mod tests {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId(id.into()),
             tool_name: name.into(),
-            input: serde_json::Value::Null,
+            input: serde_json::Value::Null.into(),
             thought_signature: None,
         })
     }
@@ -856,7 +856,8 @@ mod tests {
                     input: serde_json::json!({
                         "query": "crab 🦀",
                         "nested": { "items": [1, true, null, "é"] }
-                    }),
+                    })
+                    .into(),
                     thought_signature: None,
                 })],
             ),
@@ -952,7 +953,7 @@ mod tests {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: name.into(),
-                    input: serde_json::Value::Null,
+                    input: serde_json::Value::Null.into(),
                     thought_signature: None,
                 })
             };
@@ -1158,7 +1159,7 @@ mod tests {
                 vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("interrupted".into()),
                     tool_name: "work".into(),
-                    input: serde_json::Value::Null,
+                    input: serde_json::Value::Null.into(),
                     thought_signature: None,
                 })],
             ),

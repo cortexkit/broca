@@ -665,7 +665,7 @@ fn frozen_profiles_leave_text_only_request_bytes_unchanged_in_every_family() {
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("text-call".into()),
                 tool_name: "inspect".into(),
-                input: json!({}),
+                input: json!({}).into(),
                 thought_signature: None,
             })],
         ),

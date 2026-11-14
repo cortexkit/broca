@@ -6818,7 +6818,7 @@ mod tests {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("historic-call".into()),
                         tool_name: "historical tool/name".into(),
-                        input: serde_json::json!({"nested": {"retained": true}}),
+                        input: serde_json::json!({"nested": {"retained": true}}).into(),
                         thought_signature: Some("call-signature".into()),
                     }),
                 ],

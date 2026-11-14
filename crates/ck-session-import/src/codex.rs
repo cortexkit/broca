@@ -484,7 +484,7 @@ fn convert_response_item(
             let block = ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(call_id.to_string()),
                 tool_name: tool_name.to_string(),
-                input,
+                input: input.into(),
                 thought_signature: None,
             });
             conversion.batch.push(
@@ -499,7 +499,9 @@ fn convert_response_item(
             let output = item.get("output").cloned().unwrap_or(Value::Null);
             let output = match output {
                 Value::String(text) => ToolOutput::Text { text },
-                value => ToolOutput::Json { value },
+                value => ToolOutput::Json {
+                    value: value.into(),
+                },
             };
             conversion.batch.push(
                 messages,
@@ -785,7 +787,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(call.tool_name, "read_scrubbed");
-        assert_eq!(call.input["path"], "/tmp/example.txt");
+        assert_eq!(call.input.parse()["path"], "/tmp/example.txt");
         assert!(call.thought_signature.is_none());
 
         let tool = imported
@@ -921,7 +923,7 @@ mod tests {
                 ContentBlock::ToolCall(call) => Some((
                     call.tool_call_id.0.as_str(),
                     call.tool_name.as_str(),
-                    call.input["value"].as_i64(),
+                    call.input.parse()["value"].as_i64(),
                 )),
                 _ => None,
             })

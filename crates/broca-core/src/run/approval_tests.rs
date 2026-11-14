@@ -2660,7 +2660,7 @@ struct DenyMutatedInput {
 #[async_trait::async_trait]
 impl ApprovalPolicy for DenyMutatedInput {
     async fn decide(&self, call: &ToolCall) -> ApprovalResponse {
-        self.seen.lock().unwrap().push(call.input.clone());
+        self.seen.lock().unwrap().push(call.input.clone().parse());
         if call.input == json!({"f":"denied"}) {
             ApprovalResponse::Deny {
                 tool_call_id: call.tool_call_id.clone(),

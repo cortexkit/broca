@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::today::{
     self, fill_manifest, finish_manifest, hex, json, members, model_step_finished, set,
+    text_members,
 };
 use broca_protocol::content::Message;
 use broca_session_store::codec::Digest;
@@ -41,8 +42,8 @@ fn part_value(parts: &BTreeMap<Digest, Vec<u8>>, part: &PartRef) -> Result<Value
 }
 
 fn model_attempt(attempt: &Attempt) -> Result<Value, String> {
-    let mut object = members(attempt.telemetry.as_ref())?;
-    object.extend(members(attempt.billing.as_ref())?);
+    let mut object = text_members(attempt.telemetry.as_ref())?;
+    object.extend(text_members(attempt.billing.as_ref())?);
     object.insert("type".into(), json("model_attempt_finished"));
     object.insert("step_id".into(), json(attempt.step_id));
     object.insert("attempt".into(), json(attempt.attempt));
@@ -89,9 +90,13 @@ fn tool_intent(intent: &ToolIntent, calls: &HashMap<String, Value>) -> Value {
     let args = intent
         .args
         .clone()
-        .or_else(|| calls.get(&intent.tool_call_id.0).cloned())
-        .unwrap_or(Value::Null);
-    object.insert("args".into(), args);
+        .or_else(|| {
+            calls
+                .get(&intent.tool_call_id.0)
+                .map(broca_protocol::json::Json::from)
+        })
+        .unwrap_or_default();
+    object.insert("args".into(), args.parse());
     set(&mut object, "tool_name", intent.tool_name.as_ref());
     set(&mut object, "module_id", intent.module_id.as_ref());
     // A key the converter derived wasn't in today's record.
@@ -126,7 +131,7 @@ fn tool_terminal(reply: &ToolReply, outcome: &ToolOutcome) -> Result<Value, Stri
         set(&mut object, "tags", reply.tags_v1.as_ref());
         return Ok(Value::Object(object));
     }
-    let mut object = members(outcome.detail.as_ref())?;
+    let mut object = text_members(outcome.detail.as_ref())?;
     object.insert("type".into(), json("tool_result"));
     object.insert("result".into(), json(&reply.result));
     let name = match outcome.outcome {
@@ -149,7 +154,7 @@ fn queued(
     send: &QueuedSend,
     parts: &dyn Fn(&PartRef) -> Result<Value, String>,
 ) -> Result<Value, String> {
-    let mut object = members(send.receipt.as_ref())?;
+    let mut object = text_members(send.receipt.as_ref())?;
     object.insert("type".into(), json("queued"));
     object.insert("submission_id".into(), json(&send.submission_id));
     set(&mut object, "send_id", send.send_id.as_ref());
@@ -157,7 +162,7 @@ fn queued(
     set(&mut object, "ts_ms", send.ts_ms);
     set(&mut object, "delivery", send.delivery.as_ref());
     set(&mut object, "message_marks", send.message_marks.as_ref());
-    let mut request = members(send.request.as_ref())?;
+    let mut request = text_members(send.request.as_ref())?;
     request.insert("input".into(), json(&send.input));
     for part in &send.setup {
         if part.kind == PartKind::Tools {
@@ -243,7 +248,7 @@ fn steered(steer: &Steer, claimed: &[&Record]) -> Result<Value, String> {
         "steered",
     )?;
     check_copies(&claimed.inputs, &steer.input, "steered")?;
-    let mut object = members(steer.receipt.as_ref())?;
+    let mut object = text_members(steer.receipt.as_ref())?;
     object.insert("type".into(), json("steered"));
     object.insert("input".into(), json(&steer.input));
     set(&mut object, "written_at_ms", steer.written_at_ms);
@@ -624,8 +629,10 @@ impl Inverse {
                         self.calls.clear();
                         for block in &assistant.message.content {
                             if let broca_protocol::content::ContentBlock::ToolCall(call) = block {
-                                self.calls
-                                    .insert(call.tool_call_id.0.clone(), call.input.clone());
+                                self.calls.insert(
+                                    call.tool_call_id.0.clone(),
+                                    call.input.clone().parse(),
+                                );
                             }
                         }
                     }
@@ -633,7 +640,7 @@ impl Inverse {
                 }
                 Record::Compaction(compaction) => {
                     unclaimed(&self.pending, "a compaction boundary")?;
-                    let mut object = members(Some(&compaction.body))?;
+                    let mut object = members(Some(&(compaction.body).parse()))?;
                     let name = match compaction.version {
                         1 => "compaction_message",
                         other => {
@@ -844,7 +851,7 @@ impl Inverse {
                 object.insert("type".into(), json("compaction_view_v2"));
                 object.insert("version".into(), json(view.version));
                 object.insert("checksum".into(), json(&view.checksum));
-                object.insert("edits".into(), view.edits.clone());
+                object.insert("edits".into(), view.edits.clone().parse());
                 set(&mut object, "built_through", view.built_through.as_ref());
                 set(&mut object, "new_signed", view.new_signed.as_ref());
                 set(&mut object, "applied_by", view.applied_by.as_ref());

@@ -350,7 +350,7 @@ mod tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("call-1".into()),
                     tool_name: wire,
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 })],
             },

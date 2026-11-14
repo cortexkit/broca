@@ -22,7 +22,7 @@ fn request() -> CallOptions {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("call_1".into()),
             tool_name: "read".into(),
-            input: json!({"path":"a"}),
+            input: json!({"path":"a"}).into(),
             thought_signature: None,
         }),
         ContentBlock::Text {
@@ -48,7 +48,7 @@ fn tool_call_only_request() -> CallOptions {
     let mut content = vec![ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId("call_1".into()),
         tool_name: "read".into(),
-        input: json!({"path":"a"}),
+        input: json!({"path":"a"}).into(),
         thought_signature: None,
     })];
     let before = content.clone();

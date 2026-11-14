@@ -186,7 +186,7 @@ fn message(step: u64, tool: bool) -> AssistantMessage {
             thought_signature: None,
             tool_call_id: ToolCallId(format!("call-{step}")),
             tool_name: "read".into(),
-            input: json!({"path": "src/main.rs"}),
+            input: json!({"path": "src/main.rs"}).into(),
         }));
     }
     AssistantMessage {
@@ -959,13 +959,15 @@ impl Ran {
 
     /// The error the run ended with, as its end records it.
     fn end_error(&self) -> Value {
-        self.records
+        (self
+            .records
             .iter()
             .find_map(|(_, record)| match record {
                 Record::RunEnd(end) => end.error.clone(),
                 _ => None,
             })
-            .expect("the run ended with an error")
+            .expect("the run ended with an error"))
+        .parse()
     }
 
     fn auth_refreezes(&self) -> Vec<broca_wal::AuthSelection> {

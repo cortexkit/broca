@@ -316,7 +316,11 @@ pub fn project(
                     let mut tool = ToolPart::new(
                         call.tool_call_id.0.as_str(),
                         &call.tool_name,
-                        &call.input,
+                        // The entry shares the message's text rather than copying it.
+                        cortexkit_role_compaction::part::ToolInput::from_text(
+                            call.input.shared_text(),
+                        )
+                        .expect("canonical JSON text is one JSON value"),
                         ToolStatus::Running,
                     );
                     if let Some(result) = results

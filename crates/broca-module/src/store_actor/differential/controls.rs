@@ -693,11 +693,10 @@ impl Ended {
 
     /// The same, from the store session, whose records keep them in their receipts.
     async fn store_send_hooks(&self) -> Vec<(&'static str, Value)> {
-        let hooks = |receipt: &Option<Value>| {
+        let hooks = |receipt: &Option<broca_protocol::json::Json>| {
             receipt
                 .as_ref()
-                .and_then(|receipt| receipt.get("hooks"))
-                .cloned()
+                .and_then(|receipt| receipt.parse().get("hooks").cloned())
                 .unwrap_or(Value::Null)
         };
         self.store_records()
@@ -1359,7 +1358,7 @@ async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
             thought_signature: None,
             tool_call_id: ToolCallId("c1".into()),
             tool_name: "read".into(),
-            input: json!({ "n": n }),
+            input: json!({ "n": n }).into(),
         })
     };
     let repeated = vec![

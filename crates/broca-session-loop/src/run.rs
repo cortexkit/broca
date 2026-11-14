@@ -1077,8 +1077,11 @@ async fn close_interrupted<W: Writer, P, T>(
     let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
     if let Some((error, resumed)) = refused {
         if let Record::RunEnd(end) = &mut end {
-            end.error =
-                Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+            end.error = Some(
+                serde_json::to_value(error)
+                    .map_err(|e| LoopError::Parts(e.to_string()))?
+                    .into(),
+            );
         }
         records.push(Record::Resumed(resumed));
     }
@@ -1244,7 +1247,8 @@ where
         if cause == SealCause::CrashOrphan {
             end.error = Some(
                 serde_json::to_value(broca_core::seal::crash_orphan_error())
-                    .map_err(|e| LoopError::Parts(e.to_string()))?,
+                    .map_err(|e| LoopError::Parts(e.to_string()))?
+                    .into(),
             );
         }
     }
@@ -1385,7 +1389,7 @@ fn known_calls<W: Writer>(writer: &W) -> Vec<Known> {
         .map(|position| Known {
             id: batch.id(position).clone(),
             key: batch.key(position).map(str::to_owned),
-            args: batch.args(position).cloned(),
+            args: batch.args(position).map(broca_protocol::json::Json::parse),
             held: batch.held_reply(position).map(|held| ProviderHeldReply {
                 tool_call_id: held.tool_call_id.clone(),
                 call_key: held.call_key.clone(),
@@ -3259,7 +3263,8 @@ where
                 if let Record::RunEnd(end) = &mut record {
                     end.error = Some(
                         serde_json::to_value(&*error)
-                            .map_err(|e| LoopError::Parts(e.to_string()))?,
+                            .map_err(|e| LoopError::Parts(e.to_string()))?
+                            .into(),
                     );
                     // The failed step wrote no end of its own, so its retries count here.
                     end.retries_used = end.retries_used.saturating_add(retries);
@@ -3383,8 +3388,8 @@ where
                         service_tier_used: step.served.service_tier_used.clone(),
                         speed_used: step.served.speed_used.clone(),
                         call_count: calls.len() as u32,
-                        fallback: step.served.members(refusal)?,
-                        hooks: step_hooks,
+                        fallback: (step.served.members(refusal)?).map(Into::into),
+                        hooks: (step_hooks).map(Into::into),
                         budget_finalize: finalizing.then_some(true),
                         // As the converter fills it from today's record: what the iterations
                         // add up to, when that differs from the recorded usage.
@@ -4754,7 +4759,7 @@ where
     let mut calls = calls.to_vec();
     for call in &mut calls {
         if let Some(args) = known_of(call).and_then(|known| known.args.clone()) {
-            call.input = args;
+            call.input = args.into();
         }
     }
     let plans = plan_calls(
@@ -4782,7 +4787,9 @@ where
                     .find(|other| other.tool_call_id == call.tool_call_id)
                     .map(|other| &other.input);
                 Some((
-                    canonical(&call.input).map_err(LoopError::Parts)?.1,
+                    canonical(&(call.input).parse())
+                        .map_err(LoopError::Parts)?
+                        .1,
                     (last != Some(&call.input)).then(|| call.input.clone()),
                     seams.tools.dispatch_target(&ctx, &call.tool_call_id),
                     seams
@@ -4842,10 +4849,11 @@ where
                                 call_key: Some(format!("{session}:{seq}")),
                                 approval_digest: None,
                                 dispatched_at_ms: Some(now),
-                                schema_pin: schema_pin.as_ref().map(|pin| {
+                                schema_pin: (schema_pin.as_ref().map(|pin| {
                                     serde_json::to_value(pin).expect("a pin serializes")
-                                }),
-                                hooks: hooks.clone(),
+                                }))
+                                .map(Into::into),
+                                hooks: (hooks.clone()).map(Into::into),
                                 key_derived: None,
                             }));
                         }
@@ -5027,7 +5035,7 @@ where
                         Some(now),
                     );
                     if let Some(Record::ToolOutcome(outcome)) = records.last_mut() {
-                        outcome.hooks = answer.hooks;
+                        outcome.hooks = (answer.hooks).map(Into::into);
                     }
                 }
             }
@@ -5171,7 +5179,7 @@ async fn gate_hooked(
     let mut trace = Trace::default();
     let metadata = |trace: &Trace, input: &Value, intentless: bool| {
         trace
-            .metadata(original.clone(), input.clone(), intentless)
+            .metadata(original.clone().parse(), input.clone(), intentless)
             .map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes"))
     };
     if let Some(runtime) = hooks {
@@ -5189,7 +5197,7 @@ async fn gate_hooked(
             ));
         }
         if let Subject::PreTool { input, .. } = output.subject {
-            call.input = input;
+            call.input = input.into();
         }
         if let Some((provider, text, unavailable)) = output.refusal {
             return Ok(hook_refused(
@@ -5207,16 +5215,16 @@ async fn gate_hooked(
             NoDispatchReason::ValidationFailed {
                 detail: invalid.to_string(),
             },
-            metadata(&trace, &call.input, true),
+            metadata(&trace, &(call.input).parse(), true),
         ));
     }
     match approval.decide(call).await {
         ApprovalResponse::Allow { .. } => {}
-        ApprovalResponse::AllowNarrowed { input, .. } => call.input = input,
+        ApprovalResponse::AllowNarrowed { input, .. } => call.input = input.into(),
         ApprovalResponse::Deny { reason, .. } => {
             return Ok(CallPlan::NoDispatch(
                 NoDispatchReason::Denied { reason },
-                metadata(&trace, &call.input, true),
+                metadata(&trace, &(call.input).parse(), true),
             ));
         }
     }
@@ -5245,7 +5253,11 @@ async fn gate_hooked(
             ));
         }
     }
-    Ok(CallPlan::Dispatch(metadata(&trace, &call.input, false)))
+    Ok(CallPlan::Dispatch(metadata(
+        &trace,
+        &(call.input).parse(),
+        false,
+    )))
 }
 
 /// The plan for a call a pre-tool hook refused: today's refusal result and reason code.
@@ -5262,7 +5274,7 @@ fn hook_refused(
     CallPlan::HookTerminal {
         result,
         reason: reason.into(),
-        hooks: metadata(trace, &call.input, true),
+        hooks: metadata(trace, &(call.input).parse(), true),
     }
 }
 
@@ -5407,8 +5419,8 @@ fn no_dispatch(
         is_error,
         reason: None,
         finished_at_ms: Some(now),
-        detail: serde_json::to_value(reason).ok(),
-        hooks,
+        detail: (serde_json::to_value(reason).ok()).map(Into::into),
+        hooks: hooks.map(Into::into),
         // Minted by the entry-facts writer, which knows the seq this record takes.
         call_key: None,
     }));
@@ -5435,7 +5447,7 @@ fn hook_terminal(
         Some(now),
     );
     if let Some(Record::ToolOutcome(outcome)) = records.last_mut() {
-        outcome.hooks = hooks;
+        outcome.hooks = (hooks).map(Into::into);
     }
 }
 
@@ -5705,7 +5717,11 @@ pub async fn end_run_with_error_and_interrupt_reason<W: Writer>(
 ) -> Result<Finished, LoopError> {
     let mut record = run_end(writer, run_id, reason, now_ms);
     if let Record::RunEnd(end) = &mut record {
-        end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+        end.error = Some(
+            serde_json::to_value(error)
+                .map_err(|e| LoopError::Parts(e.to_string()))?
+                .into(),
+        );
         end.interrupt_reason = interrupt_reason;
     }
     append_end(writer, run_id, vec![record]).await?;
@@ -5739,7 +5755,11 @@ pub async fn end_restart_resume_refused<W: Writer>(
     let mut record = run_end(writer, run_id, RunFinishReason::Interrupted, now_ms);
     if let Record::RunEnd(end) = &mut record {
         end.interrupt_reason = Some("runner_crash".into());
-        end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+        end.error = Some(
+            serde_json::to_value(error)
+                .map_err(|e| LoopError::Parts(e.to_string()))?
+                .into(),
+        );
     }
     append_end(writer, run_id, vec![record]).await?;
     Ok(finished(writer, RunFinishReason::Interrupted))
@@ -5880,7 +5900,13 @@ async fn submitted<W: Writer, P, T>(
     let now = (seams.now_ms)();
     let mut records = vec![structured_result(
         run_id,
-        broca_protocol::structured_output::result(frozen, true, Some(&submit.input), None, skipped),
+        broca_protocol::structured_output::result(
+            frozen,
+            true,
+            Some(&(submit.input).parse()),
+            None,
+            skipped,
+        ),
     )];
     if !started {
         records.push(Record::BatchStart(BatchStart {
@@ -6157,12 +6183,11 @@ async fn ordered_sends<W: Writer>(
             Record::DeliveryOrdered(ordered) => ordered.sent_by.as_ref(),
             _ => None,
         }))?;
-        let receipt = |name: &str| {
-            queued
-                .receipt
-                .as_ref()
-                .and_then(|receipt| receipt.get(name))
-        };
+        let receipt_value = queued
+            .receipt
+            .as_ref()
+            .map(broca_protocol::json::Json::parse);
+        let receipt = |name: &str| receipt_value.as_ref().and_then(|receipt| receipt.get(name));
         let queued_by = principal(receipt("sent_by"))?;
         let queued_as = principal(receipt("principal"))?;
         // A ride names the module its queued record says sent it, as today's ride ledger reads
@@ -6188,9 +6213,8 @@ async fn ordered_sends<W: Writer>(
         let hooked = queued
             .receipt
             .as_ref()
-            .and_then(|receipt| receipt.get("hooks"))
-            .and_then(|hooks| hooks.get("final_value"))
-            .cloned()
+            .map(broca_protocol::json::Json::parse)
+            .and_then(|receipt| receipt.get("hooks")?.get("final_value").cloned())
             .and_then(|value| serde_json::from_value::<Vec<Message>>(value).ok());
         let input = hooked
             .unwrap_or_else(|| queued.input.clone())
@@ -6945,7 +6969,8 @@ async fn compaction_unavailable<W: Writer, P, T>(
     if let Record::RunEnd(end) = &mut record {
         end.error = Some(
             serde_json::to_value(crate::compaction::unavailable_error(message))
-                .map_err(|e| LoopError::Parts(e.to_string()))?,
+                .map_err(|e| LoopError::Parts(e.to_string()))?
+                .into(),
         );
     }
     append_end(writer, &admission.run_id, vec![record]).await?;
@@ -7224,10 +7249,11 @@ async fn pause<W: Writer, P, T>(
                 .as_ref()
                 .map_or_else(|| (seams.now_ms)(), |pause| pause.paused_at_ms),
         ),
-        error,
-        account_limit: account_limit
+        error: error.map(Into::into),
+        account_limit: (account_limit
             .map(|pause| serde_json::to_value(pause).map_err(|e| LoopError::Parts(e.to_string())))
-            .transpose()?,
+            .transpose()?)
+        .map(Into::into),
     }));
     let owned_run_id = run_id.to_string();
     let batch = writer
@@ -7409,14 +7435,15 @@ fn attempt_record(
         last_content_at_ms: attempt.content_progress.last_content_at_ms,
         transport: attempt.transport.clone(),
         served_account_ref: attempt.served_account_ref.clone(),
-        billing: disposition
+        billing: (disposition
             .map(|disposition| {
                 serde_json::to_value(disposition)
                     .map(|disposition| json!({ "account_limit_disposition": disposition }))
             })
             .transpose()
-            .map_err(|e| invalid(&e.to_string()))?,
-        telemetry,
+            .map_err(|e| invalid(&e.to_string()))?)
+        .map(Into::into),
+        telemetry: telemetry.map(Into::into),
         reached_cache: reached.then_some(true),
         requested_cache_ttl_ms: requested_ttl_ms.filter(|_| reached),
     }))

@@ -66,7 +66,7 @@ fn tool_step(id: &str, name: &str, input: Value) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: name.into(),
-                    input,
+                    input: input.into(),
                 })],
             },
         }),

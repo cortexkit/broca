@@ -243,10 +243,10 @@ pub fn rows(
                     "outcome":serde_json::to_value(reason).map_err(|_| "cannot encode no-dispatch reason")?["kind"]});
                 if let Some((name, args)) = plan {
                     if transcript {
-                        row["arguments"] = args.clone();
+                        row["arguments"] = args.clone().parse();
                     }
                     if name == "bash" || name.ends_with(".bash") {
-                        bash_fields(&mut row, args);
+                        bash_fields(&mut row, &(*args).parse());
                     }
                 }
                 rows.push(row);

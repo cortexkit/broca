@@ -2004,7 +2004,7 @@ mod tests {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("a".into()),
                         tool_name: "ask".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                         thought_signature: None,
                     })],
                 }),
@@ -2221,7 +2221,7 @@ mod tests {
                 .push(ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("b".into()),
                     tool_name: "ask".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 }));
         }
@@ -2545,7 +2545,7 @@ mod tests {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(format!("call-{index}")),
                         tool_name: "ask".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                         thought_signature: None,
                     })
                 })
@@ -4782,7 +4782,7 @@ mod tests {
                 let call = broca_protocol::ToolCall {
                     tool_call_id: ToolCallId("a".into()),
                     tool_name: "ask".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 };
                 let reply = broca_core::tool_plane::ProviderHeldReply {

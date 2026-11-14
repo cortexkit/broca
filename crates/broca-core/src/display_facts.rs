@@ -668,7 +668,7 @@ mod tests {
             },
             ToolOutput::error("failed"),
             ToolOutput::Json {
-                value: json!({"answer":42}),
+                value: json!({"answer":42}).into(),
             },
             ToolOutput::Parts {
                 parts: vec![ToolOutputPart::Text {

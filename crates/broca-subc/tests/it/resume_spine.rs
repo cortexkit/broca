@@ -114,7 +114,7 @@ fn tool_step(message_id: &str, tool_call_id: &str, input: Value) -> Vec<Normaliz
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(tool_call_id.into()),
                     tool_name: TOOL_NAME.into(),
-                    input,
+                    input: input.into(),
                     thought_signature: None,
                 })],
             },

@@ -257,7 +257,7 @@ mod tests {
             step(ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("t1".into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             })),
             batch_started(),

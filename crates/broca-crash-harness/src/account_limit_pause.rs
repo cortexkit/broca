@@ -87,7 +87,7 @@ fn script(tool: bool) -> Vec<NormalizedEvent> {
                         thought_signature: None,
                         tool_call_id: ToolCallId("once".into()),
                         tool_name: "edit".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                     })]
                 } else {
                     vec![ContentBlock::Text {

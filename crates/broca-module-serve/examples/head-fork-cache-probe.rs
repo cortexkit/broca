@@ -249,7 +249,8 @@ fn head_options(corpus: &Corpus, result_bytes: usize) -> CallOptions {
                 tool_call_id: id.clone(),
                 tool_name: catalog[call_index % catalog.len()].name.clone(),
                 input: json!({"path":"reference.md", "query":"contract", "start_line":1,
-                    "max_lines":400, "case_sensitive":false, "format":"markdown"}),
+                    "max_lines":400, "case_sensitive":false, "format":"markdown"})
+                .into(),
             }));
             let bytes = result_bytes / 45 + usize::from(call_index < result_bytes % 45);
             results.push(ContentBlock::ToolResult(ToolResult {

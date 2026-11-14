@@ -893,6 +893,28 @@ impl Value for serde_json::Value {
     }
 }
 
+/// A JSON value held as its text ([`broca_protocol::json::Json`]), stored as that text. It is
+/// the same compact text `serde_json::Value` is stored as, so the two encode a value to the same
+/// bytes, and decoding applies the same check before keeping the text as it was read.
+impl Value for broca_protocol::json::Json {
+    const WIRE: Wire = Wire::Len;
+    const NAME: &'static str = "json";
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.text().as_bytes());
+    }
+    fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
+        let bytes = len_payload(raw, Self::NAME)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| DecodeError::new(Self::NAME, DecodeErrorKind::BadJson(e.to_string())))?;
+        Self::from_canonical_text(text).ok_or_else(|| {
+            DecodeError::new(
+                Self::NAME,
+                DecodeErrorKind::BadValue("JSON text other than its compact form"),
+            )
+        })
+    }
+}
+
 /// A writer that accepts exactly the bytes it was made with, in order, and fails at the first
 /// byte that differs, so text can be compared with what serializing writes without a copy.
 struct Matches<'a>(&'a [u8]);

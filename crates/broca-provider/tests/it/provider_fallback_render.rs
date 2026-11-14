@@ -41,7 +41,7 @@ fn prompt(with_handoff: bool) -> CallOptions {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("call_1".into()),
             tool_name: "lookup".into(),
-            input: serde_json::json!({"id": 1}),
+            input: serde_json::json!({"id": 1}).into(),
             thought_signature: None,
         }),
     ];

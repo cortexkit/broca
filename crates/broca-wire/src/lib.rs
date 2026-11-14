@@ -5604,7 +5604,7 @@ mod tests {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("call-1".into()),
                         tool_name: "search".into(),
-                        input: serde_json::json!({"query": "borrowed serialization"}),
+                        input: serde_json::json!({"query": "borrowed serialization"}).into(),
                         thought_signature: None,
                     }),
                 ],
@@ -6689,7 +6689,7 @@ mod caller_message_tests {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call".into()),
                 tool_name: "work".into(),
-                input: json!({"large":payload}),
+                input: json!({"large":payload}).into(),
                 thought_signature: None,
             }),
             ContentBlock::ToolResult(ToolResult {
@@ -6875,11 +6875,16 @@ mod caller_message_tests {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: broca_protocol::ToolCallId("c".into()),
                 tool_name: "t".into(),
-                input: json!({"a": 1}),
+                input: json!({"a": 1}).into(),
                 thought_signature: Some("ts".into()),
             }),
             result("c", ToolOutput::Text { text: "out".into() }),
-            result("d", ToolOutput::Json { value: json!({}) }),
+            result(
+                "d",
+                ToolOutput::Json {
+                    value: json!({}).into(),
+                },
+            ),
             result("e", ToolOutput::error("no")),
             result(
                 "f",

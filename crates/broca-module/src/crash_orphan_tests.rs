@@ -474,7 +474,7 @@ fn model_step_with_tool_call() -> WalRecord {
                 thought_signature: None,
                 tool_call_id: ToolCallId(CALL.into()),
                 tool_name: "edit".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
             })],
         }
         .into(),

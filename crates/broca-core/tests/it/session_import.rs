@@ -167,7 +167,7 @@ async fn dangling_import_is_interrupted_then_repaired_and_tool_pairs_are_normali
         vec![ContentBlock::ToolCall(ToolCall {
             tool_call_id: call_id.clone(),
             tool_name: "read".into(),
-            input: serde_json::json!({"path": "x"}),
+            input: serde_json::json!({"path": "x"}).into(),
             thought_signature: None,
         })],
     );
@@ -777,7 +777,7 @@ async fn duplicate_tool_call_ids_are_tracked_as_a_multiset() {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: duplicate_id.clone(),
                     tool_name: name.into(),
-                    input: serde_json::Value::Null,
+                    input: serde_json::Value::Null.into(),
                     thought_signature: None,
                 })
             })

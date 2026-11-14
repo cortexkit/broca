@@ -422,7 +422,7 @@ fn fake_tool_call(name: &str, id: &str) -> ToolCall {
     ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: name.into(),
-        input,
+        input: input.into(),
         thought_signature: None,
     }
 }
@@ -462,7 +462,9 @@ fn append_tool_results(
             Role::Tool,
             vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id: call.tool_call_id.clone(),
-                output: ToolOutput::Json { value },
+                output: ToolOutput::Json {
+                    value: value.into(),
+                },
                 is_error: false,
             })],
         ));
@@ -491,7 +493,9 @@ fn append_dry_run_tool_exchange(
         Role::Tool,
         vec![ContentBlock::ToolResult(ToolResult {
             tool_call_id: call.tool_call_id,
-            output: ToolOutput::Json { value },
+            output: ToolOutput::Json {
+                value: value.into(),
+            },
             is_error: false,
         })],
     ));

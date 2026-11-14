@@ -2988,7 +2988,7 @@ fn seed_owed_question_with_scope_at(
         thought_signature: None,
         tool_call_id: broca_protocol::ToolCallId("c".into()),
         tool_name: "edit".into(),
-        input: serde_json::json!({"marker": MARKER}),
+        input: serde_json::json!({"marker": MARKER}).into(),
     };
     wal.append(
         1,
@@ -4173,7 +4173,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
                             thought_signature: None,
                             tool_call_id: broca_protocol::ToolCallId("c".into()),
                             tool_name: "edit".into(),
-                            input: serde_json::json!({}),
+                            input: serde_json::json!({}).into(),
                         },
                     )],
                 }

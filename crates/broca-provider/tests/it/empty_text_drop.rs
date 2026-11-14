@@ -167,7 +167,7 @@ fn bedrock_drops_empty_text_parts() {
         vec![ContentBlock::ToolCall(ToolCall {
             tool_call_id: tool_call_id.clone(),
             tool_name: "lookup".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         })],
     ));

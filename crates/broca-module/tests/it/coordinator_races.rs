@@ -2209,7 +2209,7 @@ async fn reopened_actor_seals_indeterminate_run_before_draining_new_send() {
                     broca_protocol::ToolCall {
                         tool_call_id: call_id.clone(),
                         tool_name: "edit".into(),
-                        input: serde_json::json!({"path": "file"}),
+                        input: serde_json::json!({"path": "file"}).into(),
                         thought_signature: None,
                     },
                 )],
@@ -4102,7 +4102,7 @@ fn seed_unsealed_run_with_queue(
                 broca_protocol::ToolCall {
                     tool_call_id: call_id.clone(),
                     tool_name: "edit".into(),
-                    input: serde_json::json!({"path": "file"}),
+                    input: serde_json::json!({"path": "file"}).into(),
                     thought_signature: None,
                 },
             )],

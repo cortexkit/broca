@@ -32,7 +32,7 @@ fn call(id: &str, name: &str) -> ToolCall {
     ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: name.into(),
-        input: json!({"n":1e-6}),
+        input: json!({"n":1e-6}).into(),
         thought_signature: None,
     }
 }

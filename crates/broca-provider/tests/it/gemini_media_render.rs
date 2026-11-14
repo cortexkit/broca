@@ -100,7 +100,7 @@ fn with_call(mut opts: CallOptions) -> CallOptions {
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call".into()),
                 tool_name: "screenshot".into(),
-                input: json!({}),
+                input: json!({}).into(),
                 thought_signature: None,
             })],
         ),

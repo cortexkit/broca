@@ -137,7 +137,7 @@ fn step(input: Option<u64>, cached: u64, writes: u64, calls: bool) -> Vec<Normal
                     vec![ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("t".into()),
                         tool_name: "edit".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     })]
                 } else {

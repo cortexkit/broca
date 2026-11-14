@@ -6,7 +6,6 @@
 
 use cortexkit_role_llm_runner::serializer_profile::error_output;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::ids::{MessageId, ToolCallId};
 
@@ -482,7 +481,8 @@ mod fallback_compatibility_tests {
 pub struct ToolCall {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
-    pub input: Value,
+    /// The call's arguments as canonical JSON text (see [`crate::json::Json`]).
+    pub input: crate::json::Json,
     /// Provider-minted signature that must accompany this function call when replayed to
     /// the same model. It is omitted for providers and model versions that do not sign calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,7 +508,7 @@ pub enum ToolOutput {
         text: String,
     },
     Json {
-        value: Value,
+        value: crate::json::Json,
     },
     Parts {
         parts: Vec<ToolOutputPart>,

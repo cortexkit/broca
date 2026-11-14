@@ -429,7 +429,7 @@ fn tool(
     let call = ToolCall {
         tool_call_id: ToolCallId(call_id.clone()),
         tool_name: name.to_owned(),
-        input,
+        input: input.into(),
         thought_signature: None,
     };
     let mut media = Vec::new();

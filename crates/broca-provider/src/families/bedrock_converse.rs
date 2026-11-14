@@ -1581,7 +1581,7 @@ impl BedrockStreamNormalizer {
                     content.push(ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(id),
                         tool_name: name,
-                        input,
+                        input: input.into(),
                         thought_signature: None,
                     }));
                 }
@@ -1873,7 +1873,7 @@ mod tests {
                 vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: tool_call_id.clone(),
                     tool_name: "lookup".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 })],
             ),
@@ -1928,7 +1928,7 @@ mod tests {
                 text: "result".into(),
             },
             ToolOutput::Json {
-                value: json!({ "answer": 42 }),
+                value: json!({ "answer": 42 }).into(),
             },
             ToolOutput::Denied {
                 reason: "policy".into(),

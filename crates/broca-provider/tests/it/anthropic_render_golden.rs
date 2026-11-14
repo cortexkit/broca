@@ -106,7 +106,7 @@ mod gated {
                         thought_signature: None,
                         tool_call_id: ToolCallId("toolu_01".into()),
                         tool_name: "get_time".into(),
-                        input: json!({"timezone": "Europe/Madrid"}),
+                        input: json!({"timezone": "Europe/Madrid"}).into(),
                     }),
                 ],
             },
@@ -413,7 +413,7 @@ mod gated {
                     thought_signature: None,
                     tool_call_id: ToolCallId(format!("toolu_step_{n}")),
                     tool_name: "tick".into(),
-                    input: json!({ "n": n }),
+                    input: json!({ "n": n }).into(),
                 }),
             ],
         }
@@ -771,7 +771,7 @@ mod gated {
                 thought_signature: None,
                 tool_call_id: ToolCallId(format!("toolu_{label}")),
                 tool_name: "tick".into(),
-                input: json!({ "label": label }),
+                input: json!({ "label": label }).into(),
             })
         };
         let result = |label: &str| {

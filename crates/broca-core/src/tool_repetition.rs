@@ -36,7 +36,8 @@ pub(crate) fn result_bytes(output: &ToolOutput) -> Cow<'_, [u8]> {
             Cow::Owned(canonical_json_bytes(&serde_json::Value::Array(identity)))
         }
         ToolOutput::Text { text } => Cow::Borrowed(text.as_bytes()),
-        ToolOutput::Json { value } => Cow::Owned(canonical_json_bytes(value)),
+        // The held text is the value's canonical bytes.
+        ToolOutput::Json { value } => Cow::Borrowed(value.text().as_bytes()),
         ToolOutput::Denied { reason } => Cow::Borrowed(reason.as_bytes()),
         ToolOutput::Error { message, .. } => Cow::Borrowed(message.as_bytes()),
     }
@@ -80,10 +81,10 @@ pub struct CallSignature {
 
 impl CallSignature {
     pub fn of(call: &ToolCall) -> Self {
-        let canonical = canonical_json_bytes(&call.input);
         Self {
             tool_name: call.tool_name.clone(),
-            args_digest: digest(&canonical),
+            // The held text is the input's canonical bytes.
+            args_digest: digest(call.input.text().as_bytes()),
         }
     }
 }
@@ -408,7 +409,7 @@ mod tests {
         ToolCall {
             tool_call_id: broca_protocol::ToolCallId(format!("call-{name}")),
             tool_name: name.to_string(),
-            input,
+            input: input.into(),
             thought_signature: None,
         }
     }
@@ -455,7 +456,7 @@ mod tests {
             // Multipart output had no representation in the legacy model.
             ToolOutput::Parts { .. } => Vec::new(),
             ToolOutput::Text { text } => text.as_bytes().to_vec(),
-            ToolOutput::Json { value } => canonical_json_bytes(value),
+            ToolOutput::Json { value } => value.text().as_bytes().to_vec(),
             ToolOutput::Denied { reason } => reason.as_bytes().to_vec(),
             ToolOutput::Error { message, .. } => message.as_bytes().to_vec(),
         }
@@ -537,7 +538,7 @@ mod tests {
                 text: "text payload".into(),
             },
             ToolOutput::Json {
-                value: json!({"z": 1, "a": [true, false]}),
+                value: json!({"z": 1, "a": [true, false]}).into(),
             },
             ToolOutput::Denied {
                 reason: "policy denied".into(),
@@ -684,7 +685,7 @@ mod prompt_fold_tests {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId(id.to_string()),
             tool_name: name.to_string(),
-            input,
+            input: input.into(),
             thought_signature: None,
         })
     }
@@ -720,7 +721,7 @@ mod prompt_fold_tests {
         let c = ToolCall {
             tool_call_id: ToolCallId("t1".into()),
             tool_name: "read".into(),
-            input: json!({"filePath": "a.rs"}),
+            input: json!({"filePath": "a.rs"}).into(),
             thought_signature: None,
         };
         let mut live = RepetitionObserver::new();
@@ -764,7 +765,7 @@ mod prompt_fold_tests {
         let signature = CallSignature::of(&ToolCall {
             tool_call_id: ToolCallId("t1".into()),
             tool_name: "read".into(),
-            input: json!({"filePath": "a.rs"}),
+            input: json!({"filePath": "a.rs"}).into(),
             thought_signature: None,
         });
         assert_eq!(
@@ -783,26 +784,26 @@ mod prompt_fold_tests {
         let first = ToolCall {
             tool_call_id: ToolCallId("call_0".into()),
             tool_name: "read".into(),
-            input: json!({"filePath": "A"}),
+            input: json!({"filePath": "A"}).into(),
             thought_signature: None,
         };
         let second = ToolCall {
             tool_call_id: ToolCallId("call_0".into()),
             tool_name: "read".into(),
-            input: json!({"filePath": "B"}),
+            input: json!({"filePath": "B"}).into(),
             thought_signature: None,
         };
         let continuation = [
             ToolCall {
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "read".into(),
-                input: json!({"filePath": "C"}),
+                input: json!({"filePath": "C"}).into(),
                 thought_signature: None,
             },
             ToolCall {
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "read".into(),
-                input: json!({"filePath": "D"}),
+                input: json!({"filePath": "D"}).into(),
                 thought_signature: None,
             },
         ];

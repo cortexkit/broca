@@ -56,7 +56,7 @@ fn rich_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_1".into()),
                 tool_name: "a_tool".into(),
-                input: json!({"x": 1}),
+                input: json!({"x": 1}).into(),
             })],
         },
     ]);

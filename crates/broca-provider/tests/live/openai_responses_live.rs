@@ -138,11 +138,8 @@ async fn openai_responses_tool_call_args_accumulate() {
         .into_iter()
         .find(|c| c.tool_name == "read_file")
     {
-        let path = call
-            .input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let input = call.input.parse();
+        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             !path.is_empty(),
             "Responses function_call argument fragments accumulated into a parseable object; got {:?}",

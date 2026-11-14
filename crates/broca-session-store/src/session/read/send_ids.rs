@@ -86,6 +86,8 @@ impl SendIdIndex {
                 let id = steer
                     .receipt
                     .as_ref()
+                    .map(broca_protocol::json::Json::parse)
+                    .as_ref()
                     .and_then(|receipt| receipt.get("send_id"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);

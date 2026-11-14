@@ -272,7 +272,7 @@ fn reads(id: &str, ids: &[&str]) -> Vec<NormalizedEvent> {
                 thought_signature: None,
                 tool_call_id: ToolCallId((*call).into()),
                 tool_name: "read".into(),
-                input: json!({ "n": n }),
+                input: json!({ "n": n }).into(),
             })
         })
         .collect();

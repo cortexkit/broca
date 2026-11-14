@@ -298,7 +298,7 @@ fn dated(attempt: &broca_session_store::record::Attempt) -> bool {
         && !attempt
             .billing
             .as_ref()
-            .is_some_and(|billing| billing["reservation"]["warm"] == true)
+            .is_some_and(|billing| billing.parse()["reservation"]["warm"] == true)
 }
 
 fn damaged(message: String) -> Error {

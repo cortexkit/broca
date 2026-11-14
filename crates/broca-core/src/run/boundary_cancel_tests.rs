@@ -21,13 +21,13 @@ fn step(tool: bool) -> Vec<NormalizedEvent> {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("one".into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             }),
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("two".into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             }),
         ]

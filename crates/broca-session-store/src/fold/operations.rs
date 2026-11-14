@@ -69,7 +69,7 @@ crate::message! {
         6 opt held_reply: crate::record::ToolHeld,
         /// The input its intent recorded when it differs from the model's message (an approval
         /// policy narrowed it); a resume that sends the call again sends this.
-        7 opt args: serde_json::Value,
+        7 opt args: broca_protocol::json::Json,
     }
 }
 
@@ -139,7 +139,7 @@ impl OpenBatch {
 
     /// The input the intent of the planned call at `position` recorded, when it differs from the
     /// model's message.
-    pub fn args(&self, position: usize) -> Option<&serde_json::Value> {
+    pub fn args(&self, position: usize) -> Option<&broca_protocol::json::Json> {
         self.calls[position].args.as_ref()
     }
 
@@ -1545,6 +1545,7 @@ impl Operations {
             Record::QueuedSend(send) => {
                 let ordered =
                     self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
+                let receipt = send.receipt.as_ref().map(broca_protocol::json::Json::parse);
                 let pending = Pending {
                     send_id: Some(
                         send.send_id
@@ -1555,12 +1556,12 @@ impl Operations {
                     interrupt: send.delivery.as_deref() == Some("interrupt"),
                     ordered,
                     sender: receipt_module(
-                        send.receipt.as_ref().and_then(|receipt| {
+                        receipt.as_ref().and_then(|receipt| {
                             receipt.get("sent_by").or(receipt.get("principal"))
                         }),
                     ),
                     request_identity_digest: receipt_string(
-                        send.receipt.as_ref(),
+                        receipt.as_ref(),
                         "request_identity_digest",
                     ),
                     message_marks: send.message_marks.clone(),
@@ -1706,7 +1707,7 @@ impl Operations {
                 let estimate = self.estimate.get_or_insert_with(Estimate::default);
                 estimate.step_model = estimate.run_model.clone();
                 estimate.step_usage = step.usage;
-                estimate.step_fallback = step.fallback.clone();
+                estimate.step_fallback = (step.fallback.clone()).map(|json| json.parse());
                 estimate.stepped = true;
                 estimate.previous_request_bytes = estimate.current_request_bytes;
                 self.last_send_run = Some(step.run_id.clone());
@@ -1720,8 +1721,19 @@ impl Operations {
     fn apply_title(&mut self, record: &Record) {
         let title = match record {
             Record::RunStart(start) => start.title.clone(),
-            Record::QueuedSend(send) => receipt_title(send.receipt.as_ref()),
-            Record::Steer(steer) => receipt_title(steer.receipt.as_ref()),
+            Record::QueuedSend(send) => receipt_title(
+                send.receipt
+                    .as_ref()
+                    .map(broca_protocol::json::Json::parse)
+                    .as_ref(),
+            ),
+            Record::Steer(steer) => receipt_title(
+                steer
+                    .receipt
+                    .as_ref()
+                    .map(broca_protocol::json::Json::parse)
+                    .as_ref(),
+            ),
             _ => None,
         };
         if title.is_some() {
@@ -1735,7 +1747,11 @@ impl Operations {
     /// Today's `OutputReservationHistory::note_served_step` decides the same.
     fn measure_step(&mut self, step: &crate::record::StepEnd) {
         let bytes = self.output_attempt_bytes.take();
-        let fallback = step.fallback.as_ref();
+        let fallback = step
+            .fallback
+            .as_ref()
+            .map(broca_protocol::json::Json::parse);
+        let fallback = fallback.as_ref();
         let routed: Option<broca_protocol::request::ModelHandle> = fallback
             .and_then(|fallback| fallback.get("route"))
             .and_then(|route| route.get("model"))
@@ -1897,10 +1913,11 @@ impl Operations {
             if let Some(next) = step
                 .fallback
                 .as_ref()
-                .and_then(|fallback| fallback.get("refusal_fallback"))
+                .map(broca_protocol::json::Json::parse)
+                .and_then(|fallback| fallback.get("refusal_fallback").cloned())
                 .filter(|next| !next.is_null())
             {
-                self.refusal_schedule = Some(next.clone());
+                self.refusal_schedule = Some(next);
             }
         }
         if let Record::Event(event) = record {
@@ -1935,7 +1952,7 @@ impl Operations {
                     && !attempt
                         .billing
                         .as_ref()
-                        .is_some_and(|billing| billing["reservation"]["warm"] == true) =>
+                        .is_some_and(|billing| billing.parse()["reservation"]["warm"] == true) =>
             {
                 run.step_request = Some(StepRequest {
                     step_id: attempt.step_id,
@@ -2104,7 +2121,7 @@ impl Operations {
                     step_id: warmed.step_id,
                     reached_cache: warmed.reached_cache == Some(true),
                     usage: warmed.usage,
-                    billing: warmed.billing.clone(),
+                    billing: (warmed.billing.clone()).map(|json| json.parse()),
                     ttl_ms: warmed.ttl_ms,
                 });
             }
@@ -2122,28 +2139,31 @@ impl Operations {
                     run.cancel = Some(cancel.at);
                 }
             }
-            Record::Steer(steer) => run.pending_steers.push(PendingInput {
-                send_id: receipt_string(steer.receipt.as_ref(), "send_id"),
-                seq,
-                placement: crate::record::Placement::Steer,
-                messages: steer.input.clone(),
-                written_at_ms: steer.written_at_ms,
-                tags_v1: steer.tags_v1.clone(),
-                submission_id: None,
-                sender: receipt_module(
-                    steer
-                        .receipt
-                        .as_ref()
-                        .and_then(|receipt| receipt.get("sent_by")),
-                ),
-                request_identity_digest: receipt_string(
-                    steer.receipt.as_ref(),
-                    "request_identity_digest",
-                ),
-                media: steer.media.clone(),
-                message_marks: steer.message_marks.clone(),
-                named_speaker: crate::record::marks_name_speaker(steer.message_marks.as_ref()),
-            }),
+            Record::Steer(steer) => {
+                let receipt = steer
+                    .receipt
+                    .as_ref()
+                    .map(broca_protocol::json::Json::parse);
+                run.pending_steers.push(PendingInput {
+                    send_id: receipt_string(receipt.as_ref(), "send_id"),
+                    seq,
+                    placement: crate::record::Placement::Steer,
+                    messages: steer.input.clone(),
+                    written_at_ms: steer.written_at_ms,
+                    tags_v1: steer.tags_v1.clone(),
+                    submission_id: None,
+                    sender: receipt_module(
+                        receipt.as_ref().and_then(|receipt| receipt.get("sent_by")),
+                    ),
+                    request_identity_digest: receipt_string(
+                        receipt.as_ref(),
+                        "request_identity_digest",
+                    ),
+                    media: steer.media.clone(),
+                    message_marks: steer.message_marks.clone(),
+                    named_speaker: crate::record::marks_name_speaker(steer.message_marks.as_ref()),
+                });
+            }
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
                 let (sender, request_identity_digest, message_marks, send_id) =
                     delivered_send.unwrap_or_default();
@@ -2185,14 +2205,14 @@ impl Operations {
                 run.retries_used = end.retries_used;
                 run.pending_steers.clear();
                 run.paused = None;
-                run.end_error = end.error.clone();
+                run.end_error = (end.error.clone()).map(|json| json.parse());
                 run.end_usage = end.usage;
             }
             Record::Pause(pause) => {
-                run.account_limit_pause = pause.account_limit.clone();
+                run.account_limit_pause = (pause.account_limit.clone()).map(|json| json.parse());
                 run.paused = Some(pause.reason);
                 run.finished = None;
-                run.end_error = pause.error.clone();
+                run.end_error = (pause.error.clone()).map(|json| json.parse());
                 run.end_usage = None;
             }
             Record::Retraction(retraction) if retraction.failure.is_some() => {

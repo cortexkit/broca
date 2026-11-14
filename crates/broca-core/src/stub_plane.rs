@@ -239,7 +239,7 @@ mod tests {
             thought_signature: None,
             tool_call_id: ToolCallId(id.into()),
             tool_name: name.into(),
-            input: json!({}),
+            input: json!({}).into(),
         }
     }
 

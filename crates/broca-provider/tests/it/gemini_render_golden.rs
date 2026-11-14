@@ -50,7 +50,7 @@ pub(crate) fn fixed_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_01".into()),
                 tool_name: "get_time".into(),
-                input: json!({"timezone": "Europe/Madrid"}),
+                input: json!({"timezone": "Europe/Madrid"}).into(),
             })],
         },
         Message {
@@ -112,7 +112,7 @@ fn json_tool_result_request(value: Value) -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_json".into()),
                 tool_name: "get_data".into(),
-                input: json!({}),
+                input: json!({}).into(),
             })],
         },
         Message {
@@ -124,7 +124,9 @@ fn json_tool_result_request(value: Value) -> CallOptions {
             role: Role::Tool,
             content: vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id: ToolCallId("call_json".into()),
-                output: ToolOutput::Json { value },
+                output: ToolOutput::Json {
+                    value: value.into(),
+                },
                 is_error: false,
             })],
         },
@@ -156,7 +158,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId(first_id.into()),
                 tool_name: "search".into(),
-                input: json!({"query": "broca"}),
+                input: json!({"query": "broca"}).into(),
             })],
         },
         Message {
@@ -185,7 +187,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId(second_id.into()),
                 tool_name: "read".into(),
-                input: json!({"path": "README.md"}),
+                input: json!({"path": "README.md"}).into(),
             })],
         },
         Message {
@@ -348,7 +350,7 @@ fn signed_call_request(target_model: &str) -> CallOptions {
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call_01".into()),
                 tool_name: "get_time".into(),
-                input: json!({"timezone": "Europe/Madrid"}),
+                input: json!({"timezone": "Europe/Madrid"}).into(),
                 thought_signature: Some("gemini-signed-call".into()),
             })],
             ModelHandle::new(PROVIDER, MODEL_X),
@@ -419,7 +421,7 @@ fn signed_reasoning_request(origin: Option<ModelHandle>, target_model: &str) -> 
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("call_02".into()),
                     tool_name: "get_weather".into(),
-                    input: json!({"city": "Madrid"}),
+                    input: json!({"city": "Madrid"}).into(),
                     thought_signature: Some("call-sig".into()),
                 }),
             ],

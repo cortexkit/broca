@@ -148,7 +148,7 @@ pub fn pre_tool_subject(
         tool: call.tool_name.clone(),
         tool_call_id: call.tool_call_id.0.clone(),
         call_key: None,
-        input: call.input.clone(),
+        input: call.input.clone().parse(),
     }
 }
 

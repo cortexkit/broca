@@ -215,7 +215,10 @@ fn changed_dispatch_arguments_are_kept() {
     let Some(Record::ToolIntent(intent)) = converted.records.last() else {
         panic!("last record is the intent");
     };
-    assert_eq!(intent.args, Some(serde_json::json!({"cmd": "ls -la"})));
+    assert_eq!(
+        intent.args,
+        (Some(serde_json::json!({"cmd": "ls -la"}))).map(Into::into)
+    );
 }
 
 /// A call answered without a dispatch intent keeps the key today's projection gives it, made

@@ -104,7 +104,7 @@ async fn capture(
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(format!("read-{fixture}")),
                 tool_name: "read".into(),
-                input: json!({"fixture":fixture}),
+                input: json!({"fixture":fixture}).into(),
                 thought_signature: None,
             })
         })

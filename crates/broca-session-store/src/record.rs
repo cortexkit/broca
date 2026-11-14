@@ -733,7 +733,7 @@ message! {
         5 req retries_used: u32,
         6 opt interrupt_reason: String,
         /// Owned by the provider layer: the typed provider error, when the run failed.
-        7 opt error: serde_json::Value,
+        7 opt error: broca_protocol::json::Json,
     }
 }
 
@@ -767,8 +767,8 @@ message! {
         /// How many tool calls the step made.
         8 req call_count: u32,
         /// Owned by the run loop: the refusal-fallback route and schedule.
-        9 opt fallback: serde_json::Value,
-        10 opt hooks: serde_json::Value,
+        9 opt fallback: broca_protocol::json::Json,
+        10 opt hooks: broca_protocol::json::Json,
         /// The run's last step, taken after its tool-call budget asked the model to finish. The
         /// transcript's `Assistant` carries the same flag; each fold reads only its own record.
         11 opt budget_finalize: bool,
@@ -821,10 +821,10 @@ message! {
         15 opt transport: String,
         16 opt served_account_ref: String,
         /// Owned by billing: the reservation and envelope of a billed attempt.
-        17 opt billing: serde_json::Value,
+        17 opt billing: broca_protocol::json::Json,
         /// Owned by diagnostics: stream event counts, cache evidence, WebSocket and input
         /// transformation details.
-        18 opt telemetry: serde_json::Value,
+        18 opt telemetry: broca_protocol::json::Json,
         /// Whether the provider accepted the request for processing, so its prompt prefix was
         /// read into or written to the provider's cache, as the run loop decides it when it
         /// records the attempt. Absent means it didn't, or isn't known to have.
@@ -875,14 +875,14 @@ message! {
         6 req args_digest: Digest,
         /// The dispatched arguments, kept only when a hook or approval changed them from the
         /// assistant's call. Otherwise they are the call's own input and aren't stored twice.
-        7 opt args: serde_json::Value,
+        7 opt args: broca_protocol::json::Json,
         8 opt call_key: String,
         9 opt approval_digest: String,
         10 opt dispatched_at_ms: u64,
         /// Owned by the tool router, the code that sends calls to tool provider modules: the
         /// schema pin the call was dispatched under.
-        11 opt schema_pin: serde_json::Value,
-        12 opt hooks: serde_json::Value,
+        11 opt schema_pin: broca_protocol::json::Json,
+        12 opt hooks: broca_protocol::json::Json,
         /// The converter derived `call_key` from today's log: today's intent stores no key, and
         /// the runner sent `<log lineage id>:<intent's position>`, which the provider keys the
         /// call's late result, approval and withdrawal on. The key is stored so it never has to
@@ -925,8 +925,8 @@ message! {
         7 opt reason: String,
         8 opt finished_at_ms: u64,
         /// Owned by the tool router: why a call wasn't dispatched, held or withdrawn.
-        9 opt detail: serde_json::Value,
-        10 opt hooks: serde_json::Value,
+        9 opt detail: broca_protocol::json::Json,
+        10 opt hooks: broca_protocol::json::Json,
         /// The key of a call answered without a dispatch intent (denied, invalid, synthetic, or
         /// refused with its batch), which no intent holds: the new loop mints it from this
         /// record's writer generation and seq, in the form of the store's ids, and a converted
@@ -945,7 +945,7 @@ message! {
     pub struct Compaction {
         /// Always 1: the protocol the message belongs to.
         1 req version: u32,
-        2 req body: serde_json::Value,
+        2 req body: broca_protocol::json::Json,
     }
 }
 
@@ -977,7 +977,7 @@ message! {
         /// Owned by the compaction code: the view's edits as stored, each either the
         /// provider's edit as raw JSON or the index of the identical edit in the previous
         /// accepted view.
-        3 req edits: serde_json::Value,
+        3 req edits: broca_protocol::json::Json,
         /// The view's build metadata as the provider sealed it: the entry it was built
         /// through, and its policy for blocks signed after that. Both are part of the view's
         /// checksum, so a reader that doesn't know them can't rebuild the view; they are
@@ -1016,9 +1016,9 @@ message! {
         6 opt ts_ms: u64,
         /// Owned by admission: the rest of the request (model, generation, budget, stop
         /// conditions, cache and auth preferences).
-        7 opt request: serde_json::Value,
+        7 opt request: broca_protocol::json::Json,
         /// The receipt: sender, principal, retention, title and hooks.
-        8 opt receipt: serde_json::Value,
+        8 opt receipt: broca_protocol::json::Json,
         /// How the send asked to be delivered, as the caller named it (`interrupt` drains ahead
         /// of every plain send). Absent for a plain queued send.
         9 opt delivery: String,
@@ -1325,9 +1325,9 @@ message! {
         2 req reason: PauseReason,
         3 opt ts_ms: u64,
         /// Owned by the provider layer: the error that paused the run.
-        4 opt error: serde_json::Value,
+        4 opt error: broca_protocol::json::Json,
         /// Owned by the run loop: when an account-limit pause may resume.
-        5 opt account_limit: serde_json::Value,
+        5 opt account_limit: broca_protocol::json::Json,
     }
 }
 
@@ -1387,7 +1387,7 @@ message! {
         2 opt written_at_ms: u64,
         3 opt tags_v1: serde_json::Value,
         /// The receipt: sender, send id, delivery, retention, title and hooks.
-        4 opt receipt: serde_json::Value,
+        4 opt receipt: broca_protocol::json::Json,
         /// Where the bytes of each medium the steer's messages carry are stored, which the
         /// messages' transcript copies point at. A record carrying any is refused by a reader
         /// that doesn't know the field.
@@ -1591,9 +1591,9 @@ message! {
         10 opt expires_at_ms: u64,
         11 opt attempt_id: String,
         /// Owned by billing: the reservation and envelope of a billed warm.
-        12 opt billing: serde_json::Value,
+        12 opt billing: broca_protocol::json::Json,
         /// Owned by account routing: the provider's rate-limit headers on the warm's answer.
-        13 opt ratelimit_headers: serde_json::Value,
+        13 opt ratelimit_headers: broca_protocol::json::Json,
         /// Whether the warm reached the provider's cache, as decided when it was recorded.
         /// Absent means it didn't, or isn't known to have.
         14 opt reached_cache: bool,

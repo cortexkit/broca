@@ -125,7 +125,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
                 thought_signature: None,
                 tool_call_id: ToolCallId((*id).into()),
                 tool_name: (*name).into(),
-                input: input.clone(),
+                input: input.clone().into(),
             })
         })
         .collect();
@@ -4292,7 +4292,7 @@ async fn finalize_turn_tool_calls_are_not_dispatched() {
         thought_signature: None,
         tool_call_id: ToolCallId("before".into()),
         tool_name: "lookup".into(),
-        input: json!({}),
+        input: json!({}).into(),
     };
     let model_steps: Vec<_> = records
         .iter()
@@ -4763,6 +4763,7 @@ async fn a_tool_role_refusal_at_batch_start_keeps_permanent_code_and_detail() {
                 "class":"permanent", "code":"tool_role_not_declared",
                 "detail":{"role":"tool-provider", "declared":null}
             })
+            .into()
         }
     );
     let _ = std::fs::remove_dir_all(dir);

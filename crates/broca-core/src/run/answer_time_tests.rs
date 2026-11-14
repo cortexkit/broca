@@ -93,7 +93,7 @@ async fn gated_batch(mode: ExecutionMode, unknown_fast: bool) -> (Vec<WalRecord>
         .map(|id| ToolCall {
             tool_call_id: ToolCallId((*id).into()),
             tool_name: "work".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         })
         .collect();

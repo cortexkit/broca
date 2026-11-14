@@ -359,7 +359,10 @@ async fn class_adoption_queued_send_is_kept_until_its_run_starts_after_reload() 
                 }
             })
             .unwrap();
-        assert_eq!(queued.receipt.as_ref().unwrap()["session_class"], "head");
+        assert_eq!(
+            queued.receipt.as_ref().unwrap().parse()["session_class"],
+            "head"
+        );
         let (commands, served) = serve(
             actor(
                 session,

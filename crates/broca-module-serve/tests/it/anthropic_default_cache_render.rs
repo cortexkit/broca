@@ -36,7 +36,7 @@ fn tool_call(id: &str, path: &str) -> ContentBlock {
         thought_signature: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: "read".into(),
-        input: json!({ "path": path }),
+        input: json!({ "path": path }).into(),
     })
 }
 

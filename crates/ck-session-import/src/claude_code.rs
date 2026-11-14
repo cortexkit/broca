@@ -625,7 +625,7 @@ fn convert_block(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string(),
-            input: block.get("input").cloned().unwrap_or(Value::Null),
+            input: block.get("input").cloned().unwrap_or(Value::Null).into(),
             thought_signature: None,
         })),
         "tool_result" => {
@@ -637,7 +637,9 @@ fn convert_block(
                     Some(text) => ToolOutput::Text {
                         text: text.to_string(),
                     },
-                    None => ToolOutput::Json { value },
+                    None => ToolOutput::Json {
+                        value: value.into(),
+                    },
                 },
             };
             Some(ContentBlock::ToolResult(ToolResult {
@@ -1014,7 +1016,12 @@ mod tests {
         ]);
         let result = converted_tool_result(content.clone(), false);
 
-        assert_eq!(result.output, ToolOutput::Json { value: content });
+        assert_eq!(
+            result.output,
+            ToolOutput::Json {
+                value: content.into()
+            }
+        );
         assert!(!result.is_error);
     }
 

@@ -10437,6 +10437,9 @@ struct PlannedDispatch {
     tool_call_id: ToolCallId,
     tool_name: String,
     input: Arc<serde_json::Value>,
+    /// `input` as the call's JSON text, kept so the dispatched call shares it instead of
+    /// writing the parsed value out again.
+    text: broca_protocol::json::Json,
     thought_signature: Option<String>,
     hooks: Option<Box<broca_wal::Hooks>>,
     call_key: Option<String>,
@@ -10448,7 +10451,8 @@ impl From<ToolCall> for PlannedDispatch {
         Self {
             tool_call_id: call.tool_call_id,
             tool_name: call.tool_name,
-            input: Arc::new(call.input),
+            input: Arc::new(call.input.parse()),
+            text: call.input,
             thought_signature: call.thought_signature,
             hooks: None,
             call_key: None,
@@ -10462,7 +10466,7 @@ impl PlannedDispatch {
         ToolCall {
             tool_call_id: self.tool_call_id,
             tool_name: self.tool_name,
-            input: Arc::unwrap_or_clone(self.input),
+            input: self.text,
             thought_signature: self.thought_signature,
         }
     }
@@ -10515,6 +10519,7 @@ fn held_resume_intents(
             };
             let mut dispatch = PlannedDispatch::from(call.clone());
             dispatch.input = Arc::clone(args);
+            dispatch.text = args.as_ref().into();
             dispatch.call_key = call_key.clone().or_else(|| writer.call_key(frame.seq));
             if let Some(key) = call_key {
                 dispatch.approved = frames.iter().find_map(|frame| match &frame.record {
@@ -10952,12 +10957,12 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 continue;
             }
             if let crate::hooks::Subject::PreTool { input, .. } = output.subject {
-                call.input = input;
+                call.input = input.into();
             }
             if let Some((provider, text, unavailable)) = output.refusal {
                 plan.push(pre_tool_terminal(
                     &call,
-                    &original,
+                    &(original).parse(),
                     &trace,
                     &provider,
                     &text,
@@ -10972,19 +10977,19 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 reason: NoDispatchReason::ValidationFailed {
                     detail: v.to_string(),
                 },
-                hooks: trace.metadata(original, call.input.clone(), true),
+                hooks: trace.metadata(original.parse(), call.input.parse(), true),
             });
             continue;
         }
         // Policy must see the input produced by mutate, after capability validation.
         match approval.decide(&call).await {
             ApprovalResponse::Allow { .. } => {}
-            ApprovalResponse::AllowNarrowed { input, .. } => call.input = input,
+            ApprovalResponse::AllowNarrowed { input, .. } => call.input = input.into(),
             ApprovalResponse::Deny { reason, .. } => {
                 plan.push(CallPlan::NoDispatch {
                     tool_call_id: call.tool_call_id.clone(),
                     reason: NoDispatchReason::Denied { reason },
-                    hooks: trace.metadata(original, call.input.clone(), true),
+                    hooks: trace.metadata(original.parse(), call.input.parse(), true),
                 });
                 continue;
             }
@@ -11016,7 +11021,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             if let Some((provider, text, unavailable)) = output.refusal {
                 plan.push(pre_tool_terminal(
                     &call,
-                    &original,
+                    &(original).parse(),
                     &trace,
                     &provider,
                     &text,
@@ -11025,7 +11030,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 continue;
             }
         }
-        let metadata = trace.metadata(original, call.input.clone(), false);
+        let metadata = trace.metadata(original.parse(), call.input.parse(), false);
         let mut dispatch = PlannedDispatch::from(call);
         dispatch.hooks = metadata;
         plan.push(CallPlan::Dispatch(dispatch));
@@ -12611,7 +12616,7 @@ fn submitted_result_record(
         result: broca_protocol::structured_output::result(
             frozen,
             true,
-            Some(&submit.input),
+            Some(&(submit.input).parse()),
             None,
             skipped,
         ),
@@ -14274,7 +14279,7 @@ mod tests {
         let mut dispatch = PlannedDispatch::from(ToolCall {
             tool_call_id: ToolCallId("call".into()),
             tool_name: "tool".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         });
         dispatch.call_key = Some("lineage:19".into());
@@ -14312,7 +14317,7 @@ mod tests {
         let call = ToolCall {
             tool_call_id: ToolCallId("call".into()),
             tool_name: "tool".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         };
         let manifest = ToolManifest::from_tools(vec![serde_json::from_value(serde_json::json!({"name":"tool","description":"","input_schema":{},"execution_mode":"parallel"})).unwrap()]);
@@ -15041,7 +15046,7 @@ mod tests {
         let call = ToolCall {
             tool_call_id: ToolCallId("a".into()),
             tool_name: "edit".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         };
         let batch = dispatch_batch(
@@ -15435,7 +15440,8 @@ mod tests {
                 value: serde_json::json!({
                     "status": "committed before crash",
                     "nested": {"attempt": 7}
-                }),
+                })
+                .into(),
             },
             is_error: false,
         };
@@ -15469,13 +15475,13 @@ mod tests {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_a".into()),
                 tool_name: "edit".into(),
-                input: serde_json::json!({"path": "a"}),
+                input: serde_json::json!({"path": "a"}).into(),
             },
             ToolCall {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_b".into()),
                 tool_name: "edit".into(),
-                input: serde_json::json!({"path": "b"}),
+                input: serde_json::json!({"path": "b"}).into(),
             },
         ];
         let manifest = ToolManifest::from_tools(vec![Tool {
@@ -16970,7 +16976,7 @@ mod approval_gate {
                     hooks,
                 } = pre_tool_terminal(
                     &call,
-                    &call.input,
+                    &(call.input).parse(),
                     &output.trace,
                     &provider,
                     &text,
@@ -17073,12 +17079,12 @@ mod approval_gate {
                 return Ok(Slot::Ready(Some(CallPlan::Stopped(call.tool_call_id))));
             }
             if let crate::hooks::Subject::PreTool { input, .. } = output.subject {
-                call.input = input;
+                call.input = input.into();
             }
             if let Some((provider, text, unavailable)) = output.refusal {
                 return Ok(Slot::Ready(Some(pre_tool_terminal(
                     &call,
-                    &original,
+                    &(original).parse(),
                     &trace,
                     &provider,
                     &text,
@@ -17092,7 +17098,7 @@ mod approval_gate {
                 NoDispatchReason::ValidationFailed {
                     detail: error.to_string(),
                 },
-                trace.metadata(original, call.input.clone(), true),
+                trace.metadata(original.parse(), call.input.parse(), true),
             ));
         }
         // Narrow the validated mutation before asking for consent or freezing bytes.
@@ -17101,10 +17107,10 @@ mod approval_gate {
                 return Ok(no_dispatch(
                     &call,
                     NoDispatchReason::Denied { reason },
-                    trace.metadata(original, call.input.clone(), true),
+                    trace.metadata(original.parse(), call.input.parse(), true),
                 ))
             }
-            ApprovalResponse::AllowNarrowed { input, .. } => call.input = input,
+            ApprovalResponse::AllowNarrowed { input, .. } => call.input = input.into(),
             ApprovalResponse::Allow { .. } => {}
         }
         let mut ask = None;
@@ -17121,12 +17127,12 @@ mod approval_gate {
                     return Ok(Slot::Ready(Some(CallPlan::Stopped(call.tool_call_id))));
                 }
                 if let crate::hooks::Subject::PreTool { input, .. } = output.subject {
-                    call.input = input;
+                    call.input = input.into();
                 }
                 if let Some((provider, text, unavailable)) = output.refusal {
                     return Ok(Slot::Ready(Some(pre_tool_terminal(
                         &call,
-                        &original,
+                        &(original).parse(),
                         &trace,
                         &provider,
                         &text,
@@ -17140,7 +17146,7 @@ mod approval_gate {
         }
         let Some(ask) = ask else {
             let mut dispatch = PlannedDispatch::from(call);
-            dispatch.hooks = trace.metadata(original, (*dispatch.input).clone(), false);
+            dispatch.hooks = trace.metadata(original.parse(), (*dispatch.input).clone(), false);
             return Ok(Slot::Ready(Some(CallPlan::Dispatch(dispatch))));
         };
         let Some(scope) = &ctx.scope else {
@@ -18111,7 +18117,7 @@ mod approval_gate {
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
                                 history.record(writer, WalRecord::ToolDispatchIntent { dispatched_at_ms: None, batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
-                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone().or_else(|| plane.dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)), hooks: None,
+                                    args: Arc::new(call.input.clone().parse()), module_id: module.clone(), schema_pin: schema_pin.clone().or_else(|| plane.dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;
                                 let before_send_cancel = control.cancel.as_ref();

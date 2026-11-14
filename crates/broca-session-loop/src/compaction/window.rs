@@ -193,10 +193,26 @@ impl Kept {
     /// entries' ride envelopes and what decided them count at their inline size.
     fn held_bytes(&self) -> usize {
         use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+        // A tool part's input shares its text with the call in the session's message, which
+        // the session holds anyway, so the walk's count of that text is taken back out.
+        let shared_inputs: usize = self
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.parts)
+            .map(|part| match &part.body {
+                cortexkit_role_compaction::part::PartBody::Tool(tool) => tool.input.as_str().len(),
+                _ => 0,
+            })
+            .sum();
         let entries = 2 * std::mem::size_of::<usize>()
             + std::mem::size_of::<Vec<Entry>>()
             + self.entries.capacity() * std::mem::size_of::<Entry>()
-            + self.entries.iter().map(serde_heap_bytes).sum::<usize>();
+            + self
+                .entries
+                .iter()
+                .map(serde_heap_bytes)
+                .sum::<usize>()
+                .saturating_sub(shared_inputs);
         let states = self.states.capacity() * std::mem::size_of::<KeptMessage>()
             + self
                 .states

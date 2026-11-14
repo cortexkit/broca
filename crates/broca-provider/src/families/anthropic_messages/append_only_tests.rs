@@ -122,7 +122,7 @@ fn tool_step(id: &str, input: Value) -> Vec<NormalizedEvent> {
                 thought_signature: None,
                 tool_call_id: ToolCallId(format!("call|{id}")),
                 tool_name: TOOL.into(),
-                input,
+                input: input.into(),
             }),
         ],
         FinishReason::ToolCalls,

@@ -126,7 +126,7 @@ fn signed_reasoning_cause_survives_new_storage_and_legacy_rebuild() {
         ts_ms: Some(1_790_000_000_000),
         retries_used: 0,
         interrupt_reason: None,
-        error: Some(expected.clone()),
+        error: Some(expected.clone().into()),
     });
     let bytes = record.encode_body();
     capture("after.store-run-end.bin", &bytes);
@@ -136,7 +136,7 @@ fn signed_reasoning_cause_survives_new_storage_and_legacy_rebuild() {
         unreachable!()
     };
     let typed: broca_protocol::ProviderError =
-        serde_json::from_value(end.error.clone().unwrap()).unwrap();
+        serde_json::from_value(end.error.clone().unwrap().parse()).unwrap();
     assert_eq!(typed, error);
     let rebuilt: WalRecord =
         serde_json::from_value(broca_session_loop::today::run_finished(&end)).unwrap();

@@ -21,7 +21,7 @@ pub(crate) fn records(session: &BindIdentity) -> Vec<FramedRecord> {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId((*id).into()),
                     tool_name: "edit".into(),
-                    input: serde_json::json!({"f":"a"}),
+                    input: serde_json::json!({"f":"a"}).into(),
                     thought_signature: None,
                 })
             })

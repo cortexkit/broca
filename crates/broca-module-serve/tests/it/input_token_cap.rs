@@ -19,7 +19,7 @@ fn measured(input: Option<u64>, call: bool) -> Step {
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("budget-call".into()),
                 tool_name: "work".into(),
-                input: json!({}),
+                input: json!({}).into(),
                 thought_signature: None,
             })]
         } else {

@@ -870,7 +870,7 @@ impl AnthropicNormalizer {
                     content.push(ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(id),
                         tool_name: name,
-                        input,
+                        input: input.into(),
                         thought_signature: None,
                     }));
                 }

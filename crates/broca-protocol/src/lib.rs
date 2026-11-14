@@ -48,6 +48,7 @@ mod diagnostic;
 pub mod display;
 pub mod error;
 pub mod ids;
+pub mod json;
 pub mod media_event;
 pub mod provider;
 pub mod render_hash;

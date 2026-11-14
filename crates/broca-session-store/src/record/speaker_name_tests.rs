@@ -133,7 +133,7 @@ fn marked() -> Vec<Record> {
             setup: vec![],
             written_at_ms: Some(8),
             ts_ms: None,
-            request: Some(json!({"model": {}})),
+            request: Some(json!({"model": {}}).into()),
             receipt: None,
             delivery: None,
             message_marks: Some(marks),

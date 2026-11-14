@@ -31,7 +31,7 @@ fn wait_step(id: &str, hold: &str) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: broca_protocol::ToolCallId("c1".into()),
                     tool_name: "wait".into(),
-                    input: json!({ "hold": hold }),
+                    input: json!({ "hold": hold }).into(),
                 })],
             },
         }),

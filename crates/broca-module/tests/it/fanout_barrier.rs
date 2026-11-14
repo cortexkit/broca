@@ -189,7 +189,7 @@ fn assistant_one_call() -> AssistantMessage {
             thought_signature: None,
             tool_call_id: ToolCallId("c1".into()),
             tool_name: "alpha".into(),
-            input: serde_json::json!({"x": 1}),
+            input: serde_json::json!({"x": 1}).into(),
         })],
     }
 }

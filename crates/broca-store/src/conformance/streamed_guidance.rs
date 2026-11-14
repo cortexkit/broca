@@ -152,7 +152,7 @@ fn compare(input_pair: bool, page_size: u64, already_guided: bool, held_count: O
         let call = ToolCall {
             tool_call_id: ToolCallId("later".into()),
             tool_name: "read".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         };
         assert_eq!(

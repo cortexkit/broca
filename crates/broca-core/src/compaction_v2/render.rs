@@ -512,10 +512,14 @@ fn render_entry(
                 }
             }
             (ContentBlock::ToolCall(call), PartBody::Tool(tool)) => {
+                let mut input = None;
                 for field in &part.replace {
                     if let Some(key) = field.field.strip_prefix("input.") {
-                        call.input[key] = field.value.clone();
+                        input.get_or_insert_with(|| call.input.parse())[key] = field.value.clone();
                     }
+                }
+                if let Some(input) = input {
+                    call.input = input.into();
                 }
                 if let Some(&result_index) = result_positions.get(&index) {
                     let result_position = position + 1;

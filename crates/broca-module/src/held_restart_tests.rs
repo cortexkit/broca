@@ -184,7 +184,7 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("inline".into()),
                         tool_name: "ask".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     }),
                     FinishReason::ToolCalls,
@@ -193,7 +193,7 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool) {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("a".into()),
                         tool_name: "ask".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     }),
                     FinishReason::ToolCalls,

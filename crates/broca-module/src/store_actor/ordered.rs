@@ -344,7 +344,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         });
         let principal = match (&ordered.sent_by, queued_as) {
             (Some(sender), _) => Some(principal(sender)?),
-            (None, Some(queued_as)) => Some(principal(queued_as)?),
+            (None, Some(queued_as)) => Some(principal(&queued_as)?),
             (None, None) => None,
         };
         Ok(Some(QueuedOrder {

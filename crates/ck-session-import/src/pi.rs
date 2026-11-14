@@ -624,7 +624,11 @@ fn convert_message(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
-                input: block.get("arguments").cloned().unwrap_or(Value::Null),
+                input: block
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .into(),
                 thought_signature: None,
             })),
             other => push_unique(skipped_blocks, other),
@@ -684,12 +688,12 @@ fn convert_tool_result(
                 text: text.to_string(),
             },
             _ => ToolOutput::Json {
-                value: Value::Array(blocks),
+                value: Value::Array(blocks).into(),
             },
         }
     } else {
         ToolOutput::Json {
-            value: Value::Array(blocks),
+            value: Value::Array(blocks).into(),
         }
     };
     Some(Message::new(

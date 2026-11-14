@@ -762,7 +762,7 @@ mod tests {
                 vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("call_lookup".into()),
                     tool_name: "lookup".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 })],
             ),

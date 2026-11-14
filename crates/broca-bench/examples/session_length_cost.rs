@@ -1116,7 +1116,7 @@ fn tool_step(run: &str, step: usize, tool: &str) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: ToolCallId(format!("call-{run}-{step}")),
                     tool_name: tool.into(),
-                    input: json!({"query": "fixed"}),
+                    input: json!({"query": "fixed"}).into(),
                 })],
             },
         }),

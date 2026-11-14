@@ -118,11 +118,10 @@ pub(crate) fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Optio
     if !matches!(first, Some(Some(_))) {
         return None;
     }
-    let receipt_u64 = |receipt: &Option<serde_json::Value>, name: &str| {
+    let receipt_u64 = |receipt: &Option<broca_protocol::json::Json>, name: &str| {
         receipt
             .as_ref()
-            .and_then(|receipt| receipt.get(name))
-            .and_then(serde_json::Value::as_u64)
+            .and_then(|receipt| receipt.parse().get(name)?.as_u64())
     };
     Some(policy_of(records.iter().filter_map(
         |(_, record)| match record {
@@ -389,7 +388,7 @@ impl RetentionService {
             .iter()
             .filter_map(|(_, record)| match record {
                 Record::Compaction(record) => {
-                    serde_json::from_value::<broca_wal::WalRecord>(record.body.clone()).ok()
+                    serde_json::from_value::<broca_wal::WalRecord>(record.body.clone().parse()).ok()
                 }
                 _ => None,
             })

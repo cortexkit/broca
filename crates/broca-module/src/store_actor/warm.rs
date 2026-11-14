@@ -223,15 +223,19 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 .iter()
                 .find_map(|(_, record)| match record {
                     Record::Warmed(warm) => warm.ratelimit_headers.clone(),
-                    Record::Attempt(attempt) => attempt
+                    Record::Attempt(attempt) => (attempt
                         .telemetry
                         .as_ref()
-                        .and_then(|t| t.get("account_observation"))
-                        .and_then(|t| t.get("ratelimit_headers"))
-                        .cloned(),
+                        .map(broca_protocol::json::Json::parse)
+                        .and_then(|t| {
+                            t.get("account_observation")?
+                                .get("ratelimit_headers")
+                                .cloned()
+                        }))
+                    .map(Into::into),
                     _ => None,
                 })
-                .and_then(|value| serde_json::from_value(value).ok())
+                .and_then(|value| serde_json::from_value(value.parse()).ok())
                 .unwrap_or_default();
             if let Err(reason) = self.executor.warm_quota(&request.config, &headers).await {
                 return refuse(Refusal::WarmUnsupported { reason });
@@ -416,8 +420,9 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 expires_at_ms: Some(expires_at_ms),
                 attempt_id: None,
                 billing: None,
-                ratelimit_headers: (!headers.is_empty())
-                    .then(|| serde_json::to_value(&headers).expect("headers serialize")),
+                ratelimit_headers: ((!headers.is_empty())
+                    .then(|| serde_json::to_value(&headers).expect("headers serialize")))
+                .map(Into::into),
                 // A warm answered without a billing envelope reached the cache, by today's rule
                 // (`warm_reached_the_cache`).
                 reached_cache: Some(true),

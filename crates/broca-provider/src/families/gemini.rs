@@ -619,7 +619,7 @@ fn function_response_payload(out: &ToolOutput) -> Value {
         // Gemini models FunctionResponse.response as a protobuf Struct, so it must be a JSON
         // object. Keep objects unchanged and give every other JSON value the same `result`
         // envelope used for text output.
-        ToolOutput::Json { value } if value.is_object() => value.clone(),
+        ToolOutput::Json { value } if value.is_object() => value.clone().parse(),
         ToolOutput::Json { value } => json!({ "result": value }),
         ToolOutput::Denied { reason } => json!({ "error": format!("denied: {reason}") }),
         ToolOutput::Error {
@@ -1191,7 +1191,7 @@ impl GeminiNormalizer {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(tcid),
                         tool_name: buf.name,
-                        input: buf.args,
+                        input: buf.args.into(),
                         thought_signature: buf.thought_signature,
                     })
                 }
@@ -1379,7 +1379,7 @@ mod tests {
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(id.to_string()),
                 tool_name: name.to_string(),
-                input: json!({"query": "broca"}),
+                input: json!({"query": "broca"}).into(),
                 thought_signature: None,
             })],
         )
@@ -1401,7 +1401,7 @@ mod tests {
                 user_tool_result(
                     "call_lookup",
                     ToolOutput::Json {
-                        value: json!([{"row": 1}, {"row": 2}]),
+                        value: json!([{"row": 1}, {"row": 2}]).into(),
                     },
                 ),
                 ContentBlock::Text {

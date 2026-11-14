@@ -513,7 +513,7 @@ fn runner_truncate_edit_marker_preserves_a_stored_tool_calls_signature() {
     let ContentBlock::ToolCall(tool) = &mut call else {
         unreachable!()
     };
-    tool.input = json!({"content":"a".repeat(60),"path":"keep"});
+    tool.input = json!({"content":"a".repeat(60),"path":"keep"}).into();
     tool.thought_signature = Some("unchanged".into());
     let prompt = stamped(vec![
         Message::new(Role::Assistant, vec![call]),

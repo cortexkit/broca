@@ -39,7 +39,7 @@ impl Provider for Model {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("c".into()),
                     tool_name: "work".into(),
-                    input: json!({"value":"original"}),
+                    input: json!({"value":"original"}).into(),
                     thought_signature: Some("signed".into()),
                 }),
             ]
@@ -52,7 +52,7 @@ impl Provider for Model {
             content.push(ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("c2".into()),
                 tool_name: "work".into(),
-                input: json!({"value":"second"}),
+                input: json!({"value":"second"}).into(),
                 thought_signature: Some("signed-second".into()),
             }));
         }

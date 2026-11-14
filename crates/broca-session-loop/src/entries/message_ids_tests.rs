@@ -31,7 +31,7 @@ fn multi_message_batch() -> Vec<Record> {
                     thought_signature: None,
                     tool_call_id: ToolCallId("call".into()),
                     tool_name: "read".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 })],
             )),
             usage: None,

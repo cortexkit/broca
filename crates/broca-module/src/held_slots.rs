@@ -320,7 +320,7 @@ mod tests {
         ToolCall {
             tool_call_id: ToolCallId("tc_1".into()),
             tool_name: "ask".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         }
     }

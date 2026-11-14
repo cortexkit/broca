@@ -41,7 +41,7 @@ fn assistant(calls: &[&str]) -> Record {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId((*id).into()),
                     tool_name: "bash".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                     thought_signature: None,
                 })
             })

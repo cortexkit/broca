@@ -101,8 +101,8 @@ pub fn queued_send(
         setup,
         written_at_ms: at.written_at_ms,
         ts_ms: at.ts_ms,
-        request: (!rest.is_empty()).then_some(Value::Object(rest)),
-        receipt,
+        request: (!rest.is_empty()).then_some(Value::Object(rest).into()),
+        receipt: receipt.map(Into::into),
         delivery,
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
         message_marks,
@@ -111,8 +111,8 @@ pub fn queued_send(
 
 /// The request `send` was queued with: its messages and its tool list back in place.
 pub fn request_of(send: &QueuedSend, parts: &dyn Parts) -> Result<SubmissionRequest, String> {
-    let mut request = match &send.request {
-        Some(Value::Object(rest)) => rest.clone(),
+    let mut request = match send.request.as_ref().map(broca_protocol::json::Json::parse) {
+        Some(Value::Object(rest)) => rest,
         Some(other) => return Err(format!("a queued send's request is {other}, not an object")),
         None => serde_json::Map::new(),
     };
@@ -178,15 +178,19 @@ pub fn steer(
         input,
         written_at_ms,
         tags_v1: None,
-        receipt,
+        receipt: receipt.map(Into::into),
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
         message_marks,
     })
 }
 
 /// The receipt field `name` of `send`, if its receipt has it.
-pub fn receipt_field<'a>(send: &'a QueuedSend, name: &str) -> Option<&'a Value> {
-    send.receipt.as_ref()?.get(name)
+pub fn receipt_field(send: &QueuedSend, name: &str) -> Option<Value> {
+    send.receipt
+        .as_ref()?
+        .parse()
+        .get_mut(name)
+        .map(Value::take)
 }
 
 #[cfg(test)]

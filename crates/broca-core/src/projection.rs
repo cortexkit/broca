@@ -1589,7 +1589,7 @@ pub fn tool_started_event_at(
         mid,
         call.tool_call_id.0.clone(),
         name.unwrap_or(&call.tool_name),
-        arguments.unwrap_or(&call.input),
+        arguments.unwrap_or(&(call.input).parse()),
         None,
         observed_at,
     ))

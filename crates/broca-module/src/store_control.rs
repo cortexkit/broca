@@ -471,7 +471,7 @@ impl StoreControl {
                             .as_ref()
                             .and_then(|detail| {
                                 serde_json::from_value::<broca_wal::NoDispatchReason>(
-                                    detail.clone(),
+                                    detail.clone().parse(),
                                 )
                                 .ok()
                             })
@@ -510,7 +510,7 @@ impl StoreControl {
             Record::RunEnd(end) => {
                 if let Some(error) = &end.error {
                     let error: broca_protocol::ProviderError =
-                        serde_json::from_value(error.clone())
+                        serde_json::from_value(error.clone().parse())
                             .map_err(|e| format!("a run end's error: {e}"))?;
                     units.plain(ControlUnit::Error {
                         awaits: None,
@@ -539,14 +539,13 @@ impl StoreControl {
                     let error = pause
                         .error
                         .as_ref()
-                        .map(|error| serde_json::from_value(error.clone()))
+                        .map(|error| serde_json::from_value(error.clone().parse()))
                         .transpose()
                         .map_err(|e| format!("a pause's error: {e}"))?;
                     let resume_not_before_ms = pause
                         .account_limit
                         .as_ref()
-                        .and_then(|limit| limit.get("resume_not_before_ms"))
-                        .and_then(serde_json::Value::as_u64);
+                        .and_then(|limit| limit.parse().get("resume_not_before_ms")?.as_u64());
                     let (unit, event) = paused_unit(
                         &RunId(pause.run_id.clone()),
                         pause.reason,
@@ -757,7 +756,7 @@ impl StoreControl {
                 .schema_pin
                 .as_ref()
                 .and_then(|pin| {
-                    serde_json::from_value::<broca_wal::DispatchSchemaPin>(pin.clone()).ok()
+                    serde_json::from_value::<broca_wal::DispatchSchemaPin>(pin.clone().parse()).ok()
                 })
                 .and_then(|pin| schema_pin_text(name, &pin)),
         };
@@ -766,7 +765,7 @@ impl StoreControl {
                 mid.clone(),
                 &call,
                 intent.tool_name.as_deref(),
-                Some(intent.args.as_ref().unwrap_or(&call.input)),
+                Some(&(*intent.args.as_ref().unwrap_or(&call.input)).parse()),
                 intent.dispatched_at_ms,
             );
             identity.stamp(&mut event);

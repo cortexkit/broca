@@ -414,7 +414,7 @@ fn steer(text: &str) -> Record {
         )],
         written_at_ms: Some(10),
         tags_v1: None,
-        receipt: Some(serde_json::json!({"send_id": format!("steer-{text}")})),
+        receipt: Some(serde_json::json!({"send_id": format!("steer-{text}")}).into()),
         media: Vec::new(),
         message_marks: None,
         named_speaker: None,
@@ -467,7 +467,7 @@ fn paused_and_resumed(run: &str, pause_seq: u64) -> [Record; 2] {
             reason: PauseReason::AccountLimit,
             ts_ms: Some(40),
             error: None,
-            account_limit: Some(serde_json::json!({"resets_at_ms": 50})),
+            account_limit: Some(serde_json::json!({"resets_at_ms": 50}).into()),
         }),
         Record::Resumed(Resumed {
             run_id: run.into(),

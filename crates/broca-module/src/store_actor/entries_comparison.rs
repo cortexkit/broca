@@ -763,7 +763,7 @@ fn tool_step(id: &str) -> Vec<NormalizedEvent> {
                         thought_signature: None,
                         tool_call_id: broca_protocol::ToolCallId("c1".into()),
                         tool_name: "read".into(),
-                        input: json!({"path": "a"}),
+                        input: json!({"path": "a"}).into(),
                     }),
                 ],
             },

@@ -32,7 +32,7 @@ fn read_call(id: &str, path: &str) -> ContentBlock {
         thought_signature: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: "read".into(),
-        input: json!({ "path": path }),
+        input: json!({ "path": path }).into(),
     })
 }
 
@@ -501,7 +501,7 @@ fn tool_call_only_prompt() -> Vec<Message> {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_1".into()),
                 tool_name: "get_time".into(),
-                input: json!({}),
+                input: json!({}).into(),
             })],
             broca_protocol::request::ModelHandle::new("ollama-cloud", "test"),
         ),

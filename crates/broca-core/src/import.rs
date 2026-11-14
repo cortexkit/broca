@@ -751,7 +751,7 @@ mod tests {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId(id.into()),
             tool_name: "test_tool".into(),
-            input: json!({}),
+            input: json!({}).into(),
             thought_signature: None,
         })
     }

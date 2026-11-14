@@ -40,6 +40,13 @@ pub fn members(payload: Option<&Value>) -> Result<Map<String, Value>, String> {
     }
 }
 
+/// [`members`] of a payload a record holds as JSON text.
+pub fn text_members(
+    payload: Option<&broca_protocol::json::Json>,
+) -> Result<Map<String, Value>, String> {
+    members(payload.map(broca_protocol::json::Json::parse).as_ref())
+}
+
 /// A digest as today's records spell it: 64 lowercase hex characters.
 pub fn hex(digest: &Digest) -> String {
     digest.0.iter().map(|b| format!("{b:02x}")).collect()
@@ -159,7 +166,7 @@ pub fn run_started(
 
 /// Today's `model_step_finished`, from a step's end and its assistant message.
 pub fn model_step_finished(assistant: &Assistant, end: &StepEnd) -> Result<Value, String> {
-    let mut object = members(end.fallback.as_ref())?;
+    let mut object = text_members(end.fallback.as_ref())?;
     object.insert("type".into(), json("model_step_finished"));
     object.insert("step_id".into(), json(end.step_id));
     let mut message = Map::new();
@@ -252,7 +259,7 @@ pub fn run_auth_refrozen(refrozen: &AuthRefrozen) -> Value {
 
 /// Today's `cache_warmed`.
 pub fn cache_warmed(warmed: &Warmed) -> Result<Value, String> {
-    let mut object = members(warmed.billing.as_ref())?;
+    let mut object = text_members(warmed.billing.as_ref())?;
     object.insert("type".into(), json("cache_warmed"));
     set(&mut object, "attempt_id", warmed.attempt_id.as_ref());
     set(&mut object, "trigger", warmed.trigger.as_ref());

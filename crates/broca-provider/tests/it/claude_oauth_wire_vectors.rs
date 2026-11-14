@@ -231,7 +231,7 @@ fn broca_request(case: &Value) -> CallOptions {
                     thought_signature: None,
                     tool_call_id: ToolCallId(block["id"].as_str().unwrap().to_string()),
                     tool_name: host_tool_name(block["name"].as_str().unwrap()),
-                    input: block["input"].clone(),
+                    input: block["input"].clone().into(),
                 })),
                 "tool_result" => results.push(ContentBlock::ToolResult(ToolResult {
                     tool_call_id: ToolCallId(block["tool_use_id"].as_str().unwrap().to_string()),

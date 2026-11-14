@@ -146,11 +146,8 @@ async fn bedrock_tool_call_over_binary_stream() {
         .into_iter()
         .find(|c| c.tool_name == "read_file")
     {
-        let path = call
-            .input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let input = call.input.parse();
+        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             !path.is_empty(),
             "Bedrock toolUse input decoded from binary frames into a parseable object; got {:?}",

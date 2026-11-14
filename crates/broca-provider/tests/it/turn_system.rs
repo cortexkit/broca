@@ -39,7 +39,7 @@ fn message(value: &Value) -> Message {
             Some("tool_use") => message.content.push(ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(part["id"].as_str().unwrap().into()),
                 tool_name: part["name"].as_str().unwrap().into(),
-                input: part["input"].clone(),
+                input: part["input"].clone().into(),
                 thought_signature: None,
             })),
             Some("tool_result") => {

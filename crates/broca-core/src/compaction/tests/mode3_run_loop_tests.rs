@@ -1547,7 +1547,7 @@ async fn compaction_v2_every_result_kind_carries_delivery_without_changing_store
             text: "value".into(),
         },
         ToolOutput::Json {
-            value: json!({"value":1}),
+            value: json!({"value":1}).into(),
         },
         ToolOutput::Parts {
             parts: vec![broca_protocol::ToolOutputPart::Text {
@@ -1948,7 +1948,7 @@ async fn frozen_rides_live_request_and_restart_are_byte_identical_for_every_carr
             true,
             false,
             ToolOutput::Json {
-                value: json!({"value": 1}),
+                value: json!({"value": 1}).into(),
             },
         ),
         (

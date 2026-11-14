@@ -62,7 +62,7 @@ fn call(id: &str) -> ContentBlock {
         thought_signature: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: "lookup".into(),
-        input: json!({}),
+        input: json!({}).into(),
     })
 }
 

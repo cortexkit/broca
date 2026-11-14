@@ -144,7 +144,7 @@ impl Provider for ScriptedProvider {
                 vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: "work".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                     thought_signature: None,
                 })],
                 FinishReason::ToolCalls,

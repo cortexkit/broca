@@ -530,7 +530,7 @@ mod tests {
         let json = ToolResult {
             tool_call_id: ToolCallId("t3".into()),
             output: ToolOutput::Json {
-                value: serde_json::json!({"a": 1}),
+                value: serde_json::json!({"a": 1}).into(),
             },
             is_error: false,
         };

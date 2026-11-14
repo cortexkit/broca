@@ -239,7 +239,7 @@ pub(super) fn call(name: &str, input: Value, id: &str) -> ToolCall {
     ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: name.into(),
-        input,
+        input: input.into(),
         thought_signature: None,
     }
 }

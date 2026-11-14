@@ -1078,7 +1078,7 @@ mod episode_page_tests {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId(id.into()),
             tool_name: tool.into(),
-            input: serde_json::json!({ "q": query }),
+            input: serde_json::json!({ "q": query }).into(),
             thought_signature: None,
         })
     }

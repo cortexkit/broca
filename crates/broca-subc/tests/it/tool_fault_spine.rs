@@ -38,7 +38,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
                 thought_signature: None,
                 tool_call_id: ToolCallId((*id).into()),
                 tool_name: (*name).into(),
-                input: input.clone(),
+                input: input.clone().into(),
             })
         })
         .collect();
@@ -639,7 +639,7 @@ async fn module_restart_between_dispatches_is_one_transparent_retry() {
         thought_signature: None,
         tool_call_id: ToolCallId("toolu_restart_1".into()),
         tool_name: "echo".into(),
-        input: json!({"value": "hello-after-restart"}),
+        input: json!({"value": "hello-after-restart"}).into(),
     };
     let manifest = ToolManifest::from_tools(vec![tool("echo")]);
     plane
@@ -814,7 +814,7 @@ async fn check_route_refusal(code: &str, refusals: usize, retry: bool, unknown: 
             thought_signature: None,
             tool_call_id: ToolCallId("toolu_next".into()),
             tool_name: "echo".into(),
-            input: json!({}),
+            input: json!({}).into(),
         };
         plane
             .batch_started(

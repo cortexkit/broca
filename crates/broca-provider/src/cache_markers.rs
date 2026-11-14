@@ -285,7 +285,7 @@ mod tests {
             thought_signature: None,
             tool_call_id: ToolCallId(id.into()),
             tool_name: "lookup".into(),
-            input: json!({"q": id}),
+            input: json!({"q": id}).into(),
         })
     }
 

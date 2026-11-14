@@ -270,7 +270,7 @@ async fn a_panicked_run_task_still_ends_runner_error_and_drains_the_queue() {
     assert_eq!(ends.len(), 2);
     assert_eq!(ends[0].run_id, "r1");
     assert_eq!(ends[0].reason, RunFinishReason::Error);
-    let error = ends[0].error.as_ref().unwrap();
+    let error = ends[0].error.as_ref().unwrap().parse();
     assert_eq!(error["class"], "permanent");
     assert_eq!(error["provider_code"], "runner_error");
     assert_eq!(ends[1].run_id, "r2");

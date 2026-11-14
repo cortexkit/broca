@@ -506,7 +506,7 @@ trait ToolPlaneConnection: Send + Sync {
         self.tool_call(
             route,
             &call.tool_name,
-            &call.input,
+            &(call.input).parse(),
             Some(&call.tool_call_id.0),
             deadline.duration,
             preset,
@@ -1227,13 +1227,13 @@ impl SubcToolPlane {
             return Duration::from_millis(
                 cortexkit_role_tool_provider::catalog::reply_deadline_ms_with_keepalive(
                     reply.as_ref(),
-                    &call.input,
+                    &(call.input).parse(),
                     self.reply_fallback_ms(),
                     keepalive,
                 ),
             );
         }
-        let legacy = tool_reply_deadline(module_id, &call.tool_name, &call.input);
+        let legacy = tool_reply_deadline(module_id, &call.tool_name, &(call.input).parse());
         #[cfg(debug_assertions)]
         if legacy == crate::connection::TOOL_CALL_TIMEOUT {
             return Duration::from_millis(self.reply_fallback_ms());
@@ -4426,7 +4426,7 @@ fn map_text_call_tool_result(
     } else if content.is_none_or(Vec::is_empty) {
         match raw.get("structuredContent") {
             Some(value) => ToolOutput::Json {
-                value: value.clone(),
+                value: value.clone().into(),
             },
             None => ToolOutput::Text { text },
         }
@@ -4873,7 +4873,7 @@ mod tests {
             self.tool_call(
                 route,
                 &call.tool_name,
-                &call.input,
+                &(call.input).parse(),
                 Some(&call.tool_call_id.0),
                 deadline.duration,
                 preset,
@@ -6063,7 +6063,12 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
-        assert_eq!(result.output, ToolOutput::Json { value: structured });
+        assert_eq!(
+            result.output,
+            ToolOutput::Json {
+                value: structured.into()
+            }
+        );
     }
 
     #[test]
@@ -6142,7 +6147,12 @@ mod tests {
 
         let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
-        assert_eq!(result.output, ToolOutput::Json { value: structured });
+        assert_eq!(
+            result.output,
+            ToolOutput::Json {
+                value: structured.into()
+            }
+        );
     }
 
     #[test]
@@ -6322,7 +6332,7 @@ mod tests {
             thought_signature: None,
             tool_call_id: ToolCallId(format!("call-{tool_name}")),
             tool_name: tool_name.into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
         }
     }
 
@@ -6870,6 +6880,7 @@ mod tests {
                         "class":"permanent", "code":"tool_role_not_declared",
                         "detail":{"role":"tool-provider", "declared":null}
                     })
+                    .into()
                 }
             );
         }
@@ -7727,7 +7738,7 @@ mod tests {
             let call = ToolCall {
                 tool_call_id: ToolCallId("deadline-vector".into()),
                 tool_name: "read".into(),
-                input: case["arguments"].clone(),
+                input: case["arguments"].clone().into(),
                 thought_signature: None,
             };
             let ctx = batch_ctx("deadline-vector");
@@ -7826,7 +7837,7 @@ mod tests {
             let call = ToolCall {
                 tool_call_id: ToolCallId("declared-reply".into()),
                 tool_name: "read".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             };
             let ctx = batch_ctx("declared-reply");
@@ -7954,7 +7965,7 @@ mod tests {
             thought_signature: None,
             tool_call_id: ToolCallId("call-slow".into()),
             tool_name: tool_name.into(),
-            input,
+            input: input.into(),
         };
         let ctx = batch_ctx("batch-slow");
         let fake_module = tokio::spawn(async move {
@@ -9141,7 +9152,7 @@ mod approved_queue_contract_tests {
             let call = ToolCall {
                 tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
                 tool_name: "edit".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             };
             let result = if pre_enqueue {
@@ -9242,7 +9253,7 @@ mod approved_queue_contract_tests {
         let call = ToolCall {
             tool_call_id: broca_protocol::ToolCallId("approved".into()),
             tool_name: "edit".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         };
         let signals = Default::default();
@@ -9284,7 +9295,7 @@ mod approved_queue_contract_tests {
         let call = ToolCall {
             tool_call_id: broca_protocol::ToolCallId("approved".into()),
             tool_name: "edit".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         };
         let result = plane
@@ -9322,7 +9333,7 @@ mod approved_queue_contract_tests {
             let call = ToolCall {
                 tool_call_id: broca_protocol::ToolCallId("approved".into()),
                 tool_name: "edit".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             };
             let token = CancellationToken::new();
@@ -9387,7 +9398,7 @@ mod approved_queue_contract_tests {
             let call = ToolCall {
                 tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
                 tool_name: "read".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             };
             let token = CancellationToken::new();

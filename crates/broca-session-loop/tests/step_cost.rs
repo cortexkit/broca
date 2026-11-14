@@ -59,7 +59,7 @@ fn tool_step(call: &str) -> Vec<NormalizedEvent> {
                         thought_signature: None,
                         tool_call_id: ToolCallId(call.into()),
                         tool_name: "read".into(),
-                        input: json!({"path": format!("src/{call}.rs")}),
+                        input: json!({"path": format!("src/{call}.rs")}).into(),
                     }),
                 ],
             },

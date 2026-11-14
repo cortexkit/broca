@@ -615,7 +615,7 @@ fn an_import_seed_and_its_interrupted_cut_both_ways() {
         vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
             tool_call_id: broca_protocol::ToolCallId("imported".into()),
             tool_name: "screen".into(),
-            input: json!({"long": "x".repeat(1_000)}),
+            input: json!({"long": "x".repeat(1_000)}).into(),
             thought_signature: None,
         })],
     );

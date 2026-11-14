@@ -52,7 +52,7 @@ fn edit_step() -> Vec<NormalizedEvent> {
             thought_signature: None,
             tool_call_id: ToolCallId("t1".into()),
             tool_name: "edit".into(),
-            input: serde_json::json!({"f": "a"}),
+            input: serde_json::json!({"f": "a"}).into(),
         })],
         FinishReason::ToolCalls,
     )

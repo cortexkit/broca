@@ -217,7 +217,7 @@ pub fn permanent_refusal_output(
     detail: Option<&serde_json::Value>,
 ) -> broca_protocol::ToolOutput {
     broca_protocol::ToolOutput::Json {
-        value: serde_json::json!({"class":"permanent", "code":code, "detail":detail}),
+        value: serde_json::json!({"class":"permanent", "code":code, "detail":detail}).into(),
     }
 }
 

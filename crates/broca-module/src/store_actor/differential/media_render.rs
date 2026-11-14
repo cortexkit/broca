@@ -196,9 +196,8 @@ impl ToolPlane for PhotoPlane {
 
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         if call.tool_name == "wait" {
-            let name = call.input["hold"]
-                .as_str()
-                .expect("a wait call names its hold");
+            let input = call.input.parse();
+            let name = input["hold"].as_str().expect("a wait call names its hold");
             let hold = tool_hold(name);
             hold.reached.fetch_add(1, Ordering::SeqCst);
             hold.released.notified().await;
@@ -631,7 +630,7 @@ fn photo_step(id: &str) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: broca_protocol::ToolCallId("c1".into()),
                     tool_name: "photo".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                 })],
             },
         }),

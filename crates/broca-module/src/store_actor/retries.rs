@@ -76,15 +76,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .filter(|_| send.legacy_steers && !send_id.is_empty())
             .find_map(|(_, record)| match record {
                 Record::Steer(steer)
-                    if receipt_str(steer.receipt.as_ref(), "send_id") == Some(send_id) =>
+                    if receipt_str(
+                        steer
+                            .receipt
+                            .as_ref()
+                            .map(broca_protocol::json::Json::parse)
+                            .as_ref(),
+                        "send_id",
+                    ) == Some(send_id) =>
                 {
                     Some(steer)
                 }
                 _ => None,
             })
         {
-            let Some(stored) = receipt_str(steer.receipt.as_ref(), "request_identity_digest")
-            else {
+            let receipt = steer
+                .receipt
+                .as_ref()
+                .map(broca_protocol::json::Json::parse);
+            let Some(stored) = receipt_str(receipt.as_ref(), "request_identity_digest") else {
                 return Ok(Keyed::Answered(SendOutcome::SendIdReuse {
                     differing: "request identity because the steer record has no digest",
                 }));

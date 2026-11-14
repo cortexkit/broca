@@ -333,7 +333,11 @@ fn assistant(mid: &str, row: &Value, content: &Value) -> Result<Option<Draft>, H
                 out.push(ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(call_id.to_owned()),
                     tool_name: name.to_owned(),
-                    input: block.get("arguments").cloned().unwrap_or(Value::Null),
+                    input: block
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .into(),
                     thought_signature: None,
                 }));
             }

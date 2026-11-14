@@ -556,7 +556,7 @@ fn provider_scripts(episode: usize, tool_turn: bool) -> Vec<Vec<NormalizedEvent>
                         thought_signature: None,
                         tool_call_id: ToolCallId(call_id.clone()),
                         tool_name: "lookup".into(),
-                        input: json!({"query": "fixed"}),
+                        input: json!({"query": "fixed"}).into(),
                     })],
                 },
             }),

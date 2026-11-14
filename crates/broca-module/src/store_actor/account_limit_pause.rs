@@ -104,12 +104,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .ok_or("account-limit pause has no recorded sequence")?;
         let error: Option<ProviderError> = recorded
             .error
-            .clone()
-            .map(serde_json::from_value)
+            .as_ref()
+            .map(|error| serde_json::from_value(error.parse()))
             .transpose()
             .map_err(|error| format!("account-limit pause source error: {error}"))?;
         if recorded.reason != PauseReason::AccountLimit
-            || recorded.account_limit != run.account_limit_pause
+            || recorded
+                .account_limit
+                .as_ref()
+                .map(broca_protocol::json::Json::parse)
+                != run.account_limit_pause
         {
             return Err("account-limit pause does not match its folded evidence".into());
         }
@@ -130,7 +134,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     && attempt.request_body_len == pause.request_body_len
                     && broca_session_store::codec::hex(&attempt.request_body_sha256.0) == pause.request_body_sha256
                     && pause.attempt_id.as_ref().is_none_or(|id| Some(id.as_str()) == attempt.attempt_id.as_deref())
-                    && attempt.billing.as_ref().and_then(|billing| billing.get("account_limit_disposition"))
+                    && attempt.billing.as_ref().map(broca_protocol::json::Json::parse).as_ref().and_then(|billing| billing.get("account_limit_disposition"))
                         == serde_json::to_value(pause.disposition).ok().as_ref())
         });
         if !matched_attempt {

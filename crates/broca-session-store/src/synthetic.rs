@@ -380,7 +380,7 @@ impl Writer {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: id.clone(),
                 tool_name: name.clone(),
-                input: input.clone(),
+                input: input.clone().into(),
                 thought_signature: None,
             })
         }));
@@ -414,11 +414,11 @@ impl Writer {
                 tool_name: Some(name.clone()),
                 module_id: Some("synthetic.tools".into()),
                 args_digest: Digest([3; 32]),
-                args: Some(input.clone()),
+                args: Some(input.clone().into()),
                 call_key: Some(key.clone()),
                 approval_digest: None,
                 dispatched_at_ms: Some(self.now()),
-                schema_pin: Some(Self::schema_pin(name)),
+                schema_pin: Some(Self::schema_pin(name).into()),
                 hooks: None,
                 key_derived: None,
             }));

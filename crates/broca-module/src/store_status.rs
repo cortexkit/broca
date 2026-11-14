@@ -446,7 +446,8 @@ impl<'a> Walk<'a> {
                 self.total_retries_used = self.total_retries_used.saturating_add(end.retries_used);
                 self.last_step_finish_reason = end.finish_reason;
                 if ours {
-                    let fallback = end.fallback.as_ref();
+                    let fallback = end.fallback.as_ref().map(broca_protocol::json::Json::parse);
+                    let fallback = fallback.as_ref();
                     let refusal_fallback = fallback
                         .and_then(|fallback| fallback.get("refusal_fallback"))
                         .is_some_and(|value| !value.is_null());
@@ -493,10 +494,11 @@ impl<'a> Walk<'a> {
                 }
             }
             Record::Attempt(attempt) if self.usage_active => {
-                let envelope = attempt
+                let billing = attempt
                     .billing
                     .as_ref()
-                    .and_then(|billing| billing.get("envelope"));
+                    .map(broca_protocol::json::Json::parse);
+                let envelope = billing.as_ref().and_then(|billing| billing.get("envelope"));
                 let served = envelope.and_then(|envelope| {
                     envelope
                         .get("speed_used")
@@ -533,6 +535,8 @@ impl<'a> Walk<'a> {
                 if let Some(send_id) = steer
                     .receipt
                     .as_ref()
+                    .map(broca_protocol::json::Json::parse)
+                    .as_ref()
                     .and_then(|receipt| receipt.get("send_id"))
                     .and_then(Value::as_str)
                 {
@@ -551,7 +555,7 @@ impl<'a> Walk<'a> {
                     let error = end
                         .error
                         .as_ref()
-                        .map(|error| decode(error, "a run end's error"))
+                        .map(|error| decode(&(*error).parse(), "a run end's error"))
                         .transpose()?;
                     self.end(End {
                         reason: end.reason,
@@ -567,14 +571,14 @@ impl<'a> Walk<'a> {
                 state.account_limit_pause = pause
                     .account_limit
                     .as_ref()
-                    .map(|pause| decode(pause, "an account-limit pause").map(Box::new))
+                    .map(|pause| decode(&(*pause).parse(), "an account-limit pause").map(Box::new))
                     .transpose()?;
                 state.usage = Some(self.total_usage);
                 state.retries_used = self.total_retries_used;
                 state.error = pause
                     .error
                     .as_ref()
-                    .map(|error| decode(error, "a pause's error"))
+                    .map(|error| decode(&(*error).parse(), "a pause's error"))
                     .transpose()?;
                 state.pause_reason = Some(pause.reason);
                 state.auth_selection.clone_from(&self.auth_selection);
@@ -591,7 +595,12 @@ impl<'a> Walk<'a> {
             Record::QueuedSend(send)
                 if send.submission_id == format!("sub-{}", self.run_id) && self.title.is_none() =>
             {
-                self.title = receipt_title(send.receipt.as_ref());
+                self.title = receipt_title(
+                    send.receipt
+                        .as_ref()
+                        .map(broca_protocol::json::Json::parse)
+                        .as_ref(),
+                );
             }
             Record::Retraction(retraction) => {
                 if let Some(failure) = retraction.failure.as_ref() {
@@ -1805,6 +1814,8 @@ impl<B: SessionBackend> SendLookup<'_, B> {
                     if steer
                         .receipt
                         .as_ref()
+                        .map(broca_protocol::json::Json::parse)
+                        .as_ref()
                         .and_then(|receipt| receipt.get("send_id"))
                         .and_then(Value::as_str)
                         == Some(send_id) =>
@@ -1886,7 +1897,12 @@ impl<B: SessionBackend> SendLookup<'_, B> {
                         return Ok(None);
                     }
                     queued = true;
-                    principal = principal_of(receipt_principal(send.receipt.as_ref()))?;
+                    principal = principal_of(receipt_principal(
+                        send.receipt
+                            .as_ref()
+                            .map(broca_protocol::json::Json::parse)
+                            .as_ref(),
+                    ))?;
                 }
                 _ => {}
             }
@@ -2016,7 +2032,12 @@ impl<B: SessionBackend> SendLookup<'_, B> {
                     return principal_of(order.sent_by.as_ref());
                 }
                 Record::QueuedSend(send) if send.submission_id == submission => {
-                    return principal_of(receipt_principal(send.receipt.as_ref()));
+                    return principal_of(receipt_principal(
+                        send.receipt
+                            .as_ref()
+                            .map(broca_protocol::json::Json::parse)
+                            .as_ref(),
+                    ));
                 }
                 Record::RunStart(start) if start.run_id == own_run.0 => {
                     return principal_of(start.principal.as_ref());

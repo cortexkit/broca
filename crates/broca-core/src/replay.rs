@@ -5921,7 +5921,7 @@ pub(crate) mod deferred_tests {
                                 thought_signature: None,
                                 tool_call_id: ToolCallId((*id).into()),
                                 tool_name: "edit".into(),
-                                input: serde_json::json!({"n":1}),
+                                input: serde_json::json!({"n":1}).into(),
                             })
                         })
                         .collect(),
@@ -6725,13 +6725,13 @@ mod offset_tail_tests {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("a".into()),
                         tool_name: "work".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     }),
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("b".into()),
                         tool_name: "work".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     }),
                 ],
@@ -7365,7 +7365,7 @@ mod offset_tail_tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("c".into()),
                     tool_name: "work".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                     thought_signature: None,
                 })],
             }),

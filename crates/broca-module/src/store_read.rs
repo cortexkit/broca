@@ -766,7 +766,7 @@ async fn open_turn_times<B: SessionBackend>(
             if let Some(pin) = intent.schema_pin.as_ref().and_then(|pin| {
                 broca_session_loop::entries::served_schema_pin(
                     intent.tool_name.as_deref().unwrap_or(&call.tool_name),
-                    pin,
+                    &(*pin).parse(),
                 )
             }) {
                 time = time.with_schema_pin(pin);

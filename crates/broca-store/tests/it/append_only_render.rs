@@ -70,7 +70,7 @@ fn read_step(id: &str, input: Value) -> Vec<NormalizedEvent> {
             thought_signature: None,
             tool_call_id: ToolCallId(id.into()),
             tool_name: "read".into(),
-            input,
+            input: input.into(),
         }),
         FinishReason::ToolCalls,
     )

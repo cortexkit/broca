@@ -33,10 +33,10 @@ async fn stored_error(side: &Side) -> (Value, Option<u64>) {
             .into_iter()
             .find_map(|(_, record)| match record {
                 broca_session_store::record::Record::RunEnd(end) => {
-                    end.error.map(|error| (error, end.ts_ms))
+                    end.error.map(|error| (error.parse(), end.ts_ms))
                 }
                 broca_session_store::record::Record::Pause(pause) => {
-                    pause.error.map(|error| (error, None))
+                    pause.error.map(|error| (error.parse(), None))
                 }
                 _ => None,
             })

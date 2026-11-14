@@ -131,13 +131,13 @@ fn gemini_preserves_thought_answer_and_parallel_call_source_order() {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "lookup".into(),
-                input: json!({"value": 391}),
+                input: json!({"value": 391}).into(),
                 thought_signature: Some("signed-first-call".into()),
             }),
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call_1".into()),
                 tool_name: "explain".into(),
-                input: json!({"value": 391}),
+                input: json!({"value": 391}).into(),
                 thought_signature: None,
             }),
             ContentBlock::Text {

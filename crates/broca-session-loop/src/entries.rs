@@ -127,6 +127,8 @@ impl Terminal {
             CallOutcome::NotDispatched => match outcome
                 .detail
                 .as_ref()
+                .map(broca_protocol::json::Json::parse)
+                .as_ref()
                 .and_then(|detail| detail.get("kind"))
                 .and_then(serde_json::Value::as_str)
             {
@@ -1118,7 +1120,7 @@ pub fn turn_facts(ordinal: u64, assistant: &Message, events: &[CallEvent]) -> Tu
                     slot.schema_pin = intent.schema_pin.as_ref().and_then(|pin| {
                         served_schema_pin(
                             intent.tool_name.as_deref().unwrap_or(slot.tool_name),
-                            pin,
+                            &(*pin).parse(),
                         )
                     });
                 }

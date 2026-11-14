@@ -112,7 +112,7 @@ impl Provider for Model {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(format!("c{i}")),
                         tool_name: "edit".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                         thought_signature: None,
                     })
                 })

@@ -10657,7 +10657,7 @@ mod tests {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         tool_call_id: broca_protocol::ToolCallId("a".into()),
                         tool_name: "ask".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     })],
                 }),
@@ -10825,7 +10825,7 @@ mod tests {
                         content: vec![ContentBlock::ToolCall(ToolCall {
                             tool_call_id: broca_protocol::ToolCallId("a".into()),
                             tool_name: "ask".into(),
-                            input: serde_json::json!({}),
+                            input: serde_json::json!({}).into(),
                             thought_signature: None,
                         })],
                     }),
@@ -11333,7 +11333,7 @@ mod tests {
             .map(|id| ToolCall {
                 tool_call_id: ToolCallId(id.into()),
                 tool_name: "ask".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             })
             .collect();
@@ -11396,7 +11396,7 @@ mod tests {
                 batch_id: BatchId("held-b1".into()),
                 tool_call_id: call.tool_call_id,
                 tool_name: Some(call.tool_name),
-                args: Arc::new(call.input),
+                args: Arc::new(call.input.parse()),
                 module_id: Some("tools".into()),
                 schema_pin: None,
                 hooks: None,
@@ -11744,7 +11744,7 @@ mod tests {
         let call = ToolCall {
             tool_call_id: ToolCallId("a".into()),
             tool_name: "ask".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         };
         vec![
@@ -11804,7 +11804,7 @@ mod tests {
                 batch_id: BatchId("held-b1".into()),
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: Some(call.tool_name.clone()),
-                args: Arc::new(call.input.clone()),
+                args: Arc::new(call.input.clone().parse()),
                 module_id: Some("tools".into()),
                 schema_pin: None,
                 hooks: None,
@@ -12749,7 +12749,7 @@ mod tests {
                                 content: vec![ContentBlock::ToolCall(ToolCall {
                                     tool_call_id: ToolCallId("call-1".into()),
                                     tool_name: "lookup".into(),
-                                    input: serde_json::json!({}),
+                                    input: serde_json::json!({}).into(),
                                     thought_signature: None,
                                 })],
                             },
@@ -15537,7 +15537,7 @@ mod import_idempotency_tests {
                     thought_signature: None,
                     tool_call_id: ToolCallId("call-1".into()),
                     tool_name: "edit".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 })],
             }
             .into(),

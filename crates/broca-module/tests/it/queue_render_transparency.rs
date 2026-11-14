@@ -205,7 +205,7 @@ impl Provider for RecordingProvider {
                 vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("recover-call".into()),
                     tool_name: "edit".into(),
-                    input: serde_json::json!({"path": "should-not-run"}),
+                    input: serde_json::json!({"path": "should-not-run"}).into(),
                     thought_signature: None,
                 })]
             } else {

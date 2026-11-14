@@ -64,7 +64,7 @@ fn tool_step(call: &str) -> Vec<NormalizedEvent> {
                         thought_signature: None,
                         tool_call_id: broca_protocol::ToolCallId(call.into()),
                         tool_name: "read".into(),
-                        input: serde_json::json!({"path": "crates/example/src/lib.rs"}),
+                        input: serde_json::json!({"path": "crates/example/src/lib.rs"}).into(),
                     }),
                 ],
             },

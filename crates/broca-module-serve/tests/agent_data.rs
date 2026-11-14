@@ -197,7 +197,7 @@ impl Rig {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         tool_call_id: call.clone(),
                         tool_name: "read_file".into(),
-                        input: json!({"path":"fixture.txt"}),
+                        input: json!({"path":"fixture.txt"}).into(),
                         thought_signature: None,
                     })],
                 }

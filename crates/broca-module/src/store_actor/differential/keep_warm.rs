@@ -474,7 +474,7 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
             assert_eq!(event.started_at_ms, warmed.sent_at_ms);
             assert_eq!(
                 Some(event.finished_at_ms),
-                warmed.billing.as_ref().unwrap()["finished_at_ms"].as_u64()
+                warmed.billing.as_ref().unwrap().parse()["finished_at_ms"].as_u64()
             );
             let incarnation: String = view
                 .head()

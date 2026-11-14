@@ -136,11 +136,8 @@ async fn anthropic_tool_loop_and_nonce_round_trip() {
         .into_iter()
         .find(|c| c.tool_name == "read_file")
         .unwrap();
-    let path = call
-        .input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let input = call.input.parse();
+    let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !path.is_empty(),
         "tool_use input_json_delta accumulated into a parseable object with a path arg; got {:?}",

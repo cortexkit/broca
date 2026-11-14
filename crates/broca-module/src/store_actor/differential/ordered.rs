@@ -560,11 +560,10 @@ fn today_ledger(records: &[WalRecord]) -> Vec<Value> {
 
 /// What the store session recorded about its sends.
 fn store_ledger(records: &[Record]) -> Vec<Value> {
-    let receipt = |receipt: &Option<Value>, name: &str| {
+    let receipt = |receipt: &Option<broca_protocol::json::Json>, name: &str| {
         receipt
             .as_ref()
-            .and_then(|receipt| receipt.get(name))
-            .cloned()
+            .and_then(|receipt| receipt.parse().get(name).cloned())
             .unwrap_or(Value::Null)
     };
     records

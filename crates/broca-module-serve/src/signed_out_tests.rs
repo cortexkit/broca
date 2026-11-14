@@ -1048,7 +1048,7 @@ async fn signed_out_at_a_due_account_limit_wake_moves_or_pauses_on_refusal() {
                     pause
                         .account_limit
                         .as_ref()
-                        .and_then(|pause| pause["resume_not_before_ms"].as_u64())
+                        .and_then(|pause| pause.parse()["resume_not_before_ms"].as_u64())
                 }
                 _ => None,
             })

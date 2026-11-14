@@ -123,7 +123,7 @@ fn tool_step(id: &str, cut: bool) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: "lookup".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 })],
             },
         }),

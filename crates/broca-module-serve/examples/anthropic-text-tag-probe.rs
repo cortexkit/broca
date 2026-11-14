@@ -503,7 +503,7 @@ fn dry_run(provider: &dyn broca_core::provider::Provider, seed_only: bool) {
                 thought_signature: None,
                 tool_call_id: ToolCallId("toolu_dry_run".into()),
                 tool_name: TOOL.into(),
-                input: json!({"path": "sample.txt"}),
+                input: json!({"path": "sample.txt"}).into(),
             }),
         ],
         received_assistant_message: true,

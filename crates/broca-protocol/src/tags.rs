@@ -824,7 +824,7 @@ mod tests {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("c".into()),
                         tool_name: "t".into(),
-                        input: serde_json::json!({"a": 1}),
+                        input: serde_json::json!({"a": 1}).into(),
                         thought_signature: Some("ts".into()),
                     }),
                 ],
@@ -843,7 +843,7 @@ mod tests {
                     ContentBlock::ToolResult(ToolResult {
                         tool_call_id: ToolCallId("d".into()),
                         output: ToolOutput::Json {
-                            value: serde_json::json!({"k": "v"}),
+                            value: serde_json::json!({"k": "v"}).into(),
                         },
                         is_error: false,
                     }),
@@ -890,7 +890,7 @@ mod tests {
         assert_eq!(
             second.output,
             ToolOutput::Json {
-                value: serde_json::json!({"k": "v"})
+                value: serde_json::json!({"k": "v"}).into()
             }
         );
         assert_eq!(prompt[3].content, untagged.content);
@@ -948,7 +948,7 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("c".into()),
                 tool_name: "t".into(),
-                input: serde_json::json!({"a": "§1§ arg"}),
+                input: serde_json::json!({"a": "§1§ arg"}).into(),
                 thought_signature: Some("ts".into()),
             }),
             ContentBlock::TextWithState {
@@ -1021,7 +1021,7 @@ mod tests {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("c".into()),
                     tool_name: "t".into(),
-                    input: serde_json::json!({"a": 1}),
+                    input: serde_json::json!({"a": 1}).into(),
                     thought_signature: None,
                 }),
             ],
@@ -1038,7 +1038,7 @@ mod tests {
                 ContentBlock::ToolResult(ToolResult {
                     tool_call_id: ToolCallId("d".into()),
                     output: ToolOutput::Json {
-                        value: serde_json::json!({"k": "v"}),
+                        value: serde_json::json!({"k": "v"}).into(),
                     },
                     is_error: false,
                 }),

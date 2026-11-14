@@ -117,7 +117,7 @@ fn one_of_each() -> Vec<Record> {
         }),
         Record::Compaction(Compaction {
             version: 2,
-            body: serde_json::json!({"first_kept_ordinal": 12}),
+            body: serde_json::json!({"first_kept_ordinal": 12}).into(),
         }),
         Record::RunStart(Box::new(RunStart {
             named_speaker: None,
@@ -204,7 +204,7 @@ fn one_of_each() -> Vec<Record> {
             transport: Some("https".into()),
             served_account_ref: None,
             billing: None,
-            telemetry: Some(serde_json::json!({"max_content_gap_ms": 613})),
+            telemetry: Some(serde_json::json!({"max_content_gap_ms": 613}).into()),
             reached_cache: Some(true),
             requested_cache_ttl_ms: Some(300_000),
         }),
@@ -261,7 +261,7 @@ fn one_of_each() -> Vec<Record> {
             setup: vec![],
             written_at_ms: Some(8),
             ts_ms: None,
-            request: Some(serde_json::json!({"model": {}})),
+            request: Some(serde_json::json!({"model": {}}).into()),
             receipt: None,
             delivery: Some("interrupt".into()),
             message_marks: None,

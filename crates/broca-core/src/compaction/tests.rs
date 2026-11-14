@@ -111,7 +111,7 @@ pub(super) fn call(id: &str) -> ContentBlock {
     ContentBlock::ToolCall(broca_protocol::ToolCall {
         tool_call_id: broca_protocol::ToolCallId(id.into()),
         tool_name: "t".into(),
-        input: json!({}),
+        input: json!({}).into(),
         thought_signature: None,
     })
 }
@@ -2679,7 +2679,7 @@ fn tool_call_events(tool: &str, input_tokens: u64) -> Vec<broca_protocol::Normal
                 content: vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
                     tool_call_id: broca_protocol::ToolCallId("call-1".into()),
                     tool_name: tool.into(),
-                    input: json!({"answer": 42}),
+                    input: json!({"answer": 42}).into(),
                     thought_signature: None,
                 })],
             },

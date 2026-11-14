@@ -1974,7 +1974,7 @@ mod tests {
                     thought_signature: None,
                     tool_call_id: ToolCallId("c1".into()),
                     tool_name: "lookup".into(),
-                    input: serde_json::json!({"query": "x"}),
+                    input: serde_json::json!({"query": "x"}).into(),
                 })],
             })
             .into(),
@@ -3839,13 +3839,13 @@ mod tests {
                                 thought_signature: None,
                                 tool_call_id: ToolCallId("c1".into()),
                                 tool_name: "lookup".into(),
-                                input: serde_json::json!({"query": "x"}),
+                                input: serde_json::json!({"query": "x"}).into(),
                             }),
                             ContentBlock::ToolCall(ToolCall {
                                 thought_signature: None,
                                 tool_call_id: ToolCallId("c2".into()),
                                 tool_name: "fetch".into(),
-                                input: serde_json::json!({"id": 2}),
+                                input: serde_json::json!({"id": 2}).into(),
                             }),
                         ],
                     }

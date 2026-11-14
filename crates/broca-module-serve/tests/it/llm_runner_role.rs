@@ -470,7 +470,7 @@ async fn finish_reason_uses_only_the_last_native_step_and_survives_restart() {
     let tool = ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId("native-tool".into()),
         tool_name: "work".into(),
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         thought_signature: None,
     });
     let oversized = "x".repeat(65);
@@ -798,7 +798,7 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
                 ContentBlock::ToolCall(broca_protocol::ToolCall {
                     tool_call_id: broca_protocol::ToolCallId("call-1".into()),
                     tool_name: "work".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                     thought_signature: None,
                 }),
             ],
@@ -919,7 +919,7 @@ async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
                 ContentBlock::ToolCall(broca_protocol::ToolCall {
                     tool_call_id: broca_protocol::ToolCallId("call-held".into()),
                     tool_name: "work".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                     thought_signature: None,
                 }),
             ],
@@ -3149,7 +3149,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("synthetic-call".into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({"path": "/synthetic/input.txt"}),
+                input: serde_json::json!({"path": "/synthetic/input.txt"}).into(),
                 thought_signature: Some("synthetic-tool-signature".into()),
             }),
         ];
@@ -3298,7 +3298,7 @@ async fn live_display_samples_match_stored_parts_and_attach_replays_current_step
         thought_signature: None,
         tool_call_id: ToolCallId("sample-call".into()),
         tool_name: "work".into(),
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
     });
     for name in ["text", "tool", "reasoning", "steer", "attach"] {
         let mut rig = Rig::start(&format!("live-sample-{name}")).await;
@@ -3429,7 +3429,7 @@ async fn live_finalize_filter_restreams_the_stored_block_indices() {
                 thought_signature: None,
                 tool_call_id: broca_protocol::ToolCallId("omitted-call".into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
             }),
             ContentBlock::Text {
                 text: "final answer".into(),
@@ -3532,7 +3532,7 @@ async fn live_display_after_steer_uses_the_next_step_placement() {
             thought_signature: None,
             tool_call_id: broca_protocol::ToolCallId("steer-call".into()),
             tool_name: "work".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
         })]),
         Step::Stream(vec![ContentBlock::Text {
             text: "after steer".into(),

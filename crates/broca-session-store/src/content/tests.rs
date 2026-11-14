@@ -58,13 +58,13 @@ fn every_block() -> Vec<ContentBlock> {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("call_0".into()),
             tool_name: "read".into(),
-            input: serde_json::Value::Null,
+            input: serde_json::Value::Null.into(),
             thought_signature: Some("QUI=".into()),
         }),
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("call_1".into()),
             tool_name: "bash".into(),
-            input: serde_json::json!({"command": "ls", "n": 1.5, "z": [true, null]}),
+            input: serde_json::json!({"command": "ls", "n": 1.5, "z": [true, null]}).into(),
             thought_signature: None,
         }),
         ContentBlock::ToolResult(ToolResult {
@@ -92,7 +92,7 @@ fn every_block() -> Vec<ContentBlock> {
         ContentBlock::ToolResult(ToolResult {
             tool_call_id: ToolCallId("j".into()),
             output: ToolOutput::Json {
-                value: serde_json::json!({"k": 0}),
+                value: serde_json::json!({"k": 0}).into(),
             },
             is_error: false,
         }),

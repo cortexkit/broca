@@ -64,7 +64,7 @@ impl RunExecutor for DispatchHeld {
                     thought_signature: None,
                     tool_call_id: call.clone(),
                     tool_name: "edit".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 })],
             }
             .into(),

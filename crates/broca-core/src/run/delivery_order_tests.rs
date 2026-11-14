@@ -26,7 +26,7 @@ fn call(id: &str, n: u64) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "work".into(),
-        input: serde_json::json!({ "n": n }),
+        input: serde_json::json!({ "n": n }).into(),
         thought_signature: None,
     })
 }

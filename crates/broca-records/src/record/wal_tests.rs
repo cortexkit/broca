@@ -1764,7 +1764,7 @@ mod schema_tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("c1".into()),
                     tool_name: "read".into(),
-                    input: json!({"path": "x"}),
+                    input: json!({"path": "x"}).into(),
                     thought_signature: Some("gemini-signed-call".into()),
                 })],
             })
@@ -1786,7 +1786,7 @@ mod schema_tests {
         let call = ToolCall {
             tool_call_id: ToolCallId("c1".into()),
             tool_name: "read".into(),
-            input: json!({"path": "x"}),
+            input: json!({"path": "x"}).into(),
             thought_signature: None,
         };
         let encoded_call = serde_json::to_vec(&call).expect("serialize unsigned call");

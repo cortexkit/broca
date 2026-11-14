@@ -86,7 +86,7 @@ fn normalizes_real_anthropic_tool_call_stream() {
         ContentBlock::ToolCall(call) => {
             assert_eq!(call.tool_name, "get_time");
             assert_eq!(call.tool_call_id.0, "00000000-0000-4000-8000-000000000024");
-            assert_eq!(call.input["timezone"], "Europe/Madrid");
+            assert_eq!(call.input.parse()["timezone"], "Europe/Madrid");
         }
         other => panic!("expected tool_call third, got {other:?}"),
     }
@@ -196,14 +196,15 @@ fn responses_tool_input(delta: &str, output_item_done: &str) -> serde_json::Valu
             _ => None,
         })
         .expect("response assembles an assistant message");
-    message
+    (message
         .content
         .iter()
         .find_map(|block| match block {
             ContentBlock::ToolCall(call) => Some(call.input.clone()),
             _ => None,
         })
-        .expect("response assembles a tool call")
+        .expect("response assembles a tool call"))
+    .parse()
 }
 
 #[test]

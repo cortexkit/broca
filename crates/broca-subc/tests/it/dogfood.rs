@@ -38,7 +38,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
                 thought_signature: None,
                 tool_call_id: ToolCallId((*id).into()),
                 tool_name: (*name).into(),
-                input: input.clone(),
+                input: input.clone().into(),
             })
         })
         .collect();

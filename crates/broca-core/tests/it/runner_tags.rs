@@ -122,7 +122,7 @@ async fn run(name: &str, render_tags: bool) -> Run {
     let call = ToolCall {
         tool_call_id: ToolCallId("call-1".into()),
         tool_name: "lookup".into(),
-        input: json!({"q": "tags"}),
+        input: json!({"q": "tags"}).into(),
         thought_signature: None,
     };
     let provider = StubProvider::new(vec![

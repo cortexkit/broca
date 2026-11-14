@@ -952,7 +952,7 @@ fn call_scans(
                 call_carrier: call_attribution(entry, &id, occurrence)
                     .and_then(|dispatch| dispatch.call_carrier.clone()),
                 tool_call_id: id,
-                arguments: call.input.clone(),
+                arguments: call.input.clone().parse(),
                 slots,
             })
         })

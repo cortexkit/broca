@@ -908,7 +908,7 @@ fn a_first_protocol_compaction_record_needs_a_saved_index() {
     let (mut history, _) = captured();
     let (at, feed) = history.batch(vec![Record::Compaction(Compaction {
         version: 1,
-        body: serde_json::json!({}),
+        body: serde_json::json!({}).into(),
     })]);
     assert_eq!(feed.needs_saved_index, Some(at));
     assert!(feed.items.is_empty());

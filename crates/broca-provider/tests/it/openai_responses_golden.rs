@@ -49,7 +49,7 @@ pub(crate) fn fixed_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_01".into()),
                 tool_name: "get_time".into(),
-                input: json!({"timezone": "Europe/Madrid"}),
+                input: json!({"timezone": "Europe/Madrid"}).into(),
             })],
         },
         Message {

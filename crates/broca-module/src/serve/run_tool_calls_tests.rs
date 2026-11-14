@@ -118,7 +118,7 @@ impl ClosedSession {
             .map(|(id, args)| ToolCall {
                 tool_call_id: ToolCallId(id.clone()),
                 tool_name: "write_file".into(),
-                input: args.clone(),
+                input: args.clone().into(),
                 thought_signature: None,
             })
             .collect();
@@ -235,13 +235,13 @@ impl ClosedSession {
             ToolCall {
                 tool_call_id: call_id.clone(),
                 tool_name: "write_file".into(),
-                input: json!({"path":"first"}),
+                input: json!({"path":"first"}).into(),
                 thought_signature: None,
             },
             ToolCall {
                 tool_call_id: call_id.clone(),
                 tool_name: "write_file".into(),
-                input: json!({"path":"duplicate"}),
+                input: json!({"path":"duplicate"}).into(),
                 thought_signature: None,
             },
         ];
@@ -274,7 +274,7 @@ impl ClosedSession {
             batch_id: batch_id.clone(),
             tool_call_id: call_id.clone(),
             tool_name: Some("write_file".into()),
-            args: Arc::new(calls[0].input.clone()),
+            args: Arc::new(calls[0].input.clone().parse()),
             module_id: Some("test-tools".into()),
             schema_pin: None,
             hooks: None,
@@ -760,7 +760,7 @@ async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
                     _ => ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("ignored".into()),
                         tool_name: "ignored".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                         thought_signature: None,
                     }),
                 })

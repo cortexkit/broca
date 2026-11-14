@@ -525,7 +525,7 @@ async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
         broca_protocol::ContentBlock::ToolCall(broca_protocol::ToolCall {
             tool_call_id: broca_protocol::ToolCallId("repeat".into()),
             tool_name: "work".into(),
-            input: json!({"data":"$$tc(99)","marker":marker}),
+            input: json!({"data":"$$tc(99)","marker":marker}).into(),
             thought_signature: None,
         })
     };
@@ -1042,7 +1042,8 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
                         "data": "extra $$tc(2)",
                         "program": "export const x = $$tc(2)\nexport const y = \"$$tc(2)\"",
                         "other": "$$tc(2)",
-                    }),
+                    })
+                    .into(),
                     thought_signature: None,
                 }),
             ],
@@ -1182,7 +1183,7 @@ async fn a_call_without_opt_in_has_no_set() {
                 broca_protocol::ToolCall {
                     tool_call_id: broca_protocol::ToolCallId("call-2".into()),
                     tool_name: "work".into(),
-                    input: json!({"data": "$$tc(2)"}),
+                    input: json!({"data": "$$tc(2)"}).into(),
                     thought_signature: None,
                 },
             )],

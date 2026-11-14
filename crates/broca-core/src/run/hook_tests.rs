@@ -171,7 +171,7 @@ pub(super) fn call(id: &str) -> ToolCall {
     ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "edit".into(),
-        input: json!({"f":"original"}),
+        input: json!({"f":"original"}).into(),
         thought_signature: Some("signed".into()),
     }
 }
@@ -558,7 +558,7 @@ async fn mapped_json_stays_structured_with_zero_post_tool_calls() {
     let expected = value.clone();
     let plane = crate::StubToolPlane::new().with_tool("edit", move |_| {
         crate::StubReply::Output(ToolOutput::Json {
-            value: value.clone(),
+            value: value.clone().into(),
         })
     });
     let result = batch(
@@ -572,7 +572,9 @@ async fn mapped_json_stays_structured_with_zero_post_tool_calls() {
     .await;
     assert_eq!(
         result.results[0].output,
-        ToolOutput::Json { value: expected }
+        ToolOutput::Json {
+            value: expected.into()
+        }
     );
     assert!(seen.lock().unwrap().is_empty());
     let _ = writer.shutdown().await;
@@ -1222,7 +1224,7 @@ async fn excluded_case(kind: &str) {
             crate::StubReply::PlaneUnavailable("offline".into())
         } else {
             crate::StubReply::Output(ToolOutput::Json {
-                value: json!({"ok":true}),
+                value: json!({"ok":true}).into(),
             })
         }
     });

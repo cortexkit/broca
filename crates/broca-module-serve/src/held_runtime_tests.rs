@@ -145,7 +145,7 @@ fn records(bind: &BindIdentity) -> Vec<WalRecord> {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("a".into()),
                     tool_name: "ask".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 })],
             }),
@@ -226,7 +226,7 @@ async fn large_stale_outbox_does_not_delay_held_result_intake() {
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(format!("inline-{call}")),
                         tool_name: "ask".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                         thought_signature: None,
                     })
                 })

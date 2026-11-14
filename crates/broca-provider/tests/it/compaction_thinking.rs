@@ -43,7 +43,7 @@ fn seed() -> Vec<Message> {
     pending.content.push(ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId("call-1".into()),
         tool_name: "record_note".into(),
-        input: json!({"value": 599}),
+        input: json!({"value": 599}).into(),
         thought_signature: None,
     }));
     vec![
@@ -613,7 +613,7 @@ fn an_asynchronous_view_strips_invalidated_thinking_or_waits_for_the_open_tool_t
     pending.content.push(ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId("call-9".into()),
         tool_name: "record_note".into(),
-        input: json!({}),
+        input: json!({}).into(),
         thought_signature: None,
     }));
     open.truncate(1);

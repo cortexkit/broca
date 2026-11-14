@@ -307,7 +307,7 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                         key,
                         &call.tool_call_id.0,
                         &call.tool_name,
-                        &call.input,
+                        &(call.input).parse(),
                         limits,
                     );
                     if let Some(fact) = entry

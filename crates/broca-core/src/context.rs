@@ -3209,7 +3209,7 @@ mod tests {
                         thought_signature: None,
                         tool_call_id: ToolCallId("t1".into()),
                         tool_name: "edit".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                     })],
                 }
                 .into(),
@@ -3560,7 +3560,7 @@ mod tests {
                         thought_signature: None,
                         tool_call_id: ToolCallId("t2".into()),
                         tool_name: "read".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                     })],
                 })
                 .into(),

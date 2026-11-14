@@ -398,9 +398,9 @@ fn assistant(
                     input: if matches!(state["status"].as_str(), Some("pending" | "running"))
                         && state["input"].is_null()
                     {
-                        serde_json::json!({})
+                        serde_json::json!({}).into()
                     } else {
-                        state["input"].clone()
+                        state["input"].clone().into()
                     },
                     thought_signature: None,
                 }));

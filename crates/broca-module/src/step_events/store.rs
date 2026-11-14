@@ -38,6 +38,8 @@ fn apply_step_end(event: &mut StepFinished, end: &broca_session_store::record::S
         if let Some(model) = end
             .fallback
             .as_ref()
+            .map(broca_protocol::json::Json::parse)
+            .as_ref()
             .and_then(|v| v.get("served_model"))
             .and_then(|v| v.as_str())
         {
@@ -65,8 +67,8 @@ fn step_envelope(end: &broca_session_store::record::StepEnd) -> broca_wal::recor
         reasoning_included_in_output: usage.and_then(|usage| usage.reasoning_tokens.map(|_| true)),
         ..Default::default()
     };
-    if let Some(iterations) = end
-        .fallback
+    let fallback = end.fallback.as_ref().map(broca_protocol::json::Json::parse);
+    if let Some(iterations) = fallback
         .as_ref()
         .and_then(|v| v.get("usage_iterations"))
         .and_then(|v| v.as_array())
@@ -349,7 +351,11 @@ impl Observer {
                 let Some(id) = &warmed.attempt_id else {
                     return;
                 };
-                let Some(facts) = &warmed.billing else {
+                let Some(facts) = warmed
+                    .billing
+                    .as_ref()
+                    .map(broca_protocol::json::Json::parse)
+                else {
                     return;
                 };
                 let Some(finished_at_ms) = facts.get("finished_at_ms").and_then(|v| v.as_u64())
@@ -565,7 +571,7 @@ mod tests {
             fallback: Some(json!({"usage_iterations":[
                 {"model":"served", "cache_creation":{"ephemeral_5m_input_tokens":0, "ephemeral_1h_input_tokens":12}},
                 {"model":"served", "cache_creation":{"ephemeral_1h_input_tokens":8}}
-            ]})),
+            ]}).into()),
             by_model: vec![ModelStepUsage {
                 provider: "serving-provider".into(),
                 model: "served".into(),

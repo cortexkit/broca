@@ -76,7 +76,10 @@ impl RunWait {
                     .error
                     .as_ref()
                     .and_then(|error| {
-                        serde_json::from_value::<broca_protocol::ProviderError>(error.clone()).ok()
+                        serde_json::from_value::<broca_protocol::ProviderError>(
+                            error.clone().parse(),
+                        )
+                        .ok()
                     })
                     .as_ref()
                     .and_then(broca_protocol::provider::await_message);
@@ -86,8 +89,7 @@ impl RunWait {
                     pause
                         .account_limit
                         .as_ref()
-                        .and_then(|limit| limit.get("resume_not_before_ms"))
-                        .and_then(serde_json::Value::as_u64),
+                        .and_then(|limit| limit.parse().get("resume_not_before_ms")?.as_u64()),
                 ));
             }
             Record::ToolHeld(held) => {
@@ -105,7 +107,9 @@ impl RunWait {
                     .error
                     .as_ref()
                     .map(|error| {
-                        serde_json::from_value::<broca_protocol::ProviderError>(error.clone())
+                        serde_json::from_value::<broca_protocol::ProviderError>(
+                            error.clone().parse(),
+                        )
                     })
                     .transpose()
                     .map_err(|error| format!("a run end's error: {error}"))?;

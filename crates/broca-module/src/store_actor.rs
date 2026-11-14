@@ -3828,9 +3828,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run_id: crate::actor::run_id_of_queued(&submission),
             one_shot: self.one_shot_submissions.contains(&submission),
             conversation_key: queue::receipt_field(&send, "conversation_key")
+                .as_ref()
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             title: queue::receipt_field(&send, "title")
+                .as_ref()
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             send_id: send.send_id.clone(),
@@ -3847,10 +3849,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             },
             manifest: self.frozen_manifest()?,
             session_class: queue::receipt_field(&send, "session_class")
+                .as_ref()
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             prepared: Prepared {
                 retention: queue::receipt_field(&send, "retention")
+                    .as_ref()
                     .and_then(serde_json::Value::as_u64),
                 ..Prepared::default()
             },
@@ -4490,7 +4494,9 @@ fn retry_of_queued(
     submission_id: broca_protocol::SubmissionId,
 ) -> SendOutcome {
     let reuse = |differing| SendOutcome::SendIdReuse { differing };
-    if queue::receipt_field(existing, "conversation_key").and_then(serde_json::Value::as_str)
+    if queue::receipt_field(existing, "conversation_key")
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
         != conversation_key
     {
         return reuse("conversation_key");
@@ -4503,8 +4509,8 @@ fn retry_of_queued(
     if existing.delivery != mode {
         return reuse("delivery");
     }
-    let stored = queue::receipt_field(existing, "request_identity_digest")
-        .and_then(serde_json::Value::as_str);
+    let stored = queue::receipt_field(existing, "request_identity_digest");
+    let stored = stored.as_ref().and_then(serde_json::Value::as_str);
     // The queued request doesn't keep the client message id; the digest does.
     if stored.and_then(broca_core::digest_client_message_id) != request.client_message_id {
         return reuse("client_message_id");

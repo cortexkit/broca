@@ -334,7 +334,12 @@ async fn run_conversation(token: &str, run_label: &str, rule: CrossModelThinking
             let results = calls
                 .iter()
                 .map(|call| {
-                    let n = call.input.get("n").and_then(Value::as_u64).unwrap_or(0);
+                    let n = call
+                        .input
+                        .parse()
+                        .get("n")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     let dividend = 1000 + (n * 7919 + step * 104_729) % 9000;
                     let divisor = 13 + step;
                     ContentBlock::ToolResult(ToolResult {

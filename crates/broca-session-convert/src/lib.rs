@@ -876,7 +876,7 @@ fn convert_record(
                 ts_ms: f.u64("ts_ms"),
                 retries_used: f.u64("retries_used").unwrap_or_default() as u32,
                 interrupt_reason: f.string("interrupt_reason"),
-                error: f.take("error"),
+                error: (f.take("error")).map(Into::into),
             }));
             // Today's storage billed this run when it ended, so the converted session owes no
             // billing for it and never bills it again.
@@ -905,7 +905,7 @@ fn convert_record(
                     message_marks.as_ref(),
                 ),
                 message_marks,
-                receipt: f.rest(),
+                receipt: (f.rest()).map(Into::into),
             }));
         }
         "send_delivered" => send_delivered(&mut f, state, out)?,
@@ -991,8 +991,8 @@ fn convert_record(
                 run_id: f.req_string("run_id"),
                 reason,
                 ts_ms: f.u64("ts_ms"),
-                error: f.take("error"),
-                account_limit: f.take("account_limit"),
+                error: (f.take("error")).map(Into::into),
+                account_limit: (f.take("account_limit")).map(Into::into),
             }));
         }
         "tool_call_provider_held" => out.records.push(Record::ToolHeld(ToolHeld {
@@ -1083,8 +1083,8 @@ fn convert_record(
                 ttl_ms: f.u64("ttl_ms"),
                 expires_at_ms: f.u64("expires_at_ms"),
                 attempt_id: f.string("attempt_id"),
-                billing: (!billing.is_empty()).then_some(Value::Object(billing)),
-                ratelimit_headers: f.take("ratelimit_headers"),
+                billing: (!billing.is_empty()).then_some(Value::Object(billing).into()),
+                ratelimit_headers: (f.take("ratelimit_headers")).map(Into::into),
                 reached_cache: reached_cache.then_some(true),
                 requested_cache_ttl_ms: state.requested_cache_ttl.filter(|_| reached_cache),
             }))
@@ -1173,7 +1173,7 @@ fn convert_record(
             out.records.push(Record::View(View {
                 version,
                 checksum,
-                edits,
+                edits: edits.into(),
                 built_through: f.string("built_through"),
                 new_signed: f.string("new_signed"),
                 applied_by: f.string("applied_by"),
@@ -1186,8 +1186,10 @@ fn convert_record(
         })),
         "compaction_message" => {
             let body = f.rest().unwrap_or(Value::Null);
-            out.records
-                .push(Record::Compaction(Compaction { version: 1, body }));
+            out.records.push(Record::Compaction(Compaction {
+                version: 1,
+                body: body.into(),
+            }));
         }
         "recovery_call_closed" => {
             let result: ToolResult = f
@@ -1363,9 +1365,9 @@ fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
         setup,
         written_at_ms: f.u64("written_at_ms"),
         ts_ms: f.u64("ts_ms"),
-        request: request_rest,
+        request: (request_rest).map(Into::into),
         delivery: f.string("delivery"),
-        receipt: f.rest(),
+        receipt: (f.rest()).map(Into::into),
     }));
     Ok(())
 }
@@ -1533,7 +1535,7 @@ fn model_step_finished(
             calls += 1;
             state
                 .call_inputs
-                .insert(call.tool_call_id.0.clone(), call.input.clone());
+                .insert(call.tool_call_id.0.clone(), call.input.clone().parse());
         }
     }
     let usage: Option<Usage> = f.parse("usage")?;
@@ -1597,8 +1599,8 @@ fn model_step_finished(
         service_tier_used,
         speed_used,
         call_count: calls,
-        hooks,
-        fallback,
+        hooks: hooks.map(Into::into),
+        fallback: fallback.map(Into::into),
         budget_finalize: finalize,
         total_usage: (Some(total) != usage).then_some(total),
         stop_met: std::mem::take(&mut state.stop_met).then_some(true),
@@ -1653,8 +1655,8 @@ fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
         last_content_at_ms: f.u64("last_content_at_ms"),
         transport: f.string("transport"),
         served_account_ref: f.string("served_account_ref"),
-        billing: (!billing.is_empty()).then_some(Value::Object(billing)),
-        telemetry: f.rest(),
+        billing: (!billing.is_empty()).then_some(Value::Object(billing).into()),
+        telemetry: (f.rest()).map(Into::into),
         reached_cache: reached_cache.then_some(true),
         requested_cache_ttl_ms: state.requested_cache_ttl.filter(|_| reached_cache),
     };
@@ -1682,13 +1684,13 @@ fn tool_intent(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         tool_name: f.string("tool_name"),
         module_id: f.string("module_id"),
         args_digest,
-        args: (!same_as_call).then_some(args),
+        args: (!same_as_call).then_some(args.into()),
         key_derived: derived.is_some().then_some(true),
         call_key: recorded.or(derived),
         approval_digest: f.string("approval_digest"),
         dispatched_at_ms: f.u64("dispatched_at_ms"),
-        schema_pin: f.take("schema_pin"),
-        hooks: f.take("hooks"),
+        schema_pin: (f.take("schema_pin")).map(Into::into),
+        hooks: (f.take("hooks")).map(Into::into),
     }));
     Ok(())
 }
@@ -1750,8 +1752,8 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
         is_error,
         reason,
         finished_at_ms,
-        detail,
-        hooks,
+        detail: detail.map(Into::into),
+        hooks: hooks.map(Into::into),
         call_key,
     }));
 }

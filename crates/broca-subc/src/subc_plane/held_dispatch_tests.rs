@@ -249,7 +249,7 @@ fn call(id: &str) -> ToolCall {
     ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "tool".into(),
-        input: json!({}),
+        input: json!({}).into(),
         thought_signature: None,
     }
 }

@@ -22,7 +22,7 @@ fn call(id: &str, tool: &str, input: Value) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: tool.into(),
-        input,
+        input: input.into(),
         thought_signature: None,
     })
 }

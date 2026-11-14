@@ -2327,7 +2327,7 @@ pub(crate) fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         tool_call_id: tool_call_id.clone(),
                         tool_name: "lookup".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     })],
                 }

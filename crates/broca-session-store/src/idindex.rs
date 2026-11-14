@@ -176,7 +176,13 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         // A fork's session is small and short-lived: its reads fold every record.
         Record::Fork(_) => {}
         // A steer's send id is part of its receipt, which the queue owns.
-        Record::Steer(steer) => push(IdKind::SendId, json_str(steer.receipt.as_ref(), "send_id")),
+        Record::Steer(steer) => {
+            let receipt = steer
+                .receipt
+                .as_ref()
+                .map(broca_protocol::json::Json::parse);
+            push(IdKind::SendId, json_str(receipt.as_ref(), "send_id"));
+        }
         // Events carry the old record's fields whole; their idempotency keys keep their names.
         Record::Event(event) => {
             let body = event.body.as_ref();

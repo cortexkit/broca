@@ -422,7 +422,7 @@ fn call(id: &str, name: &str, input: Value) -> ContentBlock {
         thought_signature: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: name.into(),
-        input,
+        input: input.into(),
     })
 }
 
@@ -787,7 +787,7 @@ impl ToolPlane for Spy {
             return DispatchResult::Completed(ToolResult {
                 tool_call_id: call.tool_call_id.clone(),
                 output: ToolOutput::Json {
-                    value: json!({"rows": 2}),
+                    value: json!({"rows": 2}).into(),
                 },
                 is_error: false,
             });
@@ -1557,7 +1557,11 @@ fn pause_names_its_attempt(writer: &Recording<'_, '_>) {
         let Record::Pause(pause) = record else {
             continue;
         };
-        let Some(limit) = &pause.account_limit else {
+        let Some(limit) = pause
+            .account_limit
+            .as_ref()
+            .map(broca_protocol::json::Json::parse)
+        else {
             continue;
         };
         let seq = limit["failed_attempt_seq"]
@@ -1567,7 +1571,7 @@ fn pause_names_its_attempt(writer: &Recording<'_, '_>) {
         assert!(
             matches!(named, Record::Attempt(attempt)
             if attempt.billing.as_ref().is_some_and(|billing| {
-                !billing["account_limit_disposition"].is_null()
+                !billing.parse()["account_limit_disposition"].is_null()
             })),
             "the pause names {named:?}"
         );
@@ -4406,7 +4410,7 @@ impl SteerSink for NewSink {
                 input,
                 written_at_ms,
                 tags_v1,
-                receipt,
+                receipt: receipt.map(Into::into),
                 message_marks,
             }));
     }
@@ -10492,7 +10496,9 @@ async fn an_enrolling_run_whose_request_cant_be_ready_ends_with_the_error_and_se
                 .unwrap()
                 .into_iter()
                 .filter_map(|(_, record)| match record {
-                    Record::RunEnd(end) if end.run_id == "r2" => end.error,
+                    Record::RunEnd(end) if end.run_id == "r2" => {
+                        end.error.map(|error| error.parse())
+                    }
                     _ => None,
                 })
                 .collect();

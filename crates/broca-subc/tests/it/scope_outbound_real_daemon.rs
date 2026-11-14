@@ -460,7 +460,7 @@ fn call(marker: &str, delay_ms: u64) -> ToolCall {
         thought_signature: None,
         tool_call_id: ToolCallId(format!("call-{marker}")),
         tool_name: TOOL.into(),
-        input: serde_json::json!({ "marker": marker, "delay_ms": delay_ms }),
+        input: serde_json::json!({ "marker": marker, "delay_ms": delay_ms }).into(),
     }
 }
 

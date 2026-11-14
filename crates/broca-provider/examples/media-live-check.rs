@@ -144,7 +144,7 @@ fn add_exchange(
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(format!("synthetic_{stage}")),
                 tool_name: TOOL_NAME.into(),
-                input: json!({}),
+                input: json!({}).into(),
                 thought_signature: matches!(
                     profile.profile,
                     MediaProfileId::Gemini3 | MediaProfileId::CodeAssistGemini3

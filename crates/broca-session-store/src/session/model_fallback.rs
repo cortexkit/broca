@@ -83,11 +83,9 @@ impl ReplyFallbacks {
                     return;
                 }
                 let Some(mid) = &step.mid else { return };
-                let Some(fallback) = end
-                    .fallback
-                    .as_ref()
-                    .and_then(|value| serde_json::from_value::<Fallback>(value.clone()).ok())
-                else {
+                let Some(fallback) = end.fallback.as_ref().and_then(|value| {
+                    serde_json::from_value::<Fallback>(value.clone().parse()).ok()
+                }) else {
                     return;
                 };
                 // A schedule or usage alone cannot prove the step was replaced.
@@ -181,7 +179,7 @@ mod tests {
             service_tier_used: None,
             speed_used: None,
             call_count: 0,
-            fallback: Some(fallback),
+            fallback: Some(fallback.into()),
             hooks: None,
             budget_finalize: None,
             total_usage: None,

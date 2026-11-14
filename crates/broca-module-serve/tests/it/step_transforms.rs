@@ -181,7 +181,7 @@ fn call(id: &str, input: Value) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "work".into(),
-        input,
+        input: input.into(),
         thought_signature: Some("tool-signature".into()),
     })
 }
@@ -945,7 +945,7 @@ async fn post_tool_excludes_pre_tool_unavailable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn post_tool_excludes_structured_json_between_caps() {
     let output = ToolOutput::Json {
-        value: json!({"large":"x".repeat(1024*1024-8192)}),
+        value: json!({"large":"x".repeat(1024*1024-8192)}).into(),
     };
     let original = output.clone();
     let (mut rig, daemon, state, plan) = start(

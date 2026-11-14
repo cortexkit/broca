@@ -122,7 +122,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
             thought_signature: None,
             tool_call_id: ToolCallId(id.into()),
             tool_name: name.into(),
-            input: json!({}),
+            input: json!({}).into(),
         })],
     }
 }
@@ -800,13 +800,13 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 thought_signature: None,
                 tool_call_id: ToolCallId("t1".into()),
                 tool_name: "edit".into(),
-                input: json!({"f": "a"}),
+                input: json!({"f": "a"}).into(),
             }),
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
                 tool_call_id: ToolCallId("t2".into()),
                 tool_name: "edit".into(),
-                input: json!({"f": "b"}),
+                input: json!({"f": "b"}).into(),
             }),
         ],
     };
@@ -3293,13 +3293,13 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
                         thought_signature: None,
                         tool_call_id: ToolCallId("c1".into()),
                         tool_name: "edit".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                     }),
                     ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
                         tool_call_id: ToolCallId("c2".into()),
                         tool_name: "edit".into(),
-                        input: json!({}),
+                        input: json!({}).into(),
                     }),
                 ],
             }

@@ -14,7 +14,7 @@ fn call(id: &str) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "read".into(),
-        input: json!({ "path": id }),
+        input: json!({ "path": id }).into(),
         thought_signature: None,
     })
 }

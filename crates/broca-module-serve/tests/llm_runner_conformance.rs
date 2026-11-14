@@ -2811,7 +2811,7 @@ impl LlmRunnerSubject for BrocaSubject {
                     match &result.output {
                         broca_protocol::ToolOutput::Text { text } => Some(text.clone()),
                         broca_protocol::ToolOutput::Json { value } => {
-                            value.as_str().map(str::to_owned)
+                            value.parse().as_str().map(str::to_owned)
                         }
                         _ => None,
                     }
@@ -3049,7 +3049,7 @@ impl LlmRunnerSubject for BrocaSubject {
                             thought_signature: None,
                             tool_call_id: ToolCallId(call.tool_call_id.clone()),
                             tool_name: call.tool.clone(),
-                            input: call.arguments.clone(),
+                            input: call.arguments.clone().into(),
                         })],
                     ),
                     Message::new(

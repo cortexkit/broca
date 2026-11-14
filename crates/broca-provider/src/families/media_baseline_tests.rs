@@ -88,7 +88,7 @@ fn every_family_renders_parts_as_ordered_carrier_markers() {
                             vec![ContentBlock::ToolCall(ToolCall {
                                 tool_call_id: ToolCallId("call".into()),
                                 tool_name: "screenshot".into(),
-                                input: json!({}),
+                                input: json!({}).into(),
                                 thought_signature: None,
                             })],
                         ),

@@ -358,7 +358,11 @@ fn convert_tool_request(part: &Value) -> Option<ToolCall> {
     Some(ToolCall {
         tool_call_id: ToolCallId(call_id.to_string()),
         tool_name: tool_name.to_string(),
-        input: value.get("arguments").cloned().unwrap_or(Value::Null),
+        input: value
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Value::Null)
+            .into(),
         thought_signature: None,
     })
 }
@@ -391,7 +395,7 @@ fn convert_tool_response(part: &Value, omitted_images: &mut usize) -> Option<Too
             match value.get("structuredContent") {
                 Some(structured_content) => (
                     ToolOutput::Json {
-                        value: structured_content.clone(),
+                        value: structured_content.clone().into(),
                     },
                     false,
                 ),
@@ -431,7 +435,9 @@ fn content_is_empty(content: &Value) -> bool {
 
 fn content_output(content: Value) -> ToolOutput {
     let Some(parts) = content.as_array() else {
-        return ToolOutput::Json { value: content };
+        return ToolOutput::Json {
+            value: content.into(),
+        };
     };
     let texts: Option<Vec<&str>> = parts
         .iter()
@@ -445,7 +451,9 @@ fn content_output(content: Value) -> ToolOutput {
         Some(texts) => ToolOutput::Text {
             text: texts.join("\n"),
         },
-        None => ToolOutput::Json { value: content },
+        None => ToolOutput::Json {
+            value: content.into(),
+        },
     }
 }
 
@@ -457,7 +465,7 @@ fn output_text(content: &Value) -> String {
             broca_protocol::MediaMarkerReason::NotRequested,
         ),
         ToolOutput::Text { text } => text,
-        ToolOutput::Json { value } => value_text(&value),
+        ToolOutput::Json { value } => value_text(&(value).parse()),
         ToolOutput::Denied { reason } => reason,
         ToolOutput::Error { message, .. } => message,
     }
@@ -719,7 +727,12 @@ mod tests {
             })
             .unwrap();
         assert!(!result.is_error);
-        assert_eq!(result.output, ToolOutput::Json { value: structured });
+        assert_eq!(
+            result.output,
+            ToolOutput::Json {
+                value: structured.into()
+            }
+        );
 
         let _ = fs::remove_file(path);
     }

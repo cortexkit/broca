@@ -734,7 +734,7 @@ fn a_seal_carries_ledger_records_into_the_new_log(cipher: Cipher) {
         let view = Record::View(crate::record::View {
             version: 3,
             checksum: "c3".into(),
-            edits: serde_json::json!([]),
+            edits: serde_json::json!([]).into(),
             built_through: None,
             new_signed: None,
             applied_by: None,

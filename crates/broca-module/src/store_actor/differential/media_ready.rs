@@ -405,7 +405,7 @@ async fn ends(session: &Session<&'static MemoryBackend>) -> Vec<(String, Value, 
                 end.run_id,
                 json!(end.reason),
                 end.error
-                    .and_then(|error| error.get("message").cloned())
+                    .and_then(|error| error.parse().get("message").cloned())
                     .unwrap_or(Value::Null),
             )),
             _ => None,

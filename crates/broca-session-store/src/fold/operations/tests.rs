@@ -354,7 +354,7 @@ fn the_refusal_schedule_comes_from_the_run_start_and_the_steps_that_change_it() 
     }
     let mut changed = step_end(0, false);
     if let Record::StepEnd(step) = &mut changed {
-        step.fallback = Some(serde_json::json!({"refusal_fallback": {"phase": "fallback"}}));
+        step.fallback = Some(serde_json::json!({"refusal_fallback": {"phase": "fallback"}}).into());
     }
     let unchanged = step_end(0, false);
     let operations = fold(&[
@@ -382,7 +382,7 @@ fn an_account_limit_pause_clears_when_the_run_continues() {
         reason: PauseReason::AccountLimit,
         ts_ms: None,
         error: None,
-        account_limit: Some(serde_json::json!({"resume_not_before_ms": 5})),
+        account_limit: Some(serde_json::json!({"resume_not_before_ms": 5}).into()),
     });
     let paused = fold(&[start(), pause.clone()]).unwrap().run.unwrap();
     assert!(paused.account_limit_pause.is_some());
@@ -445,7 +445,7 @@ fn an_accepted_view_waits_for_a_step_to_apply_it() {
         Record::View(crate::record::View {
             version,
             checksum: format!("c{version}"),
-            edits: serde_json::json!([]),
+            edits: serde_json::json!([]).into(),
             built_through: None,
             new_signed: None,
             applied_by: None,
@@ -700,7 +700,7 @@ fn the_title_is_the_newest_one_any_send_carried() {
     };
     let mut titled_queue = queued("q", None);
     if let Record::QueuedSend(send) = &mut titled_queue {
-        send.receipt = Some(serde_json::json!({ "title": "queued", "retention": 60 }));
+        send.receipt = Some(serde_json::json!({ "title": "queued", "retention": 60 }).into());
     }
     let steer = |receipt: Option<serde_json::Value>| {
         Record::Steer(Steer {
@@ -709,7 +709,7 @@ fn the_title_is_the_newest_one_any_send_carried() {
             input: Vec::new(),
             written_at_ms: None,
             tags_v1: None,
-            receipt,
+            receipt: receipt.map(Into::into),
             message_marks: None,
         })
     };

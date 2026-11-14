@@ -328,7 +328,12 @@ async fn run_conversation(token: &str, model: &str, run_label: &str) -> Outcome 
                 .map(|call| {
                     // A deterministic small puzzle per result, so each step has something to
                     // reason about and the model thinks before every call.
-                    let n = call.input.get("n").and_then(Value::as_u64).unwrap_or(0);
+                    let n = call
+                        .input
+                        .parse()
+                        .get("n")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     let dividend = 1000 + (n * 7919 + step as u64 * 104_729) % 9000;
                     let divisor = 13 + step as u64;
                     ContentBlock::ToolResult(ToolResult {

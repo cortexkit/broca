@@ -519,7 +519,7 @@ fn fork_reply_call() -> broca_protocol::content::ContentBlock {
     broca_protocol::content::ContentBlock::ToolCall(broca_protocol::content::ToolCall {
         tool_call_id: broca_protocol::ToolCallId("call-1".into()),
         tool_name: "forbidden".into(),
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         thought_signature: None,
     })
 }

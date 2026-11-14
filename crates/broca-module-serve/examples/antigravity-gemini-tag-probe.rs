@@ -540,7 +540,7 @@ fn synthetic_replies() -> (Vec<ContentBlock>, Vec<ContentBlock>) {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("dry-call".into()),
                 tool_name: TOOL.into(),
-                input: json!({"path":"sample.txt"}),
+                input: json!({"path":"sample.txt"}).into(),
                 thought_signature: Some("dry-call-signature".into()),
             }),
         ],

@@ -285,7 +285,7 @@ async fn a_failed_cached_head_does_not_hide_a_stale_history_version() {
     end.usage = None;
     // The storage fold retains opaque error JSON, but control projection requires a
     // ProviderError. This leaves a readable snapshot with a genuinely failing stream head.
-    end.error = Some(serde_json::json!("not a ProviderError"));
+    end.error = Some(serde_json::json!("not a ProviderError").into());
     session
         .append(&[Record::RunStart(start), Record::RunEnd(end)], true)
         .await

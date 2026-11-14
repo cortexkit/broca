@@ -535,7 +535,9 @@ fn behaviour(variant: Variant, step: u8, answer: Option<&Answer>) -> Value {
             calls
                 .iter()
                 .find(|call| call.tool_name == CHANGED_TOOL)
-                .is_some_and(|call| call.input.get("verification_tag") == Some(&json!("KITE"))),
+                .is_some_and(|call| {
+                    call.input.parse().get("verification_tag") == Some(&json!("KITE"))
+                }),
             "lookup_station must supply verification_tag=KITE",
         ),
         4 => {

@@ -45,7 +45,7 @@ fn assistant() -> Message {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("call".into()),
                 tool_name: "read".into(),
-                input: json!({"path":"a"}),
+                input: json!({"path":"a"}).into(),
                 thought_signature: None,
             }),
         ],
@@ -65,7 +65,7 @@ fn model_step(message: &Message) -> WalRecord {
 }
 
 fn terminal() -> WalRecord {
-    serde_json::from_value(json!({"type":"tool_result","batch_id":"b","result":ToolResult { tool_call_id:ToolCallId("call".into()), output:ToolOutput::Json { value:json!({"a":1}) }, is_error:false },"outcome":"completed","finished_at_ms":30})).unwrap()
+    serde_json::from_value(json!({"type":"tool_result","batch_id":"b","result":ToolResult { tool_call_id:ToolCallId("call".into()), output:ToolOutput::Json { value:json!({"a":1}).into() }, is_error:false },"outcome":"completed","finished_at_ms":30})).unwrap()
 }
 
 fn marked_input_entry(

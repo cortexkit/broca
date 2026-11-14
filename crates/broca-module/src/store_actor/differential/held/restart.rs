@@ -227,8 +227,11 @@ async fn story(side: &Side) -> Vec<String> {
                     end.reason,
                     end.error
                         .as_ref()
-                        .and_then(|error| error.get("provider_code"))
-                        .and_then(Value::as_str)
+                        .map(|error| error.parse())
+                        .and_then(|error| error
+                            .get("provider_code")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned))
                 )),
                 _ => {}
             }

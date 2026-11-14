@@ -525,14 +525,16 @@ impl Side {
                         pause.run_id,
                         pause.reason,
                         pause.error,
-                        normalized_pause(pause.account_limit)
+                        normalized_pause((pause.account_limit).map(|json| json.parse()))
                     ])),
                     Record::Resumed(resumed) => result.push(json!(["resume", resumed.run_id])),
                     Record::RunEnd(end) => result.push(json!([
                         "end",
                         end.run_id,
                         end.reason,
-                        end.error.as_ref().map(|error| &error["provider_code"])
+                        end.error
+                            .as_ref()
+                            .map(|error| error.parse()["provider_code"].clone())
                     ])),
                     _ => {}
                 }
@@ -676,13 +678,14 @@ async fn account_limit_timer_requires_the_durable_source_evidence() {
         "attempt_id",
     ] {
         let mut changed = pause.clone();
-        let evidence = changed.account_limit.as_mut().unwrap();
+        let mut evidence = changed.account_limit.as_ref().unwrap().parse();
         evidence[field] = match field {
             "credential_id" => json!("other"),
             "request_body_sha256" => json!("1".repeat(64)),
             "attempt_id" => json!(broca_core::attempt_id::mint_attempt_id().unwrap().as_str()),
             _ => json!(999999),
         };
+        changed.account_limit = Some(evidence.into());
         actor.append_own(Record::Pause(changed)).await.unwrap();
         assert!(actor.current_account_limit().await.is_err(), "{field}");
     }
@@ -695,7 +698,9 @@ async fn account_limit_timer_requires_the_durable_source_evidence() {
         .unwrap_err()
         .contains("no recovery evidence"));
     let mut permanent = pause.clone();
-    permanent.error.as_mut().unwrap()["class"] = json!("permanent");
+    let mut error = permanent.error.as_ref().unwrap().parse();
+    error["class"] = json!("permanent");
+    permanent.error = Some(error.into());
     actor.append_own(Record::Pause(permanent)).await.unwrap();
     assert!(actor
         .current_account_limit()
@@ -710,7 +715,9 @@ async fn account_limit_timer_requires_the_durable_source_evidence() {
         .await
         .unwrap();
     let mut unnamed = pause.clone();
-    unnamed.account_limit.as_mut().unwrap()["failed_attempt_seq"] = json!(seq);
+    let mut limit = unnamed.account_limit.as_ref().unwrap().parse();
+    limit["failed_attempt_seq"] = json!(seq);
+    unnamed.account_limit = Some(limit.into());
     actor.append_own(Record::Pause(unnamed)).await.unwrap();
     assert!(actor
         .current_account_limit()

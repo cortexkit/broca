@@ -1046,7 +1046,7 @@ fn deepseek_history() -> broca_protocol::CallOptions {
                     thought_signature: None,
                     tool_call_id: ToolCallId("call_0".into()),
                     tool_name: "read".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 }),
             ],
         ),

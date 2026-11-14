@@ -708,7 +708,7 @@ async fn reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend() {
                 broca_protocol::ToolCall {
                     tool_call_id: broca_protocol::ToolCallId("reasoning-call".into()),
                     tool_name: "work".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                     thought_signature: None,
                 },
             )],

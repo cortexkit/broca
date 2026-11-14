@@ -168,7 +168,7 @@ fn call_step(step: u64, call: &str) -> WalRecord {
             content: vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(call.into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             })],
         }),

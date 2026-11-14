@@ -510,7 +510,7 @@ async fn fixture_with_mode<F: WireFamily + 'static>(
                             ContentBlock::ToolCall(broca_protocol::ToolCall {
                                 tool_call_id: broca_protocol::ToolCallId("prior-call".into()),
                                 tool_name: "read".into(),
-                                input: json!({"path":"a"}),
+                                input: json!({"path":"a"}).into(),
                                 thought_signature: None,
                             }),
                         ],

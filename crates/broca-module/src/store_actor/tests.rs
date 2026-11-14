@@ -55,7 +55,7 @@ pub(super) fn read_step(id: &str) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: broca_protocol::ToolCallId("c1".into()),
                     tool_name: "read".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 })],
             },
         }),

@@ -1661,7 +1661,7 @@ impl OpenAiResponsesNormalizer {
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(buf.call_id),
                     tool_name: buf.name,
-                    input,
+                    input: input.into(),
                     thought_signature: None,
                 }),
             ));

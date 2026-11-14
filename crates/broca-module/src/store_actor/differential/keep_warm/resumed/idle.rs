@@ -206,7 +206,7 @@ async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: 
     assert_eq!(w.step_id, 2);
     assert_eq!(w.requested_cache_ttl_ms, Some(3_600_000));
     assert!(w.attempt_id.is_some());
-    assert!(w.billing.as_ref().unwrap()["finished_at_ms"].is_u64());
+    assert!(w.billing.as_ref().unwrap().parse()["finished_at_ms"].is_u64());
     let first_facts = export.read_export_page(None, 1000).unwrap().facts;
     assert_eq!(
         first_facts.len(),

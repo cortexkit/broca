@@ -68,7 +68,7 @@ impl Step {
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(id.into()),
                 tool_name: "work".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 thought_signature: None,
             })
         };
@@ -459,7 +459,7 @@ impl ToolPlane for ScriptedTools {
             .dispatched_inputs
             .lock()
             .unwrap()
-            .push(call.input.clone());
+            .push(call.input.clone().parse());
         if let Some(result) = self
             .0
             .tool_results
@@ -494,7 +494,7 @@ struct ScriptedApproval(Arc<Script>);
 impl broca_core::ApprovalPolicy for ScriptedApproval {
     async fn decide(&self, call: &ToolCall) -> broca_protocol::approval::ApprovalResponse {
         use broca_protocol::approval::ApprovalResponse;
-        if self.0.deny_input.lock().unwrap().as_ref() == Some(&call.input) {
+        if self.0.deny_input.lock().unwrap().as_ref() == Some(&(call.input).parse()) {
             ApprovalResponse::Deny {
                 tool_call_id: call.tool_call_id.clone(),
                 reason: "input denied".into(),

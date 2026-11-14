@@ -641,7 +641,7 @@ async fn served_tool_result_numbering_matches_runner_vectors() {
         if let Some(value) = case["result"].get("structuredContent") {
             if let WalRecord::ToolResult { result, .. } = &mut records[4] {
                 Arc::make_mut(result).output = ToolOutput::Json {
-                    value: value.clone(),
+                    value: value.clone().into(),
                 };
             }
         }

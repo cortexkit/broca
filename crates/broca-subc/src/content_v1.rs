@@ -74,7 +74,7 @@ pub(crate) fn json_dump_output_text_bytes(
         // Its object/array value needs only a byte count, not a second parse. Negotiated
         // tool-result/v1 normalization omits this program-only field.
         ToolOutput::Json { value } if value.is_object() || value.is_array() => {
-            let bytes = value.to_string().len();
+            let bytes = value.text().len();
             (bytes >= 200).then_some(bytes)
         }
         ToolOutput::Json { .. } | ToolOutput::Denied { .. } => None,

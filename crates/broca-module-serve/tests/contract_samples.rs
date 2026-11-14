@@ -1462,7 +1462,7 @@ async fn imported_duplicate_synthesized_results_have_no_call_key() {
             thought_signature: None,
             tool_call_id: ToolCallId("same".into()),
             tool_name: "work".into(),
-            input: json!({}),
+            input: json!({}).into(),
         });
         let result = ContentBlock::ToolResult(ToolResult {
             tool_call_id: ToolCallId("same".into()),

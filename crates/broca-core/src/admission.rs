@@ -4950,7 +4950,7 @@ mod tests {
                     vec![ContentBlock::ToolCall(broca_protocol::content::ToolCall {
                         tool_call_id: call_id.clone(),
                         tool_name: "work".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                         thought_signature: None,
                     })];
             }
@@ -5247,7 +5247,7 @@ mod tests {
                 thought_signature: None,
                 tool_call_id: call_id.clone(),
                 tool_name: "first".into(),
-                input: serde_json::Value::Null,
+                input: serde_json::Value::Null.into(),
             })];
         }
         records.push(tool_step);
@@ -5591,7 +5591,7 @@ mod tests {
                             thought_signature: None,
                             tool_call_id: call_id.clone(),
                             tool_name: "first".into(),
-                            input: serde_json::Value::Null,
+                            input: serde_json::Value::Null.into(),
                         })],
                     }
                     .into(),
@@ -5889,7 +5889,7 @@ mod tests {
                                     thought_signature: None,
                                     tool_call_id: ToolCallId(id.into()),
                                     tool_name: "first".into(),
-                                    input: serde_json::Value::Null,
+                                    input: serde_json::Value::Null.into(),
                                 })
                             })
                             .collect(),
@@ -6385,7 +6385,7 @@ mod tests {
                             thought_signature: None,
                             tool_call_id: ToolCallId("c".into()),
                             tool_name: "first".into(),
-                            input: serde_json::Value::Null,
+                            input: serde_json::Value::Null.into(),
                         })],
                     }
                     .into(),
@@ -6476,7 +6476,7 @@ mod tests {
                         thought_signature: None,
                         tool_call_id: ToolCallId("c".into()),
                         tool_name: "first".into(),
-                        input: serde_json::Value::Null,
+                        input: serde_json::Value::Null.into(),
                     })],
                 ),
             ),

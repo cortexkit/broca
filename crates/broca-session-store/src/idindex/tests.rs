@@ -117,7 +117,7 @@ fn records_name_their_ids() {
         input: Vec::new(),
         written_at_ms: None,
         tags_v1: None,
-        receipt: Some(json!({"send_id": "steer-1", "delivery": "steer"})),
+        receipt: Some(json!({"send_id": "steer-1", "delivery": "steer"}).into()),
         message_marks: None,
     });
     assert_eq!(

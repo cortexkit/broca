@@ -182,7 +182,7 @@ mod tests {
         ToolCall {
             tool_call_id: ToolCallId("reused".into()),
             tool_name: "read".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         }
     }

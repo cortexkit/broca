@@ -217,6 +217,12 @@ impl Gen for crate::interned::SharedJson {
     }
 }
 
+impl Gen for broca_protocol::json::Json {
+    fn gen(g: &mut G<'_>) -> Self {
+        Self::from_value(&serde_json::Value::gen(g))
+    }
+}
+
 impl Gen for serde_json::Value {
     fn gen(g: &mut G<'_>) -> Self {
         use serde_json::Value;

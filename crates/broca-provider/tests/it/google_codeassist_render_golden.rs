@@ -53,7 +53,7 @@ pub(crate) fn fixed_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_01".into()),
                 tool_name: "get_time".into(),
-                input: json!({"timezone": "Europe/Madrid"}),
+                input: json!({"timezone": "Europe/Madrid"}).into(),
             })],
         },
         Message {
@@ -111,7 +111,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "search".into(),
-                input: json!({"query": "broca"}),
+                input: json!({"query": "broca"}).into(),
             })],
         },
         Message {
@@ -140,7 +140,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "read".into(),
-                input: json!({"path": "README.md"}),
+                input: json!({"path": "README.md"}).into(),
             })],
         },
         Message {
@@ -276,7 +276,7 @@ fn google_codeassist_inherits_object_wrapping_for_array_json_tool_results() {
         panic!("fixed request must contain a tool result");
     };
     result.output = ToolOutput::Json {
-        value: json!(["first", "second"]),
+        value: json!(["first", "second"]).into(),
     };
     let mut frozen = google_codeassist_frozen_config("gemini-2.5-flash");
     frozen.project_id = Some("encouraging-env-qwp21".into());

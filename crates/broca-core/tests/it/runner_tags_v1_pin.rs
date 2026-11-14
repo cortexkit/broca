@@ -119,7 +119,7 @@ fn call(id: &str) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "lookup".into(),
-        input: json!({"q": "tags"}),
+        input: json!({"q": "tags"}).into(),
         thought_signature: None,
     })
 }

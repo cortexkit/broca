@@ -42,7 +42,7 @@ fn prompt(with_tags: bool) -> Vec<Message> {
     let call = |id: &str| ToolCall {
         tool_call_id: ToolCallId(id.into()),
         tool_name: "lookup".into(),
-        input: serde_json::json!({"q": "tags"}),
+        input: serde_json::json!({"q": "tags"}).into(),
         thought_signature: None,
     };
     vec![
@@ -86,7 +86,7 @@ fn prompt(with_tags: bool) -> Vec<Message> {
                     ContentBlock::ToolResult(ToolResult {
                         tool_call_id: ToolCallId("call-2".into()),
                         output: ToolOutput::Json {
-                            value: serde_json::json!({"hits": 2}),
+                            value: serde_json::json!({"hits": 2}).into(),
                         },
                         is_error: false,
                     }),

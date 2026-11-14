@@ -546,7 +546,7 @@ fn convert_tool(part: &Value) -> (ToolCall, Option<ToolResult>) {
     let call = ToolCall {
         tool_call_id: ToolCallId(call_id.to_string()),
         tool_name: tool_name.to_string(),
-        input,
+        input: input.into(),
         thought_signature: None,
     };
     let status = state.get("status").and_then(Value::as_str).unwrap_or("");
@@ -555,7 +555,9 @@ fn convert_tool(part: &Value) -> (ToolCall, Option<ToolResult>) {
             let output = state.get("output").cloned().unwrap_or(Value::Null);
             let output = match output {
                 Value::String(text) => ToolOutput::Text { text },
-                value => ToolOutput::Json { value },
+                value => ToolOutput::Json {
+                    value: value.into(),
+                },
             };
             Some(ToolResult {
                 tool_call_id: ToolCallId(call_id.to_string()),

@@ -73,7 +73,7 @@ async fn live_records(
         vec![ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("t1".into()),
             tool_name: "finish".into(),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             thought_signature: None,
         })]
     } else {

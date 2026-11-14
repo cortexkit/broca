@@ -3105,7 +3105,7 @@ mod executor {
                 Record::Pause(pause) => Some(pause.error.clone()),
                 _ => None,
             })?
-            .and_then(|error| serde_json::from_value(error).ok())
+            .and_then(|error| serde_json::from_value(error.parse()).ok())
     }
 
     type CredentialUseKey = (String, Option<String>, Option<String>);

@@ -258,7 +258,7 @@ fn walk(
                             call: RunToolCall::new(
                                 call.tool_call_id.0.clone(),
                                 call.tool_name.clone(),
-                                call.input.clone(),
+                                call.input.clone().parse(),
                                 "",
                                 0,
                             )
@@ -283,7 +283,7 @@ fn walk(
                 }) {
                     call.has_intent = true;
                     if let Some(args) = &intent.args {
-                        call.call.args = args.clone();
+                        call.call.args = args.clone().parse();
                     }
                     call.call.dispatched_to = intent.module_id.clone();
                     call.call.call_key = intent.call_key.clone();

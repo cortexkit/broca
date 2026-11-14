@@ -208,7 +208,7 @@ mod call_keepalive {
                 plane.windows.lock().unwrap().insert("aft".into(), 1);
                 let ctx = batch_ctx("vectors");
                 let mut call = call("read");
-                call.input = case["arguments"].clone();
+                call.input = case["arguments"].clone().into();
                 plane
                     .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
                     .await
@@ -254,7 +254,7 @@ mod call_keepalive {
             plane.windows.lock().unwrap().insert("aft".into(), 1);
             let ctx = batch_ctx("aft-declared-bounds");
             let mut call = call(name);
-            call.input = input;
+            call.input = input.into();
             plane
                 .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
                 .await

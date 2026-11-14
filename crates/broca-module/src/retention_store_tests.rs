@@ -220,7 +220,7 @@ fn store_queued(retention: Option<u64>, ts: u64) -> Record {
         written_at_ms: Some(ts),
         ts_ms: Some(ts),
         request: None,
-        receipt: Some(serde_json::to_value(receipt).unwrap()),
+        receipt: Some(serde_json::to_value(receipt).unwrap().into()),
         delivery: None,
     })
 }

@@ -94,7 +94,7 @@ fn tool_turn(mid: &str, id: &str) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: "edit".into(),
-                    input: json!({ "f": id }),
+                    input: json!({ "f": id }).into(),
                 })],
             },
         }),

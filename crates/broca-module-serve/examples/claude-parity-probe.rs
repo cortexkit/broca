@@ -383,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 thought_signature: None,
                 tool_call_id: ToolCallId("toolu_dry_run".into()),
                 tool_name: TOOL.into(),
-                input: json!({}),
+                input: json!({}).into(),
             })],
             input_tokens: 0,
             cache_read: 0,

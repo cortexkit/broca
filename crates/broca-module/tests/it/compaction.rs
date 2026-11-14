@@ -66,7 +66,7 @@ impl Provider for Model {
             vec![ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(format!("call-{}", step.0)),
                 tool_name: "lookup".into(),
-                input: json!({"q":"same"}),
+                input: json!({"q":"same"}).into(),
                 thought_signature: None,
             })]
         } else {

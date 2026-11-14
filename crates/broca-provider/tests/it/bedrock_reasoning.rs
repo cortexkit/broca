@@ -41,7 +41,7 @@ fn canonical_blocks() -> Vec<ContentBlock> {
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("call_1".into()),
             tool_name: "lookup".into(),
-            input: json!({"key":"A"}),
+            input: json!({"key":"A"}).into(),
             thought_signature: None,
         }),
         ContentBlock::Text {

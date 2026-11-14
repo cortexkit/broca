@@ -363,7 +363,7 @@ mod tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: "read".into(),
-                    input,
+                    input: input.into(),
                     thought_signature: None,
                 })],
                 origin: None,
@@ -396,7 +396,7 @@ mod tests {
                 reason: "raw".into(),
             },
             ToolOutput::Json {
-                value: json!({"raw": 1}),
+                value: json!({"raw": 1}).into(),
             },
         ] {
             let mut prompt = turn("a", json!({}), output.clone(), true);
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn no_progress_uses_raw_json_and_episode_observers_reset() {
         let raw = ToolOutput::Json {
-            value: json!({"a": 1, "b": 2}),
+            value: json!({"a": 1, "b": 2}).into(),
         };
         let mut prompt = turn("a", json!({}), raw.clone(), false);
         prompt.extend(turn("b", json!({}), raw.clone(), false));

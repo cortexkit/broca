@@ -43,7 +43,7 @@ fn head_request() -> CallOptions {
                 thought_signature: None,
                 tool_call_id: ToolCallId("toolu_1".into()),
                 tool_name: "read".into(),
-                input: json!({ "path": "src/lib.rs" }),
+                input: json!({ "path": "src/lib.rs" }).into(),
             })],
         ),
         Message::new(

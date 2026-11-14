@@ -424,8 +424,9 @@ pub(super) fn warmed(
         expires_at_ms: Some(sent.sent_at_ms.saturating_add(ttl_ms)),
         attempt_id: None,
         billing: None,
-        ratelimit_headers: (!headers.is_empty())
-            .then(|| serde_json::to_value(&headers).expect("headers serialize")),
+        ratelimit_headers: ((!headers.is_empty())
+            .then(|| serde_json::to_value(&headers).expect("headers serialize")))
+        .map(Into::into),
         reached_cache: Some(true),
         requested_cache_ttl_ms,
     })
@@ -511,7 +512,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
                 if let Some(bytes) = kept.request_body_bytes {
                     facts.insert("request_body_bytes".into(), serde_json::json!(bytes));
                 }
-                warmed.billing = Some(serde_json::Value::Object(facts));
+                warmed.billing = Some(serde_json::Value::Object(facts).into());
             }
             self.append_own(kept.record).await
         }

@@ -194,9 +194,12 @@ async fn a_send_behind_sends_queued_on_an_idle_session_is_queued() {
         &mut part_store,
     )
     .unwrap();
-    let mut receipt = send.receipt.take().unwrap_or_else(|| serde_json::json!({}));
+    let mut receipt = send
+        .receipt
+        .take()
+        .map_or_else(|| serde_json::json!({}), |receipt| receipt.parse());
     receipt["hooks"] = serde_json::json!("not transforms");
-    send.receipt = Some(receipt);
+    send.receipt = Some(receipt.into());
     Writer::append(&mut session, &[Record::QueuedSend(send)], true)
         .await
         .unwrap();

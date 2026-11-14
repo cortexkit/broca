@@ -240,6 +240,14 @@ impl HeldBytes for serde_json::Value {
     }
 }
 
+/// JSON held as its shared text: the text and the two reference counts beside it, counted in
+/// full by every holder, as an `Arc` is.
+impl HeldBytes for broca_protocol::json::Json {
+    fn heap_bytes(&self) -> usize {
+        2 * size_of::<usize>() + self.held_bytes()
+    }
+}
+
 impl HeldBytes for serde_json::Map<String, serde_json::Value> {
     fn heap_bytes(&self) -> usize {
         let nodes = if self.is_empty() {

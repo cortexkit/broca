@@ -1483,7 +1483,7 @@ fn indexed_run_tool_calls(
                             call: cortexkit_role_llm_runner::tool_calls::RunToolCall::new(
                                 call.tool_call_id.0.clone(),
                                 call.tool_name.clone(),
-                                call.input.clone(),
+                                call.input.clone().parse(),
                                 "",
                                 active_step_ordinal + 1,
                             )

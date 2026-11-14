@@ -256,7 +256,9 @@ fn append_response(
             Role::Tool,
             vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id,
-                output: ToolOutput::Json { value },
+                output: ToolOutput::Json {
+                    value: value.into(),
+                },
                 is_error: false,
             })],
         ));
@@ -684,7 +686,7 @@ fn dry_message(step: Step) -> AssistantMessage {
         Step::Read(index) => vec![ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId(format!("dry-read-{index}")),
             tool_name: "read_file".into(),
-            input: json!({"path":FILES[index]}),
+            input: json!({"path":FILES[index]}).into(),
             thought_signature: None,
         })],
         _ => vec![ContentBlock::Text {

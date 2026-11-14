@@ -28,7 +28,7 @@ fn options() -> CallOptions {
             thought_signature: None,
             tool_call_id: ToolCallId("call-1".into()),
             tool_name: CANONICAL.into(),
-            input: json!({}),
+            input: json!({}).into(),
         })],
     }]);
     options.tools = vec![Tool {

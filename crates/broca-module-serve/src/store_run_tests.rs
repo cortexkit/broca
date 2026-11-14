@@ -491,7 +491,7 @@ async fn a_store_run_refused_by_routing_starts_then_ends_with_the_refusal() {
     let error = records
         .iter()
         .find_map(|(_, record)| match record {
-            broca_session_store::record::Record::RunEnd(end) => Some(end.error.clone()),
+            broca_session_store::record::Record::RunEnd(end) => Some(end.error.as_ref().map(|error| error.parse())),
             _ => None,
         })
         .expect("the run's end is written")

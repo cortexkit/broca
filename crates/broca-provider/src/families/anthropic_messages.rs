@@ -1713,7 +1713,7 @@ mod tests {
                         thought_signature: None,
                         tool_call_id: call_id.clone(),
                         tool_name: "tick".into(),
-                        input: json!({ "n": n }),
+                        input: json!({ "n": n }).into(),
                     }),
                 ],
                 ModelHandle::new("anthropic", "claude-opus-4-8"),

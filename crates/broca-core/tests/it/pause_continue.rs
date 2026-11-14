@@ -156,7 +156,7 @@ fn tool_reply(message_id: &str, tool_call_id: &str) -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: ToolCallId(tool_call_id.into()),
                     tool_name: "edit".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                 })],
             },
         }),
@@ -313,7 +313,7 @@ fn seed_resume_without_terminal(
                     thought_signature: None,
                     tool_call_id: ToolCallId("t1".into()),
                     tool_name: "edit".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                 })],
             }
             .into(),

@@ -71,7 +71,7 @@ pub(super) fn pre_tool_terminal(
     CallPlan::HookTerminal {
         result: Arc::new(result),
         reason: reason.into(),
-        hooks: trace.metadata(original.clone(), call.input.clone(), true),
+        hooks: trace.metadata(original.clone(), call.input.clone().parse(), true),
     }
 }
 

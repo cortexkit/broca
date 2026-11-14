@@ -504,7 +504,7 @@ fn tool_step() -> Vec<NormalizedEvent> {
                     thought_signature: None,
                     tool_call_id: ToolCallId("call-1".into()),
                     tool_name: "lookup".into(),
-                    input: serde_json::json!({"q":"weather"}),
+                    input: serde_json::json!({"q":"weather"}).into(),
                 })],
             },
         }),
@@ -3167,7 +3167,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
                     thought_signature: None,
                     tool_call_id: call_id.clone(),
                     tool_name: "lookup".into(),
-                    input: serde_json::json!({}),
+                    input: serde_json::json!({}).into(),
                 })],
             })
             .into(),
@@ -3340,7 +3340,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
                     thought_signature: None,
                     tool_call_id: call_id.clone(),
                     tool_name: "lookup".into(),
-                    input: serde_json::json!({"q":"weather"}),
+                    input: serde_json::json!({"q":"weather"}).into(),
                 })],
             }
             .into(),
@@ -3653,7 +3653,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
                         thought_signature: None,
                         tool_call_id: ToolCallId("open-call".into()),
                         tool_name: "lookup".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                     })],
                 })
                 .into(),
@@ -3790,7 +3790,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                         thought_signature: None,
                         tool_call_id: call_id.clone(),
                         tool_name: "lookup".into(),
-                        input: serde_json::json!({}),
+                        input: serde_json::json!({}).into(),
                     })],
                 })
                 .into(),
@@ -4863,7 +4863,7 @@ async fn an_imported_message_never_takes_a_real_steps_attribution() {
                 thought_signature: None,
                 tool_call_id: ToolCallId("call-1".into()),
                 tool_name: "lookup".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
             })],
         ),
         Message::new(

@@ -291,7 +291,7 @@ fn seed(rig: &Rig, episodes: u64, compacts: bool) {
                     thought_signature: None,
                     tool_call_id: call.clone(),
                     tool_name: "lookup".into(),
-                    input: json!({}),
+                    input: json!({}).into(),
                 })],
                 FinishReason::ToolCalls,
             ),

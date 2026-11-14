@@ -318,7 +318,7 @@ impl Provider for DispatchAllocationProbeProvider {
                 vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId("dispatch-allocation-call".into()),
                     tool_name: "allocation_probe".into(),
-                    input: serde_json::json!({ "entries": entries }),
+                    input: serde_json::json!({ "entries": entries }).into(),
                     thought_signature: None,
                 })],
                 FinishReason::ToolCalls,
@@ -1124,13 +1124,18 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
     );
     // ONE-SIDED ON PURPOSE. Only retained growth can reveal a second argument graph; a net
     // decrease means unrelated frees outweighed allocations and cannot violate this ownership rule.
+    //
+    // The assistant message holds the call's arguments as shared JSON text, and this run loop's
+    // dispatch intent holds them parsed: exactly one argument graph, about the input's size in
+    // bytes and four allocations per entry (its map, two keys and the payload). A second graph
+    // would double both.
     assert!(
-        intent_retained_bytes < (DISPATCH_INPUT_BYTES / 4) as isize,
-        "ToolDispatchIntent retained a deep argument copy: {intent_retained_bytes} tracked bytes \
-         for {DISPATCH_INPUT_BYTES} input string bytes"
+        intent_retained_bytes < (DISPATCH_INPUT_BYTES * 2) as isize,
+        "ToolDispatchIntent retained a second deep argument copy: {intent_retained_bytes} \
+         tracked bytes for {DISPATCH_INPUT_BYTES} input string bytes"
     );
     assert!(
-        intent_retained_allocations < (DISPATCH_ENTRY_COUNT / 2) as isize,
+        intent_retained_allocations < (DISPATCH_ENTRY_COUNT * 6) as isize,
         "ToolDispatchIntent retained a second argument allocation graph: \
          {intent_retained_allocations} live allocations for {DISPATCH_ENTRY_COUNT} entries"
     );

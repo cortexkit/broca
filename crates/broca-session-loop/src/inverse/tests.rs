@@ -268,7 +268,7 @@ fn imported_messages() -> Vec<Message> {
     let call = broca_protocol::content::ToolCall {
         tool_call_id: broca_protocol::ToolCallId("call_1".into()),
         tool_name: "read".into(),
-        input: serde_json::json!({"path": "a"}),
+        input: serde_json::json!({"path": "a"}).into(),
         thought_signature: None,
     };
     vec![
