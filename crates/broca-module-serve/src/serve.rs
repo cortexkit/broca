@@ -11175,12 +11175,26 @@ mod tests {
             (FrameType::Response, 0, 2)
         );
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        // The phase counters are process-wide, and other tests in this binary run store work at
+        // the same time, so only their shape is pinned here, every value read as zero.
+        fn zeroed(value: &serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Number(_) => serde_json::json!(0),
+                serde_json::Value::Object(members) => members
+                    .iter()
+                    .map(|(name, value)| (name.clone(), zeroed(value)))
+                    .collect(),
+                other => other.clone(),
+            }
+        }
+        let mut store = health["metrics"]["store"].clone();
+        store["phases"] = zeroed(&store["phases"]);
         assert_eq!(
-            health["metrics"]["store"],
+            store,
             serde_json::json!({"key_id": 7, "loaded": false, "new_sessions": "encrypted",
                 "phases": crate::store_key::empty_phases_golden()}),
-            "health.check reports the deployment key's id, that it hasn't loaded, and the mode \
-             new sessions take, with zero-work phase counters"
+            "health.check reports the deployment key's id, that it hasn't loaded, the mode new \
+             sessions take, and every phase counter"
         );
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),

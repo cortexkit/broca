@@ -193,7 +193,9 @@ impl Puller {
             if !age.warned && age.since.elapsed() >= PIN_WARN_AFTER {
                 age.warned = true;
                 tracing::warn!(target: "late_results", module, call_key = key.call_key,
-                    event_id = key.event_id, "late-results entry has pinned the feed for five minutes");
+                    event_id = key.event_id, "late-results entry has held the feed's ack for five \
+                    minutes: its call has neither a terminal nor a held record yet (another call \
+                    of its batch may still be running, or its held reply isn't recorded)");
             }
         }
     }
@@ -868,15 +870,16 @@ impl LateResultsIntake {
                     "late-results entry deferred: {reason}"
                 );
             }
+            // Logged at debug: an entry waits here on every poll while its batch runs, and a
+            // five-minute wait is warned about once (`Puller::warn_overdue`).
             Classified::Pending => {
-                tracing::info!(
+                tracing::debug!(
                     target: "late_results",
                     module,
                     call_key = entry.call_key,
                     event_id = entry.event_id,
                     session_address,
-                    reason = "held_record_pending",
-                    "late-results entry waits for its held record"
+                    "late-results entry waits for its call's terminal or held record"
                 );
             }
             Classified::Delivered => {}
