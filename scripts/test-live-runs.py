@@ -27,7 +27,7 @@ live_runs = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = live_runs
 SPEC.loader.exec_module(live_runs)
 
-EXPECTED_SUITE_ANCHORS = 23
+EXPECTED_SUITE_ANCHORS = 25
 
 # Session logs written by the real runner for a resume close-out: two dispatched calls with no
 # result, the resume's `resume_started` record, an `outcome_unknown` result for each, and the
@@ -195,6 +195,56 @@ class LiveRunsGateTests(unittest.TestCase):
                 return real(path)
 
             with unittest.mock.patch.object(live_runs, "tail_state", delete_then_read):
+                code, out, err = self.run_main(root, int(time.time()) - 60)
+            self.assertEqual(code, 0, err)
+            self.assertIn("wal files scanned  1", out)
+            self.assertNotIn("cannot compare", err)
+
+    def test_logs_deleted_on_every_scan_leave_the_population(self) -> None:
+        # The background move into the new storage deletes idle sessions' logs continuously, more
+        # often than a rescan could outrun. Each log gone by the time it is read is left out.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            wal_dir = root / "wal"
+            wal_dir.mkdir()
+            for index in range(live_runs.SCAN_ATTEMPTS + 2):
+                (wal_dir / f"moved{index}.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+            (wal_dir / "sealed.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+            real = live_runs.tail_state
+
+            def moved_then_read(path: pathlib.Path) -> str:
+                if path.name.startswith("moved"):
+                    path.unlink()
+                return real(path)
+
+            with unittest.mock.patch.object(live_runs, "tail_state", moved_then_read):
+                code, out, err = self.run_main(root, int(time.time()) - 60)
+            self.assertEqual(code, 0, err)
+            self.assertIn("wal files scanned  1", out)
+            self.assertNotIn("cannot compare", err)
+
+    def test_a_log_deleted_before_its_identity_is_read_leaves_the_population(self) -> None:
+        # The listing also reads each log's identity, to match its retention tombstone; a log
+        # moved away between the two is left out there too.
+        import lib.archive_read as archive_read
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            wal_dir = root / "wal"
+            wal_dir.mkdir()
+            # More logs than every rescan of the listing and of the gate together could outrun.
+            rescans = (archive_read.RESCANS_ON_VANISHED_WAL + 1) * live_runs.SCAN_ATTEMPTS
+            for index in range(rescans + 2):
+                (wal_dir / f"moved{index}.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+            (wal_dir / "sealed.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+            real = archive_read.read_lineage_id
+
+            def moved_then_read(path: pathlib.Path):
+                if path.name.startswith("moved"):
+                    path.unlink()
+                return real(path)
+
+            with unittest.mock.patch.object(archive_read, "read_lineage_id", moved_then_read):
                 code, out, err = self.run_main(root, int(time.time()) - 60)
             self.assertEqual(code, 0, err)
             self.assertIn("wal files scanned  1", out)

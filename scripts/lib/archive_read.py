@@ -454,9 +454,11 @@ def _members(path: pathlib.Path) -> list[ArchivedWal]:
         raise ArchiveRefusal(f"{path}: {error}") from error
 
 
-# A retained session's log can be deleted by retention between the directory listing and the
-# read that verifies it. Rescanning sees the population as it now stands; a log that is gone
-# held no live run, because retention never deletes a session that is running.
+# A log can be deleted between the directory listing and the read that verifies it: by
+# retention, or by the background move of an idle session into the new storage. A log that is
+# gone held no live run, because neither deletes a session with a run going, so the scan leaves
+# it out; a vanishing it can't attribute that way starts a rescan of the population as it now
+# stands, up to this many times.
 RESCANS_ON_VANISHED_WAL = 3
 
 
@@ -521,8 +523,16 @@ def _logical_wals_once(wal_dir: pathlib.Path, *, include_archives: bool):
                     continue
                 if path.stem in occupied:
                     raise ArchiveRefusal(f"dual live WALs at {occupied[path.stem]} and {path}")
+                try:
+                    tombstoned = is_tombstoned(path)
+                except FileNotFoundError:
+                    # Gone since the listing (see RESCANS_ON_VANISHED_WAL): it has left the
+                    # population. A log still there that read as missing refuses as before.
+                    if path.exists():
+                        raise
+                    continue
                 occupied[path.stem] = path
-                if not is_tombstoned(path):
+                if not tombstoned:
                     selected[path.stem] = path
         containers = []
         if include_archives:

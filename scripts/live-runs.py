@@ -197,8 +197,19 @@ def scan_population(
     unsealed: list[tuple[str, float]] = []
     newer_writer: list[tuple[str, float]] = []
     files = logical_wals(wal_dir, include_archives=False)
+    scanned = 0
     for wal in files:
-        state = tail_state(wal)
+        try:
+            state = tail_state(wal)
+        except WalUnreadable as error:
+            # Gone since the listing: retention, or the move of an idle session into the new
+            # storage, deleted it, and neither deletes the log of a session with a run going.
+            # It has left the population this scan decides on. A log still there that read as
+            # missing is not explained by that, and refuses through the caller's rescans.
+            if isinstance(error.__cause__, FileNotFoundError) and not wal.exists():
+                continue
+            raise
+        scanned += 1
         if state in (OPEN, NEWER_WRITER):
             try:
                 mtime = wal.stat().st_mtime
@@ -207,7 +218,7 @@ def scan_population(
             # A newer-writer log is not corruption and not a reason to stop: listed by name,
             # decided by the caller.
             (unsealed if state == OPEN else newer_writer).append((wal.name, mtime))
-    return len(files), unsealed, newer_writer
+    return scanned, unsealed, newer_writer
 
 
 # KNOWN LIMIT, measured rather than assumed: a frame torn mid-write can hide a run that is
@@ -435,9 +446,10 @@ def main() -> int:
         )
         return 2
 
-    # Retention can delete a retained session's log between listing it and reading its tail.
-    # A log that is gone held no live run (retention never deletes a running session), so the
-    # scan starts again on the population as it now stands. Any other unreadable log refuses.
+    # Retention, or the background move into the new storage, can delete a log between listing it
+    # and reading it. A log that is gone held no live run (neither deletes a session with a run
+    # going); the scan leaves it out, and starts again if the listing itself lost a file. Any
+    # other unreadable log refuses.
     for attempt in range(SCAN_ATTEMPTS):
         try:
             scanned, unsealed, newer_writer = scan_population(wal_dir)
