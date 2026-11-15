@@ -2445,6 +2445,7 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::Fra
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+    head_turn: false,
     };
     let wal = FileWalStore::new(dir.join("wal"));
     let (tx, mut rx) = mpsc::channel(256);
@@ -3004,6 +3005,7 @@ fn tool_run_request(bind: &BindIdentity) -> RunRequest {
     policy_allowed: std::collections::HashSet::from(["lookup".into()]), tool_choice: ToolChoice::Auto, generation: GenerationConfig::default(),
     cache: None, stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None,
     budget: None, context_limit: None, work_class: None, context_management: None, variant: None, service_tier: None, inherit_frozen_cache: false, structured_output: None,
+    head_turn: false,
     }
 }
 

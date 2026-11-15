@@ -1154,6 +1154,9 @@ pub struct AccountForRequest<'a> {
     pub initial_input_bytes: u64,
     pub candidates: &'a Candidates,
     pub hold_cap: AccountHoldCap,
+    /// The run is a head's turn (see `RunRequest::head_turn`). Sent only to a router that
+    /// declares `account_head_turn`; [`RoutingClient::account_for`] drops it otherwise.
+    pub head_turn: bool,
 }
 
 static HOLD_CAP_UNKNOWN: AtomicU64 = AtomicU64::new(0);
@@ -1291,6 +1294,9 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
     }
     if let Some(credential_id) = request.credential_id {
         params["requested_account"] = json!({"credential_id":credential_id});
+    }
+    if request.head_turn {
+        params["head_turn"] = true.into();
     }
     params
 }
@@ -1492,6 +1498,27 @@ impl RoutingClient {
                 .as_object_mut()
                 .expect("account_for params are an object")
                 .remove("service_tier");
+        }
+        // A router that doesn't declare `account_head_turn` refuses the member, so a head's turn
+        // asks it as any other run. So does one whose description can't be read: the member
+        // only moves the run ahead of background work, and the admission still stands without it.
+        if params.get("head_turn").is_some() {
+            let declared = match tokio::time::timeout_at(
+                deadline,
+                self.transport
+                    .capability(cortexkit_role_routing::capabilities::ACCOUNT_HEAD_TURN),
+            )
+            .await
+            {
+                Ok(support) => support == crate::routing_capabilities::CapabilitySupport::Declared,
+                Err(_) => return AccountForOutcome::NoDecisionWithinBudget,
+            };
+            if !declared {
+                params
+                    .as_object_mut()
+                    .expect("account_for params are an object")
+                    .remove("head_turn");
+            }
         }
         let body = match serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": params }))
         {
@@ -1735,6 +1762,8 @@ pub struct ChoiceInputs<'a> {
     pub run_id: &'a str,
     pub initial_input_bytes: u64,
     pub hold_cap: AccountHoldCap,
+    /// The run is a head's turn (see `RunRequest::head_turn`).
+    pub head_turn: bool,
 }
 
 fn decision(
@@ -1883,6 +1912,7 @@ where
         initial_input_bytes: inputs.initial_input_bytes,
         candidates: &candidates,
         hold_cap: inputs.hold_cap,
+        head_turn: inputs.head_turn,
     });
     if inputs.hold_cap.evidence_unknown {
         HOLD_CAP_UNKNOWN.fetch_add(1, Ordering::Relaxed);
@@ -2937,14 +2967,17 @@ pub fn continue_request(
     } else {
         continue_selection_id(wall)
     };
-    Some(ContinueRequest::new(
-        wall.run_id,
-        decision.admission_id.as_deref()?,
-        decision.conversation_key.as_deref()?,
-        decision.decision_id.as_deref()?,
-        exhausted,
-        selection_id,
-    ))
+    Some(
+        ContinueRequest::new(
+            wall.run_id,
+            decision.admission_id.as_deref()?,
+            decision.conversation_key.as_deref()?,
+            decision.decision_id.as_deref()?,
+            exhausted,
+            selection_id,
+        )
+        .with_head_turn(wall.head_turn),
+    )
 }
 
 /// The `selection_id` of a continue request: derived from the run, the step and the refused
@@ -3010,6 +3043,22 @@ impl RoutingClient {
             self.counters.bump("continue_not_declared");
             return ContinueOutcome::NotDeclared;
         }
+        // A router that doesn't declare `account_head_turn` refuses the member, so a head's turn
+        // asks it as any other run; a description that can't be read counts as not declared.
+        let unmarked;
+        let request = if request.head_turn
+            && tokio::time::timeout_at(
+                deadline,
+                self.capability(cortexkit_role_routing::capabilities::ACCOUNT_HEAD_TURN),
+            )
+            .await
+                != Ok(crate::routing_capabilities::CapabilitySupport::Declared)
+        {
+            unmarked = request.clone().with_head_turn(false);
+            &unmarked
+        } else {
+            request
+        };
         let body = match serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": request }))
         {
             Ok(body) => body,

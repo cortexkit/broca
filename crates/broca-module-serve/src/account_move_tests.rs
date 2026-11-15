@@ -349,6 +349,7 @@ async fn a_chatgpt_wall_offered_b(
         render_config: &config.frozen_render_config,
         run_config: &config,
         reask: false,
+    head_turn: false,
     };
     let moves = AccountMoves::new(&executor, &req, None, None);
     let answer =

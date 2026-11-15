@@ -114,6 +114,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 
@@ -402,6 +403,7 @@ fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 

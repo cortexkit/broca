@@ -236,6 +236,8 @@ fn fork_account_params(job: &broca_module::executor::ForkCallJob) -> serde_json:
             max_s: 0,
             evidence_unknown: false,
         },
+        // A fork's question isn't the head's turn: the head's run is the turn.
+        head_turn: false,
     });
     params.as_object_mut().unwrap().remove("candidates");
     params["requested_account"] = serde_json::json!({

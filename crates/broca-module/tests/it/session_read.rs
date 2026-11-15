@@ -631,6 +631,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 

@@ -5753,6 +5753,7 @@ mod executor {
                     run_id: &req.run_id.0,
                     initial_input_bytes,
                     hold_cap,
+                    head_turn: req.head_turn,
                 },
                 async { Some(listing) },
                 deadline,

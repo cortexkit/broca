@@ -758,6 +758,7 @@ fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 
@@ -984,6 +985,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
 
     let (tx, mut rx) = mpsc::channel(256);
@@ -1573,6 +1575,7 @@ fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str)
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 
@@ -2508,6 +2511,7 @@ async fn cross_episode_resume_is_exactly_once() {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
 
     // Episode 1: the model calls `e1` then answers. Drive it fully.
@@ -3001,6 +3005,7 @@ fn req2(session: &BindIdentity) -> RunRequest {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 

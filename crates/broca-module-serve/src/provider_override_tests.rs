@@ -232,6 +232,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         submission_id: None,
         context_management: None,
         inherit_frozen_cache: false, structured_output: None,
+    head_turn: false,
     };
     assert!(executor
         .cache_policy_for_episode(true, None, &req, req.model.provider_module_id.as_str(), None)
@@ -445,6 +446,7 @@ fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
         submission_id: None,
         context_management: None,
         inherit_frozen_cache: false, structured_output: None,
+    head_turn: false,
     }
 }
 

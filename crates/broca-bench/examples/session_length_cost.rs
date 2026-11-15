@@ -1044,6 +1044,7 @@ fn request(session: &BindIdentity, run: &str, inputs: usize) -> RunRequest {
         on_restart: None,
         keep_warm: None,
         scope: None,
+        head_turn: false,
         send_id: None,
         request_identity_digest: None,
         project_id: None,

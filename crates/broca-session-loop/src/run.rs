@@ -166,6 +166,10 @@ pub struct Admission {
     /// run's input in the batch of its start. Like `pre_model_error`, a run read back from its
     /// start has none: the record that followed the start keeps it.
     pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// Whether the run is a head's turn (`RunRequest::head_turn`), which a continue request
+    /// at a usage wall or sign-in loss tells routing. Not frozen: a run read back from its
+    /// start reads false.
+    pub head_turn: bool,
 }
 
 /// What the send that started a run recorded about itself, as today's run start records it.
@@ -1879,6 +1883,7 @@ pub fn admission_of_start(
         },
         pre_model_error: None,
         applies_refresh: None,
+        head_turn: false,
     })
 }
 

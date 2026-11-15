@@ -430,7 +430,7 @@ async fn failed_goodbye_is_retried_and_counted() {
     let call = broca_protocol::ToolCall {
         tool_call_id: broca_protocol::ToolCallId("fresh".into()),
         tool_name: "echo".into(),
-        input: json!({}),
+        input: json!({}).into(),
         thought_signature: None,
     };
     f.plane

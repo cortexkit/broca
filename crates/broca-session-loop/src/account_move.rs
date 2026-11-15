@@ -69,6 +69,8 @@ pub struct Wall<'a> {
     /// [`crate::run::run_config_of_run`]): what the executor admits the new account's provider
     /// from.
     pub run_config: &'a broca_wal::RunConfig,
+    /// The run is a head's turn (see `Admission::head_turn`).
+    pub head_turn: bool,
     /// Set when routing is asked a second time at this wall because the account it offered
     /// first was no longer reserved when the run could take it. The question is the same, under
     /// a new selection id, and shares the first ask's budget.
@@ -249,6 +251,7 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
         renderer_version: admission.renderer_version,
         render_config: &admission.render_config,
         run_config: &run_config,
+        head_turn: admission.head_turn,
         reask: false,
     };
     // An offer is taken only while routing still reserves its account. One that lapsed before
@@ -341,6 +344,7 @@ pub(crate) async fn signed_out<W: Writer, P: broca_core::Provider, T>(
                 renderer_version: admission.renderer_version,
                 render_config: &admission.render_config,
                 run_config: &run_config,
+                head_turn: admission.head_turn,
                 reask: false,
             },
         )

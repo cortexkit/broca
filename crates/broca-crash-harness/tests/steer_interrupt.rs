@@ -375,6 +375,7 @@ impl Session {
             service_tier: None,
             inherit_frozen_cache: false,
             structured_output: None,
+            head_turn: false,
         };
         let mut submission = request.to_submission();
         // Only the creating key declares tools. Replaying that key repeats its payload;

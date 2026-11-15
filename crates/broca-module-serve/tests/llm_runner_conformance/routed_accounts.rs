@@ -943,6 +943,7 @@ mod tests {
                 run_id: "fixture-run",
                 initial_input_bytes: 14,
                 hold_cap: Default::default(),
+                head_turn: false,
             },
             async { Some(Arc::new(listing)) },
             Instant::now() + Duration::from_secs(5),

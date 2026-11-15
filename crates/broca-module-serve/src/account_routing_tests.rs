@@ -337,6 +337,7 @@ async fn choose(
             send_id: None,
             run_id: "run-1",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async move { listing },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -455,6 +456,7 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
             initial_input_bytes: 42,
             candidates: &candidates,
             hold_cap: cap,
+            head_turn: false,
         });
         let mut expected = legacy.clone();
         expected["hold_wait_max_s"] = json!(seconds);
@@ -499,6 +501,7 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero() {
                 send_id: None,
                 run_id: "run-1",
                 initial_input_bytes: 42,
+                head_turn: false,
             },
             async { Some(two_accounts()) },
             tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -634,6 +637,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
             send_id: None,
             run_id: "run-1",
             initial_input_bytes: 0,
+            head_turn: false,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + budget,
@@ -693,6 +697,7 @@ async fn a_slow_listing_shares_the_admission_budget_and_is_refused_as_unreachabl
             send_id: None,
             run_id: "run-1",
             initial_input_bytes: 0,
+            head_turn: false,
         },
         std::future::pending::<Option<Arc<ScopedList>>>(),
         tokio::time::Instant::now() + Duration::from_millis(200),
@@ -810,6 +815,7 @@ async fn choose_api_key_with_decision(
             send_id: None,
             run_id: "run-1",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async { rows },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -868,6 +874,7 @@ async fn an_account_route_offers_the_keys_of_the_provider_it_names() {
             send_id: None,
             run_id: "run-1",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async { Some(rows) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1113,6 +1120,7 @@ async fn apikey_unhinted_asks_routing_and_pinned_keeps_the_exact_vault_record() 
                 send_id: None,
                 run_id: "run-1",
                 initial_input_bytes: 42,
+                head_turn: false,
             },
             async { Some(api_keys()) },
             tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1255,6 +1263,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
             send_id: None,
             run_id: "run-1",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1669,6 +1678,7 @@ async fn refusal_log_names_send_and_routing_decision() {
             send_id: Some("send-refused"),
             run_id: "run-refused",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3322,6 +3332,7 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_its_admission_is_rep
             send_id: None,
             run_id: "run-caller",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3369,6 +3380,7 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
             send_id: None,
             run_id: "run-caller",
             initial_input_bytes: 42,
+            head_turn: false,
         },
         async { Some(listing(vec![anthropic("oauth:anthropic", "acct-a")])) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3405,6 +3417,7 @@ async fn choose_with_auth_hints(
             run_id: "run-hints",
             initial_input_bytes: 1,
             hold_cap: Default::default(),
+            head_turn: false,
         },
         async { view },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3511,6 +3524,7 @@ fn continue_wall<'a>(
         render_config: &config.frozen_render_config,
         run_config: config,
         reask,
+        head_turn: false,
     }
 }
 
@@ -4245,4 +4259,185 @@ async fn after_a_move_a_success_names_the_offered_account() {
         "{reports:?}"
     );
     assert_eq!(reports[0]["served_account_id"], "acct-2");
+}
+
+/// Writes `bytes`, a request exactly as broca sent it, under `BROCA_HEAD_TURN_SAMPLE_DIR` when
+/// set, for routing to check against its parser.
+fn head_turn_sample(name: &str, bytes: &[u8]) {
+    if let Some(directory) = std::env::var_os("BROCA_HEAD_TURN_SAMPLE_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(std::path::PathBuf::from(directory).join(name), bytes).unwrap();
+    }
+}
+
+/// An admission for a head's turn, with or without the mark.
+fn head_turn_params(head_turn: bool) -> Value {
+    let candidates = Candidates::from_listing(&two_accounts(), AuthMethod::Oauth, "anthropic");
+    account_for_params(&AccountForRequest {
+        account_route: None,
+        pool: None,
+        credential_id: None,
+        service_tier: None,
+        decision_id: None,
+        provider: "anthropic",
+        model: "model-a",
+        conversation_key: "broca-session:abc",
+        admission_id: "run-1",
+        initial_input_bytes: 42,
+        candidates: &candidates,
+        hold_cap: AccountHoldCap::default(),
+        head_turn,
+    })
+}
+
+/// Any other run is asked unmarked, even of a router that declares the mark.
+#[tokio::test]
+async fn a_run_that_isnt_a_heads_turn_is_never_marked() {
+    use cortexkit_role_routing::capabilities::ACCOUNT_HEAD_TURN;
+    let chosen = FakeRouting::choosing("acct-a", "credential-a");
+    let routing = Arc::new(FakeRouting {
+        reply: Mutex::new(chosen.reply.lock().unwrap().clone()),
+        declared: Some(vec![ACCOUNT_HEAD_TURN]),
+        ..FakeRouting::default()
+    });
+    client(&routing)
+        .account_for(
+            head_turn_params(false),
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    head_turn_sample(
+        "worker-run.account_for.json",
+        &routing.request_bytes.lock().unwrap()[0],
+    );
+    let requests = routing.requests.lock().unwrap();
+    assert!(requests[0]["params"].get("head_turn").is_none());
+}
+
+/// A head's turn carries `head_turn: true`; every other run carries no member, so its params
+/// are unchanged.
+#[test]
+fn only_a_heads_turn_is_marked_in_account_for() {
+    let marked = head_turn_params(true);
+    let mut plain = head_turn_params(false);
+    assert_eq!(marked["head_turn"], json!(true));
+    assert!(plain.get("head_turn").is_none(), "{plain}");
+    plain["head_turn"] = json!(true);
+    assert_eq!(plain, marked, "the mark is the only difference");
+    // Routing's own parser admits the mark from a router that declares it, and refuses it
+    // from one that doesn't.
+    use cortexkit_role_routing::account::parse_account_for_request_serving;
+    use cortexkit_role_routing::capabilities::ACCOUNT_HEAD_TURN;
+    assert!(
+        parse_account_for_request_serving(&marked, &[ACCOUNT_HEAD_TURN])
+            .unwrap()
+            .head_turn
+    );
+    assert!(parse_account_for_request_serving::<&str>(&marked, &[]).is_err());
+}
+
+/// The mark goes only to a router that declares `account_head_turn`. One that doesn't, or
+/// whose description can't be read, is asked as for any other run.
+#[tokio::test]
+async fn a_heads_turn_is_marked_only_for_a_router_that_declares_it() {
+    use cortexkit_role_routing::capabilities::ACCOUNT_HEAD_TURN;
+    for (declared, sent) in [
+        (Some(vec![ACCOUNT_HEAD_TURN]), true),
+        (Some(vec![]), false),
+        (None, false),
+    ] {
+        let routing = FakeRouting::choosing("acct-a", "credential-a");
+        let routing = Arc::new(FakeRouting {
+            reply: Mutex::new(routing.reply.lock().unwrap().clone()),
+            declared: declared.clone(),
+            ..FakeRouting::default()
+        });
+        let outcome = client(&routing)
+            .account_for(
+                head_turn_params(true),
+                tokio::time::Instant::now() + ADMISSION_BUDGET,
+            )
+            .await;
+        assert!(
+            matches!(outcome, AccountForOutcome::Chosen { .. }),
+            "{declared:?}"
+        );
+        head_turn_sample(
+            match &declared {
+                Some(groups) if groups.contains(&ACCOUNT_HEAD_TURN) => "head-run.account_for.json",
+                Some(_) => "head-run.undeclared-router.account_for.json",
+                None => "head-run.unreadable-description.account_for.json",
+            },
+            &routing.request_bytes.lock().unwrap()[0],
+        );
+        let requests = routing.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{declared:?}");
+        let mut expected = head_turn_params(sent);
+        if !sent {
+            expected.as_object_mut().unwrap().remove("head_turn");
+        }
+        assert_eq!(requests[0]["params"], expected, "{declared:?}");
+    }
+}
+
+/// A head's turn that hits a wall says so when it asks for another account, to a router that
+/// declares `account_head_turn`, and asks as any other run otherwise.
+#[tokio::test]
+async fn a_heads_continue_is_marked_only_for_a_router_that_declares_it() {
+    use cortexkit_role_routing::capabilities::{ACCOUNT_CONTINUE, ACCOUNT_HEAD_TURN};
+    let selection = continue_selection();
+    let config = continue_config();
+    let refused = vec!["acct-a".to_owned()];
+    let mut wall = continue_wall(&selection, &config, &refused, false);
+    wall.head_turn = true;
+    let request = continue_request(&wall).unwrap();
+    assert!(request.head_turn);
+    let unmarked = {
+        let mut plain = continue_wall(&selection, &config, &refused, false);
+        plain.head_turn = false;
+        serde_json::to_value(continue_request(&plain).unwrap()).unwrap()
+    };
+    assert!(unmarked.get("head_turn").is_none(), "{unmarked}");
+    let mut marked = unmarked.clone();
+    marked["head_turn"] = json!(true);
+    assert_eq!(serde_json::to_value(&request).unwrap(), marked);
+    // Routing's own parser reads the marked question back when it declares the mark.
+    let describe = cortexkit_role_routing::describe::RoleDescribe::new(Vec::new(), false)
+        .with_capability(ACCOUNT_CONTINUE)
+        .with_capability(ACCOUNT_HEAD_TURN);
+    let parsed =
+        cortexkit_role_routing::account_continue::parse_continue_request(&marked, &describe)
+            .unwrap();
+    assert!(parsed.same_question(&request));
+    for (head_turn_declared, expected) in [(true, &marked), (false, &unmarked)] {
+        let mut declared = vec![
+            ACCOUNT_CONTINUE,
+            crate::routing_capabilities::ACCOUNT_CONTINUE_RESUME,
+        ];
+        if head_turn_declared {
+            declared.push(ACCOUNT_HEAD_TURN);
+        }
+        let routing = Arc::new(FakeRouting {
+            declared: Some(declared),
+            ..FakeRouting::default()
+        });
+        client(&routing)
+            .account_continue(
+                true,
+                &request,
+                tokio::time::Instant::now() + ADMISSION_BUDGET,
+            )
+            .await;
+        head_turn_sample(
+            if head_turn_declared {
+                "head-run.continue.account_for.json"
+            } else {
+                "head-run.continue.undeclared-router.account_for.json"
+            },
+            &routing.request_bytes.lock().unwrap()[0],
+        );
+        let requests = routing.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{head_turn_declared}");
+        assert_eq!(&requests[0]["params"], expected, "{head_turn_declared}");
+    }
 }

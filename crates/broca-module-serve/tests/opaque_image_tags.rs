@@ -165,6 +165,7 @@ fn request(root: &Path) -> RunRequest {
     context_management: None, submission_id: None, send_id: None,
     request_identity_digest: None, title: None, scope: None,
     inherit_frozen_cache: false, structured_output: None,
+    head_turn: false,
     }
 }
 

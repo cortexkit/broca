@@ -181,6 +181,10 @@ pub struct RunRequest {
     /// the stamped scope admission decided to freeze or adopt. `None` for an unscoped episode.
     /// Admission sets it after its owner check; a resume writes no `RunStarted` and ignores it.
     pub scope: Option<broca_protocol::SessionScope>,
+    /// The run's send arrived over a route the daemon stamped with a head scope: the run is a
+    /// head's turn, which routing admits ahead of background work. Known only while broca runs;
+    /// a run resumed after a restart reads false.
+    pub head_turn: bool,
     /// Take the cache policy and caller cache key the session's previous episode froze in its
     /// render config instead of resolving `cache`. Set for a steer or interrupt into the session
     /// that omitted `cache`, so its requests carry the same cache markers and cache key as the
@@ -290,6 +294,7 @@ impl RunRequest {
             title: None,
             // Decided by admission from the session's history, never carried by the request.
             scope: None,
+            head_turn: false,
             inherit_frozen_cache: req
                 .inherit_frozen
                 .contains(&broca_protocol::request::InheritedParam::Cache),
@@ -13891,6 +13896,7 @@ mod tests {
             context_management: None,
             inherit_frozen_cache: false,
             structured_output: None,
+            head_turn: false,
         };
         // This is the cloning filter that retain replaces; comparing complete Tool values pins
         // both policy membership and the provider-visible request order.

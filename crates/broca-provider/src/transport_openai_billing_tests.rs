@@ -121,6 +121,7 @@ async fn run_with_selection(
     service_tier: None,
     inherit_frozen_cache: false,
     structured_output: None,
+    head_turn: false,
     };
     let control = RunControl {
         auth_selection: Some(selection),

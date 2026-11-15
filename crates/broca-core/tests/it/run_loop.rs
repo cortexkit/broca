@@ -412,6 +412,7 @@ fn req(name: &str, tools: Vec<Tool>, stop_when: Vec<StopCondition>) -> RunReques
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 

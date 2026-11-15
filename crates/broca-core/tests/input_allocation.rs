@@ -612,6 +612,7 @@ async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy()
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let snapshot = Arc::new(TerminalAssistantAllocationSnapshot::default());
     let run_snapshot = Arc::clone(&snapshot);
@@ -727,6 +728,7 @@ async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let snapshot = Arc::new(TerminalAssistantAllocationSnapshot::default());
     let run_snapshot = Arc::clone(&snapshot);
@@ -846,6 +848,7 @@ async fn admitted_turn_does_not_retain_a_second_input_copy() {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let provider = AllocationProbeProvider;
     let tool_plane = StubToolPlane::default();
@@ -993,6 +996,7 @@ async fn retained_at_run_started(tools: Vec<Tool>) -> (isize, isize) {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let provider = AllocationProbeProvider;
     let tool_plane = StubToolPlane::default();
@@ -1081,6 +1085,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let provider = DispatchAllocationProbeProvider;
     let tool_plane = Arc::new(DispatchAllocationProbePlane::default());
@@ -1222,6 +1227,7 @@ async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let provider = DispatchAllocationProbeProvider;
     let snapshot = Arc::new(ToolResultAllocationSnapshot::default());
@@ -1334,6 +1340,7 @@ fn append_probe_request(run_id: &str, input: Vec<Message>) -> RunRequest {
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     }
 }
 

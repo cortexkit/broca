@@ -356,6 +356,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
             service_tier: None,
             inherit_frozen_cache: false,
             structured_output: None,
+            head_turn: false,
         }
     }
 

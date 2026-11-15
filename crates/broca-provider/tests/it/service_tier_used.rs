@@ -532,6 +532,7 @@ mod end_to_end {
             service_tier: None,
             inherit_frozen_cache: false,
             structured_output: None,
+            head_turn: false,
         };
         let store = FileLeaseStore::new(dir.join("leases"));
         let wal = FileWalStore::new(dir.join("wal"));

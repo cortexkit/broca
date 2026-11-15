@@ -539,6 +539,7 @@ async fn prepare_admission(
         initial_input_bytes,
         candidates: &candidates,
         hold_cap: Default::default(),
+        head_turn: false,
     });
     params
         .as_object_mut()

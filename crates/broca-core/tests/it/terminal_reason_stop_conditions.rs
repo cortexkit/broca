@@ -68,6 +68,7 @@ async fn live_records(
         service_tier: None,
         inherit_frozen_cache: false,
         structured_output: None,
+        head_turn: false,
     };
     let content = if tool_turn {
         vec![ContentBlock::ToolCall(ToolCall {

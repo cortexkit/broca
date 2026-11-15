@@ -1719,6 +1719,7 @@ async fn routed_chatgpt_choice() -> AccountChoice {
     model: "gpt-6.1", session: &broca_protocol::BindIdentity::new("/tmp", "broca", "chatgpt"),
     send_id: None,
     run_id: "chatgpt-run", initial_input_bytes: 42,
+    head_turn: false,
     }, async { Some(listing) }, tokio::time::Instant::now() + ADMISSION_BUDGET).await.unwrap();
     let requests = routing.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
@@ -2033,6 +2034,7 @@ async fn chatgpt_refresh_run_rejecting(
     submission_id: None,
     context_management: None,
     inherit_frozen_cache: false, structured_output: None,
+    head_turn: false,
     };
     let wal = FileWalStore::new(root.join("refresh-wal"));
     let lease = FileLeaseStore::new(root.join("refresh-lease"));

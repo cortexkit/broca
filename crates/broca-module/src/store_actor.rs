@@ -189,6 +189,11 @@ pub struct StoreActor<B: SessionBackend> {
     /// The most records an import appends in one batch: one log batch's limit, or fewer in tests
     /// that cut an import between its batches.
     import_batch: usize,
+    /// A send reached this session over a route the daemon stamped with a head scope, so the
+    /// session is a head and each run it starts is a head's turn (`RunRequest::head_turn`). The
+    /// stamp isn't stored: until a head-stamped send arrives after the actor opens, a run that
+    /// starts without one (a queued send drained after a restart) isn't marked.
+    head_scoped: bool,
     /// Where a test stops an import as a crash would.
     #[cfg(test)]
     import_cut: Option<crate::store_import_stage::ImportCut>,
@@ -463,6 +468,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             class_placement: None,
             import_staging: None,
             import_batch: broca_session_store::session::MAX_BATCH_RECORDS,
+            head_scoped: false,
             #[cfg(test)]
             import_cut: None,
         }
@@ -1766,6 +1772,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     return false;
                 }
                 let mut request = *request;
+                if matches!(
+                    &request.scope,
+                    broca_protocol::SendScope::Stamped(bind)
+                        if bind.kind == broca_protocol::ScopeKind::Head
+                ) {
+                    self.head_scoped = true;
+                }
                 // Today's actor refuses a send that declares tools on a scoped session unless a
                 // plan gave the session its tools: on a scoped route a tool provider refuses a call
                 // that doesn't name the plan's settings for that tool, and only a plan supplies
@@ -2282,6 +2295,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.send_id = send_id;
         req.request_identity_digest = identity;
         req.scope = scope;
+        req.head_turn = self.head_scoped;
         req.session_class = session_class;
         req.retention = prepared.retention;
         let step: broca_core::provider::LiveStepProgress = Arc::default();
@@ -4857,6 +4871,8 @@ mod collect_tests;
 mod differential;
 #[cfg(test)]
 mod entries_comparison;
+#[cfg(test)]
+mod head_turn_tests;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]
