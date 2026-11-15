@@ -350,8 +350,8 @@ async fn compared(
 ) {
     let (today_answers, today_baselines) = drive(&today, first, steps).await;
     let (store_answers, store_baselines) = drive(&store, first, steps).await;
-    assert_eq!(store_answers, today_answers);
-    assert_eq!(store_baselines, today_baselines);
+    alike!(store_answers, today_answers);
+    alike!(store_baselines, today_baselines);
     let (runs, applied) = store_runs(&store).await;
     assert_eq!(runs, today_runs(&today));
     let frames = today.wal.read_records(&today.key).unwrap();
@@ -678,7 +678,7 @@ async fn a_refresh_changes_the_inherited_model_and_the_senders_alike() {
         "the send ran on the refreshed plan's model"
     );
     for principal in [None, Some(core()), Some(occipital())] {
-        assert_eq!(
+        alike!(
             head_json(&store, principal.as_ref()).await,
             head_json(&today, principal.as_ref()).await,
             "heads differ for {principal:?}"
@@ -743,7 +743,7 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
             answers.push(send_titled(module, run_id, request, None, None).await);
             module.closed().await;
         }
-        assert_eq!(answers[1], answers[0], "{principal:?}");
+        alike!(answers[1], answers[0], "{principal:?}");
         assert!(
             matches!(
                 &answers[0],

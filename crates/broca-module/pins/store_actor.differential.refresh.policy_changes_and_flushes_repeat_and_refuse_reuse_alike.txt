@@ -1,0 +1,16 @@
+== alike
+[
+    "active",
+    "Accepted { run_in_progress: false, applies_from_next_run: false }",
+    "Ok(Object {\"pending\": Object {\"generation\": Number(1), \"policy\": String(\"immediately\")}})",
+    "Ok(Object {\"pending\": Object {\"generation\": Number(1), \"policy\": String(\"immediately\")}})",
+    "Err(SendIdReuse { field: \"policy\", message: \"send_id p1 was used with another policy\" })",
+    "Ok(Object {\"pending_generation\": Number(1)})",
+    "Ok(Object {\"pending_generation\": Number(1)})",
+    "active",
+    "Ok(Object {\"pending_generation\": Number(1)})",
+    "Ok(Object {})",
+    "Err(AlreadyApplied { generation: 1, applied_by: \"fold\" })",
+]
+== alike
+sha256:569433b6c157250027caf1688068d9307325b8fd729a932cf402dde2ab42d7b5 (7069 bytes)

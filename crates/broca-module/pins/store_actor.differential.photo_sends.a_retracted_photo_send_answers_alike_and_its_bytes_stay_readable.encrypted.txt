@@ -1,0 +1,121 @@
+== a queued photo send
+Pending {
+    submission_id: SubmissionId(
+        "sub-r2",
+    ),
+}
+== the retraction
+Retracted
+== once retracted: media_read {"length":69,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== once retracted: media_read {"length":20,"offset":10,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("AA1JSERSAAAAAQAAAAEIAgAAAJA="),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== once retracted: media_read {"length":100,"offset":64,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("RK5CYII="),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== once retracted: media_read {"length":0,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== once retracted: media_read {"length":10,"offset":69,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String(""),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== once retracted: media_read {"length":10,"offset":70,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "Upload(UploadError { code: \"invalid_params\", subject: \"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640\", field: Some(\"offset\"), received: None })",
+)
+== once retracted: media_read {"length":2097153,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "Upload(UploadError { code: \"invalid_params\", subject: \"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640\", field: Some(\"length\"), received: None })",
+)
+== once retracted: media_read {"length":10,"offset":0,"sha256":"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789"}
+Err(
+    "Upload(UploadError { code: \"unknown_media\", subject: \"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789\", field: None, received: None })",
+)
+== after the run: media_read {"length":69,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== after the run: media_read {"length":20,"offset":10,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("AA1JSERSAAAAAQAAAAEIAgAAAJA="),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== after the run: media_read {"length":100,"offset":64,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("RK5CYII="),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== after the run: media_read {"length":0,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== after the run: media_read {"length":10,"offset":69,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String(""),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== after the run: media_read {"length":10,"offset":70,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "Upload(UploadError { code: \"invalid_params\", subject: \"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640\", field: Some(\"offset\"), received: None })",
+)
+== after the run: media_read {"length":2097153,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "Upload(UploadError { code: \"invalid_params\", subject: \"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640\", field: Some(\"length\"), received: None })",
+)
+== after the run: media_read {"length":10,"offset":0,"sha256":"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789"}
+Err(
+    "Upload(UploadError { code: \"unknown_media\", subject: \"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789\", field: None, received: None })",
+)
+== alike
+[
+    (
+        "User",
+        [],
+    ),
+    (
+        "Assistant",
+        [],
+    ),
+]

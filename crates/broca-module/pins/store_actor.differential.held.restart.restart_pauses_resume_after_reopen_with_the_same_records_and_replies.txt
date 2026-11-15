@@ -1,0 +1,56 @@
+== alike
+[
+    "start r1",
+    "pause r1 AuthRequired",
+    "pause r1 Restart",
+    "resume r1 1 0 0",
+    "end Completed None",
+]
+== alike
+Object {
+    "final_step_finish_reason": String("stop"),
+    "retries_used": Number(0),
+    "state": String("completed"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "final_message": Object {
+        "ordinal": Number(2),
+        "text": String("done"),
+    },
+    "run_id": String("r1"),
+    "state": String("completed"),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}

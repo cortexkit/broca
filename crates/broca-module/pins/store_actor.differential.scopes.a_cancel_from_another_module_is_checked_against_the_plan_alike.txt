@@ -1,0 +1,318 @@
+== Reserved { module_id: "stranger" } over Unstamped: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "stranger",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: Some("flow-1"), sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: None, sender: Some(Reserved { module_id: "basal" }), agent_id: Some("agent-1"), run_id: Some("parent-run"), agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "occipital" } over Unstamped: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "occipital",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "occipital" } over Unstamped: replies differ
+Ack
+== Reserved { module_id: "prefrontal-core" } over Unstamped: replies differ
+Ack
+== heads differ for None
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r2"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "updated_at": Bool(true),
+}
+== heads differ for Some(Reserved { module_id: "prefrontal-core" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r2"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+}
+== heads differ for Some(Reserved { module_id: "occipital" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r2"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+        ],
+    },
+    "updated_at": Bool(true),
+}
+== Reserved { module_id: "stranger" } over Unstamped: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "stranger",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: Some("flow-1"), sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: None, sender: Some(Reserved { module_id: "basal" }), agent_id: Some("agent-1"), run_id: Some("parent-run"), agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "occipital" } over Unstamped: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        OwnerOperation {
+            first: Reserved {
+                module_id: "prefrontal-core",
+            },
+            mismatch: FirstPrincipal {
+                first: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                presented_principal: Some(
+                    Reserved {
+                        module_id: "occipital",
+                    },
+                ),
+            },
+        },
+    ),
+)
+== Reserved { module_id: "occipital" } over Unstamped: replies differ
+Ack
+== Reserved { module_id: "prefrontal-core" } over Unstamped: replies differ
+Ack
+== heads differ for None
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r2"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "updated_at": Bool(true),
+}
+== heads differ for Some(Reserved { module_id: "prefrontal-core" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r2"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+}
+== heads differ for Some(Reserved { module_id: "occipital" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r2"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+        ],
+    },
+    "updated_at": Bool(true),
+}

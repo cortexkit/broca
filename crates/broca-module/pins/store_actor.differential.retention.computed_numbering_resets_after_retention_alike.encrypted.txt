@@ -1,0 +1,83 @@
+== alike
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== alike
+Active {
+    run_id: RunId(
+        "r2",
+    ),
+    delivered: None,
+}
+== alike
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r2"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(false),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("again"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== alike
+Active {
+    run_id: RunId(
+        "r3",
+    ),
+    delivered: None,
+}

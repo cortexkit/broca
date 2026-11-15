@@ -1,0 +1,62 @@
+== closed sessions still read alike
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}

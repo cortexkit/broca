@@ -1,0 +1,163 @@
+== alike
+Object {
+    "auth": Object {
+        "account_ref": String("synthetic-account"),
+        "credential_id": String("oauth:stub:synthetic"),
+    },
+    "auth_selection": String("oauth:stub:synthetic"),
+    "error": Object {
+        "class": String("auth_required"),
+        "credential_id": String("oauth:stub:synthetic"),
+        "message": String("Sign in to the synthetic account again"),
+        "provider_code": String("needs_reauth"),
+    },
+    "reason": String("auth_required"),
+    "retries_used": Number(0),
+    "state": String("paused"),
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "auth_selection": String("oauth:stub:synthetic"),
+    "error": Object {
+        "class": String("auth_required"),
+        "credential_id": String("oauth:stub:synthetic"),
+        "message": String("Sign in to the synthetic account again"),
+        "provider_code": String("needs_reauth"),
+    },
+    "reason": String("auth_required"),
+    "run_id": String("r1"),
+    "state": String("paused"),
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("no"),
+    },
+    "last_ordinal": Number(1),
+    "last_run_state": Object {
+        "reason": String("auth_required"),
+        "run_id": String("r1"),
+        "state": String("paused"),
+    },
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+}
+== alike
+Object {
+    "auth_selection": String("oauth:stub:synthetic"),
+    "final_step_finish_reason": String("stop"),
+    "retries_used": Number(0),
+    "state": String("completed"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "auth_selection": String("oauth:stub:synthetic"),
+    "final_message": Object {
+        "ordinal": Number(2),
+        "text": String("done"),
+    },
+    "run_id": String("r1"),
+    "state": String("completed"),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(2),
+    "last_run_state": Object {
+        "reason": String("completed"),
+        "run_id": String("r1"),
+        "state": String("completed"),
+    },
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "since": String("r1"),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}

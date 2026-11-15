@@ -1,0 +1,250 @@
+== step 0: replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== step 1: replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== step 2: replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== step 3: replies differ
+SendIdReuse {
+    differing: "input",
+}
+== step 4: replies differ
+SendIdReuse {
+    differing: "delivery",
+}
+== step 8: replies differ
+Finished {
+    run_id: RunId(
+        "r1",
+    ),
+    reason: Completed,
+    delivered: Some(
+        Delivered {
+            as: "step",
+            ref: Some(
+                "r1",
+            ),
+            call_key: None,
+            call_carrier: None,
+        },
+    ),
+}
+== the run starts record the sends differently
+[
+    Object {
+        "model": Object {
+            "model_id": String("m"),
+            "provider_module_id": String("stub"),
+        },
+        "principal": Null,
+        "request_identity_digest": Null,
+        "run_id": String("r1"),
+        "scope": Null,
+        "send_id": Null,
+        "sent_by": Null,
+        "session_class": Null,
+        "submission_id": Null,
+        "title": Null,
+    },
+]
+== display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:60aaa95349238caaf7ff60998f03bbf5b697861e164b4cc4e3c2408b9e74d324 (3476 bytes)
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:0c3a73232594da8d5c492ce87ed41cc014e2111091f351de727e565af704c0cb (2770 bytes)
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:94316c800409f077bbcc36d5be2c80c8417dbf7ce53646d40f0e85f65768fcb8 (3591 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:72b887f0a474ac697eb229b0cd16cbacb05626dca4a41b2bc9c9f9e07a970dc7 (2923 bytes)
+== display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:ad84e3e25cd194bf1b013d624f69186a15d19ccbd51b3e0de620c4ccd551dc49 (3320 bytes)
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:ba6745dc96574da97d8e4acdfc73035f0600e9841d9d62ae47ea5905277f645a (2652 bytes)
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:7cc6a4b6067e210bff01024eceddc2481f8ef7fa705b026360c7a3eac4874927 (3747 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:6bd38f7abe1964a878c9370dbb74c9938cd00415c6b06a0dd8c870aaa66d5a2c (3041 bytes)

@@ -1,0 +1,511 @@
+== step 0: replies differ
+Active {
+    run_id: RunId(
+        "r-k1",
+    ),
+    delivered: None,
+}
+== step 2: replies differ
+SendIdReuse {
+    differing: "input",
+}
+== the run starts record the sends differently
+[
+    Object {
+        "model": Object {
+            "model_id": String("m"),
+            "provider_module_id": String("stub"),
+        },
+        "principal": Null,
+        "request_identity_digest": String("{\"version\":1,\"model\":\"5c4857cc1835fb102ef91665304900a2ea8635c809227a7928042182c4b001e7\",\"input\":\"8127738feb781a2be7cc444c0ba1be1c6043bfd77d5a549f633dcbfc2e179faa\",\"tools\":\"d2a1037066453602a31d06f371349169675c5d3efcfbb9d69564467324793dc0\",\"policy_allowed\":\"8a2d0b87e8c712cc8e06c5c3f8de5e7f9dc8edcca03079a7aec0cb6436294927\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"af7cbe31c025fa06bef6e57aa2e36940d7290e9d0b55a2d4cdd9483ed9cb1e98\"}"),
+        "run_id": String("r-k1"),
+        "scope": Null,
+        "send_id": String("k1"),
+        "sent_by": Null,
+        "session_class": Null,
+        "submission_id": Null,
+        "title": Null,
+    },
+]
+== display facts, tools, rich ui (true, false, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "completed_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(true),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "completed_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(true),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:3aaeb0439735d71c0c025d0e187e8e717f0b5974b458a00355885dc946c73976 (2096 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r-k1"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(true),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r-k1"),
+}
+== display facts, tools, rich ui (false, false, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(true),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(true),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:e5e956220f79bfc69a837c8f06aa7030b65f8397f306ecf8377e2946ad0c63c2 (2174 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r-k1"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r-k1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "completed_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(true),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r-k1"),
+}

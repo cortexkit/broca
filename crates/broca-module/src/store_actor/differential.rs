@@ -507,7 +507,7 @@ async fn compare_with_render(
                     class,
                 )
                 .await;
-                assert_eq!(new, old, "step {index}: replies differ");
+                alike!(new, old, "step {index}: replies differ");
                 answers.push(old);
             }
             Step::Retract(submission_id) => {
@@ -520,7 +520,7 @@ async fn compare_with_render(
                     .await
                     .expect("today's actor opens");
                 let new = super::tests::retract(&commands, submission_id).await;
-                assert_eq!(new, old, "step {index}: retraction replies differ");
+                alike!(new, old, "step {index}: retraction replies differ");
             }
             Step::Release => {
                 for gate in today_gate.iter().chain(store_gate.iter()) {
@@ -544,7 +544,7 @@ async fn compare_with_render(
         today.texts().await,
         "the conversations differ"
     );
-    assert_eq!(
+    alike!(
         store_starts(&session).await,
         today.starts(),
         "the run starts record the sends differently"
@@ -599,7 +599,7 @@ async fn display_reads_alike(
             let new = crate::store_read::serve_view(session, parts, &request)
                 .await
                 .expect("the store's session reads");
-            assert_eq!(
+            alike!(
                 comparable_read(&new),
                 comparable_read(&old),
                 "display facts, tools, rich ui {opted:?}, page {page:?}"
@@ -624,7 +624,7 @@ async fn opted_reads_alike(today: &Module, store: &Module, label: &str) {
                 .read(opted_request(&store.key, page, opted))
                 .await
                 .expect("the store's session reads");
-            assert_eq!(
+            alike!(
                 comparable_read(&new),
                 comparable_read(&old),
                 "{label}: display facts, tools, rich ui {opted:?}, page {page:?}"
@@ -1814,13 +1814,13 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
     for (from, limit) in [(None, None), (Some(1), Some(2)), (Some(3), Some(1))] {
         let (old, _) = read_json(&today, from, limit, None).await;
         let (new, _) = read_json(&store, from, limit, None).await;
-        assert_eq!(new, old, "page from {from:?} limit {limit:?}");
+        alike!(new, old, "page from {from:?} limit {limit:?}");
     }
     let (_, today_mids) = read_json(&today, Some(1), Some(1), None).await;
     let (_, store_mids) = read_json(&store, Some(1), Some(1), None).await;
     let (old, _) = read_json(&today, None, Some(2), Some(today_mids[0].clone())).await;
     let (new, _) = read_json(&store, None, Some(2), Some(store_mids[0].clone())).await;
-    assert_eq!(new, old, "page after the first message");
+    alike!(new, old, "page after the first message");
     // The ids served are the ones the session stored when it placed each message.
     let (_, all) = read_json(&store, Some(1), None, None).await;
     assert_eq!(all, store.stored_mids().await);
@@ -1851,7 +1851,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
                     }
                     roles.push(envelope_roles);
                 }
-                assert_eq!(roles[1], roles[0], "{media:?}, {opted:?}, {page:?}");
+                alike!(roles[1], roles[0], "{media:?}, {opted:?}, {page:?}");
             }
         }
     }
@@ -1882,7 +1882,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
         assert_eq!(roles.len(), 4);
         history_roles.push(roles);
     }
-    assert_eq!(history_roles[1], history_roles[0]);
+    alike!(history_roles[1], history_roles[0]);
     // A cursor naming another history version is refused, never answered.
     use crate::serve::{ServeHandler, SessionReadRequest};
     let mut stale = SessionReadRequest::new(store.key.clone(), None, Some(1));
@@ -2140,7 +2140,7 @@ async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storage
                 .send(run, request.clone(), key.clone(), mode, None)
                 .await;
             let new = super::tests::send_exactly(&commands, run, request, key, mode, None).await;
-            assert_eq!(new, old);
+            alike!(new, old);
             if run == "native-second" && delivery == broca_protocol::Delivery::Queue {
                 let SendOutcome::Pending { submission_id } = old else {
                     panic!("queue returned {old:?}")

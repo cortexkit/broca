@@ -1100,13 +1100,10 @@ async fn spend_alike(today: &LogImage, session: &Session<&MemoryBackend>, parts:
             "differential",
             &UnknownCharge,
         );
+        let new = timeless(new);
+        broca_test_support::pin!(format!("run {}'s spend facts", run_id.0), new);
         assert!(!old.is_empty(), "today bills run {}", run_id.0);
-        assert_eq!(
-            timeless(new),
-            timeless(old),
-            "run {}'s spend facts",
-            run_id.0
-        );
+        assert_eq!(new, timeless(old), "run {}'s spend facts", run_id.0);
     }
 }
 
@@ -1226,7 +1223,12 @@ async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
         rename(&mut value, &mut Default::default());
         value
     }
-    assert_eq!(masked(&new), masked(&old), "the compaction entries differ");
+    let new = masked(&new);
+    broca_test_support::pin!(
+        "compaction entries",
+        broca_test_support::pins::Text(serde_json::to_string_pretty(&new).unwrap())
+    );
+    assert_eq!(new, masked(&old), "the compaction entries differ");
 }
 
 tokio::task_local! {
@@ -1687,6 +1689,7 @@ async fn compare_reported<F: std::future::Future<Output = ()>>(at_least: usize, 
     REPORTS.scope(Some(Arc::clone(&pair)), compare).await;
     let today = pair.today.lock().unwrap().clone();
     let new = pair.new.lock().unwrap().clone();
+    broca_test_support::pin!("account reports", new);
     assert!(today.len() >= at_least, "today's reports: {today:?}");
     assert_eq!(new, today, "the new loop's reports");
 }
@@ -2366,6 +2369,36 @@ struct Outcome {
     records: Vec<Value>,
     requests: Vec<CallOptions>,
     calls: Vec<String>,
+}
+
+/// Pins what the new loop did, labelled with `context` (see `broca_test_support::pins`): how
+/// many requests and records, each request as `rendered` shows it, each record, and the tool
+/// calls. Each value pinned is one the comparison beside it found alike with today's loop when
+/// the pins were written.
+fn pin_outcome(
+    context: &str,
+    requests: &[CallOptions],
+    records: &[Value],
+    calls: &[String],
+    rendered: impl Fn(&CallOptions) -> CallOptions,
+) {
+    broca_test_support::pin!(format!("{context}request count"), requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        broca_test_support::pin!(format!("{context}request {index}"), rendered(request));
+    }
+    pin_records(context, records);
+    broca_test_support::pin!(format!("{context}tool calls"), calls);
+}
+
+/// Pins `records`, as [`pin_outcome`] does: their count, and the records together as one
+/// entry, one compact JSON record per line, which keeps a long run's pins small.
+fn pin_records(context: &str, records: &[Value]) {
+    broca_test_support::pin!(format!("{context}record count"), records.len());
+    let lines: Vec<String> = records.iter().map(Value::to_string).collect();
+    broca_test_support::pin!(
+        format!("{context}records"),
+        broca_test_support::pins::Text(lines.join("\n"))
+    );
 }
 
 async fn today(scenario: &Scenario) -> Outcome {
@@ -3144,6 +3177,7 @@ async fn compare_in_once(scenario: Scenario) {
             eprintln!("new   {index}: {record}");
         }
     }
+    pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
         assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
@@ -3383,6 +3417,13 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
                 eprintln!("{context} new   {index}: {record}");
             }
         }
+        pin_outcome(
+            &format!("{context}: "),
+            &new.requests,
+            &new.records,
+            &new.calls,
+            Clone::clone,
+        );
         assert_eq!(
             new.requests.len(),
             today.requests.len(),
@@ -3491,6 +3532,7 @@ async fn compare_seal_every_cut_in(scenario: Scenario) {
                 eprintln!("{context} new   {index}: {record}");
             }
         }
+        pin_records(&format!("{context}: "), &new.records);
         for (index, (new, today)) in new.records.iter().zip(&today_sealed).enumerate() {
             assert_eq!(new, today, "{context}: record {index}");
         }
@@ -3996,6 +4038,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
             eprintln!("new   {index}: {record}");
         }
     }
+    pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
         assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
@@ -5049,6 +5092,13 @@ async fn compare_actions_every_cut_once(
                 eprintln!("{context} new   {index}: {record}");
             }
         }
+        pin_outcome(
+            &format!("{context}: "),
+            &new.requests,
+            &new.records,
+            &new.calls,
+            Clone::clone,
+        );
         assert_eq!(
             new.requests.len(),
             today.requests.len(),
@@ -5227,6 +5277,7 @@ fn assert_same(today: &Outcome, new: &Outcome) {
             eprintln!("new   {index}: {record}");
         }
     }
+    pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
         assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
@@ -8490,15 +8541,29 @@ async fn a_ride_claims_a_cache_expired_by_the_lifetime_its_requests_asked_for() 
 /// The same run with its cache written moments ago: nothing is claimed.
 #[tokio::test]
 async fn a_live_cache_is_not_claimed_expired() {
-    CACHE
+    // Both loops read one fixed clock, so the pinned run is the same every time. It is set
+    // after today's date, so a cache sent at that time is live by the wall clock as well.
+    const NOW_MS: u64 = 1_800_000_000_000;
+    let dir = broca_test_support::scratch_root().join(format!(
+        "live-cache-clock-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("test-clock"), format!(r#"{{"now_ms":{NOW_MS}}}"#)).unwrap();
+    let clock = broca_core::Clock::for_state_root(&dir).unwrap();
+    ACCOUNT_CLOCK
         .scope(
-            true,
-            compare_compacted(
-                cached_scenario(broca_core::clock::Clock::default().now_ms()),
-                CompactionScript {
-                    context_limit: 100_000,
-                    rides: Vec::new(),
-                },
+            clock,
+            CACHE.scope(
+                true,
+                compare_compacted(
+                    cached_scenario(NOW_MS),
+                    CompactionScript {
+                        context_limit: 100_000,
+                        rides: Vec::new(),
+                    },
+                ),
             ),
         )
         .await;
@@ -8528,6 +8593,7 @@ async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: Option<usiz
     WARM.scope(Some(Arc::clone(&pair)), compare).await;
     let today = pair.today.log.lock().unwrap().clone();
     let new = pair.new.log.lock().unwrap().clone();
+    broca_test_support::pin!("warms", new);
     assert!(!today.is_empty(), "today's loop sent no warm");
     if let Some(expect) = expect {
         assert_eq!(

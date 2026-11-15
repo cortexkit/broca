@@ -1,0 +1,60 @@
+== request count
+2
+== request 0
+sha256:b709a73b3b7a3819b78631e5f02c2e61df5bc6c9f15abf64be7c7bf7d1ba97b6 (2498 bytes)
+== request 1
+sha256:11bd90158cbf872fa7e1ba7c2bba4159bf4619e6c16601f9825795f30bbd4314 (5630 bytes)
+== record count
+19
+== records
+sha256:e854ed4c7dd8995e94456ac3b9443fd111ff9f28e7e850a2f620464c384b1cd7 (7061 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:b709a73b3b7a3819b78631e5f02c2e61df5bc6c9f15abf64be7c7bf7d1ba97b6 (2498 bytes)
+== request 1
+sha256:11bd90158cbf872fa7e1ba7c2bba4159bf4619e6c16601f9825795f30bbd4314 (5630 bytes)
+== record count
+19
+== records
+sha256:e854ed4c7dd8995e94456ac3b9443fd111ff9f28e7e850a2f620464c384b1cd7 (7061 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:9d68a0be80779bb655891643169c135670e9f7dff28bf4a38e526aeda5068824 (2498 bytes)
+== request 1
+sha256:738c4ea8da80b1cf619ccc3e3eac60dc4b82c480778c1f752ca70cfc2ae3b1d9 (5632 bytes)
+== record count
+19
+== records
+sha256:ceb9e7f97a67b6bbab4b22efd065fe39157dbb2f94c5884db47b0269a534fe90 (7280 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:9d68a0be80779bb655891643169c135670e9f7dff28bf4a38e526aeda5068824 (2498 bytes)
+== request 1
+sha256:738c4ea8da80b1cf619ccc3e3eac60dc4b82c480778c1f752ca70cfc2ae3b1d9 (5632 bytes)
+== record count
+19
+== records
+sha256:ceb9e7f97a67b6bbab4b22efd065fe39157dbb2f94c5884db47b0269a534fe90 (7280 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"batch_finished\"",
+]

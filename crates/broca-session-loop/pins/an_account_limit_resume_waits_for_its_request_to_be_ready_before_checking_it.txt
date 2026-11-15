@@ -1,0 +1,76 @@
+== request count
+3
+== request 0
+sha256:eeadfe5cdd00e774c04001da1a062339da49adb803dfe04367e554407bca5bad (2583 bytes)
+== request 1
+sha256:199e7fd7d3c62cf96628d40cb8df8c0ca8924a9f8b6b8cf65116ec7c85e138a3 (5263 bytes)
+== request 2
+sha256:199e7fd7d3c62cf96628d40cb8df8c0ca8924a9f8b6b8cf65116ec7c85e138a3 (5263 bytes)
+== record count
+24
+== records
+sha256:723fd970eac9f3d52614b96129e0942b890483028aee62b2ea0352bfd25a4ccb (8912 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+3
+== request 0
+sha256:eeadfe5cdd00e774c04001da1a062339da49adb803dfe04367e554407bca5bad (2583 bytes)
+== request 1
+sha256:199e7fd7d3c62cf96628d40cb8df8c0ca8924a9f8b6b8cf65116ec7c85e138a3 (5263 bytes)
+== request 2
+sha256:199e7fd7d3c62cf96628d40cb8df8c0ca8924a9f8b6b8cf65116ec7c85e138a3 (5263 bytes)
+== record count
+24
+== records
+sha256:723fd970eac9f3d52614b96129e0942b890483028aee62b2ea0352bfd25a4ccb (8912 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+3
+== request 0
+sha256:d374ac533308ad707765aef3a52410176c5ee105895a59044fc9564a87f9c14c (2583 bytes)
+== request 1
+sha256:0f4b49d7f4749100e17b3d8a4e9157ba7ced0609db3bbb7a0cac67268aa89df0 (5265 bytes)
+== request 2
+sha256:0f4b49d7f4749100e17b3d8a4e9157ba7ced0609db3bbb7a0cac67268aa89df0 (5265 bytes)
+== record count
+24
+== records
+sha256:531f34300d6381a93fce894fcbc0fe263dbfa3af1f7abaa7e082e77e49ae063f (9131 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+3
+== request 0
+sha256:d374ac533308ad707765aef3a52410176c5ee105895a59044fc9564a87f9c14c (2583 bytes)
+== request 1
+sha256:0f4b49d7f4749100e17b3d8a4e9157ba7ced0609db3bbb7a0cac67268aa89df0 (5265 bytes)
+== request 2
+sha256:0f4b49d7f4749100e17b3d8a4e9157ba7ced0609db3bbb7a0cac67268aa89df0 (5265 bytes)
+== record count
+24
+== records
+sha256:531f34300d6381a93fce894fcbc0fe263dbfa3af1f7abaa7e082e77e49ae063f (9131 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]

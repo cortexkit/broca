@@ -1,0 +1,559 @@
+== alike
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the conversations differ
+[
+    "you are a worker",
+    "first",
+]
+== the runs' starts differ
+[
+    Object {
+        "compaction_plan_version": Null,
+        "context_limit": Null,
+        "hooks": Null,
+        "run_id": String("r1"),
+        "tools_were_omitted": Bool(true),
+    },
+]
+== the model calls were sent different messages
+[]
+== display facts, tools, rich ui (true, false, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (false, true, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (false, false, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:c8464b003c3d8d4f6cd2396e21fe9c3142e53c86f4c85a29a5be8e822973c86a (2083 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "last_run_id": String("r1"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}

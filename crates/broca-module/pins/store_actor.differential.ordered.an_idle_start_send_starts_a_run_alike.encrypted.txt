@@ -1,0 +1,264 @@
+== the first send's replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the replies to q1 differ
+Active {
+    run_id: RunId(
+        "q1",
+    ),
+    delivered: None,
+}
+== the replies to q2 differ
+Active {
+    run_id: RunId(
+        "q2",
+    ),
+    delivered: None,
+}
+== the replies to q3 differ
+Active {
+    run_id: RunId(
+        "q3",
+    ),
+    delivered: None,
+}
+== display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:9f70d263e34a6278ad30db0f19c19414663271152cee764134841233306a6ed5 (7182 bytes)
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("transient"),
+            "message": String("provider stream ended without an assembled assistant message and Finished control"),
+            "provider_code": String("transient"),
+        },
+        "last_run_id": String("q3"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:14e14788954832071759f432ab187e3abe5a7f018051dcfb88b1101c1eb83731 (2947 bytes)
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:a9a29c5080a51a5ac95cdd910a7ab515f59fa1c79deb61654dfcca0dfc4b7322 (6859 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("transient"),
+            "message": String("provider stream ended without an assembled assistant message and Finished control"),
+            "provider_code": String("transient"),
+        },
+        "last_run_id": String("q3"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("q3"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:394343657776897aafa85685f3cfc70503fbef9eefe0a7ffc801bc3109951890 (3006 bytes)
+== display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:e7e0435452ef451ca6a00d25936568ab005eb454b78e31776487ee1d262c78f4 (6588 bytes)
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("transient"),
+            "message": String("provider stream ended without an assembled assistant message and Finished control"),
+            "provider_code": String("transient"),
+        },
+        "last_run_id": String("q3"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:5e442190f07f4503cbdcb50139272ac04eca6f80257446ea16dfa333a0e89935 (2735 bytes)
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:4eee267f48dc97eb353a39bb033cca0fb3aa1259d29ec0ffdffa4966d250b300 (7453 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "error": Object {
+            "class": String("transient"),
+            "message": String("provider stream ended without an assembled assistant message and Finished control"),
+            "provider_code": String("transient"),
+        },
+        "last_run_id": String("q3"),
+        "reason": String("error"),
+        "state": String("error"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("q3"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:e8e38c0cbcba8c0694f34f65495ce18d13bba3adfadd805b330d61a762ee0f47 (3218 bytes)
+== the conversations differ
+[
+    "you are a worker",
+    "first",
+    "hello",
+    "wake up",
+    "again",
+    "go on",
+    "more",
+    "keyed wake up",
+]
+== the runs' starts differ
+sha256:79884e9d74339d0f1cb2d5fc5be94351b883cc1dd07a0433430348266105f59a (4776 bytes)
+== the model calls were sent different messages
+[
+    [
+        "you are a worker",
+        "first",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "wake up",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "wake up",
+        "again",
+        "go on",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "wake up",
+        "again",
+        "go on",
+        "more",
+        "keyed wake up",
+    ],
+]

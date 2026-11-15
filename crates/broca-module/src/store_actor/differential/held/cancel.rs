@@ -217,7 +217,7 @@ async fn a_parked_held_run_cancels_alike(cipher: Cipher) {
             observations.push((format!("{reply:?}"), before));
             assert!(side.registry.stop_and_seal().await);
         }
-        assert_eq!(observations[1], observations[0]);
+        alike!(observations[1], observations[0]);
     }
 }
 
@@ -267,8 +267,9 @@ async fn other_parked_pauses_cancel_alike(cipher: Cipher) {
                 ));
                 assert!(side.registry.stop_and_seal().await);
             }
-            assert_eq!(
-                observations[1], observations[0],
+            alike!(
+                observations[1],
+                observations[0],
                 "reason={reason:?}, at={at:?}"
             );
         }

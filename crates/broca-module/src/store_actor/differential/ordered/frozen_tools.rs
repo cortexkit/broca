@@ -51,32 +51,32 @@ async fn a_creating_sends_tools_are_frozen_alike(cipher: Cipher) {
         .send("r-k1", naming_tools("first"), None, None, Some("k1"))
         .await;
     assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(new, old, "the creating send");
+    alike!(new, old, "the creating send");
     pair.idle().await;
     let (old, new) = pair
         .send("r-k1", naming_tools("first"), None, None, Some("k1"))
         .await;
     assert!(matches!(old, SendOutcome::Finished { .. }), "{old:?}");
-    assert_eq!(new, old, "the creating send's retry");
+    alike!(new, old, "the creating send's retry");
     let (old, new) = pair
         .send("r2", naming_tools("second"), None, None, None)
         .await;
     frozen(&old);
-    assert_eq!(new, old, "a later send naming tools");
+    alike!(new, old, "a later send naming tools");
     let (old, new) = pair
         .send("r3", naming_tools("third"), None, Some(plan()), None)
         .await;
     frozen(&old);
-    assert_eq!(new, old, "a later send naming tools and carrying a plan");
+    alike!(new, old, "a later send naming tools and carrying a plan");
     let mut leaving = naming_tools("fourth");
     leaving.tools = None;
     let (old, new) = pair.send("r4", leaving, None, None, None).await;
     assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(new, old, "a later send leaving tools out");
+    alike!(new, old, "a later send leaving tools out");
     pair.idle().await;
     let today = offered(pair.today.executor.provider.inner.calls());
     assert_eq!(today, [["read"], ["read"]], "today's runs' tools");
-    assert_eq!(
+    alike!(
         offered(pair.store.provider.inner.calls()),
         today,
         "the store's runs' tools"
@@ -98,12 +98,12 @@ async fn a_send_naming_tools_and_another_plan_is_refused_for_its_tools_alike(cip
         .send("r2", named, None, Some(Arc::new(another)), None)
         .await;
     frozen(&old);
-    assert_eq!(new, old, "a later send naming tools and another plan");
+    alike!(new, old, "a later send naming tools and another plan");
     let (old, new) = pair
         .send("r3", from(core(), "third"), None, Some(plan()), None)
         .await;
     assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(new, old, "a later send leaving tools out");
+    alike!(new, old, "a later send leaving tools out");
     pair.idle().await;
     pair.assert_alike().await;
 }

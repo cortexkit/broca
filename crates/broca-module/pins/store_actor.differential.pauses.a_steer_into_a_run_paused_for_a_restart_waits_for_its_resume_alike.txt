@@ -1,0 +1,32 @@
+== the replies to r1 differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the replies to r-k1 differ
+Paused {
+    run_id: RunId(
+        "r1",
+    ),
+    reason: Restart,
+    delivered: None,
+}
+== the replies to r-k1 differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the replies to r-k1 differ
+SendIdReuse {
+    differing: "input",
+}
+== the replies to r2 differ
+Pending {
+    submission_id: SubmissionId(
+        "sub-r2",
+    ),
+}

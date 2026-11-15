@@ -789,18 +789,18 @@ impl Ended {
     /// compaction, tool and hook facts, every model call was sent the same messages, and reads
     /// with each opt-in serve the same.
     async fn assert_alike(&self) {
-        assert_eq!(
+        alike!(
             store::texts(&self.session),
             self.today.texts().await,
             "the conversations differ"
         );
-        assert_eq!(
+        alike!(
             self.store_starts().await,
             self.today_starts(),
             "the runs' starts differ"
         );
         let (old, new) = self.prompts();
-        assert_eq!(new, old, "the model calls were sent different messages");
+        alike!(new, old, "the model calls were sent different messages");
         super::display_reads_alike(&self.today, &self.session, &self.parts).await;
     }
 
@@ -821,13 +821,13 @@ async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     let (today, store) = pair
         .send("r2", limited("second"), None, Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
@@ -845,7 +845,7 @@ async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
         1,
         "today's actor sends Setup once in its life"
     );
-    assert_eq!(
+    alike!(
         new.setups(),
         old.setups(),
         "the store actor's second run sent Setup again: {:?}",
@@ -866,7 +866,7 @@ async fn a_planned_sends_input_is_transformed_alike() {
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
@@ -892,12 +892,12 @@ async fn a_steers_input_is_transformed_alike() {
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     let (today, store) = pair
         .send("s1", untooled("more"), None, Delivery::Steer)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.release();
     pair.release();
     pair.idle().await;
@@ -931,12 +931,12 @@ async fn a_queued_sends_transforms_are_reused_when_it_drains_alike() {
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     let (today, store) = pair
         .send("r2", untooled("second"), None, Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Pending { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.release();
     pair.release();
     pair.idle().await;
@@ -975,7 +975,7 @@ async fn a_send_leaving_its_tools_to_a_confining_plan_records_it_alike() {
     request.scope = super::head_scope(super::core());
     let (today, store) = pair.send("r1", request, Some(&plan), Delivery::Queue).await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
@@ -1001,7 +1001,7 @@ async fn a_refused_input_ends_its_run_before_the_model_alike() {
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
@@ -1031,7 +1031,7 @@ async fn a_refused_steer_or_queued_send_writes_nothing_alike() {
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     for noter in [&old, &new] {
         noter.unavailable.store(true, Ordering::SeqCst);
     }
@@ -1044,7 +1044,7 @@ async fn a_refused_steer_or_queued_send_writes_nothing_alike() {
             },
             "{delivery:?}"
         );
-        assert_eq!(store, today, "{delivery:?}");
+        alike!(store, today, "{delivery:?}");
     }
     pair.release();
     pair.idle().await;
@@ -1119,9 +1119,9 @@ async fn a_change_at_a_runs_end_is_told_before_the_next_run_alike() {
     first.stop_when = vec![broca_protocol::request::StopCondition::StepCount { n: 1 }];
     let (today, store) = pair.send("r1", first, Some(&plan), Delivery::Queue).await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
-    assert_eq!(
+    alike!(
         new.calls(),
         old.calls(),
         "between the runs the compaction provider was told different things"
@@ -1130,9 +1130,9 @@ async fn a_change_at_a_runs_end_is_told_before_the_next_run_alike() {
         .send("r2", limited("second"), None, Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
-    assert_eq!(new.calls(), old.calls());
+    alike!(new.calls(), old.calls());
     let ended = pair.end().await;
     ended.assert_alike().await;
     ended.stop().await;
@@ -1154,16 +1154,16 @@ async fn a_tool_batchs_results_are_told_once_durable_alike() {
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     let (today, store) = pair
         .send("s1", limited("more"), None, Delivery::Steer)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.release();
     pair.release();
     pair.idle().await;
-    assert_eq!(new.calls(), old.calls());
+    alike!(new.calls(), old.calls());
     let ended = pair.end().await;
     ended.assert_alike().await;
     ended.stop().await;
@@ -1187,7 +1187,7 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         )
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     let ended = pair.end().await;
     let request =
@@ -1342,7 +1342,7 @@ async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_sto
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     // The view drops the first run's answer, the session's second message.
     old.drop_at_next_ride(2);
@@ -1351,14 +1351,14 @@ async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_sto
     second.model = broca_protocol::request::ModelHandle::new("stub", "another");
     let (today, store) = pair.send("r2", second, None, Delivery::Queue).await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     assert_eq!(
         (old.views(), new.views()),
         (1, 1),
         "a ride handed a view over"
     );
-    assert_eq!(new.calls(), old.calls());
+    alike!(new.calls(), old.calls());
     super::super::subscribe_tests::every_unit_resumes(&pair.commands).await;
     let ended = pair.end().await;
     ended.assert_alike().await;
@@ -1432,7 +1432,7 @@ async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
         .send("r1", store::request("first"), None, Delivery::Queue)
         .await;
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    assert_eq!(store, today);
+    alike!(store, today);
     pair.idle().await;
     // Today's control lane: one start, and two finishes under two distinct keys, the first
     // the start's.

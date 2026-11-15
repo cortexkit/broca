@@ -1,0 +1,114 @@
+== alike
+(
+    "Ack",
+    (
+        Object {
+            "final_step_finish_reason": String("tool_calls"),
+            "retries_used": Number(0),
+            "state": String("cancelled"),
+            "undelivered_steers": Array [],
+            "usage": Object {
+                "by_model": Array [
+                    Object {
+                        "input_tokens": Number(100),
+                        "model": String("m"),
+                        "output_tokens": Number(20),
+                        "provider": String("stub"),
+                        "steps": Number(1),
+                        "unreported_steps": Number(0),
+                    },
+                ],
+                "input_tokens": Number(100),
+                "output_tokens": Number(20),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        },
+        Object {
+            "run_id": String("r1"),
+            "state": String("cancelled"),
+            "usage": Object {
+                "by_model": Array [
+                    Object {
+                        "input_tokens": Number(100),
+                        "model": String("m"),
+                        "output_tokens": Number(20),
+                        "provider": String("stub"),
+                        "steps": Number(1),
+                        "unreported_steps": Number(0),
+                    },
+                ],
+                "input_tokens": Number(100),
+                "output_tokens": Number(20),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        },
+        (
+            String("cancelled"),
+            [
+                Object {
+                    "outcome": String("interrupted"),
+                    "reason": String("provider_held_cancelled"),
+                },
+            ],
+        ),
+    ),
+)
+== alike
+(
+    "Ack",
+    (
+        Object {
+            "final_step_finish_reason": String("tool_calls"),
+            "retries_used": Number(0),
+            "state": String("cancelled"),
+            "undelivered_steers": Array [],
+            "usage": Object {
+                "by_model": Array [
+                    Object {
+                        "input_tokens": Number(100),
+                        "model": String("m"),
+                        "output_tokens": Number(20),
+                        "provider": String("stub"),
+                        "steps": Number(1),
+                        "unreported_steps": Number(0),
+                    },
+                ],
+                "input_tokens": Number(100),
+                "output_tokens": Number(20),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        },
+        Object {
+            "run_id": String("r1"),
+            "state": String("cancelled"),
+            "usage": Object {
+                "by_model": Array [
+                    Object {
+                        "input_tokens": Number(100),
+                        "model": String("m"),
+                        "output_tokens": Number(20),
+                        "provider": String("stub"),
+                        "steps": Number(1),
+                        "unreported_steps": Number(0),
+                    },
+                ],
+                "input_tokens": Number(100),
+                "output_tokens": Number(20),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        },
+        (
+            String("cancelled"),
+            [
+                Object {
+                    "outcome": String("interrupted"),
+                    "reason": String("provider_held_cancelled"),
+                },
+            ],
+        ),
+    ),
+)

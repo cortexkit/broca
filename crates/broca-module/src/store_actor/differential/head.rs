@@ -227,7 +227,7 @@ async fn heads_alike(today: &Module, store: &Module, label: &str) -> serde_json:
     for principal in [None, Some(core()), Some(occipital())] {
         let old = head_json(today, principal.as_ref()).await;
         let new = head_json(store, principal.as_ref()).await;
-        assert_eq!(new, old, "{label}: heads differ for {principal:?}");
+        alike!(new, old, "{label}: heads differ for {principal:?}");
     }
     super::opted_reads_alike(today, store, label).await;
     head_json(store, None).await
@@ -394,7 +394,7 @@ async fn flow_and_run_routes_have_no_owner_authority_alike() {
             assert!(head.sender.is_none(), "{route} route received owner grant");
             answers.push(refused);
         }
-        assert_eq!(answers[1], answers[0], "{route} refusals");
+        alike!(answers[1], answers[0], "{route} refusals");
     }
     run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;

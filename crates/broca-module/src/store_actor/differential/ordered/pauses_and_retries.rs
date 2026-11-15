@@ -61,7 +61,7 @@ async fn retract_alike(pair: &Pair, submission_id: &str) -> crate::actor::Retrac
         .await
         .expect("today's actor opens");
     let new = store::retract(&pair.commands, submission_id).await;
-    assert_eq!(new, old, "the retractions of {submission_id} differ");
+    alike!(new, old, "the retractions of {submission_id} differ");
     new
 }
 
@@ -154,7 +154,7 @@ async fn an_ended_or_delivered_ordered_sends_retry_is_answered_alike(cipher: Cip
                 Some(key),
             )
             .await;
-        assert_eq!(
+        alike!(
             keyless(new),
             keyless(old.clone()),
             "the retries of {key} differ"
@@ -283,7 +283,7 @@ async fn a_steer_leaving_its_model_meets_the_plans_model_check_alike(cipher: Cip
     let pair = Pair::new(reading(), true, cipher).await;
     pair.first("r1").await;
     let (old, new) = steer_checked(&pair, "s1", "use another", "another").await;
-    assert_eq!(new, old, "the refused steer's replies differ");
+    alike!(new, old, "the refused steer's replies differ");
     assert!(
         matches!(
             new,
@@ -292,7 +292,7 @@ async fn a_steer_leaving_its_model_meets_the_plans_model_check_alike(cipher: Cip
         "{new:?}"
     );
     let (old, new) = steer_checked(&pair, "s2", "also this", "m").await;
-    assert_eq!(new, old, "the admitted steer's replies differ");
+    alike!(new, old, "the admitted steer's replies differ");
     assert!(matches!(new, SendOutcome::Active { .. }), "{new:?}");
     pair.release();
     pair.release();

@@ -1,0 +1,270 @@
+== alike
+"Err(Import(\"import carried no messages to import, so nothing was written; if the source transcript holds only system messages or unpaired tool results there is nothing to seed and the session stays empty and importable\"))"
+== alike
+"Err(Import(\"import carried no messages to import, so nothing was written; if the source transcript holds only system messages or unpaired tool results there is nothing to seed and the session stays empty and importable\"))"
+== alike
+"Err(Import(\"import message at ordinal 0 has no content\"))"
+== valid import after refusals: display facts, tools, rich ui (true, false, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+}
+== valid import after refusals: display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+}
+== valid import after refusals: display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [],
+}
+== valid import after refusals: display facts, tools, rich ui (false, true, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== valid import after refusals: display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== valid import after refusals: display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== valid import after refusals: display facts, tools, rich ui (false, false, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+}
+== valid import after refusals: display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+}
+== valid import after refusals: display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [],
+}
+== valid import after refusals: display facts, tools, rich ui (true, true, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== valid import after refusals: display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("usable"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== valid import after refusals: display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}

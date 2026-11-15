@@ -1,0 +1,607 @@
+== alike
+Active {
+    run_id: RunId(
+        "run-send_sample_first_0123456789abcdef",
+    ),
+    delivered: None,
+}
+== the store answers the retry as today's
+SendIdReuse {
+    differing: "model",
+}
+== the store answers as today's
+Ok(
+    Object {
+        "answer": String("accepted"),
+    },
+)
+== alike
+Array [
+    Object {
+        "content": Array [
+            Object {
+                "text": String("You are the head of a synthetic agent."),
+                "type": String("text"),
+            },
+        ],
+        "role": String("system"),
+    },
+    Object {
+        "content": Array [
+            Object {
+                "text": String("§1§ Start STRIATUM-SAMPLE on the synthetic project."),
+                "type": String("text"),
+            },
+        ],
+        "role": String("user"),
+    },
+    Object {
+        "content": Array [
+            Object {
+                "text": String("§3§ Continue the synthetic project."),
+                "type": String("text"),
+            },
+        ],
+        "role": String("user"),
+    },
+    Object {
+        "content": Array [
+            Object {
+                "text": String("§4§ Continuing."),
+                "type": String("text"),
+            },
+        ],
+        "origin": Object {
+            "model_id": String("gpt-6.1-sol"),
+            "provider_module_id": String("openai"),
+        },
+        "role": String("assistant"),
+    },
+    Object {
+        "content": Array [
+            Object {
+                "text": String("§5§ Carry on with the synthetic project."),
+                "type": String("text"),
+            },
+        ],
+        "role": String("user"),
+    },
+]
+== a head's three turns: {}
+sha256:dc6df28f45fe93fc6c499ef91a420f215245bc58dfd405d4fb563b41a94af4c0 (5591 bytes)
+== a head's three turns: {"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("after the view"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== a head's three turns: {"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Carry on with the synthetic project."),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "notice": Bool(true),
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(false),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "send_id": String("send_sample_third_0123456789abcdef"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("after the view"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== a head's three turns: {"from_ordinal":1,"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Start STRIATUM-SAMPLE on the synthetic project."),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "notice": Bool(true),
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(false),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "send_id": String("send_sample_first_0123456789abcdef"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Awake."),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== a head's three turns: {"from_ordinal":2}
+sha256:f252c03fb485297a429652033e3d382339543164939900c339e8649ec5d7a15d (4682 bytes)
+== a head's three turns: {"before_ordinal":3,"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Awake."),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== a head's three turns: {"from_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== a head's three turns: {"before_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== a head's three turns: {"from_mid":"no-such-message"}
+Object {
+    "refused": String("unknown_mid"),
+}
+== a head's three turns: {"cursor":"not-a-cursor"}
+Object {
+    "error": String("InvalidParams { field: \"cursor\", message: \"session.history cursor is malformed\" }"),
+}
+== a head's three turns: {"limit":1,"max_bytes":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("after the view"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== a head's three turns: older page 0
+sha256:5f7f86c621d26e02595eaeb2836d30bd3b0875e0556292813fa984212319fa5f (4689 bytes)
+== a head's three turns: the oldest page
+sha256:5f7f86c621d26e02595eaeb2836d30bd3b0875e0556292813fa984212319fa5f (4689 bytes)
+== a head's three turns: a newer page
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("after the view"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== a head's three turns: from_mid at 1 (the store's id geb350ccab6660801.5)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Start STRIATUM-SAMPLE on the synthetic project."),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "notice": Bool(true),
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(false),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "send_id": String("send_sample_first_0123456789abcdef"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Awake."),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== a head's three turns: before_mid at 1 (the store's id geb350ccab6660801.5)
+Object {
+    "messages": Array [],
+    "newer": Bool(true),
+}
+== a head's three turns: from_mid at 3 (the store's id geb350ccab6660801.13)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Continue the synthetic project."),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "notice": Bool(true),
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("run-send_sample_second_0123456789abcdef"),
+                "final": Bool(false),
+                "run_id": String("run-send_sample_second_0123456789abcdef"),
+            },
+            "send_id": String("send_sample_second_0123456789abcdef"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Continuing."),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_second_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_second_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== a head's three turns: before_mid at 3 (the store's id geb350ccab6660801.13)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Start STRIATUM-SAMPLE on the synthetic project."),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "notice": Bool(true),
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(false),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "send_id": String("send_sample_first_0123456789abcdef"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Awake."),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_first_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_first_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== a head's three turns: from_mid at 6 (the store's id geb350ccab6660801.24)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("after the view"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== a head's three turns: before_mid at 6 (the store's id geb350ccab6660801.24)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Continuing."),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("gpt-6.1-sol"),
+                    "provider_module_id": String("openai"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("run-send_sample_second_0123456789abcdef"),
+                "final": Bool(true),
+                "run_id": String("run-send_sample_second_0123456789abcdef"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("Carry on with the synthetic project."),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "notice": Bool(true),
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("run-send_sample_third_0123456789abcdef"),
+                "final": Bool(false),
+                "run_id": String("run-send_sample_third_0123456789abcdef"),
+            },
+            "send_id": String("send_sample_third_0123456789abcdef"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== a head's three turns: display {"form":"display"}
+sha256:2606ee0f243020258e49a3680f6eb85423cc12cbbed26873a571d04b8d97c631 (4864 bytes)
+== a head's three turns: display {"form":"display","from_ordinal":1,"limit":3}
+sha256:c5d85a7b17e45a1252b815382d8fe8d0a87cc05821a8dc4489b160741fc22aff (2379 bytes)

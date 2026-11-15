@@ -240,7 +240,7 @@ impl Pair {
             .send(run_id, from(core(), "first"), None, Some(plan()), None)
             .await;
         assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-        assert_eq!(new, old, "the first send's replies differ");
+        alike!(new, old, "the first send's replies differ");
     }
 
     /// Sends `request` as `run_id` to both sessions with the delivery list `order`, or as a
@@ -335,7 +335,7 @@ impl Pair {
         let (old, new) = self
             .send_as(run_id, request, delivery, None, None, None)
             .await;
-        assert_eq!(new, old, "the replies to {run_id} differ");
+        alike!(new, old, "the replies to {run_id} differ");
         old
     }
 
@@ -348,7 +348,7 @@ impl Pair {
         key: Option<&str>,
     ) -> SendOutcome {
         let (old, new) = self.send(run_id, request, order, None, key).await;
-        assert_eq!(new, old, "the replies to {run_id} differ");
+        alike!(new, old, "the replies to {run_id} differ");
         old
     }
 
@@ -452,17 +452,17 @@ impl Pair {
             queue, today_queue,
             "the sessions hold different sends queued"
         );
-        assert_eq!(
+        alike!(
             store::texts(&session),
             self.today.texts().await,
             "the conversations differ"
         );
-        assert_eq!(
+        alike!(
             store_starts(&session).await,
             self.today.starts(),
             "the runs' starts differ"
         );
-        assert_eq!(
+        alike!(
             prompts(self.store.provider.inner.calls()),
             prompts(self.today.executor.provider.inner.calls()),
             "the model calls were sent different messages"
@@ -1356,7 +1356,7 @@ async fn first_scoped(pair: &Pair, run_id: &str) {
         .send(run_id, scoped("first"), None, Some(plan()), None)
         .await;
     assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(new, old, "the first send's replies differ");
+    alike!(new, old, "the first send's replies differ");
 }
 
 /// Sends queued to ride on a tool batch keep their display marks: a plan sender's notice, and

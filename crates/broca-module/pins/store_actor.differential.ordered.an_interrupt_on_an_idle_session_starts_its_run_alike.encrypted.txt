@@ -1,0 +1,306 @@
+== the first send's replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the replies to i1 differ
+Active {
+    run_id: RunId(
+        "i1",
+    ),
+    delivered: None,
+}
+== the replies to i2 differ
+Active {
+    run_id: RunId(
+        "i2",
+    ),
+    delivered: None,
+}
+== display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:1d5f94224a92ac234f9c0adbbcf65c2983966bbfc55f5e19287043a24e9cd044 (5968 bytes)
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("i2"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:9b8eb75cac332dbbc5aabb5528eae016aec5d546f2e12e7b205cc04ba4d84005 (2737 bytes)
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:167b0229bfab067a9d4fff144ce5f1da1c659dca208b283200406f2bee5b67d7 (5782 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("i2"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("i2"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:6388cd99b9ab2b07588cfd8b9a2d4645d1452c14724bd4faf2062d6a55af063a (2794 bytes)
+== display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:e7055902a6071914273e375d87504729d946fa4d11925caee0cd2717d8dfefe0 (5511 bytes)
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("i2"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:a2bbb2502de98d725b8bcb10f7654637a3e38ebc8f9cdb82bea18fbff76f801f (2523 bytes)
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:be40cf8fada7dd8b3c8857a4e61464bacbfac1281dc6e1de5db5db915032fdf6 (6239 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("i2"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("i2"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:51326665f731c7c63f17aa20105845afa6d8ab41819a9ab3e503d8a63b6f27bd (3008 bytes)
+== the conversations differ
+[
+    "you are a worker",
+    "first",
+    "hello",
+    "do this now",
+    "again",
+    "do this now",
+    "more",
+]
+== the runs' starts differ
+[
+    Object {
+        "model": Object {
+            "model_id": String("m"),
+            "provider_module_id": String("stub"),
+        },
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "request_identity_digest": Null,
+        "run_id": String("r1"),
+        "scope": Null,
+        "send_id": Null,
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "session_class": Null,
+        "submission_id": Null,
+        "title": Null,
+    },
+    Object {
+        "model": Object {
+            "model_id": String("m"),
+            "provider_module_id": String("stub"),
+        },
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "request_identity_digest": Null,
+        "run_id": String("i1"),
+        "scope": Null,
+        "send_id": Null,
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "session_class": Null,
+        "submission_id": Null,
+        "title": Null,
+    },
+    Object {
+        "model": Object {
+            "model_id": String("m"),
+            "provider_module_id": String("stub"),
+        },
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "request_identity_digest": Null,
+        "run_id": String("i2"),
+        "scope": Null,
+        "send_id": Null,
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("occi"),
+        },
+        "session_class": Null,
+        "submission_id": Null,
+        "title": Null,
+    },
+]
+== the model calls were sent different messages
+[
+    [
+        "you are a worker",
+        "first",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "do this now",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "do this now",
+        "again",
+        "do this now",
+    ],
+]

@@ -280,8 +280,8 @@ async fn restart_pauses_resume_after_reopen_with_the_same_records_and_replies() 
         originals.push(original);
         resumed.push(side);
     }
-    assert_eq!(story(&resumed[1]).await, story(&resumed[0]).await);
-    assert_eq!(resumed[1].status().await, resumed[0].status().await);
+    alike!(story(&resumed[1]).await, story(&resumed[0]).await);
+    alike!(resumed[1].status().await, resumed[0].status().await);
     let mut replies = [resumed[0].result().await, resumed[1].result().await];
     for reply in &mut replies {
         reply["final_message"]
@@ -289,7 +289,7 @@ async fn restart_pauses_resume_after_reopen_with_the_same_records_and_replies() 
             .unwrap()
             .remove("mid");
     }
-    assert_eq!(replies[1], replies[0]);
+    alike!(replies[1], replies[0]);
     for side in originals.iter().chain(&resumed) {
         assert!(side.registry.stop_and_seal().await);
     }
@@ -313,9 +313,9 @@ async fn refused_restart_resume_is_interrupted_and_drains_the_next_send() {
         originals.push(original);
         resumed.push(side);
     }
-    assert_eq!(story(&resumed[1]).await, story(&resumed[0]).await);
-    assert_eq!(resumed[1].status().await, resumed[0].status().await);
-    assert_eq!(resumed[1].result().await, resumed[0].result().await);
+    alike!(story(&resumed[1]).await, story(&resumed[0]).await);
+    alike!(resumed[1].status().await, resumed[0].status().await);
+    alike!(resumed[1].result().await, resumed[0].result().await);
     for side in originals.iter().chain(&resumed) {
         assert!(side.registry.stop_and_seal().await);
     }

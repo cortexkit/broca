@@ -1,0 +1,59 @@
+== r1: replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== r2: replies differ
+Active {
+    run_id: RunId(
+        "r2",
+    ),
+    delivered: None,
+}
+== r3: replies differ
+Active {
+    run_id: RunId(
+        "r3",
+    ),
+    delivered: None,
+}
+== r4: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        Scoped {
+            frozen: SessionScope {
+                owner: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                scope_ref: "head-1",
+                scope_epoch: 2,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+                agent_id_frozen: false,
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "prefrontal-core",
+                },
+            ),
+            presented_scope: Some(
+                SessionScope {
+                    owner: Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                    scope_ref: "head-1",
+                    scope_epoch: 1,
+                    flow_id: None,
+                    sender: None,
+                    agent_id: None,
+                    run_id: None,
+                    agent_id_frozen: false,
+                },
+            ),
+        },
+    ),
+)

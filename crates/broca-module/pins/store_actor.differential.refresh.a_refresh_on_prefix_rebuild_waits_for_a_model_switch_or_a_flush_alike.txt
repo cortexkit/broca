@@ -1,0 +1,12 @@
+== alike
+[
+    "active",
+    "Accepted { run_in_progress: false, applies_from_next_run: false }",
+    "active",
+    "active",
+    "Accepted { run_in_progress: false, applies_from_next_run: false }",
+    "Ok(Object {\"pending_generation\": Number(2)})",
+    "active",
+]
+== alike
+sha256:3f47407b9dcd2ed16678e1f3458e8de223dcfc6ac27b195ecb1c442cae6db79f (4881 bytes)

@@ -1,0 +1,534 @@
+== failed and paused: {}
+sha256:9f45746dcbeb961870dbc278a8b12614a1138f752b152ba95425ef131f1c7e8b (2879 bytes)
+== failed and paused: {"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("third"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== failed and paused: {"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("third"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== failed and paused: {"from_ordinal":1,"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== failed and paused: {"from_ordinal":2}
+sha256:574e162923f990afaa748fdbcb7d3223c6369322fb304446a8df80d53db9eb73 (2236 bytes)
+== failed and paused: {"before_ordinal":3,"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== failed and paused: {"from_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== failed and paused: {"before_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== failed and paused: {"from_mid":"no-such-message"}
+Object {
+    "refused": String("unknown_mid"),
+}
+== failed and paused: {"cursor":"not-a-cursor"}
+Object {
+    "error": String("InvalidParams { field: \"cursor\", message: \"session.history cursor is malformed\" }"),
+}
+== failed and paused: {"limit":1,"max_bytes":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("third"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== failed and paused: older page 0
+sha256:01ea014a5f6473c511d1dec8bcc51455c2ef6eb2109924db735c765e4215e8cc (2236 bytes)
+== failed and paused: the oldest page
+sha256:01ea014a5f6473c511d1dec8bcc51455c2ef6eb2109924db735c765e4215e8cc (2236 bytes)
+== failed and paused: a newer page
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("third"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== failed and paused: from_mid at 1 (the store's id g902533deb767ac48.5)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== failed and paused: before_mid at 1 (the store's id g902533deb767ac48.5)
+Object {
+    "messages": Array [],
+    "newer": Bool(true),
+}
+== failed and paused: from_mid at 2 (the store's id g902533deb767ac48.6)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== failed and paused: before_mid at 2 (the store's id g902533deb767ac48.6)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== failed and paused: from_mid at 4 (the store's id g902533deb767ac48.18)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("third"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== failed and paused: before_mid at 4 (the store's id g902533deb767ac48.18)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== failed and paused: display {"form":"display"}
+sha256:d001634234dfe8a086aeafe6fd81dd4620e48fea64ba518f2c8b66d5c740e9b0 (2577 bytes)
+== failed and paused: display {"form":"display","from_ordinal":1,"limit":3}
+sha256:e54c03832bbbf5ba8fe79e8b6136f5f31b340a1266a05cc1fe1ee2e425e3d864 (2049 bytes)
+== failed and paused: bind from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== failed and paused: bind from None
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== failed and paused: session.entries from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== failed and paused: session.applied_view from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== failed and paused: session.apply_view from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== failed and paused: session.unknown from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)

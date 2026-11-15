@@ -199,7 +199,7 @@ async fn retained_creating_sends_validate_alike(cipher: Cipher) {
     let new_invalid = new.send("invalid", Some(0)).await.unwrap_err();
     assert_eq!(new_invalid.to_string(), old_invalid.to_string());
     assert!(!new.runtime.holds(&new.module.key).unwrap());
-    assert_eq!(
+    alike!(
         new.send("r1", Some(SECONDS)).await.unwrap(),
         old.send("r1", Some(SECONDS)).await.unwrap()
     );
@@ -209,11 +209,11 @@ async fn retained_creating_sends_validate_alike(cipher: Cipher) {
     );
     old.idle().await;
     new.idle().await;
-    assert_eq!(
+    alike!(
         new.send("changed", Some(SECONDS + 1)).await.unwrap(),
         old.send("changed", Some(SECONDS + 1)).await.unwrap()
     );
-    assert_eq!(
+    alike!(
         new.send("r2", Some(SECONDS)).await.unwrap(),
         old.send("r2", Some(SECONDS)).await.unwrap()
     );
@@ -226,7 +226,7 @@ async fn retained_creating_sends_validate_alike(cipher: Cipher) {
 async fn swept_retained_reads_and_fresh_sends_match(cipher: Cipher) {
     let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
-    assert_eq!(
+    alike!(
         new.send("r1", Some(SECONDS)).await.unwrap(),
         old.send("r1", Some(SECONDS)).await.unwrap()
     );
@@ -238,7 +238,7 @@ async fn swept_retained_reads_and_fresh_sends_match(cipher: Cipher) {
         assert_eq!(rig.module.registry.sweep_once(deadline).await.unwrap(), 1);
         rig.expired_read(deadline).await;
     }
-    assert_eq!(
+    alike!(
         new.send("r2", Some(SECONDS)).await.unwrap(),
         old.send("r2", Some(SECONDS)).await.unwrap()
     );
@@ -269,7 +269,7 @@ async fn swept_retained_reads_and_fresh_sends_match(cipher: Cipher) {
 async fn closed_retained_sessions_expire_before_any_sweep_alike(cipher: Cipher) {
     let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
-    assert_eq!(
+    alike!(
         new.send("r1", Some(SECONDS)).await.unwrap(),
         old.send("r1", Some(SECONDS)).await.unwrap()
     );
@@ -281,7 +281,7 @@ async fn closed_retained_sessions_expire_before_any_sweep_alike(cipher: Cipher) 
     assert!(new.runtime.holds(&new.module.key).unwrap());
     old.expired_read(deadline).await;
     new.expired_read(deadline).await;
-    assert_eq!(
+    alike!(
         new.send("r2", Some(SECONDS)).await.unwrap(),
         old.send("r2", Some(SECONDS)).await.unwrap()
     );
@@ -299,7 +299,7 @@ async fn closed_retained_sessions_expire_before_any_sweep_alike(cipher: Cipher) 
 async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
     let old = retained(false, cipher, TTL, None).await;
     let new = retained(true, cipher, TTL, None).await;
-    assert_eq!(
+    alike!(
         new.send("r1", Some(SECONDS)).await.unwrap(),
         old.send("r1", Some(SECONDS)).await.unwrap()
     );
@@ -396,7 +396,7 @@ async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher
         new.runtime.deployment(),
     )
     .unwrap();
-    assert_eq!(
+    alike!(
         new.send("r2", Some(SECONDS)).await.unwrap(),
         old.send("r2", Some(SECONDS)).await.unwrap()
     );
@@ -438,7 +438,7 @@ async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher
         config.computed_tags.map(|tags| tags.checkpoint),
         old_checkpoint
     );
-    assert_eq!(
+    alike!(
         new.runtime
             .expiry_markers(&new.module.key)
             .unwrap()
@@ -517,7 +517,7 @@ async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
             model_check: None,
         }
     };
-    assert_eq!(
+    alike!(
         new.send_with_plan("r1", Some(SECONDS), Some(plan()))
             .await
             .unwrap(),
@@ -540,7 +540,7 @@ async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
         new.runtime.expiry_markers(&new.module.key).unwrap()[0].next_tag,
         1
     );
-    assert_eq!(
+    alike!(
         new.send_with_plan("r2", Some(SECONDS), Some(plan()))
             .await
             .unwrap(),
@@ -571,11 +571,11 @@ async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
     .unwrap();
     assert!(config.render_tags);
     assert_eq!(config.computed_tags.unwrap().checkpoint, 0);
-    assert_eq!(
+    alike!(
         read_json(&new.module, None, None, None).await.0,
         read_json(&old.module, None, None, None).await.0
     );
-    assert_eq!(
+    alike!(
         new.send("r3", None).await.unwrap(),
         old.send("r3", None).await.unwrap()
     );
@@ -729,7 +729,7 @@ async fn an_active_run_outlives_the_retention_deadline_alike(cipher: Cipher) {
     let new_gate = Arc::new(Notify::new());
     let old = retained(false, cipher, TTL, Some(old_gate.clone())).await;
     let new = retained(true, cipher, TTL, Some(new_gate.clone())).await;
-    assert_eq!(
+    alike!(
         new.send("r1", Some(SECONDS)).await.unwrap(),
         old.send("r1", Some(SECONDS)).await.unwrap()
     );

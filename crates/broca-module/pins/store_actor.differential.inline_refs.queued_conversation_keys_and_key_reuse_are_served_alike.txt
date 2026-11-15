@@ -1,0 +1,27 @@
+== k1: first
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== k2: queued
+Pending {
+    submission_id: SubmissionId(
+        "sub-r2",
+    ),
+}
+== k2: queued
+Pending {
+    submission_id: SubmissionId(
+        "sub-r2",
+    ),
+}
+== k2: changed
+SendIdReuse {
+    differing: "conversation_key",
+}
+== alike
+Busy
+== alike
+Busy

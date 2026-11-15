@@ -105,7 +105,7 @@ async fn compare(cache: bool) {
                 gate.as_ref().unwrap().notify_one();
                 module.closed().await;
             }
-            assert_eq!(baselines[1], baselines[0], "baseline of {run}");
+            alike!(baselines[1], baselines[0], "baseline of {run}");
             if run == "r1" {
                 assert!(
                     baselines[0].is_some(),

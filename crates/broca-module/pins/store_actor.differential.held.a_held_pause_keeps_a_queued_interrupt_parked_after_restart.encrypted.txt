@@ -1,0 +1,54 @@
+== alike
+Object {
+    "held_calls": Array [
+        Object {
+            "call_key": Bool(true),
+            "held_at_ms": Bool(true),
+            "provider": String("tools"),
+            "reason": String("running"),
+            "tool": String("read"),
+        },
+    ],
+    "state": String("active"),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "run_id": String("r1"),
+    "state": String("active"),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+[
+    "sub-i1",
+]

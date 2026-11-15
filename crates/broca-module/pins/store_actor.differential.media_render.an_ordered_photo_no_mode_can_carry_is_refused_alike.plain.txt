@@ -1,0 +1,12 @@
+== ["tool_result"]: the store answers as today's
+DeliveryRefused {
+    code: "media_unsupported",
+    field: "content",
+    message: "media_unsupported: image for model stub/m: carrier",
+}
+== ["turn_system"]: the store answers as today's
+DeliveryRefused {
+    code: "media_unsupported",
+    field: "content",
+    message: "media_unsupported: image for model stub/m: carrier",
+}

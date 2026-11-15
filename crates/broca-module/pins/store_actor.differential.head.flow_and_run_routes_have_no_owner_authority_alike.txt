@@ -1,0 +1,12 @@
+== flow refusals
+[
+    "OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"prefrontal-core\" }) } })",
+    "OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"prefrontal-core\" }) } })",
+    "OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"prefrontal-core\" }) } })",
+]
+== run refusals
+[
+    "OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"prefrontal-core\" }) } })",
+    "OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"prefrontal-core\" }) } })",
+    "OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"prefrontal-core\" }) } })",
+]

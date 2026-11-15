@@ -1,0 +1,39 @@
+== alike
+[
+    "start r1",
+    "pause r1 AuthRequired",
+    "pause r1 Restart",
+    "resume r1 1 0 0",
+    "end Interrupted Some(\"restart_resume_refused\")",
+    "start r2",
+    "end Completed None",
+]
+== alike
+Object {
+    "error": Object {
+        "class": String("permanent"),
+        "message": String("run resolution failed: restart admission refused"),
+        "provider_code": String("restart_resume_refused"),
+    },
+    "indeterminate_tool_calls": Array [],
+    "reason": String("runner_crash"),
+    "retries_used": Number(0),
+    "state": String("interrupted"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "reason": String("runner_crash"),
+    "run_id": String("r1"),
+    "state": String("interrupted"),
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}

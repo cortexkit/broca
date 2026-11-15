@@ -1,0 +1,479 @@
+== finished: {}
+sha256:f341efef6ffde0d7f85db1ab0e1846ed8aa0e0d02b85dc34ae231050d7208480 (5400 bytes)
+== finished: {"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("read it"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== finished: {"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "is_error": Bool(false),
+                        "output": Object {
+                            "kind": String("text"),
+                            "text": String("file contents"),
+                        },
+                        "tool_call_id": String("c1"),
+                        "type": String("tool_result"),
+                    },
+                ],
+                "role": String("tool"),
+            },
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("tool"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(false),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("read it"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== finished: {"from_ordinal":1,"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== finished: {"from_ordinal":2}
+sha256:9761549dbbcfe0c24676bd80c2b8ab1bc9abb16ee8eaff35c8a9d40a013d9540 (4757 bytes)
+== finished: {"before_ordinal":3,"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== finished: {"from_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== finished: {"before_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== finished: {"from_mid":"no-such-message"}
+Object {
+    "refused": String("unknown_mid"),
+}
+== finished: {"cursor":"not-a-cursor"}
+Object {
+    "error": String("InvalidParams { field: \"cursor\", message: \"session.history cursor is malformed\" }"),
+}
+== finished: {"limit":1,"max_bytes":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("read it"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== finished: older page 0
+sha256:edaa772ec559df2915016bb2d64ff8f9610a3918e3652f21aeb9808b34097746 (4589 bytes)
+== finished: the oldest page
+sha256:edaa772ec559df2915016bb2d64ff8f9610a3918e3652f21aeb9808b34097746 (4589 bytes)
+== finished: a newer page
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("read it"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== finished: from_mid at 1 (the store's id g46401322b85be54a.5)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== finished: before_mid at 1 (the store's id g46401322b85be54a.5)
+Object {
+    "messages": Array [],
+    "newer": Bool(true),
+}
+== finished: from_mid at 3 (the store's id g46401322b85be54a.13)
+sha256:c1729cf3d1692b6e4767c62161c348396d9acfd57c3e4dac1ac9c7e587943d63 (2200 bytes)
+== finished: before_mid at 3 (the store's id g46401322b85be54a.13)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== finished: from_mid at 6 (the store's id g46401322b85be54a.25)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("read it"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(6),
+            "part_keys": Array [
+                String("m5#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== finished: before_mid at 6 (the store's id g46401322b85be54a.25)
+sha256:aef455cc596ada6d89b82f881daae661a00e038c59453947935c6ace486b87bd (2443 bytes)
+== finished: display {"form":"display"}
+sha256:32ff7ae1aa2338dc2ef20750e5745cd54ee8846c90f98933621109d198a89643 (4911 bytes)
+== finished: display {"form":"display","from_ordinal":1,"limit":3}
+sha256:e54c03832bbbf5ba8fe79e8b6136f5f31b340a1266a05cc1fe1ee2e425e3d864 (2049 bytes)
+== finished: bind from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== finished: bind from None
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== finished: session.entries from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== finished: session.applied_view from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== finished: session.apply_view from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== finished: session.unknown from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)

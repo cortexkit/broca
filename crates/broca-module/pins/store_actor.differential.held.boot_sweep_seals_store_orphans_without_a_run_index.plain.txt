@@ -1,0 +1,29 @@
+== alike
+Object {
+    "error": Object {
+        "class": String("transient"),
+        "message": String("the previous broca process ended without sealing this run: host crash, kill, or power loss"),
+        "provider_code": String("previous_process_ended_unsealed"),
+    },
+    "indeterminate_tool_calls": Array [],
+    "reason": String("runner_crash"),
+    "retries_used": Number(0),
+    "state": String("interrupted"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== alike
+Object {
+    "reason": String("runner_crash"),
+    "run_id": String("r1"),
+    "state": String("interrupted"),
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}

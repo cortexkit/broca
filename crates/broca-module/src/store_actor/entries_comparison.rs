@@ -615,7 +615,7 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
         json!({"limit": 1, "max_bytes": 1}),
     ] {
         let (old, new) = both(request.clone()).await;
-        assert_eq!(masked(&new), masked(&old), "{label}: {request}");
+        alike!(masked(&new), masked(&old), "{label}: {request}");
     }
     // Each side follows its own cursors back from the newest message, and forward again.
     let (mut old, mut new) = both(json!({"limit": 1})).await;
@@ -627,12 +627,12 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
             old_page["older"].as_str().map(str::to_owned),
             new_page["older"].as_str().map(str::to_owned),
         ) else {
-            assert_eq!(masked(&new), masked(&old), "{label}: the oldest page");
+            alike!(masked(&new), masked(&old), "{label}: the oldest page");
             break;
         };
         old = today.history(json!({"cursor": older_old})).await;
         new = store.history(json!({"cursor": older_new})).await;
-        assert_eq!(masked(&new), masked(&old), "{label}: older page {step}");
+        alike!(masked(&new), masked(&old), "{label}: older page {step}");
     }
     if let (Ok(old_page), Ok(new_page)) = (&old, &new) {
         if let (Some(newer_old), Some(newer_new)) =
@@ -640,7 +640,7 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
         {
             let old = today.history(json!({"cursor": newer_old})).await;
             let new = store.history(json!({"cursor": newer_new})).await;
-            assert_eq!(masked(&new), masked(&old), "{label}: a newer page");
+            alike!(masked(&new), masked(&old), "{label}: a newer page");
         }
     }
     // A seek by message id, each side naming its own id of the same message.
@@ -656,7 +656,7 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
             let new = store
                 .history(json!({ seek: mid_at(&new_all, ordinal), "limit": 2 }))
                 .await;
-            assert_eq!(
+            alike!(
                 masked(&new),
                 masked(&old),
                 "{label}: {seek} at {ordinal} (the store's id {})",
@@ -672,7 +672,7 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
         let old = today.history(params.clone()).await;
         let new = store.history(params.clone()).await;
         assert!(old.is_ok(), "{label}: today's display history {params}");
-        assert_eq!(
+        alike!(
             masked_display(&new),
             masked_display(&old),
             "{label}: display {params}"
@@ -732,7 +732,7 @@ async fn compare_compaction_refusals(today: &Side, store: &Side, label: &str) {
     ] {
         let old = today.compaction(caller, method, params.clone()).await;
         let new = store.compaction(caller, method, params).await;
-        assert_eq!(new, old, "{label}: {method} from {caller:?}");
+        alike!(new, old, "{label}: {method} from {caller:?}");
         assert_eq!(
             old.unwrap_err()["detail"]["reason"],
             json!("session_not_held"),
@@ -1099,7 +1099,7 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
         ),
     ] {
         let (old, new) = both(caller, method, params.clone()).await;
-        assert_eq!(new, old, "{method} from {caller:?}: {params}");
+        alike!(new, old, "{method} from {caller:?}: {params}");
     }
     assert_eq!(
         store.compaction(Some("ck-mc"), "bind", json!({})).await,
@@ -1136,7 +1136,7 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
     requests.push(json!({"select": {"by": "tags", "tags": [1, 3, 999]}, "detail": "compact"}));
     for request in requests {
         let (old, new) = both(Some("ck-mc"), "session.entries", request.clone()).await;
-        assert_eq!(new, old, "session.entries {request}");
+        alike!(new, old, "session.entries {request}");
     }
     // A read by ids names each storage's own ids of the same messages.
     let by_ids = |mids: &std::collections::BTreeMap<u64, String>| {
@@ -1153,7 +1153,7 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
             .compaction(Some("ck-mc"), "session.entries", by_ids(&store_mids))
             .await,
     );
-    assert_eq!(new, old, "session.entries by ids");
+    alike!(new, old, "session.entries by ids");
     assert_eq!(new.unwrap()["entries"].as_array().unwrap().len(), 3);
     // Both storages refuse a malformed view (here an empty object) before reading the session.
     let params = json!({"view": {}});
@@ -1163,7 +1163,7 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
     let new = store
         .compaction(Some("ck-mc"), "session.apply_view", params)
         .await;
-    assert_eq!(new, old);
+    alike!(new, old);
     assert_eq!(new.unwrap_err()["code"], json!("invalid_params"));
 }
 
@@ -2188,7 +2188,7 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
         let unknown = apply(drop(2, "no-such-message".into())).await;
         answers.push((first, retry, unknown));
     }
-    assert_eq!(answers[1], answers[0], "the store answers as today's");
+    alike!(answers[1], answers[0], "the store answers as today's");
     assert_eq!(answers[0].0, Ok(json!({"answer": "accepted"})));
     for refused in [&answers[0].1, &answers[0].2] {
         assert!(
@@ -2207,7 +2207,7 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
     }
     // r3's first step is the provider's fourth request.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
-    assert_eq!(prompt(&store), prompt(&today));
+    alike!(prompt(&store), prompt(&today));
     assert!(
         !prompt(&store).to_string().contains("Done."),
         "the view dropped the first reply: {}",
@@ -2465,7 +2465,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         side.assert_completed(&format!("run-{first_id}")).await;
         replies.push(reply);
     }
-    assert_eq!(replies[1], replies[0]);
+    alike!(replies[1], replies[0]);
     let address = |side: &Side| broca_core::session_addr(&side.key);
     let wal_folder = |side: &Side| {
         let wal = FileWalStore::new(side.dir.join("wal"));
@@ -2513,8 +2513,9 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
             .await,
         );
     }
-    assert_eq!(
-        retries[1], retries[0],
+    alike!(
+        retries[1],
+        retries[0],
         "the store answers the retry as today's"
     );
     assert!(
@@ -2597,7 +2598,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         );
     }
     assert_eq!(answers[0], Ok(json!({"answer": "accepted"})));
-    assert_eq!(answers[1], answers[0], "the store answers as today's");
+    alike!(answers[1], answers[0], "the store answers as today's");
     let mut third = second.clone();
     third["send_id"] = json!("send_sample_third_0123456789abcdef");
     third["prompt"] = json!("Carry on with the synthetic project.");
@@ -2623,7 +2624,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     }
     // The third turn's first step is the provider's third request.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[2].prompt).unwrap();
-    assert_eq!(prompt(&store), prompt(&today));
+    alike!(prompt(&store), prompt(&today));
     assert!(
         !prompt(&store).to_string().contains("Awake."),
         "the view dropped the first reply: {}",
@@ -2762,7 +2763,7 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
     let [mut old, mut new] = [Value::from(old), Value::from(new)];
     by_ordinal(&mut old, &ids[0]);
     by_ordinal(&mut new, &ids[1]);
-    assert_eq!(new, old, "both logs record the view alike");
+    alike!(new, old, "both logs record the view alike");
     let through = format!("entry {}", ids[0].keys().next_back().unwrap());
     assert_eq!(
         old,
@@ -2780,7 +2781,7 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
     }
     // r3's first step is the provider's fourth request.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
-    assert_eq!(prompt(&store), prompt(&today));
+    alike!(prompt(&store), prompt(&today));
     let mut served = Vec::new();
     for (side, mids) in [&today, &store].into_iter().zip(&ids) {
         let mut reply = side
@@ -2790,8 +2791,9 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
         by_ordinal(&mut reply, mids);
         served.push(reply);
     }
-    assert_eq!(
-        served[1], served[0],
+    alike!(
+        served[1],
+        served[0],
         "the store serves the applied view as today's"
     );
     assert_eq!(served[0]["applied_by"], json!("ck-mc"), "{}", served[0]);
@@ -2967,13 +2969,14 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         side.assert_completed("t1").await;
         named.push((mid, part, number));
     }
-    assert_eq!(
-        named[1].2, named[0].2,
+    alike!(
+        named[1].2,
+        named[0].2,
         "both storages number the part alike"
     );
     // t1's first step is the provider's fourth request; its input is the rendered template.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
-    assert_eq!(prompt(&store), prompt(&today));
+    alike!(prompt(&store), prompt(&today));
     let input = prompt(&store)
         .as_array()
         .unwrap()
@@ -3008,7 +3011,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         request.input = Vec::new();
         gone.push(side.send_ordered("t2", request, order(mid, part)).await);
     }
-    assert_eq!(gone[1], gone[0], "the store answers as today's");
+    alike!(gone[1], gone[0], "the store answers as today's");
     assert_eq!(
         gone[0],
         SendOutcome::TemplatePartGone {

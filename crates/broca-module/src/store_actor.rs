@@ -4868,6 +4868,9 @@ mod class_tests;
 #[cfg(test)]
 mod collect_tests;
 #[cfg(test)]
+#[macro_use]
+mod alike;
+#[cfg(test)]
 mod differential;
 #[cfg(test)]
 mod entries_comparison;

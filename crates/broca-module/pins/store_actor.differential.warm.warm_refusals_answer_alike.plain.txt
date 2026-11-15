@@ -1,0 +1,31 @@
+== a cache whose clock is unknown
+Refused(
+    WarmRefusal {
+        code: "cache_expired",
+        message: "not warmed, nothing was sent: no request of this session has been sent since this broca started, so the cache's expiry is unknown",
+        detail: CacheExpired {
+            expires_at_ms: None,
+            reason: "no request of this session has been sent since this broca started, so the cache's expiry is unknown",
+        },
+    },
+)
+== a module that can't read the cache policy
+Refused(
+    WarmRefusal {
+        code: "warm_unsupported",
+        message: "this session cannot be warmed: this runner cannot read the session's cache policy",
+        detail: WarmUnsupported {
+            reason: "this runner cannot read the session's cache policy",
+        },
+    },
+)
+== a session that froze no cache policy
+Refused(
+    WarmRefusal {
+        code: "warm_unsupported",
+        message: "this session cannot be warmed: this runner cannot read the session's cache policy",
+        detail: WarmUnsupported {
+            reason: "this runner cannot read the session's cache policy",
+        },
+    },
+)

@@ -105,7 +105,7 @@ async fn retry(side: &Side) {
 }
 
 async fn compare_reads(sides: &[Side]) {
-    assert_eq!(
+    alike!(
         comparable(sides[1].status().await),
         comparable(sides[0].status().await)
     );
@@ -119,11 +119,11 @@ async fn compare_reads(sides: &[Side]) {
         }
         value
     };
-    assert_eq!(
+    alike!(
         normalize_result(sides[1].result().await),
         normalize_result(sides[0].result().await)
     );
-    assert_eq!(head(&sides[1]).await, head(&sides[0]).await);
+    alike!(head(&sides[1]).await, head(&sides[0]).await);
     let old_records = record_meaning(&sides[0]).await;
     let new_records = record_meaning(&sides[1]).await;
     assert_eq!(new_records, old_records);

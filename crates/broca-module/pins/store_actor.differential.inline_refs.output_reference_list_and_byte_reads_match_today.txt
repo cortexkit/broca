@@ -1,0 +1,24 @@
+== alike
+Object {
+    "data": String("ZmlsZSBjb250ZW50cw=="),
+    "format": String("text"),
+    "size": Number(13),
+}
+== alike
+Object {
+    "data": String("bGUg"),
+    "format": String("text"),
+    "size": Number(13),
+}
+== alike
+Object {
+    "data": String(""),
+    "format": String("text"),
+    "size": Number(13),
+}
+== alike
+Object {
+    "data": String(""),
+    "format": String("text"),
+    "size": Number(13),
+}

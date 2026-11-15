@@ -1,0 +1,9 @@
+== a photo send creating its session
+Upload(
+    UploadError {
+        code: "unknown_upload",
+        subject: "no-such-upload",
+        field: None,
+        received: None,
+    },
+)

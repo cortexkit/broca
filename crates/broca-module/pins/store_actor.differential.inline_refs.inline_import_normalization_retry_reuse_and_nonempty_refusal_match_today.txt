@@ -1,0 +1,529 @@
+== ok
+"Ok(SessionImportResponse { run_id: \"seed\", synthesized_tool_results: 1, dropped_orphan_tool_results: 1, dropped_system_messages: Some(1), already_imported: false })"
+== retry
+"Ok(SessionImportResponse { run_id: \"seed\", synthesized_tool_results: 1, dropped_orphan_tool_results: 1, dropped_system_messages: Some(1), already_imported: true })"
+== reuse
+"Err(ImportIdReuse)"
+== nonempty
+"Err(Import(\"session import requires an empty lineage; this session already has runs, so import into a new session id\"))"
+== inline import: display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:0659ba94d977636609524bfc7c519f7770187d89936638e8d52bd772ecaa68c4 (2443 bytes)
+== inline import: display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== inline import: display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "input": Object {},
+                        "tool_call_id": String("c1"),
+                        "tool_name": String("bash"),
+                        "type": String("tool_call"),
+                    },
+                ],
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "tool_calls": Array [
+                Object {
+                    "indeterminate": Bool(false),
+                    "tool_call_id": String("c1"),
+                },
+            ],
+            "tool_times": Array [
+                Object {
+                    "tool_call_id": String("c1"),
+                },
+            ],
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "is_error": Bool(true),
+                        "output": Object {
+                            "kind": String("error"),
+                            "message": String("tool not run: interrupted before dispatch"),
+                        },
+                        "tool_call_id": String("c1"),
+                        "type": String("tool_result"),
+                    },
+                ],
+                "role": String("tool"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("tool"),
+            "written_at": Bool(true),
+        },
+    ],
+}
+== inline import: display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:9fdebac4b263324fb647afed273032f97dc4edb127e5ac3ec0aee0597d755fba (2359 bytes)
+== inline import: display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== inline import: display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "input": Object {},
+                        "tool_call_id": String("c1"),
+                        "tool_name": String("bash"),
+                        "type": String("tool_call"),
+                    },
+                ],
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "tool_calls": Array [
+                Object {
+                    "indeterminate": Bool(false),
+                    "tool_call_id": String("c1"),
+                },
+            ],
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "is_error": Bool(true),
+                        "output": Object {
+                            "kind": String("error"),
+                            "message": String("tool not run: interrupted before dispatch"),
+                        },
+                        "tool_call_id": String("c1"),
+                        "type": String("tool_result"),
+                    },
+                ],
+                "role": String("tool"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("tool"),
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== inline import: display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:6eb7cf867667ecb5aeb4b7cccf01b3bc5c63cb63d0b4bf2b3f3f2ab1bc02adab (2300 bytes)
+== inline import: display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== inline import: display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "input": Object {},
+                        "tool_call_id": String("c1"),
+                        "tool_name": String("bash"),
+                        "type": String("tool_call"),
+                    },
+                ],
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "tool_calls": Array [
+                Object {
+                    "indeterminate": Bool(false),
+                    "tool_call_id": String("c1"),
+                },
+            ],
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "is_error": Bool(true),
+                        "output": Object {
+                            "kind": String("error"),
+                            "message": String("tool not run: interrupted before dispatch"),
+                        },
+                        "tool_call_id": String("c1"),
+                        "type": String("tool_result"),
+                    },
+                ],
+                "role": String("tool"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("tool"),
+            "written_at": Bool(true),
+        },
+    ],
+}
+== inline import: display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:f953f8ff6fe0d0380ea35d49387013558ed7bffa613e3d944050d000de1924ad (2502 bytes)
+== inline import: display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== inline import: display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("seed"),
+        "reason": String("completed"),
+        "state": String("completed"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "input": Object {},
+                        "tool_call_id": String("c1"),
+                        "tool_name": String("bash"),
+                        "type": String("tool_call"),
+                    },
+                ],
+                "role": String("assistant"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("assistant"),
+            "tool_calls": Array [
+                Object {
+                    "indeterminate": Bool(false),
+                    "tool_call_id": String("c1"),
+                },
+            ],
+            "tool_times": Array [
+                Object {
+                    "tool_call_id": String("c1"),
+                },
+            ],
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "is_error": Bool(true),
+                        "output": Object {
+                            "kind": String("error"),
+                            "message": String("tool not run: interrupted before dispatch"),
+                        },
+                        "tool_call_id": String("c1"),
+                        "type": String("tool_result"),
+                    },
+                ],
+                "role": String("tool"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("tool"),
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("seed"),
+}
+== alike
+Active {
+    run_id: RunId(
+        "continued",
+    ),
+    delivered: None,
+}
+== continued inline import: display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:5e138db917265f93d67c96da50bc79a7930a0fd6e116e772d5d1164a30e91296 (4184 bytes)
+== continued inline import: display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("continued"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== continued inline import: display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:dabe8258a2fea8ea7ac949474fbc93a3c044ce24fcc39a239a37d8356ebfb7db (2817 bytes)
+== continued inline import: display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:ebd2f08ed2f60d3c0a0a0b8e960ef6fffe6c391e590901bf1311ae69d9c684ad (4027 bytes)
+== continued inline import: display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("continued"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("continued"),
+}
+== continued inline import: display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:c6eb09b95a0b752d4b168a3e909dd33eec9181954066481b2fcbc708e6f37892 (2700 bytes)
+== continued inline import: display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:d2e6a94f00397ca07c703aa24d1bdeb2c4291396807ceac574eaea84a0b3c1a2 (3963 bytes)
+== continued inline import: display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("continued"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== continued inline import: display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:d81a3109726637465097d0b8debeeaed7fd511bb8c1e1abacddfda53b092975e (2636 bytes)
+== continued inline import: display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:c699411e753b938cd632d7f963c9a0b44dd18f964fe3adde869bc67844818f97 (4248 bytes)
+== continued inline import: display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("continued"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("question"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("continued"),
+}
+== continued inline import: display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:8bf009d3d3ca897e90a25a59389df014b21af0203430ff3cfe47496a674ace60 (2881 bytes)

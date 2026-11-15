@@ -1,0 +1,315 @@
+== the first send's replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the replies to r-k1 differ
+Pending {
+    submission_id: SubmissionId(
+        "sub-r-k1",
+    ),
+}
+== the replies to r-k2 differ
+Pending {
+    submission_id: SubmissionId(
+        "sub-r-k2",
+    ),
+}
+== the replies to r-k3 differ
+Pending {
+    submission_id: SubmissionId(
+        "sub-r-k3",
+    ),
+}
+== the replies to r-k1 differ
+SendEnded {
+    submission_id: SubmissionId(
+        "sub-r-k1",
+    ),
+    reason: Superseded {
+        by: SubmissionId(
+            "sub-r-k2",
+        ),
+    },
+}
+== the retries of k1 differ
+SendEnded {
+    submission_id: SubmissionId(
+        "sub-r-k1",
+    ),
+    reason: Superseded {
+        by: SubmissionId(
+            "sub-r-k2",
+        ),
+    },
+}
+== the retries of k2 differ
+Finished {
+    run_id: RunId(
+        "r1",
+    ),
+    reason: Completed,
+    delivered: Some(
+        Delivered {
+            as: "step",
+            ref: Some(
+                "r1",
+            ),
+            call_key: Some(
+                "<call key>",
+            ),
+            call_carrier: None,
+        },
+    ),
+}
+== the retries of k3 differ
+Finished {
+    run_id: RunId(
+        "r1",
+    ),
+    reason: Completed,
+    delivered: Some(
+        Delivered {
+            as: "step",
+            ref: Some(
+                "r1",
+            ),
+            call_key: None,
+            call_carrier: None,
+        },
+    ),
+}
+== display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:f484b09944c1437987fdab9a2795816c2461364ea0958260ef553f3e3690d86d (6391 bytes)
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:d0545b564506ecf087144552071d5ce38c00533094573e32cade26da0cf34df6 (3895 bytes)
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:65daa4d2e8ae0492e77fe14e2d7a8b415e61bbda97722ba7624e64739488a3b1 (5622 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:2ccc22c43ccf683d3d1e94c3ff528d638966d4186505d04266fcbf521c46303e (3377 bytes)
+== display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:218b3c9407205140410cc6b8211b5a1cc796312c88e8b5cff88c97c0b0a6cac7 (5351 bytes)
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:a1848a31c03b10ed3e53a52ac6f38757bd76fb21f91397129cef805bbe6ca946 (3106 bytes)
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:6b341075d45c335d4f6996bfcbf41eebfdf67bf7e1711572dffb9f5aa7070041 (6662 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(200),
+            "output_tokens": Number(40),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:3f48b129a5a8ffdf5906772214f0bc86de10efb75988f47e709937a4b98f6377 (4166 bytes)
+== the conversations differ
+[
+    "you are a worker",
+    "first",
+    "also this",
+    "done",
+]
+== the runs' starts differ
+[
+    Object {
+        "model": Object {
+            "model_id": String("m"),
+            "provider_module_id": String("stub"),
+        },
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "request_identity_digest": Null,
+        "run_id": String("r1"),
+        "scope": Null,
+        "send_id": Null,
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "session_class": Null,
+        "submission_id": Null,
+        "title": Null,
+    },
+]
+== the model calls were sent different messages
+[
+    [
+        "you are a worker",
+        "first",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "result of c1: {\"kind\":\"text\",\"text\":\"file contents\\n\\nnote two\"}",
+        "also this",
+    ],
+]

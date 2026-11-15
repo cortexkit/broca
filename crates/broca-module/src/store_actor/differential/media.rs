@@ -529,7 +529,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
 
     // Before the session exists, an upload is refused alike.
     let begin = json!({"mime": "image/png", "bytes": unsent.len(), "sha256": digest(&unsent)});
-    assert_eq!(
+    alike!(
         store
             .upload(&core(), "session.upload_begin", begin.clone())
             .await,
@@ -564,7 +564,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
             .upload(&core(), "session.upload_begin", begin.clone())
             .await,
     );
-    assert_eq!(
+    alike!(
         masked(new.clone(), None),
         masked(old.clone(), None),
         "upload_begin"
@@ -624,7 +624,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
         ("session.upload_status", per_side(&|_| json!({}))),
     ] {
         let (old, new) = both(method, params.clone()).await;
-        assert_eq!(new, old, "{method} {params:?}");
+        alike!(new, old, "{method} {params:?}");
     }
     // Another module may not upload to core's session, on either storage.
     let (old, new) = (
@@ -636,7 +636,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
             .await,
     );
     assert!(old.is_err(), "{old:?}");
-    assert_eq!(new, old, "another module's upload");
+    alike!(new, old, "another module's upload");
 
     // Each session's image reads back alike, whole, by range and as a probe; and what neither
     // session's records name is refused alike.
@@ -653,7 +653,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
             today.media_read(params.clone()).await,
             store.media_read(params.clone()).await,
         );
-        assert_eq!(new, old, "media_read {params}");
+        alike!(new, old, "media_read {params}");
     }
     let whole = store
         .media_read(json!({"sha256": digest(&image), "offset": 0, "length": size}))

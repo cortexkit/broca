@@ -420,7 +420,7 @@ async fn cached_anthropic_auto_step_events_match(cipher: Cipher) {
         body.as_object_mut().unwrap().remove("request_body_bytes");
         bodies.push(body);
     }
-    assert_eq!(bodies[0], bodies[1]);
+    alike_today_first!(bodies[0], bodies[1]);
 }
 
 cipher_tests! { durable_step_events_match, no_bus_publishes_no_step_events, run_publishes_step_events_without_configuration, failing_step_publisher_does_not_fail_runs, a_model_attempt_without_send_time_emits_no_step_event, cached_anthropic_auto_step_events_match }

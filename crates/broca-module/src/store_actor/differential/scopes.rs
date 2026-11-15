@@ -317,7 +317,7 @@ async fn sends_alike(
         );
         module.closed().await;
     }
-    assert_eq!(answers[1], answers[0], "{run_id}: replies differ");
+    alike!(answers[1], answers[0], "{run_id}: replies differ");
     answers.swap_remove(0)
 }
 
@@ -461,8 +461,9 @@ async fn cancels_alike(
                 .expect("the cancel is routed"),
         );
     }
-    assert_eq!(
-        answers[1], answers[0],
+    alike!(
+        answers[1],
+        answers[0],
         "{principal:?} over {scope:?}: replies differ"
     );
     answers.swap_remove(0)
@@ -583,7 +584,7 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
     run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
     for principal in [None, Some(super::core()), Some(occipital())] {
-        assert_eq!(
+        alike!(
             head_json(&store, principal.as_ref()).await,
             head_json(&today, principal.as_ref()).await,
             "heads differ for {principal:?}"

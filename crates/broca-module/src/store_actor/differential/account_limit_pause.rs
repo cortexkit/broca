@@ -775,19 +775,20 @@ async fn account_limit_timer_waits_then_resumes_the_same_run_alike() {
         assert_eq!(side.state("r1").await["state"], "active");
         let requests = side.executor.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0], requests[1],
+        alike_today_first!(
+            requests[0],
+            requests[1],
             "the timer restores the run id and recorded policies"
         );
         let sent = side.executor.provider.sent.lock().unwrap().clone();
-        assert_eq!(sent[0], sent[1], "the frozen request is sent again");
+        alike_today_first!(sent[0], sent[1], "the frozen request is sent again");
         side.executor.provider.release_success.notify_one();
         side.wait_state("r1", "completed").await;
         side.idle().await;
         side.stop().await;
         histories.push(side.records().await);
     }
-    assert_eq!(histories[0], histories[1]);
+    alike_today_first!(histories[0], histories[1]);
 }
 
 #[tokio::test]
@@ -811,7 +812,7 @@ async fn account_limit_timer_rebuilds_when_the_actor_reopens_alike() {
         reopened.stop().await;
         histories.push(reopened.records().await);
     }
-    assert_eq!(histories[0], histories[1]);
+    alike_today_first!(histories[0], histories[1]);
 }
 
 #[tokio::test]
@@ -839,7 +840,7 @@ async fn account_limit_cancel_disarms_the_timer_alike() {
         side.stop().await;
         histories.push(side.records().await);
     }
-    assert_eq!(histories[0], histories[1]);
+    alike_today_first!(histories[0], histories[1]);
 }
 
 #[tokio::test]
@@ -924,9 +925,9 @@ async fn account_limit_refused_resume_seals_and_drains_alike() {
                 .collect::<Vec<_>>(),
         );
     }
-    assert_eq!(histories[0], histories[1]);
-    assert_eq!(reads[0], reads[1]);
-    assert_eq!(terminals[0], terminals[1]);
+    alike_today_first!(histories[0], histories[1]);
+    alike_today_first!(reads[0], reads[1]);
+    alike_today_first!(terminals[0], terminals[1]);
 }
 
 #[tokio::test]
@@ -1015,14 +1016,14 @@ async fn account_limit_wake_pauses_for_sign_in_alike() {
         ));
         side.calls(2).await;
         let sent = side.executor.provider.sent.lock().unwrap().clone();
-        assert_eq!(sent[0], sent[1]);
+        alike_today_first!(sent[0], sent[1]);
         side.executor.provider.release_success.notify_one();
         side.wait_state("r1", "completed").await;
         side.idle().await;
         side.stop().await;
         histories.push(side.records().await);
     }
-    assert_eq!(histories[1], histories[0]);
+    alike!(histories[1], histories[0]);
 }
 
 #[tokio::test]
@@ -1057,5 +1058,5 @@ async fn account_limit_pause_uses_bound_session_evidence_on_both_storages() {
         ));
         side.stop().await;
     }
-    assert_eq!(pauses[0], pauses[1]);
+    alike_today_first!(pauses[0], pauses[1]);
 }

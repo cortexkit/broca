@@ -1,0 +1,21 @@
+== alike
+Object {
+    "attempt": Number(1),
+    "cache": Object {
+        "ttl_ms": Number(3600000),
+        "warming": Object {
+            "on": Bool(true),
+        },
+    },
+    "cached_input_tokens": Number(1000),
+    "harness": String("store-actor"),
+    "input_tokens": Number(3),
+    "model": String("claude-opus-4-8"),
+    "provider": String("anthropic"),
+    "request_body_bytes": Number(267),
+    "run_id": String("r1"),
+    "runner": String("broca"),
+    "session": String("s1"),
+    "step_id": String("1"),
+    "terminal_status": String("completed"),
+}

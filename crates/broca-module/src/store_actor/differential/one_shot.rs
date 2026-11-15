@@ -69,7 +69,7 @@ async fn a_one_shot_closes_at_its_terminal_and_reads_back_alike() {
         pages.push(page);
         assert!(module.registry.stop_and_seal().await);
     }
-    assert_eq!(pages[1], pages[0], "closed sessions still read alike");
+    alike!(pages[1], pages[0], "closed sessions still read alike");
 }
 
 #[tokio::test]

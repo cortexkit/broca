@@ -1,0 +1,98 @@
+== alike
+[
+    Array [
+        String("start"),
+        String("r1"),
+        String("off"),
+        String("resume"),
+    ],
+    Array [
+        String("pause"),
+        String("r1"),
+        String("account_limit"),
+        Object {
+            "account_ref": String("acct-a"),
+            "class": String("transient"),
+            "credential_id": String("oauth:stub:work"),
+            "message": String("account window exhausted"),
+            "provider_code": String("account_limit_exhausted"),
+            "resets_at_ms": Number(61000),
+            "status": Number(429),
+        },
+        Object {
+            "account_ref": String("acct-a"),
+            "attempt": Number(0),
+            "auth_method": String("oauth"),
+            "credential_id": String("oauth:stub:work"),
+            "disposition": Object {
+                "kind": String("account_limit"),
+                "scope": String("account"),
+            },
+            "failed_step": Number(1),
+            "observed_at_ms": Number(1000),
+            "paused_at_ms": Number(1000),
+            "request_body_len": Number(162),
+            "request_body_sha256": String("e8254aab3ed1862e936c90eb4c3df6e1843d73c07c629e51a6289d9ffbada9b6"),
+            "resets_at_ms": Number(61000),
+            "resume_not_before_ms": Number(61000),
+            "selection_round": Number(0),
+        },
+    ],
+    Array [
+        String("end"),
+        String("r1"),
+        String("interrupted"),
+        String("account_limit_resume_refused"),
+    ],
+    Array [
+        String("start"),
+        String("queued"),
+        String("off"),
+        String("resume"),
+    ],
+    Array [
+        String("end"),
+        String("queued"),
+        String("completed"),
+        Null,
+    ],
+]
+== alike
+(
+    Object {
+        "auth_selection": String("oauth:stub:work"),
+        "error": Object {
+            "class": String("permanent"),
+            "provider_code": String("account_limit_resume_refused"),
+        },
+        "indeterminate_tool_calls": Array [],
+        "reason": String("runner_crash"),
+        "retries_used": Number(0),
+        "state": String("interrupted"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "auth_selection": String("oauth:stub:work"),
+        "reason": String("runner_crash"),
+        "run_id": String("r1"),
+        "state": String("interrupted"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+)
+== alike
+Object {
+    "indeterminate_tool_calls": Array [],
+    "reason": String("interrupted"),
+    "retries_used": Number(0),
+    "run_id": String("r1"),
+    "type": String("run_finished"),
+}

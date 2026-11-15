@@ -1,0 +1,135 @@
+== an upload before the session's first send
+Err(
+    "Upload(UploadError { code: \"unknown_session\", subject: \"s1\", field: None, received: None })",
+)
+== upload_begin
+Ok(
+    Object {
+        "upload_id": Bool(true),
+    },
+)
+== session.upload_status [Object {"upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Ok(
+    Object {
+        "received": Number(0),
+        "state": String("open"),
+    },
+)
+== session.upload_append [Object {"data": String("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAEElEQVR4nGP4z8AAQQxwFgBB0gX7h/C5SAAAAABJRU5ErkJggg=="), "offset": Number(3), "upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"data": String("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAEElEQVR4nGP4z8AAQQxwFgBB0gX7h/C5SAAAAABJRU5ErkJggg=="), "offset": Number(3), "upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Err(
+    "Upload(UploadError { code: \"upload_offset_mismatch\", subject: \"<upload>\", field: None, received: Some(0) })",
+)
+== session.upload_append [Object {"data": String("iVBORw0KGgoAAA=="), "offset": Number(0), "upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"data": String("iVBORw0KGgoAAA=="), "offset": Number(0), "upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Ok(
+    Object {
+        "received": Number(10),
+    },
+)
+== session.upload_commit [Object {"upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Err(
+    "Upload(UploadError { code: \"upload_size_mismatch\", subject: \"<upload>\", field: None, received: None })",
+)
+== session.upload_append [Object {"data": String("AA1JSERSAAAAAwAAAAIIAgAAABIW8U0AAAAQSURBVHicY/jPwABBDHAWAEHSBfuH8LlIAAAAAElFTkSuQmCC"), "offset": Number(10), "upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"data": String("AA1JSERSAAAAAwAAAAIIAgAAABIW8U0AAAAQSURBVHicY/jPwABBDHAWAEHSBfuH8LlIAAAAAElFTkSuQmCC"), "offset": Number(10), "upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Ok(
+    Object {
+        "received": Number(73),
+    },
+)
+== session.upload_status [Object {"upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Ok(
+    Object {
+        "received": Number(73),
+        "state": String("open"),
+    },
+)
+== session.upload_commit [Object {"upload_id": String("0c103bb34e74e039d17eb16ca8335d204bea851880011ba18db9061bf37e9bda")}, Object {"upload_id": String("21e4fbec7f6c7d12303b6de41078a77463b5386399b3748d586491c4cece2c1b")}]
+Ok(
+    Object {
+        "bytes": Number(73),
+        "mime": String("image/png"),
+        "sha256": String("074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789"),
+        "state": String("committed"),
+    },
+)
+== session.upload_commit [Object {"upload_id": String("no-such-upload")}, Object {"upload_id": String("no-such-upload")}]
+Err(
+    "Upload(UploadError { code: \"unknown_upload\", subject: \"no-such-upload\", field: None, received: None })",
+)
+== session.upload_status [Object {"upload_id": String("no-such-upload")}, Object {"upload_id": String("no-such-upload")}]
+Ok(
+    Object {
+        "received": Number(0),
+        "state": String("gone"),
+    },
+)
+== session.upload_status [Object {}, Object {}]
+Err(
+    "InvalidParams { field: \"upload_id\", message: \"missing field `upload_id`\" }",
+)
+== another module's upload
+Err(
+    "ScopeRefused(OwnerMismatch(OwnerOperation { first: Reserved { module_id: \"prefrontal-core\" }, mismatch: Scoped { frozen: SessionScope { owner: Reserved { module_id: \"prefrontal-core\" }, scope_ref: \"head-1\", scope_epoch: 1, flow_id: None, sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, presented_principal: Some(Reserved { module_id: \"magic-context\" }), presented_scope: Some(SessionScope { owner: Reserved { module_id: \"prefrontal-core\" }, scope_ref: \"head-1\", scope_epoch: 1, flow_id: None, sender: None, agent_id: None, run_id: None, agent_id_frozen: false }) } }))",
+)
+== media_read {"length":69,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== media_read {"length":20,"offset":10,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("AA1JSERSAAAAAQAAAAEIAgAAAJA="),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== media_read {"length":100,"offset":64,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String("RK5CYII="),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== media_read {"length":0,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== media_read {"length":10,"offset":69,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Ok(
+    Object {
+        "data": String(""),
+        "mime": String("image/png"),
+        "size": Number(69),
+    },
+)
+== media_read {"length":10,"offset":70,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "Upload(UploadError { code: \"invalid_params\", subject: \"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640\", field: Some(\"offset\"), received: None })",
+)
+== media_read {"length":2097153,"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "Upload(UploadError { code: \"invalid_params\", subject: \"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640\", field: Some(\"length\"), received: None })",
+)
+== media_read {"length":10,"offset":0,"sha256":"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789"}
+Err(
+    "Upload(UploadError { code: \"unknown_media\", subject: \"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789\", field: None, received: None })",
+)
+== media_read {"length":10,"offset":0,"sha256":"b68565cf5699273f6a21847b3fe44726374cbd6c3bfdc829527f1db2a0504341"}
+Err(
+    "Upload(UploadError { code: \"unknown_media\", subject: \"b68565cf5699273f6a21847b3fe44726374cbd6c3bfdc829527f1db2a0504341\", field: None, received: None })",
+)
+== media_read {"length":10,"offset":0,"sha256":"not-a-digest"}
+Err(
+    "Upload(UploadError { code: \"unknown_media\", subject: \"not-a-digest\", field: None, received: None })",
+)
+== media_read {"offset":0,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"}
+Err(
+    "InvalidParams { field: \"length\", message: \"missing field `length`\" }",
+)

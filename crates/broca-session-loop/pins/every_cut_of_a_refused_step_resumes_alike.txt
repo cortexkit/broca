@@ -1,0 +1,724 @@
+== cut after record 1 of 12: request count
+3
+== cut after record 1 of 12: request 0
+sha256:b9c699dc02c975b8f744ff1627c6ad98b0aa74ec07153cf4b09b81861e91ef9b (2811 bytes)
+== cut after record 1 of 12: request 1
+sha256:3e9cfcc710ba1d3dd31458f3f5e3fcda1de8e068642ee1ec5c62ad24ee923eb8 (2826 bytes)
+== cut after record 1 of 12: request 2
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 1 of 12: record count
+18
+== cut after record 1 of 12: records
+sha256:721907e15b11258a24d87848655391d70c18231deffe3ac24a1797dcb3ef33c5 (6200 bytes)
+== cut after record 1 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 12: request count
+3
+== cut after record 2 of 12: request 0
+sha256:b9c699dc02c975b8f744ff1627c6ad98b0aa74ec07153cf4b09b81861e91ef9b (2811 bytes)
+== cut after record 2 of 12: request 1
+sha256:3e9cfcc710ba1d3dd31458f3f5e3fcda1de8e068642ee1ec5c62ad24ee923eb8 (2826 bytes)
+== cut after record 2 of 12: request 2
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 2 of 12: record count
+18
+== cut after record 2 of 12: records
+sha256:721907e15b11258a24d87848655391d70c18231deffe3ac24a1797dcb3ef33c5 (6200 bytes)
+== cut after record 2 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 12: request count
+1
+== cut after record 3 of 12: request 0
+sha256:3e9cfcc710ba1d3dd31458f3f5e3fcda1de8e068642ee1ec5c62ad24ee923eb8 (2826 bytes)
+== cut after record 3 of 12: record count
+6
+== cut after record 3 of 12: records
+sha256:4cd401ff4afc8d109fa2291560c9aff2d8ed19a079e55845e1866adbaf74ef83 (2130 bytes)
+== cut after record 3 of 12: tool calls
+[]
+== cut after record 4 of 12: request count
+2
+== cut after record 4 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 4 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 4 of 12: record count
+24
+== cut after record 4 of 12: records
+sha256:be41042aba9ebca971b3355b8f7d28bb2a8ab26a990d35dd28ffbdb80d649b67 (7453 bytes)
+== cut after record 4 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 12: request count
+2
+== cut after record 5 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 5 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 5 of 12: record count
+23
+== cut after record 5 of 12: records
+sha256:c85e98ef2b63a4d014cd637f5a1df5555a1954b97271aad83474f7d1533823e9 (7340 bytes)
+== cut after record 5 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 6 of 12: request count
+0
+== cut after record 6 of 12: record count
+7
+== cut after record 6 of 12: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 6 of 12: tool calls
+[]
+== cut after record 7 of 12: request count
+2
+== cut after record 7 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 7 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 7 of 12: record count
+18
+== cut after record 7 of 12: records
+sha256:6c8bf99e8d66f2749f6042714a6a3cfee34b206f233f67efde79606f6067cea2 (5699 bytes)
+== cut after record 7 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 12: request count
+2
+== cut after record 8 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 8 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 8 of 12: record count
+17
+== cut after record 8 of 12: records
+sha256:da633b29206c6f0f3bf1738de63b8657a88d6e7ca78294eeecd051fe5267a271 (5666 bytes)
+== cut after record 8 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 12: request count
+2
+== cut after record 9 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 9 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 9 of 12: record count
+17
+== cut after record 9 of 12: records
+sha256:da633b29206c6f0f3bf1738de63b8657a88d6e7ca78294eeecd051fe5267a271 (5666 bytes)
+== cut after record 9 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 12: request count
+2
+== cut after record 10 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 10 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 10 of 12: record count
+17
+== cut after record 10 of 12: records
+sha256:da633b29206c6f0f3bf1738de63b8657a88d6e7ca78294eeecd051fe5267a271 (5666 bytes)
+== cut after record 10 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 12: request count
+0
+== cut after record 11 of 12: record count
+2
+== cut after record 11 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 11 of 12: tool calls
+[]
+== cut after record 1 of 12: request count
+3
+== cut after record 1 of 12: request 0
+sha256:b9c699dc02c975b8f744ff1627c6ad98b0aa74ec07153cf4b09b81861e91ef9b (2811 bytes)
+== cut after record 1 of 12: request 1
+sha256:3e9cfcc710ba1d3dd31458f3f5e3fcda1de8e068642ee1ec5c62ad24ee923eb8 (2826 bytes)
+== cut after record 1 of 12: request 2
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 1 of 12: record count
+18
+== cut after record 1 of 12: records
+sha256:721907e15b11258a24d87848655391d70c18231deffe3ac24a1797dcb3ef33c5 (6200 bytes)
+== cut after record 1 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 12: request count
+3
+== cut after record 2 of 12: request 0
+sha256:b9c699dc02c975b8f744ff1627c6ad98b0aa74ec07153cf4b09b81861e91ef9b (2811 bytes)
+== cut after record 2 of 12: request 1
+sha256:3e9cfcc710ba1d3dd31458f3f5e3fcda1de8e068642ee1ec5c62ad24ee923eb8 (2826 bytes)
+== cut after record 2 of 12: request 2
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 2 of 12: record count
+18
+== cut after record 2 of 12: records
+sha256:721907e15b11258a24d87848655391d70c18231deffe3ac24a1797dcb3ef33c5 (6200 bytes)
+== cut after record 2 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 12: request count
+1
+== cut after record 3 of 12: request 0
+sha256:3e9cfcc710ba1d3dd31458f3f5e3fcda1de8e068642ee1ec5c62ad24ee923eb8 (2826 bytes)
+== cut after record 3 of 12: record count
+6
+== cut after record 3 of 12: records
+sha256:4cd401ff4afc8d109fa2291560c9aff2d8ed19a079e55845e1866adbaf74ef83 (2130 bytes)
+== cut after record 3 of 12: tool calls
+[]
+== cut after record 4 of 12: request count
+2
+== cut after record 4 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 4 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 4 of 12: record count
+24
+== cut after record 4 of 12: records
+sha256:be41042aba9ebca971b3355b8f7d28bb2a8ab26a990d35dd28ffbdb80d649b67 (7453 bytes)
+== cut after record 4 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 12: request count
+2
+== cut after record 5 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 5 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 5 of 12: record count
+23
+== cut after record 5 of 12: records
+sha256:c85e98ef2b63a4d014cd637f5a1df5555a1954b97271aad83474f7d1533823e9 (7340 bytes)
+== cut after record 5 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 6 of 12: request count
+0
+== cut after record 6 of 12: record count
+7
+== cut after record 6 of 12: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 6 of 12: tool calls
+[]
+== cut after record 7 of 12: request count
+2
+== cut after record 7 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 7 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 7 of 12: record count
+18
+== cut after record 7 of 12: records
+sha256:6c8bf99e8d66f2749f6042714a6a3cfee34b206f233f67efde79606f6067cea2 (5699 bytes)
+== cut after record 7 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 12: request count
+2
+== cut after record 8 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 8 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 8 of 12: record count
+17
+== cut after record 8 of 12: records
+sha256:da633b29206c6f0f3bf1738de63b8657a88d6e7ca78294eeecd051fe5267a271 (5666 bytes)
+== cut after record 8 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 12: request count
+2
+== cut after record 9 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 9 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 9 of 12: record count
+17
+== cut after record 9 of 12: records
+sha256:da633b29206c6f0f3bf1738de63b8657a88d6e7ca78294eeecd051fe5267a271 (5666 bytes)
+== cut after record 9 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 12: request count
+2
+== cut after record 10 of 12: request 0
+sha256:9d1e5526b6f6b125241583f062ac4bf32a5700eb4785692d7d17d227b3c507e7 (5519 bytes)
+== cut after record 10 of 12: request 1
+sha256:aa4d76ba7d6c40f78b26041cd623d7c74abbae9d3e4d12ad410d5f06b21c97ca (8385 bytes)
+== cut after record 10 of 12: record count
+17
+== cut after record 10 of 12: records
+sha256:da633b29206c6f0f3bf1738de63b8657a88d6e7ca78294eeecd051fe5267a271 (5666 bytes)
+== cut after record 10 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 12: request count
+0
+== cut after record 11 of 12: record count
+2
+== cut after record 11 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 11 of 12: tool calls
+[]
+== cut after record 1 of 12: request count
+3
+== cut after record 1 of 12: request 0
+sha256:a95df0bd1cfa0ecbc939e399c548be508f2dde1ffdcd05db46f16e12eca0c09f (2811 bytes)
+== cut after record 1 of 12: request 1
+sha256:994bbc293bae22f32f7c4c0b035782486df1ff7ab1ef9166e255761e09bcdc11 (2826 bytes)
+== cut after record 1 of 12: request 2
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 1 of 12: record count
+18
+== cut after record 1 of 12: records
+sha256:ebb18cfd0cb22cd1a48387c99f63c2d252ccf6af069f28879647bc1dc6325e53 (6422 bytes)
+== cut after record 1 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 12: request count
+3
+== cut after record 2 of 12: request 0
+sha256:a95df0bd1cfa0ecbc939e399c548be508f2dde1ffdcd05db46f16e12eca0c09f (2811 bytes)
+== cut after record 2 of 12: request 1
+sha256:994bbc293bae22f32f7c4c0b035782486df1ff7ab1ef9166e255761e09bcdc11 (2826 bytes)
+== cut after record 2 of 12: request 2
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 2 of 12: record count
+18
+== cut after record 2 of 12: records
+sha256:ebb18cfd0cb22cd1a48387c99f63c2d252ccf6af069f28879647bc1dc6325e53 (6422 bytes)
+== cut after record 2 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 12: request count
+1
+== cut after record 3 of 12: request 0
+sha256:994bbc293bae22f32f7c4c0b035782486df1ff7ab1ef9166e255761e09bcdc11 (2826 bytes)
+== cut after record 3 of 12: record count
+6
+== cut after record 3 of 12: records
+sha256:28df925acb38ded869e0bc671918bcc3930f2f109958251ab74f991fe9b36833 (2241 bytes)
+== cut after record 3 of 12: tool calls
+[]
+== cut after record 4 of 12: request count
+2
+== cut after record 4 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 4 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 4 of 12: record count
+24
+== cut after record 4 of 12: records
+sha256:1e17f7af28174728d37396dade05ca5b3b3c71ef7aca46077dae648a2ec3cbe7 (7675 bytes)
+== cut after record 4 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 12: request count
+2
+== cut after record 5 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 5 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 5 of 12: record count
+23
+== cut after record 5 of 12: records
+sha256:c0d26a291ab8483404f9c09b8279f497ff07ff6c7d7ed3060106f5fb49d87960 (7562 bytes)
+== cut after record 5 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 6 of 12: request count
+0
+== cut after record 6 of 12: record count
+7
+== cut after record 6 of 12: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 6 of 12: tool calls
+[]
+== cut after record 7 of 12: request count
+2
+== cut after record 7 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 7 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 7 of 12: record count
+18
+== cut after record 7 of 12: records
+sha256:90111908f6acedd98e21dd848a37d715ce16deec42d42c4588e04df3b31e92ae (5921 bytes)
+== cut after record 7 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 12: request count
+2
+== cut after record 8 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 8 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 8 of 12: record count
+17
+== cut after record 8 of 12: records
+sha256:ba4e17cef256e1681812b5eaf5d5acc35e26cbb6a4b5be4f112a8b78e00d292b (5888 bytes)
+== cut after record 8 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 12: request count
+2
+== cut after record 9 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 9 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 9 of 12: record count
+17
+== cut after record 9 of 12: records
+sha256:ba4e17cef256e1681812b5eaf5d5acc35e26cbb6a4b5be4f112a8b78e00d292b (5888 bytes)
+== cut after record 9 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 12: request count
+2
+== cut after record 10 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 10 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 10 of 12: record count
+17
+== cut after record 10 of 12: records
+sha256:ba4e17cef256e1681812b5eaf5d5acc35e26cbb6a4b5be4f112a8b78e00d292b (5888 bytes)
+== cut after record 10 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 12: request count
+0
+== cut after record 11 of 12: record count
+2
+== cut after record 11 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 11 of 12: tool calls
+[]
+== cut after record 1 of 12: request count
+3
+== cut after record 1 of 12: request 0
+sha256:a95df0bd1cfa0ecbc939e399c548be508f2dde1ffdcd05db46f16e12eca0c09f (2811 bytes)
+== cut after record 1 of 12: request 1
+sha256:994bbc293bae22f32f7c4c0b035782486df1ff7ab1ef9166e255761e09bcdc11 (2826 bytes)
+== cut after record 1 of 12: request 2
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 1 of 12: record count
+18
+== cut after record 1 of 12: records
+sha256:ebb18cfd0cb22cd1a48387c99f63c2d252ccf6af069f28879647bc1dc6325e53 (6422 bytes)
+== cut after record 1 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 12: request count
+3
+== cut after record 2 of 12: request 0
+sha256:a95df0bd1cfa0ecbc939e399c548be508f2dde1ffdcd05db46f16e12eca0c09f (2811 bytes)
+== cut after record 2 of 12: request 1
+sha256:994bbc293bae22f32f7c4c0b035782486df1ff7ab1ef9166e255761e09bcdc11 (2826 bytes)
+== cut after record 2 of 12: request 2
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 2 of 12: record count
+18
+== cut after record 2 of 12: records
+sha256:ebb18cfd0cb22cd1a48387c99f63c2d252ccf6af069f28879647bc1dc6325e53 (6422 bytes)
+== cut after record 2 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 12: request count
+1
+== cut after record 3 of 12: request 0
+sha256:994bbc293bae22f32f7c4c0b035782486df1ff7ab1ef9166e255761e09bcdc11 (2826 bytes)
+== cut after record 3 of 12: record count
+6
+== cut after record 3 of 12: records
+sha256:28df925acb38ded869e0bc671918bcc3930f2f109958251ab74f991fe9b36833 (2241 bytes)
+== cut after record 3 of 12: tool calls
+[]
+== cut after record 4 of 12: request count
+2
+== cut after record 4 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 4 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 4 of 12: record count
+24
+== cut after record 4 of 12: records
+sha256:1e17f7af28174728d37396dade05ca5b3b3c71ef7aca46077dae648a2ec3cbe7 (7675 bytes)
+== cut after record 4 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 12: request count
+2
+== cut after record 5 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 5 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 5 of 12: record count
+23
+== cut after record 5 of 12: records
+sha256:c0d26a291ab8483404f9c09b8279f497ff07ff6c7d7ed3060106f5fb49d87960 (7562 bytes)
+== cut after record 5 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 6 of 12: request count
+0
+== cut after record 6 of 12: record count
+7
+== cut after record 6 of 12: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 6 of 12: tool calls
+[]
+== cut after record 7 of 12: request count
+2
+== cut after record 7 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 7 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 7 of 12: record count
+18
+== cut after record 7 of 12: records
+sha256:90111908f6acedd98e21dd848a37d715ce16deec42d42c4588e04df3b31e92ae (5921 bytes)
+== cut after record 7 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 12: request count
+2
+== cut after record 8 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 8 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 8 of 12: record count
+17
+== cut after record 8 of 12: records
+sha256:ba4e17cef256e1681812b5eaf5d5acc35e26cbb6a4b5be4f112a8b78e00d292b (5888 bytes)
+== cut after record 8 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 12: request count
+2
+== cut after record 9 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 9 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 9 of 12: record count
+17
+== cut after record 9 of 12: records
+sha256:ba4e17cef256e1681812b5eaf5d5acc35e26cbb6a4b5be4f112a8b78e00d292b (5888 bytes)
+== cut after record 9 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 12: request count
+2
+== cut after record 10 of 12: request 0
+sha256:421759c07f4a8ccc44441c4ebda6b94fffa114b8cf1400725b7880c3e0db5f3a (5521 bytes)
+== cut after record 10 of 12: request 1
+sha256:13adc9925b693e20539b31d0f767d40750be21a5f0ef5d1be22537a9222dd333 (8389 bytes)
+== cut after record 10 of 12: record count
+17
+== cut after record 10 of 12: records
+sha256:ba4e17cef256e1681812b5eaf5d5acc35e26cbb6a4b5be4f112a8b78e00d292b (5888 bytes)
+== cut after record 10 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 12: request count
+0
+== cut after record 11 of 12: record count
+2
+== cut after record 11 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 11 of 12: tool calls
+[]

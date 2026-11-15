@@ -1,0 +1,28 @@
+== both logs record the view alike
+Array [
+    Object {
+        "applied_by": String("ck-mc"),
+        "built_through": String("entry 6"),
+        "new_signed": String("strip"),
+        "version": Number(1),
+    },
+]
+== alike
+sha256:4b254482685a3ea56794eb5396bf61414faa5179634e14620eab27b41d741385 (2261 bytes)
+== the store serves the applied view as today's
+Object {
+    "applied_by": String("ck-mc"),
+    "view": Object {
+        "built_through": String("entry 6"),
+        "checksum": Bool(true),
+        "edits": Array [
+            Object {
+                "mid": String("entry 2"),
+                "op": String("drop"),
+                "since": Number(1),
+            },
+        ],
+        "new_signed": String("strip"),
+        "version": Number(1),
+    },
+}

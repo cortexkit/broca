@@ -755,9 +755,9 @@ async fn a_held_pause_keeps_a_queued_interrupt_parked_after_restart(cipher: Ciph
         initial.push(side);
         restarted.push(recovered);
     }
-    assert_eq!(statuses[1], statuses[0]);
-    assert_eq!(results[1], results[0]);
-    assert_eq!(queues[1], queues[0]);
+    alike!(statuses[1], statuses[0]);
+    alike!(results[1], results[0]);
+    alike!(queues[1], queues[0]);
     for side in initial.iter().chain(&restarted) {
         assert!(side.registry.stop_and_seal().await);
     }
@@ -792,10 +792,10 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
         initial.push(side);
     }
     let before = [initial[0].status().await, initial[1].status().await];
-    assert_eq!(comparable(before[1].clone()), comparable(before[0].clone()));
+    alike!(comparable(before[1].clone()), comparable(before[0].clone()));
     assert_eq!(before[1]["state"], "active");
     assert_eq!(before[1]["held_calls"].as_array().unwrap().len(), 1);
-    assert_eq!(
+    alike!(
         comparable(initial[1].result().await),
         comparable(initial[0].result().await)
     );
@@ -845,7 +845,7 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
             "opening must not redispatch"
         );
     }
-    assert_eq!(
+    alike!(
         comparable(restarted[1].status().await),
         comparable(restarted[0].status().await)
     );
@@ -877,7 +877,7 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
         assert_eq!(side.executor.tools.0.load(Ordering::SeqCst), 1);
         assert_eq!(side.executor.provider.inner.calls().len(), 1);
     }
-    assert_eq!(restarted[1].status().await, restarted[0].status().await);
+    alike!(restarted[1].status().await, restarted[0].status().await);
     let mut results = [restarted[0].result().await, restarted[1].result().await];
     for result in &mut results {
         result["final_message"]
@@ -885,7 +885,7 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
             .unwrap()
             .remove("mid");
     }
-    assert_eq!(results[1], results[0]);
+    alike!(results[1], results[0]);
     assert_eq!(results[1]["state"], "completed");
     for side in initial.iter().chain(&restarted) {
         assert!(side.registry.stop_and_seal().await);
@@ -939,8 +939,8 @@ async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
         restarted.push(side);
         originals.push(original);
     }
-    assert_eq!(restarted[1].status().await, restarted[0].status().await);
-    assert_eq!(restarted[1].result().await, restarted[0].result().await);
+    alike!(restarted[1].status().await, restarted[0].status().await);
+    alike!(restarted[1].result().await, restarted[0].result().await);
     assert_eq!(restarted[1].status().await["state"], "interrupted");
     for side in originals.iter().chain(&restarted) {
         assert!(side.registry.stop_and_seal().await);
@@ -1173,7 +1173,7 @@ async fn startup_recovery_work_ignores_idle_store_sessions() {
         assert!(counts.1 > 0, "the candidate's real log must be read");
         work.push(counts);
     }
-    assert_eq!(work[0], work[1]);
+    alike_today_first!(work[0], work[1]);
 }
 
 #[tokio::test]

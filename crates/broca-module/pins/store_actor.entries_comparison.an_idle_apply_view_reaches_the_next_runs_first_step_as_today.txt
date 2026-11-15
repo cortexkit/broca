@@ -1,0 +1,29 @@
+== the store answers as today's
+(
+    Ok(
+        Object {
+            "answer": String("accepted"),
+        },
+    ),
+    Ok(
+        Object {
+            "answer": String("refused"),
+            "refusal": Object {
+                "code": String("stale_version"),
+                "latest": Number(1),
+                "version": Number(1),
+            },
+        },
+    ),
+    Ok(
+        Object {
+            "answer": String("refused"),
+            "refusal": Object {
+                "code": String("unknown_message"),
+                "mid": String("no-such-message"),
+            },
+        },
+    ),
+)
+== alike
+sha256:4b254482685a3ea56794eb5396bf61414faa5179634e14620eab27b41d741385 (2261 bytes)

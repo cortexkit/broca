@@ -1,0 +1,21 @@
+== alike
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== alike
+RetentionInvalid(
+    RetentionInvalidDetail {
+        field: "retention",
+        max_seconds: None,
+    },
+)
+== alike
+Active {
+    run_id: RunId(
+        "r2",
+    ),
+    delivered: None,
+}

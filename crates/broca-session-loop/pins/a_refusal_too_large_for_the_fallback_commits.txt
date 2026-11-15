@@ -1,0 +1,68 @@
+== request count
+2
+== request 0
+sha256:b9c699dc02c975b8f744ff1627c6ad98b0aa74ec07153cf4b09b81861e91ef9b (2811 bytes)
+== request 1
+sha256:12d81813e1cf7d5f4c1467f2ee8361a24db86097c90d321dd2344669be8290fa (5491 bytes)
+== record count
+20
+== records
+sha256:42174c425322584835b6dde7aa55e0e769c9b0eb6c802a1ef59bd3a197603f6f (7155 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:b9c699dc02c975b8f744ff1627c6ad98b0aa74ec07153cf4b09b81861e91ef9b (2811 bytes)
+== request 1
+sha256:12d81813e1cf7d5f4c1467f2ee8361a24db86097c90d321dd2344669be8290fa (5491 bytes)
+== record count
+20
+== records
+sha256:42174c425322584835b6dde7aa55e0e769c9b0eb6c802a1ef59bd3a197603f6f (7155 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:a95df0bd1cfa0ecbc939e399c548be508f2dde1ffdcd05db46f16e12eca0c09f (2811 bytes)
+== request 1
+sha256:bff6f920b887925cf461662237947cc46eac9cd8b057b6121d8561883872394b (5493 bytes)
+== record count
+20
+== records
+sha256:fae45d32d00407863d616a84aa7c329a652d0f0d2f46a34dedf9822e7f132066 (7374 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:a95df0bd1cfa0ecbc939e399c548be508f2dde1ffdcd05db46f16e12eca0c09f (2811 bytes)
+== request 1
+sha256:bff6f920b887925cf461662237947cc46eac9cd8b057b6121d8561883872394b (5493 bytes)
+== record count
+20
+== records
+sha256:fae45d32d00407863d616a84aa7c329a652d0f0d2f46a34dedf9822e7f132066 (7374 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]

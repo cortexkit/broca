@@ -710,7 +710,7 @@ async fn both_from(
 /// image's bytes.
 fn sent_alike(today: &Rendered, store: &Rendered, when: &str) {
     let (old, new) = (today.sent(), store.sent());
-    assert_eq!(new.len(), old.len(), "{when}: how many requests");
+    alike!(new.len(), old.len(), "{when}: how many requests");
     for (index, (old, new)) in old.iter().zip(&new).enumerate() {
         match (old, new) {
             (Ok(old), Ok(new)) => assert!(
@@ -719,7 +719,7 @@ fn sent_alike(today: &Rendered, store: &Rendered, when: &str) {
                 String::from_utf8_lossy(old),
                 String::from_utf8_lossy(new)
             ),
-            _ => assert_eq!(new, old, "{when}: request {index}"),
+            _ => alike!(new, old, "{when}: request {index}"),
         }
     }
     let last = new
@@ -967,8 +967,9 @@ async fn an_ordered_photo_no_mode_can_carry_is_refused_alike(cipher: Cipher) {
             side.side.idle().await;
             assert_eq!(side.sent().len(), before, "{modes:?}: nothing is sent");
         }
-        assert_eq!(
-            replies[1], replies[0],
+        alike!(
+            replies[1],
+            replies[0],
             "{modes:?}: the store answers as today's"
         );
         assert!(
@@ -1207,7 +1208,7 @@ async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(ciph
     }
     let (old, new) = (today.sent(), store.sent());
     assert_eq!(new.last(), Some(&Err("media_object_missing".to_owned())));
-    assert_eq!(new, old, "both refuse alike");
+    alike!(new, old, "both refuse alike");
 }
 
 /// Sends `request` on `side` as run `run_id` under the fetch plan `plan`, as a planned
@@ -1302,7 +1303,7 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
     );
     let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
     let (old, new) = (today.sent(), store.sent());
-    assert_eq!(new.len(), old.len(), "how many requests");
+    alike!(new.len(), old.len(), "how many requests");
     for (index, (old, new)) in old.iter().zip(&new).enumerate() {
         assert!(
             old == new,
@@ -1375,7 +1376,7 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
     );
     let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
     let (old, new) = (today.sent(), store.sent());
-    assert_eq!(new.len(), old.len(), "how many requests");
+    alike!(new.len(), old.len(), "how many requests");
     for (index, (old, new)) in old.iter().zip(&new).enumerate() {
         assert!(
             old == new,

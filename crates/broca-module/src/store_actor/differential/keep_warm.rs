@@ -397,7 +397,7 @@ async fn a_keep_warm_resends_the_last_request_and_records_it_alike(cipher: Ciphe
     let store = side(true, cipher).await;
     today.keep_warm_once().await;
     store.keep_warm_once().await;
-    assert_eq!(
+    alike!(
         *store.sent.lock().unwrap(),
         *today.sent.lock().unwrap(),
         "the same bytes warmed"
@@ -534,5 +534,5 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
         }
         bodies.push(body);
     }
-    assert_eq!(normalized(&bodies[0]), normalized(&bodies[1]));
+    alike_today_first!(normalized(&bodies[0]), normalized(&bodies[1]));
 }

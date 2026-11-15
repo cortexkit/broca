@@ -1,0 +1,564 @@
+== cancelled and queued: {}
+sha256:d6d53d98c790b7482b9f9825326a5e9bdd8489a292af4ed1c93dfb41dfa0a2dc (3714 bytes)
+== cancelled and queued: {"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(true),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== cancelled and queued: {"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("queued"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(true),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== cancelled and queued: {"from_ordinal":1,"limit":2}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(false),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== cancelled and queued: {"from_ordinal":2}
+sha256:c0bf0e0488e8ddc77ad772107cff5e3a7569ca3ec58b4dd8d58ca2c74667297d (3072 bytes)
+== cancelled and queued: {"before_ordinal":3,"limit":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(false),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== cancelled and queued: {"from_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== cancelled and queued: {"before_ordinal":99}
+Object {
+    "refused": String("unknown_ordinal"),
+}
+== cancelled and queued: {"from_mid":"no-such-message"}
+Object {
+    "refused": String("unknown_mid"),
+}
+== cancelled and queued: {"cursor":"not-a-cursor"}
+Object {
+    "error": String("InvalidParams { field: \"cursor\", message: \"session.history cursor is malformed\" }"),
+}
+== cancelled and queued: {"limit":1,"max_bytes":1}
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(true),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== cancelled and queued: older page 0
+sha256:bb90936e841e93cff6b00afc12dcac378dc021758edc3824ea3db3b2dc310e5e (2905 bytes)
+== cancelled and queued: the oldest page
+sha256:bb90936e841e93cff6b00afc12dcac378dc021758edc3824ea3db3b2dc310e5e (2905 bytes)
+== cancelled and queued: a newer page
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(true),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== cancelled and queued: from_mid at 1 (the store's id g8129fe2b59b493fc.5)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(false),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== cancelled and queued: before_mid at 1 (the store's id g8129fe2b59b493fc.5)
+Object {
+    "messages": Array [],
+    "newer": Bool(true),
+}
+== cancelled and queued: from_mid at 3 (the store's id g8129fe2b59b493fc.12)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("queued"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== cancelled and queued: before_mid at 3 (the store's id g8129fe2b59b493fc.12)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("second"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(false),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+}
+== cancelled and queued: from_mid at 5 (the store's id g8129fe2b59b493fc.21)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(5),
+            "part_keys": Array [
+                String("m4#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(true),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "older": Bool(true),
+}
+== cancelled and queued: before_mid at 5 (the store's id g8129fe2b59b493fc.21)
+Object {
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r2"),
+                "final": Bool(true),
+                "run_id": String("r2"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("queued"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(4),
+            "part_keys": Array [
+                String("m3#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r3"),
+                "final": Bool(false),
+                "run_id": String("r3"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "newer": Bool(true),
+    "older": Bool(true),
+}
+== cancelled and queued: display {"form":"display"}
+sha256:965c537a86bab9740a4b827326e9a10b8ae6a178b0ac7e02bc18884824ceb104 (3454 bytes)
+== cancelled and queued: display {"form":"display","from_ordinal":1,"limit":3}
+sha256:a33c0fdbbdb21b4d33b87aa0861f323e72a068317b4e50eb025cf9407f745a50 (2049 bytes)
+== cancelled and queued: bind from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== cancelled and queued: bind from None
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== cancelled and queued: session.entries from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== cancelled and queued: session.applied_view from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== cancelled and queued: session.apply_view from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== cancelled and queued: session.unknown from Some("ck-mc")
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("session_not_held"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)

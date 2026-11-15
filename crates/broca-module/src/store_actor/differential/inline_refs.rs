@@ -45,7 +45,7 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
             .import(imported(&today, run, payload.clone()))
             .await;
         let new = store.registry.import(imported(&store, run, payload)).await;
-        assert_eq!(format!("{new:?}"), format!("{old:?}"), "{expected}");
+        alike!(format!("{new:?}"), format!("{old:?}"), "{expected}");
         match expected {
             "ok" | "retry" => {
                 let reply = new.unwrap();
@@ -92,7 +92,7 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
                 .unwrap(),
         );
     }
-    assert_eq!(continued[1], continued[0]);
+    alike!(continued[1], continued[0]);
     assert!(
         matches!(continued[1], SendOutcome::Active { .. }),
         "{:?}",
@@ -120,7 +120,7 @@ async fn inline_import_invalid_and_empty_payloads_match_today_and_leave_a_fillab
             .registry
             .import(imported(&store, "seed", messages))
             .await;
-        assert_eq!(format!("{new:?}"), format!("{old:?}"));
+        alike!(format!("{new:?}"), format!("{old:?}"));
         assert!(new.is_err());
     }
     for module in [&today, &store] {
@@ -148,7 +148,7 @@ async fn conversation_key_sends_and_subsequent_sends_are_admitted_alike() {
     for (run, key) in [("r1", Some("shared-conversation")), ("r2", None)] {
         let old = today.send(run, "input", key).await;
         let new = store.send(run, "input", key).await;
-        assert_eq!(new, old);
+        alike!(new, old);
         assert!(matches!(new, SendOutcome::Active { .. }));
         today.closed().await;
         store.closed().await;
@@ -234,7 +234,7 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
             })
             .unwrap();
         let new = answer.await.unwrap();
-        assert_eq!(new, old, "{id}: {conversation}");
+        alike!(new, old, "{id}: {conversation}");
         if conversation == "changed" {
             assert!(matches!(
                 new,
@@ -270,7 +270,7 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
             })
             .unwrap();
         let new = answer.await.unwrap();
-        assert_eq!(new, old);
+        alike!(new, old);
         assert!(matches!(new, crate::actor::ImportOutcome::Busy));
     }
     old_gate.notify_one();
@@ -400,7 +400,7 @@ async fn output_reference_list_and_byte_reads_match_today() {
     let old_id = old_page["records"][0]["ref_id"].as_str().unwrap();
     let new_id = new_page["records"][0]["ref_id"].as_str().unwrap();
     for (offset, length) in [(0, 131_072), (2, 3), (0, 0), (13, 1)] {
-        assert_eq!(
+        alike!(
             read_ref(&store, new_id, offset, length).await,
             read_ref(&today, old_id, offset, length).await
         );

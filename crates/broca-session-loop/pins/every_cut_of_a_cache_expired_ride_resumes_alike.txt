@@ -1,0 +1,344 @@
+== cut after record 1 of 12: request count
+2
+== cut after record 1 of 12: request 0
+sha256:68e4b0977f67401c809485a2640791138ced26ae0764e9dc57f530b44acc0798 (4170 bytes)
+== cut after record 1 of 12: request 1
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 1 of 12: record count
+18
+== cut after record 1 of 12: records
+sha256:5f220ad29497f9e6bb24c0102fd4e82cc807fab85ae0f96a7542c000c9b3d10f (5890 bytes)
+== cut after record 1 of 12: tool calls
+sha256:e86a6dbaea13467512f25d492a2d1d7efead33d1617ac84f222621757745a4cb (4158 bytes)
+== cut after record 2 of 12: request count
+2
+== cut after record 2 of 12: request 0
+sha256:68e4b0977f67401c809485a2640791138ced26ae0764e9dc57f530b44acc0798 (4170 bytes)
+== cut after record 2 of 12: request 1
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 2 of 12: record count
+18
+== cut after record 2 of 12: records
+sha256:5f220ad29497f9e6bb24c0102fd4e82cc807fab85ae0f96a7542c000c9b3d10f (5890 bytes)
+== cut after record 2 of 12: tool calls
+sha256:e86a6dbaea13467512f25d492a2d1d7efead33d1617ac84f222621757745a4cb (4158 bytes)
+== cut after record 3 of 12: request count
+2
+== cut after record 3 of 12: request 0
+sha256:68e4b0977f67401c809485a2640791138ced26ae0764e9dc57f530b44acc0798 (4170 bytes)
+== cut after record 3 of 12: request 1
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 3 of 12: record count
+18
+== cut after record 3 of 12: records
+sha256:5f220ad29497f9e6bb24c0102fd4e82cc807fab85ae0f96a7542c000c9b3d10f (5890 bytes)
+== cut after record 3 of 12: tool calls
+sha256:7a7c17d166a375c8510dccb2dc54e27273a462da09e3915ce408c65f27f8d228 (4484 bytes)
+== cut after record 4 of 12: request count
+1
+== cut after record 4 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 4 of 12: record count
+13
+== cut after record 4 of 12: records
+sha256:7bffb5caa61c209342cc43ad8af5a33f24e8aaa5e94cc7e0281bb2d5efd70bec (3654 bytes)
+== cut after record 4 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 5 of 12: request count
+1
+== cut after record 5 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 5 of 12: record count
+12
+== cut after record 5 of 12: records
+sha256:465b6b7d8249dadf2fdb369f6535d13ef2442214275232486bf72453936156d4 (3541 bytes)
+== cut after record 5 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 6 of 12: request count
+0
+== cut after record 6 of 12: record count
+7
+== cut after record 6 of 12: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":1,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 6 of 12: tool calls
+[]
+== cut after record 7 of 12: request count
+1
+== cut after record 7 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 7 of 12: record count
+7
+== cut after record 7 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 7 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 8 of 12: request count
+1
+== cut after record 8 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 8 of 12: record count
+6
+== cut after record 8 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 8 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 9 of 12: request count
+1
+== cut after record 9 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 9 of 12: record count
+6
+== cut after record 9 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 9 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 10 of 12: request count
+1
+== cut after record 10 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 10 of 12: record count
+6
+== cut after record 10 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 10 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 11 of 12: request count
+0
+== cut after record 11 of 12: record count
+2
+== cut after record 11 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 11 of 12: tool calls
+[]
+== cut after record 1 of 12: request count
+2
+== cut after record 1 of 12: request 0
+sha256:68e4b0977f67401c809485a2640791138ced26ae0764e9dc57f530b44acc0798 (4170 bytes)
+== cut after record 1 of 12: request 1
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 1 of 12: record count
+18
+== cut after record 1 of 12: records
+sha256:5f220ad29497f9e6bb24c0102fd4e82cc807fab85ae0f96a7542c000c9b3d10f (5890 bytes)
+== cut after record 1 of 12: tool calls
+sha256:e86a6dbaea13467512f25d492a2d1d7efead33d1617ac84f222621757745a4cb (4158 bytes)
+== cut after record 2 of 12: request count
+2
+== cut after record 2 of 12: request 0
+sha256:68e4b0977f67401c809485a2640791138ced26ae0764e9dc57f530b44acc0798 (4170 bytes)
+== cut after record 2 of 12: request 1
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 2 of 12: record count
+18
+== cut after record 2 of 12: records
+sha256:5f220ad29497f9e6bb24c0102fd4e82cc807fab85ae0f96a7542c000c9b3d10f (5890 bytes)
+== cut after record 2 of 12: tool calls
+sha256:e86a6dbaea13467512f25d492a2d1d7efead33d1617ac84f222621757745a4cb (4158 bytes)
+== cut after record 3 of 12: request count
+2
+== cut after record 3 of 12: request 0
+sha256:68e4b0977f67401c809485a2640791138ced26ae0764e9dc57f530b44acc0798 (4170 bytes)
+== cut after record 3 of 12: request 1
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 3 of 12: record count
+18
+== cut after record 3 of 12: records
+sha256:5f220ad29497f9e6bb24c0102fd4e82cc807fab85ae0f96a7542c000c9b3d10f (5890 bytes)
+== cut after record 3 of 12: tool calls
+sha256:7a7c17d166a375c8510dccb2dc54e27273a462da09e3915ce408c65f27f8d228 (4484 bytes)
+== cut after record 4 of 12: request count
+1
+== cut after record 4 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 4 of 12: record count
+13
+== cut after record 4 of 12: records
+sha256:7bffb5caa61c209342cc43ad8af5a33f24e8aaa5e94cc7e0281bb2d5efd70bec (3654 bytes)
+== cut after record 4 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 5 of 12: request count
+1
+== cut after record 5 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 5 of 12: record count
+12
+== cut after record 5 of 12: records
+sha256:465b6b7d8249dadf2fdb369f6535d13ef2442214275232486bf72453936156d4 (3541 bytes)
+== cut after record 5 of 12: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 6 of 12: request count
+0
+== cut after record 6 of 12: record count
+7
+== cut after record 6 of 12: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":1,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 6 of 12: tool calls
+[]
+== cut after record 7 of 12: request count
+1
+== cut after record 7 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 7 of 12: record count
+7
+== cut after record 7 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 7 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 8 of 12: request count
+1
+== cut after record 8 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 8 of 12: record count
+6
+== cut after record 8 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 8 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 9 of 12: request count
+1
+== cut after record 9 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 9 of 12: record count
+6
+== cut after record 9 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 9 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 10 of 12: request count
+1
+== cut after record 10 of 12: request 0
+sha256:66b19d392971c708e61fd5ec646b3394df814c031baac65d90027bcb6b2bd000 (5979 bytes)
+== cut after record 10 of 12: record count
+6
+== cut after record 10 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 10 of 12: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
+== cut after record 11 of 12: request count
+0
+== cut after record 11 of 12: record count
+2
+== cut after record 11 of 12: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 11 of 12: tool calls
+[]

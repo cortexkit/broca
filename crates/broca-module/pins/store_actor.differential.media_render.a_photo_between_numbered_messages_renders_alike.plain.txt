@@ -1,0 +1,2 @@
+== a request with a photo between numbered messages: how many requests
+3

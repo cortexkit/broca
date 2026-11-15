@@ -234,7 +234,7 @@ async fn a_steer_into_a_run_paused_for_a_restart_waits_for_its_resume_alike() {
             .send(run_id, sent.clone(), send_key(), delivery, None)
             .await;
         let new = store::send_exactly(&commands, run_id, sent, send_key(), delivery, None).await;
-        assert_eq!(new, old, "the replies to {run_id} differ");
+        alike!(new, old, "the replies to {run_id} differ");
         if run_id == "r1" {
             // Both runs pause at their first boundary before the next send.
             today.idle().await;

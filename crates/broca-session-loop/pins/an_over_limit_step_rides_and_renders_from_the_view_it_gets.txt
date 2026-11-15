@@ -1,0 +1,24 @@
+== request count
+2
+== request 0
+sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
+== request 1
+sha256:be152d4ef5588d523781cd3e057269fb855fe1eda551193a8a525896d124e764 (4559 bytes)
+== record count
+22
+== records
+sha256:a0906f7f21608b7ebde9533c97fa80a15571e10d5e6b5fe06bb971d670eeb0c3 (16715 bytes)
+== tool calls
+sha256:e2a87e881ea05b386c6fd7fbdb910d1024232557badf653c64a7ab058098cc73 (4194 bytes)
+== request count
+2
+== request 0
+sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
+== request 1
+sha256:be152d4ef5588d523781cd3e057269fb855fe1eda551193a8a525896d124e764 (4559 bytes)
+== record count
+22
+== records
+sha256:a0906f7f21608b7ebde9533c97fa80a15571e10d5e6b5fe06bb971d670eeb0c3 (16715 bytes)
+== tool calls
+sha256:e2a87e881ea05b386c6fd7fbdb910d1024232557badf653c64a7ab058098cc73 (4194 bytes)

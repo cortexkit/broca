@@ -419,7 +419,7 @@ async fn first_resumed_wait_matches_todays_recorded_base(cipher: Cipher) {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(
+        alike_today_first!(
             today_warm,
             (
                 store_warm.trigger,

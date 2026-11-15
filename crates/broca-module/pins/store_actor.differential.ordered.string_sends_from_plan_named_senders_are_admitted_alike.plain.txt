@@ -1,0 +1,278 @@
+== the first send's replies differ
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== the replies to s1 differ
+Pending {
+    submission_id: SubmissionId(
+        "sub-s1",
+    ),
+}
+== the replies to s2 differ
+DeliveryRefused {
+    code: "invalid_params",
+    field: "delivery",
+    message: "the session's plan does not let module aft send delivery steer",
+}
+== the replies to s3 differ
+DeliveryRefused {
+    code: "invalid_params",
+    field: "delivery",
+    message: "the session's plan does not let module aft send delivery queue",
+}
+== the replies to s4 differ
+DeliveryRefused {
+    code: "invalid_params",
+    field: "delivery",
+    message: "the session's plan does not let module aft send delivery interrupt",
+}
+== the replies to s6 differ
+Active {
+    run_id: RunId(
+        "s6",
+    ),
+    delivered: None,
+}
+== the replies to s7 differ
+Active {
+    run_id: RunId(
+        "s7",
+    ),
+    delivered: None,
+}
+== display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:090e40ab57322f8ce95a7a41f081f1a46297a696a731b85c9dc38507298ec921 (7825 bytes)
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("s7"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:c41aac3f6c699ff84681422a314c8ace9f19fd6e37e1ac44fd7de0ef99c111b5 (2873 bytes)
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:5f7d7d47714668ab22c535ad12ff80aeb13a179d6d6129fe791fed8bbe8e6896 (7471 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("s7"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("s7"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:f450169c18bf8fb35279c5f8a82976057d2c675910273a9f4fe23a2b7a46e4ae (2891 bytes)
+== display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:36ac36d1671d5f274754521525af9450c2049dd8e267fc19b08f58757faf6879 (7200 bytes)
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("s7"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:61d69670b949e2092cca94012d3b9c2f415589adbfe32164444b08beab3fbfc0 (2620 bytes)
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:ffba8b3f51c6cd8715ac618e40a89c82280dafb9fd9172f35c1110cf93eb6aa1 (8096 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("s7"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("s7"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:ac86dd959c9a973e577f8210d9d5564f16311bc0d5fb2f42698fc5cfad50089a (3144 bytes)
+== the conversations differ
+[
+    "you are a worker",
+    "first",
+    "hello",
+    "steered in",
+    "again",
+    "wake up",
+    "more",
+    "hi",
+    "last",
+]
+== the runs' starts differ
+sha256:865c02835aa0683a4c78d68f0a6b6fe892b3d3d0957a86f34186412268fea289 (3979 bytes)
+== the model calls were sent different messages
+[
+    [
+        "you are a worker",
+        "first",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "steered in",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "steered in",
+        "again",
+        "wake up",
+    ],
+    [
+        "you are a worker",
+        "first",
+        "hello",
+        "steered in",
+        "again",
+        "wake up",
+        "more",
+        "hi",
+    ],
+]

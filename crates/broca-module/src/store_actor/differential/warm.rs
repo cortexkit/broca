@@ -464,7 +464,7 @@ async fn warm_refusals_answer_alike(cipher: Cipher) {
             panic!("{what}: {old:?}");
         };
         assert!(expected(&refusal.detail), "{what}: {old:?}");
-        assert_eq!(new, old, "{what}");
+        alike!(new, old, "{what}");
         assert!(
             store.sent.lock().unwrap().is_empty(),
             "{what}: nothing sent"

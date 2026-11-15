@@ -1,0 +1,503 @@
+== planned: heads differ for None
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_rich_ui": Object {
+        "catalog_digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "dialect": String("1.0"),
+    },
+    "last_run_state": Object {
+        "reason": String("completed"),
+        "run_id": String("r1"),
+        "state": String("completed"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+        "variant": String("high"),
+    },
+    "updated_at": Bool(true),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "since": String("r1"),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== planned: heads differ for Some(Reserved { module_id: "prefrontal-core" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_rich_ui": Object {
+        "catalog_digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "dialect": String("1.0"),
+    },
+    "last_run_state": Object {
+        "reason": String("completed"),
+        "run_id": String("r1"),
+        "state": String("completed"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+        "variant": String("high"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "since": String("r1"),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== planned: heads differ for Some(Reserved { module_id: "occipital" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(3),
+    "last_run_rich_ui": Object {
+        "catalog_digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "dialect": String("1.0"),
+    },
+    "last_run_state": Object {
+        "reason": String("completed"),
+        "run_id": String("r1"),
+        "state": String("completed"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+        "variant": String("high"),
+    },
+    "sender": Object {
+        "interrupt": Bool(false),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+    },
+    "updated_at": Bool(true),
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "since": String("r1"),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== planned: display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:160ab8b9f8e0916f8e0c36fefac8f5567d8995358c5d4908b3f1d120ba72ea94 (2710 bytes)
+== planned: display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== planned: display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+        Object {
+            "completed_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== planned: display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:9c159c8195226b95ad36da48a31edb48628f4d05e275ba078e505828c492277e (2553 bytes)
+== planned: display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("r1"),
+}
+== planned: display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [],
+    "tools_run_id": String("r1"),
+}
+== planned: display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:c7aeb751ad6114884e271e1e60ac3d652f6153eead7ff6d3857e63addf6ce98e (2695 bytes)
+== planned: display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== planned: display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(2),
+            "part_keys": Array [
+                String("m1#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("hello"),
+                        "type": String("text"),
+                    },
+                ],
+                "origin": Object {
+                    "model_id": String("m"),
+                    "provider_module_id": String("stub"),
+                },
+                "role": String("assistant"),
+            },
+            "ordinal": Number(3),
+            "part_keys": Array [
+                String("m2#0"),
+            ],
+            "rich_ui": Object {
+                "catalog_digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                "dialect": String("1.0"),
+            },
+            "role": String("assistant"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== planned: display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:2c167e99a2f4e0596d02a947fb6fc5b0fb9effad38564a7800222b23ee0cb01a (2966 bytes)
+== planned: display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("you are a worker"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("system"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("system"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(false),
+                "run_id": String("r1"),
+            },
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("r1"),
+}
+== planned: display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:1a9dbf8c0a59008030105d30be4657d4e221fe037bd9bb0577d0ed6f0cba7ab2 (2196 bytes)

@@ -1,0 +1,90 @@
+== step 0: replies differ
+PlanRefused(
+    ScopedToolsRequirePlan,
+)
+== the run starts record the sends differently
+[]
+== display facts, tools, rich ui (true, false, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (false, true, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (false, false, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (true, true, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "state": String("idle"),
+    },
+    "messages": Array [],
+}

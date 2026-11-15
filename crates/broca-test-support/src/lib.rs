@@ -31,6 +31,23 @@
 #![deny(unsafe_code)]
 
 pub mod alloc;
+pub mod pins;
+
+/// Checks a value against the calling test's next pinned entry (see [`pins`]).
+#[macro_export]
+macro_rules! pin {
+    ($label:expr, $value:expr) => {
+        $crate::pins::expect(env!("CARGO_MANIFEST_DIR"), &$label, &$value)
+    };
+}
+
+/// Fails when the calling test checked fewer values than it pins (see [`pins::all_checked`]).
+#[macro_export]
+macro_rules! pins_checked {
+    () => {
+        $crate::pins::all_checked(env!("CARGO_MANIFEST_DIR"))
+    };
+}
 mod ckdev;
 mod process;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

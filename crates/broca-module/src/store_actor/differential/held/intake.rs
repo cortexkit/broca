@@ -702,7 +702,7 @@ async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike()
         observations.push((before, rig.delivery.calls.load(Ordering::SeqCst)));
         assert!(side.registry.stop_and_seal().await);
     }
-    assert_eq!(observations[1], observations[0]);
+    alike!(observations[1], observations[0]);
 }
 
 async fn new_storage_ended_run_does_not_deliver_into_later_run(cipher: Cipher) {

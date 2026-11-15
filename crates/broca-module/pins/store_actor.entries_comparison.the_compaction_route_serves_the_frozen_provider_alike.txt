@@ -1,0 +1,1416 @@
+== bind from Some("ck-mc"): {}
+Ok(
+    Object {},
+)
+== bind from Some("another"): {}
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("provider_mismatch"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== bind from None: {}
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("provider_mismatch"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== session.entries from Some("another"): {}
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("provider_mismatch"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== session.applied_view from Some("another"): {}
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("provider_mismatch"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== session.unknown from Some("another"): {}
+Err(
+    Object {
+        "code": String("compaction_not_permitted"),
+        "detail": Object {
+            "reason": String("provider_mismatch"),
+        },
+        "message": String("the caller is not this session's compaction provider"),
+    },
+)
+== session.applied_view from Some("ck-mc"): {}
+Ok(
+    Object {},
+)
+== session.unknown from Some("ck-mc"): {}
+Err(
+    Object {
+        "code": String("unknown_method"),
+        "detail": Object {
+            "method": String("session.unknown"),
+        },
+        "message": String("this route does not serve `session.unknown`"),
+    },
+)
+== session.entries from Some("ck-mc"): {"detail":"full","select":{"by":"after","limit":0}}
+Err(
+    Object {
+        "code": String("invalid_params"),
+        "detail": Object {
+            "field": String(""),
+        },
+        "message": String("compaction field error: {\"field\":\"limit\",\"message\":\"limit must be at least 1\"} at line 1 column 51"),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":0,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("f609b257845f68f940023d8084c38bc350090ed665e43227b3e3685eac33b85b"),
+                "mid": String("<mid>"),
+                "ordinal": Number(1),
+                "parts": Array [
+                    Object {
+                        "digest": String("2dad5b4b54819e362d69a5b6e23b59a4bdb450d143d65acc11fe3855106ceec5"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(1),
+                        "text": String("first"),
+                        "tokens": Object {
+                            "count": Number(4),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(1),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":0,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("f609b257845f68f940023d8084c38bc350090ed665e43227b3e3685eac33b85b"),
+                "mid": String("<mid>"),
+                "ordinal": Number(1),
+                "parts": Array [
+                    Object {
+                        "digest": String("2dad5b4b54819e362d69a5b6e23b59a4bdb450d143d65acc11fe3855106ceec5"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(1),
+                        "text": String("first"),
+                        "tokens": Object {
+                            "count": Number(4),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(1),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":0,"by":"after","limit":2}}
+sha256:f7110e4ebc49448b6dd6880f4557f03fa43bed36dc0c09e6dd86b1f46d2156ad (2443 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":0,"by":"after","limit":2}}
+sha256:f7110e4ebc49448b6dd6880f4557f03fa43bed36dc0c09e6dd86b1f46d2156ad (2443 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":0,"by":"after","limit":6}}
+sha256:b647635aac482329c48957634c205b2af007bab6b0389cdab31f297f857db0e6 (6752 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":0,"by":"after","limit":6}}
+sha256:88d07a1791ec578215be8c58b4514fedb9bcda66cd26be2c86d13b5838424f49 (6693 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":0,"by":"after"}}
+sha256:b647635aac482329c48957634c205b2af007bab6b0389cdab31f297f857db0e6 (6752 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":0,"by":"after"}}
+sha256:88d07a1791ec578215be8c58b4514fedb9bcda66cd26be2c86d13b5838424f49 (6693 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":1,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("54bae68ae49a20b7e5ffe2c46d3e008610b778da291524d79236ec2443a63292"),
+                "mid": String("<mid>"),
+                "ordinal": Number(2),
+                "parts": Array [
+                    Object {
+                        "digest": String("e207c1f43986bb9bdc1ebad087977ed787f8bcc529bc633107f6aba22468de58"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(2),
+                        "text": String("Done."),
+                        "tokens": Object {
+                            "count": Number(5),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(15),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(2),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":1,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("54bae68ae49a20b7e5ffe2c46d3e008610b778da291524d79236ec2443a63292"),
+                "mid": String("<mid>"),
+                "ordinal": Number(2),
+                "parts": Array [
+                    Object {
+                        "digest": String("e207c1f43986bb9bdc1ebad087977ed787f8bcc529bc633107f6aba22468de58"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(2),
+                        "text": String("Done."),
+                        "tokens": Object {
+                            "count": Number(5),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(15),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(2),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":1,"by":"after","limit":2}}
+sha256:a2eb5fa3b898cdd011c16bd0817110938993860b5681ed0fa0624cdc6b29905e (2444 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":1,"by":"after","limit":2}}
+sha256:a2eb5fa3b898cdd011c16bd0817110938993860b5681ed0fa0624cdc6b29905e (2444 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":1,"by":"after","limit":6}}
+sha256:e4e465cd9615dc0eedb6b40306e0eede6c6c3db982a1d3e8c60a27702752ca54 (5940 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":1,"by":"after","limit":6}}
+sha256:ff36f483cfd8c4a88a29d5a1f5964327177e6949572304a0622e7ef44da7fc26 (5881 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":1,"by":"after"}}
+sha256:e4e465cd9615dc0eedb6b40306e0eede6c6c3db982a1d3e8c60a27702752ca54 (5940 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":1,"by":"after"}}
+sha256:ff36f483cfd8c4a88a29d5a1f5964327177e6949572304a0622e7ef44da7fc26 (5881 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":2,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("924938d0a5721fbe4740d7c5e1f98969bc2574bb87516db89a83e59d942ac35f"),
+                "mid": String("<mid>"),
+                "ordinal": Number(3),
+                "parts": Array [
+                    Object {
+                        "digest": String("be34dd3897cd71644ca7ecbb992e2da1f0f4dbb3a630c7c78c6e49cb662bc142"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(3),
+                        "text": String("read a"),
+                        "tokens": Object {
+                            "count": Number(5),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(3),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":2,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("924938d0a5721fbe4740d7c5e1f98969bc2574bb87516db89a83e59d942ac35f"),
+                "mid": String("<mid>"),
+                "ordinal": Number(3),
+                "parts": Array [
+                    Object {
+                        "digest": String("be34dd3897cd71644ca7ecbb992e2da1f0f4dbb3a630c7c78c6e49cb662bc142"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(3),
+                        "text": String("read a"),
+                        "tokens": Object {
+                            "count": Number(5),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(3),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":2,"by":"after","limit":2}}
+sha256:64f328c4b03eeca21d066cbcea6a3054f495d3e5d960adb48d01fbaf63fd56dd (3292 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":2,"by":"after","limit":2}}
+sha256:6a22bd154cd2c9f0831008bdfbcd07f4ce0adf9fa245f36f694c73d90b4d8127 (3233 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":2,"by":"after","limit":6}}
+sha256:1a33296839abe3473b437e1a9c3e9b663be78b692c1564e4822050ce346c3088 (4777 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":2,"by":"after","limit":6}}
+sha256:6a0f995f1478769a514336f0caf8b62b54802af12000da2c23f89bc72e187db1 (4718 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":2,"by":"after"}}
+sha256:1a33296839abe3473b437e1a9c3e9b663be78b692c1564e4822050ce346c3088 (4777 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":2,"by":"after"}}
+sha256:6a0f995f1478769a514336f0caf8b62b54802af12000da2c23f89bc72e187db1 (4718 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":3,"by":"after","limit":1}}
+sha256:4fa1d2a6c78b3105b9ab0b614a982dd0786289ff4bbf2ffe686a4c65e470c6d2 (2479 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":3,"by":"after","limit":1}}
+sha256:f5444ae64054009c882c162db57d1bc5e372309ef6816a013f0c1fee4fb61803 (2420 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":3,"by":"after","limit":2}}
+sha256:c94fd85db68baf7db1d6f209984c77a528d98593c8c4f6582058fdb813521d51 (2817 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":3,"by":"after","limit":2}}
+sha256:8e2d58090cee43cba78d0b3aa1fc22af8841573a487b35baa1481e5bc9b26a4a (2758 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":3,"by":"after","limit":6}}
+sha256:1b05b4b78308618b6eaddda456294e296f2c41575854967dabe78102d6579484 (3964 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":3,"by":"after","limit":6}}
+sha256:72ce3b3e40448b87a374eae7d637e057f81fc186cc85cd78018bfd9298695ac8 (3905 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":3,"by":"after"}}
+sha256:1b05b4b78308618b6eaddda456294e296f2c41575854967dabe78102d6579484 (3964 bytes)
+== session.entries {"detail":"compact","select":{"after_ordinal":3,"by":"after"}}
+sha256:72ce3b3e40448b87a374eae7d637e057f81fc186cc85cd78018bfd9298695ac8 (3905 bytes)
+== session.entries {"detail":"full","select":{"after_ordinal":4,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(5),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":4,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(5),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":4,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":4,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":4,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":4,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":4,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":4,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615"),
+                "mid": String("<mid>"),
+                "ordinal": Number(5),
+                "parts": Array [],
+                "role": String("assistant"),
+                "written_at": Bool(true),
+            },
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":5,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":5,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":5,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":5,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":5,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":5,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":5,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":5,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "completed_at": Bool(true),
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+                "parts": Array [
+                    Object {
+                        "digest": String("49735d3b854aa438eb63c47e662e25000d6bf99e6f3520dd043d502c4b44c970"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(6),
+                        "text": String("It says file contents."),
+                        "tokens": Object {
+                            "count": Number(8),
+                        },
+                    },
+                ],
+                "reasoning_tokens": Object {
+                    "count": Number(12),
+                    "measured": Bool(false),
+                },
+                "role": String("assistant"),
+                "usage": Object {
+                    "output_tokens": Number(20),
+                    "prompt_tokens": Number(100),
+                },
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":6,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":6,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":6,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":6,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":6,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":6,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":6,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":6,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":7,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":7,"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":7,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":7,"by":"after","limit":2}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":7,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":7,"by":"after","limit":6}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"after_ordinal":7,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"compact","select":{"after_ordinal":7,"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+    },
+)
+== session.entries {"detail":"full","select":{"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("f609b257845f68f940023d8084c38bc350090ed665e43227b3e3685eac33b85b"),
+                "mid": String("<mid>"),
+                "ordinal": Number(1),
+                "parts": Array [
+                    Object {
+                        "digest": String("2dad5b4b54819e362d69a5b6e23b59a4bdb450d143d65acc11fe3855106ceec5"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(1),
+                        "text": String("first"),
+                        "tokens": Object {
+                            "count": Number(4),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(1),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"by":"after","limit":1}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("f609b257845f68f940023d8084c38bc350090ed665e43227b3e3685eac33b85b"),
+                "mid": String("<mid>"),
+                "ordinal": Number(1),
+                "parts": Array [
+                    Object {
+                        "digest": String("2dad5b4b54819e362d69a5b6e23b59a4bdb450d143d65acc11fe3855106ceec5"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(1),
+                        "text": String("first"),
+                        "tokens": Object {
+                            "count": Number(4),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(1),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"full","select":{"by":"after","limit":2}}
+sha256:f7110e4ebc49448b6dd6880f4557f03fa43bed36dc0c09e6dd86b1f46d2156ad (2443 bytes)
+== session.entries {"detail":"compact","select":{"by":"after","limit":2}}
+sha256:f7110e4ebc49448b6dd6880f4557f03fa43bed36dc0c09e6dd86b1f46d2156ad (2443 bytes)
+== session.entries {"detail":"full","select":{"by":"after","limit":6}}
+sha256:b647635aac482329c48957634c205b2af007bab6b0389cdab31f297f857db0e6 (6752 bytes)
+== session.entries {"detail":"compact","select":{"by":"after","limit":6}}
+sha256:88d07a1791ec578215be8c58b4514fedb9bcda66cd26be2c86d13b5838424f49 (6693 bytes)
+== session.entries {"detail":"full","select":{"by":"after"}}
+sha256:b647635aac482329c48957634c205b2af007bab6b0389cdab31f297f857db0e6 (6752 bytes)
+== session.entries {"detail":"compact","select":{"by":"after"}}
+sha256:88d07a1791ec578215be8c58b4514fedb9bcda66cd26be2c86d13b5838424f49 (6693 bytes)
+== session.entries {"detail":"full","max_bytes":600,"select":{"by":"after"}}
+Ok(
+    Object {
+        "entries": Array [
+            Object {
+                "digest": String("f609b257845f68f940023d8084c38bc350090ed665e43227b3e3685eac33b85b"),
+                "mid": String("<mid>"),
+                "ordinal": Number(1),
+                "parts": Array [
+                    Object {
+                        "digest": String("2dad5b4b54819e362d69a5b6e23b59a4bdb450d143d65acc11fe3855106ceec5"),
+                        "id": String("0"),
+                        "kind": String("text"),
+                        "tag": Number(1),
+                        "text": String("first"),
+                        "tokens": Object {
+                            "count": Number(4),
+                        },
+                    },
+                ],
+                "role": String("user"),
+                "written_at": Bool(true),
+            },
+        ],
+        "head": Object {
+            "newest": Object {
+                "digest": String("3b4ffd09fd1a83a449f4b8983e06d82a8aee191e6248e1c435a893ca794a69eb"),
+                "mid": String("<mid>"),
+                "ordinal": Number(6),
+            },
+        },
+        "next_after": Number(1),
+        "token_family": String("o200k/1+img:anthropic-2576-4784"),
+        "token_family_exact": Bool(false),
+    },
+)
+== session.entries {"detail":"compact","select":{"by":"tags","tags":[1,3,999]}}
+sha256:38718d094a8f1d5e680836400b35e83d1502fbef895386660f4427eaf8787d44 (2060 bytes)
+== session.entries by ids
+sha256:3f67fb47696abcf1e4b84dd75c843f5bffab0827657dd9aacddf44cb7d2ba399 (3240 bytes)
+== alike
+Err(
+    Object {
+        "code": String("invalid_params"),
+        "detail": Object {
+            "field": String("view"),
+        },
+        "message": String("missing field `version` at line 1 column 2"),
+    },
+)

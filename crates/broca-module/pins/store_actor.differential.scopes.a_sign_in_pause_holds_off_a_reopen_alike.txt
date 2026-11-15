@@ -1,0 +1,282 @@
+== step 0: replies differ
+Active {
+    run_id: RunId(
+        "r-k1",
+    ),
+    delivered: None,
+}
+== step 2: replies differ
+ScopeFreezeBusy {
+    reason: RunActive,
+    run_id: Some(
+        RunId(
+            "r-k1",
+        ),
+    ),
+}
+== step 3: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        Scoped {
+            frozen: SessionScope {
+                owner: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                scope_ref: "head-1",
+                scope_epoch: 1,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+                agent_id_frozen: false,
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "prefrontal-core",
+                },
+            ),
+            presented_scope: Some(
+                SessionScope {
+                    owner: Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                    scope_ref: "head-1",
+                    scope_epoch: 2,
+                    flow_id: None,
+                    sender: None,
+                    agent_id: None,
+                    run_id: None,
+                    agent_id_frozen: false,
+                },
+            ),
+        },
+    ),
+)
+== step 4: replies differ
+ScopeRefused(
+    OwnerMismatch(
+        Scoped {
+            frozen: SessionScope {
+                owner: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                scope_ref: "head-1",
+                scope_epoch: 1,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+                agent_id_frozen: false,
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "prefrontal-core",
+                },
+            ),
+            presented_scope: Some(
+                SessionScope {
+                    owner: Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                    scope_ref: "head-1",
+                    scope_epoch: 2,
+                    flow_id: None,
+                    sender: None,
+                    agent_id: None,
+                    run_id: None,
+                    agent_id_frozen: false,
+                },
+            ),
+        },
+    ),
+)
+== step 5: replies differ
+Active {
+    run_id: RunId(
+        "r-k1",
+    ),
+    delivered: None,
+}
+== step 7: replies differ
+Active {
+    run_id: RunId(
+        "r4",
+    ),
+    delivered: None,
+}
+== the run starts record the sends differently
+sha256:d9569f5deb258f01eca3d1fd7f0edabf3e5e20472db6b61253b673694e9dd712 (2466 bytes)
+== display facts, tools, rich ui (true, false, false), page (None, None)
+sha256:fdc4980a05642f9100db01a5e2ff9cc93c1b6f69662fd96436f4ae7b579a37b7 (3617 bytes)
+== display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r4"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "send_id": String("k1"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+sha256:6e646ae8382fc51095664823827558a72ca821bbd7213d314a28b12c93075ee2 (2821 bytes)
+== display facts, tools, rich ui (false, true, false), page (None, None)
+sha256:347ad5d3a58d770c13a25652718e99b6c9e654528188679fed6347ce5f9652b6 (3383 bytes)
+== display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r4"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("r4"),
+}
+== display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+sha256:f0dc9431ad16b91fde858e88c2417103a2e5d5aa7caa87ecdf14f4b94653edfe (2711 bytes)
+== display facts, tools, rich ui (false, false, true), page (None, None)
+sha256:efc4740798270aead87ca7ab1553bce4cfde23e64833a613897caca6133b4e22 (3326 bytes)
+== display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r4"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+}
+== display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+sha256:128c92e5f4cf3aa778a23a5aaee4c898326050c544ee73de95db7221190758e8 (2654 bytes)
+== display facts, tools, rich ui (true, true, true), page (None, None)
+sha256:04ec103f4c121df95265a6fb6bbdb4234157232b554e001562f965a0ac7759b6 (3674 bytes)
+== display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r4"),
+        "reason": String("completed"),
+        "state": String("completed"),
+        "usage": Object {
+            "input_tokens": Number(100),
+            "output_tokens": Number(20),
+        },
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r-k1"),
+                "final": Bool(false),
+                "run_id": String("r-k1"),
+            },
+            "send_id": String("k1"),
+            "sender": String("prefrontal-core"),
+            "written_at": Bool(true),
+        },
+    ],
+    "next_from_ordinal": Number(2),
+    "tools": Array [],
+    "tools_run_id": String("r4"),
+}
+== display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+sha256:30cc48eb9fb6ce2acb647c2f541a6770130570d7f58c7bf243e73b2c3c00532e (2878 bytes)

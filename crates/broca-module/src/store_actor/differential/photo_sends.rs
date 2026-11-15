@@ -89,7 +89,7 @@ async fn reads_alike(today: &Side, store: &Side, image: &[u8], when: &str) {
     let mut reads = reads_of(&digest(image), image.len() as u64);
     reads.push(json!({"sha256": digest(&bytes_of(WIDE)), "offset": 0, "length": 10}));
     for params in reads {
-        assert_eq!(
+        alike!(
             store.media_read(params.clone()).await,
             today.media_read(params.clone()).await,
             "{when}: media_read {params}"
@@ -191,7 +191,7 @@ async fn a_photo_send_creating_its_session_answers_alike(cipher: Cipher) {
     scoped_by_core(&mut new_send);
     let old = today.send("r1", old_send).await;
     assert!(!matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(
+    alike!(
         store.send("r1", new_send).await,
         old,
         "a photo send creating its session"
@@ -208,7 +208,7 @@ async fn a_photo_send_starting_a_run_answers_alike(cipher: Cipher) {
     let (today, store) = both(false, cipher).await;
     let image = bytes_of(PNG);
     let unknown = photo("look", &["no-such-upload"]);
-    assert_eq!(
+    alike!(
         store.send("r2", unknown.clone()).await,
         today.send("r2", unknown).await,
         "a send naming no upload"
@@ -222,11 +222,11 @@ async fn a_photo_send_starting_a_run_answers_alike(cipher: Cipher) {
     )
     .await;
     assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(new, old, "a photo send starting a run");
+    alike!(new, old, "a photo send starting a run");
     today.idle().await;
     store.idle().await;
     reads_alike(&today, &store, &image, "after its run").await;
-    assert_eq!(history_media(&store).await, history_media(&today).await);
+    alike!(history_media(&store).await, history_media(&today).await);
     assert_eq!(media_objects(&store), 1);
     reads_back(&store, &image).await;
     survives_a_restart(&store, &image).await;
@@ -247,13 +247,13 @@ async fn a_queued_photo_send_answers_alike_and_its_run_points_at_its_bytes(ciphe
     )
     .await;
     assert!(matches!(old, SendOutcome::Pending { .. }), "{old:?}");
-    assert_eq!(new, old, "a queued photo send");
+    alike!(new, old, "a queued photo send");
     reads_alike(&today, &store, &image, "while it is queued").await;
     assert_eq!(media_objects(&store), 1, "stored with its queued record");
     today.release_to_idle().await;
     store.release_to_idle().await;
     reads_alike(&today, &store, &image, "after its run").await;
-    assert_eq!(history_media(&store).await, history_media(&today).await);
+    alike!(history_media(&store).await, history_media(&today).await);
     assert_eq!(
         media_objects(&store),
         1,
@@ -277,7 +277,7 @@ async fn a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes(cipher: 
     )
     .await;
     assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    assert_eq!(new, old, "a steered photo");
+    alike!(new, old, "a steered photo");
     reads_alike(&today, &store, &image, "before its boundary").await;
     today.release_to_idle().await;
     store.release_to_idle().await;
@@ -310,7 +310,7 @@ async fn a_retracted_photo_send_answers_alike_and_its_bytes_stay_readable(cipher
         broca_protocol::Delivery::Queue,
     )
     .await;
-    assert_eq!(new, old, "a queued photo send");
+    alike!(new, old, "a queued photo send");
     let SendOutcome::Pending { submission_id } = old else {
         panic!("queued: {old:?}");
     };
@@ -324,12 +324,12 @@ async fn a_retracted_photo_send_answers_alike_and_its_bytes_stay_readable(cipher
         .route_retract(&store.key, submission_id)
         .await
         .unwrap();
-    assert_eq!(new, old, "the retraction");
+    alike!(new, old, "the retraction");
     reads_alike(&today, &store, &image, "once retracted").await;
     today.release_to_idle().await;
     store.release_to_idle().await;
     reads_alike(&today, &store, &image, "after the run").await;
-    assert_eq!(history_media(&store).await, history_media(&today).await);
+    alike!(history_media(&store).await, history_media(&today).await);
     reads_back(&store, &image).await;
     survives_a_restart(&store, &image).await;
 }

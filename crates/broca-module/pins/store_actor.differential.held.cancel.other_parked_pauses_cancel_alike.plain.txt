@@ -1,0 +1,162 @@
+== reason=AuthRequired, at=Now
+(
+    "Ack",
+    Object {
+        "retries_used": Number(0),
+        "state": String("cancelled"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    (
+        String("cancelled"),
+        [],
+    ),
+)
+== reason=AuthRequired, at=StepBoundary
+(
+    "Ack",
+    Object {
+        "retries_used": Number(0),
+        "state": String("cancelled"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    (
+        String("cancelled"),
+        [],
+    ),
+)
+== reason=AccountLimit, at=Now
+(
+    "Ack",
+    Object {
+        "retries_used": Number(0),
+        "state": String("cancelled"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    (
+        String("cancelled"),
+        [],
+    ),
+)
+== reason=AccountLimit, at=StepBoundary
+(
+    "Ack",
+    Object {
+        "retries_used": Number(0),
+        "state": String("cancelled"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    (
+        String("cancelled"),
+        [],
+    ),
+)
+== reason=Restart, at=Now
+(
+    "Ack",
+    Object {
+        "retries_used": Number(0),
+        "state": String("cancelled"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    (
+        String("cancelled"),
+        [],
+    ),
+)
+== reason=Restart, at=StepBoundary
+(
+    "Ack",
+    Object {
+        "retries_used": Number(0),
+        "state": String("cancelled"),
+        "undelivered_steers": Array [],
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    (
+        String("cancelled"),
+        [],
+    ),
+)

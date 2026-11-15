@@ -1,0 +1,64 @@
+== baseline of r1
+Some(
+    BaselineWire {
+        items: [],
+        absent_items: [],
+        composition_digest: Some(
+            "7eb0315e39b8fe5a206e065e76a8d260dbba65e29006d56dfa68be7655f2ec02",
+        ),
+        tool_names: [
+            "read",
+        ],
+        accepted_generation: 0,
+        applied_generation: 0,
+        pending: None,
+        effective: None,
+        rungs: Some(
+            Rungs {
+                tools: [
+                    "on_prefix_rebuild",
+                    "immediately",
+                ],
+                system_text: [
+                    "on_prefix_rebuild",
+                    "immediately",
+                ],
+            },
+        ),
+        cache: None,
+    },
+)
+== baseline of r2
+None
+== baseline of r1
+Some(
+    BaselineWire {
+        items: [],
+        absent_items: [],
+        composition_digest: Some(
+            "7eb0315e39b8fe5a206e065e76a8d260dbba65e29006d56dfa68be7655f2ec02",
+        ),
+        tool_names: [
+            "read",
+        ],
+        accepted_generation: 0,
+        applied_generation: 0,
+        pending: None,
+        effective: None,
+        rungs: Some(
+            Rungs {
+                tools: [
+                    "on_prefix_rebuild",
+                    "immediately",
+                ],
+                system_text: [
+                    "on_prefix_rebuild",
+                    "immediately",
+                ],
+            },
+        ),
+        cache: None,
+    },
+)
+== baseline of r2
+None

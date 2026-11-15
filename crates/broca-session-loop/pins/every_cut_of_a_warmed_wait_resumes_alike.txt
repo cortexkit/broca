@@ -1,0 +1,1138 @@
+== cut after record 1 of 18: request count
+3
+== cut after record 1 of 18: request 0
+sha256:dab94ed172181b80b2605d682664591b1bda5479fc2fd277c5724082f009684e (2768 bytes)
+== cut after record 1 of 18: request 1
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 1 of 18: request 2
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 1 of 18: record count
+28
+== cut after record 1 of 18: records
+sha256:4c05557ec9e01871cc50e3a3dbaf72392f2c4e6fa3492cbd40e7ad7a0184716a (8169 bytes)
+== cut after record 1 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 18: request count
+3
+== cut after record 2 of 18: request 0
+sha256:dab94ed172181b80b2605d682664591b1bda5479fc2fd277c5724082f009684e (2768 bytes)
+== cut after record 2 of 18: request 1
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 2 of 18: request 2
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 2 of 18: record count
+28
+== cut after record 2 of 18: records
+sha256:4c05557ec9e01871cc50e3a3dbaf72392f2c4e6fa3492cbd40e7ad7a0184716a (8169 bytes)
+== cut after record 2 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 18: request count
+2
+== cut after record 3 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 3 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 3 of 18: record count
+24
+== cut after record 3 of 18: records
+sha256:2ee763aa742405116c5fa914e9820ab60dac4c439a44eaa7348d6771eceb46e5 (6753 bytes)
+== cut after record 3 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 4 of 18: request count
+2
+== cut after record 4 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 4 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 4 of 18: record count
+23
+== cut after record 4 of 18: records
+sha256:82cc0cfb0578b837c666c762d91aab9e786391055bdc2ddf2c2abe71e8ac6b08 (6640 bytes)
+== cut after record 4 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 18: request count
+0
+== cut after record 5 of 18: record count
+7
+== cut after record 5 of 18: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 5 of 18: tool calls
+[]
+== cut after record 6 of 18: request count
+2
+== cut after record 6 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 6 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 6 of 18: record count
+18
+== cut after record 6 of 18: records
+sha256:01b43c8b865b92ca46a058ea3044ce5b54b025baf0e5e9d49950d021066d8666 (4992 bytes)
+== cut after record 6 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 7 of 18: request count
+2
+== cut after record 7 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 7 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 7 of 18: record count
+17
+== cut after record 7 of 18: records
+sha256:6ac4be9450308af656bed7d4cbc0bcfd439bf2aeb0e0b4f9533441f022bd1178 (4959 bytes)
+== cut after record 7 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 18: request count
+2
+== cut after record 8 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 8 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 8 of 18: record count
+17
+== cut after record 8 of 18: records
+sha256:6ac4be9450308af656bed7d4cbc0bcfd439bf2aeb0e0b4f9533441f022bd1178 (4959 bytes)
+== cut after record 8 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 18: request count
+2
+== cut after record 9 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 9 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 9 of 18: record count
+17
+== cut after record 9 of 18: records
+sha256:6ac4be9450308af656bed7d4cbc0bcfd439bf2aeb0e0b4f9533441f022bd1178 (4959 bytes)
+== cut after record 9 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 18: request count
+1
+== cut after record 10 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 10 of 18: record count
+13
+== cut after record 10 of 18: records
+sha256:d2e117a8512e5a57d73a0cce3b5f8ef4dcd83ddff42574553b1737e02e023ad5 (3543 bytes)
+== cut after record 10 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 18: request count
+1
+== cut after record 11 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 11 of 18: record count
+12
+== cut after record 11 of 18: records
+sha256:5426f179f06568a885c26da717e834efca7340e3417ed3217d10fbb95a222d17 (3430 bytes)
+== cut after record 11 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 12 of 18: request count
+0
+== cut after record 12 of 18: record count
+7
+== cut after record 12 of 18: records
+{"Resumed":{"indeterminate":["c2"],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c2"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b2","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"057c2518273ec415621dad6cb9f24ff4b95691b8b835c1985234f495fcf4a624","run_id":"r1","tool_call_id":"c2"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#4","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":5,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c2","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 12 of 18: tool calls
+[]
+== cut after record 13 of 18: request count
+1
+== cut after record 13 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 13 of 18: record count
+7
+== cut after record 13 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 13 of 18: tool calls
+[]
+== cut after record 14 of 18: request count
+1
+== cut after record 14 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 14 of 18: record count
+6
+== cut after record 14 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 14 of 18: tool calls
+[]
+== cut after record 15 of 18: request count
+1
+== cut after record 15 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 15 of 18: record count
+6
+== cut after record 15 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 15 of 18: tool calls
+[]
+== cut after record 16 of 18: request count
+1
+== cut after record 16 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 16 of 18: record count
+6
+== cut after record 16 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 16 of 18: tool calls
+[]
+== cut after record 17 of 18: request count
+0
+== cut after record 17 of 18: record count
+2
+== cut after record 17 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":6,"model_steps":3,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 17 of 18: tool calls
+[]
+== cut after record 1 of 18: request count
+3
+== cut after record 1 of 18: request 0
+sha256:dab94ed172181b80b2605d682664591b1bda5479fc2fd277c5724082f009684e (2768 bytes)
+== cut after record 1 of 18: request 1
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 1 of 18: request 2
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 1 of 18: record count
+28
+== cut after record 1 of 18: records
+sha256:4c05557ec9e01871cc50e3a3dbaf72392f2c4e6fa3492cbd40e7ad7a0184716a (8169 bytes)
+== cut after record 1 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 18: request count
+3
+== cut after record 2 of 18: request 0
+sha256:dab94ed172181b80b2605d682664591b1bda5479fc2fd277c5724082f009684e (2768 bytes)
+== cut after record 2 of 18: request 1
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 2 of 18: request 2
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 2 of 18: record count
+28
+== cut after record 2 of 18: records
+sha256:4c05557ec9e01871cc50e3a3dbaf72392f2c4e6fa3492cbd40e7ad7a0184716a (8169 bytes)
+== cut after record 2 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 18: request count
+2
+== cut after record 3 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 3 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 3 of 18: record count
+24
+== cut after record 3 of 18: records
+sha256:2ee763aa742405116c5fa914e9820ab60dac4c439a44eaa7348d6771eceb46e5 (6753 bytes)
+== cut after record 3 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 4 of 18: request count
+2
+== cut after record 4 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 4 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 4 of 18: record count
+23
+== cut after record 4 of 18: records
+sha256:82cc0cfb0578b837c666c762d91aab9e786391055bdc2ddf2c2abe71e8ac6b08 (6640 bytes)
+== cut after record 4 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 18: request count
+0
+== cut after record 5 of 18: record count
+7
+== cut after record 5 of 18: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 5 of 18: tool calls
+[]
+== cut after record 6 of 18: request count
+2
+== cut after record 6 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 6 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 6 of 18: record count
+18
+== cut after record 6 of 18: records
+sha256:01b43c8b865b92ca46a058ea3044ce5b54b025baf0e5e9d49950d021066d8666 (4992 bytes)
+== cut after record 6 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 7 of 18: request count
+2
+== cut after record 7 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 7 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 7 of 18: record count
+17
+== cut after record 7 of 18: records
+sha256:6ac4be9450308af656bed7d4cbc0bcfd439bf2aeb0e0b4f9533441f022bd1178 (4959 bytes)
+== cut after record 7 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 18: request count
+2
+== cut after record 8 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 8 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 8 of 18: record count
+17
+== cut after record 8 of 18: records
+sha256:6ac4be9450308af656bed7d4cbc0bcfd439bf2aeb0e0b4f9533441f022bd1178 (4959 bytes)
+== cut after record 8 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 18: request count
+2
+== cut after record 9 of 18: request 0
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== cut after record 9 of 18: request 1
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 9 of 18: record count
+17
+== cut after record 9 of 18: records
+sha256:6ac4be9450308af656bed7d4cbc0bcfd439bf2aeb0e0b4f9533441f022bd1178 (4959 bytes)
+== cut after record 9 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 18: request count
+1
+== cut after record 10 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 10 of 18: record count
+13
+== cut after record 10 of 18: records
+sha256:d2e117a8512e5a57d73a0cce3b5f8ef4dcd83ddff42574553b1737e02e023ad5 (3543 bytes)
+== cut after record 10 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 18: request count
+1
+== cut after record 11 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 11 of 18: record count
+12
+== cut after record 11 of 18: records
+sha256:5426f179f06568a885c26da717e834efca7340e3417ed3217d10fbb95a222d17 (3430 bytes)
+== cut after record 11 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 12 of 18: request count
+0
+== cut after record 12 of 18: record count
+7
+== cut after record 12 of 18: records
+{"Resumed":{"indeterminate":["c2"],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c2"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b2","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"057c2518273ec415621dad6cb9f24ff4b95691b8b835c1985234f495fcf4a624","run_id":"r1","tool_call_id":"c2"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#4","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":5,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c2","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 12 of 18: tool calls
+[]
+== cut after record 13 of 18: request count
+1
+== cut after record 13 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 13 of 18: record count
+7
+== cut after record 13 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 13 of 18: tool calls
+[]
+== cut after record 14 of 18: request count
+1
+== cut after record 14 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 14 of 18: record count
+6
+== cut after record 14 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 14 of 18: tool calls
+[]
+== cut after record 15 of 18: request count
+1
+== cut after record 15 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 15 of 18: record count
+6
+== cut after record 15 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 15 of 18: tool calls
+[]
+== cut after record 16 of 18: request count
+1
+== cut after record 16 of 18: request 0
+sha256:b9d45b86f6ad045ab29249943615bd0bec1649cb2a1b7c60c5ec56bcb1c504f0 (8616 bytes)
+== cut after record 16 of 18: record count
+6
+== cut after record 16 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 16 of 18: tool calls
+[]
+== cut after record 17 of 18: request count
+0
+== cut after record 17 of 18: record count
+2
+== cut after record 17 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":6,"model_steps":3,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 17 of 18: tool calls
+[]
+== cut after record 1 of 18: request count
+3
+== cut after record 1 of 18: request 0
+sha256:4aec40c3e7247ab2bc40b99e5b2759f4ec7add90377d9f318e1934a8a9e8af66 (2768 bytes)
+== cut after record 1 of 18: request 1
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 1 of 18: request 2
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 1 of 18: record count
+28
+== cut after record 1 of 18: records
+sha256:7cf26ef8045da31cd6f0078b1d7aa990fd0145ed3f0f939618b27533838115d2 (8502 bytes)
+== cut after record 1 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 18: request count
+3
+== cut after record 2 of 18: request 0
+sha256:4aec40c3e7247ab2bc40b99e5b2759f4ec7add90377d9f318e1934a8a9e8af66 (2768 bytes)
+== cut after record 2 of 18: request 1
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 2 of 18: request 2
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 2 of 18: record count
+28
+== cut after record 2 of 18: records
+sha256:7cf26ef8045da31cd6f0078b1d7aa990fd0145ed3f0f939618b27533838115d2 (8502 bytes)
+== cut after record 2 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 18: request count
+2
+== cut after record 3 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 3 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 3 of 18: record count
+24
+== cut after record 3 of 18: records
+sha256:a4f032f837fa476f0411878e17bca3f8200618cd1c209267f7a2b7bd8ce218ed (6975 bytes)
+== cut after record 3 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 4 of 18: request count
+2
+== cut after record 4 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 4 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 4 of 18: record count
+23
+== cut after record 4 of 18: records
+sha256:397e59718e49331d01d6efd87de31d469de7f13aaf46b6ae08d71db69cd43d15 (6862 bytes)
+== cut after record 4 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 18: request count
+0
+== cut after record 5 of 18: record count
+7
+== cut after record 5 of 18: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 5 of 18: tool calls
+[]
+== cut after record 6 of 18: request count
+2
+== cut after record 6 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 6 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 6 of 18: record count
+18
+== cut after record 6 of 18: records
+sha256:8b77d62791e3d286bd8ed9c52174c033b1983bc795a7b313b37408def26414b5 (5214 bytes)
+== cut after record 6 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 7 of 18: request count
+2
+== cut after record 7 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 7 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 7 of 18: record count
+17
+== cut after record 7 of 18: records
+sha256:362c3885646d73c50c29f836953ac479e387b63cdd3c0a80f3a9a15a46e2e12d (5181 bytes)
+== cut after record 7 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 18: request count
+2
+== cut after record 8 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 8 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 8 of 18: record count
+17
+== cut after record 8 of 18: records
+sha256:362c3885646d73c50c29f836953ac479e387b63cdd3c0a80f3a9a15a46e2e12d (5181 bytes)
+== cut after record 8 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 18: request count
+2
+== cut after record 9 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 9 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 9 of 18: record count
+17
+== cut after record 9 of 18: records
+sha256:362c3885646d73c50c29f836953ac479e387b63cdd3c0a80f3a9a15a46e2e12d (5181 bytes)
+== cut after record 9 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 18: request count
+1
+== cut after record 10 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 10 of 18: record count
+13
+== cut after record 10 of 18: records
+sha256:1ee9586f5b9d5cd8cd0df769dcb08b40fc353f92dc5db3853289092cbb4a85af (3654 bytes)
+== cut after record 10 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 18: request count
+1
+== cut after record 11 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 11 of 18: record count
+12
+== cut after record 11 of 18: records
+sha256:90405102a746ee10785972b73aa45596ef373ad12059738dc4a4bc2fe4e63589 (3541 bytes)
+== cut after record 11 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 12 of 18: request count
+0
+== cut after record 12 of 18: record count
+7
+== cut after record 12 of 18: records
+{"Resumed":{"indeterminate":["c2"],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c2"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b2","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"057c2518273ec415621dad6cb9f24ff4b95691b8b835c1985234f495fcf4a624","run_id":"r1","tool_call_id":"c2"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#4","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":5,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c2","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 12 of 18: tool calls
+[]
+== cut after record 13 of 18: request count
+1
+== cut after record 13 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 13 of 18: record count
+7
+== cut after record 13 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 13 of 18: tool calls
+[]
+== cut after record 14 of 18: request count
+1
+== cut after record 14 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 14 of 18: record count
+6
+== cut after record 14 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 14 of 18: tool calls
+[]
+== cut after record 15 of 18: request count
+1
+== cut after record 15 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 15 of 18: record count
+6
+== cut after record 15 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 15 of 18: tool calls
+[]
+== cut after record 16 of 18: request count
+1
+== cut after record 16 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 16 of 18: record count
+6
+== cut after record 16 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 16 of 18: tool calls
+[]
+== cut after record 17 of 18: request count
+0
+== cut after record 17 of 18: record count
+2
+== cut after record 17 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":6,"model_steps":3,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 17 of 18: tool calls
+[]
+== cut after record 1 of 18: request count
+3
+== cut after record 1 of 18: request 0
+sha256:4aec40c3e7247ab2bc40b99e5b2759f4ec7add90377d9f318e1934a8a9e8af66 (2768 bytes)
+== cut after record 1 of 18: request 1
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 1 of 18: request 2
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 1 of 18: record count
+28
+== cut after record 1 of 18: records
+sha256:7cf26ef8045da31cd6f0078b1d7aa990fd0145ed3f0f939618b27533838115d2 (8502 bytes)
+== cut after record 1 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 2 of 18: request count
+3
+== cut after record 2 of 18: request 0
+sha256:4aec40c3e7247ab2bc40b99e5b2759f4ec7add90377d9f318e1934a8a9e8af66 (2768 bytes)
+== cut after record 2 of 18: request 1
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 2 of 18: request 2
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 2 of 18: record count
+28
+== cut after record 2 of 18: records
+sha256:7cf26ef8045da31cd6f0078b1d7aa990fd0145ed3f0f939618b27533838115d2 (8502 bytes)
+== cut after record 2 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 3 of 18: request count
+2
+== cut after record 3 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 3 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 3 of 18: record count
+24
+== cut after record 3 of 18: records
+sha256:a4f032f837fa476f0411878e17bca3f8200618cd1c209267f7a2b7bd8ce218ed (6975 bytes)
+== cut after record 3 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 4 of 18: request count
+2
+== cut after record 4 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 4 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 4 of 18: record count
+23
+== cut after record 4 of 18: records
+sha256:397e59718e49331d01d6efd87de31d469de7f13aaf46b6ae08d71db69cd43d15 (6862 bytes)
+== cut after record 4 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#3 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#3 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 5 of 18: request count
+0
+== cut after record 5 of 18: record count
+7
+== cut after record 5 of 18: records
+{"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 5 of 18: tool calls
+[]
+== cut after record 6 of 18: request count
+2
+== cut after record 6 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 6 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 6 of 18: record count
+18
+== cut after record 6 of 18: records
+sha256:8b77d62791e3d286bd8ed9c52174c033b1983bc795a7b313b37408def26414b5 (5214 bytes)
+== cut after record 6 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 7 of 18: request count
+2
+== cut after record 7 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 7 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 7 of 18: record count
+17
+== cut after record 7 of 18: records
+sha256:362c3885646d73c50c29f836953ac479e387b63cdd3c0a80f3a9a15a46e2e12d (5181 bytes)
+== cut after record 7 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 8 of 18: request count
+2
+== cut after record 8 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 8 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 8 of 18: record count
+17
+== cut after record 8 of 18: records
+sha256:362c3885646d73c50c29f836953ac479e387b63cdd3c0a80f3a9a15a46e2e12d (5181 bytes)
+== cut after record 8 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 9 of 18: request count
+2
+== cut after record 9 of 18: request 0
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== cut after record 9 of 18: request 1
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 9 of 18: record count
+17
+== cut after record 9 of 18: records
+sha256:362c3885646d73c50c29f836953ac479e387b63cdd3c0a80f3a9a15a46e2e12d (5181 bytes)
+== cut after record 9 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 10 of 18: request count
+1
+== cut after record 10 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 10 of 18: record count
+13
+== cut after record 10 of 18: records
+sha256:1ee9586f5b9d5cd8cd0df769dcb08b40fc353f92dc5db3853289092cbb4a85af (3654 bytes)
+== cut after record 10 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 11 of 18: request count
+1
+== cut after record 11 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 11 of 18: record count
+12
+== cut after record 11 of 18: records
+sha256:90405102a746ee10785972b73aa45596ef373ad12059738dc4a4bc2fe4e63589 (3541 bytes)
+== cut after record 11 of 18: tool calls
+[
+    "\"batch_started_guarded [\\\"c2\\\"]\"",
+    "\"register [\\\"c2 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c2 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== cut after record 12 of 18: request count
+0
+== cut after record 12 of 18: record count
+7
+== cut after record 12 of 18: records
+{"Resumed":{"indeterminate":["c2"],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c2"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b2","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"057c2518273ec415621dad6cb9f24ff4b95691b8b835c1985234f495fcf4a624","run_id":"r1","tool_call_id":"c2"}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#4","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":5,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c2","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 12 of 18: tool calls
+[]
+== cut after record 13 of 18: request count
+1
+== cut after record 13 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 13 of 18: record count
+7
+== cut after record 13 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 13 of 18: tool calls
+[]
+== cut after record 14 of 18: request count
+1
+== cut after record 14 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 14 of 18: record count
+6
+== cut after record 14 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 14 of 18: tool calls
+[]
+== cut after record 15 of 18: request count
+1
+== cut after record 15 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 15 of 18: record count
+6
+== cut after record 15 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 15 of 18: tool calls
+[]
+== cut after record 16 of 18: request count
+1
+== cut after record 16 of 18: request 0
+sha256:fe87f1faa66f030268d4df0401becbcee3374a8cd337f6ff9638f615a5d69aee (8620 bytes)
+== cut after record 16 of 18: record count
+6
+== cut after record 16 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[{"step_id":3,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"StepStart":{"kind":"StepStart","mid":"mid#5","run_id":"r1","step_id":3}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a3","pruned":[],"run_id":"r1","step_id":3,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":3,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#5","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":6,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":3,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 16 of 18: tool calls
+[]
+== cut after record 17 of 18: request count
+0
+== cut after record 17 of 18: record count
+2
+== cut after record 17 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":6,"model_steps":3,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":300,"output_tokens":60}}}
+== cut after record 17 of 18: tool calls
+[]
+== warms
+sha256:9e941b202e71d786204c0b9dc666c318ce1e6fba4300f262a932c1335e961e1b (2859 bytes)

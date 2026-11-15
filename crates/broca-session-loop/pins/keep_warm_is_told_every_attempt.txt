@@ -1,0 +1,91 @@
+== request count
+2
+== request 0
+sha256:dab94ed172181b80b2605d682664591b1bda5479fc2fd277c5724082f009684e (2768 bytes)
+== request 1
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== record count
+22
+== records
+sha256:6f4ed49bd309b4af6c1d86e5dba6fb18eab48375efa9229b2c478d4136ba123e (8513 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:dab94ed172181b80b2605d682664591b1bda5479fc2fd277c5724082f009684e (2768 bytes)
+== request 1
+sha256:4e4dc91de6ebeff22a9da15488678c42dba32d807ee9786f5ea423c86a60199d (5595 bytes)
+== record count
+22
+== records
+sha256:6f4ed49bd309b4af6c1d86e5dba6fb18eab48375efa9229b2c478d4136ba123e (8513 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:4aec40c3e7247ab2bc40b99e5b2759f4ec7add90377d9f318e1934a8a9e8af66 (2768 bytes)
+== request 1
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== record count
+22
+== records
+sha256:515fb985168a69c840a114eb95186796f21bac6ef886a0d2e2bd0b4214763c46 (8732 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== request count
+2
+== request 0
+sha256:4aec40c3e7247ab2bc40b99e5b2759f4ec7add90377d9f318e1934a8a9e8af66 (2768 bytes)
+== request 1
+sha256:89bb32794fc0bd115c4eae48895b019c3eff9c150906c772381ce10bd16e2a2f (5597 bytes)
+== record count
+22
+== records
+sha256:515fb985168a69c840a114eb95186796f21bac6ef886a0d2e2bd0b4214763c46 (8732 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== warms
+[
+    "note attempt 1 EofBeforeCompletion",
+    "note attempt 2 Complete",
+    "warm r1 m",
+    "warm r1 m",
+    "warm r1 m",
+    "note attempt 1 EofBeforeCompletion",
+    "note attempt 2 Complete",
+    "warm r1 m",
+    "warm r1 m",
+    "warm r1 m",
+    "note attempt 1 EofBeforeCompletion",
+    "note attempt 2 Complete",
+    "warm r1 m",
+    "warm r1 m",
+    "warm r1 m",
+    "note attempt 1 EofBeforeCompletion",
+    "note attempt 2 Complete",
+    "warm r1 m",
+    "warm r1 m",
+    "warm r1 m",
+]

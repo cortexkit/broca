@@ -1,0 +1,443 @@
+== cancelled: heads differ for None
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(1),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+}
+== cancelled: heads differ for Some(Reserved { module_id: "prefrontal-core" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(1),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+}
+== cancelled: heads differ for Some(Reserved { module_id: "occipital" })
+Object {
+    "first_ordinal": Number(1),
+    "input": Object {
+        "attachments": String("unknown"),
+    },
+    "last_ordinal": Number(1),
+    "last_run_state": Object {
+        "reason": String("cancelled"),
+        "run_id": String("r1"),
+        "state": String("cancelled"),
+    },
+    "mode3": Bool(false),
+    "model": Object {
+        "model": String("m"),
+        "provider": String("stub"),
+    },
+    "sender": Object {
+        "interrupt": Bool(true),
+        "modes": Array [
+            String("tool_result"),
+            String("turn_system"),
+            String("steer"),
+            String("idle_start"),
+        ],
+        "owner": Bool(true),
+    },
+    "updated_at": Bool(true),
+}
+== cancelled: display facts, tools, rich ui (true, false, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== cancelled: display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== cancelled: display facts, tools, rich ui (true, false, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [],
+}
+== cancelled: display facts, tools, rich ui (false, true, false), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== cancelled: display facts, tools, rich ui (false, true, false), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== cancelled: display facts, tools, rich ui (false, true, false), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== cancelled: display facts, tools, rich ui (false, false, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== cancelled: display facts, tools, rich ui (false, false, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+}
+== cancelled: display facts, tools, rich ui (false, false, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [],
+}
+== cancelled: display facts, tools, rich ui (true, true, true), page (None, None)
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== cancelled: display facts, tools, rich ui (true, true, true), page (Some(1), Some(1))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [
+        Object {
+            "created_at": Bool(true),
+            "message": Object {
+                "content": Array [
+                    Object {
+                        "text": String("first"),
+                        "type": String("text"),
+                    },
+                ],
+                "role": String("user"),
+            },
+            "ordinal": Number(1),
+            "part_keys": Array [
+                String("m0#0"),
+            ],
+            "role": String("user"),
+            "run": Object {
+                "episode": String("r1"),
+                "final": Bool(true),
+                "run_id": String("r1"),
+            },
+            "written_at": Bool(true),
+        },
+    ],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
+== cancelled: display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
+Object {
+    "lineage_state": Object {
+        "last_run_id": String("r1"),
+        "reason": String("cancelled"),
+        "state": String("cancelled"),
+    },
+    "messages": Array [],
+    "tools": Array [
+        Object {
+            "description": String("reads a file"),
+            "input_schema": Object {
+                "type": String("object"),
+            },
+            "name": String("read"),
+        },
+    ],
+    "tools_run_id": String("r1"),
+}
