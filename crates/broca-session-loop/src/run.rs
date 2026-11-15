@@ -2761,6 +2761,7 @@ where
                 &mut kept_prompt,
                 &rendered,
                 entering.as_ref().map(|entering| &*entering.accepted_under),
+                entering.as_ref().and_then(|entering| entering.overflow),
             )
             .await?
             {
@@ -2837,41 +2838,14 @@ where
             }
         }
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
-        // the session's schedule says so, or when it is a step already refused and re-sent. On
-        // the run that moved the session onto the current compaction contract, the newest
-        // step's usage measures the request from before the move, which rebuilt it, so the
-        // prepared request's own estimate decides whether it fits the fallback's window.
-        let own_estimate = match (
-            call_ready && crate::enroll::is_enrolling_run(writer.operations(), &admission.run_id),
-            seams.provider.refusal_fallback_model(),
-        ) {
-            (true, Some(_)) => {
-                let history = writer
-                    .operations()
-                    .estimate
-                    .as_ref()
-                    .map(crate::compaction::history)
-                    .unwrap_or_default();
-                let bytes = seams
-                    .provider
-                    .request_len(&opts)
-                    .map_err(|error| LoopError::Parts(error.message))?;
-                Some(broca_core::compaction::request_estimate(bytes, &history).0)
-            }
-            _ => None,
-        };
-        let mut route =
-            crate::refusal::Route::decide(writer, seams.provider, step_id, own_estimate)?;
+        // the session's schedule says so, or when it is a step already refused and re-sent.
+        let mut route = crate::refusal::Route::decide(writer, seams.provider, step_id)?;
         // The step holds one copy of its request's options, which every attempt's call shares.
         // Reserving the output cap changes only the target model and the step context, so a
         // re-reserve for the fallback model starts from these again rather than from a second
         // copy of the whole request kept for it.
         let prepared = (opts.target_model.clone(), opts.step_context.clone());
-        let mut opts =
-            match reserve_for(writer, seams, admission, step_id, opts, &route, call_ready).await? {
-                Some(opts) => Arc::new(opts),
-                None => return Ok(finished(writer, RunFinishReason::Error)),
-            };
+        let mut opts = Arc::new(reserve_for(writer, step_id, opts, &route));
         // The step a timed account pause resumes is sent again only if it renders the request
         // the provider refused, byte for byte, as today's resume checks it: anything else ends
         // the run interrupted rather than send a request the pause wasn't for.
@@ -3004,14 +2978,7 @@ where
                     route.reroute(seams.provider);
                     let mut again = Arc::unwrap_or_clone(opts);
                     (again.target_model, again.step_context) = prepared.clone();
-                    opts = match reserve_for(
-                        writer, seams, admission, step_id, again, &route, call_ready,
-                    )
-                    .await?
-                    {
-                        Some(opts) => Arc::new(opts),
-                        None => return Ok(finished(writer, RunFinishReason::Error)),
-                    };
+                    opts = Arc::new(reserve_for(writer, step_id, again, &route));
                     continue;
                 }
             }
@@ -3047,6 +3014,81 @@ where
                     selection.and_then(|selection| selection.account_ref.as_deref()),
                     selection.map(|selection| selection.credential_id.as_str()),
                 ));
+                // The provider refused the request as too long. broca never sizes a request
+                // before sending it, so this refusal is what asks the compaction provider for a
+                // smaller view: the step is entered again, rides `over_limit` with the
+                // provider's own count, and is sent once more on the view it gets. A second
+                // refusal of the same step ends the run at the context ceiling, with the
+                // provider's numbers. Without a compaction provider the refusal ends the run as
+                // any error does.
+                if error.class == broca_protocol::ErrorClass::ContextOverflow
+                    && compaction.is_some()
+                {
+                    use broca_core::compaction::view::{
+                        reported_limit_tokens, reported_prompt_tokens,
+                    };
+                    let request_tokens = reported_prompt_tokens(&error.message);
+                    if entering
+                        .as_ref()
+                        .is_none_or(|entering| entering.overflow.is_none())
+                    {
+                        let first_attempt = writer
+                            .open_log_records()
+                            .await?
+                            .iter()
+                            .rev()
+                            .find_map(|(_, record)| match record {
+                                Record::Attempt(attempt)
+                                    if attempt.run_id == admission.run_id
+                                        && attempt.step_id == step_id =>
+                                {
+                                    Some(attempt.attempt.saturating_add(1))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        let (refused, accepted_under) = match entering {
+                            Some(entering) => (entering.refused, entering.accepted_under),
+                            None => (Vec::new(), Box::new(admission.clone())),
+                        };
+                        reentry = Some(crate::account_move::Reentry {
+                            step_id,
+                            refused,
+                            retries,
+                            first_attempt,
+                            accepted_under,
+                            overflow: Some(broca_core::compaction_v2::request::Overflow {
+                                request_tokens,
+                            }),
+                        });
+                        continue;
+                    }
+                    let window = reported_limit_tokens(&error.message).or(admission.context_limit);
+                    let detail = window
+                        .zip(request_tokens)
+                        .map(|(window, size)| {
+                            serde_json::to_value(broca_protocol::ContextCeilingDetail::new(
+                                window,
+                                size,
+                                "over_window",
+                            ))
+                        })
+                        .transpose()
+                        .map_err(|e| LoopError::Parts(e.to_string()))?;
+                    writer
+                        .append(
+                            &[Record::CeilingDecided(CeilingDecided { step_id, detail })],
+                            false,
+                        )
+                        .await?;
+                    return finish(
+                        writer,
+                        seams,
+                        &admission.run_id,
+                        RunFinishReason::ContextCeiling,
+                    )
+                    .await;
+                }
                 // A definite sign-in failure can move the same step to another routed account.
                 // All other auth errors retain their existing resumable pause.
                 if error.class == broca_protocol::ErrorClass::Auth {
@@ -3112,6 +3154,7 @@ where
                                     accepted_under: entering
                                         .map(|entry| entry.accepted_under)
                                         .unwrap_or_else(|| Box::new(admission.clone())),
+                                    overflow: None,
                                 },
                             });
                             return Ok(finished(writer, RunFinishReason::Interrupted));
@@ -3216,6 +3259,7 @@ where
                                     retries,
                                     first_attempt: limited.attempt.attempt.saturating_add(1),
                                     accepted_under,
+                                    overflow: None,
                                 },
                             });
                             return Ok(finished(writer, RunFinishReason::Interrupted));
@@ -5627,50 +5671,19 @@ pub(crate) fn run_selection<'a, P, T>(
         .or(admission.auth_selection.as_ref())
 }
 
-/// The step's request with its output cap reserved for the model it goes to: the run's own, or
-/// the refusal-fallback model, with that model's window. `None` when even the provider's floor
-/// doesn't fit: the run's end with the overflow error is then durable. `renders` is false when
-/// the step's request can't be rendered, so the cap isn't estimated (see `output::reserve`).
-async fn reserve_for<W: Writer, P: Provider, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    admission: &Admission,
+/// The step's request for the model it goes to, the run's own or the refusal-fallback model,
+/// with its output cap (see `output::reserve`).
+fn reserve_for<W: Writer>(
+    writer: &W,
     step_id: u64,
     mut opts: CallOptions,
     route: &crate::refusal::Route,
-    renders: bool,
-) -> Result<Option<CallOptions>, LoopError> {
-    let mut context_limit = admission.context_limit;
+) -> CallOptions {
     if route.route == broca_core::refusal_fallback::StepRoute::Fallback {
         // A fallback step tells the renderer which model it renders for.
         opts.target_model = route.fallback.clone();
-        context_limit = seams.provider.refusal_fallback_context_limit();
     }
-    let model = route.model(&admission.model).clone();
-    match crate::output::reserve(
-        writer,
-        seams.provider,
-        step_id,
-        opts,
-        &model,
-        context_limit,
-        renders,
-    )
-    .await?
-    {
-        crate::output::Reserved::Send(opts) => Ok(Some(*opts)),
-        crate::output::Reserved::Overflow(error) => {
-            end_with_error(
-                writer,
-                seams,
-                &admission.run_id,
-                RunFinishReason::Error,
-                &error,
-            )
-            .await?;
-            Ok(None)
-        }
-    }
+    crate::output::reserve(writer.operations(), step_id, opts)
 }
 
 /// The timed same-account pause the run's state holds, if it is paused on one.

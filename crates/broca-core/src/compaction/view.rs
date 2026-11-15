@@ -1103,6 +1103,24 @@ pub fn reported_limit_tokens(message: &str) -> Option<u64> {
         .then_some(number)
 }
 
+/// The size of the request a model provider refused as too long, when its text states one:
+/// Anthropic's `prompt is too long: N tokens > M maximum` and OpenAI's `your messages resulted
+/// in N tokens`. Anything else gives `None`; the size is never guessed.
+pub fn reported_prompt_tokens(message: &str) -> Option<u64> {
+    let after = |marker: &str| {
+        message
+            .find(marker)
+            .map(|at| message[at + marker.len()..].trim_start())
+    };
+    let rest = after("prompt is too long:").or_else(|| after("resulted in"))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let number = digits.parse().ok()?;
+    rest[digits.len()..]
+        .trim_start()
+        .starts_with("tokens")
+        .then_some(number)
+}
+
 /// The ride at the ceiling (compaction-provider/v1 §8). `overflow_error` is the model
 /// provider's refusal text when the pause follows one: the ride then carries `overflow`, with
 /// `reported_limit_tokens` only when that text states the limit. Without it the ceiling came

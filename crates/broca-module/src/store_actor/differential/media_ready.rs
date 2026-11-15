@@ -441,8 +441,8 @@ async fn until_waiting(log: &Log) {
 }
 
 /// A compacting run whose media are still being prepared when its step starts waits for them
-/// before its compaction estimate renders the request: nothing is rendered until then. Once the
-/// media are ready, the step's request is estimated and sent, and the run ends with its end.
+/// before its step is prepared: nothing is rendered or sent until then. Once the media are
+/// ready, the step's request is sent, never sized first, and the run ends with its end.
 #[tokio::test]
 async fn a_compacting_run_renders_and_sends_only_once_its_media_are_ready() {
     let build = Arc::new(Notify::new());
@@ -467,10 +467,10 @@ async fn a_compacting_run_renders_and_sends_only_once_its_media_are_ready() {
         ends(&session).await,
         vec![("r1".into(), json!("completed"), Value::Null)]
     );
-    let estimates = log.estimates();
-    assert!(
-        !estimates.is_empty() && estimates.iter().all(Result::is_ok),
-        "the compaction estimate rendered once the media were ready: {estimates:?}"
+    assert_eq!(
+        log.estimates(),
+        vec![],
+        "no request is sized before it is sent"
     );
     let sent = log.sent();
     assert!(
@@ -534,42 +534,6 @@ async fn a_cancel_while_a_compacting_run_waits_for_its_media_ends_it_cancelled()
     );
     assert_eq!(log.estimates(), vec![], "nothing was rendered");
     assert_eq!(log.sent(), vec![], "nothing was sent");
-}
-
-/// A run after one whose step measured the model estimates its first request to reserve the
-/// output cap, before the model call: a run that isn't compacting waits for its media before
-/// that estimate too, and ends with its end.
-#[tokio::test]
-async fn a_later_run_estimates_its_output_cap_only_once_its_media_are_ready() {
-    let executor = ReadyExecutor::new(vec![measured_step("a1", "hello"), text_step("a2", "again")]);
-    let log = Arc::clone(&executor.log);
-    let (commands, served) = actor(executor, None).await;
-    let sent = send_with(&commands, "r1", windowed("first"), SendKey::Minted).await;
-    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
-    idle(&commands).await;
-    assert_eq!(
-        log.estimates(),
-        vec![],
-        "the first run had nothing to estimate from"
-    );
-    let sent = send_with(&commands, "r2", windowed("second"), SendKey::Minted).await;
-    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
-    idle(&commands).await;
-    drop(commands);
-    let session = served.await.unwrap();
-    assert_eq!(
-        ends(&session).await,
-        vec![
-            ("r1".into(), json!("completed"), Value::Null),
-            ("r2".into(), json!("completed"), Value::Null),
-        ]
-    );
-    let estimates = log.estimates();
-    assert!(
-        !estimates.is_empty() && estimates.iter().all(Result::is_ok),
-        "the second run estimated its cap once its media were ready: {estimates:?}"
-    );
-    assert_eq!(log.sent().len(), 2, "{:?}", log.sent());
 }
 
 /// A run after a measured one whose media can't be had doesn't estimate its output cap: its

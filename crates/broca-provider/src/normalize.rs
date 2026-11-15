@@ -951,7 +951,9 @@ fn block_index(v: &Value) -> usize {
 pub(crate) fn map_stop_reason(sr: &str) -> FinishReason {
     match sr {
         "end_turn" | "stop_sequence" => FinishReason::Stop,
-        "max_tokens" => FinishReason::Length,
+        // Claude 4.5 and newer accept a prompt and output cap past the context window and stop
+        // generation at the window with this reason: the output ran out of room, as at the cap.
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
         "tool_use" => FinishReason::ToolCalls,
         "refusal" => FinishReason::ContentFilter,
         _ => FinishReason::Other,
@@ -1075,6 +1077,17 @@ fn status_default_class(status: u16) -> ErrorClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request whose prompt and output cap pass the window is accepted by Claude 4.5 and newer,
+    /// which stop generation at the window: the step ends as one that reached its cap.
+    #[test]
+    fn a_stop_at_the_context_window_ends_the_step_as_a_length_stop() {
+        assert_eq!(
+            map_stop_reason("model_context_window_exceeded"),
+            FinishReason::Length
+        );
+        assert_eq!(map_stop_reason("max_tokens"), FinishReason::Length);
+    }
 
     #[test]
     fn anthropic_cache_write_lifetimes_preserve_presence_and_last_reported_value() {

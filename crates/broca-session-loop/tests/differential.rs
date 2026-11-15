@@ -73,6 +73,9 @@ struct ScriptedProvider {
     /// What the current run's requests wait for before they can be rendered, when the
     /// comparison gives the new loop one (see [`ScriptedProvider::model_call_ready`]).
     readiness: Arc<Mutex<Option<Arc<Readiness>>>>,
+    /// The context window this provider refuses requests past, when a test gives it one; a
+    /// comparison under a compaction script refuses past the script's limit.
+    window: Arc<Mutex<Option<u64>>>,
 }
 
 /// Whether `script` is the provider refusing the strict schema's grammar.
@@ -96,7 +99,13 @@ impl ScriptedProvider {
             drifted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             route: Arc::new(Mutex::new(None)),
             readiness: Arc::new(Mutex::new(None)),
+            window: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// From now on, refuses a request past `window` tokens as too long.
+    fn set_window(&self, window: u64) {
+        *self.window.lock().unwrap() = Some(window);
     }
 
     /// What a new-loop run or resume on this provider waits for before its requests can be
@@ -201,10 +210,6 @@ impl Provider for ScriptedProvider {
         account().map(|_| harness_now())
     }
 
-    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
-        output().map(|script| script.limits)
-    }
-
     /// Refuses while the run's requests aren't ready to render, as a store run's media renderer
     /// refuses before its run waited for the session's media.
     fn try_render_request(
@@ -254,6 +259,19 @@ impl Provider for ScriptedProvider {
         let opts = &opts;
         self.sent.lock().unwrap().push(opts.clone());
         let rendered = self.render_request(opts);
+        // Under a compaction script the provider has a window, and refuses a request past it as
+        // Anthropic does, before answering anything: the request's size is its rendered bytes at
+        // two per token, this provider's own count. No scripted answer is used up.
+        let window = (*self.window.lock().unwrap())
+            .or_else(|| compaction().map(|script| script.context_limit));
+        if let Some(window) = window {
+            let tokens = (rendered.len() as u64).div_ceil(2);
+            if tokens > window {
+                let (tx, rx) = mpsc::channel(1);
+                let _ = tx.try_send(too_long(tokens, window));
+                return rx;
+            }
+        }
         let script = {
             let mut scripts = self.scripts.lock().unwrap();
             let downgraded = self.downgraded.load(std::sync::atomic::Ordering::SeqCst);
@@ -943,18 +961,6 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
-    /// The output cap the provider's requests carry and the context limit the run freezes, for
-    /// a comparison of how a step's cap is lowered. `None` runs with neither.
-    static OUTPUT: Option<OutputScript>;
-}
-
-#[derive(Clone, Copy)]
-struct OutputScript {
-    limits: broca_core::output_reservation::OutputLimits,
-    context_limit: u64,
-}
-
-tokio::task_local! {
     /// The structured output the provider's frozen render config carries, as a
     /// `FrozenStructuredOutput` value. `None` runs without structured output.
     static STRUCTURED: Option<Value>;
@@ -1623,16 +1629,9 @@ fn unconstrained(mode: &str) -> Value {
     })
 }
 
-/// The output script the comparison running in this task uses.
-fn output() -> Option<OutputScript> {
-    OUTPUT.try_with(|script| *script).ok().flatten()
-}
-
 /// The context limit both loops freeze: the compaction script's, else the output script's.
 fn frozen_context_limit() -> Option<u64> {
-    compaction()
-        .map(|script| script.context_limit)
-        .or(output().map(|script| script.context_limit))
+    compaction().map(|script| script.context_limit)
 }
 
 /// The compaction script the comparison running in this task uses.
@@ -7027,7 +7026,13 @@ async fn a_view_dropping_the_final_tool_turn_is_refused() {
                                 assert!(record.get(kind).is_none(), "unexpected {record}");
                             }
                         }
-                        assert_eq!(outcome.requests.len(), 1, "no over-window request sent");
+                        // The first step's request, then the over-window one: refused, and
+                        // refused again once the ride's view is refused too.
+                        assert_eq!(
+                            outcome.requests.len(),
+                            3,
+                            "the over-window request is sent twice"
+                        );
                     }
                 }),
             ),
@@ -7112,96 +7117,11 @@ async fn two_runs_frozen_with_part_numbers_number_on_from_the_first() {
     .await;
 }
 
-/// Two tool steps, then an answer. Each step reports an attempt with its body length, so a later
-/// step's input can be estimated from the measured one before it.
-fn measured_scenario() -> Scenario {
-    let tools = vec![tool("read", ExecutionMode::Parallel)];
-    Scenario {
-        input: vec![user("read a and b")],
-        manifest: None,
-        tools,
-        stop_when: Vec::new(),
-        steps: vec![
-            attempted(
-                answer(
-                    "a1",
-                    vec![call("c1", "read", json!({"path": "a"}))],
-                    FinishReason::ToolCalls,
-                ),
-                vec![attempt(1, 200, "complete")],
-            ),
-            attempted(
-                answer(
-                    "a2",
-                    vec![call("c2", "read", json!({"path": "b"}))],
-                    FinishReason::ToolCalls,
-                ),
-                vec![attempt(1, 200, "complete")],
-            ),
-            attempted(text_step("a3", "done"), vec![attempt(1, 200, "complete")]),
-        ],
-    }
-}
-
-/// A context limit whose room beside the estimated input is below the frozen cap and above the
-/// floor: each step after the first has its cap lowered, durable before it is sent.
-fn lowering() -> OutputScript {
-    OutputScript {
-        limits: broca_core::output_reservation::OutputLimits::new(32_000, 0),
-        context_limit: 1_024 + 100 + 10_000,
-    }
-}
-
-/// A context limit with no room for even the floor beside the estimated input: the second step
-/// is never sent and the run ends with the overflow error.
-fn overflowing() -> OutputScript {
-    OutputScript {
-        limits: broca_core::output_reservation::OutputLimits::new(32_000, 0),
-        context_limit: 1_024 + 100 + 1_000,
-    }
-}
-
-#[tokio::test]
-async fn a_step_whose_cap_would_pass_the_context_limit_is_sent_with_a_lowered_cap() {
-    OUTPUT
-        .scope(Some(lowering()), compare(measured_scenario()))
-        .await;
-}
-
-#[tokio::test]
-async fn a_lowered_cap_survives_every_crash_cut() {
-    OUTPUT
-        .scope(Some(lowering()), compare_every_cut(measured_scenario()))
-        .await;
-}
-
-#[tokio::test]
-async fn a_step_with_no_room_for_output_ends_the_run_unsent() {
-    OUTPUT
-        .scope(Some(overflowing()), compare(measured_scenario()))
-        .await;
-}
-
-#[tokio::test]
-async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
-    let script = CompactionScript {
-        context_limit: lowering().context_limit,
-        rides: Vec::new(),
-    };
-    OUTPUT
-        .scope(
-            Some(lowering()),
-            compare_compacted(measured_scenario(), script),
-        )
-        .await;
-}
-
 /// A new-loop run whose requests can't be rendered until it waited for something (as a store
 /// run's media renderer renders nothing until its run waited for the session's media) waits
-/// before its first step's compaction estimate renders the step's request, and makes the same
-/// run as today's loop.
+/// before its first compacted step is prepared and sent, and makes the same run as today's loop.
 #[tokio::test]
-async fn a_compacted_step_waits_for_its_request_to_be_ready_before_estimating_it() {
+async fn a_compacted_step_waits_for_its_request_to_be_ready_before_sending_it() {
     READY
         .scope(
             Some(ReadyScript::Ready),
@@ -7219,19 +7139,6 @@ async fn a_compacted_step_waits_for_its_request_to_be_ready_before_estimating_it
                     rides: Vec::new(),
                 },
             ),
-        )
-        .await;
-}
-
-/// A resume whose requests can't be rendered until it waited for something waits before the
-/// output cap's estimate renders the step it resumes, which an earlier step measured, and
-/// resumes as today's loop does at every crash cut.
-#[tokio::test]
-async fn a_resumed_step_waits_for_its_request_to_be_ready_before_estimating_its_cap() {
-    READY
-        .scope(
-            Some(ReadyScript::Ready),
-            OUTPUT.scope(Some(lowering()), compare_every_cut(measured_scenario())),
         )
         .await;
 }
@@ -7353,6 +7260,21 @@ fn strict(mode: &str) -> Value {
     structured.as_object_mut().unwrap().remove("reason");
     structured["delivery"] = json!("strict");
     structured
+}
+
+/// The provider refuses a request of `tokens` as longer than its window of `limit`, in
+/// Anthropic's words.
+fn too_long(tokens: u64, limit: u64) -> NormalizedEvent {
+    NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(json!({
+            "class": "context_overflow",
+            "message": format!("prompt is too long: {tokens} tokens > {limit} maximum"),
+            "status": 400,
+            "provider_code": "invalid_request_error",
+        }))
+        .unwrap(),
+        retries_used: 0,
+    })
 }
 
 /// The provider refuses the run's strict schema as too large a grammar, after one retry.
@@ -8856,6 +8778,10 @@ async fn enroll_run_with(
         ..Default::default()
     };
     request.context_limit = control.admitted_context_limit;
+    // The model provider refuses a request past the window the run froze, as a real one does.
+    if let Some(window) = control.admitted_context_limit {
+        provider.set_window(window);
+    }
     let admission = broca_session_loop::admit::admission(
         &mut request,
         &control,
@@ -9318,21 +9244,23 @@ async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_r
             assert!(session.conversation.window_start() <= enrolled.through_ordinal);
             let texts =
                 |request: &CallOptions| request.prompt.iter().map(text_of).collect::<Vec<_>>();
-            assert_eq!(requests.len(), 2, "{:?}", spy.calls());
+            // The first step's request, the one the provider refused as too long, and
+            // the one sent again on the ride's view.
+            assert_eq!(requests.len(), 3, "{:?}", spy.calls());
             assert!(texts(&requests[0])
                 .iter()
                 .any(|text| text.contains("read a")));
-            assert!(!texts(&requests[1])
+            assert!(!texts(&requests[2])
                 .iter()
                 .any(|text| text.contains("read a")));
-            assert!(!texts(&requests[1])
+            assert!(!texts(&requests[2])
                 .iter()
                 .any(|text| text.contains("done with a")));
-            assert!(texts(&requests[1])
+            assert!(texts(&requests[2])
                 .iter()
                 .any(|text| text.contains("count the rows")));
-            assert_eq!(text_of(&requests[1].prompt[0]), ENROLLED_SYSTEM);
-            let blocks: Vec<_> = requests[1]
+            assert_eq!(text_of(&requests[2].prompt[0]), ENROLLED_SYSTEM);
+            let blocks: Vec<_> = requests[2]
                 .prompt
                 .iter()
                 .flat_map(|message| &message.content)
@@ -9647,74 +9575,6 @@ async fn a_failed_setup_ends_the_enrolling_run_and_the_next_send_retries_it() {
     .await;
 }
 
-/// On the enrolling run, a scheduled refusal fallback takes the step only if the prepared
-/// request's own estimate fits the fallback's window; the newest step's usage, from before the
-/// request was rebuilt, doesn't decide. A window that holds it lets the step go there.
-#[tokio::test]
-async fn the_enrolling_run_falls_back_only_when_its_own_request_fits() {
-    in_each_cipher(|| async {
-        for (fallback_limit, expected) in [
-            (150, broca_core::refusal_fallback::StepRoute::Source),
-            (1_000_000, broca_core::refusal_fallback::StepRoute::Fallback),
-        ] {
-            FALLBACK
-                .scope(
-                    Some(FallbackScript {
-                        model: ModelHandle::new(provider_id(), "fallback-model"),
-                        context_limit: Some(fallback_limit),
-                    }),
-                    async {
-                        let backend = MemoryBackend::default();
-                        let mut session = enrollment_session(&backend).await;
-                        let mut parts = MemoryParts::default();
-                        let spy = CompactionSpy::new(&CompactionScript {
-                            context_limit: ENROLLED_LIMIT,
-                            rides: Vec::new(),
-                        });
-                        // The run's own model refuses its first step, which arms the schedule the
-                        // next run carries.
-                        let refused = EnrollRun {
-                            id: "r1",
-                            input: vec![system("You are terse."), user("first task")],
-                            manifest: None,
-                            steps: vec![refusal("a0"), text_step("a1", "ok")],
-                            limit: None,
-                        };
-                        enroll_run(&mut session, &mut parts, &spy, &refused)
-                            .await
-                            .expect("the refused run");
-                        let mut manifest = enrolling_manifest().as_ref().clone();
-                        manifest.system_text = "Compact with care. ".repeat(200);
-                        let provider = ScriptedProvider::new(vec![text_step("a2", "on")]);
-                        enroll_run_with(
-                            &mut session,
-                            &mut parts,
-                            &spy,
-                            &EnrollRun {
-                                id: "r2",
-                                input: vec![user("second task")],
-                                manifest: Some(Arc::new(manifest)),
-                                steps: Vec::new(),
-                                limit: None,
-                            },
-                            &provider,
-                        )
-                        .await
-                        .expect("the enrolling run");
-                        assert!(session.operations.enrolled.is_some());
-                        assert_eq!(
-                            *provider.route.lock().unwrap(),
-                            Some(expected),
-                            "a fallback window of {fallback_limit}"
-                        );
-                    },
-                )
-                .await;
-        }
-    })
-    .await;
-}
-
 /// The enrolling run under a refusal fallback renders its own request to estimate it, besides
 /// its compaction estimate. When what its requests wait for before they can be rendered fails,
 /// neither renders: the step fails with that error before anything is sent, and the run's end
@@ -9985,7 +9845,9 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                 "{:?}",
                 spy.calls()
             );
-            assert_eq!(requests.len(), 2, "{:?}", spy.calls());
+            // The first step's request, the one the provider refused as too long, and
+            // the one sent again on the ride's view.
+            assert_eq!(requests.len(), 3, "{:?}", spy.calls());
             // Once the run enrolled the session, the entries the provider reads hold the
             // suppressed message's with no parts: the contract counts every message, so a view
             // can name it.
@@ -10007,7 +9869,7 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                     .iter()
                     .any(|message| text_of(message).contains("a turn-scoped note")));
             }
-            assert!(requests[1].prompt.iter().any(|message| {
+            assert!(requests[2].prompt.iter().any(|message| {
                 message.content.iter().any(|block| {
                     matches!(block, ContentBlock::ToolResult(result)
                         if result.output == ToolOutput::Text { text: "compacted tool output".into() })
@@ -10032,7 +9894,8 @@ async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_withou
                     .collect::<Vec<_>>(),
             );
         }
-        assert_eq!(rendered[0].len(), 3);
+        // The enrolling run's three requests (one refused as too long) and the next run's one.
+        assert_eq!(rendered[0].len(), 4);
         assert!(
             rendered[0] == rendered[1],
             "a cut through the suppressed system message changed what was sent"

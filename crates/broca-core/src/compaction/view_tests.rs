@@ -1013,6 +1013,27 @@ fn overflow_limits_come_only_from_the_providers_text() {
     ] {
         assert_eq!(reported_limit_tokens(text), limit, "{text}");
     }
+    // The refused request's own size, which an `over_limit` ride after the refusal names.
+    for (text, size) in [
+        (
+            "prompt is too long: 215463 tokens > 200000 maximum",
+            Some(215_463),
+        ),
+        (
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1000 tokens > 999 maximum"}}"#,
+            Some(1_000),
+        ),
+        (
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.",
+            Some(130_000),
+        ),
+        ("prompt is too long", None),
+        ("prompt is too long: many tokens", None),
+        ("Input is too long for requested model.", None),
+        ("rate limited", None),
+    ] {
+        assert_eq!(reported_prompt_tokens(text), size, "{text}");
+    }
     let ride = ceiling_ride(
         SESSION_REF,
         1000,

@@ -38,6 +38,16 @@ pub struct At<'a> {
     /// renders to reuse and bring up to date (see `render::RenderCache`); `None` renders every
     /// entry.
     pub render: Option<&'a render::RenderCache>,
+    /// The model provider refused this step's request as too long, so it is prepared again
+    /// after an `over_limit` ride.
+    pub overflow: Option<Overflow>,
+}
+
+/// A model provider's refusal of a step's request as too long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    /// The refused request's size in tokens, when the refusal states it.
+    pub request_tokens: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -121,7 +131,7 @@ pub async fn prepare(
         at.render,
     )?;
     let mut tokens = estimate(&prompt)?;
-    let causes = if frozen {
+    let mut causes = if frozen {
         Vec::new()
     } else {
         conditions::ride_causes(
@@ -133,6 +143,16 @@ pub async fn prepare(
             at.conditions,
         )
     };
+    // A request the model provider refused as too long rides for a smaller view even on a step
+    // that already applied one: the refused bytes were never processed, so no cache they could
+    // have written is lost by changing them. The ride names the provider's own count.
+    let mut ride_tokens = Some(tokens);
+    if let Some(overflow) = at.overflow {
+        if !causes.contains(&RideCause::OverLimit) {
+            causes.push(RideCause::OverLimit);
+        }
+        ride_tokens = overflow.request_tokens;
+    }
     let usable = conditions::usable_window(at.conditions);
     let mut rode_over_limit = causes.contains(&RideCause::OverLimit);
     if !causes.is_empty() {
@@ -143,7 +163,7 @@ pub async fn prepare(
             plane,
             &mut setup,
             &at,
-            (causes, tokens),
+            (causes, ride_tokens),
         )
         .await?;
         view = state.lock().await.view_for_step(at.step).cloned();
@@ -169,7 +189,7 @@ pub async fn prepare(
             plane,
             &mut setup,
             &at,
-            (vec![RideCause::OverLimit], tokens),
+            (vec![RideCause::OverLimit], Some(tokens)),
         )
         .await?;
         rode_over_limit = true;
@@ -215,7 +235,7 @@ async fn ride(
     plane: &dyn Plane,
     setup: &mut cortexkit_role_compaction::setup::SetupRequest,
     at: &At<'_>,
-    opportunity: (Vec<RideCause>, u64),
+    opportunity: (Vec<RideCause>, Option<u64>),
 ) -> Result<(), String> {
     let (causes, tokens) = opportunity;
     let deadline = if causes.contains(&RideCause::CacheExpired) {
@@ -226,7 +246,7 @@ async fn ride(
     let mut request = RideRequest::new(causes, deadline.as_millis() as u64, at.conditions.clone());
     request.applied_view = state.lock().await.view_for_step(at.step).map(View::applied);
     if request.causes.contains(&RideCause::OverLimit) {
-        request.request_tokens = Some(tokens);
+        request.request_tokens = tokens;
     }
     let Some(received) = runtime.ride(plane, setup, &request).await else {
         return Ok(());

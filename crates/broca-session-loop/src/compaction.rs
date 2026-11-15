@@ -1048,7 +1048,9 @@ pub async fn apply_boundary<W: Writer, P, T>(
 ///
 /// `moved_from` is set when the step is prepared again after the run moved to another account
 /// inside it: the run's last accepted request was sent under that admission, so the ride
-/// compares the current account with its account, and names the change.
+/// compares the current account with its account, and names the change. `overflow` is set when
+/// the step is prepared again after the model provider refused its request as too long: the
+/// step then rides `over_limit` for a smaller view.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     writer: &mut W,
@@ -1060,6 +1062,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     stored: &mut prompt::KeptPrompt,
     rendered: &v2::render::RenderCache,
     moved_from: Option<&Admission>,
+    overflow: Option<v2::request::Overflow>,
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
     let stored = stored.stored(&transcript.sealed);
@@ -1082,12 +1085,6 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     };
     let current = v2::host::context_of(&frozen(admission), admission.manifest.as_deref());
     let previous = previous(writer, moved_from.unwrap_or(admission), ctx)?;
-    let history = writer
-        .operations()
-        .estimate
-        .as_ref()
-        .map(history)
-        .unwrap_or_default();
     let plane = v2::runtime::BoundPlane {
         plane: seams.compaction_plane,
         provider: &ctx.provider,
@@ -1133,19 +1130,17 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             now,
             next_mid: NEXT_MID,
             render: Some(rendered),
+            overflow,
         },
         // A view's inserted image isn't a medium the session captured, so the request shows
         // its provenance marker in its place, as today's storage renders it; only its reference
         // is needed, checked as the view was when accepted.
         v2::host::image_reference,
-        |prompt| {
-            let view = finish(&opts, prompt.to_vec(), admission)?;
-            seams
-                .provider
-                .request_len(&view)
-                .map(|bytes| broca_core::compaction::request_estimate(bytes, &history).0)
-                .map_err(|error| error.message.clone())
-        },
+        // The new loop never sizes a request before sending it: a byte count can't say what a
+        // provider counts (an image's base64 is a few thousand tokens to the provider, not its
+        // bytes), so a guess could stop a run that fits. Every request counts as fitting here;
+        // the provider says when one doesn't, and only that refusal decides.
+        |_prompt| Ok(0),
     )
     .await
     .map_err(LoopError::Parts)?;

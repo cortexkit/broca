@@ -1745,43 +1745,6 @@ fn the_ride_after_a_move_compares_the_old_account_with_the_new_one() {
     assert_eq!(before.surface, after.surface);
 }
 
-/// The step entered again on the new account keeps the output cap its refused attempt recorded:
-/// the cap is lowered once, before the first request of the step, and the re-sent request
-/// carries the same cap, with no second record.
-#[tokio::test]
-async fn the_re_sent_step_keeps_its_recorded_output_cap() {
-    let mut case = Case::new(
-        vec![("A", vec![Reply::Tool, wall()]), ("B", vec![Reply::Answer])],
-        vec![offer("B")],
-    );
-    // A cap far above what the context leaves beside the measured input, so step 2's cap is
-    // lowered before its first request.
-    case.output_limits = Some(broca_core::output_reservation::OutputLimits {
-        max: 4_000_000_000,
-        floor: 1,
-    });
-    case.context_limit = Some(2_000_000_000);
-    let ran = run_case(case).await;
-    assert_eq!(ran.reason(), RunFinishReason::Completed, "{:#?}", ran.log);
-    let cap = |sent: &Sent| sent.opts.step_context.as_ref().unwrap().max_output_tokens;
-    let (refused, resent) = (ran.sent_on("A")[1], ran.sent_on("B")[0]);
-    assert!(cap(refused).is_some(), "the step's cap was lowered");
-    assert!(cap(refused) < Some(4_000_000_000));
-    assert_eq!(cap(resent), cap(refused));
-    let lowered: Vec<_> = ran
-        .records
-        .iter()
-        .filter_map(|(_, record)| match record {
-            Record::OutputCapLowered(lowered) if lowered.step_id == 2 => {
-                Some(lowered.max_output_tokens)
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(lowered.len(), 1, "{lowered:?}");
-    assert_eq!(Some(lowered[0]), cap(resent));
-}
-
 /// The context limit a compacted run freezes.
 const COMPACTED_LIMIT: u64 = 200_000;
 

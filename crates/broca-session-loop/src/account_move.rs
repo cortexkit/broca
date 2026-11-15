@@ -159,9 +159,10 @@ pub(crate) enum AtWall<P> {
     Stopped,
 }
 
-/// How the loop enters a step again after a move: no boundary is written (the step started
-/// already, and messages steered since wait for the next boundary), and the step's request is
-/// prepared again on the new account.
+/// How the loop enters a step again, after a move or after the model provider refused its
+/// request as too long. No step boundary is written: the step started already, and messages a
+/// caller steered into the run meanwhile wait for the next step's boundary. The step's request
+/// is prepared again, on the new account or after an `over_limit` ride.
 pub(crate) struct Reentry {
     pub step_id: u64,
     /// The accounts that refused this step so far.
@@ -174,6 +175,10 @@ pub(crate) struct Reentry {
     /// accepted was sent under it, so the compaction provider compares the new account with
     /// its account.
     pub accepted_under: Box<Admission>,
+    /// Set when the provider refused the step's request as too long: the request is prepared
+    /// again after an `over_limit` ride, and a second such refusal ends the run at the context
+    /// ceiling.
+    pub overflow: Option<broca_core::compaction_v2::request::Overflow>,
 }
 
 /// A move the loop made, for the driver to continue on.

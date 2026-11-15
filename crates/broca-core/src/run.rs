@@ -6489,6 +6489,7 @@ where
                     now,
                     next_mid: &next_mid,
                     render: None,
+                    overflow: None,
                 },
                 |image| crate::compaction_v2::host::image(writer, image),
                 |prompt| {
