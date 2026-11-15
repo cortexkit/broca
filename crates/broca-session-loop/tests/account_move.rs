@@ -380,6 +380,8 @@ struct Asked {
     account: String,
     limit_window: String,
     resets_at_ms: Option<u64>,
+    /// The predecessor the question names, which routing's continue request carries as
+    /// `previous_decision_id`.
     decision_id: Option<String>,
     refused: Vec<String>,
     reask: bool,
@@ -402,11 +404,7 @@ impl AccountContinue<Box<dyn Provider>> for Routing {
             account: wall.account.into(),
             limit_window: wall.limit_window.into(),
             resets_at_ms: wall.resets_at_ms,
-            decision_id: wall
-                .selection
-                .account_decision
-                .as_ref()
-                .and_then(|decision| decision.decision_id.clone()),
+            decision_id: Some(wall.predecessor.to_owned()),
             refused: wall.refused_accounts.to_vec(),
             reask: wall.reask,
             attempt_seq: wall.attempt_seq,
@@ -742,6 +740,8 @@ struct Case {
     context_limit: Option<u64>,
     /// The session's compaction provider: the run is admitted under a plan that names it.
     compaction: Option<Arc<Compactor>>,
+    /// The caller's routing selection the send carried.
+    route_decision: Option<&'static str>,
 }
 
 impl Case {
@@ -758,6 +758,7 @@ impl Case {
             output_limits: None,
             context_limit: None,
             compaction: None,
+            route_decision: None,
         }
     }
 }
@@ -882,6 +883,7 @@ async fn run_case(case: Case) -> Ran {
         .selection
         .unwrap_or_else(|| routed(first, &format!("decision-{first}")));
     let mut request = request();
+    request.route_decision_id = case.route_decision.map(str::to_owned);
     let compacted = case.compaction.is_some();
     let context_limit = case.context_limit.or(compacted.then_some(COMPACTED_LIMIT));
     request.context_limit = context_limit;
@@ -1550,6 +1552,32 @@ async fn two_walls_in_one_step_move_from_a_to_b_to_c() {
     let on_c = ran.sent_on("C");
     assert_eq!(on_c[0].first_attempt, 2);
     assert_eq!(rendered(&ran.sent_on("A")[1].opts), rendered(&on_c[0].opts));
+}
+
+/// A run admitted under a caller's routing selection names that selection as its predecessor on
+/// its first question, as routing's continue requires (contract 0.7.34), and the decision of
+/// the offer it moved on after that.
+#[tokio::test]
+async fn a_selection_backed_run_names_its_selection_first_and_then_the_offer() {
+    let ran = run_case(Case {
+        route_decision: Some("dec-select"),
+        ..Case::new(
+            vec![
+                ("A", vec![Reply::Tool, wall()]),
+                ("B", vec![wall()]),
+                ("C", vec![Reply::Answer]),
+            ],
+            vec![offer("B"), offer("C")],
+        )
+    })
+    .await;
+    assert_eq!(ran.reason(), RunFinishReason::Completed);
+    let named: Vec<_> = ran
+        .asked
+        .iter()
+        .map(|asked| asked.decision_id.as_deref())
+        .collect();
+    assert_eq!(named, [Some("dec-select"), Some("decision-B")]);
 }
 
 /// A second wall in the step is never answered by going back to an account that refused it.

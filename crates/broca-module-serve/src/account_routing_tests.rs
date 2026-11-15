@@ -3512,6 +3512,7 @@ fn continue_wall<'a>(
         run_id: "run-1",
         step_id: 2,
         selection,
+        predecessor: "decision-a",
         credential_id: &selection.credential_id,
         account: "acct-a",
         limit_window: "seven_day",
@@ -3608,15 +3609,6 @@ fn a_continue_request_is_built_from_the_wall_and_the_runs_selection() {
         serde_json::to_value(&request).unwrap()["exhausted"]["retry_after_s"],
         604_800
     );
-}
-
-#[test]
-fn a_selection_without_a_decision_asks_nothing() {
-    let mut selection = continue_selection();
-    selection.account_decision.as_mut().unwrap().decision_id = None;
-    let config = continue_config();
-    let wall = continue_wall(&selection, &config, &[], false);
-    assert!(continue_request(&wall).is_none());
 }
 
 #[test]

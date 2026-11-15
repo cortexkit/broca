@@ -337,6 +337,7 @@ async fn a_chatgpt_wall_offered_b(
         run_id: "chatgpt-run",
         step_id: 2,
         selection: &selection,
+        predecessor: "decision-a",
         credential_id: &selection.credential_id,
         account: "chatgpt-a",
         limit_window: "seven_day",

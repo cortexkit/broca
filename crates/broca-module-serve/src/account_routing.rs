@@ -2932,9 +2932,9 @@ pub enum ContinueOutcome {
 }
 
 /// The continue request for a usage wall or sign-in loss, in routing's types: the run, its
-/// original admission and conversation key, the decision the run uses now, and the unavailable
-/// account with its quota evidence or sign-in observation time. `None` when the selection lacks what routing needs
-/// to find the run (an admission id, a conversation key, a decision id).
+/// original admission and conversation key, its predecessor decision (`Wall::predecessor`), and
+/// the unavailable account with its quota evidence or sign-in observation time. `None` when the
+/// selection lacks what routing needs to find the run (an admission id, a conversation key).
 pub fn continue_request(
     wall: &broca_session_loop::account_move::Wall<'_>,
 ) -> Option<cortexkit_role_routing::account_continue::ContinueRequest> {
@@ -2972,7 +2972,7 @@ pub fn continue_request(
             wall.run_id,
             decision.admission_id.as_deref()?,
             decision.conversation_key.as_deref()?,
-            decision.decision_id.as_deref()?,
+            wall.predecessor,
             exhausted,
             selection_id,
         )

@@ -42,9 +42,11 @@ const CONTINUED_WINDOWS: [&str; 2] = ["five_hour", "seven_day"];
 pub struct Wall<'a> {
     pub run_id: &'a str,
     pub step_id: u64,
-    /// The selection the refused attempt was sent under. Its decision is the one routing knows
-    /// the run by now.
+    /// The selection the refused attempt was sent under.
     pub selection: &'a broca_wal::AuthSelection,
+    /// The decision routing's continue request names as the run's predecessor (see
+    /// [`predecessor`]).
+    pub predecessor: &'a str,
     /// The credential and account that hit the wall.
     pub credential_id: &'a str,
     pub account: &'a str,
@@ -227,6 +229,13 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     if !routed {
         return Ok(None);
     }
+    let Some(predecessor) = predecessor(
+        start_selection(writer).as_ref(),
+        admission.route_decision_id.as_deref(),
+        selection,
+    ) else {
+        return Ok(None);
+    };
     // The account the refused attempt was served by, as its own record names it.
     let Some(account) = limited
         .attempt
@@ -245,6 +254,7 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
         run_id: &admission.run_id,
         step_id,
         selection,
+        predecessor: &predecessor,
         credential_id: &selection.credential_id,
         account: &account,
         limit_window: window,
@@ -327,6 +337,13 @@ pub(crate) async fn signed_out<W: Writer, P: broca_core::Provider, T>(
         .account_ref
         .as_deref()
         .expect("eligible selection names an account");
+    let Some(predecessor) = predecessor(
+        start_selection(writer).as_ref(),
+        admission.route_decision_id.as_deref(),
+        selection,
+    ) else {
+        return Ok(None);
+    };
     if !refused.iter().any(|id| id == account) {
         refused.push(account.to_owned());
     }
@@ -338,6 +355,7 @@ pub(crate) async fn signed_out<W: Writer, P: broca_core::Provider, T>(
                 run_id: &admission.run_id,
                 step_id,
                 selection,
+                predecessor: &predecessor,
                 credential_id: &selection.credential_id,
                 account,
                 limit_window: "signed_out",
@@ -429,6 +447,41 @@ pub(crate) async fn record_move<W: Writer, P, T>(
         .expect("prepared move")
         .adopted(&moved.selection);
     Ok(())
+}
+
+/// The decision routing knows a run by when broca asks it to continue the run elsewhere
+/// (routing contract 0.7.34, the continue request's predecessor). While the run still sends
+/// under the account decision its start froze, that is the caller's routing selection the run was
+/// admitted under (`route_decision_id`), when the send carried one: routing chose the account
+/// for that selection. A run admitted without one names its account decision. After a move, or
+/// a resume routing gave another account, `selection` holds the decision of that offer, which
+/// is the predecessor from then on. `None` when the selection has no decision id.
+pub fn predecessor(
+    start_selection: Option<&Value>,
+    route_decision_id: Option<&str>,
+    selection: &broca_wal::AuthSelection,
+) -> Option<String> {
+    let current = selection
+        .account_decision
+        .as_ref()?
+        .decision_id
+        .as_deref()?;
+    let admitted = start_selection
+        .and_then(|start| start.get("account_decision"))
+        .and_then(|decision| decision.get("decision_id"))
+        .and_then(Value::as_str);
+    Some(match route_decision_id {
+        Some(select) if admitted == Some(current) => select.to_owned(),
+        _ => current.to_owned(),
+    })
+}
+
+/// The account selection the run's start froze, before any move or resume refroze it.
+fn start_selection<W: Writer>(writer: &W) -> Option<Value> {
+    crate::run::run_state(writer)
+        .start
+        .as_ref()
+        .and_then(|start| start.auth_selection.clone())
 }
 
 /// A provider's retry-after in whole seconds, rounded up, as routing's continue request takes
@@ -724,5 +777,38 @@ mod tests {
             assert_eq!(refused.retry_after_secs, own);
             assert_eq!(refused.account_continue, Some(Box::new(refusal)));
         }
+    }
+
+    /// The selection a run's start froze, routed under account decision `decision`.
+    fn routed(decision: Option<&str>) -> broca_wal::AuthSelection {
+        serde_json::from_value(json!({
+            "credential_id": "c",
+            "account_decision": {"path": "routed", "admission_id": "a", "decision_id": decision},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_continue_names_the_runs_selection_until_it_sends_under_another_decision() {
+        let start = serde_json::to_value(routed(Some("acd-1"))).unwrap();
+        // Still on its admitted account: the caller's selection, else its account decision.
+        assert_eq!(
+            predecessor(Some(&start), Some("dec-1"), &routed(Some("acd-1"))).as_deref(),
+            Some("dec-1")
+        );
+        assert_eq!(
+            predecessor(Some(&start), None, &routed(Some("acd-1"))).as_deref(),
+            Some("acd-1")
+        );
+        // Moved, or resumed on another account: the offer's decision.
+        assert_eq!(
+            predecessor(Some(&start), Some("dec-1"), &routed(Some("acd-2"))).as_deref(),
+            Some("acd-2")
+        );
+        // A selection without a decision gives routing nothing to continue.
+        assert_eq!(
+            predecessor(Some(&start), Some("dec-1"), &routed(None)),
+            None
+        );
     }
 }
