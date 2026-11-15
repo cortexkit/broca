@@ -58,7 +58,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         }
     }
     pub(super) async fn idle_warm_due(&self) -> Result<u64, String> {
-        if self.run.is_some() || self.stopping || self.close_after_one_shot {
+        if self.run.is_some() || self.stopping || self.close_when_idle {
             return Err("run_active_or_closing".into());
         }
         let operations = self.session.operations();

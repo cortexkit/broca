@@ -609,6 +609,20 @@ fn finish(
     Ok(response)
 }
 
+/// The cursor at `session`'s durable end, which a subscribe resumes from with nothing missed or
+/// repeated: `known` when the caller holds it (an actor's maintained cursor, or a stored view's
+/// shared projection; `Some(None)` when the session's control stream has no event yet, so there
+/// is no cursor), else projected from the session's retained log.
+pub(crate) async fn stream_head<B: SessionBackend>(
+    session: &Session<B>,
+    known: Option<Option<broca_core::Cursor>>,
+) -> Result<Option<broca_core::Cursor>, crate::serve::ServeError> {
+    match known {
+        Some(known) => Ok(known),
+        None => ViewHead::new(session).await.get(),
+    }
+}
+
 /// The `session.read` reply `request` asks of `session`, as far as the session decides it: the
 /// page, from the message `after_mid` names or the ordinal asked for, refused when the session's
 /// history version isn't the one asked for (the version the llm-runner surface serves,
@@ -686,14 +700,10 @@ pub(crate) async fn page<B: SessionBackend>(
     let mut response = crate::serve::session_read_response(page, tools);
     response.history_version = served_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
-    // The cursor at the read's durable end, which a subscribe resumes from with nothing missed
-    // or repeated. Actors provide their maintained cursor; stored views share one projection.
-    // A caller without either projects the retained log, or reads storage when needed.
-    let stream_head = match stream_head {
-        Some(known) => known,
-        None => ViewHead::new(session).await.get()?,
-    };
-    response.head = stream_head.map(broca_wire::CursorWire::from);
+    // The cursor at the read's durable end (see `stream_head`).
+    response.head = self::stream_head(session, stream_head)
+        .await?
+        .map(broca_wire::CursorWire::from);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
         entry.mid = mid;
     }

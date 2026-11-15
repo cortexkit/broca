@@ -2214,6 +2214,64 @@ async fn a_send_leaving_its_model_runs_on_the_plans_model() {
     assert_eq!(start.model.model_id, "planned");
 }
 
+/// A steer that leaves its model to the session and finds no running run to join (the run it
+/// meant to join has ended) starts a run on that run's model and variant, never on the empty
+/// placeholder the serve layer leaves in the send.
+#[tokio::test]
+async fn a_steer_finding_no_run_starts_one_on_the_latest_runs_model() {
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, _) = actor_with(
+        executor(
+            vec![text_step("a1", "hello"), text_step("a2", "again")],
+            None,
+        ),
+        parts.clone(),
+    )
+    .await;
+    let mut first = untooled("first");
+    first.model = broca_protocol::ModelHandle::new("stub", "chosen");
+    first.variant = Some("high".into());
+    assert!(matches!(
+        send_with(&commands, "r1", first, SendKey::Minted).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    let mut steer = untooled("late steer");
+    steer.model = broca_protocol::ModelHandle::new("", "");
+    steer
+        .inherit_frozen
+        .insert(broca_protocol::request::InheritedParam::Model);
+    assert!(matches!(
+        send_as(
+            &commands,
+            "r2",
+            steer,
+            SendKey::Minted,
+            broca_protocol::Delivery::Steer
+        )
+        .await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let start = session
+        .operations()
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .as_ref()
+        .unwrap();
+    assert_eq!(start.run_id, "r2");
+    let admission = broca_session_loop::run::admission_of_start(start, &parts).unwrap();
+    assert_eq!(
+        admission.model,
+        broca_protocol::ModelHandle::new("stub", "chosen")
+    );
+    assert_eq!(admission.variant.as_deref(), Some("high"));
+}
+
 /// A send queued behind a planned session's running run drains under the session's plan: its
 /// run is sent the manifest's tools and records the manifest on its start.
 #[tokio::test]

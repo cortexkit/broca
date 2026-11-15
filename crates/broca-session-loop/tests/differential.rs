@@ -8451,6 +8451,51 @@ async fn unsupported_stopped_cut_stream_is_reset() {
     );
 }
 
+/// A finalize step drops the tool call its answer asked for, so the call's live words won't be
+/// stored: the display lane is reset and given the answer as it is stored, each block at its
+/// index in the stored message (the text moves from part 1 to part 0).
+#[tokio::test]
+async fn a_finalize_step_that_drops_a_call_restreams_the_stored_answer() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut last = answer(
+        "z",
+        vec![
+            call("cz", "read", json!({"path": "z"})),
+            ContentBlock::Text {
+                text: "final answer".into(),
+            },
+        ],
+        FinishReason::ToolCalls,
+    );
+    let streamed_call = DisplayEvent::ToolInputDelta {
+        mid: None,
+        part: None,
+        tool_call_id: ToolCallId("cz".into()),
+        delta: r#"{"path":"z"}"#.into(),
+    };
+    last.insert(0, text_delta("z", "final answer"));
+    last.insert(0, NormalizedEvent::Display(streamed_call.clone()));
+    BUDGET
+        .scope(
+            Some(budgeted(&[], Some(1))),
+            DISPLAY_OUT.scope(out, async {
+                new_loop(&reads(1, last)).await;
+            }),
+        )
+        .await;
+    let mut stored = expected_delta("z", "final answer");
+    stored.set_part(0);
+    assert_eq!(
+        display_events(&mut events),
+        vec![
+            streamed_call,
+            expected_delta("z", "final answer"),
+            DisplayEvent::DisplayReset,
+            stored
+        ]
+    );
+}
+
 #[tokio::test]
 async fn grammar_downgrade_stream_is_reset_before_resend() {
     let (out, mut events) = mpsc::channel(64);

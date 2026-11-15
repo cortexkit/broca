@@ -2307,6 +2307,53 @@ where
     result
 }
 
+/// Resets the display lane and streams `message` on it again, each text, reasoning and tool-input
+/// block at its index in `message`, so a live view shows the answer as it will be stored.
+async fn restream(
+    out: Option<&mpsc::Sender<OutputEvent>>,
+    message: &AssistantMessage,
+    live: &mut bool,
+) {
+    use broca_protocol::content::ContentBlock;
+    use broca_protocol::DisplayEvent;
+    let Some(out) = out else {
+        return;
+    };
+    let _ = out
+        .send(OutputEvent::Display(DisplayEvent::DisplayReset))
+        .await;
+    *live = false;
+    for (index, part) in message.content.iter().enumerate() {
+        let mut event = match part {
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                DisplayEvent::TextDelta {
+                    mid: None,
+                    part: None,
+                    message_id: message.message_id.clone(),
+                    tool_call_id: None,
+                    delta: text.clone(),
+                }
+            }
+            ContentBlock::Reasoning { text, .. } => DisplayEvent::ReasoningDelta {
+                mid: None,
+                part: None,
+                message_id: message.message_id.clone(),
+                delta: text.clone(),
+            },
+            ContentBlock::ToolCall(call) => DisplayEvent::ToolInputDelta {
+                mid: None,
+                part: None,
+                tool_call_id: call.tool_call_id.clone(),
+                delta: call.input.to_string(),
+            },
+            _ => continue,
+        };
+        event.set_part(index as u64);
+        let _ = out.send(OutputEvent::Display(event)).await;
+        *live = true;
+    }
+}
+
 async fn reset_live_display(out: Option<&mpsc::Sender<OutputEvent>>, live: &mut bool) {
     if std::mem::take(live) {
         if let Some(out) = out {
@@ -3325,6 +3372,8 @@ where
         // The post-assistant hooks edit the answer's text before anything decides on it, so
         // the stop conditions, the record and the next request all see the edited answer.
         let mut step = step;
+        // What streamed live, kept only when the answer can still change before it is stored.
+        let streamed = (hooks.is_some() || finalizing).then(|| step.message.content.clone());
         let step_hooks = match hooks.as_ref() {
             Some(runtime) => post_assistant(runtime, step_id, &mut step.message).await,
             None => None,
@@ -3345,6 +3394,11 @@ where
             if step.finish_reason == FinishReason::ToolCalls {
                 step.finish_reason = FinishReason::Stop;
             }
+        }
+        // Words that streamed live and won't be stored are abandoned: the display lane is reset
+        // and given the answer as it will be stored.
+        if streamed.is_some_and(|streamed| streamed != step.message.content) {
+            restream(seams.out, &step.message, live_display).await;
         }
         // What the step records about the refusal fallback. A refusal after a completed tool
         // call commits as a tool step and arms the schedule, as today's loop commits it.

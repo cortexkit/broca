@@ -99,7 +99,11 @@ pub struct StoreActor<B: SessionBackend> {
     /// Reopening loses the hints, as it does in the WAL actor.
     one_shot_runs: std::collections::HashSet<RunId>,
     one_shot_submissions: std::collections::HashSet<broca_protocol::SubmissionId>,
-    close_after_one_shot: bool,
+    /// Set when the actor is to close as soon as nothing holds it open, instead of waiting out
+    /// its idle timeout: after a one-shot run's durable end, and after the send that created the
+    /// session was refused before its run started, so closing deletes the session it left
+    /// untouched (see [`StoreActor::created_here`]).
+    close_when_idle: bool,
     /// A late result raced the task's held pause; resume after its terminal is processed.
     held_resume_owed: bool,
     restart_admitting: bool,
@@ -431,7 +435,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run: None,
             one_shot_runs: Default::default(),
             one_shot_submissions: Default::default(),
-            close_after_one_shot: false,
+            close_when_idle: false,
             held_resume_owed: false,
             restart_admitting: false,
             restart_waiters: Vec::new(),
@@ -567,6 +571,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     pub fn created_here(mut self) -> Self {
         self.created = Some(self.session.next_seq());
         self
+    }
+
+    /// The session's latest run's frozen config, with the run's later refreezes folded in, or
+    /// `None` before any run and when that run was seeded from an import, which froze nothing a
+    /// caller chose.
+    fn latest_run_config(&self) -> Result<Option<broca_wal::RunConfig>, String> {
+        let Some(run) = self.session.operations().run.as_ref() else {
+            return Ok(None);
+        };
+        let Some(start) = run
+            .start
+            .as_ref()
+            .filter(|start| start.seeded != Some(true))
+        else {
+            return Ok(None);
+        };
+        warm::run_config(run, start, &self.parts)
+            .map(Some)
+            .map_err(|error| format!("the session's latest run start: {error:?}"))
     }
 
     /// Whether this actor created the session and nothing was appended to it since: no run
@@ -1208,19 +1231,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             self.retry_views().await;
-            if self.close_finished_one_shot().await {
+            if self.closes_now().await {
                 return Exit::Idle;
             }
         }
     }
 
-    /// Match the WAL actor's `close_finished_one_shot`/`try_close`: only a durable terminal,
-    /// never a pause, can skip the TTL; an active run, live subscriber, warm or run-starting
-    /// queued send still holds the actor open. Billing and cancel finalization are awaited
-    /// inline here, before this check, rather than held in background tasks as in the WAL actor.
-    /// A blocked attempt is consumed, so losing the holder later waits for ordinary idle close.
-    async fn close_finished_one_shot(&mut self) -> bool {
-        std::mem::take(&mut self.close_after_one_shot)
+    /// Whether the actor closes now rather than at its idle timeout: only when
+    /// [`StoreActor::close_when_idle`] was set and nothing holds the actor open (an active run,
+    /// a live subscriber, a warm or a queued send that starts a run). Billing and cancel
+    /// finalization are awaited before this check. The flag is consumed, so an actor a holder
+    /// kept open waits for the ordinary idle close.
+    async fn closes_now(&mut self) -> bool {
+        std::mem::take(&mut self.close_when_idle)
             && self.idle_holds().is_empty()
             && matches!(self.queue_starts_runs().await, Ok(false))
     }
@@ -1797,14 +1820,33 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     return false;
                 }
                 let steering = order.is_none() && delivery == broca_protocol::Delivery::Steer;
-                // Today's actor lets a plain send leave its model to the session only when a
-                // plan selected the session's next-run model (`plan.model`), and then runs it on
-                // that model: the latest refresh's choice, else the first run's plan's. A steer
-                // may leave it: it joins a run whose model is already frozen. So may an ordered
-                // send whose list names a mode delivered into a running run; it takes the latest
-                // run's model, unless the plan's selection applies to a run it starts now.
+                // A steer, an interrupt, or a delivery list that can join a run takes every
+                // runner parameter it left to the session from the session's latest run
+                // (llm-runner: a steer or interrupt "takes every parameter the runner freezes
+                // for the session, when the send omits it, from the frozen value"). Only such
+                // sends name parameters in `inherit_frozen`. The fill comes after the retry
+                // lookup above, which matches the send as it arrived.
+                if !request.inherit_frozen.is_empty() {
+                    match self.latest_run_config() {
+                        Ok(Some(config)) => {
+                            crate::actor::inherit_frozen_parameters(&mut request, &config)
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = reply.send(SendOutcome::Error(error));
+                            return false;
+                        }
+                    }
+                }
+                // The model a send leaves to the session, when the send can start a run: the
+                // plan's selection of the session's next-run model (`plan.model`, the latest
+                // refresh's choice, else the first run's plan's) when there is one, else the
+                // latest run's. A plain send must have a selection; a steer, an interrupt or a
+                // joining delivery list falls back to the latest run. A steer into a running run
+                // keeps that run's model, which is already frozen, and so does an ordered send
+                // delivered into a running run.
                 let joins = order.as_ref().is_some_and(ordered::joins_a_run);
-                if !steering
+                if !(steering && self.run.is_some())
                     && request
                         .inherit_frozen
                         .contains(&broca_protocol::request::InheritedParam::Model)
@@ -1825,7 +1867,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             return false;
                         }
                     };
-                    if selection.is_none() && !joins {
+                    if selection.is_none() && !joins && !steering && !interrupting {
                         let _ = reply.send(SendOutcome::DeliveryRefused {
                             code: "invalid_params",
                             field: "model",
@@ -3598,7 +3640,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
-        self.close_after_one_shot = active.one_shot
+        let one_shot_ended = active.one_shot
             && completed
             && self
                 .session
@@ -3606,6 +3648,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .run
                 .as_ref()
                 .is_some_and(|run| run.run_id == active.run_id.0 && run.finished.is_some());
+        // A creating send refused before its run started leaves a session nobody sent anything
+        // to; closing now deletes it, so the address reads as having no session at once, not
+        // after the idle timeout.
+        self.close_when_idle = one_shot_ended || self.created_and_untouched();
         if std::mem::take(&mut self.held_resume_owed) {
             if let Err(error) = self.resume_held().await {
                 tracing::error!(target: "broca.store_actor", %error, "could not resume a held run after its task parked");

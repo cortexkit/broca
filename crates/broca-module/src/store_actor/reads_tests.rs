@@ -1285,6 +1285,44 @@ async fn a_session_created_again_is_read_fresh() {
         .await;
 }
 
+/// `session.head` carries the same control cursor (`head`) as a `session.read` page of the same
+/// session, the cursor a subscribe resumes from, both while the session's actor is open and
+/// from the stored view once it closed.
+#[tokio::test]
+async fn session_head_serves_the_cursor_a_read_page_serves() {
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    let m = module(vec![text_step("a1", "one")]).await;
+    active(m.send("r1", "first").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+
+    let cursors = || async {
+        let head = m.registry.head(&m.key).await.unwrap().head;
+        let read = m
+            .registry
+            .read(SessionReadRequest::new(m.key.clone(), Some(1), None))
+            .await
+            .unwrap()
+            .head;
+        (
+            serde_json::to_value(head).unwrap(),
+            serde_json::to_value(read).unwrap(),
+        )
+    };
+    let (head, read) = cursors().await;
+    assert!(
+        !read.is_null(),
+        "a read page of a session that ran carries a cursor"
+    );
+    assert_eq!(head, read, "the open actor's head serves the read's cursor");
+    m.close().await;
+    let (closed_head, closed_read) = cursors().await;
+    assert_eq!(
+        closed_head, closed_read,
+        "the stored view's head serves the read's cursor"
+    );
+    assert_eq!(closed_head, head, "closing moved nothing");
+}
 /// Every llm-runner surface serves a store session's history version one above the version its
 /// head stores (`store_exposure::EXPOSURE_EPOCH`), from the session's first read on, and takes a
 /// caller's version back the same way: a page asked for at the served version is served, and one

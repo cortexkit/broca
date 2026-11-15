@@ -321,18 +321,26 @@ pub async fn execute<B: SessionBackend>(
                 .await,
         ),
         StoreReadRequest::Head => StoreReadReply::Head(
-            crate::store_head::build_with_retry(
-                session,
-                ctx.parts,
-                ctx.open,
-                ctx.labels.clone(),
-                ctx.live_step
-                    .and_then(|live| live.step.as_ref())
-                    .and_then(|step| step.retry_awaits.as_deref()),
-            )
-            .await
-            .map(Box::new)
-            .map_err(crate::store_head::head_failed),
+            async {
+                let mut head = crate::store_head::build_with_retry(
+                    session,
+                    ctx.parts,
+                    ctx.open,
+                    ctx.labels.clone(),
+                    ctx.live_step
+                        .and_then(|live| live.step.as_ref())
+                        .and_then(|step| step.retry_awaits.as_deref()),
+                )
+                .await
+                .map_err(crate::store_head::head_failed)?;
+                // The cursor a `session.read` page of the same session carries now, which a
+                // subscribe resumes from.
+                head.reply.head = crate::store_read::stream_head(session, ctx.stream_head)
+                    .await?
+                    .map(broca_wire::CursorWire::from);
+                Ok(Box::new(head))
+            }
+            .await,
         ),
         StoreReadRequest::Page(page) => StoreReadReply::Page(
             crate::store_read::page(session, ctx.parts, page, ctx.stream_head).await,

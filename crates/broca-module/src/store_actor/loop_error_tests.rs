@@ -59,6 +59,9 @@ struct FailingExecutor {
     fails_next: AtomicBool,
     temporarily_refuse_resume: AtomicBool,
     fail: Notify,
+    /// When set, the next fresh run's admission is refused because routing couldn't be reached,
+    /// before anything of the run is written.
+    routing_unreachable_next: AtomicBool,
 }
 
 #[async_trait]
@@ -118,6 +121,11 @@ impl RunExecutor for FailingExecutor {
             };
             match mode {
                 StoreRunMode::Fresh => {
+                    if self.routing_unreachable_next.swap(false, Ordering::SeqCst) {
+                        return Err(StoreRunError::Admission(RunError::RoutingUnavailable(
+                            broca_core::RoutingUnavailable::unreachable(),
+                        )));
+                    }
                     let admission = broca_session_loop::admit::admission(
                         &mut req,
                         &control,
@@ -301,6 +309,7 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
         fails_next: AtomicBool::new(true),
         fail: Notify::new(),
         temporarily_refuse_resume: AtomicBool::new(false),
+        routing_unreachable_next: AtomicBool::new(false),
     });
     let side = Side::new(Arc::clone(&executor)).await;
     let sent = side.send("r1", "first").await;
@@ -332,6 +341,116 @@ async fn a_run_whose_loop_fails_after_its_start_ends_with_the_error_and_the_sess
     side.until_state("r3", "completed").await;
 }
 
+/// A send that creates its session and is refused before its run starts (here routing can't
+/// be reached for its account) leaves nothing behind: the actor closes at once rather than at
+/// its idle timeout, which deletes the session it created, so the address has no session again.
+#[tokio::test]
+async fn a_refused_creating_send_leaves_no_session() {
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![text_step("a1", "never asked")])),
+        fails_next: AtomicBool::new(false),
+        fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        routing_unreachable_next: AtomicBool::new(true),
+    });
+    let side = Side::new(Arc::clone(&executor)).await;
+    let sent = side.send("r1", "first").await;
+    assert!(
+        !matches!(
+            sent,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{sent:?}"
+    );
+    let runtime = side.registry.store_runtime().unwrap();
+    broca_test_support::wait_until("the refused send's session is deleted", || async {
+        match (
+            side.registry.slot_state(&side.key),
+            runtime.current_view(&side.key).await,
+        ) {
+            (None, Ok(None)) => Ok(()),
+            (slot, view) => Err(format!(
+                "slot {slot:?}, session present: {:?}",
+                view.map(|view| view.is_some())
+            )),
+        }
+    })
+    .await;
+    assert!(
+        executor.script.calls().is_empty(),
+        "no model request was sent"
+    );
+}
+
+/// A send ordered to start a run when the session is idle (`idle_start`) is answered `pending`,
+/// and its run starts in the background. When routing can't be reached for that run's account,
+/// the run ends with the refusal at once: `run.status` reads a transient `routing_unavailable`
+/// error and `session.send_status` reads the send finished with an error, without any later send
+/// waking the session, and admission is never retried for it.
+#[tokio::test]
+async fn an_idle_start_send_routing_cant_admit_reads_as_an_error_on_both_status_surfaces() {
+    let executor = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![text_step("a1", "never asked")])),
+        fails_next: AtomicBool::new(false),
+        fail: Notify::new(),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        routing_unreachable_next: AtomicBool::new(true),
+    });
+    let side = Side::new(Arc::clone(&executor)).await;
+    let key = SendKey::SendId("refused".into());
+    let request = side.caller.shape("r1", &key, request("first"));
+    let sent = side
+        .registry
+        .route_submission_with_order(
+            &side.key,
+            RunId("r1".into()),
+            request,
+            RunKind::FreshOrResume,
+            key,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(broca_protocol::DeliveryOrder {
+                modes: vec![broca_protocol::DeliveryMode::IdleStart],
+                dedupe_key: None,
+                expires_at_ms: None,
+                template: None,
+            }),
+        )
+        .await
+        .expect("the session opens");
+    assert!(matches!(sent, SendOutcome::Pending { .. }), "{sent:?}");
+
+    let status = side.until_state("r1", "error").await;
+    assert_eq!(status["error"]["class"], "transient", "{status}");
+    assert_eq!(
+        status["error"]["provider_code"], "routing_unavailable",
+        "{status}"
+    );
+    let send_status = serde_json::to_value(
+        side.registry
+            .send_status(&side.key, RunId("r1".into()), "refused", None)
+            .await
+            .expect("the send's fate reads"),
+    )
+    .unwrap();
+    assert_eq!(send_status["state"], "finished", "{send_status}");
+    assert_eq!(send_status["reason"], "error", "{send_status}");
+    assert!(
+        !executor.routing_unreachable_next.load(Ordering::SeqCst),
+        "the refused run was admitted once"
+    );
+    assert!(
+        executor.script.calls().is_empty(),
+        "no model request is sent for a run routing can't admit"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_admission_of_an_existing_auth_pause_records_an_error() {
     let executor = Arc::new(FailingExecutor {
@@ -342,6 +461,7 @@ async fn a_failed_admission_of_an_existing_auth_pause_records_an_error() {
         fails_next: AtomicBool::new(false),
         fail: Notify::new(),
         temporarily_refuse_resume: AtomicBool::new(false),
+        routing_unreachable_next: AtomicBool::new(false),
     });
     let side = Side::new(executor.clone()).await;
     let key = || SendKey::SendId("synthetic-send".into());
@@ -375,6 +495,7 @@ async fn a_temporary_admission_failure_keeps_the_pause_for_a_later_resume() {
         fails_next: AtomicBool::new(false),
         temporarily_refuse_resume: AtomicBool::new(false),
         fail: Notify::new(),
+        routing_unreachable_next: AtomicBool::new(false),
     });
     let side = Side::new(executor.clone()).await;
     let key = || SendKey::SendId("temporary-admission-send".into());
@@ -488,6 +609,7 @@ async fn a_refused_resume_of_a_started_run_ends_it_before_the_next_run(temporary
         fails_next: AtomicBool::new(true),
         temporarily_refuse_resume: AtomicBool::new(false),
         fail: Notify::new(),
+        routing_unreachable_next: AtomicBool::new(false),
     });
     let mut side = Side::new(Arc::clone(&original)).await;
     let sent = side.send("r1", "first").await;
@@ -532,6 +654,7 @@ async fn a_refused_resume_of_a_started_run_ends_it_before_the_next_run(temporary
         fails_next: AtomicBool::new(!temporary),
         temporarily_refuse_resume: AtomicBool::new(temporary),
         fail: Notify::new(),
+        routing_unreachable_next: AtomicBool::new(false),
     });
     let mut restarted = Side::at(stopped, side.key.clone(), Arc::clone(&resumed)).await;
     // The same caller sends on: its later sends leave out the tools its first send froze into
