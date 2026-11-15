@@ -177,6 +177,25 @@ async fn closed_read_fixture(
     (root, runtime, registry, key)
 }
 
+/// Only a session kept in the ephemeral root can expire, so the expiry check every operation
+/// makes reads no log for a session kept anywhere else. It used to load the session's whole
+/// view, also for a running session whose actor then served the operation itself.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn the_expiry_check_reads_no_log_outside_the_ephemeral_root() {
+    use std::sync::atomic::Ordering;
+    let (root, runtime, registry, key) =
+        closed_read_fixture("expiry-reads", crate::store_reads::ViewCache::MAX_BYTES).await;
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    for _ in 0..3 {
+        registry.check_expired(&key, None).await.unwrap();
+    }
+    assert_eq!(runtime.log_reads.load(Ordering::Relaxed), 0);
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn cached_closed_pages_read_the_log_once() {
@@ -411,16 +430,14 @@ async fn raw_sender_pages_reuse_the_stored_position_with_or_without_an_actor() {
         .await
         .unwrap();
     assert_eq!(open["messages"], first["messages"]);
+    // The view the closed pages loaded is still the session's position, and the expiry check no
+    // longer loads a view of its own, so the open session's pages read nothing more.
     assert_eq!(
         runtime.log_reads.load(Ordering::Relaxed),
-        1,
-        "first sender page may load a stored view"
+        0,
+        "the first page with the actor open reuses the closed pages' view"
     );
-    assert_eq!(
-        runtime.checkpoint_frame_reads.load(Ordering::Relaxed),
-        1,
-        "a stored view's stream head reads its checkpoint frame"
-    );
+    assert_eq!(runtime.checkpoint_frame_reads.load(Ordering::Relaxed), 0);
     for _ in 0..3 {
         assert_eq!(
             open,
@@ -431,16 +448,12 @@ async fn raw_sender_pages_reuse_the_stored_position_with_or_without_an_actor() {
     }
     assert_eq!(
         runtime.log_reads.load(Ordering::Relaxed),
-        1,
+        0,
         "later sender pages reuse the view and its index"
     );
-    assert_eq!(
-        runtime.checkpoint_frame_reads.load(Ordering::Relaxed),
-        1,
-        "later sender pages reuse the view's stream head"
-    );
+    assert_eq!(runtime.checkpoint_frame_reads.load(Ordering::Relaxed), 0);
     assert_eq!(registry.slot_state(&key), Some("open"));
-    eprintln!("raw sender history: closed pages=2 log_reads=1 checkpoint_frame_reads=1; open pages=4 log_reads=1 checkpoint_frame_reads=1");
+    eprintln!("raw sender history: closed pages=2 log_reads=1 checkpoint_frame_reads=1; open pages=4 log_reads=0 checkpoint_frame_reads=0");
     // The actor owns files until the registry shuts it down; the shared scratch root reclaims them.
     drop(handle);
     drop(registry);
@@ -448,6 +461,8 @@ async fn raw_sender_pages_reuse_the_stored_position_with_or_without_an_actor() {
     let _ = root;
 }
 
+/// A registered session whose stored state owes recovery nothing is retired by the boot sweep
+/// without being opened, and a later sweep has nothing left to inspect.
 #[tokio::test]
 async fn a_finished_administrative_install_retires_its_recovery_candidate() {
     let root = state_root("installed-candidate");
@@ -468,7 +483,8 @@ async fn a_finished_administrative_install_retires_its_recovery_candidate() {
     create_in(&root, class, &key).await;
     let sweep = registry.recover_store_crash_orphans().await.unwrap();
     assert!(sweep.failed.is_empty(), "{sweep:?}");
-    assert_eq!(sweep.recovered, 1);
+    assert_eq!((sweep.recovered, sweep.retired), (0, 1), "{sweep:?}");
+    assert_eq!(registry.slot_state(&key), None, "the sweep opened no actor");
     assert_eq!(
         registry
             .recover_store_crash_orphans()

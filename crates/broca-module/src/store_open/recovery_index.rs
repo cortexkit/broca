@@ -54,6 +54,12 @@ pub(crate) fn members_for_test(root: &Path) -> io::Result<Option<Vec<SessionAddr
     candidates(root)
 }
 
+/// Whether `addr` is registered under `root`, whether or not the inventory is complete.
+#[cfg(test)]
+pub(crate) fn registered_for_test(root: &Path, addr: &SessionAddr) -> bool {
+    root.join(DIRECTORY).join(&addr.0).exists()
+}
+
 pub(super) fn prepare(root: &Path) -> io::Result<()> {
     broca_owner_only::create_dir_all(root.join(DIRECTORY))?;
     sync_dir(root)

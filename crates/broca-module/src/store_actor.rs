@@ -532,15 +532,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(())
     }
 
+    /// Retires the session's recovery registration once its durable state owes a boot nothing,
+    /// by the boot sweep's own rule (`recovery::owes_recovery`): a run paused for sign-in on an
+    /// account routing didn't choose stays paused but is retired, since opening does nothing for
+    /// it.
     fn retire_recovery(&mut self) {
-        let operations = self.session.operations();
         if self.run.is_some()
-            || operations
-                .run
-                .as_ref()
-                .is_some_and(|run| run.finished.is_none())
-            || !operations.queue.is_empty()
-            || (self.billing.is_some() && !operations.billing_owed.is_empty())
+            || crate::store_open::recovery::owes_recovery(
+                self.session.operations(),
+                self.billing.is_some(),
+                Some(&self.parts as &dyn broca_session_loop::parts::Parts),
+            )
         {
             return;
         }
@@ -2639,17 +2641,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     return;
                 }
                 if run.paused == Some(broca_protocol::PauseReason::AuthRequired) {
-                    let routed =
-                        broca_session_loop::account_move::current_auth_selection(run, &self.parts)
-                            .ok()
-                            .flatten()
-                            .and_then(|selection| selection.account_decision)
-                            .is_some_and(|decision| {
-                                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
-                                    && decision.admission_id.is_some()
-                                    && decision.decision_id.is_some()
-                            });
-                    if !routed {
+                    // The boot sweep skips the same unrouted pauses (`recovery::needs_recovery`).
+                    if !crate::store_open::recovery::sign_in_move_routed(run, &self.parts) {
                         return;
                     }
                     self.sign_in_open_owed = true;

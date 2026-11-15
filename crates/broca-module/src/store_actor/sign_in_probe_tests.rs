@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct CountAdmissions {
     inner: tests::LoopExecutor,
     calls: AtomicUsize,
+    /// Whether a fresh run's account is one routing chose, the kind a sign-in pause can ask
+    /// routing to move off.
+    routed: bool,
 }
 
 #[async_trait::async_trait]
@@ -28,7 +31,7 @@ impl RunExecutor for CountAdmissions {
         out: mpsc::Sender<OutputEvent>,
     ) -> StoreRunEnd {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if job.mode == StoreRunMode::Fresh {
+        if job.mode == StoreRunMode::Fresh && self.routed {
             job.control.auth_selection = Some(serde_json::from_value(serde_json::json!({
                 "credential_id":"credential-a","account_ref":"account-a","auth_method":"oauth",
                 "account_decision":{"path":"routed","admission_id":"r1","decision_id":"decision-a","conversation_key":"conversation"}
@@ -46,11 +49,18 @@ struct ProbeFixture {
 }
 
 async fn paused_probe(label: &str) -> ProbeFixture {
+    paused_on(label, true).await
+}
+
+/// A session whose first run paused for sign-in, its account routed or not, and an actor over it
+/// that hasn't opened yet.
+async fn paused_on(label: &str, routed: bool) -> ProbeFixture {
     let backend: &'static MemoryBackend = Box::leak(Box::default());
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
     let runner = Arc::new(CountAdmissions {
         inner: executor(vec![auth_failure(), text_step("answer", "done")], None),
         calls: AtomicUsize::new(0),
+        routed,
     });
     let session = Session::create(
         backend,
@@ -88,6 +98,36 @@ async fn paused_probe(label: &str) -> ProbeFixture {
         runner,
         registry,
         backend,
+    }
+}
+
+/// A run paused for sign-in on an account routing didn't choose owes a boot nothing: opening
+/// leaves the pause as it is, so the actor retires the session's recovery registration and the
+/// next boot doesn't open it. The same pause on a routed account stays registered, since opening
+/// asks routing to move the run.
+#[tokio::test]
+async fn only_a_routed_sign_in_pause_stays_registered_for_recovery() {
+    for routed in [false, true] {
+        let fixture = paused_on(&format!("registered-{routed}"), routed).await;
+        let index = broca_test_support::scratch_root()
+            .join(format!("sign-in-index-{routed}-{}", std::process::id()));
+        // The actor registers and retires the session under its key's address.
+        let addr = SessionAddr(broca_core::session_addr(&bind()));
+        crate::store_open::recovery::register_candidate(&index, &addr).unwrap();
+        let actor = fixture.actor.with_recovery_index(index.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let commands = Commands::over(tx, fixture.backend);
+        let task = tokio::spawn(actor.serve(rx));
+        idle(&commands).await;
+        assert_eq!(
+            crate::store_open::recovery_index::registered_for_test(&index, &addr),
+            routed,
+            "routed: {routed}: whether the session is still registered after its open"
+        );
+        drop(commands);
+        drop(task.await.unwrap());
+        drop(fixture.registry);
+        let _ = std::fs::remove_dir_all(index);
     }
 }
 

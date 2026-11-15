@@ -213,11 +213,15 @@ impl RetentionService {
                 return Vec::new();
             }
         };
+        // A set, not a scan of the list for each cached deadline: the ephemeral root holds tens
+        // of thousands of sessions, and the scan cost each pass their count squared.
+        let listed: std::collections::HashSet<&str> =
+            addresses.iter().map(|addr| addr.0.as_str()).collect();
         self.store
             .deadlines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|address, _| addresses.iter().any(|addr| addr.0 == *address));
+            .retain(|address, _| listed.contains(address.as_str()));
         let mut deleted = Vec::new();
         for addr in addresses {
             match self

@@ -50,6 +50,17 @@ impl StoreRuntime {
                 return Ok((Some(marker.expired_at_ms), None));
             }
         }
+        // Only a session with a retention policy expires, and such a session is created in the
+        // ephemeral root. One kept in any other root can't expire, so its view isn't loaded:
+        // every operation runs this check, and loading the whole view here cost each read or
+        // send of a running session a full read of its log, which its actor then answered
+        // anyway.
+        if self
+            .class_of(key)?
+            .is_some_and(|class| class != StorageClass::Ephemeral)
+        {
+            return Ok((None, None));
+        }
         let Some(view) = self.current_view(key).await? else {
             return Ok((
                 run.is_none()

@@ -18,21 +18,78 @@ pub fn register_candidate(root: &Path, addr: &SessionAddr) -> std::io::Result<()
     super::recovery_index::insert(root, addr)
 }
 
-/// Whether a session's stored state leaves its open-time recovery anything to do: an unfinished
-/// run, queued sends, usage billing still owed (when `billing` runs), or a durable head that
-/// warms itself and so opens once at boot to rebuild its warming timer.
-fn needs_recovery(
+/// Whether a session's stored state leaves its open-time recovery anything to do: queued sends,
+/// usage billing still owed (when `billing` runs), an unfinished run that opening acts on, or a
+/// durable head that warms itself and so opens once at boot to rebuild its warming timer.
+///
+/// The one unfinished run opening leaves as it is: a run paused for sign-in on an account
+/// routing didn't choose. Only a person signing in or a caller's own command moves it, so
+/// opening it at boot changes nothing. Such pauses outlive the caller that started them (one-shot
+/// workers whose account was signed out weeks ago), and keeping them counted re-opened hundreds
+/// of sessions at every restart. The actor's open-time recovery makes the same decision (see
+/// `StoreActor::recover`). Without the session's setup `parts` the run's account can't be read,
+/// so every unfinished run counts.
+pub(crate) fn needs_recovery(
     operations: &broca_session_store::fold::operations::Operations,
     billing: bool,
+    parts: Option<&dyn broca_session_loop::parts::Parts>,
+) -> bool {
+    owes_recovery(operations, billing, parts)
+        || operations.run.as_ref().is_some_and(|run| {
+            run.start.as_ref().is_some_and(|start| {
+                start.session_class.as_deref() == Some("head")
+                    && start.keep_warm.as_ref() == Some(&serde_json::json!("auto"))
+            })
+        })
+}
+
+/// [`needs_recovery`] without a durable head's warming timer: what keeps a session registered
+/// for recovery. The actor retires its registration when this is false; durable heads need no
+/// registration to be found at boot, since every durable head is read there.
+pub(crate) fn owes_recovery(
+    operations: &broca_session_store::fold::operations::Operations,
+    billing: bool,
+    parts: Option<&dyn broca_session_loop::parts::Parts>,
 ) -> bool {
     !operations.queue.is_empty()
         || (billing && !operations.billing_owed.is_empty())
         || operations.run.as_ref().is_some_and(|run| {
             run.finished.is_none()
-                || run.start.as_ref().is_some_and(|start| {
-                    start.session_class.as_deref() == Some("head")
-                        && start.keep_warm.as_ref() == Some(&serde_json::json!("auto"))
-                })
+                && !parts.is_some_and(|parts| waits_only_on_a_sign_in(run, parts))
+        })
+}
+
+/// Whether `run` is paused for sign-in with nothing opening could do for it: no cancel to
+/// finish, and an account routing didn't choose, so there is no move to ask routing for
+/// (see [`sign_in_move_routed`]).
+fn waits_only_on_a_sign_in(
+    run: &broca_session_store::fold::operations::Run,
+    parts: &dyn broca_session_loop::parts::Parts,
+) -> bool {
+    use broca_session_store::fold::operations::Resolution;
+    run.cancel.is_none()
+        && matches!(
+            run.resolution(),
+            Resolution::Paused(broca_protocol::PauseReason::AuthRequired)
+        )
+        && !sign_in_move_routed(run, parts)
+}
+
+/// Whether `run`'s current account is one routing chose for its admission, the only kind a run
+/// paused for sign-in can ask routing to move off when the session opens. A run whose account
+/// can't be read is taken as not routed: opening could not ask for it either.
+pub(crate) fn sign_in_move_routed(
+    run: &broca_session_store::fold::operations::Run,
+    parts: &dyn broca_session_loop::parts::Parts,
+) -> bool {
+    broca_session_loop::account_move::current_auth_selection(run, parts)
+        .ok()
+        .flatten()
+        .and_then(|selection| selection.account_decision)
+        .is_some_and(|decision| {
+            decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                && decision.admission_id.is_some()
+                && decision.decision_id.is_some()
         })
 }
 
@@ -61,7 +118,7 @@ pub async fn retire_settled_install(
         Err(_) => return Ok(false),
     };
     // Billing is taken to run: a session that still owes it stays registered either way.
-    if needs_recovery(&view.operations, true) {
+    if needs_recovery(&view.operations, true, None) {
         return Ok(false);
     }
     super::recovery_index::remove(root, addr)
@@ -93,6 +150,8 @@ pub(crate) fn candidate_addresses(
 pub struct StoreRecoverySweep {
     pub inspected: usize,
     pub recovered: usize,
+    /// Registered sessions found owing nothing, whose registration was retired without opening.
+    pub retired: usize,
     pub lease_held: usize,
     pub deferred: usize,
     pub failed: Vec<String>,
@@ -160,6 +219,11 @@ impl crate::registry::LineageRegistry {
                     if broca_core::session_addr(&key) != addr.0 {
                         return Err("head identity does not match its address".into());
                     }
+                    // The view reads every record that reached the store, the ones a crash left
+                    // past the head included, so a session it finds with nothing owed has
+                    // nothing for an open to do. A registration only says a session might owe
+                    // something; when it owes nothing the registration is retired here, without
+                    // opening the session.
                     match Session::view(
                         runtime.backend(class),
                         addr.clone(),
@@ -169,10 +233,19 @@ impl crate::registry::LineageRegistry {
                     .await
                     {
                         Ok(view)
-                            if !registered.contains(&addr.0)
-                                && !needs_recovery(&view.operations, runtime.billing.is_some()) =>
+                            if !needs_recovery(
+                                &view.operations,
+                                runtime.billing.is_some(),
+                                Some(runtime.parts_for(class, cipher)
+                                    as &dyn broca_session_loop::parts::Parts),
+                            ) =>
                         {
-                            return Ok(())
+                            if registered.contains(&addr.0) {
+                                super::recovery_index::remove(&root, &addr)
+                                    .map_err(|error| format!("retire recovery: {error}"))?;
+                                sweep.retired += 1;
+                            }
+                            return Ok(());
                         }
                         Ok(_) | Err(SessionError::NeedsRecovery) => {}
                         Err(error) => return Err(format!("read operational state: {error:?}")),

@@ -269,7 +269,7 @@ async fn recover_sessions(registry: &broca_module::LineageRegistry) -> bool {
     match registry.recover_store_crash_orphans().await {
         Ok(sweep) => {
             tracing::info!(target: "lifecycle", inspected = sweep.inspected,
-                recovered = sweep.recovered, lease_held = sweep.lease_held,
+                recovered = sweep.recovered, retired = sweep.retired, lease_held = sweep.lease_held,
                 deferred = sweep.deferred, failed = sweep.failed.len(),
                 "store restart resume candidate sweep complete");
             for error in sweep.failed {
