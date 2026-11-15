@@ -136,7 +136,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .ok_or("compaction session has no frozen configuration")?;
         let config = broca_session_loop::run::run_config_of_start(start, &self.parts)
             .map_err(|error| format!("{error:?}"))?;
-        let entries = crate::store_entries::all_entries(&self.session).await?;
+        let entries = self.entries_to_check(received.view()).await?;
         let floor = broca_session_loop::run::signed_floor(
             &self.session,
             &self.parts,
@@ -145,6 +145,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         .await
         .map_err(|error| format!("{error:?}"))?;
         let conditions = v2::host::conditions(&config, &entries, false, None, floor)?;
+        #[cfg(test)]
+        self.check_alike_against_every_entry(
+            &entries,
+            state.latest(),
+            received.view(),
+            &config,
+            floor,
+        )
+        .await?;
         let journal = ActorJournal {
             session: tokio::sync::Mutex::new(&mut self.session),
             applied_by: command.caller.as_deref(),
@@ -179,7 +188,114 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         serde_json::to_string(&answer).map_err(|error| error.to_string())
     }
+
+    /// The entries `view` is checked against: the ones the session's next step checks it
+    /// against (`broca_session_loop::compaction::transcript`), its open window and the earlier
+    /// entries the view names. A view cutting inside the window drops everything before the
+    /// window, so nothing else there can change its answer. Reading every entry instead decoded
+    /// the whole sealed history on every apply: about 38 s for a head imported with 422k
+    /// entries, past the provider's 30 s deadline.
+    ///
+    /// A view with no cut, or one cutting into the sealed history, keeps entries the window
+    /// doesn't hold, so it is checked against every entry, as before.
+    async fn entries_to_check(
+        &self,
+        view: &ProviderView,
+    ) -> Result<Vec<v2::protocol::read::Entry>, String> {
+        use v2::protocol::view::{EditOp, InsertAt};
+        let window_start = self.session.conversation.window_start();
+        let cut = view.edits.iter().find_map(|edit| match &edit.op {
+            EditOp::Cut { through } => Some(through),
+            _ => None,
+        });
+        let Some(cut) = cut.filter(|_| window_start > 1) else {
+            return crate::store_entries::all_entries(&self.session).await;
+        };
+        let named: Vec<String> = view
+            .edits
+            .iter()
+            .filter_map(|edit| match &edit.op {
+                EditOp::Drop { mid, .. } | EditOp::Replace { mid, .. } => Some(mid.clone()),
+                EditOp::Cut { through } => Some(through.clone()),
+                EditOp::Insert {
+                    at: InsertAt::Before(mid),
+                    ..
+                } => Some(mid.clone()),
+                _ => None,
+            })
+            .collect();
+        let project = |stored: Vec<broca_session_store::session::StoredEntry>| {
+            stored
+                .iter()
+                .map(broca_session_loop::entries::project)
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let read_error = |error| format!("{error:?}");
+        let mut entries = project(
+            crate::store_read::served_compaction_entries_by_mid(&self.session, &named)
+                .await
+                .map_err(read_error)?,
+        )?;
+        if entries
+            .iter()
+            .any(|entry| &entry.mid == cut && entry.ordinal < window_start)
+        {
+            return crate::store_entries::all_entries(&self.session).await;
+        }
+        entries.retain(|entry| entry.ordinal < window_start);
+        entries.extend(project(
+            crate::store_read::served_compaction_entries(&self.session, window_start, usize::MAX)
+                .await
+                .map_err(read_error)?,
+        )?);
+        entries.sort_by_key(|entry| entry.ordinal);
+        entries.dedup_by_key(|entry| entry.ordinal);
+        Ok(entries)
+    }
+
+    /// Test builds check every apply's answer against the answer over every entry, so each
+    /// test that applies a view proves [`Self::entries_to_check`] changes no answer. Skipped
+    /// for a session longer than [`CROSS_CHECK_ENTRIES`]: the scale gate's heads are, and
+    /// reading them whole is what the gate measures away.
+    #[cfg(test)]
+    async fn check_alike_against_every_entry(
+        &self,
+        entries: &[v2::protocol::read::Entry],
+        latest: Option<&ProviderView>,
+        view: &ProviderView,
+        config: &broca_wal::RunConfig,
+        floor: Option<u64>,
+    ) -> Result<(), String> {
+        if crate::store_read::transcript_len(&self.session) > CROSS_CHECK_ENTRIES {
+            return Ok(());
+        }
+        let every = crate::store_entries::all_entries(&self.session).await?;
+        let answer = |entries: &[v2::protocol::read::Entry]| -> Result<String, String> {
+            let conditions = v2::host::conditions(config, entries, false, None, floor)?;
+            Ok(format!(
+                "{:?}",
+                v2::views::check(
+                    entries,
+                    latest,
+                    view,
+                    &conditions.rules,
+                    v2::host::view_floor(&conditions),
+                )
+            ))
+        };
+        assert_eq!(
+            answer(entries)?,
+            answer(&every)?,
+            "a view checked against the window and its named entries is answered as against \
+             every entry"
+        );
+        Ok(())
+    }
 }
+
+/// The longest session a test build cross-checks each apply on.
+#[cfg(test)]
+const CROSS_CHECK_ENTRIES: u64 = 20_000;
 
 fn internal(message: String) -> StoreOutcome {
     StoreOutcome::Refused(ImportRefusal::new("internal_error", message))

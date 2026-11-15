@@ -118,7 +118,7 @@ pub async fn served_compaction_entries_by_mid<B: SessionBackend>(
     session: &Session<B>,
     mids: &[String],
 ) -> Result<Vec<StoredEntry>, SessionError> {
-    let entries = session.entries_by_mid(mids).await?;
+    let entries = session.compaction_entries_by_mid(mids).await?;
     Ok(held_back(session, entries))
 }
 

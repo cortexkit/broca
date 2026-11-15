@@ -235,6 +235,17 @@ impl<B: SessionBackend> Session<B> {
         let entries = self.entries(from, limit).await?;
         Ok(EnrollmentOverlay::serve(overlay.as_ref(), entries))
     }
+
+    /// The entries whose message ids `mids` lists, found by their ids
+    /// ([`Session::entries_by_mid`]) and served as [`Session::compaction_entries`] serves them.
+    pub async fn compaction_entries_by_mid(
+        &self,
+        mids: &[String],
+    ) -> Result<Vec<StoredEntry>, SessionError> {
+        let overlay = self.enrollment().await?;
+        let entries = self.entries_by_mid(mids).await?;
+        Ok(EnrollmentOverlay::serve(overlay.as_ref(), entries))
+    }
 }
 
 #[cfg(test)]

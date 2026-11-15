@@ -2147,6 +2147,81 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
     assert_eq!(applied, [1], "r3's first step applied the view");
 }
 
+/// Once a session is sealed behind a cut it keeps only its window open, and a view the
+/// provider applies is checked against the window and the earlier entries the view names, as
+/// the next step checks it, not against every entry. A cut further into the window with a drop
+/// of a sealed entry, a cut back into the sealed history (checked against every entry) and a
+/// stale version each get the answer every entry gives: test builds check each apply's answer
+/// against every entry (`check_alike_against_every_entry`).
+#[tokio::test]
+async fn a_view_applied_after_a_seal_is_answered_as_against_every_entry() {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let store = contract_sessions_with(
+        false,
+        vec![text_step("a4", "sealed behind the cut")],
+        Duration::from_secs(60),
+    )
+    .await;
+    let apply =
+        |view: View| store.compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }));
+    let cut = |version: u64, through: &str| {
+        Edit::new(
+            version,
+            EditOp::Cut {
+                through: through.to_owned(),
+            },
+        )
+    };
+    let mids = entry_mids(&store).await;
+    assert_eq!(
+        apply(View::seal(1, vec![cut(1, &mids[&2])])).await,
+        Ok(json!({"answer": "accepted"}))
+    );
+    // r3's first step applies the view and seals the history before its cut.
+    assert!(matches!(
+        store
+            .send_request("r3", untooled("again"), Some(planned("plan-1", None)))
+            .await,
+        SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+    ));
+    store.settled("r3").await;
+    store.assert_completed("r3").await;
+    let window_start = store
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&store.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .conversation
+        .window_start();
+    assert_eq!(window_start, 3, "the seal kept entries from 3 on open");
+
+    let further = apply(View::seal(
+        2,
+        vec![
+            cut(2, &mids[&6]),
+            Edit::new(
+                2,
+                EditOp::Drop {
+                    mid: mids[&1].clone(),
+                    part: None,
+                },
+            ),
+        ],
+    ))
+    .await;
+    let into_sealed = apply(View::seal(3, vec![cut(3, &mids[&1])])).await;
+    let stale = apply(View::seal(2, vec![cut(2, &mids[&6])])).await;
+    assert_eq!(further, Ok(json!({"answer": "accepted"})));
+    assert!(
+        matches!(&stale, Ok(answer) if answer["answer"] == "refused"),
+        "{stale:?}"
+    );
+    broca_test_support::pin!("a cut into the sealed history", into_sealed);
+}
+
 /// One of core's sends to a new head, as core serializes it for transport: its `session.send`
 /// params. Core's runner-head sample (prefrontal-core's
 /// `write_broca_head_first_send_sample`, at core commit 83d9e536) gave them, with synthetic

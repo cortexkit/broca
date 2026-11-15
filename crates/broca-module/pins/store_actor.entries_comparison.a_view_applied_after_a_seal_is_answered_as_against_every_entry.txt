@@ -1,0 +1,6 @@
+== a cut into the sealed history
+Ok(
+    Object {
+        "answer": String("accepted"),
+    },
+)

@@ -20,7 +20,7 @@ use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
 use super::*;
 use crate::serve::ServeHandler as _;
 use crate::store_import::{
-    ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
+    ApplyViewCommand, ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
 };
 
 /// The most an operation's median may take once the view is installed. Import and install are
@@ -32,6 +32,15 @@ const COLD_LIMIT: Duration = Duration::from_millis(50);
 
 /// Each repeated read runs this many times.
 const ROUNDS: usize = 5;
+
+/// How many later views the compaction provider applies after the sends.
+const APPLIES: usize = 3;
+
+/// The most an applied view's median may take. An apply on an idle head opens its actor,
+/// restores its compaction state from the open log and checks the view against the window's
+/// entries, each projected and hashed; about 46 ms on a 1,000-entry window. Before it checked
+/// against every entry it took tens of seconds on a 400k-entry head.
+const APPLY_LIMIT: Duration = Duration::from_millis(100);
 
 fn sha256_of(path: &std::path::Path) -> String {
     use sha2::Digest as _;
@@ -174,13 +183,24 @@ async fn scale_gate_imported_head() {
         .unwrap();
     let length = crate::store_read::transcript_len(&view);
     assert!(length > keep, "{length} entries, keeping {keep}");
-    let through = view.entries(length - keep, 1).await.unwrap()[0]
-        .state
-        .facts
-        .as_ref()
-        .unwrap()
-        .mid
-        .clone();
+    let mid_at = |ordinal: u64| {
+        let view = &view;
+        async move {
+            view.entries(ordinal, 1).await.unwrap()[0]
+                .state
+                .facts
+                .as_ref()
+                .unwrap()
+                .mid
+                .clone()
+        }
+    };
+    let through = mid_at(length - keep).await;
+    // The later views the compaction provider applies each cut a few entries further.
+    let mut later_cuts = Vec::new();
+    for step in 1..=APPLIES as u64 {
+        later_cuts.push(mid_at(length - keep + 5 * step).await);
+    }
     drop(view);
     report.push(format!(
         "entries: {length}, the view keeps the newest {keep}"
@@ -287,6 +307,9 @@ async fn scale_gate_imported_head() {
         ask.scope = head_scope(core());
         ask.tools = None;
         ask.policy_allowed = Default::default();
+        // A head's run freezes its model's context window; the compaction provider's views are
+        // checked under it. The test's executor admits the send's own.
+        ask.context_limit = Some(1_000_000);
         let run = format!("scale-gate-{round}");
         let phases_before = broca_session_store::metrics::snapshot();
         let started = Instant::now();
@@ -355,6 +378,36 @@ async fn scale_gate_imported_head() {
         }
         module.closed().await;
     }
+    // The compaction provider applies each later view through the session's actor, which
+    // checks it against the session's entries under the latest run's rules.
+    let mut applies = Vec::new();
+    for (index, cut) in later_cuts.into_iter().enumerate() {
+        let version = 2 + index as u64;
+        let view = View::seal(
+            version,
+            vec![Edit::new(version, EditOp::Cut { through: cut })],
+        );
+        eprintln!("scale gate: applying view {version}");
+        let started = Instant::now();
+        let outcome = module
+            .registry
+            .route_store_command(
+                &module.key,
+                StoreCommand::ApplyView(Box::new(ApplyViewCommand {
+                    view: serde_json::value::to_raw_value(&view).unwrap(),
+                    caller: Some("magic-context".into()),
+                })),
+            )
+            .await
+            .unwrap();
+        applies.push(started.elapsed());
+        match &outcome {
+            StoreOutcome::ViewApplied(answer) => {
+                assert!(answer.contains("accepted"), "view {version}: {answer}")
+            }
+            other => panic!("view {version}: {other:?}"),
+        }
+    }
     let spread = |mut times: Vec<Duration>| {
         times.sort();
         (times[times.len() / 2], times[times.len() - 1])
@@ -367,11 +420,16 @@ async fn scale_gate_imported_head() {
     // Through the run's first request and its scripted answer, with the test's stand-in
     // provider and compaction provider in the time: reported, not limited.
     measure(&format!("{rounds} sends: the run ends"), spread(ends), None);
+    measure(
+        &format!("{APPLIES} applied views"),
+        spread(applies),
+        Some(APPLY_LIMIT),
+    );
 
     eprintln!(
         "\nscale gate, {}:\n  {}",
         source.display(),
         report.join("\n  ")
     );
-    assert!(over.is_empty(), "over {LIMIT:?}: {over:?}");
+    assert!(over.is_empty(), "over their limits: {over:?}");
 }
