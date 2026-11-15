@@ -427,7 +427,7 @@ fn failing_step() -> Vec<NormalizedEvent> {
 /// Asserts the store's reply equals today's, and that it says `state` when given, so a
 /// comparison of two refusals never passes for a fact neither served.
 fn same(today: &Value, store: &Value, what: &str, state: Option<&str>) {
-    assert_eq!(store, today, "{what}");
+    alike!(store, today, "{what}");
     if let Some(state) = state {
         assert_eq!(store["state"], json!(state), "{what}: {store}");
     }

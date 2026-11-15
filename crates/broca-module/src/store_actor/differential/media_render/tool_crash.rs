@@ -173,7 +173,7 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(old.len(), 1, "today's next run sent its request");
+    alike_today_first!(old.len(), 1, "today's next run sent its request");
     let ended = {
         let runtime = store.side.registry.store_runtime().unwrap();
         let view = runtime

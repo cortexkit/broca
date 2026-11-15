@@ -66,6 +66,97 @@ Object {
     },
     "updated_at": Bool(true),
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "auth_required",
+      "run_id": "r1",
+      "type": "run_paused"
+    },
+    "unit": {
+      "error": {
+        "class": "auth_required",
+        "message": "sign in again",
+        "provider_code": "auth_required",
+        "status": 401
+      },
+      "reason": "auth_required",
+      "run_id": "r1",
+      "type": "paused"
+    }
+  },
+  {
+    "event": {
+      "reason": "restart",
+      "run_id": "r1",
+      "type": "run_paused"
+    },
+    "unit": {
+      "reason": "restart",
+      "run_id": "r1",
+      "type": "paused"
+    }
+  },
+  {
+    "event": {
+      "reason": "auth_required",
+      "run_id": "r1",
+      "type": "run_paused"
+    },
+    "unit": {
+      "error": {
+        "class": "auth_required",
+        "credential_id": "oauth:stub:synthetic",
+        "message": "Sign in to the synthetic account again",
+        "provider_code": "needs_reauth"
+      },
+      "reason": "auth_required",
+      "run_id": "r1",
+      "type": "paused"
+    }
+  }
+]
 == alike
 Object {
     "auth_selection": String("oauth:stub:synthetic"),
@@ -161,3 +252,5 @@ Object {
         "unreported_steps": Number(0),
     },
 }
+== control stream
+sha256:c2b2eefa54b5c092d5cf5d6785c0a42c15118ccbaba80297dc573d7aee5d0ccf (2685 bytes)

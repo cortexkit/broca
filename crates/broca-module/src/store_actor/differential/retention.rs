@@ -308,7 +308,7 @@ async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
     assert!(new.module.registry.slot_state(&new.module.key).is_some());
     let (old_sink, mut old_stream) = mpsc::channel(64);
     let (new_sink, mut new_stream) = mpsc::channel(64);
-    assert_eq!(
+    alike_today_first!(
         old.module
             .registry
             .route_subscribe_live(&old.module.key, old_sink)
@@ -532,7 +532,7 @@ async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
         rig.advance(deadline);
         assert_eq!(rig.module.registry.sweep_once(deadline).await.unwrap(), 1);
     }
-    assert_eq!(
+    alike_today_first!(
         old.module.wal.retired_tag_floor(&old.module.key).unwrap(),
         1
     );

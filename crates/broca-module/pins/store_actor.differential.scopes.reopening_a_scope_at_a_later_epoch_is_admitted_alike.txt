@@ -157,6 +157,19 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:8acc8d3fbf8c1afd3774d8debc19461c7700239826619257f6139485ace5ee2e (6199 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "reopened",
+    "hello",
+    "queued at the reopened epoch",
+    "hello",
+    "again",
+    "hello",
+]
 == the run starts record the sends differently
 sha256:d1e1f59883c11bf60d2438d2f3ac6a9e95193c449e3b512f17bf10e0a0c6643b (4931 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

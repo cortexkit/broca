@@ -441,3 +441,59 @@ Object {
     ],
     "tools_run_id": String("r1"),
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished"
+    }
+  }
+]

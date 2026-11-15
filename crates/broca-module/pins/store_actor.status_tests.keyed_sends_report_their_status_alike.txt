@@ -1,0 +1,34 @@
+== send.status k1
+Object {
+    "baseline": Object {
+        "accepted_generation": Number(0),
+        "applied_generation": Number(0),
+        "items": Array [],
+        "rungs": Object {
+            "system_text": Array [
+                String("on_prefix_rebuild"),
+                String("immediately"),
+            ],
+            "tools": Array [
+                String("on_prefix_rebuild"),
+                String("immediately"),
+            ],
+        },
+        "tool_names": Array [
+            String("read"),
+        ],
+    },
+    "reason": String("completed"),
+    "run_id": String("r-k1"),
+    "state": String("finished"),
+}
+== send.status k2
+Object {
+    "reason": String("completed"),
+    "run_id": String("r-k2"),
+    "state": String("finished"),
+}
+== send.status k9
+Object {
+    "refused": String("UnknownSend"),
+}

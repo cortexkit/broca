@@ -18,6 +18,13 @@ sha256:4ce9e2ef888fc644b29f3fa174b7588a6b49a3596a7e8f62728596849e889e3d (8490 by
     "\"terminal_synced c1\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -38,25 +45,12 @@ sha256:4ce9e2ef888fc644b29f3fa174b7588a6b49a3596a7e8f62728596849e889e3d (8490 by
     "\"terminal_synced c1\"",
     "\"batch_finished\"",
 ]
-== request count
-2
-== request 0
-sha256:90bff39b61c886f0bc3928a6940557fe4b8f6660533036aac690ba347370a6bf (2782 bytes)
-== request 1
-sha256:7510a26718f32e842d25bc56c72f476b24327c05083f4ab3a2d00345c6922ed4 (6330 bytes)
-== record count
-24
-== records
-sha256:592273dc903987f9e453f3e045c0f72aef4a50e253f0bb75ff5aec6304b420d6 (8709 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"job\\\":1} key#1 recorder=true\"",
-    "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
-    "\"held_wait c1\"",
-    "\"terminal_synced c1\"",
-    "\"batch_finished\"",
+    (
+        Completed,
+        None,
+    ),
 ]
 == request count
 2
@@ -77,4 +71,38 @@ sha256:592273dc903987f9e453f3e045c0f72aef4a50e253f0bb75ff5aec6304b420d6 (8709 by
     "\"held_wait c1\"",
     "\"terminal_synced c1\"",
     "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
+2
+== request 0
+sha256:90bff39b61c886f0bc3928a6940557fe4b8f6660533036aac690ba347370a6bf (2782 bytes)
+== request 1
+sha256:7510a26718f32e842d25bc56c72f476b24327c05083f4ab3a2d00345c6922ed4 (6330 bytes)
+== record count
+24
+== records
+sha256:592273dc903987f9e453f3e045c0f72aef4a50e253f0bb75ff5aec6304b420d6 (8709 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"job\\\":1} key#1 recorder=true\"",
+    "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
+    "\"held_wait c1\"",
+    "\"terminal_synced c1\"",
+    "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
 ]

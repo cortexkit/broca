@@ -11,6 +11,8 @@ Pending {
         "sub-r2",
     ),
 }
+== control stream
+sha256:0e6b6afd6f4d6dac8d3158d4d5f6425505a8759cc0e56cd24b3859ac0fff76e1 (3434 bytes)
 == the conversations differ
 [
     "you are a worker",
@@ -220,3 +222,36 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:f2d77adaf0f610258dfd2832a44b9a458c2f258776ad0c94159a96d924fa057d (2921 bytes)
+== the queued send is transformed once, when it is queued
+(
+    2,
+    2,
+)
+== alike
+[
+    (
+        "queued",
+        Object {
+            "final": Array [
+                Object {
+                    "content": Array [
+                        Object {
+                            "text": String("[noted] second"),
+                            "type": String("text"),
+                        },
+                    ],
+                    "role": String("user"),
+                },
+            ],
+            "ops": Array [
+                Object {
+                    "block": Number(0),
+                    "hook": String("pre_user"),
+                    "module": String("noter"),
+                    "op": String("prepend"),
+                    "phase": Null,
+                },
+            ],
+        },
+    ),
+]

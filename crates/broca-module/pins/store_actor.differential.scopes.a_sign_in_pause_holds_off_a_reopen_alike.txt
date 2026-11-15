@@ -104,6 +104,15 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:0520fc7ea904eac0ba37b4fb51b12abc68bad0b27c951ee2cdcb314942476c63 (3617 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "reopened",
+    "hello",
+]
 == the run starts record the sends differently
 sha256:d9569f5deb258f01eca3d1fd7f0edabf3e5e20472db6b61253b673694e9dd712 (2466 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

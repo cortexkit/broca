@@ -18,6 +18,8 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:480cb8c25d6ad38dad027290728605b4fcd5635bb1abd2071049265550983a38 (3401 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:e0a8a2abca4496f8c24954525cfe8e4df9db96178471ea3de07801805a2cbb35 (4338 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -206,6 +208,58 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:0332a4d96f36d4213505d45ae267d79c1395905442c7fec30903a4e7ff88d986 (3001 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r1"),
+        "submission_id": Null,
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+    Object {
+        "order": Object {
+            "expires_at_ms": Bool(true),
+            "modes": Array [
+                String("tool_result"),
+            ],
+        },
+        "ordered": String("sub-q1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("aft"),
+        },
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-q1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("aft"),
+        },
+    },
+    Object {
+        "run": String("r2"),
+        "submission_id": Null,
+    },
+    Object {
+        "ended": String("sub-q1"),
+        "reason": Object {
+            "kind": String("expired"),
+        },
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

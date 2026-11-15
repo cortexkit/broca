@@ -12,6 +12,71 @@ RunPaused {
     ),
     reason: AuthRequired,
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r-k1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r-k1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "auth_required",
+      "run_id": "r-k1",
+      "type": "run_paused"
+    },
+    "unit": {
+      "error": {
+        "class": "auth_required",
+        "message": "sign in again",
+        "provider_code": "auth_required",
+        "status": 401
+      },
+      "reason": "auth_required",
+      "run_id": "r-k1",
+      "type": "paused"
+    }
+  }
+]
+== the conversations differ
+[
+    "first",
+]
 == the run starts record the sends differently
 [
     Object {

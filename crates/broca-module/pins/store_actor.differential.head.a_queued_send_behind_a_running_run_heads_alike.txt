@@ -756,3 +756,5 @@ Object {
 }
 == after both runs: display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:a37661bd292fcd8bbc351e5bfd3588f66f171deab7d66f090becf94b58d329bb (3037 bytes)
+== control stream
+sha256:2a3ec13d5dc7d3cc93989d13c36f426b6974e7beb74bdfb30f10c9afbfecb4c5 (3113 bytes)

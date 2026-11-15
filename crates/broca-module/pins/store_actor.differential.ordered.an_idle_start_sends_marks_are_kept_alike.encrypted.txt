@@ -19,6 +19,8 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:2ed5bfd7c3a169c8fa3c1bcec0c9d4054acd87479c062838c84786e61274163f (5005 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:8f93d56febee1988ea8b8beedf9f10f677fafc89e05f3c0cffe5c746c3ffe4e3 (6294 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -207,6 +209,81 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:aa89cad801006f216fc53f4a8b61fdbda5c7ae20f2da1e3834d76f2a29bfdd6d (3134 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r1"),
+        "submission_id": Null,
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+    Object {
+        "order": Object {
+            "modes": Array [
+                String("idle_start"),
+            ],
+        },
+        "ordered": String("sub-q1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("magic-context"),
+        },
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-q1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("magic-context"),
+        },
+    },
+    Object {
+        "run": String("q1"),
+        "submission_id": String("sub-q1"),
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+    Object {
+        "order": Object {
+            "modes": Array [
+                String("steer"),
+                String("idle_start"),
+            ],
+        },
+        "ordered": String("sub-q2"),
+        "sent_by": Null,
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-q2"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+    },
+    Object {
+        "run": String("q2"),
+        "submission_id": String("sub-q2"),
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

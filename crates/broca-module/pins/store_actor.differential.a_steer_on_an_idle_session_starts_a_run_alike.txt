@@ -12,6 +12,15 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:1bac4606a78a2e64ca90dc4d8cca316efd178d1f819fbf33b1421b8a75f08984 (3088 bytes)
+== the conversations differ
+[
+    "steered",
+    "hello",
+    "again",
+    "again",
+]
 == the run starts record the sends differently
 [
     Object {

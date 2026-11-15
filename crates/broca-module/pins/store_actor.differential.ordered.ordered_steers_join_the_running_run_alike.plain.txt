@@ -17,6 +17,8 @@ Pending {
         "sub-q2",
     ),
 }
+== control stream
+sha256:adac299ac72671b6d27dd8c2805a9f7ed4811d69814040f6ed7e039e93fda387 (4554 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:f54d247952ff0e18a8c1850d13b51264b02ca3ddb105c5da56655a8ef3805b2a (6903 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -205,6 +207,84 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:9cc7ae06cb85f44502a4aa0f2e8807cbf02d627b23aaf4b69b7810e9c889f7c8 (3784 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r1"),
+        "submission_id": Null,
+    },
+    Object {
+        "order": Object {
+            "modes": Array [
+                String("steer"),
+            ],
+        },
+        "ordered": String("sub-q1"),
+        "sent_by": Null,
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-q1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+    },
+    Object {
+        "order": Object {
+            "modes": Array [
+                String("turn_system"),
+                String("steer"),
+            ],
+            "template": Object {
+                "digest": String("105fea9a226f3df4a811f376cb5cf1cd5dd7eda6932f47e938a7cc4e92489d83"),
+                "id": String("reminder"),
+                "slots": Object {
+                    "n": Number(3),
+                },
+            },
+        },
+        "ordered": String("sub-q2"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("aft"),
+        },
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-q2"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("aft"),
+        },
+    },
+    Object {
+        "appended_text": Null,
+        "delivered": String("sub-q1"),
+        "mode": String("steer"),
+        "tool_call_id": Null,
+    },
+    Object {
+        "appended_text": Null,
+        "delivered": String("sub-q2"),
+        "mode": String("steer"),
+        "tool_call_id": Null,
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

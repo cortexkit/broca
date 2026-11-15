@@ -351,7 +351,7 @@ pub struct MemoryBackend {
     checkpoint_frame_reads: std::sync::atomic::AtomicUsize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct MemorySession {
     head: Option<(Vec<u8>, Version)>,
     logs: HashMap<Id128, Vec<u8>>,
@@ -368,6 +368,17 @@ impl MemorySession {
 }
 
 impl MemoryBackend {
+    /// A copy of everything the backend holds now, as a crash at this moment would leave it:
+    /// a test reopens a session from it. Its read counters and failure settings start fresh.
+    /// Tests only.
+    pub fn snapshot(&self) -> MemoryBackend {
+        MemoryBackend {
+            sessions: Mutex::new(self.sessions.lock().unwrap().clone()),
+            setup: Mutex::new(self.setup.lock().unwrap().clone()),
+            ..Default::default()
+        }
+    }
+
     /// Makes the backend fail every mutation after the next `mutations`, as if the process died
     /// there: what landed before stays, nothing after lands. `None` revives it. Tests only.
     pub fn crash_after(&self, mutations: Option<usize>) {

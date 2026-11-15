@@ -58,6 +58,119 @@ SendEnded {
 TemplatePartGone {
     slot: "part",
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#2",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#2",
+      "type": "message_finished"
+    },
+    "unit": {
+      "message": {
+        "content": [
+          {
+            "text": "hello",
+            "type": "text"
+          }
+        ],
+        "message_id": "a1"
+      },
+      "type": "assistant_message"
+    }
+  },
+  {
+    "event": {
+      "type": "display_reset"
+    },
+    "unit": {
+      "finish_reason": "stop",
+      "step_id": 1,
+      "type": "step_finished",
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 20
+      }
+    }
+  },
+  {
+    "event": {
+      "reason": "completed",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "final_step_finish_reason": "stop",
+      "reason": "completed",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished",
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 20
+      }
+    }
+  }
+]
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:160ab8b9f8e0916f8e0c36fefac8f5567d8995358c5d4908b3f1d120ba72ea94 (2710 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -369,6 +482,50 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r1"),
+        "submission_id": Null,
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+    Object {
+        "order": Object {
+            "expires_at_ms": Bool(true),
+            "modes": Array [
+                String("tool_result"),
+            ],
+        },
+        "ordered": String("sub-x1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("aft"),
+        },
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-x1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("aft"),
+        },
+    },
+    Object {
+        "ended": String("sub-x1"),
+        "reason": Object {
+            "kind": String("expired"),
+        },
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

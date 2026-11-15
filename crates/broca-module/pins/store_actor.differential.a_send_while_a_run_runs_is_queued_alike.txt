@@ -11,6 +11,15 @@ Pending {
         "sub-r2",
     ),
 }
+== control stream
+sha256:2a3ec13d5dc7d3cc93989d13c36f426b6974e7beb74bdfb30f10c9afbfecb4c5 (3113 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "second",
+    "again",
+]
 == the run starts record the sends differently
 [
     Object {

@@ -264,7 +264,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== finished: from_mid at 1 (the store's id g46401322b85be54a.5)
+== finished: from_mid at 1 (the store's id gfd2232bcaa13841f.5)
 Object {
     "messages": Array [
         Object {
@@ -318,14 +318,14 @@ Object {
     ],
     "newer": Bool(true),
 }
-== finished: before_mid at 1 (the store's id g46401322b85be54a.5)
+== finished: before_mid at 1 (the store's id gfd2232bcaa13841f.5)
 Object {
     "messages": Array [],
     "newer": Bool(true),
 }
-== finished: from_mid at 3 (the store's id g46401322b85be54a.13)
+== finished: from_mid at 3 (the store's id gfd2232bcaa13841f.13)
 sha256:c1729cf3d1692b6e4767c62161c348396d9acfd57c3e4dac1ac9c7e587943d63 (2200 bytes)
-== finished: before_mid at 3 (the store's id g46401322b85be54a.13)
+== finished: before_mid at 3 (the store's id gfd2232bcaa13841f.13)
 Object {
     "messages": Array [
         Object {
@@ -379,7 +379,7 @@ Object {
     ],
     "newer": Bool(true),
 }
-== finished: from_mid at 6 (the store's id g46401322b85be54a.25)
+== finished: from_mid at 6 (the store's id gfd2232bcaa13841f.25)
 Object {
     "messages": Array [
         Object {
@@ -411,7 +411,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== finished: before_mid at 6 (the store's id g46401322b85be54a.25)
+== finished: before_mid at 6 (the store's id gfd2232bcaa13841f.25)
 sha256:aef455cc596ada6d89b82f881daae661a00e038c59453947935c6ace486b87bd (2443 bytes)
 == finished: display {"form":"display"}
 sha256:32ff7ae1aa2338dc2ef20750e5745cd54ee8846c90f98933621109d198a89643 (4911 bytes)
@@ -427,6 +427,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== finished: bind
+String("session_not_held")
 == finished: bind from None
 Err(
     Object {
@@ -437,6 +439,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== finished: bind
+String("session_not_held")
 == finished: session.entries from Some("ck-mc")
 Err(
     Object {
@@ -447,6 +451,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== finished: session.entries
+String("session_not_held")
 == finished: session.applied_view from Some("ck-mc")
 Err(
     Object {
@@ -457,6 +463,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== finished: session.applied_view
+String("session_not_held")
 == finished: session.apply_view from Some("ck-mc")
 Err(
     Object {
@@ -467,6 +475,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== finished: session.apply_view
+String("session_not_held")
 == finished: session.unknown from Some("ck-mc")
 Err(
     Object {
@@ -477,3 +487,5 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== finished: session.unknown
+String("session_not_held")

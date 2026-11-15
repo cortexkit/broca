@@ -107,3 +107,24 @@ Err(
 Err(
     "Upload(UploadError { code: \"unknown_media\", subject: \"074522f5bcd75c5832b201d72d7286411c8e1a5bf6d73a3d779e606c24e68789\", field: None, received: None })",
 )
+== alike
+[
+    (
+        "User",
+        [],
+    ),
+    (
+        "Assistant",
+        [],
+    ),
+    (
+        "User",
+        [
+            "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640",
+        ],
+    ),
+    (
+        "Assistant",
+        [],
+    ),
+]

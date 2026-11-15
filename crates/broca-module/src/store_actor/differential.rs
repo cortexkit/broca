@@ -539,7 +539,7 @@ async fn compare_with_render(
     );
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
-    assert_eq!(
+    alike!(
         texts(&session),
         today.texts().await,
         "the conversations differ"
@@ -1702,7 +1702,7 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
         module.head().exists(),
         "the session's head is in the new storage"
     );
-    assert_eq!(module.wal.wal_present(&module.key), Some(false));
+    alike_today_first!(module.wal.wal_present(&module.key), Some(false));
     assert!(
         module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE),
         "{}",
@@ -1713,7 +1713,7 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
         SendOutcome::Active { .. }
     ));
     module.closed().await;
-    assert_eq!(module.wal.wal_present(&module.key), Some(false));
+    alike_today_first!(module.wal.wal_present(&module.key), Some(false));
     assert_eq!(
         module.store_texts().await,
         ["first", "hello", "second", "again"]
@@ -1730,7 +1730,7 @@ async fn sessions_stay_on_todays_storage_when_the_switch_is_off() {
     ));
     module.closed().await;
     assert!(!module.head().exists());
-    assert_eq!(module.wal.wal_present(&module.key), Some(true));
+    alike_today_first!(module.wal.wal_present(&module.key), Some(true));
     assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
 }
 

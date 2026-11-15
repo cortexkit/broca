@@ -310,7 +310,7 @@ async fn handoff_evidence(new_storage: bool) {
         assert!(record_end > 0);
         assert!(synced >= record_end, "published before sync: {evidence:?}");
     } else {
-        assert_eq!(evidence.fields["storage"], "wal");
+        alike!(evidence.fields["storage"], "wal");
         let synced = evidence.fields["synced_seq"].parse::<u64>().unwrap();
         assert!(
             synced >= published.seq,

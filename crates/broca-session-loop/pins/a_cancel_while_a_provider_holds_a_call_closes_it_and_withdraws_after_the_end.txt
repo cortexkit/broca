@@ -16,6 +16,13 @@ sha256:93a3197b73bc38e56aedf78707be685f68a7773ce5d3827976e572f821b0ae94 (7632 by
     "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=true\"",
 ]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
 == request count
 1
 == request 0
@@ -34,23 +41,12 @@ sha256:93a3197b73bc38e56aedf78707be685f68a7773ce5d3827976e572f821b0ae94 (7632 by
     "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=true\"",
 ]
-== request count
-1
-== request 0
-sha256:0cda66cf92b876a5ee4f65b9d392734000ec0ed1ead816f809a575311c10f6cb (2784 bytes)
-== record count
-21
-== records
-sha256:29e6f7eb74f318ef1284c8e1fcf43a3e034977b43f12b82eb632b7f90dea57e6 (7740 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"job\\\":1} key#1 recorder=true\"",
-    "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
-    "\"held_wait c1\"",
-    "\"terminal_synced c1\"",
-    "\"withdraw c1 after_run_end=true\"",
+    (
+        Cancelled,
+        None,
+    ),
 ]
 == request count
 1
@@ -69,4 +65,36 @@ sha256:29e6f7eb74f318ef1284c8e1fcf43a3e034977b43f12b82eb632b7f90dea57e6 (7740 by
     "\"held_wait c1\"",
     "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=true\"",
+]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
+== request count
+1
+== request 0
+sha256:0cda66cf92b876a5ee4f65b9d392734000ec0ed1ead816f809a575311c10f6cb (2784 bytes)
+== record count
+21
+== records
+sha256:29e6f7eb74f318ef1284c8e1fcf43a3e034977b43f12b82eb632b7f90dea57e6 (7740 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"job\\\":1} key#1 recorder=true\"",
+    "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
+    "\"held_wait c1\"",
+    "\"terminal_synced c1\"",
+    "\"withdraw c1 after_run_end=true\"",
+]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
 ]

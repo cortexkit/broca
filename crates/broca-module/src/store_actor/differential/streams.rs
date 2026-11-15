@@ -58,8 +58,13 @@ pub(super) async fn store(commands: &mpsc::UnboundedSender<LineageCmd>) -> Vec<V
     normalized(&drain(deliveries).await)
 }
 
-/// The two streams are equal, unit for unit; a difference is named by its first unit.
+/// The two streams are equal, unit for unit; a difference is named by its first unit. The
+/// store's stream is pinned (see `broca_test_support::pins`).
 pub(super) fn assert_alike(store: &[Value], today: &[Value]) {
+    broca_test_support::pin!(
+        "control stream",
+        broca_test_support::pins::Text(serde_json::to_string_pretty(store).unwrap())
+    );
     let same = store
         .iter()
         .zip(today)
@@ -233,8 +238,8 @@ async fn live_attach_during_step(seed_held: bool) {
     })
     .await;
     let old = before_display_reset(live_routed(&today.registry, &today.key).await).await;
-    assert_eq!(old.len(), 1);
-    assert_eq!(
+    alike_today_first!(old.len(), 1);
+    alike_today_first!(
         old[0].1,
         broca_protocol::ControlUnit::StepStarted {
             step_id: broca_protocol::StepId(1)

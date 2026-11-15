@@ -1,0 +1,33 @@
+== run.status of a failed run
+Object {
+    "error": Object {
+        "class": String("permanent"),
+        "message": String("the model refused the request"),
+        "provider_code": String("provider_error"),
+        "status": Number(400),
+    },
+    "retries_used": Number(0),
+    "state": String("error"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== run.result of a failed run
+Object {
+    "error": Object {
+        "class": String("permanent"),
+        "message": String("the model refused the request"),
+        "provider_code": String("provider_error"),
+        "status": Number(400),
+    },
+    "run_id": String("r1"),
+    "state": String("error"),
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}

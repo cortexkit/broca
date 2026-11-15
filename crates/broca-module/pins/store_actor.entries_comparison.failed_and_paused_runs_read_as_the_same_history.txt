@@ -243,7 +243,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== failed and paused: from_mid at 1 (the store's id g902533deb767ac48.5)
+== failed and paused: from_mid at 1 (the store's id g49bbff7fca63938a.5)
 Object {
     "messages": Array [
         Object {
@@ -297,12 +297,12 @@ Object {
     ],
     "newer": Bool(true),
 }
-== failed and paused: before_mid at 1 (the store's id g902533deb767ac48.5)
+== failed and paused: before_mid at 1 (the store's id g49bbff7fca63938a.5)
 Object {
     "messages": Array [],
     "newer": Bool(true),
 }
-== failed and paused: from_mid at 2 (the store's id g902533deb767ac48.6)
+== failed and paused: from_mid at 2 (the store's id g49bbff7fca63938a.6)
 Object {
     "messages": Array [
         Object {
@@ -357,7 +357,7 @@ Object {
     "newer": Bool(true),
     "older": Bool(true),
 }
-== failed and paused: before_mid at 2 (the store's id g902533deb767ac48.6)
+== failed and paused: before_mid at 2 (the store's id g49bbff7fca63938a.6)
 Object {
     "messages": Array [
         Object {
@@ -385,7 +385,7 @@ Object {
     ],
     "newer": Bool(true),
 }
-== failed and paused: from_mid at 4 (the store's id g902533deb767ac48.18)
+== failed and paused: from_mid at 4 (the store's id g49bbff7fca63938a.18)
 Object {
     "messages": Array [
         Object {
@@ -413,7 +413,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== failed and paused: before_mid at 4 (the store's id g902533deb767ac48.18)
+== failed and paused: before_mid at 4 (the store's id g49bbff7fca63938a.18)
 Object {
     "messages": Array [
         Object {
@@ -482,6 +482,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== failed and paused: bind
+String("session_not_held")
 == failed and paused: bind from None
 Err(
     Object {
@@ -492,6 +494,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== failed and paused: bind
+String("session_not_held")
 == failed and paused: session.entries from Some("ck-mc")
 Err(
     Object {
@@ -502,6 +506,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== failed and paused: session.entries
+String("session_not_held")
 == failed and paused: session.applied_view from Some("ck-mc")
 Err(
     Object {
@@ -512,6 +518,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== failed and paused: session.applied_view
+String("session_not_held")
 == failed and paused: session.apply_view from Some("ck-mc")
 Err(
     Object {
@@ -522,6 +530,8 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== failed and paused: session.apply_view
+String("session_not_held")
 == failed and paused: session.unknown from Some("ck-mc")
 Err(
     Object {
@@ -532,3 +542,5 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
+== failed and paused: session.unknown
+String("session_not_held")

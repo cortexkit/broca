@@ -14,3 +14,24 @@
 ]
 == alike
 sha256:569433b6c157250027caf1688068d9307325b8fd729a932cf402dde2ab42d7b5 (7069 bytes)
+== alike
+[
+    (
+        "r1",
+        Some(
+            "plan-1",
+        ),
+        "m",
+    ),
+    (
+        "r2",
+        Some(
+            "plan-2",
+        ),
+        "m",
+    ),
+]
+== alike
+[
+    1,
+]

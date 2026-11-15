@@ -12,6 +12,8 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:80adbf13a8a9b37d32cf5b2e8bd64503203e769dffe2d8d79aaba9b0646a9bda (2889 bytes)
 == the conversations differ
 [
     "you are a worker",
@@ -259,3 +261,36 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:daa821b940c71512b9a7b7432f70019ac704f3f03ae54ba64c06169884efa1cf (2920 bytes)
+== alike
+(
+    2,
+    2,
+)
+== alike
+[
+    (
+        "steer",
+        Object {
+            "ops": Array [
+                Object {
+                    "block": Number(0),
+                    "hook": String("pre_user"),
+                    "module": String("noter"),
+                    "op": String("prepend"),
+                    "phase": Null,
+                },
+            ],
+            "original": Array [
+                Object {
+                    "content": Array [
+                        Object {
+                            "text": String("more"),
+                            "type": String("text"),
+                        },
+                    ],
+                    "role": String("user"),
+                },
+            ],
+        },
+    ),
+]

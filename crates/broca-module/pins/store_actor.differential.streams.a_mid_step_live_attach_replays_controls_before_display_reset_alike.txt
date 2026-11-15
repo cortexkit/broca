@@ -1,0 +1,21 @@
+== alike
+1
+== alike
+StepStarted {
+    step_id: StepId(
+        1,
+    ),
+}
+== control stream
+[
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  }
+]

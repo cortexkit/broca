@@ -11,6 +11,15 @@ Pending {
         "sub-r-k2",
     ),
 }
+== control stream
+sha256:d44d9437167b9ca4af8a2772f81a7a73efd72961d16a646bf148dc9411ac97a6 (3131 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "second",
+    "again",
+]
 == the run starts record the sends differently
 sha256:f42dafd9ea85f6de85f01d27d1fad810b725f963a331aaa007a3c37971b88cc3 (2779 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

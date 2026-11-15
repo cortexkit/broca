@@ -384,7 +384,7 @@ async fn an_ordered_send_starting_its_run_records_its_scope_alike() {
     ));
     let mut replaced = request("replaced");
     super::scoped_by_core(&mut replaced);
-    assert_eq!(
+    alike_today_first!(
         sends_alike(&today, &store, "r4", &replaced, None).await,
         scoped_mismatch(2, 1)
     );
@@ -541,7 +541,7 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
             "{principal:?} over {scope:?}: {refused:?}"
         );
     }
-    assert_eq!(
+    alike_today_first!(
         cancels_alike(
             &today,
             &store,
@@ -569,7 +569,7 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         in_model_step(module, "r2").await;
     }
-    assert_eq!(
+    alike_today_first!(
         cancels_alike(
             &today,
             &store,

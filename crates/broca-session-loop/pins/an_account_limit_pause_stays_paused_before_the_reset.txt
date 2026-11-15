@@ -15,6 +15,21 @@ sha256:468784654f21362a8ad787f5001b5b4faf9f6bb412de3680eb0716295728aeb8 (7195 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
+]
 == request count
 2
 == request 0
@@ -32,22 +47,20 @@ sha256:468784654f21362a8ad787f5001b5b4faf9f6bb412de3680eb0716295728aeb8 (7195 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== request count
-2
-== request 0
-sha256:d374ac533308ad707765aef3a52410176c5ee105895a59044fc9564a87f9c14c (2583 bytes)
-== request 1
-sha256:0f4b49d7f4749100e17b3d8a4e9157ba7ced0609db3bbb7a0cac67268aa89df0 (5265 bytes)
-== record count
-18
-== records
-sha256:5768a34a33a42f61bd39820a4570343ff12f54d1b39f270f38f552a9a43abf12 (7303 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
 ]
 == request count
 2
@@ -65,4 +78,51 @@ sha256:5768a34a33a42f61bd39820a4570343ff12f54d1b39f270f38f552a9a43abf12 (7303 by
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
+]
+== request count
+2
+== request 0
+sha256:d374ac533308ad707765aef3a52410176c5ee105895a59044fc9564a87f9c14c (2583 bytes)
+== request 1
+sha256:0f4b49d7f4749100e17b3d8a4e9157ba7ced0609db3bbb7a0cac67268aa89df0 (5265 bytes)
+== record count
+18
+== records
+sha256:5768a34a33a42f61bd39820a4570343ff12f54d1b39f270f38f552a9a43abf12 (7303 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
+    (
+        Interrupted,
+        Some(
+            AccountLimit,
+        ),
+    ),
 ]

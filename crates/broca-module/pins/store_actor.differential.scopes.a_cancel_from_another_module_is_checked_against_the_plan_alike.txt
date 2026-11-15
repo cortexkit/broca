@@ -80,7 +80,87 @@ ScopeRefused(
 )
 == Reserved { module_id: "occipital" } over Unstamped: replies differ
 Ack
+== alike
+Ack
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#2",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished"
+    }
+  }
+]
 == Reserved { module_id: "prefrontal-core" } over Unstamped: replies differ
+Ack
+== alike
 Ack
 == heads differ for None
 Object {
@@ -157,6 +237,135 @@ Object {
     },
     "updated_at": Bool(true),
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#2",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished"
+    }
+  },
+  {
+    "event": {
+      "run_id": "r2",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r2",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#3",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#3",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#3",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#3",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#4",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r2",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r2",
+      "type": "run_finished"
+    }
+  }
+]
 == Reserved { module_id: "stranger" } over Unstamped: replies differ
 ScopeRefused(
     OwnerMismatch(
@@ -239,7 +448,87 @@ ScopeRefused(
 )
 == Reserved { module_id: "occipital" } over Unstamped: replies differ
 Ack
+== alike
+Ack
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#2",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished"
+    }
+  }
+]
 == Reserved { module_id: "prefrontal-core" } over Unstamped: replies differ
+Ack
+== alike
 Ack
 == heads differ for None
 Object {
@@ -316,3 +605,132 @@ Object {
     },
     "updated_at": Bool(true),
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#2",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished"
+    }
+  },
+  {
+    "event": {
+      "run_id": "r2",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r2",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#3",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#3",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#3",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#3",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#4",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "reason": "cancelled",
+      "run_id": "r2",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "cancelled",
+      "retries_used": 0,
+      "run_id": "r2",
+      "type": "run_finished"
+    }
+  }
+]

@@ -25,6 +25,15 @@ NotPending
 AlreadyStarted
 == step 9: retraction replies differ
 NotPending
+== control stream
+sha256:1d1786dce9ec0964edfe2e7c0b844fd5b9c5856bcfe43e9459afa33b9b9af12b (3113 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "third",
+    "again",
+]
 == the run starts record the sends differently
 [
     Object {

@@ -1,30 +1,30 @@
-== cut after record 1 of 11: request count
+== cut after record 4 of 18: request count
 1
-== cut after record 1 of 11: request 0
+== cut after record 4 of 18: request 0
 sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
-== cut after record 1 of 11: record count
+== cut after record 4 of 18: record count
 15
-== cut after record 1 of 11: records
+== cut after record 4 of 18: records
 sha256:011d2a62a39472c05401126f61677daa3a1048cfbfb3a2e484467cbc58a5b98f (11870 bytes)
-== cut after record 1 of 11: tool calls
+== cut after record 4 of 18: tool calls
 sha256:36c28bb51061ba83bdaa04f11cba6405aa06d30d63bc1421ed0d24e9fb385ed8 (3120 bytes)
-== cut after record 2 of 11: request count
+== cut after record 5 of 18: request count
 1
-== cut after record 2 of 11: request 0
+== cut after record 5 of 18: request 0
 sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
-== cut after record 2 of 11: record count
+== cut after record 5 of 18: record count
 15
-== cut after record 2 of 11: records
+== cut after record 5 of 18: records
 sha256:011d2a62a39472c05401126f61677daa3a1048cfbfb3a2e484467cbc58a5b98f (11870 bytes)
-== cut after record 2 of 11: tool calls
+== cut after record 5 of 18: tool calls
 sha256:36c28bb51061ba83bdaa04f11cba6405aa06d30d63bc1421ed0d24e9fb385ed8 (3120 bytes)
-== cut after record 3 of 11: request count
+== cut after record 8 of 18: request count
 0
-== cut after record 3 of 11: record count
+== cut after record 8 of 18: record count
 11
-== cut after record 3 of 11: records
+== cut after record 8 of 18: records
 sha256:d4b361240702a2584c9a73a4ee8a6f88c8f65d843f8323f1b40c38590a3e37b7 (10346 bytes)
-== cut after record 3 of 11: tool calls
+== cut after record 8 of 18: tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
@@ -33,26 +33,11 @@ sha256:d4b361240702a2584c9a73a4ee8a6f88c8f65d843f8323f1b40c38590a3e37b7 (10346 b
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 4 of 11: request count
+== cut after record 10 of 18: request count
 0
-== cut after record 4 of 11: record count
-10
-== cut after record 4 of 11: records
-sha256:22674922d21a23e1c3d0fe4f8992f335063557a9001ac162d2e34d87255f1fb8 (10233 bytes)
-== cut after record 4 of 11: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
-    "\"batch_finished\"",
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
-]
-== cut after record 5 of 11: request count
-0
-== cut after record 5 of 11: record count
+== cut after record 10 of 18: record count
 7
-== cut after record 5 of 11: records
+== cut after record 10 of 18: records
 {"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
@@ -60,106 +45,77 @@ sha256:22674922d21a23e1c3d0fe4f8992f335063557a9001ac162d2e34d87255f1fb8 (10233 b
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 11: tool calls
+== cut after record 10 of 18: tool calls
 []
-== cut after record 6 of 11: request count
+== cut after record 15 of 18: request count
 0
-== cut after record 6 of 11: record count
-5
-== cut after record 6 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 11: tool calls
-[
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
-]
-== cut after record 7 of 11: request count
-0
-== cut after record 7 of 11: record count
+== cut after record 15 of 18: record count
 4
-== cut after record 7 of 11: records
+== cut after record 15 of 18: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
 {"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 11: tool calls
+== cut after record 15 of 18: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 8 of 11: request count
+== cut after record 16 of 18: request count
 0
-== cut after record 8 of 11: record count
+== cut after record 16 of 18: record count
 4
-== cut after record 8 of 11: records
+== cut after record 16 of 18: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
 {"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 8 of 11: tool calls
+== cut after record 16 of 18: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 9 of 11: request count
+== cut after record 17 of 18: request count
 0
-== cut after record 9 of 11: record count
+== cut after record 17 of 18: record count
 4
-== cut after record 9 of 11: records
+== cut after record 17 of 18: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
 {"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 9 of 11: tool calls
+== cut after record 17 of 18: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 10 of 11: request count
-0
-== cut after record 10 of 11: record count
-4
-== cut after record 10 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 10 of 11: tool calls
-[
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
-]
-== cut after record 1 of 11: request count
+== cut after record 4 of 18: request count
 1
-== cut after record 1 of 11: request 0
+== cut after record 4 of 18: request 0
 sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
-== cut after record 1 of 11: record count
+== cut after record 4 of 18: record count
 15
-== cut after record 1 of 11: records
+== cut after record 4 of 18: records
 sha256:011d2a62a39472c05401126f61677daa3a1048cfbfb3a2e484467cbc58a5b98f (11870 bytes)
-== cut after record 1 of 11: tool calls
+== cut after record 4 of 18: tool calls
 sha256:36c28bb51061ba83bdaa04f11cba6405aa06d30d63bc1421ed0d24e9fb385ed8 (3120 bytes)
-== cut after record 2 of 11: request count
+== cut after record 5 of 18: request count
 1
-== cut after record 2 of 11: request 0
+== cut after record 5 of 18: request 0
 sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
-== cut after record 2 of 11: record count
+== cut after record 5 of 18: record count
 15
-== cut after record 2 of 11: records
+== cut after record 5 of 18: records
 sha256:011d2a62a39472c05401126f61677daa3a1048cfbfb3a2e484467cbc58a5b98f (11870 bytes)
-== cut after record 2 of 11: tool calls
+== cut after record 5 of 18: tool calls
 sha256:36c28bb51061ba83bdaa04f11cba6405aa06d30d63bc1421ed0d24e9fb385ed8 (3120 bytes)
-== cut after record 3 of 11: request count
+== cut after record 8 of 18: request count
 0
-== cut after record 3 of 11: record count
+== cut after record 8 of 18: record count
 11
-== cut after record 3 of 11: records
+== cut after record 8 of 18: records
 sha256:d4b361240702a2584c9a73a4ee8a6f88c8f65d843f8323f1b40c38590a3e37b7 (10346 bytes)
-== cut after record 3 of 11: tool calls
+== cut after record 8 of 18: tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
@@ -168,26 +124,11 @@ sha256:d4b361240702a2584c9a73a4ee8a6f88c8f65d843f8323f1b40c38590a3e37b7 (10346 b
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 4 of 11: request count
+== cut after record 10 of 18: request count
 0
-== cut after record 4 of 11: record count
-10
-== cut after record 4 of 11: records
-sha256:22674922d21a23e1c3d0fe4f8992f335063557a9001ac162d2e34d87255f1fb8 (10233 bytes)
-== cut after record 4 of 11: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {} key#1 recorder=true\"",
-    "\"batch_finished\"",
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
-]
-== cut after record 5 of 11: request count
-0
-== cut after record 5 of 11: record count
+== cut after record 10 of 18: record count
 7
-== cut after record 5 of 11: records
+== cut after record 10 of 18: records
 {"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
@@ -195,75 +136,46 @@ sha256:22674922d21a23e1c3d0fe4f8992f335063557a9001ac162d2e34d87255f1fb8 (10233 b
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 11: tool calls
+== cut after record 10 of 18: tool calls
 []
-== cut after record 6 of 11: request count
+== cut after record 15 of 18: request count
 0
-== cut after record 6 of 11: record count
-5
-== cut after record 6 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 11: tool calls
-[
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
-]
-== cut after record 7 of 11: request count
-0
-== cut after record 7 of 11: record count
+== cut after record 15 of 18: record count
 4
-== cut after record 7 of 11: records
+== cut after record 15 of 18: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
 {"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 11: tool calls
+== cut after record 15 of 18: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 8 of 11: request count
+== cut after record 16 of 18: request count
 0
-== cut after record 8 of 11: record count
+== cut after record 16 of 18: record count
 4
-== cut after record 8 of 11: records
+== cut after record 16 of 18: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
 {"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 8 of 11: tool calls
+== cut after record 16 of 18: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
 ]
-== cut after record 9 of 11: request count
+== cut after record 17 of 18: request count
 0
-== cut after record 9 of 11: record count
+== cut after record 17 of 18: record count
 4
-== cut after record 9 of 11: records
+== cut after record 17 of 18: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
 {"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 9 of 11: tool calls
-[
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",
-]
-== cut after record 10 of 11: request count
-0
-== cut after record 10 of 11: record count
-4
-== cut after record 10 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"CeilingDecided":{"detail":{"cause":"over_window","size":4477,"window":1200},"kind":"CeilingDecided","step_id":2}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 10 of 11: tool calls
+== cut after record 17 of 18: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
     "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4477}",

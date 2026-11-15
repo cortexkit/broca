@@ -61,7 +61,7 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
     opted_reads_alike(&today, &store, "inline import").await;
     store.closed().await;
     assert!(store.head().exists());
-    assert_eq!(store.wal.wal_present(&store.key), Some(false));
+    alike_today_first!(store.wal.wal_present(&store.key), Some(false));
     let mut continued = Vec::new();
     for module in [&today, &store] {
         let mut request = request("continue");
@@ -279,7 +279,7 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
     super::super::tests::idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), today.texts().await);
+    alike!(texts(&session), today.texts().await);
     assert!(today.registry.stop_and_seal().await);
 }
 

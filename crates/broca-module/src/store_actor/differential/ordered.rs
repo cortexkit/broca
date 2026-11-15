@@ -432,6 +432,10 @@ impl Pair {
             .map(|(_, record)| record)
             .collect();
         let ledger = store_ledger(&records);
+        broca_test_support::pin!(
+            "the sessions recorded their sends differently",
+            timeless(&ledger)
+        );
         assert_eq!(
             ledger,
             today_ledger(&today_records(&self.today)),
@@ -448,8 +452,9 @@ impl Pair {
                 .into_iter()
                 .map(|pending| pending.submission_id.0)
                 .collect();
-        assert_eq!(
-            queue, today_queue,
+        alike!(
+            queue,
+            today_queue,
             "the sessions hold different sends queued"
         );
         alike!(
@@ -554,6 +559,24 @@ fn today_ledger(records: &[WalRecord]) -> Vec<Value> {
                 ..
             } => Some(json!({"run_ended": reason, "interrupt_reason": interrupt_reason})),
             _ => None,
+        })
+        .collect()
+}
+
+/// `ledger` with each order's expiry kept as whether it is there: a test sets it from the wall
+/// clock.
+fn timeless(ledger: &[Value]) -> Vec<Value> {
+    ledger
+        .iter()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            if let Some(expires) = entry
+                .get_mut("order")
+                .and_then(|order| order.get_mut("expires_at_ms"))
+            {
+                *expires = json!(!expires.is_null());
+            }
+            entry
         })
         .collect()
 }
@@ -1294,7 +1317,7 @@ async fn an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike(cipher: Ci
         run_story(&ledger),
         ["start r1", "end cancelled", "start i1", "end completed"]
     );
-    assert_eq!(today_calls, 2, "r1's tool step and i1's answer");
+    alike_today_first!(today_calls, 2, "r1's tool step and i1's answer");
 }
 
 /// A process that dies after an interrupt's message is durable and before the run it stopped

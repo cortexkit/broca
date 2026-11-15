@@ -11,6 +11,8 @@ Pending {
         "sub-i1",
     ),
 }
+== control stream
+sha256:6f714fb8d4e5c52e75be3745ebd7133d1c054029b4b2bae1a13bdeb4a40d5d07 (5327 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:86424feaa5232f068e05a4ed05aa2b4a1fc6a0da462f3f81c38e9d25f486e8b0 (6076 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -199,6 +201,39 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:802580929c95461e388794231ab71c8550795007c86dcc25ffe772ba8dc578e4 (3933 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r1"),
+        "submission_id": Null,
+    },
+    Object {
+        "delivery": String("interrupt"),
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-i1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+    },
+    Object {
+        "interrupt_reason": String("runner_crash"),
+        "run_ended": String("interrupted"),
+    },
+    Object {
+        "run": String("i1"),
+        "submission_id": String("sub-i1"),
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

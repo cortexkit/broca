@@ -43,6 +43,8 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:022afe514961b951a9b8d07d74fab1794ecef6704cfec2bb7aa1d58fc3a012a1 (6543 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:090e40ab57322f8ce95a7a41f081f1a46297a696a731b85c9dc38507298ec921 (7825 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -231,6 +233,10 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:ac86dd959c9a973e577f8210d9d5564f16311bc0d5fb2f42698fc5cfad50089a (3144 bytes)
+== the sessions recorded their sends differently
+sha256:5db7936df8b5b9ba873399b303f5ec00caeb806b710208d96c03ec27bb6f9f99 (2062 bytes)
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

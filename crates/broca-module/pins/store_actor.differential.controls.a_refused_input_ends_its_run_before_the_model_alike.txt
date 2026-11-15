@@ -5,6 +5,85 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "type": "display_reset"
+    },
+    "unit": {
+      "error": {
+        "class": "permanent",
+        "message": "pre_user unavailable: noter",
+        "provider_code": "pre_user_unavailable"
+      },
+      "type": "error"
+    }
+  },
+  {
+    "event": {
+      "reason": "error",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "reason": "error",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished"
+    }
+  }
+]
 == the conversations differ
 [
     "you are a worker",
@@ -557,3 +636,14 @@ Object {
     ],
     "tools_run_id": String("r1"),
 }
+== alike
+[
+    Object {
+        "error": Object {
+            "class": String("permanent"),
+            "message": String("pre_user unavailable: noter"),
+            "provider_code": String("pre_user_unavailable"),
+        },
+        "reason": String("error"),
+    },
+]

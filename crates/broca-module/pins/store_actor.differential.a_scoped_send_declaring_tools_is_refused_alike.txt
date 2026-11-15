@@ -2,6 +2,10 @@
 PlanRefused(
     ScopedToolsRequirePlan,
 )
+== control stream
+[]
+== the conversations differ
+[]
 == the run starts record the sends differently
 []
 == display facts, tools, rich ui (true, false, false), page (None, None)

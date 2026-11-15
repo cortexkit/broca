@@ -1,57 +1,34 @@
-== seal after record 1 of 20: record count
+== seal after record 4 of 34: record count
 2
-== seal after record 1 of 20: records
+== seal after record 4 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== seal after record 2 of 20: record count
+== seal after record 5 of 34: record count
 2
-== seal after record 2 of 20: records
+== seal after record 5 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== seal after record 3 of 20: record count
+== seal after record 8 of 34: record count
 10
-== seal after record 3 of 20: records
+== seal after record 8 of 34: records
 sha256:f600e678c3cbedb71de9fcb6d3295e76f71640c2b418cff72c05d58c5fb7e0b4 (2811 bytes)
-== seal after record 4 of 20: record count
+== seal after record 11 of 34: record count
 9
-== seal after record 4 of 20: records
-sha256:b7b2bbe444c62a85b466cb1aaf813cc7f0e3b4588a76f6cc35ffd58b56523f03 (2693 bytes)
-== seal after record 5 of 20: record count
-9
-== seal after record 5 of 20: records
-sha256:9bd8d26f69e328ca43a57d61860968a61dd098f932c8ce70b3ad5b9065a0729d (2774 bytes)
-== seal after record 6 of 20: record count
-9
-== seal after record 6 of 20: records
+== seal after record 11 of 34: records
 sha256:485b10e151ed2c54cfaf951b6bbefecb7b6fa0fc7f410fad072db0ae9798d9f1 (2856 bytes)
-== seal after record 7 of 20: record count
-7
-== seal after record 7 of 20: records
-sha256:e52d07e697c0ab4088bc6858af2fb1c6f2de8b048ec86adeca6ff5763019d9f7 (2190 bytes)
-== seal after record 8 of 20: record count
-3
-== seal after record 8 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":2}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 9 of 20: record count
+== seal after record 18 of 34: record count
 2
-== seal after record 9 of 20: records
+== seal after record 18 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 10 of 20: record count
+== seal after record 19 of 34: record count
 2
-== seal after record 10 of 20: records
+== seal after record 19 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 11 of 20: record count
-2
-== seal after record 11 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 12 of 20: record count
+== seal after record 22 of 34: record count
 8
-== seal after record 12 of 20: records
+== seal after record 22 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"BatchStart":{"batch_id":"r1-b2","kind":"BatchStart","mid":"mid#4","planned":["c3"],"run_id":"r1","step_id":2}}
 {"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: the run was interrupted before this call was dispatched"},"tool_call_id":"c3"},"run_id":"r1","tags_v1":null}}
@@ -60,19 +37,9 @@ sha256:e52d07e697c0ab4088bc6858af2fb1c6f2de8b048ec86adeca6ff5763019d9f7 (2190 by
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c3","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
 {"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 13 of 20: record count
+== seal after record 24 of 34: record count
 7
-== seal after record 13 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: the run was interrupted before this call was dispatched"},"tool_call_id":"c3"},"run_id":"r1","tags_v1":null}}
-{"ToolOutcome":{"batch_id":"r1-b2","call_key":"<normalized>","detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Interrupted","reason":null,"result_digest":"83ca7f38eb2b776f7193d4fd4863f5007dd4a6c8ec4209d570498f21a8461cb6","run_id":"r1","tool_call_id":"c3"}}
-{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#4","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":5,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
-{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c3","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
-{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 14 of 20: record count
-7
-== seal after record 14 of 20: records
+== seal after record 24 of 34: records
 {"Resumed":{"indeterminate":["c3"],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c3"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b2","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"1ac5324a9f7840b2e0628898b9dcbcb6f0bc5366f5722fae5842df8c56e64d50","run_id":"r1","tool_call_id":"c3"}}
@@ -80,81 +47,47 @@ sha256:e52d07e697c0ab4088bc6858af2fb1c6f2de8b048ec86adeca6ff5763019d9f7 (2190 by
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c3","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
 {"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 15 of 20: record count
-3
-== seal after record 15 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 16 of 20: record count
+== seal after record 29 of 34: record count
 2
-== seal after record 16 of 20: records
+== seal after record 29 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 17 of 20: record count
+== seal after record 30 of 34: record count
 2
-== seal after record 17 of 20: records
+== seal after record 30 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 18 of 20: record count
+== seal after record 4 of 34: record count
 2
-== seal after record 18 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 1 of 20: record count
-2
-== seal after record 1 of 20: records
+== seal after record 4 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== seal after record 2 of 20: record count
+== seal after record 5 of 34: record count
 2
-== seal after record 2 of 20: records
+== seal after record 5 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== seal after record 3 of 20: record count
+== seal after record 8 of 34: record count
 10
-== seal after record 3 of 20: records
+== seal after record 8 of 34: records
 sha256:a9ac3a51a17cd00f383944cc99f685ace5376105d5bbd00a4e9349bdde0f7640 (2811 bytes)
-== seal after record 4 of 20: record count
+== seal after record 11 of 34: record count
 9
-== seal after record 4 of 20: records
-sha256:b7a74877692b639a5f78051aacd7a8333a8726ce58802f20dd6bb995b701043f (2693 bytes)
-== seal after record 5 of 20: record count
-9
-== seal after record 5 of 20: records
-sha256:7839e028285e992490b43a42522355038159f37935d27f95d7ab63445184fd05 (2774 bytes)
-== seal after record 6 of 20: record count
-9
-== seal after record 6 of 20: records
+== seal after record 11 of 34: records
 sha256:21ff5e2d17ca53481ae9f5acf4ef1b3d23ea86fbc073cc137c09dd8fcdf18625 (2856 bytes)
-== seal after record 7 of 20: record count
-7
-== seal after record 7 of 20: records
-sha256:54d159d00365be23b468b17883e705d03de40cd909fd5b12ba8302acacb4ad25 (2190 bytes)
-== seal after record 8 of 20: record count
-3
-== seal after record 8 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":2}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 9 of 20: record count
+== seal after record 18 of 34: record count
 2
-== seal after record 9 of 20: records
+== seal after record 18 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 10 of 20: record count
+== seal after record 19 of 34: record count
 2
-== seal after record 10 of 20: records
+== seal after record 19 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 11 of 20: record count
-2
-== seal after record 11 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== seal after record 12 of 20: record count
+== seal after record 22 of 34: record count
 8
-== seal after record 12 of 20: records
+== seal after record 22 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"BatchStart":{"batch_id":"r1-b2","kind":"BatchStart","mid":"mid#4","planned":["c3"],"run_id":"r1","step_id":2}}
 {"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: the run was interrupted before this call was dispatched"},"tool_call_id":"c3"},"run_id":"r1","tags_v1":null}}
@@ -163,19 +96,9 @@ sha256:54d159d00365be23b468b17883e705d03de40cd909fd5b12ba8302acacb4ad25 (2190 by
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c3","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
 {"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 13 of 20: record count
+== seal after record 24 of 34: record count
 7
-== seal after record 13 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: the run was interrupted before this call was dispatched"},"tool_call_id":"c3"},"run_id":"r1","tags_v1":null}}
-{"ToolOutcome":{"batch_id":"r1-b2","call_key":"<normalized>","detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Interrupted","reason":null,"result_digest":"83ca7f38eb2b776f7193d4fd4863f5007dd4a6c8ec4209d570498f21a8461cb6","run_id":"r1","tool_call_id":"c3"}}
-{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#4","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":5,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":4,"usage":null,"written_at_ms":"<normalized>"}}
-{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c3","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
-{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 14 of 20: record count
-7
-== seal after record 14 of 20: records
+== seal after record 24 of 34: records
 {"Resumed":{"indeterminate":["c3"],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b2","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c3"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b2","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"1ac5324a9f7840b2e0628898b9dcbcb6f0bc5366f5722fae5842df8c56e64d50","run_id":"r1","tool_call_id":"c3"}}
@@ -183,24 +106,13 @@ sha256:54d159d00365be23b468b17883e705d03de40cd909fd5b12ba8302acacb4ad25 (2190 by
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c3","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":4}}
 {"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 15 of 20: record count
-3
-== seal after record 15 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b2","kind":"BatchEnd","run_id":"r1"}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 16 of 20: record count
+== seal after record 29 of 34: record count
 2
-== seal after record 16 of 20: records
+== seal after record 29 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 17 of 20: record count
+== seal after record 30 of 34: record count
 2
-== seal after record 17 of 20: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== seal after record 18 of 20: record count
-2
-== seal after record 18 of 20: records
+== seal after record 30 of 34: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":5,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}

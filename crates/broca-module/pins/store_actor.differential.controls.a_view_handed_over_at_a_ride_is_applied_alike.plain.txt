@@ -12,6 +12,11 @@ Active {
     ),
     delivered: None,
 }
+== a ride handed a view over
+(
+    1,
+    1,
+)
 == alike
 [
     Object {
@@ -46,6 +51,8 @@ Active {
         "seq": Number(3),
     },
 ]
+== control stream
+sha256:be8f3e6f41a5158c96be83a483792cb8d9543ff4607458c76346c39fd93380d1 (3080 bytes)
 == the conversations differ
 [
     "first",
@@ -268,3 +275,8 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:be88e28ac4888a3d0961ce3a5a7da6fbd23704b1ffb522de0d168474c5a3f06a (3043 bytes)
+== alike
+(
+    1,
+    1,
+)

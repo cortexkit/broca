@@ -25,3 +25,10 @@ SendIdReuse {
 Busy
 == alike
 Busy
+== alike
+[
+    "input",
+    "first answer",
+    "input",
+    "queued answer",
+]

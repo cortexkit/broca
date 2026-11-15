@@ -21,6 +21,19 @@ sha256:33b21fbfb74ee58e5e7f797f87e5ba5ce516b0ada757a0e19b0a5a5c47e44d67 (8750 by
     "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Interrupted,
+        Some(
+            ToolHeld,
+        ),
+    ),
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -44,28 +57,18 @@ sha256:33b21fbfb74ee58e5e7f797f87e5ba5ce516b0ada757a0e19b0a5a5c47e44d67 (8750 by
     "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
     "\"batch_finished\"",
 ]
-== request count
-2
-== request 0
-sha256:9904a2bad495b1f9544bed2b4843deede9210f662098888342b71d6388df8a85 (2778 bytes)
-== request 1
-sha256:c3f6d26d9fb626664c1f77eb5db9fb6688d0f4037f35a2323d7a78a0c8b94802 (6320 bytes)
-== record count
-26
-== records
-sha256:776a68008a40bd3ab6b15c52ad931a35d95de22b8875c792854a75452358a107 (8969 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"job\\\":1} key#1 recorder=true\"",
-    "\"held_wait c1\"",
-    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
-    "\"held_wait c1\"",
-    "\"terminal_synced c1\"",
-    "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
-    "\"batch_finished\"",
+    (
+        Interrupted,
+        Some(
+            ToolHeld,
+        ),
+    ),
+    (
+        Completed,
+        None,
+    ),
 ]
 == request count
 2
@@ -89,4 +92,53 @@ sha256:776a68008a40bd3ab6b15c52ad931a35d95de22b8875c792854a75452358a107 (8969 by
     "\"terminal_synced c1\"",
     "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
     "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Interrupted,
+        Some(
+            ToolHeld,
+        ),
+    ),
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
+2
+== request 0
+sha256:9904a2bad495b1f9544bed2b4843deede9210f662098888342b71d6388df8a85 (2778 bytes)
+== request 1
+sha256:c3f6d26d9fb626664c1f77eb5db9fb6688d0f4037f35a2323d7a78a0c8b94802 (6320 bytes)
+== record count
+26
+== records
+sha256:776a68008a40bd3ab6b15c52ad931a35d95de22b8875c792854a75452358a107 (8969 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"job\\\":1} key#1 recorder=true\"",
+    "\"held_wait c1\"",
+    "\"batch_started_guarded [\\\"c1\\\", \\\"c2\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\", \\\"c2 key#2 approved=false\\\"]\"",
+    "\"held_wait c1\"",
+    "\"terminal_synced c1\"",
+    "\"dispatch_guarded c2 {\\\"path\\\":\\\"a\\\"} key#2 recorder=true\"",
+    "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Interrupted,
+        Some(
+            ToolHeld,
+        ),
+    ),
+    (
+        Completed,
+        None,
+    ),
 ]

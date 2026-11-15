@@ -197,7 +197,7 @@ async fn a_photo_send_creating_its_session_answers_alike(cipher: Cipher) {
         "a photo send creating its session"
     );
     // Each storage keeps the session the send opened, as an empty one.
-    assert_eq!(today.registry.wal_written(&today.key), Some(true));
+    alike_today_first!(today.registry.wal_written(&today.key), Some(true));
     assert!(store.registry.store_holding(&store.key).unwrap().is_some());
 }
 
@@ -283,7 +283,7 @@ async fn a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes(cipher: 
     store.release_to_idle().await;
     reads_alike(&today, &store, &image, "after its boundary").await;
     let history = history_media(&store).await;
-    assert_eq!(history, history_media(&today).await);
+    alike!(history, history_media(&today).await);
     assert!(
         history.iter().any(|(_, media)| media == &[digest(&image)]),
         "the steer's copy holds the image: {history:?}"

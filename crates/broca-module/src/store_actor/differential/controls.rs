@@ -840,7 +840,7 @@ async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
             "{start}"
         );
     }
-    assert_eq!(
+    alike_today_first!(
         old.setups(),
         1,
         "today's actor sends Setup once in its life"
@@ -870,7 +870,7 @@ async fn a_planned_sends_input_is_transformed_alike() {
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
-    assert_eq!((old.calls(), new.calls()), (1, 1));
+    alike_today_first!((old.calls(), new.calls()), (1, 1));
     let starts = ended.store_starts().await;
     assert!(starts[0]["hooks"].is_object(), "{}", starts[0]);
     let (_, prompts) = ended.prompts();
@@ -903,9 +903,9 @@ async fn a_steers_input_is_transformed_alike() {
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
-    assert_eq!((old.calls(), new.calls()), (2, 2));
+    alike_today_first!((old.calls(), new.calls()), (2, 2));
     let hooks = ended.store_send_hooks().await;
-    assert_eq!(hooks, ended.today_send_hooks());
+    alike!(hooks, ended.today_send_hooks());
     assert!(
         matches!(hooks.as_slice(), [("steer", Value::Object(_))]),
         "{hooks:?}"
@@ -942,13 +942,13 @@ async fn a_queued_sends_transforms_are_reused_when_it_drains_alike() {
     pair.idle().await;
     let ended = pair.end().await;
     ended.assert_alike().await;
-    assert_eq!(
+    alike_today_first!(
         (old.calls(), new.calls()),
         (2, 2),
         "the queued send is transformed once, when it is queued"
     );
     let hooks = ended.store_send_hooks().await;
-    assert_eq!(hooks, ended.today_send_hooks());
+    alike!(hooks, ended.today_send_hooks());
     assert!(
         matches!(hooks.as_slice(), [("queued", Value::Object(_))]),
         "{hooks:?}"
@@ -1006,7 +1006,7 @@ async fn a_refused_input_ends_its_run_before_the_model_alike() {
     let ended = pair.end().await;
     ended.assert_alike().await;
     let ends = ended.store_ends().await;
-    assert_eq!(ends, ended.today_ends());
+    alike!(ends, ended.today_ends());
     assert_eq!(ends.len(), 1);
     assert_eq!(ends[0]["reason"], json!("error"), "{}", ends[0]);
     assert_eq!(
@@ -1037,7 +1037,7 @@ async fn a_refused_steer_or_queued_send_writes_nothing_alike() {
     }
     for (run_id, delivery) in [("s1", Delivery::Steer), ("r2", Delivery::Queue)] {
         let (today, store) = pair.send(run_id, untooled("more"), None, delivery).await;
-        assert_eq!(
+        alike_today_first!(
             today,
             SendOutcome::PreUserUnavailable {
                 provider: "noter".into()
@@ -1353,7 +1353,7 @@ async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_sto
     assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
     alike!(store, today);
     pair.idle().await;
-    assert_eq!(
+    alike_today_first!(
         (old.views(), new.views()),
         (1, 1),
         "a ride handed a view over"
@@ -1384,7 +1384,7 @@ async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_sto
         .iter()
         .filter(|record| matches!(record, Record::ViewApplied(_)))
         .count();
-    assert_eq!((today_applied, store_applied), (1, 1));
+    alike_today_first!((today_applied, store_applied), (1, 1));
     ended.stop().await;
 }
 

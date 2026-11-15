@@ -12,6 +12,8 @@ Active {
     ),
     delivered: None,
 }
+== control stream
+sha256:be8f3e6f41a5158c96be83a483792cb8d9543ff4607458c76346c39fd93380d1 (3080 bytes)
 == the conversations differ
 [
     "first",
@@ -235,5 +237,7 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:a37661bd292fcd8bbc351e5bfd3588f66f171deab7d66f090becf94b58d329bb (3037 bytes)
+== today's actor sends Setup once in its life
+1
 == the store actor's second run sent Setup again: ["compaction.setup", "compaction.notice", "compaction.notice", "compaction.notice"]
 1

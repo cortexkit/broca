@@ -40,6 +40,15 @@ ScopeRefused(
         field: RunId,
     },
 )
+== control stream
+sha256:6d18fba247abb977aaea2d5bdfa0232c9446299943a6810f63a12fc231f26ab3 (3080 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "second",
+    "hello",
+]
 == the run starts record the sends differently
 sha256:0d045568f2912c4288a406cc64ecc1a59525a0b434e35ff4109a65d753f7113a (2113 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

@@ -1,44 +1,35 @@
-== cut after record 1 of 11: request count
+== cut after record 4 of 20: request count
 0
-== cut after record 1 of 11: record count
+== cut after record 4 of 20: record count
 2
-== cut after record 1 of 11: records
+== cut after record 4 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 1 of 11: tool calls
+== cut after record 4 of 20: tool calls
 []
-== cut after record 2 of 11: request count
+== cut after record 5 of 20: request count
 0
-== cut after record 2 of 11: record count
+== cut after record 5 of 20: record count
 2
-== cut after record 2 of 11: records
+== cut after record 5 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 2 of 11: tool calls
+== cut after record 5 of 20: tool calls
 []
-== cut after record 3 of 11: request count
+== cut after record 8 of 20: request count
 0
-== cut after record 3 of 11: record count
+== cut after record 8 of 20: record count
 2
-== cut after record 3 of 11: records
+== cut after record 8 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 3 of 11: tool calls
+== cut after record 8 of 20: tool calls
 []
-== cut after record 4 of 11: request count
+== cut after record 10 of 20: request count
 0
-== cut after record 4 of 11: record count
-2
-== cut after record 4 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 4 of 11: tool calls
-[]
-== cut after record 5 of 11: request count
-0
-== cut after record 5 of 11: record count
+== cut after record 10 of 20: record count
 7
-== cut after record 5 of 11: records
+== cut after record 10 of 20: records
 {"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
@@ -46,94 +37,67 @@
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 11: tool calls
+== cut after record 10 of 20: tool calls
 []
-== cut after record 6 of 11: request count
+== cut after record 15 of 20: request count
 0
-== cut after record 6 of 11: record count
+== cut after record 15 of 20: record count
 2
-== cut after record 6 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 11: tool calls
-[]
-== cut after record 7 of 11: request count
-0
-== cut after record 7 of 11: record count
-2
-== cut after record 7 of 11: records
+== cut after record 15 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 11: tool calls
+== cut after record 15 of 20: tool calls
 []
-== cut after record 8 of 11: request count
+== cut after record 16 of 20: request count
 0
-== cut after record 8 of 11: record count
+== cut after record 16 of 20: record count
 2
-== cut after record 8 of 11: records
+== cut after record 16 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 8 of 11: tool calls
+== cut after record 16 of 20: tool calls
 []
-== cut after record 9 of 11: request count
+== cut after record 19 of 20: request count
 0
-== cut after record 9 of 11: record count
+== cut after record 19 of 20: record count
 2
-== cut after record 9 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 9 of 11: tool calls
-[]
-== cut after record 10 of 11: request count
-0
-== cut after record 10 of 11: record count
-2
-== cut after record 10 of 11: records
+== cut after record 19 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== cut after record 10 of 11: tool calls
+== cut after record 19 of 20: tool calls
 []
-== cut after record 1 of 11: request count
+== cut after record 4 of 20: request count
 0
-== cut after record 1 of 11: record count
+== cut after record 4 of 20: record count
 2
-== cut after record 1 of 11: records
+== cut after record 4 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 1 of 11: tool calls
+== cut after record 4 of 20: tool calls
 []
-== cut after record 2 of 11: request count
+== cut after record 5 of 20: request count
 0
-== cut after record 2 of 11: record count
+== cut after record 5 of 20: record count
 2
-== cut after record 2 of 11: records
+== cut after record 5 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 2 of 11: tool calls
+== cut after record 5 of 20: tool calls
 []
-== cut after record 3 of 11: request count
+== cut after record 8 of 20: request count
 0
-== cut after record 3 of 11: record count
+== cut after record 8 of 20: record count
 2
-== cut after record 3 of 11: records
+== cut after record 8 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 3 of 11: tool calls
+== cut after record 8 of 20: tool calls
 []
-== cut after record 4 of 11: request count
+== cut after record 10 of 20: request count
 0
-== cut after record 4 of 11: record count
-2
-== cut after record 4 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 4 of 11: tool calls
-[]
-== cut after record 5 of 11: request count
-0
-== cut after record 5 of 11: record count
+== cut after record 10 of 20: record count
 7
-== cut after record 5 of 11: records
+== cut after record 10 of 20: records
 {"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
@@ -141,94 +105,67 @@
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 11: tool calls
+== cut after record 10 of 20: tool calls
 []
-== cut after record 6 of 11: request count
+== cut after record 15 of 20: request count
 0
-== cut after record 6 of 11: record count
+== cut after record 15 of 20: record count
 2
-== cut after record 6 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 11: tool calls
-[]
-== cut after record 7 of 11: request count
-0
-== cut after record 7 of 11: record count
-2
-== cut after record 7 of 11: records
+== cut after record 15 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 11: tool calls
+== cut after record 15 of 20: tool calls
 []
-== cut after record 8 of 11: request count
+== cut after record 16 of 20: request count
 0
-== cut after record 8 of 11: record count
+== cut after record 16 of 20: record count
 2
-== cut after record 8 of 11: records
+== cut after record 16 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 8 of 11: tool calls
+== cut after record 16 of 20: tool calls
 []
-== cut after record 9 of 11: request count
+== cut after record 19 of 20: request count
 0
-== cut after record 9 of 11: record count
+== cut after record 19 of 20: record count
 2
-== cut after record 9 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 9 of 11: tool calls
-[]
-== cut after record 10 of 11: request count
-0
-== cut after record 10 of 11: record count
-2
-== cut after record 10 of 11: records
+== cut after record 19 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== cut after record 10 of 11: tool calls
+== cut after record 19 of 20: tool calls
 []
-== cut after record 1 of 11: request count
+== cut after record 4 of 20: request count
 0
-== cut after record 1 of 11: record count
+== cut after record 4 of 20: record count
 2
-== cut after record 1 of 11: records
+== cut after record 4 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 1 of 11: tool calls
+== cut after record 4 of 20: tool calls
 []
-== cut after record 2 of 11: request count
+== cut after record 5 of 20: request count
 0
-== cut after record 2 of 11: record count
+== cut after record 5 of 20: record count
 2
-== cut after record 2 of 11: records
+== cut after record 5 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 2 of 11: tool calls
+== cut after record 5 of 20: tool calls
 []
-== cut after record 3 of 11: request count
+== cut after record 8 of 20: request count
 0
-== cut after record 3 of 11: record count
+== cut after record 8 of 20: record count
 2
-== cut after record 3 of 11: records
+== cut after record 8 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 3 of 11: tool calls
+== cut after record 8 of 20: tool calls
 []
-== cut after record 4 of 11: request count
+== cut after record 10 of 20: request count
 0
-== cut after record 4 of 11: record count
-2
-== cut after record 4 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 4 of 11: tool calls
-[]
-== cut after record 5 of 11: request count
-0
-== cut after record 5 of 11: record count
+== cut after record 10 of 20: record count
 7
-== cut after record 5 of 11: records
+== cut after record 10 of 20: records
 {"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
@@ -236,94 +173,67 @@
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 11: tool calls
+== cut after record 10 of 20: tool calls
 []
-== cut after record 6 of 11: request count
+== cut after record 15 of 20: request count
 0
-== cut after record 6 of 11: record count
+== cut after record 15 of 20: record count
 2
-== cut after record 6 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 11: tool calls
-[]
-== cut after record 7 of 11: request count
-0
-== cut after record 7 of 11: record count
-2
-== cut after record 7 of 11: records
+== cut after record 15 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 11: tool calls
+== cut after record 15 of 20: tool calls
 []
-== cut after record 8 of 11: request count
+== cut after record 16 of 20: request count
 0
-== cut after record 8 of 11: record count
+== cut after record 16 of 20: record count
 2
-== cut after record 8 of 11: records
+== cut after record 16 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 8 of 11: tool calls
+== cut after record 16 of 20: tool calls
 []
-== cut after record 9 of 11: request count
+== cut after record 19 of 20: request count
 0
-== cut after record 9 of 11: record count
+== cut after record 19 of 20: record count
 2
-== cut after record 9 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 9 of 11: tool calls
-[]
-== cut after record 10 of 11: request count
-0
-== cut after record 10 of 11: record count
-2
-== cut after record 10 of 11: records
+== cut after record 19 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== cut after record 10 of 11: tool calls
+== cut after record 19 of 20: tool calls
 []
-== cut after record 1 of 11: request count
+== cut after record 4 of 20: request count
 0
-== cut after record 1 of 11: record count
+== cut after record 4 of 20: record count
 2
-== cut after record 1 of 11: records
+== cut after record 4 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 1 of 11: tool calls
+== cut after record 4 of 20: tool calls
 []
-== cut after record 2 of 11: request count
+== cut after record 5 of 20: request count
 0
-== cut after record 2 of 11: record count
+== cut after record 5 of 20: record count
 2
-== cut after record 2 of 11: records
+== cut after record 5 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":0,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{}}}
-== cut after record 2 of 11: tool calls
+== cut after record 5 of 20: tool calls
 []
-== cut after record 3 of 11: request count
+== cut after record 8 of 20: request count
 0
-== cut after record 3 of 11: record count
+== cut after record 8 of 20: record count
 2
-== cut after record 3 of 11: records
+== cut after record 8 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 3 of 11: tool calls
+== cut after record 8 of 20: tool calls
 []
-== cut after record 4 of 11: request count
+== cut after record 10 of 20: request count
 0
-== cut after record 4 of 11: record count
-2
-== cut after record 4 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 4 of 11: tool calls
-[]
-== cut after record 5 of 11: request count
-0
-== cut after record 5 of 11: record count
+== cut after record 10 of 20: record count
 7
-== cut after record 5 of 11: records
+== cut after record 10 of 20: records
 {"Resumed":{"indeterminate":["c1"],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"outcome_unknown: this tool call was sent, but no result was recorded before the run stopped, so it may or may not have run. It will not be sent again."},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
 {"ToolOutcome":{"batch_id":"r1-b1","call_key":null,"detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"Unknown","reason":null,"result_digest":"3dfd7e0edbfcccf736df0c43c29d279f0acd0d65c25ff37d96e8425ebea0d0bd","run_id":"r1","tool_call_id":"c1"}}
@@ -331,50 +241,32 @@
 {"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":"<normalized>","dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Interrupted"}],"kind":"TurnFacts","ordinal":2}}
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 11: tool calls
+== cut after record 10 of 20: tool calls
 []
-== cut after record 6 of 11: request count
+== cut after record 15 of 20: request count
 0
-== cut after record 6 of 11: record count
+== cut after record 15 of 20: record count
 2
-== cut after record 6 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 11: tool calls
-[]
-== cut after record 7 of 11: request count
-0
-== cut after record 7 of 11: record count
-2
-== cut after record 7 of 11: records
+== cut after record 15 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 11: tool calls
+== cut after record 15 of 20: tool calls
 []
-== cut after record 8 of 11: request count
+== cut after record 16 of 20: request count
 0
-== cut after record 8 of 11: record count
+== cut after record 16 of 20: record count
 2
-== cut after record 8 of 11: records
+== cut after record 16 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 8 of 11: tool calls
+== cut after record 16 of 20: tool calls
 []
-== cut after record 9 of 11: request count
+== cut after record 19 of 20: request count
 0
-== cut after record 9 of 11: record count
+== cut after record 19 of 20: record count
 2
-== cut after record 9 of 11: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 9 of 11: tool calls
-[]
-== cut after record 10 of 11: request count
-0
-== cut after record 10 of 11: record count
-2
-== cut after record 10 of 11: records
+== cut after record 19 of 20: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":4,"model_steps":2,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
-== cut after record 10 of 11: tool calls
+== cut after record 19 of 20: tool calls
 []

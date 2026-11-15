@@ -1,0 +1,46 @@
+== run.status r1 after both ran
+Object {
+    "final_step_finish_reason": String("stop"),
+    "retries_used": Number(0),
+    "state": String("completed"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
+== run.status r2 after both ran
+Object {
+    "final_step_finish_reason": String("stop"),
+    "retries_used": Number(0),
+    "state": String("completed"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}

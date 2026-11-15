@@ -25,6 +25,19 @@ Pending {
         "sub-r3",
     ),
 }
+== control stream
+sha256:8e9b6fae8d281a15c774fd34eabe644f8696a775de9270d2c564735df9cd2b73 (5677 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "steered",
+    "again",
+    "second",
+    "more",
+    "queued",
+    "done",
+]
 == the run starts record the sends differently
 sha256:c500201715bd7f3a1147962beae49365a67a3f0d53b19e64653699bab1cc57c8 (3316 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

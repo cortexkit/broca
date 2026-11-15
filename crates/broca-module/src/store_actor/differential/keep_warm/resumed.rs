@@ -384,7 +384,7 @@ async fn first_resumed_wait_matches_todays_recorded_base(cipher: Cipher) {
             recorded,
         );
         assert!(matches!(today.warm(&config, &run).await, WarmTick::Sent));
-        assert_eq!(
+        alike!(
             *executor.sent.lock().unwrap(),
             *legacy_executor.sent.lock().unwrap(),
             "Recorded bases warm identical bytes"

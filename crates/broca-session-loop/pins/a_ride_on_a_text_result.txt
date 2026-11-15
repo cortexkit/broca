@@ -15,6 +15,13 @@ sha256:62c65e99fb2f537f84631c5973ff327c18f95e2379e631242a0e443024eddd7e (8819 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -32,109 +39,12 @@ sha256:62c65e99fb2f537f84631c5973ff327c18f95e2379e631242a0e443024eddd7e (8819 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== request count
-2
-== request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
-== request 1
-sha256:84aeca8df7e58da621dfb8fd031db9084083b19e28643487856e3516b396d0aa (5741 bytes)
-== record count
-25
-== records
-sha256:b757c8da591acbe7ba1ed1bf3a40e89349c60182f16068b2d4c25d60182c99f7 (9068 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== compaction entries
-[
-  {
-    "digest": "5f8e83d00b35d776970a0bf4cd0f94cf3a5f94415d9cfdbe08082ed3cc070787",
-    "mid": "mid#0",
-    "ordinal": 1,
-    "parts": [
-      {
-        "digest": "be34dd3897cd71644ca7ecbb992e2da1f0f4dbb3a630c7c78c6e49cb662bc142",
-        "id": "id#1",
-        "kind": "text",
-        "tag": 1,
-        "text": "read a"
-      }
-    ],
-    "role": "user",
-    "written_at": "<time>"
-  },
-  {
-    "completed_at": "<time>",
-    "digest": "35df86ab171ef0ba517312e3cd83aab21ef9d862e5d041ddbc8da6836cf6aa5a",
-    "mid": "mid#2",
-    "ordinal": 2,
-    "parts": [
-      {
-        "call_id": "c1",
-        "delivered": [
-          {
-            "forms": [
-              "tool_result"
-            ],
-            "send_id": "q1",
-            "sender": "broca",
-            "text": "note q1",
-            "text_bytes": 7
-          }
-        ],
-        "digest": "491b4c02a20d5d51432d8dab9da43724d40181324bff2a26dbc8b1407692f0d3",
-        "id": "id#1",
-        "input": {
-          "path": "a"
-        },
-        "kind": "tool",
-        "name": "read",
-        "output": "file contents",
-        "output_bytes": 13,
-        "status": "completed",
-        "tag": 2
-      }
-    ],
-    "role": "assistant",
-    "usage": {
-      "output_tokens": 20,
-      "prompt_tokens": 100
-    },
-    "written_at": "<time>"
-  },
-  {
-    "digest": "822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615",
-    "mid": "mid#3",
-    "ordinal": 3,
-    "parts": [],
-    "role": "assistant",
-    "written_at": "<time>"
-  },
-  {
-    "completed_at": "<time>",
-    "digest": "e1efc2091db0847bf25e772f20ce320afe09f78e55c054d9560833f06ba94b38",
-    "mid": "mid#4",
-    "ordinal": 4,
-    "parts": [
-      {
-        "digest": "1fc03dd92b44bf9a8dd2849645744885c75d570b341cbe9fdca9252809d0896a",
-        "id": "id#1",
-        "kind": "text",
-        "tag": 3,
-        "text": "done"
-      }
-    ],
-    "role": "assistant",
-    "usage": {
-      "output_tokens": 20,
-      "prompt_tokens": 100
-    },
-    "written_at": "<time>"
-  }
+    (
+        Completed,
+        None,
+    ),
 ]
 == request count
 2
@@ -239,4 +149,122 @@ sha256:b757c8da591acbe7ba1ed1bf3a40e89349c60182f16068b2d4c25d60182c99f7 (9068 by
     },
     "written_at": "<time>"
   }
+]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
+2
+== request 0
+sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+== request 1
+sha256:84aeca8df7e58da621dfb8fd031db9084083b19e28643487856e3516b396d0aa (5741 bytes)
+== record count
+25
+== records
+sha256:b757c8da591acbe7ba1ed1bf3a40e89349c60182f16068b2d4c25d60182c99f7 (9068 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== compaction entries
+[
+  {
+    "digest": "5f8e83d00b35d776970a0bf4cd0f94cf3a5f94415d9cfdbe08082ed3cc070787",
+    "mid": "mid#0",
+    "ordinal": 1,
+    "parts": [
+      {
+        "digest": "be34dd3897cd71644ca7ecbb992e2da1f0f4dbb3a630c7c78c6e49cb662bc142",
+        "id": "id#1",
+        "kind": "text",
+        "tag": 1,
+        "text": "read a"
+      }
+    ],
+    "role": "user",
+    "written_at": "<time>"
+  },
+  {
+    "completed_at": "<time>",
+    "digest": "35df86ab171ef0ba517312e3cd83aab21ef9d862e5d041ddbc8da6836cf6aa5a",
+    "mid": "mid#2",
+    "ordinal": 2,
+    "parts": [
+      {
+        "call_id": "c1",
+        "delivered": [
+          {
+            "forms": [
+              "tool_result"
+            ],
+            "send_id": "q1",
+            "sender": "broca",
+            "text": "note q1",
+            "text_bytes": 7
+          }
+        ],
+        "digest": "491b4c02a20d5d51432d8dab9da43724d40181324bff2a26dbc8b1407692f0d3",
+        "id": "id#1",
+        "input": {
+          "path": "a"
+        },
+        "kind": "tool",
+        "name": "read",
+        "output": "file contents",
+        "output_bytes": 13,
+        "status": "completed",
+        "tag": 2
+      }
+    ],
+    "role": "assistant",
+    "usage": {
+      "output_tokens": 20,
+      "prompt_tokens": 100
+    },
+    "written_at": "<time>"
+  },
+  {
+    "digest": "822aab69cd0fb2aaf8e31a0ca847b86cdba637df0e11e9a5465ea44f6ca3f615",
+    "mid": "mid#3",
+    "ordinal": 3,
+    "parts": [],
+    "role": "assistant",
+    "written_at": "<time>"
+  },
+  {
+    "completed_at": "<time>",
+    "digest": "e1efc2091db0847bf25e772f20ce320afe09f78e55c054d9560833f06ba94b38",
+    "mid": "mid#4",
+    "ordinal": 4,
+    "parts": [
+      {
+        "digest": "1fc03dd92b44bf9a8dd2849645744885c75d570b341cbe9fdca9252809d0896a",
+        "id": "id#1",
+        "kind": "text",
+        "tag": 3,
+        "text": "done"
+      }
+    ],
+    "role": "assistant",
+    "usage": {
+      "output_tokens": 20,
+      "prompt_tokens": 100
+    },
+    "written_at": "<time>"
+  }
+]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
 ]

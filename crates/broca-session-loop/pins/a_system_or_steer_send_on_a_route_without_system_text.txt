@@ -15,6 +15,13 @@ sha256:4be5ea2bec841464e50e7142cd0e1f28412c326b46af12754572f5b213473ae6 (8855 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -32,6 +39,13 @@ sha256:4be5ea2bec841464e50e7142cd0e1f28412c326b46af12754572f5b213473ae6 (8855 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -51,6 +65,13 @@ sha256:c1246df90dad7d36a0b0bdbb5865fab0cd7244304df51fdc8191d09c2a600f79 (9074 by
 ]
 == compaction entries
 sha256:7c516d99ff2c7e1ffde8a794dd80d82a5c2411d80bd6508af49db568c37f8afe (2149 bytes)
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -70,3 +91,10 @@ sha256:c1246df90dad7d36a0b0bdbb5865fab0cd7244304df51fdc8191d09c2a600f79 (9074 by
 ]
 == compaction entries
 sha256:7c516d99ff2c7e1ffde8a794dd80d82a5c2411d80bd6508af49db568c37f8afe (2149 bytes)
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]

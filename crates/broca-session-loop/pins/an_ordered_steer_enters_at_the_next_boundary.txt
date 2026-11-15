@@ -15,6 +15,13 @@ sha256:ae89e1617c5f5f63880b2216d98df97904026675a0193818f5aac425ca08d29b (8739 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
 == request count
 2
 == request 0
@@ -32,22 +39,12 @@ sha256:ae89e1617c5f5f63880b2216d98df97904026675a0193818f5aac425ca08d29b (8739 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== request count
-2
-== request 0
-sha256:2579dc898e42e4da0572aa848f3993e8a6ebb79b08faf052f3431371ed0683d9 (2492 bytes)
-== request 1
-sha256:07c0f7290b0adecbc4c6b0d4982c00602fbe60d24ce3c4cef8b9f6031f840d46 (6127 bytes)
-== record count
-25
-== records
-sha256:485339738d3825ffcdfaecb6782433bf4dcfc6a32c933ecd99245753a9826276 (8958 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
+    (
+        Completed,
+        None,
+    ),
 ]
 == request count
 2
@@ -65,4 +62,35 @@ sha256:485339738d3825ffcdfaecb6782433bf4dcfc6a32c933ecd99245753a9826276 (8958 by
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
+2
+== request 0
+sha256:2579dc898e42e4da0572aa848f3993e8a6ebb79b08faf052f3431371ed0683d9 (2492 bytes)
+== request 1
+sha256:07c0f7290b0adecbc4c6b0d4982c00602fbe60d24ce3c4cef8b9f6031f840d46 (6127 bytes)
+== record count
+25
+== records
+sha256:485339738d3825ffcdfaecb6782433bf4dcfc6a32c933ecd99245753a9826276 (8958 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
 ]

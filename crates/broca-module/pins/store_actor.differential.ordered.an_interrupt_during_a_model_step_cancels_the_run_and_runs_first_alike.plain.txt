@@ -17,6 +17,8 @@ Pending {
         "sub-i1",
     ),
 }
+== control stream
+sha256:23b776daade4d51afdd1f4538e48b7096937d0b1897f398ba12bac95cd3a366b (4329 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:ceb5459cc55416e6abd60220b7f9b2ba4d9df610bc2c40a11267bd099770dce9 (5191 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -205,6 +207,59 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:083ee9e2ec7027631c8a48e4b6d55ff2fe7effeead070bc779acb0a308452eda (3053 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r1"),
+        "submission_id": Null,
+    },
+    Object {
+        "delivery": Null,
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-p1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+    },
+    Object {
+        "delivery": String("interrupt"),
+        "principal": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+        "queued": String("sub-i1"),
+        "sent_by": Object {
+            "kind": String("reserved"),
+            "module_id": String("prefrontal-core"),
+        },
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("cancelled"),
+    },
+    Object {
+        "run": String("i1"),
+        "submission_id": String("sub-i1"),
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+    Object {
+        "run": String("p1"),
+        "submission_id": String("sub-p1"),
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "you are a worker",

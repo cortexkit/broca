@@ -41,6 +41,8 @@ Active {
         "read",
     ],
 ]
+== control stream
+sha256:1b01230c0dc0109fe94d1d453e43938d094f117df03ffb90f098be3fb48e3d72 (3088 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:169a51522176cfc35bf06f5f35d9c18ed50d5e6cd18c6337c2ba757299958573 (3480 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))
@@ -227,6 +229,27 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:2837a9cadcef5b4d5c98050771880bd5f4d6711fe396ad9a589bd6299a097d7a (3041 bytes)
+== the sessions recorded their sends differently
+[
+    Object {
+        "run": String("r-k1"),
+        "submission_id": Null,
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+    Object {
+        "run": String("r4"),
+        "submission_id": Null,
+    },
+    Object {
+        "interrupt_reason": Null,
+        "run_ended": String("completed"),
+    },
+]
+== the sessions hold different sends queued
+[]
 == the conversations differ
 [
     "first",

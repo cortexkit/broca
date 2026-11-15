@@ -13,6 +13,13 @@ sha256:485e74b81cacb2d5f449a7f09dd34e31babe87a71bb5bbd438a6a9704839460d (5845 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
 == request count
 1
 == request 0
@@ -28,20 +35,12 @@ sha256:485e74b81cacb2d5f449a7f09dd34e31babe87a71bb5bbd438a6a9704839460d (5845 by
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== request count
-1
-== request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
-== record count
-17
-== records
-sha256:0d2d3afe5313b1b326a79d2ead8c57dd298522dda0aa32bdca489a7cda7be9d2 (5953 bytes)
-== tool calls
+== how each run reported
 [
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
+    (
+        Cancelled,
+        None,
+    ),
 ]
 == request count
 1
@@ -57,4 +56,33 @@ sha256:0d2d3afe5313b1b326a79d2ead8c57dd298522dda0aa32bdca489a7cda7be9d2 (5953 by
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
+== request count
+1
+== request 0
+sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+== record count
+17
+== records
+sha256:0d2d3afe5313b1b326a79d2ead8c57dd298522dda0aa32bdca489a7cda7be9d2 (5953 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
 ]

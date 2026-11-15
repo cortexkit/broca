@@ -29,6 +29,15 @@ Finished {
     reason: Completed,
     delivered: None,
 }
+== control stream
+sha256:d44d9437167b9ca4af8a2772f81a7a73efd72961d16a646bf148dc9411ac97a6 (3131 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "second",
+    "again",
+]
 == the run starts record the sends differently
 sha256:360189a299bdc308973383b9f2008c47b83c664d1d603b138284cb3f71de3b34 (2355 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

@@ -733,7 +733,7 @@ async fn compare_compaction_refusals(today: &Side, store: &Side, label: &str) {
         let old = today.compaction(caller, method, params.clone()).await;
         let new = store.compaction(caller, method, params).await;
         alike!(new, old, "{label}: {method} from {caller:?}");
-        assert_eq!(
+        alike_today_first!(
             old.unwrap_err()["detail"]["reason"],
             json!("session_not_held"),
             "{label}: {method}"
@@ -2477,12 +2477,12 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         broca_wal::session_storage_class(&store.dir, &address(&store)).unwrap(),
         Some(StorageClass::Durable)
     );
-    assert_eq!(wal_folder(&store), None);
-    assert_eq!(
+    alike_today_first!(wal_folder(&store), None);
+    alike_today_first!(
         broca_wal::session_storage_class(&today.dir, &address(&today)).unwrap(),
         None
     );
-    assert_eq!(wal_folder(&today), Some(StorageClass::Durable));
+    alike_today_first!(wal_folder(&today), Some(StorageClass::Durable));
     let current = || async {
         store
             .registry
@@ -2551,7 +2551,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         side.settled(&format!("run-{second_id}")).await;
         side.assert_completed(&format!("run-{second_id}")).await;
     }
-    assert_eq!(
+    alike_today_first!(
         wal_folder(&store),
         None,
         "the next turn ran in the new storage"
@@ -2765,7 +2765,7 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
     by_ordinal(&mut new, &ids[1]);
     alike!(new, old, "both logs record the view alike");
     let through = format!("entry {}", ids[0].keys().next_back().unwrap());
-    assert_eq!(
+    alike_today_first!(
         old,
         json!([{"version": 1, "built_through": through, "new_signed": "strip",
                 "applied_by": "ck-mc"}])

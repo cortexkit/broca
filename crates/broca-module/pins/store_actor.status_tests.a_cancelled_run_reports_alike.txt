@@ -1,0 +1,21 @@
+== run.status of a cancelled run
+Object {
+    "retries_used": Number(0),
+    "state": String("cancelled"),
+    "undelivered_steers": Array [],
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== run.result of a cancelled run
+Object {
+    "run_id": String("r1"),
+    "state": String("cancelled"),
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}

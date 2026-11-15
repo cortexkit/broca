@@ -1,0 +1,4 @@
+== run.status of a retracted send
+Object {
+    "state": String("retracted"),
+}

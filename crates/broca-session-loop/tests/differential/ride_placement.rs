@@ -132,6 +132,9 @@ async fn new_only(
             let mut writer = Recording {
                 session: &mut session,
                 records: Vec::new(),
+                batch_ends: Vec::new(),
+                backend: None,
+                snapshots: Vec::new(),
                 injected,
                 ended: Default::default(),
                 media: Default::default(),

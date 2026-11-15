@@ -24,6 +24,19 @@ Pending {
         "sub-r4",
     ),
 }
+== control stream
+sha256:0777cf22af8b00ab6c651f5b0226222855ed227e4db1eacc9657ef035536939d (6222 bytes)
+== the conversations differ
+[
+    "first",
+    "hello",
+    "queued",
+    "again",
+    "third",
+    "more",
+    "queued too",
+    "done",
+]
 == the run starts record the sends differently
 sha256:056b51ef038a704f671f83b8334d8f7ac1431cadf8b46c7ac396fffa5bc7e95a (4933 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)

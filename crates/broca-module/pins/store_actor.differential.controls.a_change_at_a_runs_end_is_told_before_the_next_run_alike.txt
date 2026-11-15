@@ -72,6 +72,8 @@ Active {
         "seq": Number(4),
     },
 ]
+== control stream
+sha256:aeb36917b6cd1a396f6d81e2ec45a67ca542ead5d4b4b3d1ddb70f42e8f0b380 (4471 bytes)
 == the conversations differ
 [
     "first",

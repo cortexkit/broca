@@ -9,6 +9,104 @@ Active {
 SteerSettingsConflict {
     field: "generation.temperature",
 }
+== control stream
+[
+  {
+    "event": {
+      "run_id": "r1",
+      "type": "run_started"
+    },
+    "unit": {
+      "run_id": "r1",
+      "type": "run_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "step_id": 1,
+      "type": "step_started"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "message": {
+        "content": [
+          {
+            "text": "hello",
+            "type": "text"
+          }
+        ],
+        "message_id": "a1"
+      },
+      "type": "assistant_message"
+    }
+  },
+  {
+    "event": {
+      "type": "display_reset"
+    },
+    "unit": {
+      "finish_reason": "stop",
+      "step_id": 1,
+      "type": "step_finished",
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 20
+      }
+    }
+  },
+  {
+    "event": {
+      "reason": "completed",
+      "run_id": "r1",
+      "type": "run_finished"
+    },
+    "unit": {
+      "final_step_finish_reason": "stop",
+      "reason": "completed",
+      "retries_used": 0,
+      "run_id": "r1",
+      "type": "run_finished",
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 20
+      }
+    }
+  }
+]
+== the conversations differ
+[
+    "first",
+    "hello",
+]
 == the run starts record the sends differently
 [
     Object {

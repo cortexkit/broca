@@ -1,14 +1,16 @@
-//! Today's loop and the new loop, driven by the same scripted provider and tool plane, must
-//! make the same run.
+//! The new loop driven by a scripted provider and tool plane, checked against what it was pinned
+//! to do (see `broca_test_support::pins`).
 //!
-//! Each scenario runs once through today's loop (`broca_core::run_loop`) on a real file log,
-//! and once through the new loop on a new-format session. Today's log is converted with the
-//! proven converter, so both runs are compared as new-format records. Three things must match:
-//! - **the requests:** every `CallOptions` the provider was asked to send, compared whole,
-//!   including the render inputs that never serialize;
+//! These scenarios once compared the new loop with the previous runner, scenario by scenario,
+//! and the pins hold what both did alike when the previous runner was removed. Each run pins:
+//! - **the requests:** every `CallOptions` the provider was asked to send, whole, including the
+//!   render inputs that never serialize;
 //! - **the records:** kind by kind and field by field, apart from fields that hold a time or
 //!   an id minted per log, which the harness normalizes by name;
 //! - **the tool calls:** what the tool plane was asked to run, in order.
+//!
+//! A crash is a cut of the session's own log at the end of one of its batches: the session
+//! reopens from the backend as that batch left it, and the loop resumes or seals the run.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -21,11 +23,7 @@ use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
     ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
 };
-use broca_core::{
-    provider::Provider, run_loop_on_writer, run_loop_with_control, FileLeaseStore, FileWalStore,
-    RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane, WalHandle, WalStore,
-};
-use broca_crash_harness::wal::LogImage;
+use broca_core::{provider::Provider, RunControl, RunRequest, StubReply, StubToolPlane};
 use broca_protocol::caller::PauseReason;
 use broca_protocol::content::{
     AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolOutputPart, ToolResult,
@@ -904,11 +902,6 @@ async fn media_reads_back(session: &Session<&MemoryBackend>) {
     }
 }
 
-/// A log's lineage id as the converter takes it, which today's call keys are made of.
-fn lineage(image: &LogImage) -> Option<String> {
-    image.lineage_id().map(|lineage| lineage.to_string())
-}
-
 /// The model a run of the comparison uses: `m`, or the one a run id names after an `@`
 /// (`r2@m2`), so a scenario can change the model between runs.
 fn run_model(run_id: &str) -> &str {
@@ -1042,11 +1035,10 @@ async fn compare_spent<F: std::future::Future<Output = ()>>(comparison: F) {
     SPEND.scope(true, comparison).await;
 }
 
-/// Each run of today's log `today` gets the same spend facts from today's builder
-/// (`compute_segments_for_run`) as the same run of `session` does, its records rebuilt in
-/// today's form as the store actor's billing rebuilds them. The times each loop took from its
-/// own clock, and the fact ids made from them, are set aside.
-async fn spend_alike(today: &LogImage, session: &Session<&MemoryBackend>, parts: &MemoryParts) {
+/// Pins the spend facts each run of `session` gets from the usage-export builder
+/// (`compute_segments_for_run`), its records rebuilt as the store actor's billing rebuilds them.
+/// The times the loop took from its clock, and the fact ids made from them, are set aside.
+async fn pin_spend(session: &Session<&MemoryBackend>, parts: &MemoryParts) {
     struct UnknownCharge;
     impl broca_core::ChargeBasisResolver for UnknownCharge {
         fn resolve_charge_basis(&self, _: &str, _: &str) -> (broca_core::ChargeBasis, u32) {
@@ -1070,40 +1062,27 @@ async fn spend_alike(today: &LogImage, session: &Session<&MemoryBackend>, parts:
             })
             .collect()
     }
-    let framed = today.framed();
-    let mut runs: Vec<(RunId, broca_protocol::BindIdentity)> = Vec::new();
-    for frame in &framed {
-        if let WalRecord::RunStarted {
-            run_id, session, ..
-        } = &frame.record
-        {
-            if !runs.iter().any(|(known, _)| known == run_id) {
-                runs.push((run_id.clone(), session.clone()));
+    let records = session.open_log_records().await.unwrap();
+    let mut runs: Vec<String> = Vec::new();
+    for (_, record) in &records {
+        if let Record::RunStart(start) = record {
+            if !runs.contains(&start.run_id) {
+                runs.push(start.run_id.clone());
             }
         }
     }
-    assert!(!runs.is_empty(), "today's log started no run");
-    let records = session.open_log_records().await.unwrap();
-    for (run_id, identity) in runs {
-        let old = broca_core::billing::compute_segments_for_run(
-            &framed,
-            &run_id,
-            "differential",
-            &UnknownCharge,
-        );
-        let rebuilt =
-            broca_session_loop::billing::today_records(&records, &run_id.0, &identity, parts)
-                .expect("the run's records rebuild");
-        let new = broca_core::billing::compute_segments_for_run(
+    assert!(!runs.is_empty(), "the session started no run");
+    for run_id in runs {
+        let rebuilt = broca_session_loop::billing::today_records(&records, &run_id, &bind(), parts)
+            .expect("the run's records rebuild");
+        let facts = timeless(broca_core::billing::compute_segments_for_run(
             &rebuilt,
-            &run_id,
+            &RunId(run_id.clone()),
             "differential",
             &UnknownCharge,
-        );
-        let new = timeless(new);
-        broca_test_support::pin!(format!("run {}'s spend facts", run_id.0), new);
-        assert!(!old.is_empty(), "today bills run {}", run_id.0);
-        assert_eq!(new, timeless(old), "run {}'s spend facts", run_id.0);
+        ));
+        assert!(!facts.is_empty(), "run {run_id} bills");
+        broca_test_support::pin!(format!("run {run_id}'s spend facts"), facts);
     }
 }
 
@@ -1122,25 +1101,15 @@ async fn reading_entries(comparison: impl std::future::Future<Output = ()>) {
     ENTRIES.scope(true, comparison).await;
 }
 
-/// On the compaction contract, every compaction entry the new session serves equals the one
-/// today's storage serves for the same history (`compaction_v2::transcript::project`): a
-/// carrying tool result with its own output and each ride beside it, and each delivered
-/// message as it was placed. Message ids, call keys and other ids each storage mints its own
-/// way are compared by order of first appearance; times by whether they are there.
-async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
+/// On the compaction contract, pins every compaction entry the session serves: a tool result
+/// with its own output and, beside it, each ride (text a queued send delivered with that result,
+/// which the contract keeps apart from the output), and each delivered message as it was placed. Message ids, call keys and other ids are pinned by order of first appearance; times
+/// by whether they are there.
+async fn pin_entries(session: &Session<&MemoryBackend>) {
     // Only a log on the compaction contract serves compaction entries.
     if LAYOUT.try_with(|layout| layout.is_none()).unwrap_or(true) {
         return;
     }
-    let framed = today.framed();
-    assert!(
-        broca_core::is_mode3_log(framed.iter().map(|frame| &frame.record)),
-        "today's log is on the compaction contract"
-    );
-    let lineage = lineage(today).expect("today's log on the contract has a lineage");
-    let old = broca_core::compaction_v2::transcript::project(&framed, &lineage)
-        .expect("today's entries project")
-        .entries;
     let new: Vec<_> = session
         .entries(1, usize::MAX)
         .await
@@ -1223,12 +1192,10 @@ async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
         rename(&mut value, &mut Default::default());
         value
     }
-    let new = masked(&new);
     broca_test_support::pin!(
         "compaction entries",
-        broca_test_support::pins::Text(serde_json::to_string_pretty(&new).unwrap())
+        broca_test_support::pins::Text(serde_json::to_string_pretty(&masked(&new)).unwrap())
     );
-    assert_eq!(new, masked(&old), "the compaction entries differ");
 }
 
 tokio::task_local! {
@@ -1304,7 +1271,6 @@ tokio::task_local! {
 /// One scripted driver per loop, so a comparison can check both sent the same warms.
 #[derive(Default)]
 struct WarmPair {
-    today: Arc<WarmScript>,
     new: Arc<WarmScript>,
 }
 
@@ -1348,35 +1314,6 @@ impl WarmScript {
             .unwrap()
             .push(format!("warm {} {}", run_id.0, model.model_id));
         broca_core::keep_warm_wait::WarmTick::Sent
-    }
-}
-
-/// The script as today's loop calls it: with the run's `RunConfig`.
-struct TodayWarmer(Arc<WarmScript>);
-
-#[async_trait::async_trait]
-impl broca_core::keep_warm_wait::KeepWarmDriver for TodayWarmer {
-    fn timing(
-        &self,
-        _: &broca_wal::RunConfig,
-    ) -> Result<broca_core::keep_warm_wait::WarmTiming, String> {
-        self.0.timing()
-    }
-    fn last_sent_at_ms(&self) -> Option<u64> {
-        Some(0)
-    }
-    fn note_attempt(&self, attempt: &broca_protocol::ModelAttempt) {
-        self.0.note(attempt);
-    }
-    fn costs(&self, _: &broca_wal::RunConfig) -> Result<broca_core::keep_warm::WarmCosts, String> {
-        self.0.costs()
-    }
-    async fn warm(
-        &self,
-        config: &broca_wal::RunConfig,
-        run_id: &RunId,
-    ) -> broca_core::keep_warm_wait::WarmTick {
-        self.0.warm(run_id, &config.model)
     }
 }
 
@@ -1622,7 +1559,6 @@ tokio::task_local! {
 
 #[derive(Default)]
 struct ReportPair {
-    today: Arc<Mutex<Vec<String>>>,
     new: Arc<Mutex<Vec<String>>>,
 }
 
@@ -1637,29 +1573,6 @@ fn reported_attempt(attempt: &broca_protocol::ModelAttempt) -> String {
         "attempt {} {:?} {:?}",
         attempt.attempt, attempt.outcome, attempt.http_status
     )
-}
-
-struct TodayReports(Arc<Mutex<Vec<String>>>);
-
-/// Today's loop's account reporter, when the comparison has one.
-fn today_reporter() -> Option<Arc<dyn broca_core::AccountReporter>> {
-    reports().map(|reports| {
-        Arc::new(TodayReports(Arc::clone(&reports.today))) as Arc<dyn broca_core::AccountReporter>
-    })
-}
-
-impl broca_core::AccountReporter for TodayReports {
-    fn run_started(&self, _: Option<broca_wal::WalLineageId>, _: u64) {
-        self.0.lock().unwrap().push("run started".into());
-    }
-    fn attempt_recorded(
-        &self,
-        _: Option<broca_wal::WalLineageId>,
-        _: u64,
-        attempt: &broca_protocol::ModelAttempt,
-    ) {
-        self.0.lock().unwrap().push(reported_attempt(attempt));
-    }
 }
 
 /// The new loop's reports, which also checks each names its own record.
@@ -1687,46 +1600,9 @@ impl AccountReports for NewReports {
 async fn compare_reported<F: std::future::Future<Output = ()>>(at_least: usize, compare: F) {
     let pair = Arc::new(ReportPair::default());
     REPORTS.scope(Some(Arc::clone(&pair)), compare).await;
-    let today = pair.today.lock().unwrap().clone();
     let new = pair.new.lock().unwrap().clone();
     broca_test_support::pin!("account reports", new);
-    assert!(today.len() >= at_least, "today's reports: {today:?}");
-    assert_eq!(new, today, "the new loop's reports");
-}
-
-/// Today's loop reads the cache lifetime a run's requests ask for from its keep-warm driver,
-/// which production builds from the provider's cache declaration. This one only answers that,
-/// as production's does, and never warms (no run in these comparisons asks to).
-struct CacheLifetime;
-
-#[async_trait::async_trait]
-impl broca_core::keep_warm_wait::KeepWarmDriver for CacheLifetime {
-    fn timing(
-        &self,
-        _: &broca_wal::RunConfig,
-    ) -> Result<broca_core::keep_warm_wait::WarmTiming, String> {
-        Err("not warming in this comparison".into())
-    }
-    fn requested_ttl_ms(&self, config: &broca_wal::RunConfig) -> Option<u64> {
-        let frozen = serde_json::from_value(config.frozen_render_config.clone()).ok()?;
-        broca_provider::cache_warm::requested_ttl_ms(&config.model.provider_module_id, &frozen)
-    }
-    fn last_sent_at_ms(&self) -> Option<u64> {
-        None
-    }
-    fn costs(&self, _: &broca_wal::RunConfig) -> Result<broca_core::keep_warm::WarmCosts, String> {
-        Err("not warming in this comparison".into())
-    }
-    async fn warm(
-        &self,
-        _: &broca_wal::RunConfig,
-        _: &RunId,
-    ) -> broca_core::keep_warm_wait::WarmTick {
-        broca_core::keep_warm_wait::WarmTick::Stop {
-            reason: "unsupported".into(),
-            detail: None,
-        }
-    }
+    assert!(new.len() >= at_least, "the new loop's reports: {new:?}");
 }
 
 /// The structured output the comparison running in this task freezes.
@@ -2223,10 +2099,6 @@ impl Scenario {
         )
     }
 
-    fn request(&self) -> RunRequest {
-        self.request_for("r1", &self.input)
-    }
-
     fn request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
         let mut request = self.plain_request_for(run_id, input);
         if RECORDED_MARKS.try_with(|_| ()).is_ok() {
@@ -2401,119 +2273,17 @@ fn pin_records(context: &str, records: &[Value]) {
     );
 }
 
-async fn today(scenario: &Scenario) -> Outcome {
-    today_from(scenario, None, scenario.steps.clone()).await.0
-}
-
-/// Runs today's loop, starting from the log bytes `start` when given (a crash's cut log, which
-/// today's loop resumes), with the provider serving `steps`. Returns what it did, its whole
-/// log, and the log's file name.
-async fn today_from(
-    scenario: &Scenario,
-    start: Option<(&str, &[u8])>,
-    steps: Vec<Vec<NormalizedEvent>>,
-) -> (Outcome, LogImage, String) {
-    let dir = broca_test_support::scratch_root().join(format!(
-        "session-loop-differential-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("wal")).unwrap();
-    if let Some((name, bytes)) = start {
-        std::fs::write(dir.join("wal").join(name), bytes).unwrap();
-    }
-    let provider = ScriptedProvider::new(steps);
-    // A real provider resumed after a downgrade is rebuilt from the downgraded frozen config.
-    if start.is_some_and(|(_, bytes)| {
-        bytes
-            .windows(b"structured_output_downgraded".len())
-            .any(|window| window == b"structured_output_downgraded")
-    }) {
-        provider
-            .downgraded
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    if start.is_some() {
-        provider.resuming();
-    }
-    let plane = scenario.plane();
-    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
-    let lease = FileLeaseStore::new(dir.join("lease"));
-    let wal = FileWalStore::new(dir.join("wal"));
-    let (tx, mut rx) = mpsc::channel(512);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let cancel = CancellationToken::new();
-    run_loop_with_control(
-        scenario.request(),
-        &provider,
-        &plane,
-        &lease,
-        &HarnessPolicy,
-        &wal,
-        None,
-        RunControl {
-            auth_selection: account_selection(),
-            account_limit_pause: account().is_some(),
-            max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
-            provider_held_lifecycle: Some(plane.lifecycle()),
-            manifest: scenario.manifest.clone(),
-            cancel: Some(cancel.clone()),
-            hook_plane: Some(harness_hooks_cancelling(cancel)),
-            new_log_compaction_plan_version: layout(),
-            compaction_plane: spy
-                .clone()
-                .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
-            admitted_context_limit: frozen_context_limit(),
-            account_reporter: reports().map(|reports| {
-                Arc::new(TodayReports(Arc::clone(&reports.today)))
-                    as Arc<dyn broca_core::AccountReporter>
-            }),
-            keep_warm: match warm_script() {
-                Some(script) => Some(Arc::new(TodayWarmer(Arc::clone(&script.today)))
-                    as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>),
-                None => cache().then(|| {
-                    Arc::new(CacheLifetime) as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
-                }),
-            },
-            ..admission_control(scenario)
-        },
-        &tx,
-    )
-    .await
-    .expect("today's loop runs");
-    drop(tx);
-    drain.await.unwrap();
-    let file = std::fs::read_dir(dir.join("wal"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .expect("today's loop wrote a log");
-    let image = LogImage::read(&file);
-    let name = file.file_name().unwrap().to_string_lossy().into_owned();
-    let converted =
-        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
-    let _ = std::fs::remove_dir_all(&dir);
-    (
-        Outcome {
-            records: normalized(&converted.records),
-            requests: sent_requests(&provider),
-            calls: plane
-                .log()
-                .iter()
-                .map(|event| format!("{event:?}"))
-                .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
-                .collect(),
-        },
-        image,
-        name,
-    )
-}
-
 /// A session writer that also keeps every record it appended, for comparison.
 struct Recording<'s, 'b> {
     session: &'s mut Session<&'b MemoryBackend>,
     records: Vec<Record>,
+    /// How many of `records` each appended batch ends at. A crash keeps whole batches, so a log
+    /// cut short ends at one of these.
+    batch_ends: Vec<usize>,
+    /// When set, the backend the session is stored on: after each batch the writer keeps a
+    /// snapshot of it in `snapshots`, what a crash right then would leave behind.
+    backend: Option<&'b MemoryBackend>,
+    snapshots: Vec<MemoryBackend>,
     /// Records another appender (the session actor, in production) added while the loop was
     /// waiting on a seam. They're appended, durably, before the loop's next batch.
     injected: Arc<Mutex<Vec<Record>>>,
@@ -2525,11 +2295,19 @@ struct Recording<'s, 'b> {
 }
 
 impl Recording<'_, '_> {
+    fn snapshot(&mut self) {
+        if let Some(backend) = self.backend {
+            self.snapshots.push(backend.snapshot());
+        }
+    }
+
     async fn flush(&mut self) -> Result<(), SessionError> {
         let pending: Vec<Record> = std::mem::take(&mut *self.injected.lock().unwrap());
         if !pending.is_empty() {
             self.records.extend(pending.iter().cloned());
+            self.batch_ends.push(self.records.len());
             self.media.append(self.session, &pending, true).await?;
+            self.snapshot();
         }
         Ok(())
     }
@@ -2539,7 +2317,9 @@ impl Writer for Recording<'_, '_> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         self.flush().await?;
         self.records.extend_from_slice(records);
+        self.batch_ends.push(self.records.len());
         let seq = self.media.append(self.session, records, barrier).await?;
+        self.snapshot();
         if barrier
             && records
                 .iter()
@@ -2672,13 +2452,193 @@ async fn new_loop(scenario: &Scenario) -> Outcome {
 /// Runs the new loop on a new session. With `start` (a crash's cut log, converted), the session
 /// first holds those records and the loop resumes its run; the outcome's records are only what
 /// the loop appended.
+/// What a new-loop session holds before the run a comparison drives: the records already in
+/// its log, the setup parts they name, and whether they came from today's converter rather than
+/// from the new loop's own log cut short.
+struct Start {
+    records: Vec<Record>,
+    parts: std::collections::BTreeMap<broca_session_store::codec::Digest, Vec<u8>>,
+    converted: bool,
+    /// The backend a crash left the session on, when the start is a cut: the session reopens
+    /// from it as after a restart, rather than from `records` appended to a new session.
+    snapshot: Option<MemoryBackend>,
+}
+
+/// The new loop's whole run of `scenario`, kept so a comparison can cut it: what the run did,
+/// the records its session holds, and the setup parts they name.
+struct Source {
+    outcome: Outcome,
+    records: Vec<Record>,
+    /// How many of `records` each batch ends at, the places a crash can cut the log.
+    batch_ends: Vec<usize>,
+    /// The backend as each batch left it, beside `batch_ends`; empty when not kept.
+    snapshots: Vec<MemoryBackend>,
+    parts: std::collections::BTreeMap<broca_session_store::codec::Digest, Vec<u8>>,
+}
+
+impl Source {
+    /// The session `cut` leaves when a crash stops it after the first `kept` records reached
+    /// the disk.
+    fn cut(&self, kept: usize) -> Start {
+        let snapshot = self
+            .batch_ends
+            .iter()
+            .position(|&end| end == kept)
+            .and_then(|batch| self.snapshots.get(batch))
+            .map(MemoryBackend::snapshot);
+        Start {
+            records: self.records[..kept].to_vec(),
+            parts: self.parts.clone(),
+            converted: false,
+            snapshot,
+        }
+    }
+
+    /// How many model steps the first `kept` records hold an answer for, so a resume is served
+    /// only the steps after them.
+    fn answered(&self, kept: usize) -> usize {
+        self.records[..kept]
+            .iter()
+            .filter(|record| matches!(record, Record::Assistant(_)))
+            .count()
+    }
+}
+
+/// A session converted from today's storage, as `tests/fixtures/converted/<name>.json` keeps it:
+/// each record's kind and encoded body, and each setup part by digest, all hex. The fixtures
+/// were written by today's loop and converter before today's storage was removed, so these
+/// tests still start from what production's converted sessions hold.
+fn converted_fixture(name: &str) -> Start {
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/converted")
+        .join(format!("{name}.json"));
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let records = fixture["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| {
+            Record::decode(
+                record["kind"].as_u64().unwrap() as u32,
+                &bytes(record["body"].as_str().unwrap()),
+            )
+            .expect("a fixture record decodes")
+        })
+        .collect();
+    let parts = fixture["parts"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(digest, part)| {
+            let digest: [u8; 32] = bytes(digest).try_into().unwrap();
+            (
+                broca_session_store::codec::Digest(digest),
+                bytes(part.as_str().unwrap()),
+            )
+        })
+        .collect();
+    Start {
+        records,
+        parts,
+        converted: true,
+        snapshot: None,
+    }
+}
+
+/// The split points among `points` (indexes into `records`; `records.len()` splits after the
+/// last) where loading from a checkpoint written there, then folding the rest, ends in another
+/// state than folding every record: a log can start at any record, so every split must agree.
+/// The states are compared by their encoded bytes, which cover every field of both folds.
+fn check_splits(records: &[Record], points: &[usize]) -> Result<Vec<usize>, String> {
+    use broca_session_store::checkpoint::Checkpoint;
+    use broca_session_store::codec::Message as _;
+    use broca_session_store::fold::conversation::Conversation;
+    use broca_session_store::record::Stream;
+    fn fold(
+        conversation: &mut Conversation,
+        operations: &mut Operations,
+        record: &Record,
+    ) -> Result<(), String> {
+        match record.stream() {
+            Stream::Transcript => conversation
+                .apply(record)
+                .map_err(|e| format!("conversation: {e:?}")),
+            Stream::Ledger => operations
+                .apply(record)
+                .map_err(|e| format!("operations: {e:?}")),
+        }
+    }
+    let (mut conversation, mut operations) = (Conversation::new(false), Operations::default());
+    for record in records {
+        fold(&mut conversation, &mut operations, record)?;
+    }
+    let expected = (conversation.encode(), operations.encode());
+    let mut differing = Vec::new();
+    let mut running = (Conversation::new(false), Operations::default());
+    for split in 0..=records.len() {
+        if points.contains(&split) {
+            let checkpoint = Checkpoint {
+                covers_through: split as u64,
+                next_seq: split as u64 + 1,
+                conversation: running.0.clone(),
+                operational: running.1.clone(),
+                transcript_base: None,
+                ledger_base: None,
+                activity_ms: None,
+                media: None,
+            };
+            let loaded = Checkpoint::decode(&checkpoint.encode())
+                .map_err(|e| format!("checkpoint at {split} doesn't decode: {e}"))?;
+            let (mut conversation, mut operations) = (loaded.conversation, loaded.operational);
+            for record in &records[split..] {
+                fold(&mut conversation, &mut operations, record)?;
+            }
+            if (conversation.encode(), operations.encode()) != expected {
+                differing.push(split);
+            }
+        }
+        if let Some(record) = records.get(split) {
+            fold(&mut running.0, &mut running.1, record)?;
+        }
+    }
+    Ok(differing)
+}
+
+/// A charge-basis resolver that answers each provider and auth method differently, so a fact
+/// resolved under the wrong provider or method shows as a difference.
+fn charge_resolver(provider: &str, method: &str) -> (broca_core::ChargeBasis, u32) {
+    let basis = match (provider.len() + 3 * method.len()) % 3 {
+        0 => broca_core::ChargeBasis::MeteredApi,
+        1 => broca_core::ChargeBasis::SubscriptionIncluded,
+        _ => broca_core::ChargeBasis::Unknown,
+    };
+    (basis, (provider.len() * 7 + method.len()) as u32)
+}
+
 async fn new_from(
     scenario: &Scenario,
-    start: Option<broca_session_convert::Converted>,
+    start: Option<Start>,
     steps: Vec<Vec<NormalizedEvent>>,
 ) -> Outcome {
+    new_source(scenario, start, steps).await.outcome
+}
+
+/// [`new_from`], keeping the session's records and setup parts as a [`Source`].
+async fn new_source(
+    scenario: &Scenario,
+    mut start: Option<Start>,
+    steps: Vec<Vec<NormalizedEvent>>,
+) -> Source {
     let bind = bind();
-    let backend = MemoryBackend::default();
+    let snapshot = start.as_mut().and_then(|start| start.snapshot.take());
+    let reopened = snapshot.is_some();
+    let backend = snapshot.unwrap_or_default();
     let triple = SessionTriple {
         project_root: "/project".into(),
         harness: "differential".into(),
@@ -2687,26 +2647,43 @@ async fn new_from(
     // A session converted from today's log off the compaction contract keeps text delivered
     // before ride envelopes existed joined into its results, as the converter sets it up.
     let converted_off_contract = layout().is_none()
-        && start.as_ref().is_some_and(|converted| {
-            converted
-                .records
-                .iter()
-                .any(|r| matches!(r, Record::RunStart(_)))
+        && start.as_ref().is_some_and(|start| {
+            start.converted
+                && start
+                    .records
+                    .iter()
+                    .any(|r| matches!(r, Record::RunStart(_)))
         });
-    let mut session = Session::create(
-        &backend,
-        SessionAddr("0123456789abcdef".into()),
-        triple,
-        &DeploymentKey::new(1, &[7; 32]),
-        converted_off_contract,
-    )
-    .await
-    .unwrap();
+    let mut session = if reopened {
+        Session::load(
+            &backend,
+            SessionAddr("0123456789abcdef".into()),
+            &triple,
+            &DeploymentKey::new(1, &[7; 32]),
+        )
+        .await
+        .expect("the cut session reopens")
+    } else {
+        Session::create(
+            &backend,
+            SessionAddr("0123456789abcdef".into()),
+            triple,
+            &DeploymentKey::new(1, &[7; 32]),
+            converted_off_contract,
+        )
+        .await
+        .unwrap()
+    };
     let mut parts = MemoryParts::default();
     // The records the session already held, so the appended ones' message ids number on from
     // theirs, as in today's whole log.
     let mut held = Vec::new();
     let resuming = match start {
+        Some(cut) if reopened => {
+            held = cut.records;
+            parts.parts = cut.parts;
+            true
+        }
         Some(converted)
             if converted
                 .records
@@ -2720,7 +2697,26 @@ async fn new_from(
         }
         _ => false,
     };
-    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
+    // A resumed run's compaction provider reads the entries the session already holds after
+    // its Setup, as a real provider does with `session.entries`.
+    let read = match PROVIDER_READ.try_with(Clone::clone) {
+        Ok(Some(read)) => Some(read),
+        _ if resuming && layout().is_some() => {
+            let entries: Vec<_> = session
+                .entries(1, usize::MAX)
+                .await
+                .expect("the cut session's entries read")
+                .iter()
+                .map(|entry| {
+                    broca_session_loop::entries::project(entry).expect("an entry projects")
+                })
+                .collect();
+            Some(Arc::new(serde_json::to_value(entries).unwrap()))
+        }
+        _ => None,
+    };
+    let spy = compaction()
+        .map(|script| Arc::new(PROVIDER_READ.sync_scope(read, || CompactionSpy::new(&script))));
     let provider = ScriptedProvider::new(steps);
     if held
         .iter()
@@ -2738,6 +2734,9 @@ async fn new_from(
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
+        batch_ends: Vec::new(),
+        backend: Some(&backend),
+        snapshots: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
         media: Default::default(),
@@ -2799,10 +2798,16 @@ async fn new_from(
             ),
             "{result:?}"
         );
-        return Outcome {
+        return Source {
+            outcome: Outcome {
+                records: Vec::new(),
+                requests: Vec::new(),
+                calls: Vec::new(),
+            },
             records: Vec::new(),
-            requests: Vec::new(),
-            calls: Vec::new(),
+            batch_ends: Vec::new(),
+            snapshots: Vec::new(),
+            parts: parts.parts,
         };
     }
     result.expect("the new loop runs");
@@ -2823,15 +2828,26 @@ async fn new_from(
         }
     }
     let all: Vec<Record> = held.iter().chain(&records).cloned().collect();
-    Outcome {
-        records: normalized(&all)[held.len()..].to_vec(),
-        requests: sent_requests(&provider),
-        calls: plane
-            .log()
-            .iter()
-            .map(|event| format!("{event:?}"))
-            .chain(spy.map_or_else(Vec::new, |spy| spy.calls_but_prompt_view()))
-            .collect(),
+    let batch_ends = writer
+        .batch_ends
+        .iter()
+        .map(|end| held.len() + end)
+        .collect();
+    Source {
+        outcome: Outcome {
+            records: normalized(&all)[held.len()..].to_vec(),
+            requests: sent_requests(&provider),
+            calls: plane
+                .log()
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .chain(spy.map_or_else(Vec::new, |spy| spy.calls_but_prompt_view()))
+                .collect(),
+        },
+        records: all,
+        batch_ends,
+        snapshots: std::mem::take(&mut writer.snapshots),
+        parts: parts.parts,
     }
 }
 
@@ -2839,21 +2855,6 @@ fn rand_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Today's log converted, without the `Billed` record the converter writes after each run's
-/// end. That record settles the run's usage export, which the store actor writes after a run
-/// ends; the run loop never writes one, so the two loops' records are compared without it.
-fn convert_unbilled(
-    frames: &[broca_wal::FramedRecord],
-    lineage: Option<&str>,
-) -> Result<broca_session_convert::Converted, broca_session_convert::ConvertError> {
-    broca_session_convert::convert(frames, lineage).map(|mut converted| {
-        converted
-            .records
-            .retain(|record| !matches!(record, Record::Billed(_)));
-        converted
-    })
 }
 
 /// The fields that hold a time or an id minted per log, replaced so two logs compare.
@@ -3130,26 +3131,6 @@ fn scrub(value: &mut Value) {
     }
 }
 
-/// `new`, with the one difference allowed between a resume of each loop. When today's loop
-/// resumes a tool turn the refusal-fallback model answered, it commits the turn's message
-/// under the run's own model (`complete_pending_turn` stamps `cfg.model`), although its live
-/// path and its replay both name the fallback model. The new loop names the fallback model on
-/// both paths. Only a message where the new loop names the fallback and today names the run's
-/// model is aligned; every other difference still fails.
-fn resumed_as_today(new: &CallOptions, today: &CallOptions) -> CallOptions {
-    let mut new = new.clone();
-    let Some(script) = fallback() else {
-        return new;
-    };
-    let run_model = ModelHandle::new(provider_id(), "m");
-    for (new, today) in new.prompt.iter_mut().zip(today.prompt.iter()) {
-        if new.origin.as_ref() == Some(&script.model) && today.origin.as_ref() == Some(&run_model) {
-            new.origin = today.origin.clone();
-        }
-    }
-    new
-}
-
 /// Runs [`compare_in`] in both layouts.
 async fn compare(scenario: Scenario) {
     for layout in LAYOUTS {
@@ -3164,29 +3145,13 @@ async fn compare_in(scenario: Scenario) {
 }
 
 async fn compare_in_once(scenario: Scenario) {
-    let today = today(&scenario).await;
-    let dump = std::env::var_os("DIFFERENTIAL_DUMP").is_some();
-    if dump {
-        for (index, record) in today.records.iter().enumerate() {
-            eprintln!("today {index}: {record}");
-        }
-    }
     let new = new_loop(&scenario).await;
-    if dump {
+    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
         for (index, record) in new.records.iter().enumerate() {
             eprintln!("new   {index}: {record}");
         }
     }
     pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
-    assert_eq!(new.requests.len(), today.requests.len(), "request count");
-    for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
-    }
-    for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
-        assert_eq!(new, today, "record {index}");
-    }
-    assert_eq!(new.records.len(), today.records.len(), "record count");
-    assert_calls_alike(&new.calls, &today.calls, "");
 }
 
 fn user(text: &str) -> Message {
@@ -3341,10 +3306,8 @@ async fn a_call_whose_outcome_is_unknown() {
     .await;
 }
 
-/// Cuts today's log of `scenario` after each of its records, as a crash could, and resumes the
-/// cut twice: today's loop resumes the cut log, and the new loop resumes a session holding the
-/// same records converted. Both must send the same requests, run the same tool calls, and
-/// append the same records.
+/// Cuts the new loop's log of `scenario` after each of its records, as a crash could, resumes
+/// the cut, and pins what the resume sends, runs and appends.
 /// Runs [`compare_every_cut_in`] in both layouts.
 async fn compare_every_cut(scenario: Scenario) {
     for layout in LAYOUTS {
@@ -3359,60 +3322,33 @@ async fn compare_every_cut_in(scenario: Scenario) {
 }
 
 async fn compare_every_cut_in_once(scenario: Scenario) {
-    // The whole log the cuts are taken from. Only the resumes are compared, so its run's warms
+    // The whole run the cuts are taken from. Only the resumes are pinned, so its run's warms
     // and account reports go to a driver and reporter of their own; the run still freezes the
     // keep-warm its resumes read back.
     let source_warms = warm_script().map(|_| Arc::new(WarmPair::default()));
     let source_reports = reports().map(|_| Arc::new(ReportPair::default()));
-    let (_, full, name) = WARM
+    let source = WARM
         .scope(
             source_warms,
             REPORTS.scope(
                 source_reports,
-                today_from(&scenario, None, scenario.steps.clone()),
+                new_source(&scenario, None, scenario.steps.clone()),
             ),
         )
         .await;
-    let records = full.framed().len();
+    let records = source.records.len();
     assert!(records > 2, "the scenario wrote a log to cut");
-    for cut in 1..records {
-        let bytes = broca_crash_harness::cut_log(&full, cut, false);
-        let cut_image = LogImage::parse(bytes.clone());
-        let frames = cut_image.framed();
+    for cut in source
+        .batch_ends
+        .iter()
+        .copied()
+        .filter(|&end| end < records)
+    {
         // The provider serves the steps the cut log has no answer for yet.
-        let answered = frames
-            .iter()
-            .filter(|frame| {
-                serde_json::to_value(&frame.record).unwrap()["type"] == "model_step_finished"
-            })
-            .count();
-        let steps = scenario.steps[answered..].to_vec();
-        let converted =
-            convert_unbilled(&frames, lineage(&cut_image).as_deref()).expect("the cut converts");
-        let cut_records = converted.records.clone();
-        let before = converted.records.len();
-        // The window the cut log holds, as the resumed run's compaction provider reads it.
-        let read = lineage(&cut_image)
-            .and_then(|lineage| {
-                broca_core::compaction_v2::transcript::project(&frames, &lineage).ok()
-            })
-            .map(|transcript| Arc::new(serde_json::to_value(&transcript.entries).unwrap()));
-        let (today, _, _) = PROVIDER_READ
-            .scope(
-                read.clone(),
-                Box::pin(today_from(&scenario, Some((&name, &bytes)), steps.clone())),
-            )
-            .await;
-        eprintln!("cut after record {cut} of {records}");
-        let new = PROVIDER_READ
-            .scope(read, Box::pin(new_from(&scenario, Some(converted), steps)))
-            .await;
-        let today_appended = &today.records[before.min(today.records.len())..];
+        let steps = scenario.steps[source.answered(cut)..].to_vec();
+        let new = Box::pin(new_from(&scenario, Some(source.cut(cut)), steps)).await;
         let context = format!("cut after record {cut} of {records}");
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
-            for (index, record) in today_appended.iter().enumerate() {
-                eprintln!("{context} today {index}: {record}");
-            }
             for (index, record) in new.records.iter().enumerate() {
                 eprintln!("{context} new   {index}: {record}");
             }
@@ -3424,36 +3360,11 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
             &new.calls,
             Clone::clone,
         );
-        assert_eq!(
-            new.requests.len(),
-            today.requests.len(),
-            "{context}: request count"
-        );
-        for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-            let new = resumed_as_today(new, today);
-            assert_eq!(&new, today, "{context}: request {index}");
-        }
-        for (index, (new, today)) in new.records.iter().zip(today_appended).enumerate() {
-            assert_eq!(new, today, "{context}: record {index}");
-        }
-        assert_eq!(
-            new.records.len(),
-            today_appended.len(),
-            "{context}: record count"
-        );
-        let expected_calls = if resumes_an_answered_batch(&cut_records) {
-            without_empty_resumed_batch(&today.calls)
-        } else {
-            today.calls.clone()
-        };
-        assert_calls_alike(&new.calls, &expected_calls, &context);
     }
 }
 
-/// At every cut of `scenario` where the run was still running (no pause, no end) and today's
-/// replay would resume it or stop it for review, the new loop's seal writes the same records as
-/// today's seal plan (`broca_core::resume::interrupted_seal`, a crash-orphan seal as today's
-/// actor writes it on open) appended to today's cut log and converted. Asserts some cut seals.
+/// At every cut of the new loop's log of `scenario` where the run was still running (no pause,
+/// no end), pins the records the loop's crash-orphan seal writes. Asserts some cut seals.
 async fn compare_seal_every_cut(scenario: Scenario) {
     for layout in LAYOUTS {
         LAYOUT
@@ -3466,81 +3377,50 @@ async fn compare_seal_every_cut(scenario: Scenario) {
 }
 
 async fn compare_seal_every_cut_in(scenario: Scenario) {
-    use broca_core::resume::interrupted_seal;
-    use broca_core::resume::DeferredCloseKind;
-    use broca_core::seal::{crash_orphan_error, SealCause};
-    let (_, full, _) = today_from(&scenario, None, scenario.steps.clone()).await;
-    let records = full.framed().len();
+    use broca_core::seal::SealCause;
+    let source = new_source(&scenario, None, scenario.steps.clone()).await;
+    let records = source.records.len();
     let mut sealed = 0;
-    for cut in 1..records {
-        let bytes = broca_crash_harness::cut_log(&full, cut, false);
-        let image = LogImage::parse(bytes);
-        let frames = image.framed();
-        let wal: Vec<WalRecord> = frames.iter().map(|frame| frame.record.clone()).collect();
-        let prior = broca_core::replay(&wal).expect("the cut replays");
-        let running = prior.run_id.is_some()
-            && !prior.run_finished_durable
-            && matches!(
-                prior.resolution,
-                broca_core::ReplayResolution::Resume { .. }
-                    | broca_core::ReplayResolution::Interrupted { .. }
-            );
+    for cut in source
+        .batch_ends
+        .iter()
+        .copied()
+        .filter(|&end| end < records)
+    {
+        let start = source.cut(cut);
+        let mut operations = Operations::default();
+        for record in &start.records {
+            if record.stream() == broca_session_store::record::Stream::Ledger {
+                operations.apply(record).expect("the cut folds");
+            }
+        }
+        // The loop seals a run that was running when the crash cut it: one it would resume, or
+        // one it stops for review.
+        let running = operations.run.as_ref().is_some_and(|run| {
+            use broca_session_store::fold::operations::Resolution;
+            run.finished.is_none()
+                && matches!(
+                    run.resolution(),
+                    Resolution::Resume | Resolution::Interrupted(_)
+                )
+        });
         if !running {
             continue;
         }
         sealed += 1;
-        let lineage = lineage(&image);
-        let converted = convert_unbilled(&frames, lineage.as_deref()).expect("the cut converts");
-        let before = converted.records.len();
-        // Today: the seal plan over the cut, appended as today's actor appends it.
-        let head = frames.last().map_or(0, |frame| frame.seq);
-        let plan = interrupted_seal(
-            &prior,
-            SealCause::CrashOrphan,
-            None,
-            false,
-            Some(head),
-            Some(crash_orphan_error()),
-            |_| DeferredCloseKind::NotDispatched,
-        );
-        let today_frames = through_todays_writer(
-            &image.bytes,
-            plan.resume_started
-                .into_iter()
-                .chain(plan.close_out)
-                .chain(std::iter::once(plan.terminal.record(Some(harness_now()))))
-                .collect(),
-            &wal,
-        )
-        .await;
-        let today = convert_unbilled(&today_frames, lineage.as_deref())
-            .expect("today's sealed log converts");
-        let today_sealed = normalized(&today.records)[before..].to_vec();
-        // New: the loop's seal over the converted cut.
         let new = SEALING
             .scope(
                 SealCause::CrashOrphan,
-                new_from(&scenario, Some(converted), Vec::new()),
+                new_from(&scenario, Some(start), Vec::new()),
             )
             .await;
         let context = format!("seal after record {cut} of {records}");
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
-            for (index, record) in today_sealed.iter().enumerate() {
-                eprintln!("{context} today {index}: {record}");
-            }
             for (index, record) in new.records.iter().enumerate() {
                 eprintln!("{context} new   {index}: {record}");
             }
         }
         pin_records(&format!("{context}: "), &new.records);
-        for (index, (new, today)) in new.records.iter().zip(&today_sealed).enumerate() {
-            assert_eq!(new, today, "{context}: record {index}");
-        }
-        assert_eq!(
-            new.records.len(),
-            today_sealed.len(),
-            "{context}: record count"
-        );
         assert!(new.requests.is_empty(), "{context}: a seal sends nothing");
         assert!(
             new.calls.iter().all(|call| !call.contains("dispatch")),
@@ -3549,39 +3429,6 @@ async fn compare_seal_every_cut_in(scenario: Scenario) {
         );
     }
     assert!(sealed > 0, "some cut leaves a running run to seal");
-}
-
-/// The log `bytes` holds with `records` appended through today's real WAL writer, which stamps
-/// what a record leaves for it to stamp (a tool result's finish time), read back as frames.
-async fn through_todays_writer(
-    bytes: &[u8],
-    records: Vec<WalRecord>,
-    held: &[WalRecord],
-) -> Vec<broca_wal::FramedRecord> {
-    use broca_wal::{FileWal, Wal as _};
-    let root = broca_test_support::scratch_root().join(format!(
-        "seal-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("session.wal");
-    std::fs::write(&path, bytes).unwrap();
-    let floor = root.join("wal-feature-floor");
-    let writer = broca_core::WalHandle::spawn(
-        Box::new(FileWal::open(&path).unwrap().with_feature_floor(&floor)),
-        2,
-    )
-    .unwrap();
-    writer.seed_lineage_tags(Some(broca_core::tags::lineage_tags(held)));
-    for record in records {
-        writer.record(record).into_result().unwrap();
-    }
-    writer.sync().await.unwrap();
-    writer.shutdown().await.unwrap();
-    let frames = FileWal::open(&path).unwrap().replay().unwrap();
-    let _ = std::fs::remove_dir_all(&root);
-    frames
 }
 
 #[tokio::test]
@@ -3597,43 +3444,6 @@ async fn every_cut_of_an_unsent_call_seals_alike() {
 #[tokio::test]
 async fn every_cut_of_parallel_calls_seals_alike() {
     compare_seal_every_cut(tool_run()).await;
-}
-
-/// Whether a crash left the run's open tool batch with every call answered and the batch not
-/// yet closed, read from the operational fold over the cut's records.
-fn resumes_an_answered_batch(records: &[Record]) -> bool {
-    let mut operations = Operations::default();
-    for record in records {
-        if record.stream() == broca_session_store::record::Stream::Ledger {
-            operations.apply(record).expect("the cut folds");
-        }
-    }
-    operations
-        .run
-        .as_ref()
-        .and_then(|run| run.open_batch.as_ref())
-        .is_some_and(|batch| {
-            (0..batch.calls.len()).all(|position| {
-                batch.state(position)
-                    == broca_session_store::fold::operations::CallState::Terminated
-            })
-        })
-}
-
-/// Today's tool-plane calls without the one difference the new loop makes on purpose: on
-/// resume, today's loop opens and closes a batch whose calls all have recorded results, sending
-/// nothing; the new loop records the batch's end without calling the plane, since a plane can
-/// open routes for a batch it never sends on. Only that pair, opening the resume, is left out.
-fn without_empty_resumed_batch(calls: &[String]) -> Vec<String> {
-    match calls {
-        [started, finished, rest @ ..]
-            if started.starts_with("\"batch_started_guarded ")
-                && finished == "\"batch_finished\"" =>
-        {
-            rest.to_vec()
-        }
-        _ => calls.to_vec(),
-    }
 }
 
 fn sequential_tool_run() -> Scenario {
@@ -3818,100 +3628,6 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
 }
 
 async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
-    // Today's loop.
-    let dir = broca_test_support::scratch_root().join(format!(
-        "session-loop-differential-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let provider = ScriptedProvider::new(scenario.steps.clone());
-    let plane = scenario.plane();
-    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
-    // One compaction session state for the session's life, as the actor keeps it across runs.
-    let compaction_session: Arc<broca_core::compaction_v2::session::Session> = Arc::default();
-    let control = || RunControl {
-        auth_selection: account_selection(),
-        account_limit_pause: account().is_some(),
-        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
-        manifest: scenario.manifest.clone(),
-        compaction_session: Some(Arc::clone(&compaction_session)),
-        keep_warm: warm_script().map(|script| {
-            Arc::new(TodayWarmer(Arc::clone(&script.today)))
-                as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
-        }),
-        account_reporter: reports().map(|reports| {
-            Arc::new(TodayReports(Arc::clone(&reports.today)))
-                as Arc<dyn broca_core::AccountReporter>
-        }),
-        new_log_compaction_plan_version: layout(),
-        compaction_plane: spy
-            .clone()
-            .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
-        admitted_context_limit: frozen_context_limit(),
-        ..admission_control(&scenario)
-    };
-    let lease = FileLeaseStore::new(dir.join("lease"));
-    let wal = FileWalStore::new(dir.join("wal"));
-    for (index, (run_id, input)) in runs.iter().enumerate() {
-        let (tx, mut rx) = mpsc::channel(512);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let request = scenario.request_for(run_id, input);
-        if index == 0 {
-            run_loop_with_control(
-                request,
-                &provider,
-                &plane,
-                &lease,
-                &HarnessPolicy,
-                &wal,
-                None,
-                control(),
-                &tx,
-            )
-            .await
-            .expect("today's first run");
-        } else {
-            broca_core::run_loop_append_episode_with_control(
-                request,
-                &provider,
-                &plane,
-                &lease,
-                &HarnessPolicy,
-                &wal,
-                None,
-                control(),
-                &tx,
-            )
-            .await
-            .expect("today's later run");
-        }
-        drop(tx);
-        drain.await.unwrap();
-    }
-    let file = std::fs::read_dir(dir.join("wal"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .expect("today's loop wrote a log");
-    let converted = {
-        let image = LogImage::read(&file);
-        convert_unbilled(&image.framed(), lineage(&image).as_deref())
-    }
-    .expect("the log converts");
-    let _ = std::fs::remove_dir_all(&dir);
-    let today = Outcome {
-        records: normalized(&converted.records),
-        requests: sent_requests(&provider),
-        calls: plane
-            .log()
-            .iter()
-            .map(|event| format!("{event:?}"))
-            .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
-            .collect(),
-    };
-
     // The new loop.
     let backend = MemoryBackend::default();
     let triple = SessionTriple {
@@ -3934,6 +3650,9 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
+        batch_ends: Vec::new(),
+        backend: None,
+        snapshots: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
         media: Default::default(),
@@ -4031,23 +3750,11 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     };
 
     if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
-        for (index, record) in today.records.iter().enumerate() {
-            eprintln!("today {index}: {record}");
-        }
         for (index, record) in new.records.iter().enumerate() {
             eprintln!("new   {index}: {record}");
         }
     }
     pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
-    assert_eq!(new.requests.len(), today.requests.len(), "request count");
-    for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
-    }
-    for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
-        assert_eq!(new, today, "record {index}");
-    }
-    assert_eq!(new.records.len(), today.records.len(), "record count");
-    assert_calls_alike(&new.calls, &today.calls, "");
     let _ = NEW_REQUESTS.try_with(|seen| seen.lock().unwrap().extend(new.requests.clone()));
     // Every call as the new loop made it, `last_prompt_view` included.
     let _ = NEW_CALLS.try_with(|seen| {
@@ -4275,7 +3982,7 @@ enum Action {
     /// the send it supersedes when it replaces one.
     Ordered {
         send: Box<broca_core::delivery_order::OrderedSend>,
-        records: Vec<WalRecord>,
+        records: Vec<Record>,
     },
 }
 
@@ -4294,8 +4001,8 @@ fn template_use() -> Value {
     json!({"id": "nudge", "digest": "0".repeat(64), "slots": {}})
 }
 
-/// A send queued with the delivery order `order`, in today's form. `supersedes` names the
-/// undelivered send under the same dedupe key that it replaces, which ends first.
+/// A send queued with the delivery order `order`, as the session actor records it. `supersedes`
+/// names the undelivered send under the same dedupe key that it replaces, which ends first.
 fn ordered_with(id: &str, order: Value, text: &str, supersedes: Option<&str>) -> Action {
     let input = vec![user(text)];
     let send = broca_core::delivery_order::OrderedSend {
@@ -4305,36 +4012,51 @@ fn ordered_with(id: &str, order: Value, text: &str, supersedes: Option<&str>) ->
         principal: None,
         input: input.clone(),
     };
-    let mut records: Vec<WalRecord> = supersedes
+    use broca_session_store::record::{DeliveryOrdered, QueuedSend, SendEnded};
+    let mut records: Vec<Record> = supersedes
         .map(|old| {
-            broca_core::delivery_order::ended(
-                &broca_protocol::SubmissionId(old.into()),
-                broca_wal::record::SendEndReason::Superseded {
-                    by: broca_protocol::SubmissionId(id.into()),
-                },
-            )
+            Record::SendEnded(SendEnded {
+                submission_id: old.into(),
+                reason: Some(
+                    serde_json::to_value(broca_wal::record::SendEndReason::Superseded {
+                        by: broca_protocol::SubmissionId(id.into()),
+                    })
+                    .unwrap(),
+                ),
+            })
         })
         .into_iter()
         .collect();
     records.extend([
-        serde_json::from_value(json!({
-            "type": "delivery_ordered", "submission_id": id, "order": order,
-        }))
-        .unwrap(),
-        serde_json::from_value(json!({
-            "type": "queued",
-            "submission_id": id,
-            "request": {
-                "model": {"provider_module_id": "stub", "model_id": "m"},
-                "input": input,
-                "policy_allowed": [],
-                "tool_choice": {"type": "auto"},
-                "generation": {},
-                "stop_when": [],
-            },
-            "written_at_ms": HARNESS_TIME_MS,
-        }))
-        .unwrap(),
+        // The order as the actor stores it: its typed form, serialized.
+        Record::DeliveryOrdered(DeliveryOrdered {
+            submission_id: id.into(),
+            order: serde_json::to_value(&send.order).unwrap(),
+            sent_by: None,
+        }),
+        Record::QueuedSend(QueuedSend {
+            media: Vec::new(),
+            named_speaker: None,
+            message_marks: None,
+            submission_id: id.into(),
+            send_id: None,
+            input,
+            setup: Vec::new(),
+            written_at_ms: Some(HARNESS_TIME_MS),
+            ts_ms: None,
+            request: Some(
+                json!({
+                    "model": {"provider_module_id": "stub", "model_id": "m"},
+                    "policy_allowed": [],
+                    "tool_choice": {"type": "auto"},
+                    "generation": {},
+                    "stop_when": [],
+                })
+                .into(),
+            ),
+            delivery: None,
+            receipt: None,
+        }),
     ]);
     Action::Ordered {
         send: Box::new(send),
@@ -4355,75 +4077,7 @@ trait SteerSink: Send + Sync {
     /// Asks the run to stop, as the runner does when it shuts down.
     fn stop(&self);
     /// Queues an ordered send into the running run, as the actor does.
-    async fn ordered(&self, send: broca_core::delivery_order::OrderedSend, records: Vec<WalRecord>);
-}
-
-/// Today's actor: the record is written under the run's steer inbox lock and synced.
-struct TodaySink {
-    inbox: Arc<SteerInbox>,
-    writer: Arc<WalHandle>,
-    stop: CancellationToken,
-    cancel: CancellationToken,
-}
-
-#[async_trait]
-impl SteerSink for TodaySink {
-    async fn steer(&self, record: WalRecord) {
-        let WalRecord::Steered { input, .. } = &record else {
-            panic!("a steer");
-        };
-        let messages = input.as_ref().clone();
-        let writer = Arc::clone(&self.writer);
-        assert!(self.inbox.deliver(messages, move || {
-            writer.record(record);
-            None
-        }));
-        self.writer.sync().await.expect("the steer is durable");
-    }
-
-    async fn cancel_at_boundary(&self) {
-        self.inbox
-            .request_boundary_cancel(&self.writer, &RunId("r1".into()))
-            .await
-            .expect("the cancel is durable");
-    }
-
-    fn cancel_now(&self) {
-        self.cancel.cancel();
-    }
-
-    fn stop(&self) {
-        self.stop.cancel();
-    }
-
-    async fn ordered(
-        &self,
-        send: broca_core::delivery_order::OrderedSend,
-        records: Vec<WalRecord>,
-    ) {
-        let writer = Arc::clone(&self.writer);
-        let accepted = self.inbox.accept_ordered(send, move |superseded| {
-            let expected = match records.first() {
-                Some(WalRecord::SendEnded { submission_id, .. }) => Some(submission_id),
-                _ => None,
-            };
-            assert_eq!(
-                superseded, expected,
-                "the send replaces what the scenario says"
-            );
-            for record in records {
-                writer.record(record);
-            }
-        });
-        assert!(
-            matches!(
-                accepted,
-                broca_core::steer::OrderedAcceptance::Queued { .. }
-            ),
-            "the running turn takes the send"
-        );
-        self.writer.sync().await.expect("the send is durable");
-    }
+    async fn ordered(&self, send: broca_core::delivery_order::OrderedSend, records: Vec<Record>);
 }
 
 /// The new store's actor: the same steer as the converter writes it, appended before the
@@ -4476,22 +4130,8 @@ impl SteerSink for NewSink {
         self.stop.cancel();
     }
 
-    async fn ordered(
-        &self,
-        _send: broca_core::delivery_order::OrderedSend,
-        records: Vec<WalRecord>,
-    ) {
-        let framed: Vec<broca_wal::FramedRecord> = records
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| broca_wal::FramedRecord {
-                seq: index as u64 + 1,
-                fence: 0,
-                record,
-            })
-            .collect();
-        let converted = convert_unbilled(&framed, None).expect("the send's records convert");
-        self.injected.lock().unwrap().extend(converted.records);
+    async fn ordered(&self, _send: broca_core::delivery_order::OrderedSend, records: Vec<Record>) {
+        self.injected.lock().unwrap().extend(records);
     }
 }
 
@@ -4652,210 +4292,20 @@ async fn compare_actions_in(
     .await;
 }
 
-/// The summary each of a comparison's runs reported: how it ended, and why it paused.
-type Summaries = Vec<(broca_protocol::caller::RunFinishReason, Option<PauseReason>)>;
-
-tokio::task_local! {
-    /// Whether today's loop writes a ride's envelope (the carrying call's key, the sender and
-    /// the send's forms), as production has since llm-runner 0.8.11. A comparison of rides
-    /// recorded without one turns it off.
-    static RIDES_WRITER: bool;
+/// What the new loop did running a scenario while the session actor does its actions: its
+/// whole run as a [`Source`].
+struct Actions {
+    source: Source,
 }
 
-fn rides_writer() -> bool {
-    RIDES_WRITER.try_with(|on| *on).unwrap_or(true)
-}
-
-/// Today's loop running `scenario` while the session actor does `steers`, on a writer this test
-/// owns so its actor side can write steers and queue sends. With `start`, it resumes that log,
-/// as today's actor resumes one: the run may deliver every ordered send the log holds queued.
-/// Returns what it did, how each run reported, and its whole log with the log's file name.
-async fn today_with_actions(
+/// The new loop running `scenario` while the session actor does `steers`, resuming a run that
+/// pauses as a restart would. With `pins`, it pins what the run did, as a comparison does.
+async fn new_with_actions(
     scenario: &Scenario,
-    start: Option<(&str, &[u8])>,
-    steps: Vec<Vec<NormalizedEvent>>,
     steers: Vec<(usize, Action)>,
     on_restart: Option<OnRestart>,
-) -> (Outcome, Summaries, LogImage, String) {
-    let dir = broca_test_support::scratch_root().join(format!(
-        "session-loop-differential-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("wal")).unwrap();
-    if let Some((name, bytes)) = start {
-        std::fs::write(dir.join("wal").join(name), bytes).unwrap();
-    }
-    let wal = FileWalStore::new(dir.join("wal"));
-    let mut request = scenario.request();
-    request.on_restart = on_restart;
-    let writer = Arc::new(WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap());
-    if rides_writer() {
-        writer.enable_ride_writer_for_test();
-    }
-    let inbox = SteerInbox::new();
-    if let Some((_, bytes)) = start {
-        // Today's actor seeds a resumed run with the sends still queued: their ride facts, and
-        // the ordered ones for the run's boundaries.
-        let records: Vec<WalRecord> = LogImage::parse(bytes.to_vec())
-            .framed()
-            .into_iter()
-            .map(|framed| framed.record)
-            .collect();
-        let pending = broca_core::queue::pending_submissions(&records);
-        for queued in &pending {
-            writer.note_queued_ride(queued);
-        }
-        inbox.seed_ordered(
-            pending
-                .iter()
-                .filter_map(broca_core::delivery_order::OrderedSend::from_pending)
-                .collect(),
-        );
-    }
-    let stop = CancellationToken::new();
-    let cancel = CancellationToken::new();
-    let scripted = ScriptedProvider::new(steps);
-    if start.is_some() {
-        scripted.resuming();
-    }
-    let provider = SteeringProvider {
-        inner: scripted,
-        calls: Default::default(),
-        reports_attempts: cancels_mid_stream(&steers),
-        steers: Mutex::new(steers.clone()),
-        sink: Arc::new(TodaySink {
-            inbox: Arc::clone(&inbox),
-            writer: Arc::clone(&writer),
-            stop: stop.clone(),
-            cancel: cancel.clone(),
-        }),
-    };
-    let plane = scenario.plane();
-    let (tx, mut rx) = mpsc::channel(512);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    plane.cancel_on_hold(cancel.clone());
-    let wal_dir = dir.join("wal");
-    *plane.held.ended.lock().unwrap() = Some(Arc::new(move || {
-        std::fs::read_dir(&wal_dir).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
-                std::fs::read(entry.path()).is_ok_and(|bytes| {
-                    bytes
-                        .windows(br#""type":"run_finished""#.len())
-                        .any(|window| window == br#""type":"run_finished""#)
-                })
-            })
-        })
-    }));
-    let control = RunControl {
-        auth_selection: account_selection(),
-        account_limit_pause: account().is_some(),
-        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
-        steer: Some(Arc::clone(&inbox)),
-        stop_requested: Some(stop),
-        provider_held_lifecycle: Some(plane.lifecycle()),
-        cancel: Some(cancel),
-        new_log_compaction_plan_version: layout(),
-        account_reporter: today_reporter(),
-        ..admission_control(scenario)
-    };
-    let first = run_loop_on_writer(
-        request.clone(),
-        &writer,
-        StartMode::FreshOrResume,
-        &provider,
-        &plane,
-        &HarnessPolicy,
-        &wal,
-        None,
-        control,
-        &tx,
-    )
-    .await
-    .expect("today's loop runs");
-    let mut summaries = vec![(first.reason, first.paused)];
-    if first.paused.is_some() {
-        // A run paused on held calls resumes when their late results arrive; any other pause
-        // resumes when the runner starts again. Either way it's the same run.
-        if first.paused == Some(PauseReason::ToolHeld) {
-            plane.held.deposit_all();
-        }
-        let second = run_loop_on_writer(
-            request,
-            &writer,
-            StartMode::FreshOrResume,
-            &provider,
-            &plane,
-            &HarnessPolicy,
-            &wal,
-            None,
-            RunControl {
-                auth_selection: account_selection(),
-                account_limit_pause: account().is_some(),
-                max_same_account_wait: account()
-                    .map_or_else(Default::default, |script| script.wait),
-                provider_held_lifecycle: Some(plane.lifecycle()),
-                new_log_compaction_plan_version: layout(),
-                account_reporter: today_reporter(),
-                ..admission_control(scenario)
-            },
-            &tx,
-        )
-        .await
-        .expect("today's loop resumes");
-        summaries.push((second.reason, second.paused));
-    }
-    drop(tx);
-    drain.await.unwrap();
-    // The provider's sink holds the writer too; keep only what the comparison reads.
-    let sent = Arc::clone(&provider.inner.sent);
-    drop(provider);
-    Arc::try_unwrap(writer)
-        .ok()
-        .expect("the run released the writer")
-        .shutdown()
-        .await
-        .unwrap();
-    let file = std::fs::read_dir(dir.join("wal"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .expect("today's loop wrote a log");
-    let image = LogImage::read(&file);
-    let name = file.file_name().unwrap().to_string_lossy().into_owned();
-    let converted =
-        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
-    let _ = std::fs::remove_dir_all(&dir);
-    let today = Outcome {
-        records: normalized(&converted.records),
-        requests: sent.lock().unwrap().clone(),
-        calls: plane
-            .log()
-            .iter()
-            .map(|event| format!("{event:?}"))
-            .collect(),
-    };
-    (today, summaries, image, name)
-}
-
-async fn compare_actions_in_once(
-    scenario: Scenario,
-    steers: Vec<(usize, Action)>,
-    on_restart: Option<OnRestart>,
-) {
-    // Today's run is boxed: its future is large enough to overflow a test thread's stack where
-    // it is built.
-    let (today, summaries, full, _) = Box::pin(today_with_actions(
-        &scenario,
-        None,
-        scenario.steps.clone(),
-        steers.clone(),
-        on_restart,
-    ))
-    .await;
-
-    // The new loop.
+    pins: bool,
+) -> Actions {
     let backend = MemoryBackend::default();
     let triple = SessionTriple {
         project_root: "/project".into(),
@@ -4889,6 +4339,9 @@ async fn compare_actions_in_once(
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
+        batch_ends: Vec::new(),
+        backend: Some(&backend),
+        snapshots: Vec::new(),
         injected,
         ended: Default::default(),
         media: Default::default(),
@@ -4951,7 +4404,6 @@ async fn compare_actions_in_once(
             .expect("the new loop resumes");
         reports.push((second.reason, second.paused));
     }
-    assert_eq!(reports, summaries, "how each run reported");
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
     turns_have_facts(writer.session).await;
@@ -4965,31 +4417,48 @@ async fn compare_actions_in_once(
             .map(|event| format!("{event:?}"))
             .collect(),
     };
-    assert_same(&today, &new);
-    if entries_compared() {
-        entries_alike(&full, writer.session).await;
-    }
-    if spend_compared() {
-        spend_alike(&full, writer.session, &parts).await;
+    if pins {
+        pin_same(&new);
+        if entries_compared() {
+            pin_entries(writer.session).await;
+        }
+        if spend_compared() {
+            pin_spend(writer.session, &parts).await;
+        }
+        broca_test_support::pin!("how each run reported", reports);
     }
     rides_name_their_carrier(&writer.records);
     // Reloading the session from a checkpoint at any record gives the state folding every
     // record does, rides kept beside their calls included.
     let points: Vec<usize> = (0..=writer.records.len()).collect();
-    let check = broca_session_convert::split::check_splits(&writer.records, false, &points)
-        .expect("the session's records fold");
+    let check = check_splits(&writer.records, &points).expect("the session's records fold");
     assert!(
-        check.differing.is_empty(),
-        "a checkpoint at {:?} reloads another state than the whole fold",
-        check.differing
+        check.is_empty(),
+        "a checkpoint at {check:?} reloads another state than the whole fold"
     );
+    Actions {
+        source: Source {
+            records: writer.records.clone(),
+            batch_ends: writer.batch_ends.clone(),
+            snapshots: std::mem::take(&mut writer.snapshots),
+            parts: parts.parts.clone(),
+            outcome: new,
+        },
+    }
 }
 
-/// Cuts today's log of `scenario`, run while the actor does `steers`, after each of its records,
-/// as a crash could, and resumes the cut in both loops, as `compare_every_cut` does: today's loop
-/// on the cut log, with the sends it holds queued, and the new loop on the same records
-/// converted. Nothing the actor did after the cut happens again. Runs in both layouts and both
-/// writer modes.
+async fn compare_actions_in_once(
+    scenario: Scenario,
+    steers: Vec<(usize, Action)>,
+    on_restart: Option<OnRestart>,
+) {
+    Box::pin(new_with_actions(&scenario, steers, on_restart, true)).await;
+}
+
+/// Cuts the new loop's log of `scenario`, run while the actor does `steers`, after each of its
+/// records, as a crash could, and resumes the cut, as `compare_every_cut` does, with the sends
+/// it holds queued. Nothing the actor did after the cut happens again. Runs in both layouts and
+/// both writer modes.
 async fn compare_actions_every_cut(scenario: Scenario, steers: Vec<(usize, Action)>) {
     compare_actions_cut(scenario, steers, Cuts::default()).await;
 }
@@ -4997,7 +4466,8 @@ async fn compare_actions_every_cut(scenario: Scenario, steers: Vec<(usize, Actio
 /// Where a cut comparison cuts, and what the resumes run on.
 #[derive(Clone, Default)]
 struct Cuts {
-    /// Cut only after the first record of this type: the loops write differently before it.
+    /// Cut only after the first record of this kind (`Record`'s variant name), where the
+    /// scenario's interesting part begins.
     after: Option<&'static str>,
     /// The route the resumes judge and render turn-scoped system messages by, when it isn't the
     /// one the run delivered under, as after a switch to another model.
@@ -5026,68 +4496,39 @@ async fn compare_actions_every_cut_once(
     steers: Vec<(usize, Action)>,
     cuts: Cuts,
 ) {
-    let (_, _, full, name) = Box::pin(today_with_actions(
-        &scenario,
-        None,
-        scenario.steps.clone(),
-        steers,
-        None,
-    ))
-    .await;
-    let records = full.framed().len();
+    let source = Box::pin(new_with_actions(&scenario, steers, None, false))
+        .await
+        .source;
+    let records = source.records.len();
     assert!(records > 2, "the scenario wrote a log to cut");
     let first = match cuts.after {
         Some(kind) => {
-            full.framed()
+            source
+                .records
                 .iter()
-                .position(|frame| serde_json::to_value(&frame.record).unwrap()["type"] == kind)
+                .position(|record| serde_json::to_value(record).unwrap()["kind"] == kind)
                 .unwrap_or_else(|| panic!("the scenario wrote a {kind} record"))
                 + 1
         }
         None => 1,
     };
     let route = cuts.resume_route.clone().unwrap_or_else(turn_system_route);
-    for cut in first..records {
-        let bytes = broca_crash_harness::cut_log(&full, cut, false);
-        let cut_image = LogImage::parse(bytes.clone());
-        let frames = cut_image.framed();
+    for cut in source
+        .batch_ends
+        .iter()
+        .copied()
+        .filter(|&end| end >= first && end < records)
+    {
         // The provider serves the steps the cut log has no answer for yet.
-        let answered = frames
-            .iter()
-            .filter(|frame| {
-                serde_json::to_value(&frame.record).unwrap()["type"] == "model_step_finished"
-            })
-            .count();
-        let steps = scenario.steps[answered..].to_vec();
-        let envelope_lost = loses_ride_envelopes(&frames);
-        let converted =
-            convert_unbilled(&frames, lineage(&cut_image).as_deref()).expect("the cut converts");
-        let cut_records = converted.records.clone();
-        let before = converted.records.len();
-        let (today, _, _, _) = TURN_SYSTEM
-            .scope(
-                route.clone(),
-                Box::pin(today_with_actions(
-                    &scenario,
-                    Some((&name, &bytes)),
-                    steps.clone(),
-                    Vec::new(),
-                    None,
-                )),
-            )
-            .await;
+        let steps = scenario.steps[source.answered(cut)..].to_vec();
         let new = TURN_SYSTEM
             .scope(
                 route.clone(),
-                Box::pin(new_from(&scenario, Some(converted), steps)),
+                Box::pin(new_from(&scenario, Some(source.cut(cut)), steps)),
             )
             .await;
-        let today_appended = &today.records[before.min(today.records.len())..];
         let context = format!("cut after record {cut} of {records}");
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
-            for (index, record) in today_appended.iter().enumerate() {
-                eprintln!("{context} today {index}: {record}");
-            }
             for (index, record) in new.records.iter().enumerate() {
                 eprintln!("{context} new   {index}: {record}");
             }
@@ -5099,132 +4540,7 @@ async fn compare_actions_every_cut_once(
             &new.calls,
             Clone::clone,
         );
-        assert_eq!(
-            new.requests.len(),
-            today.requests.len(),
-            "{context}: request count"
-        );
-        for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-            let new = resumed_as_today(new, today);
-            assert_eq!(&new, today, "{context}: request {index}");
-        }
-        // Where today's resumed loop loses a ride's envelope it has no notice for the ride, so
-        // nothing restates the carrying message's facts after it: the new loop's restatement
-        // right after each ride is set aside.
-        let new_records: Vec<Value> = new
-            .records
-            .iter()
-            .enumerate()
-            .filter(|(index, record)| {
-                !(envelope_lost
-                    && record["EntryFacts"].is_object()
-                    && index.checked_sub(1).is_some_and(|before| {
-                        new.records[before]["ResultAppend"]["ride"].is_object()
-                    }))
-            })
-            .map(|(_, record)| record.clone())
-            .collect();
-        for (index, (new, today)) in new_records.iter().zip(today_appended).enumerate() {
-            if envelope_lost && today["ResultAppend"]["ride"].is_null() {
-                // Without its envelope today's ride is a delivery of the old kind, which names
-                // the results message as delivered on its call; the new loop's ride, with its
-                // envelope, names nothing on the message.
-                let without = |record: &Value| {
-                    let mut record = record.clone();
-                    if let Some(append) = record["ResultAppend"].as_object_mut() {
-                        append.remove("ride");
-                        append.remove("send_id");
-                    }
-                    if let Some(facts) = record["EntryFacts"].as_object_mut() {
-                        if facts["delivery_mode"] == "tool_result" {
-                            facts.insert("delivery_mode".into(), Value::Null);
-                            facts.insert("delivery_tool_call_id".into(), Value::Null);
-                        }
-                    }
-                    record
-                };
-                assert_eq!(without(new), without(today), "{context}: record {index}");
-                continue;
-            }
-            assert_eq!(new, today, "{context}: record {index}");
-        }
-        assert_eq!(
-            new_records.len(),
-            today_appended.len(),
-            "{context}: record count"
-        );
-        let expected_calls = if resumes_an_answered_batch(&cut_records) {
-            without_empty_resumed_batch(&today.calls)
-        } else {
-            today.calls.clone()
-        };
-        assert_calls_alike(&new.calls, &expected_calls, &context);
-        // On a route that can't take a turn-scoped system message, the provider renders a stored
-        // one as user-authority text, never dropping it.
-        if let Some(route) = route
-            .as_ref()
-            .filter(|route| !broca_provider::turn_system::supported(route))
-        {
-            for request in &new.requests {
-                let rendered = broca_provider::turn_system::prepare(route, request);
-                assert!(
-                    !rendered
-                        .prompt
-                        .iter()
-                        .any(|message| message.role == Role::System && message.turn_system),
-                    "{context}: a turn-scoped system message goes out as one"
-                );
-                let stored = request
-                    .prompt
-                    .iter()
-                    .filter(|message| message.turn_system)
-                    .count();
-                let notes = rendered
-                    .prompt
-                    .iter()
-                    .filter(|message| {
-                        message.role == Role::User
-                            && message.content.iter().any(|block| {
-                                matches!(block,
-                                ContentBlock::Text { text } if text.starts_with("<context-note>"))
-                            })
-                    })
-                    .count();
-                assert_eq!(
-                    notes, stored,
-                    "{context}: each stored entry goes out as a note"
-                );
-            }
-        }
     }
-}
-
-/// Whether today's loop resumes `frames` without the envelope of a ride it then writes: a cut
-/// after a tool step's `model_step_finished` and before that step's batch commits
-/// (`tool_batch_finished`). On a legacy state root today's writer replays no ride ledger when it
-/// reopens a log, and its actor seeds the ledger again only with the queued sends, not the
-/// step's calls, so the ride's carrier has no key there and the ride goes out with none. The new
-/// loop reads the key from its own records and always writes the envelope. A gap in today's loop,
-/// reached only by a crash in that window; the request bytes are the same either way.
-fn loses_ride_envelopes(frames: &[broca_wal::FramedRecord]) -> bool {
-    let kind = |frame: &broca_wal::FramedRecord| {
-        serde_json::to_value(&frame.record).unwrap()["type"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let Some(step) = frames.iter().rposition(|frame| {
-        matches!(
-            &frame.record,
-            WalRecord::ModelStepFinished { assistant_message, .. }
-                if assistant_message.tool_calls().next().is_some()
-        )
-    }) else {
-        return false;
-    };
-    !frames[step..]
-        .iter()
-        .any(|frame| kind(frame) == "tool_batch_finished")
 }
 
 /// Each ride names the key of the call whose result carries it: the key of that call's intent,
@@ -5268,25 +4584,14 @@ async fn finishes<F: std::future::Future>(run: F) -> F::Output {
         .expect("the loop finished")
 }
 
-fn assert_same(today: &Outcome, new: &Outcome) {
+/// Pins what the new loop did, as [`pin_outcome`] does with requests as they render.
+fn pin_same(new: &Outcome) {
     if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
-        for (index, record) in today.records.iter().enumerate() {
-            eprintln!("today {index}: {record}");
-        }
         for (index, record) in new.records.iter().enumerate() {
             eprintln!("new   {index}: {record}");
         }
     }
     pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
-    assert_eq!(new.requests.len(), today.requests.len(), "request count");
-    for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
-    }
-    for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
-        assert_eq!(new, today, "record {index}");
-    }
-    assert_eq!(new.records.len(), today.records.len(), "record count");
-    assert_calls_alike(&new.calls, &today.calls, "");
 }
 
 #[tokio::test]
@@ -5513,78 +4818,6 @@ async fn compare_auth_pause_in_once(
     scenario: Scenario,
     resume_account: Option<broca_wal::AuthSelection>,
 ) {
-    // Today's loop, pausing and resuming on one writer.
-    let dir = broca_test_support::scratch_root().join(format!(
-        "session-loop-differential-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let wal = FileWalStore::new(dir.join("wal"));
-    let request = scenario.request();
-    let writer = WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap();
-    let provider = ScriptedProvider::new(scenario.steps.clone());
-    let plane = scenario.plane();
-    let (tx, mut rx) = mpsc::channel(512);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let mut summaries = Vec::new();
-    for mode in [StartMode::FreshOrResume, StartMode::ResumeAfterAuth] {
-        if mode == StartMode::ResumeAfterAuth {
-            reset_passes().await;
-            provider.resuming();
-        }
-        let summary = run_loop_on_writer(
-            request.clone(),
-            &writer,
-            mode,
-            &provider,
-            &plane,
-            &HarnessPolicy,
-            &wal,
-            None,
-            RunControl {
-                auth_selection: match mode {
-                    StartMode::ResumeAfterAuth => resume_account.clone().or_else(account_selection),
-                    _ => account_selection(),
-                },
-                account_limit_pause: account().is_some(),
-                clock: ACCOUNT_CLOCK.try_with(Clone::clone).ok(),
-                max_same_account_wait: account()
-                    .map_or_else(Default::default, |script| script.wait),
-                new_log_compaction_plan_version: layout(),
-                ..admission_control(&scenario)
-            },
-            &tx,
-        )
-        .await
-        .expect("today's loop runs");
-        summaries.push((summary.reason, summary.paused));
-    }
-    drop(tx);
-    drain.await.unwrap();
-    writer.shutdown().await.unwrap();
-    let file = std::fs::read_dir(dir.join("wal"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .expect("today's loop wrote a log");
-    let converted = {
-        let image = LogImage::read(&file);
-        convert_unbilled(&image.framed(), lineage(&image).as_deref())
-    }
-    .expect("the log converts");
-    let _ = std::fs::remove_dir_all(&dir);
-    let today = Outcome {
-        records: normalized(&converted.records),
-        requests: sent_requests(&provider),
-        calls: plane
-            .log()
-            .iter()
-            .map(|event| format!("{event:?}"))
-            .collect(),
-    };
-
     // The new loop.
     let backend = MemoryBackend::default();
     let triple = SessionTriple {
@@ -5606,6 +4839,9 @@ async fn compare_auth_pause_in_once(
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
+        batch_ends: Vec::new(),
+        backend: None,
+        snapshots: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
         media: Default::default(),
@@ -5685,12 +4921,11 @@ async fn compare_auth_pause_in_once(
             .map(|event| format!("{event:?}"))
             .collect(),
     };
-    assert_eq!(
-        [(first.reason, first.paused), (second.reason, second.paused)].as_slice(),
-        summaries.as_slice(),
-        "how each run reported"
+    pin_same(&new);
+    broca_test_support::pin!(
+        "how each run reported",
+        [(first.reason, first.paused), (second.reason, second.paused)]
     );
-    assert_same(&today, &new);
 }
 
 #[tokio::test]
@@ -6117,48 +5352,43 @@ async fn every_cut_of_a_system_or_steer_send_resumes_alike() {
     }
 }
 
-/// In a session that began in the new storage, a step that announced its message's id and
-/// stopped before writing it keeps that minted id when it runs again, even when a delivery lands
-/// before it at the retried step's boundary: a minted id names the record that announced it,
-/// wherever the message lands. (A converted session's position id is derived again instead,
-/// which `every_cut_of_a_system_or_steer_send_resumes_alike` checks.)
+/// A step that announced its message's id and stopped before writing it keeps that minted id
+/// when it runs again, even when a delivery lands before it at the retried step's boundary: a
+/// minted id names the record that announced it, wherever the message lands.
 #[tokio::test]
 async fn a_retried_steps_minted_id_survives_a_delivery_before_it() {
     let scenario = calling("read", 0);
     for layout in LAYOUTS {
         let scenario = scenario.clone();
         let run = async move {
-            let (_, _, full, _) = Box::pin(today_with_actions(
+            let source = Box::pin(new_with_actions(
                 &scenario,
-                None,
-                scenario.steps.clone(),
                 vec![system_note("q1")],
                 None,
+                false,
             ))
-            .await;
+            .await
+            .source;
             // The log up to the queued send: the run started, its first step announced its
-            // message, and the send waits.
-            let cut = full
-                .framed()
+            // message's minted id, and the send waits.
+            let cut = source
+                .records
                 .iter()
-                .position(|frame| serde_json::to_value(&frame.record).unwrap()["type"] == "queued")
+                .position(|record| matches!(record, Record::QueuedSend(_)))
                 .expect("the send was queued")
                 + 1;
-            let image = LogImage::parse(broca_crash_harness::cut_log(&full, cut, false));
-            let mut converted = convert_unbilled(&image.framed(), lineage(&image).as_deref())
-                .expect("the cut converts");
-            // As a session begun in the new storage holds it: the step announced a minted id,
-            // naming its own record, which takes the seq after the session's `WriterOpened`.
-            let index = converted
+            let start = source.cut(cut);
+            let index = start
                 .records
                 .iter()
                 .position(|record| matches!(record, Record::StepStart(_)))
                 .expect("the step started");
-            if let Record::StepStart(start) = &mut converted.records[index] {
-                start.mid = Some(format!("g0123456789abcdef.{}", index + 2));
-            }
-            let announced = normalized(&converted.records)[index]["StepStart"]["mid"].clone();
-            let new = new_from(&scenario, Some(converted), scenario.steps.clone()).await;
+            let announced = normalized(&start.records)[index]["StepStart"]["mid"].clone();
+            assert!(
+                announced.is_string(),
+                "the step announced a minted id: {announced}"
+            );
+            let new = new_from(&scenario, Some(start), scenario.steps.clone()).await;
             let retried = new
                 .records
                 .iter()
@@ -6195,7 +5425,7 @@ async fn a_stored_system_entry_after_a_switch_to_a_route_without_it() {
                 calling("read", 0),
                 vec![system_note("q1")],
                 Cuts {
-                    after: Some("send_delivered"),
+                    after: Some("Delivery"),
                     resume_route: Some(Some(anthropic_route(false))),
                 },
             ),
@@ -6249,27 +5479,6 @@ async fn a_dedupe_key_supersedes_the_undelivered_send() {
 #[tokio::test]
 async fn every_cut_of_a_superseded_send_resumes_alike() {
     compare_actions_every_cut(calling("read", 0), deduped()).await;
-}
-
-/// A ride recorded before llm-runner 0.8.11, with no envelope, converts and goes out as today's
-/// loop sends it, joined to its result, in every request after it.
-#[tokio::test]
-async fn a_ride_without_an_envelope_resumes_alike() {
-    for tool in ["read", "broken"] {
-        RIDES_WRITER
-            .scope(
-                false,
-                compare_actions_cut(
-                    calling(tool, 0),
-                    vec![a_note("q1")],
-                    Cuts {
-                        after: Some("send_delivered"),
-                        resume_route: None,
-                    },
-                ),
-            )
-            .await;
-    }
 }
 
 #[tokio::test]
@@ -7242,14 +6451,14 @@ async fn a_provider_that_lost_its_setup_mid_run_gets_setup_before_the_next_step(
         let scenario = compacted_scenario(steps);
         LOST.scope(lost, compare_compacted(scenario.clone(), script()))
             .await;
-        // Today's calls, which the new loop's were just compared with, show the case is seen:
-        // the call after the lost answer is a Setup, and a Setup was sent once before it.
+        // The new loop's calls show the case is seen: the call after the lost answer is a Setup,
+        // and a Setup was sent once before it.
         let calls = LOST
             .scope(
                 lost,
                 LAYOUT.scope(
                     Some(cortexkit_compaction_view::PLAN_VERSION),
-                    COMPACTION.scope(Some(Arc::new(script())), today(&scenario)),
+                    COMPACTION.scope(Some(Arc::new(script())), new_loop(&scenario)),
                 ),
             )
             .await
@@ -7771,7 +6980,7 @@ async fn a_ledger_seal_between_runs_keeps_the_compaction_views() {
 /// Removing the final tool turn is refused, not accepted as a smaller request. Both loops
 /// report the same rule and leave no view or cut to apply or seal.
 #[tokio::test]
-async fn a_view_dropping_the_final_tool_turn_is_refused_alike() {
+async fn a_view_dropping_the_final_tool_turn_is_refused() {
     LAYOUT
         .scope(
             Some(cortexkit_compaction_view::PLAN_VERSION),
@@ -7789,10 +6998,9 @@ async fn a_view_dropping_the_final_tool_turn_is_refused_alike() {
                         ),
                         text_step("a2", "done"),
                     ]);
-                    let today = Box::pin(today(&scenario)).await;
                     let new = Box::pin(new_loop(&scenario)).await;
-                    assert_same(&today, &new);
-                    for outcome in [&today, &new] {
+                    pin_same(&new);
+                    for outcome in [&new] {
                         let events: Vec<Value> = outcome
                             .calls
                             .iter()
@@ -8266,28 +7474,27 @@ async fn a_nudge_is_placed_after_the_batch_that_reaches_it() {
 }
 
 /// The step after a finalize budget firing, rebuilt offline from a copy of the session cut at
-/// that step's start, disables tool calls as the request today's loop sent for it did, and keeps
-/// the declared tools.
+/// that step's start, disables tool calls as the request the loop sent for it did, and keeps the
+/// declared tools.
 #[tokio::test]
 async fn a_finalize_steps_offline_request_disables_calls_as_sent() {
     BUDGET
         .scope(Some(budgeted(&[], Some(1))), async {
             let scenario = reads(1, text_step("z", "done"));
-            let (today, image, _) = today_from(&scenario, None, scenario.steps.clone()).await;
+            let source = new_source(&scenario, None, scenario.steps.clone()).await;
             assert_eq!(
-                today.requests.len(),
+                source.outcome.requests.len(),
                 2,
                 "a tool step, then the finalize step"
             );
-            let sent = &today.requests[1];
+            let sent = &source.outcome.requests[1];
             assert_eq!(*sent.tool_choice, broca_protocol::ToolChoice::None);
-            let frames = image.framed();
-            let start = frames
+            let start = source
+                .records
                 .iter()
-                .rposition(|frame| matches!(frame.record, broca_wal::WalRecord::StepStarted { .. }))
+                .rposition(|record| matches!(record, Record::StepStart(_)))
                 .expect("the finalize step started");
-            let converted = convert_unbilled(&frames[..=start], lineage(&image).as_deref())
-                .expect("the cut converts");
+            let cut = source.cut(start + 1);
             let backend = MemoryBackend::default();
             let mut session = Session::create(
                 &backend,
@@ -8298,14 +7505,12 @@ async fn a_finalize_steps_offline_request_disables_calls_as_sent() {
                     session: "s1".into(),
                 },
                 &DeploymentKey::new(1, &[7; 32]),
-                true,
+                false,
             )
             .await
             .unwrap();
-            session.append(&converted.records, true).await.unwrap();
-            let parts = MemoryParts {
-                parts: converted.parts,
-            };
+            session.append(&cut.records, true).await.unwrap();
+            let parts = MemoryParts { parts: cut.parts };
             let rebuilt = broca_session_loop::run::offline_request(&session, &parts, &bind(), 2)
                 .await
                 .expect("the finalize step rebuilds");
@@ -8316,9 +7521,8 @@ async fn a_finalize_steps_offline_request_disables_calls_as_sent() {
 }
 
 /// A session whose run froze no cache marker order (one converted from a log written before
-/// runs froze one) keeps rendering without one, as today's loop does: a step rebuilt from it
-/// names none, and a new run admitted on it freezes none. A session's first run takes the
-/// current order.
+/// runs froze one) keeps rendering without one: a step rebuilt from it names none, and a new run
+/// admitted on it freezes none. A session's first run takes the current order.
 #[tokio::test]
 async fn a_session_whose_run_froze_no_marker_order_keeps_none() {
     use broca_session_loop::run::MARKER_ORDER_VERSION;
@@ -8329,14 +7533,12 @@ async fn a_session_whose_run_froze_no_marker_order_keeps_none() {
         stop_when: Vec::new(),
         steps: vec![text_step("a1", "hi")],
     };
-    let (today, image, _) = today_from(&scenario, None, scenario.steps.clone()).await;
+    let source = new_source(&scenario, None, scenario.steps.clone()).await;
     assert_eq!(
-        today.requests[0].marker_order_version,
+        source.outcome.requests[0].marker_order_version,
         Some(MARKER_ORDER_VERSION)
     );
-    let frames = image.framed();
-    let mut converted =
-        convert_unbilled(&frames, lineage(&image).as_deref()).expect("the log converts");
+    let mut converted = source.cut(source.records.len());
     // As a log written before runs froze a marker order: its start records none.
     for record in &mut converted.records {
         if let Record::RunStart(start) = record {
@@ -8345,7 +7547,7 @@ async fn a_session_whose_run_froze_no_marker_order_keeps_none() {
                 .as_mut()
                 .and_then(|choices| choices.get_mut("record"))
                 .and_then(Value::as_object_mut)
-                .expect("the start records today's members");
+                .expect("the start records its run's members");
             assert!(recorded.remove("marker_order_version").is_some());
         }
     }
@@ -8585,25 +7787,22 @@ async fn every_cut_of_a_cache_expired_ride_resumes_alike() {
         .await;
 }
 
-/// Runs `compare` with keep-warm on in both loops, then checks both sent the same warms, and
-/// that they sent some: `expect` is how many today's loop sent in each of the comparison's
-/// modes, when the comparison knows.
+/// Runs `compare` with keep-warm on, then checks the new loop sent some warms, `expect` of them
+/// in each of the comparison's modes when the comparison knows, and pins them.
 async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: Option<usize>, compare: F) {
     let pair = Arc::new(WarmPair::default());
     WARM.scope(Some(Arc::clone(&pair)), compare).await;
-    let today = pair.today.log.lock().unwrap().clone();
     let new = pair.new.log.lock().unwrap().clone();
     broca_test_support::pin!("warms", new);
-    assert!(!today.is_empty(), "today's loop sent no warm");
+    assert!(!new.is_empty(), "the new loop sent no warm");
     if let Some(expect) = expect {
         assert_eq!(
-            today.len(),
+            new.len(),
             // Each layout runs once per writer.
             expect * LAYOUTS.len() * 2,
-            "today's warms: {today:?}"
+            "the new loop's warms: {new:?}"
         );
     }
-    assert_eq!(new, today, "the new loop's warms");
 }
 
 fn slow_scenario(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
@@ -9696,6 +8895,9 @@ async fn enroll_run_with(
     let mut writer = Recording {
         session,
         records: Vec::new(),
+        batch_ends: Vec::new(),
+        backend: None,
+        snapshots: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
         media: Default::default(),
@@ -9754,6 +8956,9 @@ async fn enroll_resume_with(
     let mut writer = Recording {
         session,
         records: Vec::new(),
+        batch_ends: Vec::new(),
+        backend: None,
+        snapshots: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
         media: Default::default(),
@@ -10579,65 +9784,13 @@ async fn an_enrolling_run_whose_request_cant_be_ready_ends_with_the_error_and_se
 /// that result, enrolls through the new loop: the earlier result keeps its stored bytes with the
 /// delivered text joined, while text delivered with a result of the enrolling run on stays apart
 /// from it and is joined only as a request renders, as the current compaction contract places
-/// it. Today's log is what today's loop wrote for one run, with a hand-written delivery riding
-/// its tool result.
+/// it. The converted log is one run's, with a hand-written delivery riding its tool result.
 #[tokio::test]
 async fn a_converted_session_with_a_joined_ride_enrolls_and_keeps_its_bytes() {
     in_each_cipher(|| async {
-        // Today's log: one run with a tool call, and text delivered with its result.
-        let today_run = Scenario {
-            input: vec![system("You are terse."), user("read a")],
-            tools: enrollment_tools(),
-            manifest: None,
-            stop_when: Vec::new(),
-            steps: vec![
-                answer(
-                    "a1",
-                    vec![call("c1", "read", json!({}))],
-                    FinishReason::ToolCalls,
-                ),
-                text_step("a2", "done with a"),
-            ],
-        };
-        let (_, image, _) = today_from(&today_run, None, today_run.steps.clone()).await;
-        let mut frames = image.framed();
-        let finished = frames
-            .iter()
-            .position(|frame| {
-                matches!(frame.record, broca_wal::WalRecord::ToolBatchFinished { .. })
-            })
-            .expect("today's run finished its batch");
-        let run_id = frames
-            .iter()
-            .find_map(|frame| match &frame.record {
-                broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let delivered: broca_wal::WalRecord = serde_json::from_value(json!({
-            "type": "send_delivered",
-            "submission_id": "q1",
-            "run_id": run_id,
-            "mode": "tool_result",
-            "tool_call_id": "c1",
-            "appended_text": "\n\nalso check b",
-            "written_at_ms": 7,
-        }))
-        .unwrap();
-        frames.insert(
-            finished + 1,
-            broca_wal::FramedRecord {
-                seq: 0,
-                fence: frames[finished].fence,
-                record: delivered,
-            },
-        );
-        for (at, frame) in frames.iter_mut().enumerate() {
-            frame.seq = at as u64 + 1;
-        }
-        let converted =
-            convert_unbilled(&frames, lineage(&image).as_deref()).expect("the log converts");
-        assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+        // One run with a tool call, and text delivered with its result, as today's loop wrote
+        // it and the converter converted it.
+        let converted = converted_fixture("joined-ride");
 
         // The converted session joins delivered text into results, as today's storage did.
         let backend = MemoryBackend::default();
@@ -10761,31 +9914,11 @@ async fn a_converted_session_with_a_joined_ride_enrolls_and_keeps_its_bytes() {
 }
 
 /// A session converted from today's storage whose first message is its global system text, with
-/// a turn-scoped note after the person's first message. Today's log is what today's loop wrote
-/// for one run that calls a tool.
+/// a turn-scoped note after the person's first message, from one run that calls a tool.
 async fn converted_with_global_system(
     backend: &MemoryBackend,
 ) -> (Session<&MemoryBackend>, MemoryParts) {
-    let mut note = system("a turn-scoped note");
-    note.turn_system = true;
-    let today_run = Scenario {
-        input: vec![system("You are terse."), user("read a"), note],
-        tools: enrollment_tools(),
-        manifest: None,
-        stop_when: Vec::new(),
-        steps: vec![
-            answer(
-                "a1",
-                vec![call("c1", "read", json!({}))],
-                FinishReason::ToolCalls,
-            ),
-            text_step("a2", "done with a"),
-        ],
-    };
-    let (_, image, _) = today_from(&today_run, None, today_run.steps.clone()).await;
-    let converted =
-        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
-    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    let converted = converted_fixture("global-system");
     let mut session = Session::create(
         backend,
         enrollment_addr(),
@@ -10975,7 +10108,7 @@ async fn the_enrolling_run_bills_as_the_same_run_without_compaction() {
                 &records,
                 &RunId("r4".into()),
                 "differential",
-                &broca_session_convert::billing::resolver,
+                &charge_resolver,
             )
             .into_iter()
             .map(|segment| serde_json::to_value(segment).unwrap())
@@ -11439,28 +10572,9 @@ async fn a_reading_with_no_view_ever_names_none() {
 /// facts carry that view, so the first run on the new storage names it with the step's reading.
 #[tokio::test]
 async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
-    let scenario = compacted_scenario(vec![
-        answer(
-            "a1",
-            vec![call("c1", "big", json!({}))],
-            FinishReason::ToolCalls,
-        ),
-        measured("a2", "done", 900),
-    ]);
-    let (_, image, _) = LAYOUT
-        .scope(
-            Some(cortexkit_compaction_view::PLAN_VERSION),
-            COMPACTION.scope(
-                Some(Arc::new(CompactionScript {
-                    context_limit: 1_200,
-                    rides: vec![Ride::Trim(2)],
-                })),
-                today_from(&scenario, None, scenario.steps.clone()),
-            ),
-        )
-        .await;
-    let converted =
-        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
+    // A run that called a tool and answered, measured at 900 tokens, as today's loop wrote it
+    // under view 1 and the converter converted it.
+    let converted = converted_fixture("view-reading");
     let backend: &'static MemoryBackend = Box::leak(Box::default());
     let mut session = enrollment_session(backend).await;
     session.append(&converted.records, true).await.unwrap();
@@ -11500,40 +10614,3 @@ async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
 /// The probe placement of rides after a tool turn's results, run on the new loop alone.
 #[path = "differential/ride_placement.rs"]
 mod ride_placement;
-
-/// The new loop's compaction and tool calls match today's, but for the `accepts_images` member a
-/// compaction call states, at the top level or in its conditions: the new loop states it takes no
-/// inserted images, which it renders only as markers, where today's states what the model takes.
-/// A call is its method, any routing note, then its JSON body from the first `{`.
-fn assert_calls_alike(new: &[String], today: &[String], context: &str) {
-    assert!(
-        new.iter()
-            .filter(|call| call.contains("accepts_images"))
-            .all(|call| call.contains("\"accepts_images\":false")),
-        "{context}: the new loop states it takes no images: {new:?}"
-    );
-    let without = |calls: &[String]| -> Vec<String> {
-        calls
-            .iter()
-            .map(|call| {
-                let Some(start) = call.find('{').filter(|_| call.starts_with("compaction.")) else {
-                    return call.clone();
-                };
-                let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&call[start..]) else {
-                    return call.clone();
-                };
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("accepts_images");
-                    if let Some(conditions) = object
-                        .get_mut("conditions")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        conditions.remove("accepts_images");
-                    }
-                }
-                format!("{}{body}", &call[..start])
-            })
-            .collect()
-    };
-    assert_eq!(without(new), without(today), "{context}: tool calls");
-}

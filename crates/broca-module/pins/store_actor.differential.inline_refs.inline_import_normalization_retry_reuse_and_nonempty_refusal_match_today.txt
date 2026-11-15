@@ -373,6 +373,10 @@ Object {
     "tools_run_id": String("seed"),
 }
 == alike
+Some(
+    false,
+)
+== alike
 Active {
     run_id: RunId(
         "continued",

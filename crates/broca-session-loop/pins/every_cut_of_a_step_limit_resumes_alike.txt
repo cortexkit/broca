@@ -1,324 +1,140 @@
-== cut after record 1 of 8: request count
+== cut after record 4 of 15: request count
 1
-== cut after record 1 of 8: request 0
+== cut after record 4 of 15: request 0
 sha256:90d79c11088883377139317c88ce54d8dcfa4346f068af563560c6ba5aa86ded (2492 bytes)
-== cut after record 1 of 8: record count
+== cut after record 4 of 15: record count
 12
-== cut after record 1 of 8: records
+== cut after record 4 of 15: records
 sha256:1e34276b6ed1622ca04e935ac5a40838a6102d61a1d467eb93e4386d77d5ad03 (3289 bytes)
-== cut after record 1 of 8: tool calls
+== cut after record 4 of 15: tool calls
 []
-== cut after record 2 of 8: request count
+== cut after record 5 of 15: request count
 1
-== cut after record 2 of 8: request 0
+== cut after record 5 of 15: request 0
 sha256:90d79c11088883377139317c88ce54d8dcfa4346f068af563560c6ba5aa86ded (2492 bytes)
-== cut after record 2 of 8: record count
+== cut after record 5 of 15: record count
 12
-== cut after record 2 of 8: records
+== cut after record 5 of 15: records
 sha256:1e34276b6ed1622ca04e935ac5a40838a6102d61a1d467eb93e4386d77d5ad03 (3289 bytes)
-== cut after record 2 of 8: tool calls
+== cut after record 5 of 15: tool calls
 []
-== cut after record 3 of 8: request count
+== cut after record 8 of 15: request count
 1
-== cut after record 3 of 8: request 0
+== cut after record 8 of 15: request 0
 sha256:f6cffdacc46362715ce053e6fc59e3bad9db92d43fb6cd448b9690436167c0ea (5172 bytes)
-== cut after record 3 of 8: record count
+== cut after record 8 of 15: record count
 10
-== cut after record 3 of 8: records
+== cut after record 8 of 15: records
 sha256:9230bcd9a3565227f13a0a031855a3c64b8bdba44f8d1dad24cdc35ede0f4349 (2357 bytes)
-== cut after record 3 of 8: tool calls
+== cut after record 8 of 15: tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== cut after record 4 of 8: request count
+== cut after record 4 of 15: request count
 1
-== cut after record 4 of 8: request 0
-sha256:f6cffdacc46362715ce053e6fc59e3bad9db92d43fb6cd448b9690436167c0ea (5172 bytes)
-== cut after record 4 of 8: record count
-9
-== cut after record 4 of 8: records
-sha256:41d703cdaa7356118bfcbfa75c4d94708ba4aed98b9f68cccb685568c12772d5 (2244 bytes)
-== cut after record 4 of 8: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== cut after record 5 of 8: request count
-1
-== cut after record 5 of 8: request 0
-sha256:3df5d77d747189b4f6154f3173c4bfd5ddc9e621a4fef3da8a7b199182dc9f4d (5422 bytes)
-== cut after record 5 of 8: record count
-4
-== cut after record 5 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"RunEnd":{"error":{"class":"provider_unavailable","message":"provider stream ended without an assembled assistant message and Finished control"},"interrupt_reason":null,"kind":"RunEnd","reason":"error","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 8: tool calls
-[]
-== cut after record 6 of 8: request count
-0
-== cut after record 6 of 8: record count
-2
-== cut after record 6 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 8: tool calls
-[]
-== cut after record 7 of 8: request count
-0
-== cut after record 7 of 8: record count
-2
-== cut after record 7 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 8: tool calls
-[]
-== cut after record 1 of 8: request count
-1
-== cut after record 1 of 8: request 0
+== cut after record 4 of 15: request 0
 sha256:90d79c11088883377139317c88ce54d8dcfa4346f068af563560c6ba5aa86ded (2492 bytes)
-== cut after record 1 of 8: record count
+== cut after record 4 of 15: record count
 12
-== cut after record 1 of 8: records
+== cut after record 4 of 15: records
 sha256:1e34276b6ed1622ca04e935ac5a40838a6102d61a1d467eb93e4386d77d5ad03 (3289 bytes)
-== cut after record 1 of 8: tool calls
+== cut after record 4 of 15: tool calls
 []
-== cut after record 2 of 8: request count
+== cut after record 5 of 15: request count
 1
-== cut after record 2 of 8: request 0
+== cut after record 5 of 15: request 0
 sha256:90d79c11088883377139317c88ce54d8dcfa4346f068af563560c6ba5aa86ded (2492 bytes)
-== cut after record 2 of 8: record count
+== cut after record 5 of 15: record count
 12
-== cut after record 2 of 8: records
+== cut after record 5 of 15: records
 sha256:1e34276b6ed1622ca04e935ac5a40838a6102d61a1d467eb93e4386d77d5ad03 (3289 bytes)
-== cut after record 2 of 8: tool calls
+== cut after record 5 of 15: tool calls
 []
-== cut after record 3 of 8: request count
+== cut after record 8 of 15: request count
 1
-== cut after record 3 of 8: request 0
+== cut after record 8 of 15: request 0
 sha256:f6cffdacc46362715ce053e6fc59e3bad9db92d43fb6cd448b9690436167c0ea (5172 bytes)
-== cut after record 3 of 8: record count
+== cut after record 8 of 15: record count
 10
-== cut after record 3 of 8: records
+== cut after record 8 of 15: records
 sha256:9230bcd9a3565227f13a0a031855a3c64b8bdba44f8d1dad24cdc35ede0f4349 (2357 bytes)
-== cut after record 3 of 8: tool calls
+== cut after record 8 of 15: tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== cut after record 4 of 8: request count
+== cut after record 4 of 15: request count
 1
-== cut after record 4 of 8: request 0
-sha256:f6cffdacc46362715ce053e6fc59e3bad9db92d43fb6cd448b9690436167c0ea (5172 bytes)
-== cut after record 4 of 8: record count
-9
-== cut after record 4 of 8: records
-sha256:41d703cdaa7356118bfcbfa75c4d94708ba4aed98b9f68cccb685568c12772d5 (2244 bytes)
-== cut after record 4 of 8: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== cut after record 5 of 8: request count
-1
-== cut after record 5 of 8: request 0
-sha256:3df5d77d747189b4f6154f3173c4bfd5ddc9e621a4fef3da8a7b199182dc9f4d (5422 bytes)
-== cut after record 5 of 8: record count
-4
-== cut after record 5 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"RunEnd":{"error":{"class":"provider_unavailable","message":"provider stream ended without an assembled assistant message and Finished control"},"interrupt_reason":null,"kind":"RunEnd","reason":"error","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 8: tool calls
-[]
-== cut after record 6 of 8: request count
-0
-== cut after record 6 of 8: record count
-2
-== cut after record 6 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 8: tool calls
-[]
-== cut after record 7 of 8: request count
-0
-== cut after record 7 of 8: record count
-2
-== cut after record 7 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 8: tool calls
-[]
-== cut after record 1 of 8: request count
-1
-== cut after record 1 of 8: request 0
+== cut after record 4 of 15: request 0
 sha256:2579dc898e42e4da0572aa848f3993e8a6ebb79b08faf052f3431371ed0683d9 (2492 bytes)
-== cut after record 1 of 8: record count
+== cut after record 4 of 15: record count
 12
-== cut after record 1 of 8: records
+== cut after record 4 of 15: records
 sha256:4f87c93b3ad5b40609a3c45019ed47133cda0387c09710014ca5eba25580a12d (3400 bytes)
-== cut after record 1 of 8: tool calls
+== cut after record 4 of 15: tool calls
 []
-== cut after record 2 of 8: request count
+== cut after record 5 of 15: request count
 1
-== cut after record 2 of 8: request 0
+== cut after record 5 of 15: request 0
 sha256:2579dc898e42e4da0572aa848f3993e8a6ebb79b08faf052f3431371ed0683d9 (2492 bytes)
-== cut after record 2 of 8: record count
+== cut after record 5 of 15: record count
 12
-== cut after record 2 of 8: records
+== cut after record 5 of 15: records
 sha256:4f87c93b3ad5b40609a3c45019ed47133cda0387c09710014ca5eba25580a12d (3400 bytes)
-== cut after record 2 of 8: tool calls
+== cut after record 5 of 15: tool calls
 []
-== cut after record 3 of 8: request count
+== cut after record 8 of 15: request count
 1
-== cut after record 3 of 8: request 0
+== cut after record 8 of 15: request 0
 sha256:0bf43baae647f8c142d7c4024d5fcd9d0a9b59578afbbf0bbaa5e36d4293463a (5174 bytes)
-== cut after record 3 of 8: record count
+== cut after record 8 of 15: record count
 10
-== cut after record 3 of 8: records
+== cut after record 8 of 15: records
 sha256:838cf3c95909fdaf2ca7800fb3f222f59b2baabe9846276f6d4ca9092ff70ce6 (2357 bytes)
-== cut after record 3 of 8: tool calls
+== cut after record 8 of 15: tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== cut after record 4 of 8: request count
+== cut after record 4 of 15: request count
 1
-== cut after record 4 of 8: request 0
-sha256:0bf43baae647f8c142d7c4024d5fcd9d0a9b59578afbbf0bbaa5e36d4293463a (5174 bytes)
-== cut after record 4 of 8: record count
-9
-== cut after record 4 of 8: records
-sha256:a8a092f8defb417e7963cd1cb73e3fbcb3ba3267695b820bd22047aec2cc9174 (2244 bytes)
-== cut after record 4 of 8: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== cut after record 5 of 8: request count
-1
-== cut after record 5 of 8: request 0
-sha256:fc1c2c4bf11e35c809d21d94f1d96c9100e65cf95746a881fed0a6af7e29dade (5424 bytes)
-== cut after record 5 of 8: record count
-4
-== cut after record 5 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"RunEnd":{"error":{"class":"provider_unavailable","message":"provider stream ended without an assembled assistant message and Finished control"},"interrupt_reason":null,"kind":"RunEnd","reason":"error","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 8: tool calls
-[]
-== cut after record 6 of 8: request count
-0
-== cut after record 6 of 8: record count
-2
-== cut after record 6 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 8: tool calls
-[]
-== cut after record 7 of 8: request count
-0
-== cut after record 7 of 8: record count
-2
-== cut after record 7 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 8: tool calls
-[]
-== cut after record 1 of 8: request count
-1
-== cut after record 1 of 8: request 0
+== cut after record 4 of 15: request 0
 sha256:2579dc898e42e4da0572aa848f3993e8a6ebb79b08faf052f3431371ed0683d9 (2492 bytes)
-== cut after record 1 of 8: record count
+== cut after record 4 of 15: record count
 12
-== cut after record 1 of 8: records
+== cut after record 4 of 15: records
 sha256:4f87c93b3ad5b40609a3c45019ed47133cda0387c09710014ca5eba25580a12d (3400 bytes)
-== cut after record 1 of 8: tool calls
+== cut after record 4 of 15: tool calls
 []
-== cut after record 2 of 8: request count
+== cut after record 5 of 15: request count
 1
-== cut after record 2 of 8: request 0
+== cut after record 5 of 15: request 0
 sha256:2579dc898e42e4da0572aa848f3993e8a6ebb79b08faf052f3431371ed0683d9 (2492 bytes)
-== cut after record 2 of 8: record count
+== cut after record 5 of 15: record count
 12
-== cut after record 2 of 8: records
+== cut after record 5 of 15: records
 sha256:4f87c93b3ad5b40609a3c45019ed47133cda0387c09710014ca5eba25580a12d (3400 bytes)
-== cut after record 2 of 8: tool calls
+== cut after record 5 of 15: tool calls
 []
-== cut after record 3 of 8: request count
+== cut after record 8 of 15: request count
 1
-== cut after record 3 of 8: request 0
+== cut after record 8 of 15: request 0
 sha256:0bf43baae647f8c142d7c4024d5fcd9d0a9b59578afbbf0bbaa5e36d4293463a (5174 bytes)
-== cut after record 3 of 8: record count
+== cut after record 8 of 15: record count
 10
-== cut after record 3 of 8: records
+== cut after record 8 of 15: records
 sha256:838cf3c95909fdaf2ca7800fb3f222f59b2baabe9846276f6d4ca9092ff70ce6 (2357 bytes)
-== cut after record 3 of 8: tool calls
+== cut after record 8 of 15: tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
     "\"batch_finished\"",
 ]
-== cut after record 4 of 8: request count
-1
-== cut after record 4 of 8: request 0
-sha256:0bf43baae647f8c142d7c4024d5fcd9d0a9b59578afbbf0bbaa5e36d4293463a (5174 bytes)
-== cut after record 4 of 8: record count
-9
-== cut after record 4 of 8: records
-sha256:a8a092f8defb417e7963cd1cb73e3fbcb3ba3267695b820bd22047aec2cc9174 (2244 bytes)
-== cut after record 4 of 8: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== cut after record 5 of 8: request count
-1
-== cut after record 5 of 8: request 0
-sha256:fc1c2c4bf11e35c809d21d94f1d96c9100e65cf95746a881fed0a6af7e29dade (5424 bytes)
-== cut after record 5 of 8: record count
-4
-== cut after record 5 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
-{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
-{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"RunEnd":{"error":{"class":"provider_unavailable","message":"provider stream ended without an assembled assistant message and Finished control"},"interrupt_reason":null,"kind":"RunEnd","reason":"error","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 5 of 8: tool calls
-[]
-== cut after record 6 of 8: request count
-0
-== cut after record 6 of 8: record count
-2
-== cut after record 6 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 6 of 8: tool calls
-[]
-== cut after record 7 of 8: request count
-0
-== cut after record 7 of 8: record count
-2
-== cut after record 7 of 8: records
-{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
-{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
-== cut after record 7 of 8: tool calls
-[]

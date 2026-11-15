@@ -57,3 +57,41 @@ ScopeRefused(
         },
     ),
 )
+== alike
+ScopeRefused(
+    OwnerMismatch(
+        Scoped {
+            frozen: SessionScope {
+                owner: Reserved {
+                    module_id: "prefrontal-core",
+                },
+                scope_ref: "head-1",
+                scope_epoch: 2,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+                agent_id_frozen: false,
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "prefrontal-core",
+                },
+            ),
+            presented_scope: Some(
+                SessionScope {
+                    owner: Reserved {
+                        module_id: "prefrontal-core",
+                    },
+                    scope_ref: "head-1",
+                    scope_epoch: 1,
+                    flow_id: None,
+                    sender: None,
+                    agent_id: None,
+                    run_id: None,
+                    agent_id_frozen: false,
+                },
+            ),
+        },
+    ),
+)

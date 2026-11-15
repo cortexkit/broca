@@ -1,0 +1,40 @@
+== control stream
+[
+  {
+    "event": {
+      "mid": "mid#0",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#0",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": null,
+    "unit": {
+      "reason": "cancelled",
+      "type": "run_finished"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_started"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  },
+  {
+    "event": {
+      "mid": "mid#1",
+      "type": "message_finished"
+    },
+    "unit": {
+      "mid": "mid#1",
+      "type": "message_boundary"
+    }
+  }
+]

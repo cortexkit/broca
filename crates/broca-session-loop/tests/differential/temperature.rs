@@ -7,7 +7,7 @@ tokio::task_local! {
 }
 
 #[tokio::test]
-async fn temperature_effective_and_legacy_values_resume_unchanged_on_both_storages() {
+async fn temperature_effective_and_legacy_values_resume_unchanged() {
     let scenario = Scenario {
         input: vec![user("hello")],
         tools: vec![],
@@ -36,48 +36,38 @@ async fn temperature_effective_and_legacy_values_resume_unchanged_on_both_storag
             Some(1.75),
         ),
     ] {
-        let (fresh, full, name) = REQUESTED
+        let source = REQUESTED
             .scope(
                 requested,
-                POLICY.scope(policy, today_from(&scenario, None, scenario.steps.clone())),
+                POLICY.scope(policy, new_source(&scenario, None, scenario.steps.clone())),
             )
             .await;
-        assert_eq!(fresh.requests[0].generation.temperature, expected);
-        let frames = full.framed();
-        let start = frames
+        assert_eq!(source.outcome.requests[0].generation.temperature, expected);
+        let start = source
+            .records
             .iter()
-            .position(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }))
+            .position(|record| matches!(record, Record::RunStart(_)))
             .unwrap();
-        let bytes = broca_crash_harness::cut_log(&full, start + 1, false);
-        let cut = LogImage::parse(bytes.clone());
-        let converted = convert_unbilled(&cut.framed(), lineage(&cut).as_deref()).unwrap();
-        // If either resume re-applies admission, today's unsupported policy would erase the
-        // recorded value. A divergent send must not replace it either.
+        // If the resume re-applies admission, the unsupported policy would erase the recorded
+        // value. A divergent send must not replace it either.
         let changed = TemperaturePolicy {
             supported: Some(false),
             ..Default::default()
         };
-        let (wal, _, _) = REQUESTED
+        let resumed = REQUESTED
             .scope(
                 Some(0.25),
                 POLICY.scope(
                     changed,
-                    today_from(&scenario, Some((&name, &bytes)), scenario.steps.clone()),
+                    new_from(
+                        &scenario,
+                        Some(source.cut(start + 1)),
+                        scenario.steps.clone(),
+                    ),
                 ),
             )
             .await;
-        let session = REQUESTED
-            .scope(
-                Some(0.25),
-                POLICY.scope(
-                    changed,
-                    new_from(&scenario, Some(converted), scenario.steps.clone()),
-                ),
-            )
-            .await;
-        for resumed in [wal, session] {
-            assert_eq!(resumed.requests.len(), 1);
-            assert_eq!(resumed.requests[0].generation.temperature, expected);
-        }
+        assert_eq!(resumed.requests.len(), 1);
+        assert_eq!(resumed.requests[0].generation.temperature, expected);
     }
 }

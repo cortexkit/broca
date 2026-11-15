@@ -34,6 +34,13 @@ sha256:e982e0ea7fd5e56023b08fe3955429571a8daa23fee3137abcbf2b03ff34e28b (3276 by
         "usage": Object {},
     },
 ]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
 == request count
 1
 == request 0
@@ -70,41 +77,12 @@ sha256:e982e0ea7fd5e56023b08fe3955429571a8daa23fee3137abcbf2b03ff34e28b (3276 by
         "usage": Object {},
     },
 ]
-== request count
-1
-== request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
-== record count
-7
-== records
-sha256:6c27179172ab467bc47115647600e63aec80ab4993298ddb7b5040d91f62689c (3273 bytes)
-== tool calls
-[]
-== run r1's spend facts
+== how each run reported
 [
-    Object {
-        "auth_selection": Null,
-        "charge_basis": String("unknown"),
-        "charge_basis_mapping_version": Number(1),
-        "charge_basis_overrides": String("none"),
-        "fact_id": String("<normalized>"),
-        "model": String("m"),
-        "occurred_at_ms": String("<normalized>"),
-        "occurred_at_precision": String("terminal"),
-        "pricing_at_ms": String("<normalized>"),
-        "pricing_at_precision": String("exact"),
-        "provider": String("stub"),
-        "retries_used": Number(0),
-        "run_id": String("r1"),
-        "segment_ordinal": Number(0),
-        "session": Object {
-            "harness": String("differential"),
-            "project_root": String("/differential/project"),
-            "session": String("s1"),
-        },
-        "terminal_reason": String("cancelled"),
-        "usage": Object {},
-    },
+    (
+        Cancelled,
+        None,
+    ),
 ]
 == request count
 1
@@ -141,6 +119,56 @@ sha256:6c27179172ab467bc47115647600e63aec80ab4993298ddb7b5040d91f62689c (3273 by
         "terminal_reason": String("cancelled"),
         "usage": Object {},
     },
+]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
+== request count
+1
+== request 0
+sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+== record count
+7
+== records
+sha256:6c27179172ab467bc47115647600e63aec80ab4993298ddb7b5040d91f62689c (3273 bytes)
+== tool calls
+[]
+== run r1's spend facts
+[
+    Object {
+        "auth_selection": Null,
+        "charge_basis": String("unknown"),
+        "charge_basis_mapping_version": Number(1),
+        "charge_basis_overrides": String("none"),
+        "fact_id": String("<normalized>"),
+        "model": String("m"),
+        "occurred_at_ms": String("<normalized>"),
+        "occurred_at_precision": String("terminal"),
+        "pricing_at_ms": String("<normalized>"),
+        "pricing_at_precision": String("exact"),
+        "provider": String("stub"),
+        "retries_used": Number(0),
+        "run_id": String("r1"),
+        "segment_ordinal": Number(0),
+        "session": Object {
+            "harness": String("differential"),
+            "project_root": String("/differential/project"),
+            "session": String("s1"),
+        },
+        "terminal_reason": String("cancelled"),
+        "usage": Object {},
+    },
+]
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
 ]
 == account reports
 [

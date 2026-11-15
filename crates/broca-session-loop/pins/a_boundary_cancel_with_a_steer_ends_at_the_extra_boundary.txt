@@ -8,6 +8,13 @@ sha256:8fd6dbe89b793602a2789d0ee99e3ebb71f0ef3fc53ce1bdae9f0aef9ca24db1 (2491 by
 sha256:637140a9063650aad16ff324f0e49f9506398a2d0dd87da1cb3259be66ac9b6c (5041 bytes)
 == tool calls
 []
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
 == request count
 1
 == request 0
@@ -18,6 +25,13 @@ sha256:8fd6dbe89b793602a2789d0ee99e3ebb71f0ef3fc53ce1bdae9f0aef9ca24db1 (2491 by
 sha256:637140a9063650aad16ff324f0e49f9506398a2d0dd87da1cb3259be66ac9b6c (5041 bytes)
 == tool calls
 []
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
 == request count
 1
 == request 0
@@ -28,6 +42,13 @@ sha256:7c5db1c435975d3c4c0940a54146fb7ff0581371908993fbd6b0bfd9c788b089 (2491 by
 sha256:e22d1ba20d130da06180321d1e98cd98155c8be1ca5e4d304bbb4e7e7ed6042b (5149 bytes)
 == tool calls
 []
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]
 == request count
 1
 == request 0
@@ -38,3 +59,10 @@ sha256:7c5db1c435975d3c4c0940a54146fb7ff0581371908993fbd6b0bfd9c788b089 (2491 by
 sha256:e22d1ba20d130da06180321d1e98cd98155c8be1ca5e4d304bbb4e7e7ed6042b (5149 bytes)
 == tool calls
 []
+== how each run reported
+[
+    (
+        Cancelled,
+        None,
+    ),
+]

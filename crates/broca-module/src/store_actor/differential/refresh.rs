@@ -353,14 +353,14 @@ async fn compared(
     alike!(store_answers, today_answers);
     alike!(store_baselines, today_baselines);
     let (runs, applied) = store_runs(&store).await;
-    assert_eq!(runs, today_runs(&today));
+    alike!(runs, today_runs(&today));
     let frames = today.wal.read_records(&today.key).unwrap();
     let today_applied: Vec<u64> =
         broca_fetch_plan::session_change::SessionChangeState::fold(&frames)
             .applied
             .into_keys()
             .collect();
-    assert_eq!(applied, today_applied);
+    alike!(applied, today_applied);
     (today, store, store_answers, runs)
 }
 
@@ -425,7 +425,7 @@ async fn the_baseline_reports_accepted_pending_and_applied_changes_alike() {
     .await;
     let (_, today_baselines) = drive(&today, &first_plan(), &steps).await;
     let (_, baselines) = drive(&store, &first_plan(), &steps).await;
-    assert_eq!(baselines, today_baselines);
+    alike!(baselines, today_baselines);
     // The baseline the owner read, from its `Ok(<reply JSON>)`.
     let owner = |read: &str| -> Value {
         let owner = read.split(" | ").next().unwrap();
@@ -864,7 +864,7 @@ async fn only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider(
     .await;
     let (today_answers, _) = drive(&today, &first_plan(), &steps).await;
     let (store_answers, _) = drive(&store, &first_plan(), &steps).await;
-    assert_eq!(
+    alike_today_first!(
         today_answers[1],
         format!(
             "{:?}",
