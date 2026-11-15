@@ -125,7 +125,19 @@ impl Rig {
     /// session is sealed once, so it has objects (segments, directory and id-index pages) as well
     /// as a log.
     async fn seed(&self, key: &BindIdentity, records: &[Record], seal: bool) {
-        let backend = LocalBackend::new(self.ephemeral());
+        self.seed_in(StorageClass::Ephemeral, key, records, seal)
+            .await
+    }
+
+    /// [`Rig::seed`], in the root of storage class `class`.
+    async fn seed_in(
+        &self,
+        class: StorageClass,
+        key: &BindIdentity,
+        records: &[Record],
+        seal: bool,
+    ) {
+        let backend = LocalBackend::new(class.store_root(&self.root));
         let mut session = Session::create(&backend, addr(key), triple(key), &deployment(), false)
             .await
             .unwrap();
@@ -662,4 +674,152 @@ async fn a_forks_session_is_deleted_once_its_records_say_it_may_be() {
     for path in rig.folders(&key) {
         assert!(!path.exists(), "{} is left", path.display());
     }
+}
+
+/// The operator deletes a session in either storage class that holds no work, however it was
+/// kept: its head, logs and objects go, and its expiry marker stays, so reads of its runs answer
+/// expired. A session with a run going or paused, a queued send or spend still to export is
+/// refused by what it holds;
+/// one an actor holds open, by its lease; and an address with no session has nothing to delete.
+#[tokio::test]
+async fn the_operator_deletes_a_session_that_holds_no_work() {
+    use crate::retention::store::OperatorDeletion;
+    let rig = Rig::new("operator", Duration::from_secs(600)).await;
+    let billed = || {
+        Record::Billed(broca_session_store::record::Billed {
+            run_id: "r1".into(),
+        })
+    };
+    let finished = [
+        store_start("r1", None, STARTED_MS),
+        store_end("r1", ENDED_MS),
+        billed(),
+    ];
+    let durable = rig.key("durable");
+    let owed = rig.key("owed");
+    let ephemeral = rig.key("ephemeral");
+    let running = rig.key("running");
+    let paused = rig.key("paused");
+    let queued = rig.key("queued");
+    let open = rig.key("open");
+    rig.seed_in(StorageClass::Durable, &durable, &finished, true)
+        .await;
+    rig.seed(&ephemeral, &finished, false).await;
+    rig.seed_in(
+        StorageClass::Durable,
+        &running,
+        &[store_start("r1", None, STARTED_MS)],
+        false,
+    )
+    .await;
+    rig.seed_in(
+        StorageClass::Durable,
+        &paused,
+        &[
+            store_start("r1", None, STARTED_MS),
+            store_paused("r1", ENDED_MS),
+        ],
+        false,
+    )
+    .await;
+    rig.seed_in(
+        StorageClass::Durable,
+        &queued,
+        &[
+            store_start("r1", None, STARTED_MS),
+            store_end("r1", ENDED_MS),
+            billed(),
+            store_queued(None, ENDED_MS),
+        ],
+        false,
+    )
+    .await;
+    rig.seed_in(
+        StorageClass::Durable,
+        &owed,
+        &[
+            store_start("r1", None, STARTED_MS),
+            store_end("r1", ENDED_MS),
+        ],
+        false,
+    )
+    .await;
+    rig.seed_in(StorageClass::Durable, &open, &finished, false)
+        .await;
+    let leases = FileLeaseStore::new(rig.root.join("leases"));
+    let _lease =
+        broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&open)).unwrap();
+    let delete = |key: BindIdentity| {
+        let (service, runtime) = (rig.service.clone(), rig.runtime.clone());
+        async move {
+            service
+                .delete_store_session_for_operator(&runtime, &key, DEADLINE_MS)
+                .await
+                .unwrap()
+        }
+    };
+    let durable_folders: Vec<PathBuf> = ["heads", "logs", "objects"]
+        .into_iter()
+        .map(|folder| {
+            StorageClass::Durable
+                .store_root(&rig.root)
+                .join(folder)
+                .join(addr(&durable).0)
+        })
+        .collect();
+    for path in &durable_folders {
+        assert!(path.exists(), "{} before the deletion", path.display());
+    }
+
+    for key in [&durable, &ephemeral] {
+        assert_eq!(
+            delete(key.clone()).await,
+            OperatorDeletion::Deleted,
+            "{}",
+            key.session
+        );
+        assert!(
+            rig.runtime.class_of(key).unwrap().is_none(),
+            "{}",
+            key.session
+        );
+        assert!(rig.runtime.current_view(key).await.unwrap().is_none());
+        assert_eq!(
+            rig.runtime
+                .expired_at(key, Some("r1"), DEADLINE_MS)
+                .await
+                .unwrap(),
+            Some(DEADLINE_MS),
+            "a read of the deleted run answers expired"
+        );
+        assert_eq!(delete(key.clone()).await, OperatorDeletion::Absent);
+    }
+    for path in &durable_folders {
+        assert!(!path.exists(), "{} is left", path.display());
+    }
+    assert_eq!(
+        delete(running.clone()).await,
+        OperatorDeletion::Busy("a run is active or paused")
+    );
+    assert_eq!(
+        delete(paused.clone()).await,
+        OperatorDeletion::Busy("a run is active or paused")
+    );
+    assert_eq!(
+        delete(queued.clone()).await,
+        OperatorDeletion::Busy("sends are queued")
+    );
+    assert_eq!(
+        delete(owed.clone()).await,
+        OperatorDeletion::Busy("a run's spend is not exported yet")
+    );
+    assert_eq!(delete(open.clone()).await, OperatorDeletion::Held);
+    for key in [&running, &paused, &queued, &owed, &open] {
+        assert!(
+            rig.runtime.class_of(key).unwrap().is_some(),
+            "{} is kept",
+            key.session
+        );
+    }
+    assert_eq!(delete(rig.key("never")).await, OperatorDeletion::Absent);
 }

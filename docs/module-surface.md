@@ -3123,6 +3123,23 @@ since that needs the media delivery a running run's actor holds). A step outside
 current window, behind a later compaction seal, may not rebuild. `broca-session request-dump
 --run-id <id>` calls it with a ten-minute reply budget.
 
+### Deleting a session
+
+`session.delete` (operator only, and not one of the runner role's operations) deletes one
+session kept in the new storage, in either storage class, with or without a retention policy:
+for a session nobody uses any more, such as an import that will be redone. It is deleted as
+retention deletes an expired session: its expiry marker first, so reads of its runs answer
+expired afterwards and a session created later at the same address continues its counters, then
+what a move from today's storage left, then the session's head, logs and objects.
+
+Request: `{}`; the route names the session, and an unknown field is refused `invalid_params`.
+Reply: `{"deleted": true}`, or `{"deleted": false}` when no session is stored there. A session
+holding work a deletion would lose (a run active or paused, a queued send, or spend not yet
+exported) is refused `session_busy`, naming which. One an actor holds open, or a move is
+finishing, is refused `transient`: it can be deleted once its actor closes idle. Another caller
+is refused `operator_required` before anything reads the session; a session today's storage
+keeps is refused `not_served_on_old_storage`. `broca-session delete` calls it.
+
 ### Part number map
 
 `session.tag_map` (operator only: only a direct operator connection may call it, and it is

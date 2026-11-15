@@ -343,6 +343,10 @@ enum Cmd {
         #[arg(long)]
         run_id: String,
     },
+    /// `session.delete`: delete this session from the new storage, when it holds no run, queued
+    /// send or unexported spend. Operator only. Stdout is the reply (`{"result":{"deleted":…}}`)
+    /// or the refusal as the daemon sent it, which exits 1.
+    Delete,
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
     /// Diagnose recorded prompt-cache prefixes without a daemon connection.
@@ -917,6 +921,7 @@ async fn run(args: Args) -> Result<i32, String> {
             | Cmd::EventGet { .. }
             | Cmd::TagMap { .. }
             | Cmd::RequestDump { .. }
+            | Cmd::Delete
     );
     if !raw_output {
         emit(
@@ -1223,6 +1228,28 @@ async fn run(args: Args) -> Result<i32, String> {
             write_raw_reply_to(
                 &body,
                 Some(elapsed_ms),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            Ok(exit)
+        }
+        Cmd::Delete => {
+            // Reading the session to check it holds no work loads its open log.
+            let reply = client
+                .management_raw_with_deadline(
+                    broca_wire::session_delete::OP_SESSION_DELETE,
+                    &serde_json::json!({}),
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                .map_err(|error| format!("delete transport: {error}"))?;
+            let (body, exit) = match reply {
+                Ok(body) => (body, 0),
+                Err(body) => (body, 1),
+            };
+            write_raw_reply_to(
+                &body,
+                None,
                 &mut std::io::stdout().lock(),
                 &mut std::io::stderr().lock(),
             )?;

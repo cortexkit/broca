@@ -60,8 +60,8 @@ use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MEMORY_REPORT,
     OP_MOVE_TO_STORE, OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_REQUEST_DUMP,
     OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET,
-    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS,
-    OP_SUBSCRIBE, OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
+    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_DELETE,
+    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -2931,10 +2931,10 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
-        // Only the operator's own connection reads a session's tag map or its request bodies,
-        // refused before anything reads the session. The refused request is counted, as every
-        // management operation's is.
-        if matches!(method, OP_TAG_MAP | OP_REQUEST_DUMP)
+        // Only the operator's own connection reads a session's tag map or its request bodies, or
+        // deletes a session, refused before anything reads the session. The refused request is
+        // counted, as every management operation's is.
+        if matches!(method, OP_TAG_MAP | OP_REQUEST_DUMP | OP_SESSION_DELETE)
             && !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct))
         {
             count_management_operation(method);
@@ -4083,6 +4083,52 @@ where
                         corr,
                         NOT_SERVED_ON_OLD_STORAGE,
                         "session.request_dump serves sessions kept in the new storage only, and this session is kept on today's storage",
+                    )
+                    .await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        OP_SESSION_DELETE => {
+            // Checked again here so no path reaches the deletion without the operator's own
+            // connection.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.delete is for the operator only",
+                )
+                .await;
+            }
+            if let Err(error) =
+                serde_json::from_value::<broca_wire::session_delete::DeleteParams>(req.params)
+            {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_params",
+                    &error.to_string(),
+                )
+                .await;
+            }
+            match handler.delete_session(session).await {
+                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(None) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        NOT_SERVED_ON_OLD_STORAGE,
+                        "session.delete serves sessions kept in the new storage only, and this session is kept on today's storage",
                     )
                     .await
                 }
@@ -5612,6 +5658,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::Import(_) => "import_rejected".into(),
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
+        ServeError::SessionBusy(_) => "session_busy".into(),
         ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING.into(),
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED.into(),
         ServeError::CursorExpired => "cursor_expired".into(),
@@ -5760,6 +5807,8 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         OP_TAG_MAP => true,
         // Request dumps rebuild a run's requests from the store's records (`store_request_dump`).
         OP_REQUEST_DUMP => true,
+        // Deletion removes a session from the new storage only (`retention_store`).
+        OP_SESSION_DELETE => true,
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
         OP_WARM => true,
@@ -5985,6 +6034,7 @@ async fn send_serve_error(
         ServeError::Import(_) => "import_rejected",
         ServeError::ImportIdReuse => "import_id_reuse",
         ServeError::ImportBusy => "import_busy",
+        ServeError::SessionBusy(_) => "session_busy",
         ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING,
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED,
         ServeError::CursorExpired => "cursor_expired",

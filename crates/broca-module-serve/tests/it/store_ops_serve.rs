@@ -540,6 +540,23 @@ impl Rig {
     }
 
     /// The session is kept in the new storage, and nothing of it is on today's storage.
+    /// Installs retention over the rig's own leases and store, as the module installs it at
+    /// startup: what deletes a session from the new storage.
+    fn install_retention(&self) {
+        let store = Arc::new(broca_store::SqliteStore::open(self.dir.join("store.db")).unwrap());
+        let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
+        self.registry.set_retention_service(Arc::new(
+            broca_module::retention::RetentionService::new(
+                self.wal.clone(),
+                store.clone(),
+                Arc::new(FileLeaseStore::new(self.dir.join("leases"))),
+                store,
+                resolver,
+            )
+            .unwrap(),
+        ));
+    }
+
     fn assert_store_only(&self) {
         assert!(
             broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
@@ -1170,6 +1187,51 @@ async fn request_dump_writes_each_steps_request_for_the_operator_only() {
         .await,
         "invalid_params"
     );
+}
+
+/// `session.delete` reaches the store through the serve path on the operator's own route only.
+/// While the run's actor holds the session open it answers `transient`; once the actor has closed
+/// idle, the session is read, and its run's spend, which this rig never exports, refuses the
+/// deletion `session_busy`, naming it, with the session kept. Another caller is refused before
+/// anything reads the session, as is an option the operation lacks. (The deletion itself is
+/// `retention::store`'s, tested there.)
+#[tokio::test]
+async fn delete_reaches_the_store_for_the_operator_only() {
+    let mut rig = Rig::start_attempting("delete", vec![text_step("a1", "done")]).await;
+    rig.install_retention();
+    rig.send("r1", "first", Some(compacting_plan())).await;
+    rig.assert_store_only();
+
+    rig.bind_session(1, core()).await;
+    assert_eq!(
+        rig.refused(1, "session.delete", json!({})).await,
+        "operator_required"
+    );
+    rig.bind_session(2, Principal::Direct).await;
+    assert_eq!(
+        rig.refused(2, "session.delete", json!({"all": true})).await,
+        "invalid_params"
+    );
+    let mut held = 0;
+    let refusal = loop {
+        let reply = rig
+            .request(2, json!({"method": "session.delete", "params": {}}))
+            .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if body["code"] != "transient" {
+            break body;
+        }
+        held += 1;
+        assert!(held < 200, "the actor never closed idle: {body}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(refusal["code"], "session_busy", "{refusal}");
+    assert_eq!(
+        refusal["message"],
+        "the session can't be deleted: a run's spend is not exported yet"
+    );
+    rig.assert_store_only();
 }
 
 /// `session.tag_map` reaches the store through the serve path on the operator's own route only:

@@ -2362,6 +2362,9 @@ pub enum ServeError {
     ImportIdReuse,
     /// Import cannot run while the lineage actor has an active provider run.
     ImportBusy,
+    /// `session.delete` found work the deletion would lose (named): a run active or paused,
+    /// queued sends, or spend not yet exported. Nothing was deleted.
+    SessionBusy(String),
     /// The owner check refused the send; nothing was written.
     ScopeRefused(broca_core::ScopeRefusal),
     /// The attested caller is not admitted by the plan's reader policy.
@@ -2528,6 +2531,7 @@ impl std::fmt::Display for ServeError {
             ServeError::Import(s) => write!(f, "import rejected: {s}"),
             ServeError::ImportIdReuse => write!(f, "import_id was reused with different content"),
             ServeError::ImportBusy => write!(f, "session has an active run"),
+            ServeError::SessionBusy(message) => f.write_str(message),
             ServeError::ScopeRefused(refusal) => write!(f, "scope refused: {refusal:?}"),
             ServeError::ReadAccessRefused => f.write_str("the session's read policy does not admit this caller"),
             ServeError::ScopeFreezeBusy { reason, run_id } => write!(
@@ -2821,6 +2825,16 @@ pub trait ServeHandler: Send + Sync {
         _session: &LineageKey,
         _run_id: &str,
     ) -> Result<Option<broca_wire::request_dump::RequestDumpResponse>, ServeError> {
+        Ok(None)
+    }
+
+    /// `session.delete`: deletes the session for the operator when it holds no work a deletion
+    /// would lose (see `retention_store`). `None` for a session today's storage keeps, which the
+    /// operation doesn't serve.
+    async fn delete_session(
+        &self,
+        _session: &LineageKey,
+    ) -> Result<Option<broca_wire::session_delete::DeleteResponse>, ServeError> {
         Ok(None)
     }
 
@@ -4275,6 +4289,45 @@ impl ServeHandler for crate::LineageRegistry {
         match self.store_holding(session)? {
             Some(store) => crate::store_request_dump::serve(&store, session, run_id).await,
             None => Ok(None),
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<broca_wire::session_delete::DeleteResponse>, ServeError> {
+        use crate::retention::store::OperatorDeletion;
+        let Some(store) = self.store_holding(session)? else {
+            // No head in the new storage: a session today's storage keeps is refused by name,
+            // and an address holding no session at all has nothing to delete.
+            return match self.wal_written(session) {
+                Some(false) => Ok(Some(broca_wire::session_delete::DeleteResponse {
+                    deleted: false,
+                })),
+                _ => Ok(None),
+            };
+        };
+        let retention = self.handle().retention_service().ok_or_else(|| {
+            ServeError::Transient("retention is not running in this module yet".into())
+        })?;
+        let now_ms = retention.clock.now_ms();
+        match retention
+            .delete_store_session_for_operator(&store, session, now_ms)
+            .await
+            .map_err(|error| ServeError::Open(error, None))?
+        {
+            OperatorDeletion::Deleted => Ok(Some(broca_wire::session_delete::DeleteResponse {
+                deleted: true,
+            })),
+            OperatorDeletion::Absent => Ok(Some(broca_wire::session_delete::DeleteResponse {
+                deleted: false,
+            })),
+            OperatorDeletion::Busy(work) => Err(ServeError::SessionBusy(format!(
+                "the session can't be deleted: {work}"
+            ))),
+            OperatorDeletion::Held => Err(ServeError::Transient(
+                "the session is open or moving; it can be deleted once it closes idle".into(),
+            )),
         }
     }
 

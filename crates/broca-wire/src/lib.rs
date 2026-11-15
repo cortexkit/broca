@@ -10,6 +10,7 @@ pub mod head_import;
 pub mod plan_view;
 pub mod request_dump;
 pub mod role;
+pub mod session_delete;
 pub use role::*;
 pub mod tag_map;
 pub mod warm;

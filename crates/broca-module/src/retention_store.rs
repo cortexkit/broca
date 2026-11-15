@@ -144,6 +144,19 @@ pub(crate) fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Optio
     )))
 }
 
+/// What an operator's deletion of a session in the new storage came to
+/// ([`RetentionService::delete_store_session_for_operator`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OperatorDeletion {
+    Deleted,
+    /// No session is stored at the address.
+    Absent,
+    /// The session holds work a deletion would lose; says which.
+    Busy(&'static str),
+    /// An actor has the session open, holding its lease, or a move is finishing it.
+    Held,
+}
+
 fn described(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
@@ -383,7 +396,121 @@ impl RetentionService {
         if deadline > now_ms {
             return Ok(false);
         }
-        let next_tag = counters::next_tag(&records)?.unwrap_or(1);
+        self.remove_read_session(
+            runtime,
+            backend,
+            addr,
+            key,
+            triple,
+            &view,
+            &records,
+            position.version,
+            deadline,
+        )
+        .await?;
+        tracing::info!(target: "retention", session = %addr.0, expired_at_ms = deadline,
+            "expired session deleted from the new storage");
+        Ok(true)
+    }
+
+    /// Deletes the session `key` at `addr` for the operator, when it holds no work a deletion
+    /// would lose: no run active or paused, no queued send, no spend still to export. It may be
+    /// kept in either storage class, with or without a retention policy. Deletion is
+    /// retention's: the expiry marker first (dated `now_ms`), so reads of its runs answer expired
+    /// and a session created at the address later carries its counter floors, then what a move
+    /// left, then the session. An actor holding the session open holds its lease, so the
+    /// session is refused [`OperatorDeletion::Held`] until it closes idle.
+    pub(crate) async fn delete_store_session_for_operator(
+        &self,
+        runtime: &StoreRuntime,
+        key: &BindIdentity,
+        now_ms: u64,
+    ) -> Result<OperatorDeletion, String> {
+        let state_root = runtime.state_root();
+        let addr = SessionAddr(broca_core::session_addr(key));
+        let Some(class) = broca_wal::session_storage_class(state_root, &addr.0)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(OperatorDeletion::Absent);
+        };
+        if broca_wal::session_storage_move_journal(state_root, &addr.0)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(OperatorDeletion::Held);
+        }
+        let Ok(lease) = self.lease(key) else {
+            return Ok(OperatorDeletion::Held);
+        };
+        let deleting = Deleting::start(&self.store.deleting, key);
+        let backend = LocalBackend::new(class.store_root(state_root));
+        let triple = crate::store_open::triple(key);
+        let deployment = runtime.deployment();
+        let Some(position) = Session::stored_position(&backend, &addr, deployment)
+            .await
+            .map_err(described)?
+        else {
+            return Ok(OperatorDeletion::Absent);
+        };
+        let view = Session::view_at(&backend, addr.clone(), &triple, deployment, &position)
+            .await
+            .map_err(described)?;
+        let operations = &view.operations;
+        if operations
+            .run
+            .as_ref()
+            .is_some_and(|run| run.finished.is_none())
+        {
+            return Ok(OperatorDeletion::Busy("a run is active or paused"));
+        }
+        if !operations.queue.is_empty() {
+            return Ok(OperatorDeletion::Busy("sends are queued"));
+        }
+        if !operations.billing_owed.is_empty() {
+            return Ok(OperatorDeletion::Busy("a run's spend is not exported yet"));
+        }
+        let records = view.records_from(0).await.map_err(described)?;
+        self.remove_read_session(
+            runtime,
+            &backend,
+            &addr,
+            key,
+            &triple,
+            &view,
+            &records,
+            position.version,
+            now_ms,
+        )
+        .await?;
+        // The session left no work, but the set of sessions to recover at startup may still name
+        // it; a startup would find no session there.
+        crate::store_open::recovery_index::remove(&class.store_root(state_root), &addr)
+            .map_err(|error| error.to_string())?;
+        drop(deleting);
+        drop(lease);
+        tracing::info!(target: "retention", session = %addr.0, "session deleted for the operator");
+        Ok(OperatorDeletion::Deleted)
+    }
+
+    /// Deletes the session `key` at `addr`, read as `view` and `records` at head version
+    /// `version`, under its lease: the expiry marker dated `deleted_at_ms`, then what a move from
+    /// today's storage left, then the session, then what the module caches of it.
+    #[allow(clippy::too_many_arguments)]
+    async fn remove_read_session(
+        &self,
+        runtime: &StoreRuntime,
+        backend: &LocalBackend,
+        addr: &SessionAddr,
+        key: &BindIdentity,
+        triple: &SessionTriple,
+        view: &broca_session_store::session::SessionView<&LocalBackend>,
+        records: &[(u64, Record)],
+        version: broca_session_store::backend::Version,
+        deleted_at_ms: u64,
+    ) -> Result<(), String> {
+        let state_root = runtime.state_root();
+        let deployment = runtime.deployment();
+        let next_tag = counters::next_tag(records)?.unwrap_or(1);
         let next_notice_seq = records
             .iter()
             .filter_map(|(_, record)| match record {
@@ -405,7 +532,7 @@ impl RetentionService {
             broca_session_store::expired::Marker {
                 format: 1,
                 triple: triple.clone(),
-                expired_at_ms: deadline,
+                expired_at_ms: deleted_at_ms,
                 seq: 0,
                 next_tag,
                 next_notice_seq,
@@ -426,7 +553,7 @@ impl RetentionService {
             _ => None,
         });
         self.remove_move_leftovers(key, moved)?;
-        Session::delete(backend, addr, position.version)
+        Session::delete(backend, addr, version)
             .await
             .map_err(described)?;
         broca_wal::migration::unlink(&state_root.join("session-store-moves/streams").join(&addr.0))
@@ -446,9 +573,7 @@ impl RetentionService {
             evict(key);
         }
         crate::diagnostics::retention_deleted(key);
-        tracing::info!(target: "retention", session = %addr.0, expired_at_ms = deadline,
-            "expired session deleted from the new storage");
-        Ok(true)
+        Ok(())
     }
 
     /// Removes what the move `move_id` left of the session `key` on today's storage: the retired

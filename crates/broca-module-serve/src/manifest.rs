@@ -45,6 +45,9 @@ pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
 /// to. Only the operator calls it, through `broca-session tag-map`; it is outside the runner role.
 pub const OP_TAG_MAP: &str = broca_wire::tag_map::OP_SESSION_TAG_MAP;
 pub const OP_REQUEST_DUMP: &str = broca_wire::request_dump::OP_SESSION_REQUEST_DUMP;
+/// Deletes one session kept in the new storage that holds no work; operator only, outside the
+/// runner role.
+pub const OP_SESSION_DELETE: &str = broca_wire::session_delete::OP_SESSION_DELETE;
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
 pub const OP_RUN_ADMISSION: &str = "run.admission";
@@ -253,6 +256,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: Some(
                 "Rebuild the request each step of one run of a session kept in the new storage sent, and write the bodies that match their recorded digests to a private folder under the state root; operator only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_SESSION_DELETE.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Delete one session kept in the new storage that holds no run, queued send or unexported spend, as retention deletes an expired session; operator only."
                     .to_string(),
             ),
         },
