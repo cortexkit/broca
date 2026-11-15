@@ -187,6 +187,7 @@ async fn scale_gate_imported_head() {
     ));
 
     let installed = View::seal(1, vec![Edit::new(1, EditOp::Cut { through })]);
+    eprintln!("scale gate: installing the view");
     let started = Instant::now();
     let outcome = module
         .registry

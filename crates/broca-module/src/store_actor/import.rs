@@ -517,25 +517,93 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Whether `view` fits the session's history as a compaction provider reads it: each
     /// message, part and anchor it names is one the history holds. The refusal names what
     /// doesn't fit.
+    ///
+    /// Only what the view can reach is read and projected: the entries its edits name, the
+    /// entries after its cut, and back from the cut to the nearest entry with a numbered part,
+    /// which [`cut_marker`] takes its numbering from. Everything else before the cut is dropped
+    /// unseen, as it is when a step plans the view over its window. Projecting the whole history
+    /// instead hashed every part of an imported history with hundreds of thousands of messages,
+    /// about 12 s for 398k.
     async fn fits_history(
         &self,
         view: &broca_core::compaction_v2::protocol::view::View,
     ) -> Result<Vec<broca_core::compaction_v2::protocol::read::Entry>, String> {
-        let placed = self.session.conversation.placed;
-        let stored = self
-            .session
-            .entries(1, placed as usize)
-            .await
-            .map_err(|error| format!("the imported history could not be read: {error:?}"))?;
-        let entries = stored
+        use broca_core::compaction_v2::protocol::view::{EditOp, InsertAt};
+        let read_error = |error| format!("the imported history could not be read: {error:?}");
+        let project = |stored: &[broca_session_store::session::StoredEntry]| {
+            stored
+                .iter()
+                .map(broca_session_loop::entries::project)
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let named: Vec<String> = view
+            .edits
             .iter()
-            .map(broca_session_loop::entries::project)
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|edit| match &edit.op {
+                EditOp::Drop { mid, .. } | EditOp::Replace { mid, .. } => Some(mid.clone()),
+                EditOp::Cut { through } => Some(through.clone()),
+                EditOp::Insert {
+                    at: InsertAt::Before(mid),
+                    ..
+                } => Some(mid.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut entries = project(
+            &self
+                .session
+                .entries_by_mid(&named)
+                .await
+                .map_err(read_error)?,
+        )?;
+        let cut = view.edits.iter().find_map(|edit| match &edit.op {
+            EditOp::Cut { through } => entries
+                .iter()
+                .find(|entry| &entry.mid == through)
+                .map(|entry| entry.ordinal),
+            _ => None,
+        });
+        let kept_from = cut.map_or(1, |ordinal| ordinal + 1);
+        let placed = self.session.conversation.placed;
+        if let Some(cut) = cut {
+            // Part numbers only grow with the history, so the nearest numbered entry at or
+            // before the cut holds the highest number the cut drops.
+            let mut before = cut;
+            while before > 1
+                && !entries.iter().any(|entry| {
+                    entry.ordinal <= cut && entry.parts.iter().any(|p| p.tag.is_some())
+                })
+            {
+                let from = before.saturating_sub(NUMBERED_LOOKBACK).max(1);
+                let read = self
+                    .session
+                    .entries(from, (before - from) as usize)
+                    .await
+                    .map_err(read_error)?;
+                entries.extend(project(&read)?);
+                before = from;
+            }
+        }
+        entries.retain(|entry| entry.ordinal < kept_from);
+        if kept_from <= placed {
+            let kept = self
+                .session
+                .entries(kept_from, (placed + 1 - kept_from) as usize)
+                .await
+                .map_err(read_error)?;
+            entries.extend(project(&kept)?);
+        }
+        entries.sort_by_key(|entry| entry.ordinal);
+        entries.dedup_by_key(|entry| entry.ordinal);
         cortexkit_compaction_view::render::plan(&entries, &view.edits)
             .map_err(|refusal| format!("the view doesn't fit the imported history: {refusal:?}"))?;
         Ok(entries)
     }
 }
+
+/// How many entries [`StoreActor::fits_history`] reads back at a time from a cut whose own
+/// entry has no numbered part.
+const NUMBERED_LOOKBACK: u64 = 64;
 
 /// The marker of `view`'s cut over `entries`, the session's compaction entries in order: the
 /// entry after the one the cut goes through is the first kept, and the provider's numbering
