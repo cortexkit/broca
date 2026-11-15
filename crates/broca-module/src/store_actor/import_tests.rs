@@ -1747,12 +1747,13 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
             ),
         ],
     ));
-    run_once(
+    let third = run_once_with(
         &mut session,
         &mut parts,
         &cutter,
         ("r3", "m3"),
         "Question 7.",
+        true,
     )
     .await;
     assert_eq!(
@@ -1765,6 +1766,12 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
         .await
         .unwrap();
     assert_eq!(as_read(&rebuilt.opts), as_read(&first));
+    // A step after that seal ran in the log the seal opened, which starts with whole copies of the
+    // views its stored views were changes against; its history holds both.
+    let rebuilt = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r3", 1)
+        .await
+        .unwrap();
+    assert_eq!(as_read(&rebuilt.opts), as_read(&third));
 }
 
 /// The compaction provider's view names imported messages by their source ids. Installed, it applies at

@@ -136,30 +136,30 @@ async fn rebuild<W: Writer>(
             |(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id),
         )
         .ok_or("the recorded run's start is outside the readable history")?;
-    // As of the step, every ledger record before it is folded, and the compaction views come
-    // from those records too. A seal's change records mark where one log closed and the next
-    // began, which a fold over records read across logs skips; and a seal carries a copy of the
-    // compaction records into the log it opens, which this history holds beside the originals.
+    // As of the step, every ledger record before it is folded into the session's state, and the
+    // compaction views come from the ledger of the log the step ran in, as the live session read
+    // them. A seal opens its new log with whole copies of the views it names (a stored view is a
+    // change against the views before it): the applied view, the record applying it, then a
+    // newer accepted view if there is one. This history holds those copies beside the originals,
+    // and folding both would take a view again after a newer one. Views only grow newer within
+    // one log, so a view no newer than the newest before it in its log is a copy that starts the
+    // next log. A seal's change records mark where one log closed, which this fold skips.
     let (fold_from, ledger) = if as_of {
-        let mut compaction: Vec<&Record> = Vec::new();
-        let ledger: Vec<(u64, Record)> = records[..=attempt_at]
+        let mut log_start = 0;
+        let mut newest_in_log: Option<u64> = None;
+        for (at, (_, record)) in records[..=attempt_at].iter().enumerate() {
+            if let Record::View(view) = record {
+                if newest_in_log.is_some_and(|newest| view.version <= newest) {
+                    log_start = at;
+                }
+                newest_in_log = Some(view.version);
+            }
+        }
+        let ledger: Vec<(u64, Record)> = records[log_start..=attempt_at]
             .iter()
             .filter(|(_, record)| {
-                if record.stream() != Stream::Ledger
-                    || matches!(record, Record::ChangeIntent(_) | Record::ChangeAborted(_))
-                {
-                    return false;
-                }
-                if matches!(
-                    record,
-                    Record::View(_) | Record::ViewApplied(_) | Record::Marker(_)
-                ) {
-                    if compaction.contains(&record) {
-                        return false;
-                    }
-                    compaction.push(record);
-                }
-                true
+                record.stream() == Stream::Ledger
+                    && !matches!(record, Record::ChangeIntent(_) | Record::ChangeAborted(_))
             })
             .cloned()
             .collect();
