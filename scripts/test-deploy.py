@@ -104,9 +104,10 @@ if name == "place" and "--report" in args:
     backup = home / "rollback copy"
     backup.write_bytes(b"previous release")
     pathlib.Path(args[args.index("--report")+1]).write_text(json.dumps({
-        "backup": str(backup), "pid": "4321", "sessions_at_restart": ["session.wal"],
+        "backup": str(backup), "pid": "4321", "sessions_at_restart": ["a1b2c3d4e5f60718"],
+        "active_runs_at_restart": [{"session": "a1b2c3d4e5f60718", "run_id": "run-before"}],
         "client_backups": {client: str(home / (client + ".rollback")) for client in ("broca-session",)},
-        "sessions_sealed": ["session.wal"], "sessions_unconfirmed": [], "seal_error": ""}))
+        "sessions_resumed": ["a1b2c3d4e5f60718"], "sessions_unconfirmed": [], "seal_error": ""}))
 if name == "publish":
     pathlib.Path(os.environ["TAG_WHEN_GREEN_LOG"]).write_text("background CI\n")
 if name == "accept" and os.environ.get("WARMING_ACCEPTS"):
@@ -363,7 +364,8 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertEqual(records["publish"], [self.sha, "0.0.2"])
         self.assert_metadata_log(result, 0)
         self.assertIn("pid        4321", result.stdout)
-        self.assertIn("sessions sealed at restart (WAL readback): session.wal", result.stdout)
+        self.assertIn("runs live at restart: 1", result.stdout)
+        self.assertIn("resumed after the restart: a1b2c3d4e5f60718", result.stdout)
         self.assertIn("acceptance direct: PASS; worker: PASS; scoped: PASS", result.stdout)
         self.assertIn("CI log", result.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")

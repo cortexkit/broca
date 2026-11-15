@@ -1,128 +1,94 @@
 #!/usr/bin/env python3
-"""Verify per-run shutdown readback against framed WAL records."""
+"""What became of a run live at a restart, read from its export facts and the daemon's runs."""
 from __future__ import annotations
 
-import hashlib
 import json
 import pathlib
-import struct
+import sqlite3
 import sys
 import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from lib.seal_readback import (
+from lib.seal_readback import (  # noqa: E402
     CALLER_CANCELLED,
     CANCELLED,
+    FINISHED,
     PAUSED,
+    RESUMED,
     SEALED,
     UNCONFIRMED,
-    active_run_id,
     classify_run,
+    run_facts,
 )
 
-
-def frame(seq: int, record: dict) -> bytes:
-    payload = json.dumps(record, separators=(",", ":")).encode()
-    version, fence = 1, 1
-    digest = hashlib.sha256(
-        bytes((version,)) + struct.pack("<Q", seq) + struct.pack("<Q", fence) + payload
-    ).digest()
-    return struct.pack("<IBQQ", len(payload), version, seq, fence) + digest + payload
+DRAIN = 1_000
 
 
-class SealReadbackTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(prefix="place-release-seal-")
-        self.addCleanup(self.tmp.cleanup)
-        self.wal = pathlib.Path(self.tmp.name) / "session.wal"
+def fact(reason: str | None, at: int = DRAIN + 5) -> dict:
+    return {"terminal_reason": reason, "occurred_at_ms": at}
 
-    def write_records(self, *records: dict) -> None:
-        self.wal.write_bytes(b"".join(frame(seq, record) for seq, record in enumerate(records, 1)))
 
-    def test_a_revived_session_seals_the_run_that_was_live_at_restart(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-before"},
-            {"type": "step_started"},
-            {"type": "run_finished", "reason": "interrupted"},
-            {"type": "run_started", "run_id": "run-after"},
-            {"type": "step_started"},
-        )
-        self.assertEqual(classify_run(self.wal, "run-before"), SEALED)
-        self.assertEqual(active_run_id(self.wal), "run-after")
+def classify(facts: list[dict], *, live: set[str] = frozenset(), drain: int | None = DRAIN) -> str:
+    return classify_run(facts, "run-1", drain_started_ms=drain, live_after=set(live))
 
-    def test_a_live_run_without_a_terminal_is_unconfirmed(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-open"},
-            {"type": "step_started"},
-        )
-        self.assertEqual(active_run_id(self.wal), "run-open")
-        self.assertEqual(classify_run(self.wal, "run-open"), UNCONFIRMED)
 
-    def test_a_cancelled_terminal_is_classified_as_failure(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-cancelled"},
-            {"type": "run_finished", "reason": "cancelled"},
-        )
-        self.assertEqual(classify_run(self.wal, "run-cancelled"), CANCELLED)
+class ClassifyTests(unittest.TestCase):
+    def test_a_run_running_again_resumed(self):
+        self.assertEqual(classify([fact(None)], live={"run-1"}), RESUMED)
 
-    def test_a_cancel_before_the_drain_cutoff_is_a_caller_cancel(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-held"},
-            {"type": "run_paused", "reason": "tool_held", "ts_ms": 1000},
-            {"type": "run_finished", "reason": "cancelled", "ts_ms": 1999},
-            {"type": "run_started", "run_id": "run-after"},
-            {"type": "run_finished", "reason": "cancelled", "ts_ms": 2001},
-        )
-        self.assertEqual(classify_run(self.wal, "run-held", drain_started_ms=2000), CALLER_CANCELLED)
+    def test_an_interrupted_end_is_sealed(self):
+        self.assertEqual(classify([fact(None), fact("interrupted")]), SEALED)
 
-    def test_a_cancel_at_or_after_the_drain_cutoff_is_a_failure(self) -> None:
-        for timestamp in (2000, 2001):
-            with self.subTest(timestamp=timestamp):
-                self.write_records(
-                    {"type": "run_started", "run_id": "run-cancelled"},
-                    {"type": "run_finished", "reason": "cancelled", "ts_ms": timestamp},
-                )
-                self.assertEqual(classify_run(self.wal, "run-cancelled", drain_started_ms=2000), CANCELLED)
+    def test_a_normal_end_finished(self):
+        for reason in ("completed", "error", "max_steps", "budget_exhausted", "context_ceiling"):
+            with self.subTest(reason=reason):
+                self.assertEqual(classify([fact(reason)]), FINISHED)
 
-    def test_a_cancel_without_a_valid_timestamp_stays_a_failure(self) -> None:
-        for timestamp in ({}, {"ts_ms": None}, {"ts_ms": True}, {"ts_ms": "1999"}):
-            with self.subTest(timestamp=timestamp):
-                self.write_records(
-                    {"type": "run_started", "run_id": "run-cancelled"},
-                    {"type": "run_finished", "reason": "cancelled", **timestamp},
-                )
-                self.assertEqual(classify_run(self.wal, "run-cancelled", drain_started_ms=2000), CANCELLED)
+    def test_a_pause_not_running_is_paused(self):
+        self.assertEqual(classify([fact(None)]), PAUSED)
 
-    def test_auth_pause_does_not_confirm_a_restart_seal(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-auth-paused"},
-            {"type": "run_paused", "reason": "auth_required"},
-            {"type": "resume_started"},
-            {"type": "step_started"},
-        )
-        self.assertEqual(classify_run(self.wal, "run-auth-paused"), UNCONFIRMED)
+    def test_no_facts_and_not_running_is_unconfirmed(self):
+        self.assertEqual(classify([]), UNCONFIRMED)
 
-    def test_a_run_still_paused_on_a_held_tool_is_paused_not_unconfirmed(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-held"},
-            {"type": "step_started"},
-            {"type": "run_paused", "reason": "tool_held"},
-        )
-        self.assertEqual(active_run_id(self.wal), "run-held")
-        self.assertEqual(classify_run(self.wal, "run-held"), PAUSED)
+    def test_a_cancel_after_the_drain_began_is_the_drain_s(self):
+        self.assertEqual(classify([fact("cancelled", DRAIN)]), CANCELLED)
 
-    def test_restart_pause_then_resume_counts_as_sealed(self) -> None:
-        self.write_records(
-            {"type": "run_started", "run_id": "run-paused"},
-            {"type": "run_paused", "reason": "restart"},
-            {"type": "resume_started"},
-            {"type": "step_started"},
-        )
-        self.assertEqual(classify_run(self.wal, "run-paused"), SEALED)
-        self.assertEqual(active_run_id(self.wal), "run-paused")
+    def test_a_cancel_strictly_before_the_drain_is_the_caller_s(self):
+        self.assertEqual(classify([fact("cancelled", DRAIN - 1)]), CALLER_CANCELLED)
+
+    def test_a_cancel_without_a_time_or_drain_is_the_drain_s(self):
+        self.assertEqual(classify([{"terminal_reason": "cancelled"}]), CANCELLED)
+        self.assertEqual(classify([fact("cancelled", DRAIN - 1)], drain=None), CANCELLED)
+
+    def test_the_last_end_decides(self):
+        self.assertEqual(classify([fact("cancelled", DRAIN - 1), fact("interrupted")]), SEALED)
+
+
+class RunFactsTests(unittest.TestCase):
+    def test_facts_come_back_in_write_order_for_that_run_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = pathlib.Path(tmp) / "run-index.db"
+            connection = sqlite3.connect(db)
+            connection.execute(
+                "CREATE TABLE export_facts (export_seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "fact_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL, segment_json TEXT NOT NULL)")
+            rows = [("f1", "run-1", fact(None)), ("f2", "run-2", fact("completed")),
+                    ("f3", "run-1", fact("interrupted"))]
+            for fact_id, run_id, segment in rows:
+                connection.execute("INSERT INTO export_facts (fact_id, run_id, segment_json) "
+                                   "VALUES (?, ?, ?)", (fact_id, run_id, json.dumps(segment)))
+            connection.commit()
+            connection.close()
+            self.assertEqual(run_facts(db, "run-1"), [fact(None), fact("interrupted")])
+            self.assertEqual(run_facts(db, "run-3"), [])
+
+    def test_a_missing_index_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(sqlite3.OperationalError):
+                run_facts(pathlib.Path(tmp) / "run-index.db", "run-1")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

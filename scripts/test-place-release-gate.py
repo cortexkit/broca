@@ -27,7 +27,6 @@ import hashlib
 import importlib.util
 import json
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -46,15 +45,6 @@ ROOT = Path(__file__).resolve().parents[1]
 FAKE_CK_HEALTH = '#!/bin/sh\n[ "$1 $2 $3" = "--json health broca" ] && { echo "{}"; exit 0; }\n'
 PLACE = ROOT / "scripts" / "place-release.sh"
 VERIFY = ROOT / "scripts" / "verify-deploy.sh"
-
-
-def wal_frame(seq: int, record: dict) -> bytes:
-    payload = json.dumps(record, separators=(",", ":")).encode()
-    version, fence = 1, 1
-    digest = hashlib.sha256(
-        bytes((version,)) + struct.pack("<Q", seq) + struct.pack("<Q", fence) + payload
-    ).digest()
-    return struct.pack("<IBQQ", len(payload), version, seq, fence) + digest + payload
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "native Linux /proc and ELF tests")
@@ -400,9 +390,9 @@ int main(int argc, char **argv) {
                 self.assertIsNone(supervisor.poll(), log.read_text())
                 time.sleep(0.1)
             self.assertTrue(old_pid, log.read_text())
-            # Empty WALs have no open run, but ensure the live-run gate really scans a root.
-            (self.state / "wal").mkdir(exist_ok=True)
-            (self.state / "wal/deploy-control.wal").touch()
+            # The live-run gate asks the running daemon through the client installed beside it, so
+            # that client must be the real one built with this broca.
+            shutil.copy2(Path(built).with_name("broca-session"), self.dest.parent / "broca-session")
 
             # Run the script's publication sequence, without its clean-tag build prerequisite.
             # The input is the real release ELF built by the caller, not a synthetic tool stub.
@@ -749,119 +739,150 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         return dict(PLACE_RELEASE_CK=str(ck), BROCA_TEST_BIN=str(self.dest),
                     PLACE_RELEASE_WAIT_SECONDS="0", PLACE_RELEASE_POLL_SECONDS="0")
 
-    def test_live_approved_logs_approver_keeps_rollback_and_waits_for_new_image(self):
+    def fact_writer(self) -> str:
+        """Python source a fake `ck` runs to write export facts the way a run's end writes them."""
+        return textwrap.dedent(f'''
+            import json, sqlite3, time
+            def write_fact(run_id, reason, occurred_ms=None):
+                db = sqlite3.connect({str(self.state / "run-index.db")!r})
+                db.execute("CREATE TABLE IF NOT EXISTS export_facts (export_seq INTEGER PRIMARY KEY "
+                           "AUTOINCREMENT, fact_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL, "
+                           "segment_json TEXT NOT NULL)")
+                occurred = occurred_ms if occurred_ms is not None else time.time_ns() // 1_000_000
+                fact = {{"run_id": run_id, "terminal_reason": reason, "occurred_at_ms": occurred}}
+                db.execute("INSERT INTO export_facts (fact_id, run_id, segment_json) VALUES (?, ?, ?)",
+                           (f"{{run_id}}:{{occurred}}:{{reason}}", run_id, json.dumps(fact)))
+                db.commit()
+                db.close()
+        ''')
+
+    def gate(self, before: list[tuple[str, str]], after: list[tuple[str, str]]) -> str:
+        """A gate command naming `before` runs until the restart and `after` runs once it ran."""
+        def lines(runs: list[tuple[str, str]]) -> str:
+            listed = "".join(f'echo "  live  {session}  {run}  head"; ' for session, run in runs)
+            return f'echo "live runs          {len(runs)}"; {listed}exit {1 if runs else 0}'
+        return f'if [ -f "{self.tmp / "restarted"}" ]; then {lines(after)}; else {lines(before)}; fi'
+
+    def test_live_approved_logs_approver_keeps_rollback_and_reads_back_each_run(self):
         env = self.restart_fixture()
         report = self.tmp / "report.json"
-        wal = self.state / "wal"
-        wal.mkdir()
-        session = wal / "session.wal"
-        unsealed = wal / "unsealed.wal"
-        finished = wal / "finished.wal"
-        session.write_bytes(
-            wal_frame(1, {"type": "run_started", "run_id": "run-before"})
-            + wal_frame(2, {"type": "step_started"})
-        )
-        # Listed by recent writes, but its last run had already finished: nothing to seal.
-        finished.write_bytes(
-            wal_frame(1, {"type": "run_started", "run_id": "run-done"})
-            + wal_frame(2, {"type": "run_finished", "reason": "completed"})
-        )
-        unsealed.write_bytes(
-            wal_frame(1, {"type": "run_started", "run_id": "run-open"})
-            + wal_frame(2, {"type": "step_started"})
-        )
-        restart_records = self.tmp / "restart-records.wal"
-        restart_records.write_bytes(
-            wal_frame(3, {"type": "run_finished", "reason": "interrupted"})
-            + wal_frame(4, {"type": "run_started", "run_id": "run-after"})
-            + wal_frame(5, {"type": "step_started"})
-        )
-        restarted = self.tmp / "restarted"
         ck = Path(env["PLACE_RELEASE_CK"])
-        ck.write_text(FAKE_CK_HEALTH + f'cat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
+        ck.write_text(f'''#!/usr/bin/env python3
+import pathlib, sys
+{self.fact_writer()}
+if sys.argv[1:] == ["--json", "health", "broca"]:
+    print("{{}}")
+    raise SystemExit(0)
+# The drain pauses the head that resumes, seals one run and lets one finish; the fourth run's
+# outcome never lands.
+write_fact("run-resumed", None)
+write_fact("run-sealed", "interrupted")
+write_fact("run-done", "completed")
+pathlib.Path({str(self.tmp / "restarted")!r}).touch()
+''')
         ck.chmod(0o755)
+        before = [("a1", "run-resumed"), ("a2", "run-sealed"), ("a3", "run-open"), ("a4", "run-done")]
         result = self.place("--restart", "--live-approved", "--report", str(report),
-                            PLACE_RELEASE_GATE_CMD='echo "live runs          3"; echo "  live  session.wal  last write 0s ago"; echo "  live  unsealed.wal  last write 0s ago"; echo "  live  finished.wal  last write 0s ago"; exit 1', **env)
+                            PLACE_RELEASE_GATE_CMD=self.gate(before, [("a1", "run-resumed")]),
+                            PLACE_RELEASE_RESUME_WAIT_SECONDS="0", **env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("live restart approved by " + subprocess.check_output(["id", "-un"], text=True).strip(), result.stdout)
         self.assertIn("live runs accepted immediately before restart", result.stdout)
         self.assertIn("(pid 4243)", result.stdout)
         data = json.loads(report.read_text())
         self.assertEqual(data["pid"], "4243")
-        self.assertEqual(data["sessions_at_restart"], ["session.wal", "unsealed.wal", "finished.wal"])
-        self.assertEqual(data["active_runs_at_restart"], [
-            {"session": "session.wal", "run_id": "run-before"},
-            {"session": "unsealed.wal", "run_id": "run-open"},
-            {"session": "finished.wal", "run_id": None, "no_open_run": True},
-        ])
-        self.assertEqual(data["sessions_sealed"], ["session.wal"])
-        self.assertEqual(data["sessions_unconfirmed"], ["unsealed.wal"])
-        self.assertEqual(data["sessions_idle"], ["finished.wal"])
-        self.assertEqual(data["sessions_cancelled"], [])
-        self.assertEqual(data["runs_sealed"], [{"session": "session.wal", "run_id": "run-before"}])
-        self.assertEqual(data["runs_unconfirmed"], [{"session": "unsealed.wal", "run_id": "run-open"}])
+        self.assertEqual(data["sessions_at_restart"], ["a1", "a2", "a3", "a4"])
+        self.assertEqual(data["active_runs_at_restart"],
+                         [{"session": session, "run_id": run} for session, run in before])
+        self.assertEqual(data["runs_resumed"], [{"session": "a1", "run_id": "run-resumed"}])
+        self.assertEqual(data["runs_sealed"], [{"session": "a2", "run_id": "run-sealed"}])
+        self.assertEqual(data["runs_unconfirmed"], [{"session": "a3", "run_id": "run-open"}])
+        self.assertEqual(data["runs_finished"], [{"session": "a4", "run_id": "run-done"}])
+        self.assertEqual(data["runs_cancelled"], [])
         self.assertEqual(data["seal_error"], "")
         self.assertEqual(Path(data["backup"]).read_bytes(), self.deployed_bytes)
         self.assertTrue(Path(data["backup"] + ".sha256").exists())
 
+    def test_a_paused_run_is_read_again_until_it_resumes(self):
+        env = self.restart_fixture()
+        report = self.tmp / "report.json"
+        asked = self.tmp / "asked-after-restart"
+        ck = Path(env["PLACE_RELEASE_CK"])
+        ck.write_text(f'''#!/usr/bin/env python3
+import pathlib, sys
+{self.fact_writer()}
+if sys.argv[1:] == ["--json", "health", "broca"]:
+    print("{{}}")
+    raise SystemExit(0)
+write_fact("run-held", None)
+pathlib.Path({str(self.tmp / "restarted")!r}).touch()
+''')
+        ck.chmod(0o755)
+        # The restarted daemon lists the run only from its second answer, as it does once its
+        # storage key has loaded.
+        restarted = self.tmp / "restarted"
+        gate = (f'if [ -f "{restarted}" ]; then if [ -f "{asked}" ]; then '
+                f'echo "live runs          1"; echo "  live  a1  run-held  head"; exit 1; '
+                f'else touch "{asked}"; echo "live runs          0"; exit 0; fi; '
+                f'else echo "live runs          1"; echo "  live  a1  run-held  head"; exit 1; fi')
+        result = self.place("--restart", "--live-approved", "--report", str(report),
+                            PLACE_RELEASE_GATE_CMD=gate, PLACE_RELEASE_RESUME_WAIT_SECONDS="30", **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(report.read_text())
+        self.assertEqual(data["runs_resumed"], [{"session": "a1", "run_id": "run-held"}])
+        self.assertEqual(data["runs_paused"], [])
+
+    def test_a_gate_line_without_a_run_id_reads_unconfirmed_with_its_reason(self):
+        env = self.restart_fixture()
+        report = self.tmp / "report.json"
+        result = self.place("--restart", "--live-approved", "--report", str(report),
+                            PLACE_RELEASE_GATE_CMD=self.gate([("a1", "?")], []),
+                            PLACE_RELEASE_RESUME_WAIT_SECONDS="0", **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(report.read_text())
+        self.assertEqual(data["runs_unconfirmed"], [{"session": "a1", "run_id": None}])
+        self.assertIn("a1: the gate named no run id", data["seal_error"])
+
     def test_shutdown_cancelled_terminal_is_reported_as_a_loud_failure(self):
         env = self.restart_fixture()
         report = self.tmp / "report.json"
-        wal = self.state / "wal"
-        wal.mkdir()
-        session = wal / "session.wal"
-        session.write_bytes(
-            wal_frame(1, {"type": "run_started", "run_id": "run-cancelled"})
-            + wal_frame(2, {"type": "step_started"})
-        )
-        restart_records = self.tmp / "restart-records.wal"
-        restart_records.write_bytes(wal_frame(3, {"type": "run_finished", "reason": "cancelled"}))
-        restarted = self.tmp / "restarted"
         ck = Path(env["PLACE_RELEASE_CK"])
-        ck.write_text(FAKE_CK_HEALTH + f'cat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
+        ck.write_text(f'''#!/usr/bin/env python3
+import pathlib, sys
+{self.fact_writer()}
+if sys.argv[1:] == ["--json", "health", "broca"]:
+    print("{{}}")
+    raise SystemExit(0)
+write_fact("run-cancelled", "cancelled")
+pathlib.Path({str(self.tmp / "restarted")!r}).touch()
+''')
         ck.chmod(0o755)
-
         result = self.place(
             "--restart", "--live-approved", "--report", str(report),
-            PLACE_RELEASE_GATE_CMD='echo "live runs          1"; echo "  live  session.wal  last write 0s ago"; exit 1',
-            **env,
+            PLACE_RELEASE_GATE_CMD=self.gate([("a1", "run-cancelled")], []),
+            PLACE_RELEASE_RESUME_WAIT_SECONDS="0", **env,
         )
-
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("FAILURE", result.stderr)
-        self.assertIn("cancelled", result.stderr)
+        self.assertIn("FAILURE -- shutdown drain cancelled run run-cancelled", result.stderr)
         data = json.loads(report.read_text())
-        self.assertEqual(data["sessions_cancelled"], ["session.wal"])
-        self.assertEqual(data["runs_cancelled"], [{"session": "session.wal", "run_id": "run-cancelled"}])
+        self.assertEqual(data["sessions_cancelled"], ["a1"])
+        self.assertEqual(data["runs_cancelled"], [{"session": "a1", "run_id": "run-cancelled"}])
 
     def cancelled_restart_report(self, *, before_restart):
         env = self.restart_fixture()
-        env["HOME"] = str(self.tmp / "home")
         report = self.tmp / "report.json"
-        wal = self.state / "wal"
-        wal.mkdir()
-        session = wal / "session.wal"
-        session.write_bytes(
-            wal_frame(1, {"type": "run_started", "run_id": "run-held"})
-            + wal_frame(2, {"type": "step_started"})
-            + wal_frame(3, {"type": "run_paused", "reason": "tool_held"})
-        )
         timing = self.tmp / "timing.json"
         ck = Path(env["PLACE_RELEASE_CK"])
         ck.write_text(f'''#!/usr/bin/env python3
-import hashlib, json, pathlib, struct, sys, time
-session = pathlib.Path({str(session)!r})
+import json, pathlib, sys, time
+{self.fact_writer()}
 timing = pathlib.Path({str(timing)!r})
 before_restart = {before_restart!r}
 
 def cancel():
     # Use the previous millisecond for the caller cancel, so equal clock ticks cannot race.
     timestamp = time.time_ns() // 1_000_000 - int(before_restart)
-    record = {{"type": "run_finished", "reason": "cancelled", "ts_ms": timestamp}}
-    payload = json.dumps(record, separators=(",", ":")).encode()
-    header = struct.pack("<BQQ", 1, 4, 1)
-    with session.open("ab") as output:
-        output.write(struct.pack("<I", len(payload)) + header + hashlib.sha256(header + payload).digest() + payload)
+    write_fact("run-held", "cancelled", timestamp)
     timing.write_text(json.dumps({{"finished_ms": timestamp}}))
 
 if sys.argv[1:] == ["--json", "health", "broca"]:
@@ -881,8 +902,8 @@ else:
         ck.chmod(0o755)
         result = self.place(
             "--restart", "--live-approved", "--report", str(report),
-            PLACE_RELEASE_GATE_CMD='echo "live runs          1"; echo "  live  session.wal  last write 0s ago"; exit 1',
-            **env,
+            PLACE_RELEASE_GATE_CMD=self.gate([("a1", "run-held")], []),
+            PLACE_RELEASE_RESUME_WAIT_SECONDS="0", **env,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result, json.loads(report.read_text()), json.loads(timing.read_text())
@@ -890,11 +911,10 @@ else:
     def test_a_caller_cancel_between_snapshot_and_restart_is_not_a_drain_failure(self):
         result, data, timing = self.cancelled_restart_report(before_restart=True)
         self.assertNotIn("FAILURE", result.stderr)
-        self.assertEqual(data["active_runs_at_restart"], [{"session": "session.wal", "run_id": "run-held"}])
-        self.assertEqual(data["runs_caller_cancelled"], [{"session": "session.wal", "run_id": "run-held"}])
-        self.assertEqual(data["sessions_caller_cancelled"], ["session.wal"])
+        self.assertEqual(data["active_runs_at_restart"], [{"session": "a1", "run_id": "run-held"}])
+        self.assertEqual(data["runs_caller_cancelled"], [{"session": "a1", "run_id": "run-held"}])
+        self.assertEqual(data["sessions_caller_cancelled"], ["a1"])
         self.assertEqual(data["runs_cancelled"], [])
-        self.assertEqual(data["sessions_cancelled"], [])
         self.assertEqual(data["seal_error"], "")
         self.assertLess(timing["finished_ms"], data["drain_started_ms"])
         self.assertLessEqual(data["drain_started_ms"], timing["restart_signal_ms"])
@@ -902,8 +922,8 @@ else:
     def test_a_cancel_after_the_restart_signal_is_still_a_drain_failure(self):
         result, data, timing = self.cancelled_restart_report(before_restart=False)
         self.assertIn("FAILURE -- shutdown drain cancelled run run-held", result.stderr)
-        self.assertEqual(data["runs_cancelled"], [{"session": "session.wal", "run_id": "run-held"}])
-        self.assertEqual(data["sessions_cancelled"], ["session.wal"])
+        self.assertEqual(data["runs_cancelled"], [{"session": "a1", "run_id": "run-held"}])
+        self.assertEqual(data["sessions_cancelled"], ["a1"])
         self.assertEqual(data["runs_caller_cancelled"], [])
         self.assertEqual(data["seal_error"], "")
         self.assertLessEqual(data["drain_started_ms"], timing["restart_signal_ms"])

@@ -167,7 +167,8 @@ run_gate() {
   if [ -n "${PLACE_RELEASE_GATE_CMD:-}" ]; then
     bash -c "$PLACE_RELEASE_GATE_CMD" >"$GATE_LOG" 2>&1
   else
-    python3 "$REPO_ROOT/scripts/live-runs.py" >"$GATE_LOG" 2>&1
+    python3 "$REPO_ROOT/scripts/live-runs.py" --broca-session "$(dirname "$DEST")/broca-session" \
+      >"$GATE_LOG" 2>&1
   fi
   gate_rc=$?
   set -e
@@ -184,112 +185,110 @@ gate_reason() {
   fi
 }
 
+# The report names the runs live before the restart (from the gate's own lines) and, once the new
+# process runs, what became of each (scripts/lib/seal_readback.py): resumed, sealed interrupted,
+# finished, paused, or cancelled, which a drain must never do. The restarted daemon resumes runs
+# only once its storage key loads, so the readback asks again for up to
+# PLACE_RELEASE_RESUME_WAIT_SECONDS while a run is neither running nor ended.
 write_report() {
   [ -n "$REPORT" ] || return 0
-  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" "$DRAIN_STARTED_MS" <<'PY'
-import json, pathlib, sys
-path, backup, pid, gate, scripts, active_runs_file, session_backup, drain_started_ms = sys.argv[1:]
+  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" \
+    "${CLIENT_BACKUPS[0]}" "$DRAIN_STARTED_MS" "${PLACE_RELEASE_GATE_CMD:-}" "$(dirname "$DEST")/broca-session" \
+    "${PLACE_RELEASE_RESUME_WAIT_SECONDS:-90}" <<'PY'
+import json, pathlib, subprocess, sys, time
+(path, backup, pid, gate, scripts, active_runs_file, session_backup, drain_started_ms, gate_cmd,
+ broca_session, resume_wait) = sys.argv[1:]
 drain_started_ms = int(drain_started_ms) if drain_started_ms else None
-snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
-sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith("  live  ")]
 sys.path.insert(0, scripts)
 from lib import state_root
-from lib.archive_read import logical_wals
-from lib.seal_readback import CALLER_CANCELLED, CANCELLED, PAUSED, SEALED, UNCONFIRMED, active_run_id, classify_run
+from lib.seal_readback import (CALLER_CANCELLED, CANCELLED, FINISHED, PAUSED, RESUMED, SEALED,
+                               UNCONFIRMED, classify_run, run_facts)
 
+
+def live_lines(text):
+    """(session, run id) for each `  live  <session>  <run id>  ...` line of a gate snapshot."""
+    runs = []
+    for line in text.splitlines():
+        if line.startswith("  live  "):
+            fields = line.split()
+            run_id = fields[2] if len(fields) > 2 and fields[2] != "?" else None
+            runs.append({"session": fields[1], "run_id": run_id})
+    return runs
+
+
+def live_now():
+    """The run ids the restarted daemon has in progress, asked the way the gate asks."""
+    command = (["bash", "-c", gate_cmd] if gate_cmd else
+               ["python3", f"{scripts}/live-runs.py", "--broca-session", broca_session])
+    answer = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    if answer.returncode not in (0, 1):
+        raise RuntimeError("cannot read the runs in progress after the restart: "
+                           + (answer.stderr.strip().splitlines() or ["no output"])[-1])
+    return {run["run_id"] for run in live_lines(answer.stdout) if run["run_id"]}
+
+
+snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
+sessions = [run["session"] for run in live_lines(snapshot)]
 active_path = pathlib.Path(active_runs_file)
-seal_error = ""
+statuses = {status: [] for status in
+            (SEALED, RESUMED, FINISHED, PAUSED, CANCELLED, CALLER_CANCELLED, UNCONFIRMED)}
+errors = []
 if pid:
     try:
-        saved = json.loads(active_path.read_text())
-        active_runs = saved["runs"]
-        errors = [saved["error"]] if saved.get("error") else []
+        active_runs = json.loads(active_path.read_text())["runs"]
     except Exception as error:
-        active_runs = [{"session": name, "run_id": None} for name in sessions]
-        errors = [f"cannot read pre-restart run snapshot: {error}"]
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], CALLER_CANCELLED: [], PAUSED: [], "idle": []}
-    try:
-        wals = {
-            wal.name: wal
-            for wal in logical_wals(
-                state_root.default_state_root() / "wal", include_archives=False
-            )
-        }
-    except Exception as error:
-        wals = {}
-        errors.append(str(error))
-    for active in active_runs:
-        name, run_id = active.get("session"), active.get("run_id")
-        status = UNCONFIRMED
-        # live-runs.py lists sessions by recent writes, so a session whose last run had already
-        # finished can appear. The snapshot read its WAL and found no open run: nothing to seal.
-        # A missing or unreadable WAL never sets this, so it stays unconfirmed.
-        if active.get("no_open_run") is True:
-            status = "idle"
-        elif isinstance(name, str) and isinstance(run_id, str):
-            wal = wals.get(name)
-            if wal is not None:
-                try:
-                    status = classify_run(wal, run_id, drain_started_ms=drain_started_ms)
-                except Exception as error:
-                    errors.append(str(error))
-        statuses[status].append({"session": name, "run_id": run_id})
-    seal_error = "; ".join(errors)
-else:
-    active_runs = [{"session": name, "run_id": None} for name in sessions]
-    errors = []
-    try:
-        wals = {
-            wal.name: wal
-            for wal in logical_wals(
-                state_root.default_state_root() / "wal", include_archives=False
-            )
-        }
+        active_runs = live_lines(snapshot)
+        errors.append(f"cannot read pre-restart run snapshot: {error}")
+    run_index = state_root.default_state_root() / "run-index.db"
+    deadline = time.monotonic() + float(resume_wait)
+    while True:
+        outcomes, pending, round_errors = [], 0, []
+        try:
+            live_after = live_now()
+        except Exception as error:
+            live_after = set()
+            round_errors.append(str(error))
         for active in active_runs:
-            wal = wals.get(active["session"])
-            if wal is not None:
-                active["run_id"] = active_run_id(wal)
-                if active["run_id"] is None:
-                    active["no_open_run"] = True
-    except Exception as error:
-        errors.append(str(error))
-    seal_error = "; ".join(errors)
-    active_path.write_text(json.dumps({"runs": active_runs, "error": seal_error}))
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], CALLER_CANCELLED: [], PAUSED: [], "idle": []}
+            status = UNCONFIRMED
+            if active.get("run_id"):
+                try:
+                    facts = run_facts(run_index, active["run_id"])
+                    status = classify_run(facts, active["run_id"],
+                                          drain_started_ms=drain_started_ms, live_after=live_after)
+                except Exception as error:
+                    round_errors.append(f"{active['run_id']}: {error}")
+            else:
+                round_errors.append(f"{active['session']}: the gate named no run id")
+            # A paused or unread run may still be resuming; anything else is settled.
+            pending += status in (PAUSED, UNCONFIRMED) and bool(active.get("run_id"))
+            outcomes.append((status, active))
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    for status, active in outcomes:
+        statuses[status].append({"session": active.get("session"), "run_id": active.get("run_id")})
+    errors += round_errors
+else:
+    active_runs = live_lines(snapshot)
+    active_path.write_text(json.dumps({"runs": active_runs}))
 
-runs_sealed = statuses[SEALED]
-sessions_paused = [run["session"] for run in statuses[PAUSED]]
-sessions_idle = [run["session"] for run in statuses["idle"]]
-runs_unconfirmed = statuses[UNCONFIRMED]
-runs_cancelled = statuses[CANCELLED]
-runs_caller_cancelled = statuses[CALLER_CANCELLED]
-sessions_sealed = [run["session"] for run in runs_sealed]
-sessions_unconfirmed = [run["session"] for run in runs_unconfirmed]
-sessions_cancelled = [run["session"] for run in runs_cancelled]
-sessions_caller_cancelled = [run["session"] for run in runs_caller_cancelled]
-for run in runs_cancelled:
+for run in statuses[CANCELLED]:
     print(
         f"place-release: FAILURE -- shutdown drain cancelled run {run['run_id']} "
         f"in {run['session']}; a drain must not cancel a run.",
         file=sys.stderr,
     )
-pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
-                                        "client_backups": {"broca-session": session_backup},
-                                       "sessions_at_restart": sessions,
-                                       "active_runs_at_restart": active_runs,
-                                       "drain_started_ms": drain_started_ms,
-                                       "runs_sealed": runs_sealed,
-                                       "runs_unconfirmed": runs_unconfirmed,
-                                       "runs_cancelled": runs_cancelled,
-                                       "runs_caller_cancelled": runs_caller_cancelled,
-                                       "sessions_sealed": sessions_sealed,
-                                       "sessions_unconfirmed": sessions_unconfirmed,
-                                       "sessions_cancelled": sessions_cancelled,
-                                       "sessions_caller_cancelled": sessions_caller_cancelled,
-                                       "sessions_idle": sessions_idle,
-                                       "sessions_paused": sessions_paused,
-                                       "seal_error": seal_error,
-                                       "live_run_snapshot": snapshot}))
+report = {"backup": backup, "pid": pid or None,
+          "client_backups": {"broca-session": session_backup},
+          "sessions_at_restart": sessions,
+          "active_runs_at_restart": active_runs,
+          "drain_started_ms": drain_started_ms,
+          "seal_error": "; ".join(errors),
+          "live_run_snapshot": snapshot}
+for status, runs in statuses.items():
+    report[f"runs_{status}"] = runs
+    report[f"sessions_{status}"] = [run["session"] for run in runs]
+pathlib.Path(path).write_text(json.dumps(report))
 PY
 }
 

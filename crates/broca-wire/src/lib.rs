@@ -2233,6 +2233,10 @@ pub struct MemorySession {
     pub window_messages: u64,
     /// Whether a run was in progress when the report was taken.
     pub run_in_progress: bool,
+    /// The id of that run. A restart gate names it before the restart and reads its outcome
+    /// after; absent when no run is in progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Its estimated bytes by holder.
     pub holders: MemoryHolders,
     /// The rendered body of the request in flight, in bytes. Absent: the body lives in the

@@ -224,10 +224,13 @@ python3 - "$report" <<'PY'
 import json, sys
 report = json.load(open(sys.argv[1]))
 print("   pid        " + report["pid"])
-print("   sessions live at restart: " + (", ".join(report["sessions_at_restart"]) or "none"))
-print("   sessions sealed at restart (WAL readback): " + (", ".join(report["sessions_sealed"]) or "none"))
-if report.get("sessions_paused"):
-    print("   paused before restart (nothing to seal): " + ", ".join(report["sessions_paused"]))
+print("   runs live at restart: " + str(len(report["active_runs_at_restart"])))
+for status, label in (("resumed", "resumed after the restart"),
+                      ("sealed", "sealed interrupted"),
+                      ("finished", "ended normally"),
+                      ("paused", "paused, not running yet")):
+    if report.get(f"sessions_{status}"):
+        print(f"   {label}: " + ", ".join(report[f"sessions_{status}"]))
 if report["sessions_unconfirmed"]:
     print("   WARNING seal not confirmed: " + ", ".join(report["sessions_unconfirmed"]))
 if report.get("sessions_cancelled"):

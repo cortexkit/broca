@@ -266,6 +266,8 @@ fn an_actor_inside_a_provider_call_holds_no_more_than_its_budget() {
         memory.holders
     );
     assert!(memory.run_in_progress);
+    // A restart gate names the run it may cut by this id.
+    assert_eq!(memory.run_id.as_deref(), Some("r-measured"));
     assert!(memory.holders.request_in_flight > 0, "{memory:?}");
     assert_eq!(memory.request_body_bytes, None);
     assert_eq!(
@@ -279,6 +281,7 @@ fn an_actor_inside_a_provider_call_holds_no_more_than_its_budget() {
         report(&commands).await
     });
     assert!(!after.run_in_progress);
+    assert_eq!(after.run_id, None);
     assert_eq!(after.holders.request_in_flight, 0);
     assert_eq!(after.request_body_untracked, None);
     let options = hold.options.lock().unwrap().clone().unwrap();

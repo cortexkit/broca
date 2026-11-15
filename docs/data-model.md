@@ -705,8 +705,8 @@ have all five keys always present; facts above it omit unreported keys.
 - Skip unknown record `type`s in `ver = 1` frames.
 - Refuse a `ver = 3` frame whose `requires` names a feature you do not know, and refuse the
   whole file, not just that record. Report it as a newer writer, never as corruption. The
-  scripts under `scripts/` that read WAL frames (`step-timing.py`, `find-finalize-leaks.py`,
-  `live-runs.py`) read a `ver = 3` frame through `scripts/lib/wal_gate.py`: they decode its
+  scripts under `scripts/` that read WAL frames (`step-timing.py`, `find-finalize-leaks.py`)
+  read a `ver = 3` frame through `scripts/lib/wal_gate.py`: they decode its
   record when they know every feature it requires (their table is empty today, so every
   gated frame is unknown to them, including broca's `scope/v1`), and
   otherwise list the file as `newer-writer`, use none of its records, and carry on with the

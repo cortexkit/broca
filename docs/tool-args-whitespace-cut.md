@@ -52,7 +52,6 @@ scanners. No existing reader needed a change to accept the new outcome spelling:
 | `broca-module-serve/src/cache_dump.rs` | Prefers `Complete` response attempts, otherwise uses the last response attempt for a step with usage. A local cut is handled by that fallback, like an unknown outcome. |
 | `broca-provider/src/transport.rs`, `transport_websocket.rs` | Produces the new outcome only with a validated cut completion. Stops body polling and closes a generating WebSocket instead of retrying or reusing it. Retry/fallback decisions branch on actual failures only. |
 | `broca-core/src/shutdown_seal.rs` | Writes its own `SealedInFlight` evidence, not an interpretation of another attempt's outcome. |
-| `scripts/live-runs.py` | Scans run/step transition tokens, not attempt outcomes. |
 | `scripts/lib/archive_read.py` | Generic JSON/frame decoding; no outcome enum validation. |
 | `scripts/wal-scan.py` | Searches caller-supplied byte patterns; no outcome semantics. |
 | `scripts/step-timing.py` | Reads model-step records and derives run outcomes from run-finished/run-paused transitions, not attempt outcomes. |

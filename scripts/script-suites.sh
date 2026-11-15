@@ -63,8 +63,7 @@ suites=(
     scripts/test-step-timing.py
     scripts/tests/test-attempt-telemetry.py
     scripts/test-rekey-harness.py
-    # The WAL readers' handling of gated (version-3) frames: decoded when their features
-    # are known, reported as newer-writer when not.
+    # The restart gate answers from the daemon's memory report, never reading silence as idle.
     scripts/test-live-runs.py
     scripts/test-find-finalize-leaks.py
     # Every script locates broca's state root by the daemon's rule.
@@ -136,7 +135,6 @@ for suite in "${native_macos_suites[@]}"; do
     fi
 done
 python3 scripts/check-path-deps.py
-python3 scripts/live-runs.py --self-test
 python3 scripts/audit-export-lane.py --self-test
 # Nothing under .cortexkit/ may be tracked except release-notes/, skills/, rules/ and WORKER.md.
 scripts/check-cortexkit-layout.sh

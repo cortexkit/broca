@@ -63,6 +63,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 session_class: self.frozen_session_class(),
                 window_messages: self.session.conversation.messages.len() as u64,
                 run_in_progress: run.is_some(),
+                run_id: run.map(|run| run.run_id.0.clone()),
                 holders,
                 request_body_bytes: None,
                 request_body_untracked: request.is_some().then(|| BODY_UNTRACKED.to_owned()),

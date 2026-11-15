@@ -135,7 +135,6 @@ class RetentionReaders(unittest.TestCase):
 
     def commands(self):
         return [
-            ("live-runs.py", "--boot-epoch", "1"),
             ("wal-scan.py", "--control", "run_started", "--pattern", "portable", "--pattern", "ephemeral", "--pattern", "expired"),
             ("step-timing.py",),
             ("find-empty-completions.py", "--hours", "1000000"),
@@ -150,14 +149,9 @@ class RetentionReaders(unittest.TestCase):
             with self.subTest(reader=script):
                 result = self.run_reader(*command)
                 out = result.stdout
-                expected = 1 if script in ("live-runs.py", "find-empty-completions.py") else 0
+                expected = 1 if script == "find-empty-completions.py" else 0
                 self.assertEqual(result.returncode, expected, out + result.stderr)
-                if script == "live-runs.py":
-                    self.assertIn("live runs          2", out)
-                    for label in ("portable", "ephemeral"):
-                        self.assertIn(f"  live  {self.paths[label].name}", out)
-                    self.assertNotIn(self.paths["expired"].name, out)
-                elif script == "wal-scan.py":
+                if script == "wal-scan.py":
                     self.assertIn("files read          2", out)
                     self.assertIn("'expired'\n      matches           0 across 0 files", out)
                     for label in ("portable", "ephemeral"):
@@ -295,7 +289,7 @@ class RetentionReaders(unittest.TestCase):
                 command = (command[0], "--baseline", "1")
             with self.subTest(reader=command[0]):
                 result = self.run_reader(*command)
-                expected = 1 if command[0] in ("live-runs.py", "find-empty-completions.py") else 0
+                expected = 1 if command[0] == "find-empty-completions.py" else 0
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertIn(hidden.stem, result.stderr)
                 self.assertIn(suffix, result.stderr)
