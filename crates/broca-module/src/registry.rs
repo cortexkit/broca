@@ -3859,7 +3859,7 @@ impl LineageRegistry {
             if let Some(policy) = policy.as_object().filter(|policy| {
                 policy.contains_key(cortexkit_role_llm_runner::app_readers::PLAN_READERS)
             }) {
-                let starts_in_store = self.wal_written(key) == Some(false)
+                let starts_in_store = self.wal_written(key) != Some(true)
                     && (session_class.as_deref() == Some(HEAD_SESSION_CLASS)
                         || self.starts_new_sessions_in_store(session_class.as_deref()));
                 let supported = self.store_holding(key)?.is_some()

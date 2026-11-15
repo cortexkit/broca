@@ -3463,7 +3463,7 @@ impl ServeHandler for crate::LineageRegistry {
         if self.store_holding(session)?.is_some() {
             return Ok(true);
         }
-        let starts_in_store = self.wal_written(session) == Some(false)
+        let starts_in_store = self.wal_written(session) != Some(true)
             && (class == Some(crate::registry::HEAD_SESSION_CLASS)
                 || self.starts_new_sessions_in_store(class));
         // A session that starts in the new storage but can't be created there yet (its key

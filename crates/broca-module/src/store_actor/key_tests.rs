@@ -449,12 +449,30 @@ async fn a_listed_class_is_refused_transient_until_the_new_storage_can_create_it
 /// for a session on today's storage`).
 #[tokio::test]
 async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
-    let module = module_placing("mason-early", None, Cipher::XChaCha20Poly1305, |registry| {
+    readers_plan_waits_for_the_key("mason-early", false).await;
+}
+
+/// The same, when whether the session has a log on today's storage can't be read: every new
+/// session starts in the new storage, so not knowing is no reason to refuse its readers for good.
+/// A worker launched 21 s after a restart (15 Nov 22:14:52Z) got the permanent refusal this way.
+#[tokio::test]
+async fn a_readers_plan_waits_for_the_key_when_todays_logs_cant_be_read() {
+    readers_plan_waits_for_the_key("mason-unreadable", true).await;
+}
+
+async fn readers_plan_waits_for_the_key(name: &str, unreadable_wal: bool) {
+    let module = module_placing(name, None, Cipher::XChaCha20Poly1305, |registry| {
         registry.with_store_new_session_classes(["mason"])
     })
     .await;
     module.slot.open_without_key(&module.setup).await.unwrap();
     let session = BindIdentity::new(module.dir.join("project"), "store-actor", "early-mason");
+    if unreadable_wal {
+        // A file where today's log folder should be: every lookup there fails.
+        let _ = std::fs::remove_dir_all(module.dir.join("wal"));
+        std::fs::write(module.dir.join("wal"), b"not a folder").unwrap();
+        assert_eq!(module.registry.wal_written(&session), None);
+    }
     let composition = serde_json::json!({
         "providers": [{"provider": "fixture", "tools": []}],
         "step_transform_items": [],
@@ -532,6 +550,10 @@ async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
         None
     );
 
+    if unreadable_wal {
+        // The window passes: today's logs can be read again by the time the key loads.
+        std::fs::remove_file(module.dir.join("wal")).unwrap();
+    }
     module.load_key().await;
     assert!(
         matches!(front(), Ok(true)),
