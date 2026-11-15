@@ -1,0 +1,27 @@
+== an ordered send starting a run
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== an ordered send waiting for a run
+Pending {
+    submission_id: SubmissionId(
+        "sub-r1",
+    ),
+}
+== an interrupt
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}
+== a send resuming after sign-in
+Active {
+    run_id: RunId(
+        "r1",
+    ),
+    delivered: None,
+}

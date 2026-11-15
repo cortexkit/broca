@@ -1,15 +1,13 @@
-//! Plan refreshes on a session kept in the new storage, against today's actor for the same
-//! refreshes.
+//! Plan refreshes on a session kept in the new storage.
 //!
-//! Each scenario drives the same sends, refreshes, policy changes and prefix flushes through a
-//! module on today's storage and one that starts the session in the new storage, and compares
-//! every reply and the plan each run froze. Refreshes are handed to each session's actor as the
-//! serve layer hands over a fetched manifest (`route_session_refresh`); policy changes and
-//! flushes go through the serve layer's own preflight (`ServeHandler`).
+//! Each scenario drives sends, refreshes, policy changes and prefix flushes through a module
+//! whose sessions start in the new storage, and pins every reply and the plan each run froze.
+//! Refreshes are handed to the session's actor as the serve layer hands over a fetched manifest
+//! (`route_session_refresh`); policy changes and flushes go through the serve layer's own
+//! preflight (`ServeHandler`).
 
 use std::sync::Arc;
 
-use broca_core::WalStore as _;
 use broca_protocol::{SendScope, SubmissionRequest};
 use broca_session_store::fold::operations::ManifestRef;
 use broca_session_store::record::Record;
@@ -248,31 +246,8 @@ async fn baseline(module: &Module) -> String {
     read.join(" | ")
 }
 
-/// Each run of today's session with the plan identity and model its start froze.
-fn today_runs(module: &Module) -> Vec<(String, Option<String>, String)> {
-    module
-        .wal
-        .read_records(&module.key)
-        .unwrap()
-        .into_iter()
-        .filter_map(|frame| match frame.record {
-            broca_wal::WalRecord::RunStarted {
-                run_id,
-                manifest,
-                config,
-                ..
-            } => Some((
-                run_id.0,
-                manifest.map(|manifest| manifest.plan_identity.clone()),
-                config.model.model_id,
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Each run of the store's session, as [`today_runs`] reads today's, and the refresh each run
-/// start's batch says it applied.
+/// Each run of the store's session with the plan identity and model its start froze, and the
+/// refresh each run start's batch says it applied.
 async fn store_runs(module: &Module) -> (Vec<(String, Option<String>, String)>, Vec<u64>) {
     let session = module.load().await;
     let mut runs = Vec::new();
@@ -292,76 +267,52 @@ async fn store_runs(module: &Module) -> (Vec<(String, Option<String>, String)>, 
     (runs, applied)
 }
 
-/// Runs `steps` on both storages and requires every answer and every run's frozen plan to be
-/// equal, and each refresh today's fold says a run applied to be recorded as applied in the new
-/// storage. Answers both modules, and the store's answers and runs for the scenario to check
-/// what they say.
+/// Runs `steps` on the module and pins every answer, every baseline, every run's frozen plan and
+/// each refresh a run applied. Returns the module, its answers and its runs, for the scenario to
+/// check what they say.
 async fn compare(
     first: &broca_wal::PlanManifest,
     steps: &[Step],
-) -> (
-    Module,
-    Module,
-    Vec<String>,
-    Vec<(String, Option<String>, String)>,
-) {
-    let (today, store, _, _) = both(
+) -> (Module, Vec<String>, Vec<(String, Option<String>, String)>) {
+    let (store, _) = both(
         (0..steps.len())
             .map(|n| text_step(&format!("a{n}"), "hello"))
             .collect(),
         false,
     )
     .await;
-    compared(today, store, first, steps).await
+    compared(store, first, steps).await
 }
 
-/// [`compare`], with the store module's sessions in mode `cipher`.
+/// [`compare`], with the module's sessions in mode `cipher`.
 async fn compare_in(
     cipher: broca_session_store::keys::Cipher,
     first: &broca_wal::PlanManifest,
     steps: &[Step],
-) -> (
-    Module,
-    Module,
-    Vec<String>,
-    Vec<(String, Option<String>, String)>,
-) {
-    let (today, store) = super::head::both_in(
+) -> (Module, Vec<String>, Vec<(String, Option<String>, String)>) {
+    let store = super::head::both_in(
         (0..steps.len())
             .map(|n| text_step(&format!("a{n}"), "hello"))
             .collect(),
         cipher,
     )
     .await;
-    compared(today, store, first, steps).await
+    compared(store, first, steps).await
 }
 
-/// [`compare`] on the modules `today` and `store`.
+/// [`compare`] on the module `store`.
 async fn compared(
-    today: Module,
     store: Module,
     first: &broca_wal::PlanManifest,
     steps: &[Step],
-) -> (
-    Module,
-    Module,
-    Vec<String>,
-    Vec<(String, Option<String>, String)>,
-) {
-    let (today_answers, today_baselines) = drive(&today, first, steps).await;
+) -> (Module, Vec<String>, Vec<(String, Option<String>, String)>) {
     let (store_answers, store_baselines) = drive(&store, first, steps).await;
-    alike!(store_answers, today_answers);
-    alike!(store_baselines, today_baselines);
+    broca_test_support::pin!("the answers", store_answers);
+    broca_test_support::pin!("the baselines", store_baselines);
     let (runs, applied) = store_runs(&store).await;
-    alike!(runs, today_runs(&today));
-    let frames = today.wal.read_records(&today.key).unwrap();
-    let today_applied: Vec<u64> =
-        broca_fetch_plan::session_change::SessionChangeState::fold(&frames)
-            .applied
-            .into_keys()
-            .collect();
-    alike!(applied, today_applied);
-    (today, store, store_answers, runs)
+    broca_test_support::pin!("the runs", runs);
+    broca_test_support::pin!("the refreshes applied", applied);
+    (store, store_answers, runs)
 }
 
 pub(super) fn first_plan() -> broca_wal::PlanManifest {
@@ -378,7 +329,7 @@ fn second_plan() -> broca_wal::PlanManifest {
 /// An `immediately` refresh applies from the next run, which freezes its plan, alike.
 #[tokio::test]
 async fn an_immediate_refresh_applies_at_the_next_run_alike() {
-    let (_, _, answers, runs) = compare(
+    let (_, answers, runs) = compare(
         &first_plan(),
         &[
             send("r1", "plan-1"),
@@ -399,11 +350,8 @@ async fn an_immediate_refresh_applies_at_the_next_run_alike() {
     assert_eq!(runs[1].1.as_deref(), Some("plan-2"));
 }
 
-/// `session.baseline` on the new storage reports what today's does after a refresh is accepted
-/// and after it applies: the generations, the pending change, the effective plan and its tools,
-/// and it refuses a module that isn't the session's owner. `compared` already requires the two
-/// storages to agree after every step of every scenario here; this pins what they agree on, so
-/// two equally wrong answers can't pass.
+/// `session.baseline` on the new storage after a refresh is accepted and after it applies: the generations, the pending change, the effective plan and its tools,
+/// and it refuses a module that isn't the session's owner.
 #[tokio::test]
 async fn the_baseline_reports_accepted_pending_and_applied_changes_alike() {
     let steps = [
@@ -416,16 +364,15 @@ async fn the_baseline_reports_accepted_pending_and_applied_changes_alike() {
         Step::Flush { send_id: "flush-1" },
         send("r2", "plan-2"),
     ];
-    let (today, store, _, _) = both(
+    let (store, _) = both(
         (0..steps.len())
             .map(|n| text_step(&format!("a{n}"), "hello"))
             .collect(),
         false,
     )
     .await;
-    let (_, today_baselines) = drive(&today, &first_plan(), &steps).await;
     let (_, baselines) = drive(&store, &first_plan(), &steps).await;
-    alike!(baselines, today_baselines);
+    broca_test_support::pin!("the baselines", baselines);
     // The baseline the owner read, from its `Ok(<reply JSON>)`.
     let owner = |read: &str| -> Value {
         let owner = read.split(" | ").next().unwrap();
@@ -462,7 +409,7 @@ async fn the_baseline_reports_accepted_pending_and_applied_changes_alike() {
 /// the run after a model switch or a prefix flush freezes the refreshed one, alike.
 #[tokio::test]
 async fn a_refresh_on_prefix_rebuild_waits_for_a_model_switch_or_a_flush_alike() {
-    let (_, _, answers, runs) = compare(
+    let (_, answers, runs) = compare(
         &first_plan(),
         &[
             send("r1", "plan-1"),
@@ -513,7 +460,7 @@ async fn a_refresh_on_prefix_rebuild_waits_for_a_model_switch_or_a_flush_alike()
 /// and a flush's `send_id` keeps the pending generation it first reported, alike.
 #[tokio::test]
 async fn policy_changes_and_flushes_repeat_and_refuse_reuse_alike() {
-    let (_, _, answers, runs) = compare(
+    let (_, answers, runs) = compare(
         &first_plan(),
         &[
             send("r1", "plan-1"),
@@ -566,7 +513,7 @@ async fn policy_changes_and_flushes_repeat_and_refuse_reuse_alike() {
 /// original flags; one naming that generation with another plan is `generation_stale`, alike.
 #[tokio::test]
 async fn an_old_generation_repeats_identically_and_is_otherwise_stale_alike() {
-    let (_, _, answers, _) = compare(
+    let (_, answers, _) = compare(
         &first_plan(),
         &[
             send("r1", "plan-1"),
@@ -610,7 +557,7 @@ async fn a_pending_plan_whose_model_mismatches_refuses_the_run_alike() {
         ),
         "plan-pinned",
     );
-    let (_, _, answers, runs) = compare(
+    let (_, answers, runs) = compare(
         &first_plan(),
         &[
             send("r1", "plan-1"),
@@ -654,7 +601,7 @@ async fn a_refresh_changes_the_inherited_model_and_the_senders_alike() {
             json!([{"module": "occipital", "idle_start": true, "interrupt": interrupt}]);
         manifest(&plan, identity)
     };
-    let (today, store, answers, runs) = compare(
+    let (store, answers, runs) = compare(
         &choosing("plan-a", "m", false),
         &[
             send("r1", "plan-a"),
@@ -678,17 +625,16 @@ async fn a_refresh_changes_the_inherited_model_and_the_senders_alike() {
         "the send ran on the refreshed plan's model"
     );
     for principal in [None, Some(core()), Some(occipital())] {
-        alike!(
-            head_json(&store, principal.as_ref()).await,
-            head_json(&today, principal.as_ref()).await,
-            "heads differ for {principal:?}"
+        broca_test_support::pin!(
+            format!("head for {principal:?}"),
+            head_json(&store, principal.as_ref()).await
         );
     }
     let head = head_json(&store, Some(&occipital())).await;
     assert_eq!(head["model"]["model"], "m2", "{head}");
     assert!(head["sender"].is_object(), "{head}");
-    // The refreshed sender's interrupt grant decides a cancel it makes, as today's does.
-    for module in [&today, &store] {
+    // The refreshed sender's interrupt grant decides a cancel it makes.
+    for module in [&store] {
         let authority = module
             .registry
             .resolve_cancel_authority(
@@ -716,7 +662,7 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
         plan["senders"] = json!([{"module": "magic-context"}]);
         manifest(&plan, "plan-2")
     };
-    let (today, store, answers, _) = compare_in(
+    let (store, answers, _) = compare_in(
         cipher,
         &first_plan(),
         &[
@@ -735,7 +681,7 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
     };
     for (run_id, principal) in [("s1", occipital()), ("s2", stranger)] {
         let mut answers = Vec::new();
-        for module in [&today, &store] {
+        for module in [&store] {
             let mut request = request("hello");
             request.principal = Some(principal.clone());
             request.tools = None;
@@ -743,7 +689,7 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
             answers.push(send_titled(module, run_id, request, None, None).await);
             module.closed().await;
         }
-        alike!(answers[1], answers[0], "{principal:?}");
+        broca_test_support::pin!(format!("{principal:?}"), answers[0]);
         assert!(
             matches!(
                 &answers[0],
@@ -793,7 +739,7 @@ async fn a_pending_stamp_on_the_same_text_moves_to_the_next_run_and_stays(
         send("r2", "plan-1"),
         send("r3", "plan-1"),
     ];
-    let (_, store) = super::head::both_in(
+    let store = super::head::both_in(
         (0..steps.len())
             .map(|n| text_step(&format!("a{n}"), "hello"))
             .collect(),
@@ -838,9 +784,8 @@ async fn a_pending_stamp_on_the_same_text_moves_to_the_next_run_and_stays(
     assert_eq!(stamps, vec!['b', '4', '4'], "{stamps:?}");
 }
 
-/// A refresh that adds a compaction provider: today's storage refuses it with today's exact
-/// refusal, and the new storage takes it, against the latest accepted plan. Accepting it
-/// enrolls nothing: the session moves only at the run that applies it.
+/// A refresh that adds a compaction provider is taken against the latest accepted plan.
+/// Accepting it enrolls nothing: the session moves only at the run that applies it.
 async fn only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider(
     cipher: broca_session_store::keys::Cipher,
 ) {
@@ -855,29 +800,14 @@ async fn only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider(
             manifest: compacted,
         },
     ];
-    let (today, store) = super::head::both_in(
+    let store = super::head::both_in(
         (0..steps.len())
             .map(|n| text_step(&format!("a{n}"), "hello"))
             .collect(),
         cipher,
     )
     .await;
-    let (today_answers, _) = drive(&today, &first_plan(), &steps).await;
     let (store_answers, _) = drive(&store, &first_plan(), &steps).await;
-    alike_today_first!(
-        today_answers[1],
-        format!(
-            "{:?}",
-            crate::actor::SessionRefreshOutcome::Refused(
-                crate::serve::SessionChangeError::InvalidParams {
-                    field: "plan.compaction_item".into(),
-                    message: "the session's compaction provider, preset and params are fixed \
-                              for its life"
-                        .into(),
-                }
-            )
-        )
-    );
     assert!(
         store_answers[1].contains("applies_from_next_run: true"),
         "{store_answers:?}"

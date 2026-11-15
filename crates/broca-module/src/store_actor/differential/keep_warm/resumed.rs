@@ -1,12 +1,12 @@
-//! A restarted driver's first tool wait, with no transport sends in the new process. The same
-//! durable history feeds today's Recorded base and the store actor's reconstructed base.
+//! A restarted driver's first tool wait, with no transport sends in the new process: the store
+//! actor rebuilds the warm's base from the durable history.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_core::keep_warm_wait::KeepWarmDriver as _;
 use broca_core::keep_warm_wait::WarmTick;
-use broca_core::{OutputEvent, RunError, RunSummary, WalStore as _};
+use broca_core::{OutputEvent, RunError, RunSummary};
 use broca_protocol::RunId;
 use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
@@ -24,7 +24,7 @@ use crate::store_actor::tests::bind;
 use crate::store_actor::StoreActor;
 
 cipher_tests!(
-    first_resumed_wait_matches_todays_recorded_base,
+    first_resumed_wait_warms_the_recorded_base,
     resumed_warm_waits_for_the_media_fold,
     mismatched_recorded_digest_never_warms,
     cold_cache_predecessor_rebuilds_the_previous_run_lazily
@@ -311,13 +311,12 @@ async fn finish_media(actor: &mut StoreActor<LocalBackend>) {
     }
 }
 
-async fn first_resumed_wait_matches_todays_recorded_base(cipher: Cipher) {
+async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
     for closed in [false, true] {
         let side = super::side(false, cipher).await;
         let records = history(closed);
         let recorded =
             broca_core::cache_warm::last_recorded_request_with_lineage(&records, None).unwrap();
-        let config = recorded.config.clone();
         let executor = Arc::new(Warming::default());
         let mut actor = reopened(&side, &records, cipher, Arc::clone(&executor)).await;
         let mut media = Some(actor.run_media().await);
@@ -358,69 +357,12 @@ async fn first_resumed_wait_matches_todays_recorded_base(cipher: Cipher) {
             "the live conversation is unchanged"
         );
 
-        let mut wal = side.wal.open(&bind()).unwrap();
-        for record in &records {
-            wal.append(1, record, true).unwrap();
-        }
-        drop(wal);
-        let tenure = broca_core::lease::WalLeaseDomain::new(side.dir.join("warm-leases"))
-            .acquire(&bind())
-            .unwrap();
-        let writer = Arc::new(
-            broca_core::WalHandle::open_and_spawn_owned(
-                Arc::clone(&side.wal),
-                bind(),
-                tenure,
-                None,
-            )
-            .await
-            .unwrap(),
+        broca_test_support::pin!(
+            "Recorded bases warm identical bytes",
+            *executor.sent.lock().unwrap()
         );
-        let legacy_executor = Arc::new(Warming::default());
-        let today = crate::keep_warm::recorded_for_test(
-            writer.clone(),
-            legacy_executor.clone(),
-            bind(),
-            recorded,
-        );
-        assert!(matches!(today.warm(&config, &run).await, WarmTick::Sent));
-        alike!(
-            *executor.sent.lock().unwrap(),
-            *legacy_executor.sent.lock().unwrap(),
-            "Recorded bases warm identical bytes"
-        );
-        let today_warm = side
-            .wal
-            .read_records(&bind())
-            .unwrap()
-            .into_iter()
-            .find_map(|frame| match frame.record {
-                WalRecord::CacheWarmed {
-                    trigger,
-                    run_id,
-                    step_id,
-                    request_body_sha256,
-                    warm_body_sha256,
-                    usage,
-                    ttl_ms,
-                    expires_at_ms,
-                    sent_at_ms,
-                    ..
-                } => Some((
-                    trigger,
-                    run_id.0,
-                    step_id.0,
-                    request_body_sha256,
-                    warm_body_sha256,
-                    usage,
-                    ttl_ms,
-                    expires_at_ms.map(|expiry| expiry - sent_at_ms),
-                )),
-                _ => None,
-            })
-            .unwrap();
-        alike_today_first!(
-            today_warm,
+        broca_test_support::pin!(
+            "the warm's record",
             (
                 store_warm.trigger,
                 store_warm.run_id,
@@ -434,8 +376,6 @@ async fn first_resumed_wait_matches_todays_recorded_base(cipher: Cipher) {
                     .map(|expiry| expiry - store_warm.sent_at_ms)
             )
         );
-        drop(today);
-        drop(writer);
     }
 }
 

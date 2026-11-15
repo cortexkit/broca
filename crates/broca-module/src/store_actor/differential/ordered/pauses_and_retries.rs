@@ -1,8 +1,7 @@
 //! An interrupt that ends a run paused for sign-in, keyed ordered sends after they left the
 //! queue, a queued ordered send withdrawn, and a steer that leaves its model to the session under
-//! a plan's model check, through today's actor and the store actor, driven by the same pair of
-//! sessions the ordered sends use ([`super::Pair`]). Each reply is compared, and then what the
-//! two sessions recorded.
+//! a plan's model check, through the store actor, driven by the session the ordered sends use
+//! ([`super::Pair`]). Each reply is pinned, and then what the session recorded.
 
 use std::sync::Arc;
 
@@ -24,9 +23,9 @@ cipher_tests!(
 
 /// A run paused for sign-in owns the session, but an interrupt ends it: the interrupt is queued
 /// and answered `pending`, the paused run ends `cancelled` without calling the model again, and
-/// the interrupt's run answers on the next step of the script, alike. The paused run's step
-/// announced a message id it never placed, which today's storage gives the interrupt's message
-/// and the new storage doesn't, so message ids are set aside.
+/// the interrupt's run answers on the next step of the script. The paused run's step announced a
+/// message id it never placed, which the interrupt's message doesn't reuse, so message ids are set
+/// aside.
 async fn an_interrupt_ends_a_sign_in_pause_and_runs_alike(cipher: Cipher) {
     let pair = Pair::new(
         vec![store::auth_failure(), store::text_step("a2", "done")],
@@ -52,16 +51,10 @@ async fn an_interrupt_ends_a_sign_in_pause_and_runs_alike(cipher: Cipher) {
     );
 }
 
-/// Retracts the queued send `submission_id` on both sides; the replies must be equal.
+/// Retracts the queued send `submission_id`, its reply pinned.
 async fn retract_alike(pair: &Pair, submission_id: &str) -> crate::actor::RetractOutcome {
-    let old = pair
-        .today
-        .registry
-        .route_retract(&pair.today.key, SubmissionId(submission_id.into()))
-        .await
-        .expect("today's actor opens");
     let new = store::retract(&pair.commands, submission_id).await;
-    alike!(new, old, "the retractions of {submission_id} differ");
+    broca_test_support::pin!(format!("the retractions of {submission_id} differ"), new);
     new
 }
 
@@ -145,7 +138,7 @@ async fn an_ended_or_delivered_ordered_sends_retry_is_answered_alike(cipher: Cip
     pair.release();
     pair.idle().await;
     for (key, text, order) in sends {
-        let (old, new) = pair
+        let new = pair
             .send(
                 &format!("r-{key}"),
                 from(core(), text),
@@ -154,14 +147,10 @@ async fn an_ended_or_delivered_ordered_sends_retry_is_answered_alike(cipher: Cip
                 Some(key),
             )
             .await;
-        alike!(
-            keyless(new),
-            keyless(old.clone()),
-            "the retries of {key} differ"
-        );
+        broca_test_support::pin!(format!("the retry of {key}"), keyless(new.clone()));
         assert!(
-            !matches!(old, SendOutcome::Error(_) | SendOutcome::Pending { .. }),
-            "{key}: {old:?}"
+            !matches!(new, SendOutcome::Error(_) | SendOutcome::Pending { .. }),
+            "{key}: {new:?}"
         );
     }
     pair.assert_alike().await;
@@ -217,13 +206,8 @@ fn checking(id: &str) -> Arc<broca_fetch_plan::Plan> {
 }
 
 /// A steer from the owner that leaves its model to the session, sent with the session's plan
-/// checking the model `id`, on both sides. Returns today's reply and the store's.
-async fn steer_checked(
-    pair: &Pair,
-    run_id: &str,
-    text: &str,
-    id: &str,
-) -> (SendOutcome, SendOutcome) {
+/// checking the model `id`. Returns the reply.
+async fn steer_checked(pair: &Pair, run_id: &str, text: &str, id: &str) -> SendOutcome {
     let mut request: SubmissionRequest = from(core(), text);
     request.inherit_frozen = [broca_protocol::request::InheritedParam::Model]
         .into_iter()
@@ -233,27 +217,6 @@ async fn steer_checked(
         manifest: None,
         model_check: Some(checking(id)),
     };
-    let old = pair
-        .today
-        .registry
-        .route_submission_with_order(
-            &pair.today.key,
-            RunId(run_id.into()),
-            request.clone(),
-            RunKind::FreshOrResume,
-            SendKey::Minted,
-            false,
-            Delivery::Steer,
-            Some(plan()),
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("today's actor opens");
     let (reply, answer) = oneshot::channel();
     pair.commands
         .send(LineageCmd::Send {
@@ -273,7 +236,7 @@ async fn steer_checked(
             reply,
         })
         .unwrap();
-    (old, answer.await.unwrap())
+    answer.await.unwrap()
 }
 
 /// A steer that leaves its model to the session joins the running run, whose model its plan's
@@ -282,8 +245,8 @@ async fn steer_checked(
 async fn a_steer_leaving_its_model_meets_the_plans_model_check_alike(cipher: Cipher) {
     let pair = Pair::new(reading(), true, cipher).await;
     pair.first("r1").await;
-    let (old, new) = steer_checked(&pair, "s1", "use another", "another").await;
-    alike!(new, old, "the refused steer's replies differ");
+    let new = steer_checked(&pair, "s1", "use another", "another").await;
+    broca_test_support::pin!("the refused steer's reply", new);
     assert!(
         matches!(
             new,
@@ -291,8 +254,8 @@ async fn a_steer_leaving_its_model_meets_the_plans_model_check_alike(cipher: Cip
         ),
         "{new:?}"
     );
-    let (old, new) = steer_checked(&pair, "s2", "also this", "m").await;
-    alike!(new, old, "the admitted steer's replies differ");
+    let new = steer_checked(&pair, "s2", "also this", "m").await;
+    broca_test_support::pin!("the admitted steer's reply", new);
     assert!(matches!(new, SendOutcome::Active { .. }), "{new:?}");
     pair.release();
     pair.release();

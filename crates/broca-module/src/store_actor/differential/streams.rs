@@ -37,7 +37,7 @@ pub(super) async fn routed(registry: &LineageRegistry, key: &BindIdentity) -> Ve
     let attached = registry
         .route_subscribe(key, FromCursor::Start, sink)
         .await
-        .expect("today's actor opens");
+        .expect("the session's actor opens");
     assert_eq!(attached, SubscribeOutcome::Attached);
     normalized(&drain(deliveries).await)
 }
@@ -58,30 +58,16 @@ pub(super) async fn store(commands: &mpsc::UnboundedSender<LineageCmd>) -> Vec<V
     normalized(&drain(deliveries).await)
 }
 
-/// The two streams are equal, unit for unit; a difference is named by its first unit. The
-/// store's stream is pinned (see `broca_test_support::pins`).
-pub(super) fn assert_alike(store: &[Value], today: &[Value]) {
+/// Pins the store's control stream (see `broca_test_support::pins`).
+pub(super) fn pin(store: &[Value]) {
     broca_test_support::pin!(
         "control stream",
         broca_test_support::pins::Text(serde_json::to_string_pretty(store).unwrap())
     );
-    let same = store
-        .iter()
-        .zip(today)
-        .take_while(|(store, today)| store == today)
-        .count();
-    assert!(
-        same == store.len() && same == today.len(),
-        "the control streams differ at unit {same} of {} (store) and {} (today):\nstore: {:#}\ntoday: {:#}",
-        store.len(),
-        today.len(),
-        store.get(same).cloned().unwrap_or_default(),
-        today.get(same).cloned().unwrap_or_default(),
-    );
 }
 
 mod cancel_ids;
-pub(super) use cancel_ids::assert_alike_after_cancel;
+pub(super) use cancel_ids::pin_after_cancel;
 
 fn normalized(events: &[Arc<ControlEvent>]) -> Vec<Value> {
     let mut names = HashMap::new();
@@ -163,24 +149,12 @@ async fn live_actor(commands: &mpsc::UnboundedSender<LineageCmd>) -> mpsc::Recei
     deliveries
 }
 
-async fn live_routed(registry: &LineageRegistry, key: &BindIdentity) -> mpsc::Receiver<Delivery> {
-    let (sink, deliveries) = mpsc::channel(4096);
-    assert_eq!(
-        registry.route_subscribe_live(key, sink).await.unwrap(),
-        SubscribeOutcome::Attached
-    );
-    deliveries
-}
-
 async fn live_attach_during_step(seed_held: bool) {
     use super::super::tests as rig;
-    use crate::serve::ServeHandler;
     use crate::store_reads::{StoreReadOutcome, StoreReadReply, StoreReadRequest};
     let steps = vec![rig::text_step("a1", "hello")];
-    let old_gate = Arc::new(tokio::sync::Notify::new());
     let new_gate = Arc::new(tokio::sync::Notify::new());
     let seed_gate = seed_held.then(|| Arc::new(tokio::sync::Notify::new()));
-    let today = super::today(steps.clone(), Some(Arc::clone(&old_gate)));
     let (commands, served, _) = rig::actor_with_seed_gate(
         rig::executor(steps, Some(Arc::clone(&new_gate))),
         broca_session_loop::parts::SharedParts::new(Box::new(
@@ -190,30 +164,10 @@ async fn live_attach_during_step(seed_held: bool) {
     )
     .await;
     assert!(matches!(
-        today
-            .send(
-                "r1",
-                rig::request("first"),
-                crate::actor::SendKey::Minted,
-                broca_protocol::Delivery::Queue,
-                None
-            )
-            .await,
-        crate::actor::SendOutcome::Active { .. }
-    ));
-    assert!(matches!(
         rig::send(&commands, "r1", "first").await,
         crate::actor::SendOutcome::Active { .. }
     ));
-    broca_test_support::wait_until("both model steps in flight", || async {
-        let old = serde_json::to_value(
-            today
-                .registry
-                .run_status_reply(&today.key, broca_protocol::RunId("r1".into()))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+    broca_test_support::wait_until("the model step in flight", || async {
         let (reply, answer) = oneshot::channel();
         commands
             .send(LineageCmd::StoreRead {
@@ -230,21 +184,13 @@ async fn live_attach_during_step(seed_held: bool) {
             return Err("status refused".into());
         };
         let new = serde_json::to_value(answer).unwrap();
-        if old["step"]["step_id"] == 1 && new["step"]["step_id"] == 1 {
+        if new["step"]["step_id"] == 1 {
             Ok(())
         } else {
             Err("step not in flight".into())
         }
     })
     .await;
-    let old = before_display_reset(live_routed(&today.registry, &today.key).await).await;
-    alike_today_first!(old.len(), 1);
-    alike_today_first!(
-        old[0].1,
-        broca_protocol::ControlUnit::StepStarted {
-            step_id: broca_protocol::StepId(1)
-        }
-    );
     let mut deliveries = live_actor(&commands).await;
     if let Some(seed_gate) = seed_gate {
         assert!(matches!(
@@ -258,22 +204,24 @@ async fn live_attach_during_step(seed_held: bool) {
         seed_gate.notify_one();
     }
     let new = before_display_reset(deliveries).await;
-    assert_alike(&normalized(&new), &normalized(&old));
-    old_gate.notify_one();
-    new_gate.notify_one();
-    today.idle().await;
-    rig::idle(&commands).await;
-    assert!(
-        before_display_reset(live_routed(&today.registry, &today.key).await)
-            .await
-            .is_empty()
+    // The attach replays what preceded its display snapshot: the step's start, and nothing else.
+    broca_test_support::pin!("alike", new.len());
+    assert_eq!(new.len(), 1);
+    broca_test_support::pin!("alike", new[0].1);
+    assert_eq!(
+        new[0].1,
+        broca_protocol::ControlUnit::StepStarted {
+            step_id: broca_protocol::StepId(1)
+        }
     );
+    pin(&normalized(&new));
+    new_gate.notify_one();
+    rig::idle(&commands).await;
     assert!(before_display_reset(live_actor(&commands).await)
         .await
         .is_empty());
     drop(commands);
     served.await.unwrap();
-    assert!(today.registry.stop_and_seal().await);
 }
 
 #[tokio::test]

@@ -1,13 +1,11 @@
-//! `session.warm` on a session kept in the new storage, through the module's registry, against
-//! the same warm on a session on today's storage.
+//! `session.warm` on a session kept in the new storage, through the module's registry.
 //!
-//! Both modules run the same scripted model, whose frozen render config is a first-party
-//! Anthropic one with one-hour cache markers, so the session's cache policy allows a warm, and
-//! both read the policy with the provider families' own rules, as the serving layer installs
-//! them. Each refusal decided before anything is sent must answer alike. A warm the store sends
-//! re-sends the request its loop would send next, rendered by the real Anthropic transport and
-//! checked against the digest the actor computed; its record dates the session's cache, which a
-//! restarted module reads back.
+//! The module runs a scripted model whose frozen render config is a first-party Anthropic one
+//! with one-hour cache markers, so the session's cache policy allows a warm, read with the
+//! provider families' own rules, as the serving layer installs them. Each refusal decided before
+//! anything is sent is pinned. A warm the store sends re-sends the request its loop would send
+//! next, rendered by the real Anthropic transport and checked against the digest the actor
+//! computed; its record dates the session's cache, which a restarted module reads back.
 
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +20,7 @@ use broca_session_store::keys::Cipher;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::{request, TodayLoop, IDLE};
+use super::{request, IDLE};
 use crate::actor::{LineageStatus, SendKey, SendOutcome, WarmOutcome};
 use crate::cache::{CacheDeclaration, CacheDeclarer};
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
@@ -125,9 +123,8 @@ impl broca_core::provider::Provider for Probe {
     }
 }
 
-/// Today's loop and the new loop, and a warm through [`Probe`] for either.
+/// The new loop, and a warm through [`Probe`].
 struct Loops {
-    today: TodayLoop,
     store: crate::store_actor::tests::LoopExecutor,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -147,10 +144,10 @@ impl RunExecutor for Loops {
     }
     async fn execute(
         &self,
-        job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
+        _job: RunJob,
+        _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
-        self.today.execute(job, out).await
+        unreachable!("a store session's runs come through execute_on_store")
     }
 
     async fn execute_on_store(
@@ -217,20 +214,9 @@ async fn registry_at(
 ) -> LineageRegistry {
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let render_config = config.map(|config| serde_json::to_value(config).unwrap());
-    let mut store_loop = super::executor(steps.clone(), None);
-    store_loop.provider.render_config = render_config.clone();
+    let mut store_loop = super::executor(steps, None);
+    store_loop.provider.render_config = render_config;
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
-        today: TodayLoop {
-            provider: super::Gated {
-                inner: broca_core::provider::StubProvider::new(steps),
-                gate: None,
-                render_config,
-                notes_sends: false,
-                hold: None,
-            },
-            wal: Arc::clone(&wal),
-            planes: Default::default(),
-        },
         store: store_loop,
         sent: Arc::clone(sent),
     });
@@ -457,20 +443,18 @@ async fn warm_refusals_answer_alike(cipher: Cipher) {
             &unsupported,
         ),
     ] {
-        let today = side(false, declares, config, steps(), cipher).await;
         let store = side(true, declares, config, steps(), cipher).await;
-        let (old, new) = (today.warm(None).await, store.warm(None).await);
-        let WarmOutcome::Refused(refusal) = &old else {
-            panic!("{what}: {old:?}");
+        let new = store.warm(None).await;
+        let WarmOutcome::Refused(refusal) = &new else {
+            panic!("{what}: {new:?}");
         };
-        assert!(expected(&refusal.detail), "{what}: {old:?}");
-        alike!(new, old, "{what}");
+        assert!(expected(&refusal.detail), "{what}: {new:?}");
+        broca_test_support::pin!(what, new);
         assert!(
             store.sent.lock().unwrap().is_empty(),
             "{what}: nothing sent"
         );
     }
-    let today = side(false, true, Some(&config), steps(), cipher).await;
     let store = side(true, true, Some(&config), steps(), cipher).await;
     let named = |outcome: WarmOutcome| match outcome {
         WarmOutcome::Refused(refusal) => refusal.detail,
@@ -482,17 +466,13 @@ async fn warm_refusals_answer_alike(cipher: Cipher) {
             requested: "another-lineage".into()
         },
     );
-    assert!(matches!(
-        named(today.warm(Some("another-lineage")).await),
-        broca_wire::WarmRefusalDetail::LineageChanged { .. }
-    ));
 }
 
 /// A warm of a session whose last request reached the cache re-sends the request its loop would
 /// send next: the bytes the real transport renders from the session's state, with the digest the
 /// actor computed. It answers with the policy's lifetime counted from the warm's own send, and
 /// its record dates the cache: a module restarted on the same state root warms the session again
-/// from that clock, as today's module dates the cache from its log.
+/// from that clock.
 async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
     let now = crate::actor::epoch_ms();
     let config = warmable();

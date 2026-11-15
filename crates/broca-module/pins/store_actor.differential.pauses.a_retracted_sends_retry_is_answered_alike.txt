@@ -1,31 +1,31 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 1: replies differ
+== step 1: reply
 Pending {
     submission_id: SubmissionId(
         "sub-r-k1",
     ),
 }
-== step 2: retraction replies differ
+== step 2: retraction reply
 Retracted
-== step 3: replies differ
+== step 3: reply
 Retracted {
     submission_id: SubmissionId(
         "sub-r-k1",
     ),
 }
-== step 4: replies differ
+== step 4: reply
 Retracted {
     submission_id: SubmissionId(
         "sub-r-k1",
     ),
 }
-== step 7: replies differ
+== step 7: reply
 Retracted {
     submission_id: SubmissionId(
         "sub-r-k1",
@@ -124,12 +124,12 @@ Retracted {
     }
   }
 ]
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 [
     Object {
         "model": Object {

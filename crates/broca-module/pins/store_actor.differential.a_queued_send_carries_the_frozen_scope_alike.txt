@@ -1,11 +1,11 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 1: replies differ
+== step 1: reply
 Pending {
     submission_id: SubmissionId(
         "sub-r2",
@@ -13,14 +13,14 @@ Pending {
 }
 == control stream
 sha256:2a3ec13d5dc7d3cc93989d13c36f426b6974e7beb74bdfb30f10c9afbfecb4c5 (3113 bytes)
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
     "queued",
     "again",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 sha256:98883c672b56976f35492176df5c9a4ad8dfbb10819dd30486d353443afefbd9 (2468 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:52cc053f89dff09882041183dd4c8d29a22e7bd6200bb68c64385f0e03fbbe2a (3611 bytes)

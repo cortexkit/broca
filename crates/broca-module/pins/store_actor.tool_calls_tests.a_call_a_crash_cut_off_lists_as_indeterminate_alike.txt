@@ -1,0 +1,38 @@
+== the recovering read, encrypted
+[
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {},
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("indeterminate"),
+                "position": Number(0),
+                "result_bytes": Number(226),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "run_id": String("r1"),
+    },
+]
+== the recovering read, plain
+[
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {},
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("indeterminate"),
+                "position": Number(0),
+                "result_bytes": Number(226),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "run_id": String("r1"),
+    },
+]

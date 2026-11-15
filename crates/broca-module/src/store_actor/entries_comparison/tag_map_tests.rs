@@ -503,20 +503,3 @@ async fn a_session_that_numbers_nothing_says_so() {
         TagMapResponse::unnumbered()
     );
 }
-
-/// A session on today's storage is not served: the registry answers that it keeps it there.
-#[tokio::test]
-async fn a_session_on_todays_storage_is_not_mapped() {
-    let side = side(false, vec![text_step("a1", "hello")], false, false).await;
-    assert!(matches!(
-        side.send("r1", "first").await,
-        SendOutcome::Active { .. }
-    ));
-    side.settled("r1").await;
-    assert!(!side.holds(), "the session is on today's storage");
-    let reply =
-        crate::serve::ServeHandler::tag_map(&side.registry, &side.key, &TagMapParams::default())
-            .await
-            .expect("the registry answers");
-    assert_eq!(reply, None);
-}

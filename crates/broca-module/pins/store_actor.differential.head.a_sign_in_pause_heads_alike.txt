@@ -1,4 +1,4 @@
-== paused: heads differ for None
+== paused: head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -27,7 +27,7 @@ Object {
     },
     "updated_at": Bool(true),
 }
-== paused: heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== paused: head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -56,7 +56,7 @@ Object {
     },
     "updated_at": Bool(true),
 }
-== paused: heads differ for Some(Reserved { module_id: "occipital" })
+== paused: head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {

@@ -1,42 +1,42 @@
-== the first send's replies differ
+== the first send's reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== the replies to s1 differ
+== the reply to s1
 Pending {
     submission_id: SubmissionId(
         "sub-s1",
     ),
 }
-== the replies to s2 differ
+== the reply to s2
 DeliveryRefused {
     code: "invalid_params",
     field: "delivery",
     message: "the session's plan does not let module aft send delivery steer",
 }
-== the replies to s3 differ
+== the reply to s3
 DeliveryRefused {
     code: "invalid_params",
     field: "delivery",
     message: "the session's plan does not let module aft send delivery queue",
 }
-== the replies to s4 differ
+== the reply to s4
 DeliveryRefused {
     code: "invalid_params",
     field: "delivery",
     message: "the session's plan does not let module aft send delivery interrupt",
 }
-== the replies to s6 differ
+== the reply to s6
 Active {
     run_id: RunId(
         "s6",
     ),
     delivered: None,
 }
-== the replies to s7 differ
+== the reply to s7
 Active {
     run_id: RunId(
         "s7",
@@ -233,11 +233,11 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:ac86dd959c9a973e577f8210d9d5564f16311bc0d5fb2f42698fc5cfad50089a (3144 bytes)
-== the sessions recorded their sends differently
+== the sends the session recorded
 sha256:5db7936df8b5b9ba873399b303f5ec00caeb806b710208d96c03ec27bb6f9f99 (2062 bytes)
-== the sessions hold different sends queued
+== the sends queued
 []
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "first",
@@ -249,9 +249,9 @@ sha256:5db7936df8b5b9ba873399b303f5ec00caeb806b710208d96c03ec27bb6f9f99 (2062 by
     "hi",
     "last",
 ]
-== the runs' starts differ
+== the runs' starts
 sha256:865c02835aa0683a4c78d68f0a6b6fe892b3d3d0957a86f34186412268fea289 (3979 bytes)
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",

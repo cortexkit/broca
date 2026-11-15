@@ -1,11 +1,11 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r-k1",
     ),
     delivered: None,
 }
-== step 2: replies differ
+== step 2: reply
 ScopeFreezeBusy {
     reason: RunActive,
     run_id: Some(
@@ -14,7 +14,7 @@ ScopeFreezeBusy {
         ),
     ),
 }
-== step 3: replies differ
+== step 3: reply
 ScopeRefused(
     OwnerMismatch(
         Scoped {
@@ -52,7 +52,7 @@ ScopeRefused(
         },
     ),
 )
-== step 4: replies differ
+== step 4: reply
 ScopeRefused(
     OwnerMismatch(
         Scoped {
@@ -90,14 +90,14 @@ ScopeRefused(
         },
     ),
 )
-== step 5: replies differ
+== step 5: reply
 Active {
     run_id: RunId(
         "r-k1",
     ),
     delivered: None,
 }
-== step 7: replies differ
+== step 7: reply
 Active {
     run_id: RunId(
         "r4",
@@ -106,14 +106,14 @@ Active {
 }
 == control stream
 sha256:0520fc7ea904eac0ba37b4fb51b12abc68bad0b27c951ee2cdcb314942476c63 (3617 bytes)
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
     "reopened",
     "hello",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 sha256:d9569f5deb258f01eca3d1fd7f0edabf3e5e20472db6b61253b673694e9dd712 (2466 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:fdc4980a05642f9100db01a5e2ff9cc93c1b6f69662fd96436f4ae7b579a37b7 (3617 bytes)

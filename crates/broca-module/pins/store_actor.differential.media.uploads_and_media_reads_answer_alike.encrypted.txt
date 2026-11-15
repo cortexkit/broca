@@ -8,41 +8,41 @@ Ok(
         "upload_id": Bool(true),
     },
 )
-== session.upload_status [Object {"upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_status Object {"upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Ok(
     Object {
         "received": Number(0),
         "state": String("open"),
     },
 )
-== session.upload_append [Object {"data": String("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAEElEQVR4nGP4z8AAQQxwFgBB0gX7h/C5SAAAAABJRU5ErkJggg=="), "offset": Number(3), "upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"data": String("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAEElEQVR4nGP4z8AAQQxwFgBB0gX7h/C5SAAAAABJRU5ErkJggg=="), "offset": Number(3), "upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_append Object {"data": String("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAEElEQVR4nGP4z8AAQQxwFgBB0gX7h/C5SAAAAABJRU5ErkJggg=="), "offset": Number(3), "upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Err(
     "Upload(UploadError { code: \"upload_offset_mismatch\", subject: \"<upload>\", field: None, received: Some(0) })",
 )
-== session.upload_append [Object {"data": String("iVBORw0KGgoAAA=="), "offset": Number(0), "upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"data": String("iVBORw0KGgoAAA=="), "offset": Number(0), "upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_append Object {"data": String("iVBORw0KGgoAAA=="), "offset": Number(0), "upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Ok(
     Object {
         "received": Number(10),
     },
 )
-== session.upload_commit [Object {"upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_commit Object {"upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Err(
     "Upload(UploadError { code: \"upload_size_mismatch\", subject: \"<upload>\", field: None, received: None })",
 )
-== session.upload_append [Object {"data": String("AA1JSERSAAAAAwAAAAIIAgAAABIW8U0AAAAQSURBVHicY/jPwABBDHAWAEHSBfuH8LlIAAAAAElFTkSuQmCC"), "offset": Number(10), "upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"data": String("AA1JSERSAAAAAwAAAAIIAgAAABIW8U0AAAAQSURBVHicY/jPwABBDHAWAEHSBfuH8LlIAAAAAElFTkSuQmCC"), "offset": Number(10), "upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_append Object {"data": String("AA1JSERSAAAAAwAAAAIIAgAAABIW8U0AAAAQSURBVHicY/jPwABBDHAWAEHSBfuH8LlIAAAAAElFTkSuQmCC"), "offset": Number(10), "upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Ok(
     Object {
         "received": Number(73),
     },
 )
-== session.upload_status [Object {"upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_status Object {"upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Ok(
     Object {
         "received": Number(73),
         "state": String("open"),
     },
 )
-== session.upload_commit [Object {"upload_id": String("eef31517327f2ea903512a0638110f26a80815f634d73d2d320b3d588ba99719")}, Object {"upload_id": String("1803d4889688ee71b02f85120e6b952f32912b787af12f41ac6b2590fc6401f5")}]
+== session.upload_commit Object {"upload_id": String("a2af10f5151ac07507544fa2f8a5b6c2fd412ce613eaf05825c34842785ecf13")}
 Ok(
     Object {
         "bytes": Number(73),
@@ -51,18 +51,18 @@ Ok(
         "state": String("committed"),
     },
 )
-== session.upload_commit [Object {"upload_id": String("no-such-upload")}, Object {"upload_id": String("no-such-upload")}]
+== session.upload_commit Object {"upload_id": String("no-such-upload")}
 Err(
     "Upload(UploadError { code: \"unknown_upload\", subject: \"no-such-upload\", field: None, received: None })",
 )
-== session.upload_status [Object {"upload_id": String("no-such-upload")}, Object {"upload_id": String("no-such-upload")}]
+== session.upload_status Object {"upload_id": String("no-such-upload")}
 Ok(
     Object {
         "received": Number(0),
         "state": String("gone"),
     },
 )
-== session.upload_status [Object {}, Object {}]
+== session.upload_status Object {}
 Err(
     "InvalidParams { field: \"upload_id\", message: \"missing field `upload_id`\" }",
 )

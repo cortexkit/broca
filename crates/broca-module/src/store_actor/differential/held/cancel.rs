@@ -114,7 +114,7 @@ pub(super) async fn position(side: &Side) -> u64 {
 async fn a_parked_held_run_cancels_alike(cipher: Cipher) {
     for at in [RunCancelAt::Now, RunCancelAt::StepBoundary] {
         let mut observations = Vec::new();
-        for store in [false, true] {
+        for store in [true] {
             let side = Side::new(
                 store,
                 cipher,
@@ -217,7 +217,7 @@ async fn a_parked_held_run_cancels_alike(cipher: Cipher) {
             observations.push((format!("{reply:?}"), before));
             assert!(side.registry.stop_and_seal().await);
         }
-        alike!(observations[1], observations[0]);
+        broca_test_support::pin!("alike", observations[0]);
     }
 }
 
@@ -229,7 +229,7 @@ async fn other_parked_pauses_cancel_alike(cipher: Cipher) {
     ] {
         for at in [RunCancelAt::Now, RunCancelAt::StepBoundary] {
             let mut observations = Vec::new();
-            for store in [false, true] {
+            for store in [true] {
                 let side = Side::new(store, cipher, vec![auth_failure()]).await;
                 *side.executor.pause_as.lock().unwrap() = Some(reason);
                 side.send().await;
@@ -267,11 +267,7 @@ async fn other_parked_pauses_cancel_alike(cipher: Cipher) {
                 ));
                 assert!(side.registry.stop_and_seal().await);
             }
-            alike!(
-                observations[1],
-                observations[0],
-                "reason={reason:?}, at={at:?}"
-            );
+            broca_test_support::pin!(format!("reason={reason:?}, at={at:?}"), observations[0]);
         }
     }
 }

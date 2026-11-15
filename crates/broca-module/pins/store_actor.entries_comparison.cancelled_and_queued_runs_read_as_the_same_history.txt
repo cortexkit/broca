@@ -251,7 +251,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== cancelled and queued: from_mid at 1 (the store's id g0479dd0cb4dd2326.5)
+== cancelled and queued: from_mid at 1
 Object {
     "messages": Array [
         Object {
@@ -301,12 +301,12 @@ Object {
     ],
     "newer": Bool(true),
 }
-== cancelled and queued: before_mid at 1 (the store's id g0479dd0cb4dd2326.5)
+== cancelled and queued: before_mid at 1
 Object {
     "messages": Array [],
     "newer": Bool(true),
 }
-== cancelled and queued: from_mid at 3 (the store's id g0479dd0cb4dd2326.12)
+== cancelled and queued: from_mid at 3
 Object {
     "messages": Array [
         Object {
@@ -361,7 +361,7 @@ Object {
     "newer": Bool(true),
     "older": Bool(true),
 }
-== cancelled and queued: before_mid at 3 (the store's id g0479dd0cb4dd2326.12)
+== cancelled and queued: before_mid at 3
 Object {
     "messages": Array [
         Object {
@@ -411,7 +411,7 @@ Object {
     ],
     "newer": Bool(true),
 }
-== cancelled and queued: from_mid at 5 (the store's id g0479dd0cb4dd2326.21)
+== cancelled and queued: from_mid at 5
 Object {
     "messages": Array [
         Object {
@@ -443,7 +443,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== cancelled and queued: before_mid at 5 (the store's id g0479dd0cb4dd2326.21)
+== cancelled and queued: before_mid at 5
 Object {
     "messages": Array [
         Object {
@@ -512,8 +512,6 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
-== cancelled and queued: bind
-String("session_not_held")
 == cancelled and queued: bind from None
 Err(
     Object {
@@ -524,8 +522,6 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
-== cancelled and queued: bind
-String("session_not_held")
 == cancelled and queued: session.entries from Some("ck-mc")
 Err(
     Object {
@@ -536,8 +532,6 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
-== cancelled and queued: session.entries
-String("session_not_held")
 == cancelled and queued: session.applied_view from Some("ck-mc")
 Err(
     Object {
@@ -548,8 +542,6 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
-== cancelled and queued: session.applied_view
-String("session_not_held")
 == cancelled and queued: session.apply_view from Some("ck-mc")
 Err(
     Object {
@@ -560,8 +552,6 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
-== cancelled and queued: session.apply_view
-String("session_not_held")
 == cancelled and queued: session.unknown from Some("ck-mc")
 Err(
     Object {
@@ -572,5 +562,3 @@ Err(
         "message": String("the caller is not this session's compaction provider"),
     },
 )
-== cancelled and queued: session.unknown
-String("session_not_held")

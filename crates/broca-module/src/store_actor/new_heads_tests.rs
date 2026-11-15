@@ -1,9 +1,8 @@
-//! A send creating an agent head starts it in the new storage, in the root backups capture,
-//! whether or not the module creates other sessions there; every other send still starts its
-//! session on today's storage. A head the new storage can't start is refused, before anything is
-//! created in either storage. While a session in the new storage has no run, only the scope whose
-//! stamped `route.bind` reserved its address may start it, refused as today's storage refuses
-//! everyone else, and a session whose creating send was refused is deleted when its actor closes.
+//! A send creating an agent head starts it in the new storage, in its durable class (the folder
+//! backups copy). A head the new storage can't start is refused, before anything is created.
+//! While a session in the new storage has no run, only the scope whose stamped `route.bind`
+//! reserved its address may start it, and a session whose creating send was refused is deleted
+//! when its actor closes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,17 +15,15 @@ use broca_store::session_address::ScopeReservation;
 use broca_wal::StorageClass;
 use serde_json::json;
 
-use super::differential::{BothLoops, TodayLoop};
-use super::tests::{executor, request, text_step, Gated, Inventory};
+use super::tests::{executor, request, text_step, Inventory};
 use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunKind};
 use crate::registry::{LineageRegistry, OpenError, HEAD_SESSION_CLASS};
 
 pub(super) const IDLE: Duration = Duration::from_millis(100);
 
-/// A module over a scratch state root, configured as production configures one: its registry
-/// creates no session in the new storage but a head. Its opener serves the new storage when
-/// `store`, and serves today's storage alone otherwise.
+/// A module over a scratch state root whose registry creates no session in the new storage but a
+/// head. Its opener serves the new storage when `store`.
 pub(super) struct Module {
     dir: PathBuf,
     pub(super) registry: LineageRegistry,
@@ -56,20 +53,7 @@ pub(super) async fn module(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
-        today: TodayLoop {
-            provider: Gated {
-                render_config: None,
-                notes_sends: false,
-                hold: None,
-                inner: broca_core::provider::StubProvider::new(steps.clone()),
-                gate: None,
-            },
-            wal: Arc::clone(&wal),
-            planes: Default::default(),
-        },
-        store: executor(steps, None),
-    });
+    let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, None));
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
         wal.clone(),
@@ -169,13 +153,6 @@ impl Module {
             .collect()
     }
 
-    /// The class of today's folder holding the session's WAL, if one does.
-    fn wal_class(&self) -> Option<StorageClass> {
-        StorageClass::ALL
-            .into_iter()
-            .find(|class| self.wal.class_wal_path(*class, &self.key).is_file())
-    }
-
     fn floor(&self) -> String {
         std::fs::read_to_string(self.dir.join(broca_wal::FEATURE_FLOOR_FILENAME))
             .unwrap_or_default()
@@ -265,34 +242,6 @@ async fn a_head_starts_in_the_durable_root_of_the_new_storage_and_reopens_from_i
     assert_eq!(module.wal.wal_present(&module.key), Some(false));
 }
 
-/// A creating send without the head label and one with another label still start their sessions
-/// on today's storage, and the new storage holds nothing of them. So does one setting retention:
-/// it reaches today's open, which refuses it only because this module keeps no retention clock.
-#[tokio::test]
-async fn every_other_creating_send_still_starts_on_todays_storage() {
-    for (label, class) in [("unlabelled", None), ("worker", Some("worker"))] {
-        let module = module(true, vec![text_step("a1", "hello")], None).await;
-        let first = send(&module, "r1", request("first"), class, None, None)
-            .await
-            .unwrap();
-        assert!(
-            matches!(first, SendOutcome::Active { .. }),
-            "{label}: {first:?}"
-        );
-        module.closed().await;
-        assert_eq!(module.wal_class(), Some(StorageClass::Ordinary), "{label}");
-        assert_eq!(module.store_class(), None, "{label}");
-        assert!(module.store_leftovers().is_empty(), "{label}");
-    }
-    let module = module(true, vec![text_step("a1", "hello")], None).await;
-    let retained = send(&module, "r1", request("first"), None, Some(3600), None).await;
-    assert!(
-        matches!(&retained, Err(OpenError::Open(reason)) if reason == "retention service is not configured"),
-        "{retained:?}"
-    );
-    assert!(module.store_leftovers().is_empty());
-}
-
 /// [`send`] of a head's creating send, asking to be delivered as `delivery`, with the run kind
 /// `kind` and the ordered delivery `order` when given.
 async fn head_send(
@@ -354,18 +303,16 @@ async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answ
         ),
     ];
     for (label, delivery, kind, order) in cases {
-        let today = module(false, vec![text_step("a1", "hello")], None).await;
         let store = module(true, vec![text_step("a1", "hello")], None).await;
-        let old = head_send(&today, request("first"), delivery, kind, order.clone()).await;
         let new = head_send(&store, request("first"), delivery, kind, order).await;
         assert!(
             matches!(
-                old,
+                new,
                 SendOutcome::Active { .. } | SendOutcome::Pending { .. }
             ),
-            "{label}: {old:?}"
+            "{label}: {new:?}"
         );
-        assert_eq!(new, old, "{label}: today's storage answers alike");
+        broca_test_support::pin!(label, new);
         store.closed().await;
         assert_eq!(store.store_class(), Some(StorageClass::Durable), "{label}");
         assert_eq!(store.wal.wal_present(&store.key), Some(false), "{label}");
@@ -385,10 +332,9 @@ async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation
         scope_ref: "head-1".into(),
     };
     let steps = || vec![text_step("a1", "hello"), text_step("a2", "again")];
-    let today = module(false, steps(), Some(&reservation)).await;
     let store = module(true, steps(), Some(&reservation)).await;
     let mut answers = Vec::new();
-    for module in [&today, &store] {
+    for module in [&store] {
         let sent = sent_by("owner", core(), stamped(core(), "head-1", 1));
         let first = send(module, "r1", sent, Some(HEAD_SESSION_CLASS), None, None)
             .await
@@ -424,7 +370,7 @@ async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation
         });
         module.closed().await;
     }
-    assert_eq!(answers[1], answers[0], "today's storage answers alike");
+    broca_test_support::pin!("the later send's answer", answers[0]);
     assert_eq!(store.store_class(), Some(StorageClass::Durable));
     assert_eq!(store.wal.wal_present(&store.key), Some(false));
 }
@@ -442,7 +388,7 @@ fn assert_reserved_for_core(outcome: &SendOutcome, label: &str) {
 
 /// A head whose address core's stamped bind reserved is core's before any run: an unstamped
 /// first send, one stamped with another owner's scope, and one stamped with another of core's
-/// scopes are each refused as today's storage refuses them, with the same outcome. Each refused
+/// scopes are each refused, each answer pinned. Each refused
 /// send created the session to admit it, and the session is gone once its actor closes. Core's
 /// first send, under the reserved scope at a later epoch, is admitted and freezes that epoch.
 #[tokio::test]
@@ -452,7 +398,6 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
         owner: core(),
         scope_ref: "head-1".into(),
     };
-    let today = module(false, steps(), Some(&reservation)).await;
     let store = module(true, steps(), Some(&reservation)).await;
     for (label, principal, scope) in [
         ("unstamped", other(), SendScope::Unstamped),
@@ -464,7 +409,7 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
         ),
     ] {
         let mut outcomes = Vec::new();
-        for module in [&today, &store] {
+        for module in [&store] {
             let sent = sent_by("mine", principal.clone(), scope.clone());
             outcomes.push(
                 send(module, "r1", sent, Some(HEAD_SESSION_CLASS), None, None)
@@ -472,11 +417,8 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
                     .unwrap(),
             );
         }
-        assert_reserved_for_core(&outcomes[1], label);
-        assert_eq!(
-            outcomes[1], outcomes[0],
-            "{label}: today's storage answers alike"
-        );
+        assert_reserved_for_core(&outcomes[0], label);
+        broca_test_support::pin!(label, outcomes[0]);
         store.closed().await;
         assert!(
             store.store_leftovers().is_empty(),
@@ -485,7 +427,7 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
         );
         assert_eq!(store.wal.wal_present(&store.key), Some(false), "{label}");
     }
-    for module in [&today, &store] {
+    for module in [&store] {
         let sent = sent_by("owner", core(), stamped(core(), "head-1", 5));
         let first = send(module, "r1", sent, Some(HEAD_SESSION_CLASS), None, None)
             .await
@@ -508,18 +450,16 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
 }
 
 /// A reservation whose row no longer decodes refuses a head's first send as transient, never as
-/// unreserved, on the new storage as on today's, and the session that send created is gone once
-/// its actor closes.
+/// unreserved, and the session that send created is gone once its actor closes.
 #[tokio::test]
 async fn an_undecodable_reservation_refuses_a_head_send_as_transient() {
     let reservation = ScopeReservation {
         owner: core(),
         scope_ref: "head-1".into(),
     };
-    let today = module(false, vec![text_step("a1", "hello")], Some(&reservation)).await;
     let store = module(true, vec![text_step("a1", "hello")], Some(&reservation)).await;
     let mut outcomes = Vec::new();
-    for module in [&today, &store] {
+    for module in [&store] {
         module.inventory.damage(&module.key);
         let sent = sent_by("mine", other(), SendScope::Unstamped);
         outcomes.push(
@@ -528,14 +468,14 @@ async fn an_undecodable_reservation_refuses_a_head_send_as_transient() {
                 .unwrap(),
         );
     }
-    match &outcomes[1] {
+    match &outcomes[0] {
         SendOutcome::Transient(reason) => assert!(
             reason.starts_with("cannot read the session's scope reservation:"),
             "{reason}"
         ),
         other => panic!("expected a transient refusal, got {other:?}"),
     }
-    assert_eq!(outcomes[1], outcomes[0], "today's storage answers alike");
+    broca_test_support::pin!("the refusal", outcomes[0]);
     store.closed().await;
     assert!(store.store_leftovers().is_empty());
 }

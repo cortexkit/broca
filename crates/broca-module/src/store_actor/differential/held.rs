@@ -21,7 +21,7 @@ mod sign_in;
 
 #[tokio::test]
 async fn run_awaits_held_call_is_active_on_all_surfaces() {
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(
             store,
             Cipher::None,
@@ -51,7 +51,7 @@ async fn run_awaits_terminal_errors_match_status_head_result_and_both_controls()
         ("message-runner", "transient", "response_deadline", "the ChatGPT backend ended the response at its 900 s limit; send a smaller turn or lower reasoning effort", None, "nobody"),
         ("message-withheld", "permanent", "request_invalid", "websocket error: response body omitted", Some(400), "nobody"),
     ] {
-        for store in [false, true] {
+        for store in [true] {
             let error = serde_json::from_value(json!({"class":class, "provider_code":code, "message":message, "status":status})).unwrap();
             let side = Side::new(store, Cipher::None, vec![vec![NormalizedEvent::Control(
                 broca_protocol::provider::ProviderControl::Error { error, retries_used: 0 }
@@ -76,7 +76,7 @@ async fn run_awaits_terminal_errors_match_status_head_result_and_both_controls()
 
 #[tokio::test]
 async fn run_awaits_unknown_error_code_keeps_every_surface_readable() {
-    for store in [false, true] {
+    for store in [true] {
         let error = serde_json::from_value(json!({"class":"permanent", "message":"synthetic error without a provider code", "status":400})).unwrap();
         let side = Side::new(
             store,
@@ -727,7 +727,7 @@ async fn a_held_pause_keeps_a_queued_interrupt_parked_after_restart(cipher: Ciph
     let mut statuses = Vec::new();
     let mut results = Vec::new();
     let mut queues = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store, cipher, vec![super::super::tests::read_step("m1")]).await;
         side.send().await;
         side.idle().await;
@@ -755,9 +755,9 @@ async fn a_held_pause_keeps_a_queued_interrupt_parked_after_restart(cipher: Ciph
         initial.push(side);
         restarted.push(recovered);
     }
-    alike!(statuses[1], statuses[0]);
-    alike!(results[1], results[0]);
-    alike!(queues[1], queues[0]);
+    broca_test_support::pin!("alike", statuses[0]);
+    broca_test_support::pin!("alike", results[0]);
+    broca_test_support::pin!("alike", queues[0]);
     for side in initial.iter().chain(&restarted) {
         assert!(side.registry.stop_and_seal().await);
     }
@@ -773,7 +773,7 @@ async fn a_stop_yielded_hold_survives_the_seal_and_restart(cipher: Cipher) {
 
 async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
     let mut initial = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store, cipher, vec![super::super::tests::read_step("m1")]).await;
         side.executor.tools.1.store(yield_at_stop, Ordering::SeqCst);
         side.send().await;
@@ -791,14 +791,11 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
         side.idle().await;
         initial.push(side);
     }
-    let before = [initial[0].status().await, initial[1].status().await];
-    alike!(comparable(before[1].clone()), comparable(before[0].clone()));
-    assert_eq!(before[1]["state"], "active");
-    assert_eq!(before[1]["held_calls"].as_array().unwrap().len(), 1);
-    alike!(
-        comparable(initial[1].result().await),
-        comparable(initial[0].result().await)
-    );
+    let before = initial[0].status().await;
+    broca_test_support::pin!("alike", comparable(before.clone()));
+    assert_eq!(before["state"], "active");
+    assert_eq!(before["held_calls"].as_array().unwrap().len(), 1);
+    broca_test_support::pin!("alike", comparable(initial[0].result().await));
     let mut restarted = Vec::new();
     for side in &initial {
         if yield_at_stop {
@@ -817,19 +814,6 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
                 let run = session.operations.run.as_ref().unwrap();
                 assert!(run.finished.is_none(), "shutdown must not end the held run");
                 assert_eq!(run.paused, Some(broca_protocol::PauseReason::ToolHeld));
-            } else {
-                let records = side.executor.wal.read_records(&side.key).unwrap();
-                assert!(records.iter().any(|frame| matches!(
-                    frame.record,
-                    broca_wal::WalRecord::ToolCallProviderHeld { .. }
-                )));
-                assert!(
-                    !records.iter().any(|frame| matches!(
-                        frame.record,
-                        broca_wal::WalRecord::RunFinished { .. }
-                    )),
-                    "no terminal before same-run resume"
-                );
             }
         }
         restarted.push(side.restarted().await);
@@ -845,10 +829,7 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
             "opening must not redispatch"
         );
     }
-    alike!(
-        comparable(restarted[1].status().await),
-        comparable(restarted[0].status().await)
-    );
+    broca_test_support::pin!("alike", comparable(restarted[0].status().await));
     for side in &restarted {
         let status = side.status().await;
         let key = status["held_calls"][0]["call_key"].as_str().unwrap();
@@ -877,16 +858,16 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
         assert_eq!(side.executor.tools.0.load(Ordering::SeqCst), 1);
         assert_eq!(side.executor.provider.inner.calls().len(), 1);
     }
-    alike!(restarted[1].status().await, restarted[0].status().await);
-    let mut results = [restarted[0].result().await, restarted[1].result().await];
+    broca_test_support::pin!("alike", restarted[0].status().await);
+    let mut results = [restarted[0].result().await];
     for result in &mut results {
         result["final_message"]
             .as_object_mut()
             .unwrap()
             .remove("mid");
     }
-    alike!(results[1], results[0]);
-    assert_eq!(results[1]["state"], "completed");
+    broca_test_support::pin!("alike", results[0]);
+    assert_eq!(results[0]["state"], "completed");
     for side in initial.iter().chain(&restarted) {
         assert!(side.registry.stop_and_seal().await);
     }
@@ -895,7 +876,7 @@ async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
 async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
     let mut restarted = Vec::new();
     let mut originals = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let dir = scratch_dir();
         let key = BindIdentity::new(dir.join("project"), "orphan-comparison", "s1");
         let original = Side::at(
@@ -921,14 +902,6 @@ async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
                 again.recovered, 0,
                 "finished runs must stay closed: {again:?}"
             );
-        } else {
-            let sweep = side.registry.mark_crash_orphans(
-                side.executor.wal.as_ref(),
-                vec![(RunId("r1".into()), side.key.clone())],
-                std::time::SystemTime::now(),
-            );
-            let sweep = side.registry.seal_marked_crash_orphans(sweep).await;
-            assert_eq!(sweep.sealed, 1, "{sweep:?}");
         }
         assert_eq!(
             side.executor.provider.inner.calls().len(),
@@ -939,9 +912,9 @@ async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
         restarted.push(side);
         originals.push(original);
     }
-    alike!(restarted[1].status().await, restarted[0].status().await);
-    alike!(restarted[1].result().await, restarted[0].result().await);
-    assert_eq!(restarted[1].status().await["state"], "interrupted");
+    broca_test_support::pin!("alike", restarted[0].status().await);
+    broca_test_support::pin!("alike", restarted[0].result().await);
+    assert_eq!(restarted[0].status().await["state"], "interrupted");
     for side in originals.iter().chain(&restarted) {
         assert!(side.registry.stop_and_seal().await);
     }
@@ -1173,7 +1146,10 @@ async fn startup_recovery_work_ignores_idle_store_sessions() {
         assert!(counts.1 > 0, "the candidate's real log must be read");
         work.push(counts);
     }
-    alike_today_first!(work[0], work[1]);
+    assert_eq!(
+        work[0], work[1],
+        "the work is the same at either inventory size"
+    );
 }
 
 #[tokio::test]

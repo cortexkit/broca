@@ -1,4 +1,4 @@
-== the store answers as today's
+== the answers
 (
     Ok(
         Object {

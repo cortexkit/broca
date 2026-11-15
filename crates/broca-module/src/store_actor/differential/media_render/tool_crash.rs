@@ -1,17 +1,17 @@
-//! A crash while a planned session's tool call runs, recovered on both storages.
+//! A crash while a planned session's tool call runs, recovered on the new storage.
 //!
 //! The process dies with the call dispatched and no result recorded. A new process seals the
-//! run as the crash's orphan, answering the call as never run, and the session's next run must
-//! send the request today's storage (the session's WAL) sends for it. On a session whose plan names a compaction
-//! provider that request numbers the parts of every message, so it shows whether the recovered
-//! tool turn was numbered as today's storage numbers it.
+//! run as the crash's orphan, answering the call as never run, and the session's next run sends
+//! a request holding that answer, pinned. On a session whose plan names a compaction provider
+//! that request numbers the parts of every message, so it shows how the recovered tool turn is
+//! numbered.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use broca_protocol::content::{AssistantMessage, ContentBlock};
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
-use broca_protocol::{FinishReason, MessageId, RunId, Usage};
+use broca_protocol::{FinishReason, MessageId, Usage};
 use broca_session_store::keys::Cipher;
 use serde_json::json;
 
@@ -91,7 +91,7 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
     let name = format!("planned-crash-{cipher:?}");
     let hold = tool_hold(&name);
     let mut sides = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let reached = hold.reached.load(Ordering::SeqCst);
         let mut side = Rendered::with_compactor(
             store,
@@ -135,24 +135,13 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
             cipher,
         )
         .await;
-        if store {
-            let sweep = side
-                .side
-                .registry
-                .recover_store_crash_orphans()
-                .await
-                .unwrap();
-            assert_eq!((sweep.recovered, sweep.failed.len()), (1, 0), "{sweep:?}");
-        } else {
-            let wal = broca_core::FileWalStore::new(side.side.dir.join("wal"));
-            let marked = side.side.registry.mark_crash_orphans(
-                &wal,
-                vec![(RunId("r1".into()), side.side.key.clone())],
-                std::time::SystemTime::now() + std::time::Duration::from_secs(1),
-            );
-            let sealed = side.side.registry.seal_marked_crash_orphans(marked).await;
-            assert_eq!(sealed.sealed, 1, "{sealed:?}");
-        }
+        let sweep = side
+            .side
+            .registry
+            .recover_store_crash_orphans()
+            .await
+            .unwrap();
+        assert_eq!((sweep.recovered, sweep.failed.len()), (1, 0), "{sweep:?}");
         side.side.idle().await;
         assert!(
             side.sent().is_empty(),
@@ -163,17 +152,9 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
         side.side.idle().await;
         sides.push(side);
     }
-    let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
-    let (old, new) = (today.sent(), store.sent());
-    let shown = |sent: &[Result<Vec<u8>, String>]| {
-        sent.iter()
-            .map(|sent| match sent {
-                Ok(body) => String::from_utf8_lossy(body).into_owned(),
-                Err(code) => format!("refused: {code}"),
-            })
-            .collect::<Vec<_>>()
-    };
-    alike_today_first!(old.len(), 1, "today's next run sent its request");
+    let store = sides.pop().unwrap();
+    let new = store.sent();
+    assert_eq!(new.len(), 1, "the next run sent its request");
     let ended = {
         let runtime = store.side.registry.store_runtime().unwrap();
         let view = runtime
@@ -188,14 +169,7 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
             )
         })
     };
-    assert!(
-        new == old,
-        "the next run's requests after the crash differ; the store's latest {ended:?}\ntoday's: \
-         {:?}\nstore's: {:?}",
-        shown(&old),
-        shown(&new)
-    );
-    for side in [&today, &store] {
-        assert!(side.side.registry.stop_and_seal().await);
-    }
+    assert!(new[0].is_ok(), "the store's latest {ended:?}: {new:?}");
+    super::sent_pinned(&new, "the next run after the crash");
+    assert!(store.side.registry.stop_and_seal().await);
 }

@@ -105,6 +105,41 @@ Object {
         "unreported_steps": Number(0),
     },
 }
+== what the records mean
+[
+    Object {
+        "start": String("r1"),
+    },
+    Object {
+        "error": Null,
+        "pause": String("tool_held"),
+    },
+    Object {
+        "resume": String("r1"),
+    },
+    Object {
+        "result": Object {
+            "is_error": Bool(false),
+            "output": Object {
+                "kind": String("text"),
+                "text": String("late answer"),
+            },
+            "tool_call_id": String("c1"),
+        },
+    },
+    Object {
+        "batch_end": Bool(true),
+    },
+    Object {
+        "error": Object {
+            "class": String("auth_required"),
+            "credential_id": String("oauth:stub:synthetic"),
+            "message": String("Sign in to the synthetic account again"),
+            "provider_code": String("needs_reauth"),
+        },
+        "pause": String("auth_required"),
+    },
+]
 == control stream
 sha256:ea1b3fc9fbed8305163c9802cda0cf7e512b2ab358648fb15ab9368108502a2a (3454 bytes)
 == alike
@@ -202,5 +237,47 @@ Object {
         "unreported_steps": Number(0),
     },
 }
+== what the records mean
+[
+    Object {
+        "start": String("r1"),
+    },
+    Object {
+        "error": Null,
+        "pause": String("tool_held"),
+    },
+    Object {
+        "resume": String("r1"),
+    },
+    Object {
+        "result": Object {
+            "is_error": Bool(false),
+            "output": Object {
+                "kind": String("text"),
+                "text": String("late answer"),
+            },
+            "tool_call_id": String("c1"),
+        },
+    },
+    Object {
+        "batch_end": Bool(true),
+    },
+    Object {
+        "error": Object {
+            "class": String("auth_required"),
+            "credential_id": String("oauth:stub:synthetic"),
+            "message": String("Sign in to the synthetic account again"),
+            "provider_code": String("needs_reauth"),
+        },
+        "pause": String("auth_required"),
+    },
+    Object {
+        "resume": String("r1"),
+    },
+    Object {
+        "end": String("completed"),
+        "error": Null,
+    },
+]
 == control stream
 sha256:c42af6ac25f0565e9a1b87fee71ff8ecf720b65bdbe2e51b3da0500754a9018c (4520 bytes)

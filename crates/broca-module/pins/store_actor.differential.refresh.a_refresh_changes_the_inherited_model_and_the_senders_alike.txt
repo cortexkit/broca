@@ -1,16 +1,16 @@
-== alike
+== the answers
 [
     "active",
     "Accepted { run_in_progress: false, applies_from_next_run: false }",
     "active",
 ]
-== alike
+== the baselines
 [
     "Ok({\"state\":\"ready\",\"baseline\":{\"items\":[],\"composition_digest\":\"7eb0315e39b8fe5a206e065e76a8d260dbba65e29006d56dfa68be7655f2ec02\",\"tool_names\":[\"read\"],\"accepted_generation\":0,\"applied_generation\":0,\"rungs\":{\"tools\":[\"on_prefix_rebuild\",\"immediately\"],\"system_text\":[\"on_prefix_rebuild\",\"immediately\"]}}}) | Err(ScopeRefused(OwnerMismatch(FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"occipital\" }) })))",
     "Ok({\"state\":\"ready\",\"baseline\":{\"items\":[],\"composition_digest\":\"7eb0315e39b8fe5a206e065e76a8d260dbba65e29006d56dfa68be7655f2ec02\",\"tool_names\":[\"read\"],\"accepted_generation\":1,\"applied_generation\":0,\"pending\":{\"generation\":1,\"policy\":\"on_prefix_rebuild\"},\"rungs\":{\"tools\":[\"on_prefix_rebuild\",\"immediately\"],\"system_text\":[\"on_prefix_rebuild\",\"immediately\"]}}}) | Err(ScopeRefused(OwnerMismatch(FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"occipital\" }) })))",
     "Ok({\"state\":\"ready\",\"baseline\":{\"items\":[],\"composition_digest\":\"7eb0315e39b8fe5a206e065e76a8d260dbba65e29006d56dfa68be7655f2ec02\",\"tool_names\":[\"read\"],\"accepted_generation\":1,\"applied_generation\":1,\"effective\":{\"generation\":1,\"applied_by\":\"fold\",\"manifest_digest\":\"87c97741b980c58bb80788bf91feb2504f79c9720c4f7f5d26555d50b7d63519\",\"composition_digest\":\"7eb0315e39b8fe5a206e065e76a8d260dbba65e29006d56dfa68be7655f2ec02\"},\"rungs\":{\"tools\":[\"on_prefix_rebuild\",\"immediately\"],\"system_text\":[\"on_prefix_rebuild\",\"immediately\"]}}}) | Err(ScopeRefused(OwnerMismatch(FirstPrincipal { first: Reserved { module_id: \"prefrontal-core\" }, presented_principal: Some(Reserved { module_id: \"occipital\" }) })))",
 ]
-== alike
+== the runs
 [
     (
         "r1",
@@ -27,11 +27,11 @@
         "m2",
     ),
 ]
-== alike
+== the refreshes applied
 [
     1,
 ]
-== heads differ for None
+== head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -75,7 +75,7 @@ Object {
         "unreported_steps": Number(0),
     },
 }
-== heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -129,7 +129,7 @@ Object {
         "unreported_steps": Number(0),
     },
 }
-== heads differ for Some(Reserved { module_id: "occipital" })
+== head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {

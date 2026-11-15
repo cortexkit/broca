@@ -1,17 +1,17 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 1: replies differ
+== step 1: reply
 Pending {
     submission_id: SubmissionId(
         "sub-r2",
     ),
 }
-== step 2: replies differ
+== step 2: reply
 Pending {
     submission_id: SubmissionId(
         "sub-r3",
@@ -19,14 +19,14 @@ Pending {
 }
 == control stream
 sha256:632b9af08238da2bba33f75b0c85db595cae8313a0a93d85c5465d7ce9d2ce4f (3836 bytes)
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
     "third",
     "again",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 [
     Object {
         "model": Object {

@@ -1,11 +1,11 @@
-== alike
+== reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== between the runs the compaction provider was told different things
+== what the compaction provider was told between the runs
 [
     Object {
         "entries": Array [],
@@ -28,14 +28,14 @@ Active {
         "seq": Number(2),
     },
 ]
-== alike
+== reply
 Active {
     run_id: RunId(
         "r2",
     ),
     delivered: None,
 }
-== alike
+== compaction calls
 [
     Object {
         "entries": Array [],
@@ -74,13 +74,13 @@ Active {
 ]
 == control stream
 sha256:aeb36917b6cd1a396f6d81e2ec45a67ca542ead5d4b4b3d1ddb70f42e8f0b380 (4471 bytes)
-== the conversations differ
+== the conversation
 [
     "first",
     "second",
     "again",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "compaction_plan_version": Number(4),
@@ -97,7 +97,7 @@ sha256:aeb36917b6cd1a396f6d81e2ec45a67ca542ead5d4b4b3d1ddb70f42e8f0b380 (4471 by
         "tools_were_omitted": Bool(true),
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",

@@ -1,29 +1,29 @@
-== the first send's replies differ
+== the first send's reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== the replies to r-k1 differ
+== the reply to r-k1
 Pending {
     submission_id: SubmissionId(
         "sub-r-k1",
     ),
 }
-== the replies to r-k2 differ
+== the reply to r-k2
 Pending {
     submission_id: SubmissionId(
         "sub-r-k2",
     ),
 }
-== the replies to r-k3 differ
+== the reply to r-k3
 Pending {
     submission_id: SubmissionId(
         "sub-r-k3",
     ),
 }
-== the replies to r-k1 differ
+== the reply to r-k1
 SendEnded {
     submission_id: SubmissionId(
         "sub-r-k1",
@@ -34,7 +34,7 @@ SendEnded {
         ),
     },
 }
-== the retries of k1 differ
+== the retry of k1
 SendEnded {
     submission_id: SubmissionId(
         "sub-r-k1",
@@ -45,7 +45,7 @@ SendEnded {
         ),
     },
 }
-== the retries of k2 differ
+== the retry of k2
 Finished {
     run_id: RunId(
         "r1",
@@ -64,7 +64,7 @@ Finished {
         },
     ),
 }
-== the retries of k3 differ
+== the retry of k3
 Finished {
     run_id: RunId(
         "r1",
@@ -271,18 +271,18 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:3f48b129a5a8ffdf5906772214f0bc86de10efb75988f47e709937a4b98f6377 (4166 bytes)
-== the sessions recorded their sends differently
+== the sends the session recorded
 sha256:8dafccab10a5b1041e546f7c5cf671e76d022961d8af9834de05626448a66031 (2424 bytes)
-== the sessions hold different sends queued
+== the sends queued
 []
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "first",
     "also this",
     "done",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "model": Object {
@@ -306,7 +306,7 @@ sha256:8dafccab10a5b1041e546f7c5cf671e76d022961d8af9834de05626448a66031 (2424 by
         "title": Null,
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",

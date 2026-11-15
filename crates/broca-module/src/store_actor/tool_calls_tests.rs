@@ -1,11 +1,9 @@
-//! `run.tool_calls` of a session kept in the new storage, compared with today's replies for the
-//! same sends through the module's registry, in both of the new storage's modes.
+//! `run.tool_calls` of a session kept in the new storage, through the module's registry, in both
+//! of the new storage's modes.
 //!
-//! Each scenario drives the same sends through a module on today's storage and one on the new
-//! storage, then compares the pages as JSON with only what each storage keeps for itself taken
-//! out: each call's key, which each storage mints for its own log (kept as whether it is
-//! present), and the `next` cursor, which names each storage's own positions (kept as whether it
-//! is present, and followed on each side to compare every page).
+//! Each page is pinned (see `broca_test_support::pins`) with what the storage mints for itself
+//! taken out: each call's key (kept as whether it is present), and the `next` cursor, which names
+//! the log's own positions (kept as whether it is present, and followed to read every page).
 
 use std::sync::Arc;
 
@@ -19,14 +17,14 @@ use cortexkit_role_llm_runner::tool_calls::{ToolCallsPage, ToolCallsRequest};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
-use super::differential::{BothLoops, TodayLoop, IDLE};
-use super::tests::{executor, read_step, request, text_step, Gated, Planes};
+use super::differential::IDLE;
+use super::tests::{executor, read_step, request, text_step, Planes};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
 use crate::serve::{ServeError, ServeHandler};
 
-/// One module over a scratch folder: on today's storage, or on the new one (`store`).
+/// One module over a scratch folder, whose sessions start in the new storage when `store`.
 struct Side {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
@@ -82,20 +80,7 @@ async fn side_at(
     };
     let mut store_loop = executor(steps.clone(), None);
     store_loop.planes = planes.clone();
-    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
-        today: TodayLoop {
-            provider: Gated {
-                render_config: None,
-                notes_sends: false,
-                hold: None,
-                inner: broca_core::provider::StubProvider::new(steps),
-                gate: None,
-            },
-            wal: Arc::clone(&wal),
-            planes,
-        },
-        store: store_loop,
-    });
+    let executor: Arc<dyn RunExecutor> = Arc::new(store_loop);
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher),
@@ -132,25 +117,27 @@ async fn side_at(
     }
 }
 
-/// Today's side and the new storage's in mode `cipher`, over the same script, each with its own
-/// gate on tool dispatches when `gated`.
+/// The new storage's side over the script, and its gate when `gated`.
 async fn pair(
     steps: impl Fn() -> Vec<Vec<NormalizedEvent>>,
     gated: bool,
     cipher: Cipher,
-) -> [(Side, Option<ToolGate>); 2] {
-    let gate = || gated.then(tool_gate);
-    let (today_gate, store_gate) = (gate(), gate());
-    [
-        (
-            side_at(scratch(), false, steps(), today_gate.clone(), cipher).await,
-            today_gate,
-        ),
-        (
-            side_at(scratch(), true, steps(), store_gate.clone(), cipher).await,
-            store_gate,
-        ),
-    ]
+) -> (Side, Option<ToolGate>) {
+    let store_gate = gated.then(tool_gate);
+    (
+        side_at(scratch(), true, steps(), store_gate.clone(), cipher).await,
+        store_gate,
+    )
+}
+
+/// A side on the new storage, over the script.
+async fn side(
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<ToolGate>,
+    cipher: Cipher,
+) -> Side {
+    side_at(scratch(), store, steps, gate, cipher).await
 }
 
 impl Side {
@@ -317,8 +304,8 @@ async fn finished_runs_list_their_calls_alike() {
                 text_step("a4", "again"),
             ]
         };
-        let [(today, _), (store, _)] = pair(steps, false, cipher).await;
-        for side in [&today, &store] {
+        let (store, _) = pair(steps, false, cipher).await;
+        for side in [&store] {
             for (run, text) in [("r1", "first"), ("r2", "second")] {
                 assert!(matches!(
                     side.send(run, text).await,
@@ -335,8 +322,8 @@ async fn finished_runs_list_their_calls_alike() {
             ("r2", None),
             ("unknown", None),
         ] {
-            let pages = [today.pages(run, limit).await, store.pages(run, limit).await];
-            assert_eq!(pages[1], pages[0], "{run} by {limit:?}, {}", cipher.label());
+            let pages = store.pages(run, limit).await;
+            broca_test_support::pin!(format!("{run} by {limit:?}, {}", cipher.label()), pages);
         }
         let whole = store.pages("r1", None).await;
         assert_eq!(
@@ -345,15 +332,17 @@ async fn finished_runs_list_their_calls_alike() {
             "{whole:?}"
         );
         assert_eq!(store.pages("r1", Some(1)).await.len(), 3);
-        // Each storage's cursors name its own log.
+        // A session's cursors name its own log: another session's cursor is refused.
+        let other = side(true, steps(), None, cipher).await;
+        for (run, text) in [("r1", "first"), ("r2", "second")] {
+            other.send(run, text).await;
+            other.idle().await;
+        }
         let cursor = |page: Result<ToolCallsPage, ServeError>| page.unwrap().next.unwrap();
-        let from_today = cursor(today.calls("r1", None, Some(1)).await);
-        let from_store = cursor(store.calls("r1", None, Some(1)).await);
-        for (side, after) in [(&store, from_today), (&today, from_store)] {
-            match side.calls("r1", Some(after), None).await {
-                Err(ServeError::InvalidParams { field, .. }) => assert_eq!(field, "after"),
-                other => panic!("a cursor from another log: {other:?}"),
-            }
+        let from_other = cursor(other.calls("r1", None, Some(1)).await);
+        match store.calls("r1", Some(from_other), None).await {
+            Err(ServeError::InvalidParams { field, .. }) => assert_eq!(field, "after"),
+            other => panic!("a cursor from another log: {other:?}"),
         }
     }
 }
@@ -364,8 +353,8 @@ async fn finished_runs_list_their_calls_alike() {
 async fn a_repeated_call_id_lists_alike() {
     for cipher in Cipher::ALL {
         let steps = || vec![reads("a1", &["c1", "c1"]), text_step("a2", "done")];
-        let [(today, _), (store, _)] = pair(steps, false, cipher).await;
-        for side in [&today, &store] {
+        let (store, _) = pair(steps, false, cipher).await;
+        for side in [&store] {
             assert!(matches!(
                 side.send("r1", "first").await,
                 SendOutcome::Active { .. }
@@ -373,11 +362,8 @@ async fn a_repeated_call_id_lists_alike() {
             side.idle().await;
         }
         for limit in [None, Some(1)] {
-            let pages = [
-                today.pages("r1", limit).await,
-                store.pages("r1", limit).await,
-            ];
-            assert_eq!(pages[1], pages[0], "by {limit:?}, {}", cipher.label());
+            let pages = store.pages("r1", limit).await;
+            broca_test_support::pin!(format!("by {limit:?}, {}", cipher.label()), pages);
         }
         let page = store.calls("r1", None, None).await.unwrap();
         let outcomes: Vec<&str> = page
@@ -405,8 +391,8 @@ async fn a_repeated_call_id_lists_alike() {
 async fn a_batch_in_flight_lists_alike() {
     for cipher in Cipher::ALL {
         let steps = || vec![read_step("a1"), read_step("a2"), text_step("a3", "done")];
-        let [(today, today_gate), (store, store_gate)] = pair(steps, true, cipher).await;
-        for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
+        let (store, store_gate) = pair(steps, true, cipher).await;
+        for (side, gate) in [(&store, &store_gate)] {
             assert!(matches!(
                 side.send("r1", "first").await,
                 SendOutcome::Active { .. }
@@ -423,25 +409,17 @@ async fn a_batch_in_flight_lists_alike() {
             .await;
         }
         for limit in [None, Some(1)] {
-            let pages = [
-                today.pages("r1", limit).await,
-                store.pages("r1", limit).await,
-            ];
-            assert_eq!(
-                pages[1],
-                pages[0],
-                "in flight by {limit:?}, {}",
-                cipher.label()
-            );
+            let pages = store.pages("r1", limit).await;
+            broca_test_support::pin!(format!("in flight by {limit:?}, {}", cipher.label()), pages);
         }
-        for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
+        for (side, gate) in [(&store, &store_gate)] {
             gate.as_ref().unwrap().1.notify_one();
             side.idle().await;
         }
-        let pages = [today.pages("r1", None).await, store.pages("r1", None).await];
-        assert_eq!(pages[1], pages[0], "finished, {}", cipher.label());
+        let pages = store.pages("r1", None).await;
+        broca_test_support::pin!(format!("finished, {}", cipher.label()), pages);
         assert_eq!(
-            outcomes(&pages[1][0]),
+            outcomes(&pages[0]),
             [json!("succeeded"), json!("succeeded")]
         );
     }
@@ -488,42 +466,28 @@ async fn crash_mid_dispatch(dir: std::path::PathBuf, store: bool, cipher: Cipher
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_a_crash_cut_off_lists_as_indeterminate_alike() {
     for cipher in Cipher::ALL {
-        let (today_dir, store_dir) = (scratch(), scratch());
-        crash_mid_dispatch(today_dir.clone(), false, cipher).await;
+        let store_dir = scratch();
         crash_mid_dispatch(store_dir.clone(), true, cipher).await;
-        let today = side_at(today_dir, false, Vec::new(), None, cipher).await;
         let store = side_at(store_dir, true, Vec::new(), None, cipher).await;
         assert!(store.stored_in(cipher), "{}", cipher.label());
-        today.registry.status(&today.key).await.unwrap();
-        let before = [today.pages("r1", None).await, store.pages("r1", None).await];
+        let before = store.pages("r1", None).await;
         assert!(store.registry.slot_state(&store.key).is_some());
-        assert_eq!(
-            before[1],
-            before[0],
-            "the recovering read, {}",
-            cipher.label()
-        );
-        assert_eq!(outcomes(&before[1][0]), [json!("indeterminate")]);
+        broca_test_support::pin!(format!("the recovering read, {}", cipher.label()), before);
+        assert_eq!(outcomes(&before[0]), [json!("indeterminate")]);
         assert!(
-            before[1][0]["calls"][0]["result_bytes"].is_u64(),
+            before[0]["calls"][0]["result_bytes"].is_u64(),
             "the read recorded the call's unknown-outcome result"
         );
         // Explicit status and actor eviction must not change what the recovering read answered.
-        for side in [&today, &store] {
+        for side in [&store] {
             side.registry.status(&side.key).await.unwrap();
             side.closed().await;
         }
-        let after = [today.pages("r1", None).await, store.pages("r1", None).await];
-        assert_eq!(after[1], before[1], "the recovered read is stable");
-        assert_eq!(
-            after[1],
-            after[0],
-            "once the open closed it, {}",
-            cipher.label()
-        );
-        assert_eq!(outcomes(&after[1][0]), [json!("indeterminate")]);
+        let after = store.pages("r1", None).await;
+        assert_eq!(after, before, "the recovered read is stable");
+        assert_eq!(outcomes(&after[0]), [json!("indeterminate")]);
         assert!(
-            after[1][0]["calls"][0]["result_bytes"].is_u64(),
+            after[0]["calls"][0]["result_bytes"].is_u64(),
             "the open recorded the call's unknown-outcome result"
         );
     }

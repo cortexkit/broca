@@ -1,3 +1,32 @@
+== while k1 runs and k2 waits
+[
+    Object {
+        "baseline": Object {
+            "accepted_generation": Number(0),
+            "applied_generation": Number(0),
+            "items": Array [],
+            "rungs": Object {
+                "system_text": Array [
+                    String("on_prefix_rebuild"),
+                    String("immediately"),
+                ],
+                "tools": Array [
+                    String("on_prefix_rebuild"),
+                    String("immediately"),
+                ],
+            },
+            "tool_names": Array [
+                String("read"),
+            ],
+        },
+        "run_id": String("r-k1"),
+        "state": String("active"),
+    },
+    Object {
+        "state": String("pending"),
+        "submission_id": String("sub-r-k2"),
+    },
+]
 == send.status k1
 Object {
     "baseline": Object {

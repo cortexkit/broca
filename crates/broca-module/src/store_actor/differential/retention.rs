@@ -13,7 +13,6 @@ struct Retained {
     module: Module,
     service: Arc<RetentionService>,
     runtime: Arc<crate::store_open::StoreRuntime>,
-    executor: Arc<dyn RunExecutor>,
 }
 
 async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Notify>>) -> Retained {
@@ -38,20 +37,7 @@ async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Not
         .unwrap(),
     );
     let steps = [hello(), hello()].concat();
-    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
-        today: TodayLoop {
-            provider: Gated {
-                inner: broca_core::provider::StubProvider::new(steps.clone()),
-                gate: gate.clone(),
-                render_config: None,
-                notes_sends: false,
-                hold: None,
-            },
-            wal: wal.clone(),
-            planes: Default::default(),
-        },
-        store: executor(steps, gate),
-    });
+    let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, gate));
     let runtime = Arc::new(
         crate::store_open::StoreRuntime::open(
             &dir,
@@ -88,7 +74,6 @@ async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Not
         },
         service,
         runtime,
-        executor,
     }
 }
 
@@ -193,129 +178,78 @@ impl Retained {
 }
 
 async fn retained_creating_sends_validate_alike(cipher: Cipher) {
-    let old = retained(false, cipher, TTL, None).await;
     let new = retained(true, cipher, TTL, None).await;
-    let old_invalid = old.send("invalid", Some(0)).await.unwrap_err();
     let new_invalid = new.send("invalid", Some(0)).await.unwrap_err();
-    assert_eq!(new_invalid.to_string(), old_invalid.to_string());
+    broca_test_support::pin!("an invalid retention", new_invalid.to_string());
     assert!(!new.runtime.holds(&new.module.key).unwrap());
-    alike!(
-        new.send("r1", Some(SECONDS)).await.unwrap(),
-        old.send("r1", Some(SECONDS)).await.unwrap()
-    );
+    broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     assert!(
         new.runtime.holds(&new.module.key).unwrap(),
         "a retained creating send must use the new storage"
     );
-    old.idle().await;
     new.idle().await;
-    alike!(
-        new.send("changed", Some(SECONDS + 1)).await.unwrap(),
-        old.send("changed", Some(SECONDS + 1)).await.unwrap()
+    broca_test_support::pin!(
+        "alike",
+        new.send("changed", Some(SECONDS + 1)).await.unwrap()
     );
-    alike!(
-        new.send("r2", Some(SECONDS)).await.unwrap(),
-        old.send("r2", Some(SECONDS)).await.unwrap()
-    );
-    old.idle().await;
+    broca_test_support::pin!("alike", new.send("r2", Some(SECONDS)).await.unwrap());
     new.idle().await;
-    old.stop().await;
     new.stop().await;
 }
 
 async fn swept_retained_reads_and_fresh_sends_match(cipher: Cipher) {
-    let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
-    alike!(
-        new.send("r1", Some(SECONDS)).await.unwrap(),
-        old.send("r1", Some(SECONDS)).await.unwrap()
-    );
-    old.module.closed().await;
+    broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
-    for rig in [&old, &new] {
-        rig.advance(deadline);
-        assert_eq!(rig.module.registry.sweep_once(deadline).await.unwrap(), 1);
-        rig.expired_read(deadline).await;
-    }
-    alike!(
-        new.send("r2", Some(SECONDS)).await.unwrap(),
-        old.send("r2", Some(SECONDS)).await.unwrap()
-    );
+    new.advance(deadline);
+    assert_eq!(new.module.registry.sweep_once(deadline).await.unwrap(), 1);
+    new.expired_read(deadline).await;
+    broca_test_support::pin!("alike", new.send("r2", Some(SECONDS)).await.unwrap());
     assert!(new.runtime.holds(&new.module.key).unwrap());
-    old.module.closed().await;
     new.module.closed().await;
-    for rig in [&old, &new] {
-        let error = rig
-            .module
-            .registry
-            .check_expired(&rig.module.key, Some("r1"))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, crate::registry::OpenError::Expired { expired_at_ms } if expired_at_ms == deadline)
-        );
-        assert!(rig
-            .module
-            .registry
-            .read(SessionReadRequest::new(rig.module.key.clone(), None, None))
-            .await
-            .is_ok());
-    }
-    old.stop().await;
+    let error = new
+        .module
+        .registry
+        .check_expired(&new.module.key, Some("r1"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::registry::OpenError::Expired { expired_at_ms } if expired_at_ms == deadline)
+    );
+    assert!(new
+        .module
+        .registry
+        .read(SessionReadRequest::new(new.module.key.clone(), None, None))
+        .await
+        .is_ok());
     new.stop().await;
 }
 
 async fn closed_retained_sessions_expire_before_any_sweep_alike(cipher: Cipher) {
-    let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
-    alike!(
-        new.send("r1", Some(SECONDS)).await.unwrap(),
-        old.send("r1", Some(SECONDS)).await.unwrap()
-    );
-    old.module.closed().await;
+    broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
-    old.advance(deadline);
     new.advance(deadline);
     assert!(new.runtime.holds(&new.module.key).unwrap());
-    old.expired_read(deadline).await;
     new.expired_read(deadline).await;
-    alike!(
-        new.send("r2", Some(SECONDS)).await.unwrap(),
-        old.send("r2", Some(SECONDS)).await.unwrap()
-    );
-    old.module.closed().await;
+    broca_test_support::pin!("alike", new.send("r2", Some(SECONDS)).await.unwrap());
     new.module.closed().await;
     assert!(new.runtime.holds(&new.module.key).unwrap());
     assert_eq!(
         new.runtime.expiry_markers(&new.module.key).unwrap()[0].expired_at_ms,
         deadline
     );
-    old.stop().await;
     new.stop().await;
 }
 
 async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
-    let old = retained(false, cipher, TTL, None).await;
     let new = retained(true, cipher, TTL, None).await;
-    alike!(
-        new.send("r1", Some(SECONDS)).await.unwrap(),
-        old.send("r1", Some(SECONDS)).await.unwrap()
-    );
-    old.idle().await;
+    broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     new.idle().await;
     assert!(new.module.registry.slot_state(&new.module.key).is_some());
-    let (old_sink, mut old_stream) = mpsc::channel(64);
     let (new_sink, mut new_stream) = mpsc::channel(64);
-    alike_today_first!(
-        old.module
-            .registry
-            .route_subscribe_live(&old.module.key, old_sink)
-            .await
-            .unwrap(),
-        crate::actor::SubscribeOutcome::Attached
-    );
     assert_eq!(
         new.module
             .registry
@@ -325,60 +259,33 @@ async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
         crate::actor::SubscribeOutcome::Attached
     );
     let deadline = NOW + SECONDS * 1000;
-    old.advance(deadline);
     new.advance(deadline);
-    old.deleted().await;
     new.deleted().await;
-    for stream in [&mut old_stream, &mut new_stream] {
-        broca_test_support::wait_until("subscriber receives the expiry terminal", || {
-            std::future::ready(match stream.try_recv() {
-                Ok(crate::fanout::Delivery::Expired { expired_at_ms }) => {
-                    assert_eq!(expired_at_ms, deadline);
-                    Ok(())
-                }
-                other => Err(format!("{other:?}")),
-            })
+    broca_test_support::wait_until("subscriber receives the expiry terminal", || {
+        std::future::ready(match new_stream.try_recv() {
+            Ok(crate::fanout::Delivery::Expired { expired_at_ms }) => {
+                assert_eq!(expired_at_ms, deadline);
+                Ok(())
+            }
+            other => Err(format!("{other:?}")),
         })
-        .await;
-    }
-    old.expired_read(deadline).await;
+    })
+    .await;
     new.expired_read(deadline).await;
-    old.stop().await;
     new.stop().await;
 }
 
 async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher) {
     use broca_session_store::backend::SessionAddr;
     use broca_wal::StorageClass;
-    let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
-    old.send("r1", Some(SECONDS)).await.unwrap();
     new.send("r1", Some(SECONDS)).await.unwrap();
-    old.module.closed().await;
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
-    for rig in [&old, &new] {
-        rig.advance(deadline);
-        assert_eq!(rig.module.registry.sweep_once(deadline).await.unwrap(), 1);
-    }
+    new.advance(deadline);
+    assert_eq!(new.module.registry.sweep_once(deadline).await.unwrap(), 1);
     // Simulate an older deleted session whose numbers are above the most recent one's. Its
     // content is already gone; only the durable floors may decide the next session's numbers.
-    let dir = old
-        .module
-        .wal
-        .ephemeral_wal_path(&old.module.key)
-        .with_extension("expired");
-    let path = std::fs::read_dir(dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let mut stone: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    stone["next_tag"] = 42.into();
-    stone["next_notice_seq"] = 77.into();
-    std::fs::write(path, serde_json::to_vec(&stone).unwrap()).unwrap();
     let mut marker = new
         .runtime
         .expiry_markers(&new.module.key)
@@ -396,11 +303,7 @@ async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher
         new.runtime.deployment(),
     )
     .unwrap();
-    alike!(
-        new.send("r2", Some(SECONDS)).await.unwrap(),
-        old.send("r2", Some(SECONDS)).await.unwrap()
-    );
-    old.module.closed().await;
+    broca_test_support::pin!("alike", new.send("r2", Some(SECONDS)).await.unwrap());
     new.module.closed().await;
     let view = new
         .runtime
@@ -421,38 +324,18 @@ async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher
         new.runtime.parts_for(StorageClass::Ephemeral, cipher),
     )
     .unwrap();
-    let old_checkpoint = old
-        .module
-        .wal
-        .read_records(&old.module.key)
-        .unwrap()
-        .into_iter()
-        .find_map(|frame| match frame.record {
-            broca_wal::WalRecord::RunStarted { config, .. } => {
-                config.computed_tags.map(|tags| tags.checkpoint)
-            }
-            _ => None,
-        });
-    assert_eq!(old_checkpoint, Some(41));
-    assert_eq!(
-        config.computed_tags.map(|tags| tags.checkpoint),
-        old_checkpoint
-    );
-    alike!(
+    // The recreated session's numbers start above the floor: 42 is the next number, so the
+    // checkpoint is the last handed out.
+    assert_eq!(config.computed_tags.map(|tags| tags.checkpoint), Some(41));
+    broca_test_support::pin!(
+        "alike",
         new.runtime
             .expiry_markers(&new.module.key)
             .unwrap()
             .iter()
             .map(|m| m.next_notice_seq)
-            .max(),
-        Some(
-            old.module
-                .wal
-                .retired_notice_floor(&old.module.key)
-                .unwrap()
-        )
+            .max()
     );
-    old.stop().await;
     new.stop().await;
 }
 
@@ -505,7 +388,6 @@ async fn expiry_reads_before_the_key_load_never_become_absent(cipher: Cipher) {
 
 async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
     use broca_wal::StorageClass;
-    let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
     let plan = || {
         let mut manifest =
@@ -517,135 +399,72 @@ async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
             model_check: None,
         }
     };
-    alike!(
+    broca_test_support::pin!(
+        "alike",
         new.send_with_plan("r1", Some(SECONDS), Some(plan()))
             .await
-            .unwrap(),
-        old.send_with_plan("r1", Some(SECONDS), Some(plan()))
-            .await
             .unwrap()
     );
-    old.module.closed().await;
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
-    for rig in [&old, &new] {
-        rig.advance(deadline);
-        assert_eq!(rig.module.registry.sweep_once(deadline).await.unwrap(), 1);
-    }
-    alike_today_first!(
-        old.module.wal.retired_tag_floor(&old.module.key).unwrap(),
-        1
-    );
-    assert_eq!(
-        new.runtime.expiry_markers(&new.module.key).unwrap()[0].next_tag,
-        1
-    );
-    alike!(
+    new.advance(deadline);
+    assert_eq!(new.module.registry.sweep_once(deadline).await.unwrap(), 1);
+    let next_tag = new.runtime.expiry_markers(&new.module.key).unwrap()[0].next_tag;
+    broca_test_support::pin!("the next number after the sweep", next_tag);
+    assert_eq!(next_tag, 1);
+    broca_test_support::pin!(
+        "alike",
         new.send_with_plan("r2", Some(SECONDS), Some(plan()))
-            .await
-            .unwrap(),
-        old.send_with_plan("r2", Some(SECONDS), Some(plan()))
             .await
             .unwrap()
     );
-    old.module.closed().await;
     new.module.closed().await;
+    let checkpoint = |view: &broca_session_store::session::Session<_>| {
+        let start = view
+            .operations
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .as_ref()
+            .unwrap();
+        broca_session_loop::run::run_config_of_start(
+            start,
+            new.runtime.parts_for(StorageClass::Ephemeral, cipher),
+        )
+        .unwrap()
+    };
     let view = new
         .runtime
         .current_view(&new.module.key)
         .await
         .unwrap()
         .unwrap();
-    let start = view
-        .operations
-        .run
-        .as_ref()
-        .unwrap()
-        .start
-        .as_ref()
-        .unwrap();
-    let config = broca_session_loop::run::run_config_of_start(
-        start,
-        new.runtime.parts_for(StorageClass::Ephemeral, cipher),
-    )
-    .unwrap();
+    let config = checkpoint(&view);
     assert!(config.render_tags);
     assert_eq!(config.computed_tags.unwrap().checkpoint, 0);
-    alike!(
-        read_json(&new.module, None, None, None).await.0,
-        read_json(&old.module, None, None, None).await.0
-    );
-    alike!(
-        new.send("r3", None).await.unwrap(),
-        old.send("r3", None).await.unwrap()
-    );
-    old.module.closed().await;
+    broca_test_support::pin!("alike", read_json(&new.module, None, None, None).await.0);
+    broca_test_support::pin!("alike", new.send("r3", None).await.unwrap());
     new.module.closed().await;
-    let old_high = old
-        .module
-        .wal
-        .read_records(&old.module.key)
-        .unwrap()
-        .into_iter()
-        .find_map(|frame| match frame.record {
-            broca_wal::WalRecord::RunStarted { run_id, config, .. } if run_id.0 == "r3" => {
-                config.computed_tags.map(|tags| tags.checkpoint)
-            }
-            _ => None,
-        })
-        .unwrap();
-    assert!(old_high > 0, "the first recreated run handed out numbers");
     let view = new
         .runtime
         .current_view(&new.module.key)
         .await
         .unwrap()
         .unwrap();
-    let start = view
-        .operations
-        .run
-        .as_ref()
-        .unwrap()
-        .start
-        .as_ref()
-        .unwrap();
-    let config = broca_session_loop::run::run_config_of_start(
-        start,
-        new.runtime.parts_for(StorageClass::Ephemeral, cipher),
-    )
-    .unwrap();
-    assert_eq!(config.computed_tags.unwrap().checkpoint, old_high);
-    old.stop().await;
+    let high = checkpoint(&view).computed_tags.unwrap().checkpoint;
+    assert!(high > 0, "the first recreated run handed out numbers");
+    broca_test_support::pin!("the checkpoint r3 froze", high);
     new.stop().await;
 }
 
-async fn stored_ledger_tags_carry_the_same_floor_as_today(cipher: Cipher) {
+async fn stored_ledger_tags_set_the_next_number(cipher: Cipher) {
     use broca_session_store::record::Record;
-    let old = retained(false, cipher, Duration::from_millis(1), None).await;
     let new = retained(true, cipher, Duration::from_millis(1), None).await;
-    old.send("r1", Some(SECONDS)).await.unwrap();
     new.send("r1", Some(SECONDS)).await.unwrap();
-    old.module.closed().await;
     new.module.closed().await;
-    // Converted sessions retain v1's arrays. Give the same recorded messages ledger-stamped
-    // numbers, instead of the computed rules that new runs always freeze.
-    let mut frames = old.module.wal.read_records(&old.module.key).unwrap();
-    for frame in &mut frames {
-        match &mut frame.record {
-            broca_wal::WalRecord::RunStarted { config, tags, .. } => {
-                config.computed_tags = None;
-                *tags = Some(Arc::new(vec![broca_protocol::tags::MessageTags {
-                    parts: vec![41],
-                }]));
-            }
-            broca_wal::WalRecord::ModelStepFinished { tags, .. } => {
-                *tags = Some(Box::new(broca_protocol::tags::MessageTags {
-                    parts: vec![42],
-                }));
-            }
-            _ => {}
-        }
-    }
+    // Converted sessions retain v1's arrays. Give the recorded messages ledger-stamped numbers,
+    // instead of the computed rules that new runs always freeze.
     let view = new
         .runtime
         .current_view(&new.module.key)
@@ -664,105 +483,37 @@ async fn stored_ledger_tags_carry_the_same_floor_as_today(cipher: Cipher) {
             _ => {}
         }
     }
-    let expected = broca_core::tags::lineage_tags(frames.iter().map(|frame| &frame.record)).next();
-    assert_eq!(expected, Some(43));
+    // The next number is one above the highest stamped.
     assert_eq!(
         crate::retention::store::counters::next_tag(&records).unwrap(),
-        expected
+        Some(43)
     );
-    old.stop().await;
     new.stop().await;
 }
 
-async fn legacy_fallback_history_is_visible_but_old_runs_stay_expired(cipher: Cipher) {
-    let rig = retained(true, cipher, Duration::from_millis(1), None).await;
-    rig.send("r1", Some(SECONDS)).await.unwrap();
-    rig.module.closed().await;
-    let deadline = NOW + SECONDS * 1000;
-    rig.advance(deadline);
-    assert_eq!(rig.module.registry.sweep_once(deadline).await.unwrap(), 1);
-    rig.stop().await;
-    // Reopen without with_store_new_sessions(): an unserved creating send takes this same
-    // legacy fallback. This test pins history visibility, not cross-format counter carryover.
-    let executor = rig.executor.clone();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(rig.module.dir.join("leases"))),
-                rig.module.wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(Duration::from_millis(1))
-            .with_store_runtime(rig.runtime.clone()),
-        ),
-        rig.module.wal.clone(),
-        None,
-    );
-    registry.set_retention_service(rig.service.clone());
-    let fallback = Module {
-        dir: rig.module.dir.clone(),
-        registry,
-        wal: rig.module.wal.clone(),
-        key: rig.module.key.clone(),
-        caller: Default::default(),
-    };
-    assert!(matches!(
-        fallback.send("r2", "hello", None).await,
-        SendOutcome::Active { .. }
-    ));
-    fallback.closed().await;
-    assert!(!rig.runtime.holds(&fallback.key).unwrap());
-    assert!(read_json(&fallback, None, None, None)
-        .await
-        .0
-        .to_string()
-        .contains("hello"));
-    assert!(
-        matches!(fallback.registry.check_expired(&fallback.key, Some("r1")).await,
-        Err(crate::registry::OpenError::Expired { expired_at_ms }) if expired_at_ms == deadline)
-    );
-    assert!(fallback.registry.stop_and_seal().await);
-}
-
 async fn an_active_run_outlives_the_retention_deadline_alike(cipher: Cipher) {
-    let old_gate = Arc::new(Notify::new());
     let new_gate = Arc::new(Notify::new());
-    let old = retained(false, cipher, TTL, Some(old_gate.clone())).await;
     let new = retained(true, cipher, TTL, Some(new_gate.clone())).await;
-    alike!(
-        new.send("r1", Some(SECONDS)).await.unwrap(),
-        old.send("r1", Some(SECONDS)).await.unwrap()
-    );
+    broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     let crossed = NOW + SECONDS * 1000;
-    old.advance(crossed);
     new.advance(crossed);
-    for rig in [&old, &new] {
-        rig.module
-            .registry
-            .check_expired(&rig.module.key, None)
-            .await
-            .unwrap();
-        assert!(rig.module.registry.slot_state(&rig.module.key).is_some());
-    }
-    old_gate.notify_one();
+    new.module
+        .registry
+        .check_expired(&new.module.key, None)
+        .await
+        .unwrap();
+    assert!(new.module.registry.slot_state(&new.module.key).is_some());
     new_gate.notify_one();
-    old.idle().await;
     new.idle().await;
-    for rig in [&old, &new] {
-        rig.module
-            .registry
-            .check_expired(&rig.module.key, None)
-            .await
-            .unwrap();
-    }
+    new.module
+        .registry
+        .check_expired(&new.module.key, None)
+        .await
+        .unwrap();
     let deadline = crossed + SECONDS * 1000;
-    old.advance(deadline);
     new.advance(deadline);
-    old.deleted().await;
     new.deleted().await;
-    old.expired_read(deadline).await;
     new.expired_read(deadline).await;
-    old.stop().await;
     new.stop().await;
 }
 
@@ -774,7 +525,6 @@ cipher_tests!(
     recreated_retained_sessions_carry_numbering_floors_alike,
     expiry_reads_before_the_key_load_never_become_absent,
     computed_numbering_resets_after_retention_alike,
-    stored_ledger_tags_carry_the_same_floor_as_today,
-    legacy_fallback_history_is_visible_but_old_runs_stay_expired,
+    stored_ledger_tags_set_the_next_number,
     an_active_run_outlives_the_retention_deadline_alike,
 );

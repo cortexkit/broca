@@ -1,7 +1,7 @@
-//! Scope admission through today's actor and the store actor, compared reply by reply: sends
-//! under an agent-run scope, sends reopening a scope at a later epoch (plain, behind a running or
-//! paused run, and as the owner's ordered send that starts its run at once), and cancels from a
-//! module other than the session's owner, which the session's plan may grant `interrupt`.
+//! Scope admission through the store actor, each reply pinned: sends under an agent-run scope,
+//! sends reopening a scope at a later epoch (plain, behind a running or paused run, and as the
+//! owner's ordered send that starts its run at once), and cancels from a module other than the
+//! session's owner, which the session's plan may grant `interrupt`.
 
 use std::sync::Arc;
 
@@ -278,10 +278,9 @@ async fn a_sign_in_pause_holds_off_a_reopen_alike() {
     );
 }
 
-/// Sends `request` as `run_id` to both modules, with the delivery list `order` when given, as the
-/// module's caller sends it. The replies must be equal; returns today's.
+/// Sends `request` as `run_id` to the module, with the delivery list `order` when given, as the
+/// module's caller sends it. Pins the reply and returns it.
 async fn sends_alike(
-    today: &Module,
     store: &Module,
     run_id: &str,
     request: &SubmissionRequest,
@@ -289,7 +288,7 @@ async fn sends_alike(
 ) -> SendOutcome {
     let order: Option<DeliveryOrder> = order.map(|order| serde_json::from_value(order).unwrap());
     let mut answers = Vec::new();
-    for module in [today, store] {
+    for module in [store] {
         let shaped = module
             .caller
             .shape(run_id, &SendKey::Minted, request.clone());
@@ -317,28 +316,11 @@ async fn sends_alike(
         );
         module.closed().await;
     }
-    alike!(answers[1], answers[0], "{run_id}: replies differ");
+    broca_test_support::pin!(format!("{run_id}: reply"), answers[0]);
     answers.swap_remove(0)
 }
 
-/// Each run's id and the scope its start recorded, read from today's log.
-fn today_run_scopes(module: &Module) -> Vec<Value> {
-    use broca_core::WalStore;
-    module
-        .wal
-        .read_records(&module.key)
-        .unwrap()
-        .into_iter()
-        .filter_map(|frame| match frame.record {
-            broca_wal::WalRecord::RunStarted { run_id, scope, .. } => {
-                Some(json!({"run_id": run_id.0, "scope": scope}))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// [`today_run_scopes`], read from the store session.
+/// Each run's id and the scope its start recorded, read from the store session.
 async fn store_run_scopes(module: &Module) -> Vec<Value> {
     use broca_session_store::record::Record;
     module
@@ -361,35 +343,35 @@ async fn store_run_scopes(module: &Module) -> Vec<Value> {
 /// alike.
 #[tokio::test]
 async fn an_ordered_send_starting_its_run_records_its_scope_alike() {
-    let (today, store, _, _) = both(texts(3), false).await;
+    let (store, _) = both(texts(3), false).await;
     let mut first = request("first");
     super::unstamped_by_core(&mut first);
     assert!(matches!(
-        sends_alike(&today, &store, "r1", &first, None).await,
+        sends_alike(&store, "r1", &first, None).await,
         SendOutcome::Active { .. }
     ));
-    assert!(store.head().exists() && !today.head().exists());
+    assert!(store.head().exists());
     let idle_start = || Some(json!({"modes": ["idle_start"]}));
     let mut adopting = request("adopting");
     super::scoped_by_core(&mut adopting);
     assert!(matches!(
-        sends_alike(&today, &store, "r2", &adopting, idle_start()).await,
+        sends_alike(&store, "r2", &adopting, idle_start()).await,
         SendOutcome::Active { .. }
     ));
     let mut reopening = request("reopening");
     at_epoch_2(&mut reopening);
     assert!(matches!(
-        sends_alike(&today, &store, "r3", &reopening, idle_start()).await,
+        sends_alike(&store, "r3", &reopening, idle_start()).await,
         SendOutcome::Active { .. }
     ));
     let mut replaced = request("replaced");
     super::scoped_by_core(&mut replaced);
-    alike_today_first!(
-        sends_alike(&today, &store, "r4", &replaced, None).await,
+    assert_eq!(
+        sends_alike(&store, "r4", &replaced, None).await,
         scoped_mismatch(2, 1)
     );
-    let scopes = today_run_scopes(&today);
-    assert_eq!(store_run_scopes(&store).await, scopes);
+    let scopes = store_run_scopes(&store).await;
+    broca_test_support::pin!("each run's scope", scopes);
     let epochs: Vec<_> = scopes
         .iter()
         .map(|start| start["scope"]["scope_epoch"].clone())
@@ -434,11 +416,9 @@ fn from_core(text: &str) -> SubmissionRequest {
     request
 }
 
-/// Cancels `run_id` on both modules from `principal`, over a route that says `scope`, as the
-/// serve layer routes a cancel from a module other than the owner. The replies must be equal;
-/// returns today's.
+/// Cancels `run_id` on the module from `principal`, over a route that says `scope`, as the serve
+/// layer routes a cancel from a module other than the owner. Pins the reply and returns it.
 async fn cancels_alike(
-    today: &Module,
     store: &Module,
     run_id: &str,
     principal: &BindPrincipal,
@@ -446,7 +426,7 @@ async fn cancels_alike(
     at: RunCancelAt,
 ) -> CancelOutcome {
     let mut answers = Vec::new();
-    for module in [today, store] {
+    for module in [store] {
         answers.push(
             module
                 .registry
@@ -461,11 +441,7 @@ async fn cancels_alike(
                 .expect("the cancel is routed"),
         );
     }
-    alike!(
-        answers[1],
-        answers[0],
-        "{principal:?} over {scope:?}: replies differ"
-    );
+    broca_test_support::pin!(format!("{principal:?} over {scope:?}: reply"), answers[0]);
     answers.swap_remove(0)
 }
 
@@ -497,9 +473,8 @@ async fn a_cancel_from_another_module_is_checked_against_the_plan_alike() {
 }
 
 async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
-    let (today, store, today_gate, store_gate) =
-        super::head::both_with_cipher(texts(4), true, cipher).await;
-    for module in [&today, &store] {
+    let (store, store_gate) = super::head::both_with_cipher(texts(4), true, cipher).await;
+    for module in [&store] {
         let sent = send_titled(
             module,
             "r1",
@@ -511,7 +486,7 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         in_model_step(module, "r1").await;
     }
-    assert!(store.head().exists() && !today.head().exists());
+    assert!(store.head().exists());
     let stranger = BindPrincipal::Reserved {
         module_id: "stranger".into(),
     };
@@ -531,7 +506,7 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
             RunCancelAt::StepBoundary,
         ),
     ] {
-        let refused = cancels_alike(&today, &store, "r1", principal, &scope, at).await;
+        let refused = cancels_alike(&store, "r1", principal, &scope, at).await;
         assert!(
             matches!(
                 &refused,
@@ -541,9 +516,8 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
             "{principal:?} over {scope:?}: {refused:?}"
         );
     }
-    alike_today_first!(
+    assert_eq!(
         cancels_alike(
-            &today,
             &store,
             "r1",
             &occipital(),
@@ -553,25 +527,20 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
         .await,
         CancelOutcome::Ack
     );
-    run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
-    super::streams::assert_alike(
-        &super::streams::routed(&store.registry, &store.key).await,
-        &super::streams::routed(&today.registry, &today.key).await,
-    );
+    super::streams::pin(&super::streams::routed(&store.registry, &store.key).await);
     // `run_out` may leave a permit on a gate, which would let the next run's step through at
     // once; take it, so that run is still running when it is cancelled.
-    for gate in today_gate.iter().chain(store_gate.iter()) {
+    for gate in store_gate.iter() {
         let _ = tokio::time::timeout(std::time::Duration::from_millis(20), gate.notified()).await;
     }
-    for module in [&today, &store] {
+    for module in [&store] {
         let sent = send_titled(module, "r2", from_core("second"), None, None).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         in_model_step(module, "r2").await;
     }
-    alike_today_first!(
+    assert_eq!(
         cancels_alike(
-            &today,
             &store,
             "r2",
             &super::core(),
@@ -581,22 +550,17 @@ async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
         .await,
         CancelOutcome::Ack
     );
-    run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
     for principal in [None, Some(super::core()), Some(occipital())] {
-        alike!(
-            head_json(&store, principal.as_ref()).await,
-            head_json(&today, principal.as_ref()).await,
-            "heads differ for {principal:?}"
+        broca_test_support::pin!(
+            format!("head for {principal:?}"),
+            head_json(&store, principal.as_ref()).await
         );
     }
     let head = head_json(&store, None).await;
     assert_eq!(head["last_run_state"]["run_id"], "r2", "{head}");
     assert_eq!(head["last_run_state"]["state"], "cancelled", "{head}");
-    super::streams::assert_alike_after_cancel(
-        &super::streams::routed(&store.registry, &store.key).await,
-        &super::streams::routed(&today.registry, &today.key).await,
-    );
+    super::streams::pin_after_cancel(&super::streams::routed(&store.registry, &store.key).await);
 }
 
 /// A cancel must meet an in-flight model step, not race the run's admission.

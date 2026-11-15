@@ -1,0 +1,62 @@
+== Recorded bases warm identical bytes
+sha256:2e5d5fd5d78e991cc9a0eb2335e74b1b2bf68e69ca11446f7cf4625e92ea0452 (9569 bytes)
+== the warm's record
+(
+    Some(
+        "keep_warm",
+    ),
+    "r1",
+    2,
+    "be64e9208c5939f55503d36ecc0a1e421c4098cf3e26121961fd29847ad2ef5a",
+    "be64e9208c5939f55503d36ecc0a1e421c4098cf3e26121961fd29847ad2ef5a",
+    Usage {
+        input_tokens: Some(
+            3,
+        ),
+        cached_input_tokens: Some(
+            1000,
+        ),
+        cache_write_tokens: None,
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
+        output_tokens: None,
+        reasoning_tokens: None,
+    },
+    Some(
+        3600000,
+    ),
+    Some(
+        3600000,
+    ),
+)
+== Recorded bases warm identical bytes
+sha256:2e5d5fd5d78e991cc9a0eb2335e74b1b2bf68e69ca11446f7cf4625e92ea0452 (9569 bytes)
+== the warm's record
+(
+    Some(
+        "keep_warm",
+    ),
+    "r1",
+    2,
+    "be64e9208c5939f55503d36ecc0a1e421c4098cf3e26121961fd29847ad2ef5a",
+    "be64e9208c5939f55503d36ecc0a1e421c4098cf3e26121961fd29847ad2ef5a",
+    Usage {
+        input_tokens: Some(
+            3,
+        ),
+        cached_input_tokens: Some(
+            1000,
+        ),
+        cache_write_tokens: None,
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
+        output_tokens: None,
+        reasoning_tokens: None,
+    },
+    Some(
+        3600000,
+    ),
+    Some(
+        3600000,
+    ),
+)

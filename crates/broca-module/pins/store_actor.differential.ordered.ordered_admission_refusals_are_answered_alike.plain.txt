@@ -1,60 +1,60 @@
-== the first send's replies differ
+== the first send's reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== the replies to q1 differ
+== the reply to q1
 DeliveryRefused {
     code: "scope_owner_mismatch",
     field: "delivery",
     message: "the session's plan does not name module stranger as a sender",
 }
-== the replies to q2 differ
+== the reply to q2
 DeliveryRefused {
     code: "invalid_params",
     field: "delivery",
     message: "the session's plan does not let module aft start runs",
 }
-== the replies to q3 differ
+== the reply to q3
 DeliveryRefused {
     code: "invalid_params",
     field: "delivery",
     message: "the session's plan does not let module aft send delivery queue",
 }
-== the replies to t0 differ
+== the reply to t0
 DeliveryRefused {
     code: "invalid_params",
     field: "template",
     message: "cannot render the sender's template: UnknownTemplate",
 }
-== the replies to t1 differ
+== the reply to t1
 DeliveryRefused {
     code: "invalid_params",
     field: "template",
     message: "cannot render the sender's template: DigestMismatch",
 }
-== the replies to t2 differ
+== the reply to t2
 DeliveryRefused {
     code: "invalid_params",
     field: "template",
     message: "cannot render the sender's template: InvalidSlot(\"n\")",
 }
-== the replies to t3 differ
+== the reply to t3
 DeliveryRefused {
     code: "invalid_params",
     field: "template",
     message: "cannot render the sender's template: UnknownTemplate",
 }
-== the replies to x1 differ
+== the reply to x1
 SendEnded {
     submission_id: SubmissionId(
         "sub-x1",
     ),
     reason: Expired,
 }
-== the replies to p1 differ
+== the reply to p1
 TemplatePartGone {
     slot: "part",
 }
@@ -482,7 +482,7 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 bytes)
-== the sessions recorded their sends differently
+== the sends the session recorded
 [
     Object {
         "run": String("r1"),
@@ -524,15 +524,15 @@ sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 by
         },
     },
 ]
-== the sessions hold different sends queued
+== the sends queued
 []
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "first",
     "hello",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "model": Object {
@@ -556,7 +556,7 @@ sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 by
         "title": Null,
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",

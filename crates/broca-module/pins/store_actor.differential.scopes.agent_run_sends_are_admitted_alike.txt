@@ -1,40 +1,40 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 2: replies differ
+== step 2: reply
 Active {
     run_id: RunId(
         "r2",
     ),
     delivered: None,
 }
-== step 4: replies differ
+== step 4: reply
 Error(
     "agent-run sends cannot carry tools",
 )
-== step 5: replies differ
+== step 5: reply
 ScopeRefused(
     RunMismatch {
         field: RunId,
     },
 )
-== step 6: replies differ
+== step 6: reply
 ScopeRefused(
     RunMismatch {
         field: AgentId,
     },
 )
-== step 7: replies differ
+== step 7: reply
 ScopeRefused(
     FlowMismatch {
         field: Sender,
     },
 )
-== step 8: replies differ
+== step 8: reply
 ScopeRefused(
     RunMismatch {
         field: RunId,
@@ -42,14 +42,14 @@ ScopeRefused(
 )
 == control stream
 sha256:6d18fba247abb977aaea2d5bdfa0232c9446299943a6810f63a12fc231f26ab3 (3080 bytes)
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
     "second",
     "hello",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 sha256:0d045568f2912c4288a406cc64ecc1a59525a0b434e35ff4109a65d753f7113a (2113 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:372cec9fb2e6eb6020cfbd1502203290a80457450919a79139db36348afad77c (3550 bytes)

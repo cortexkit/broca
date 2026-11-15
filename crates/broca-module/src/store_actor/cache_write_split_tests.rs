@@ -64,8 +64,8 @@ async fn served(
     expected_run: Option<(u64, u64)>,
     expected_models: &[(&str, Option<(u64, u64)>)],
 ) {
-    let [(today, _), (store, _)] = pair(|| script(&iterations), false).await;
-    for (storage, side) in [("legacy", &today), ("store", &store)] {
+    let (store, _) = pair(|| script(&iterations), false).await;
+    for (storage, side) in [("store", &store)] {
         assert!(matches!(
             side.send("cache-run", "synthetic cache usage").await,
             SendOutcome::Active { .. }
@@ -122,7 +122,7 @@ async fn served(
         }
         capture(case, storage, "session.head", &bytes);
     }
-    assert!(store.in_store() && !today.in_store());
+    assert!(store.in_store());
 }
 
 #[tokio::test]

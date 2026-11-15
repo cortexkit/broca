@@ -1,8 +1,8 @@
-== both storages number the part alike
+== the part's number
 2
-== alike
+== t1's first request
 sha256:f0d6dd6f6e94d30b461274015d1eb88dba86fa904ef1c1fbc5d9b74df8cc8bea (2608 bytes)
-== the store answers as today's
+== the answers
 TemplatePartGone {
     slot: "part",
 }

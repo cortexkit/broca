@@ -68,3 +68,8 @@ Object {
         "unreported_steps": Number(0),
     },
 }
+== the session's status as it recovers
+Object {
+    "run_id": String("r2"),
+    "state": String("active"),
+}

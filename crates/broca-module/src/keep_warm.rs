@@ -233,38 +233,6 @@ pub(crate) struct AutomaticWarmer {
     pub(crate) recorded: Mutex<Option<RecordedRequest>>,
 }
 
-#[cfg(test)]
-pub(crate) fn recorded_for_test(
-    writer: Arc<WalHandle>,
-    executor: Arc<dyn RunExecutor>,
-    session: BindIdentity,
-    request: RecordedRequest,
-) -> Arc<dyn KeepWarmDriver> {
-    let clock = CacheClock::default();
-    clock.note_sent(epoch_ms(), Some(3_600_000));
-    Arc::new(AutomaticWarmer {
-        trigger: "keep_warm",
-        retention: false,
-        session,
-        writer,
-        executor,
-        clock,
-        seal: ShutdownSeal::new(),
-        slot: WarmSlot::default(),
-        declare: Arc::new(|_| {
-            Some(CacheDeclaration {
-                ttl_ms: Some(3_600_000),
-                ttl_options_ms: vec![],
-                read_refreshes_ttl: Some(true),
-                warm: Ok(()),
-                basis: None,
-                requested_ttl_ms: Some(3_600_000),
-            })
-        }),
-        recorded: Mutex::new(Some(request)),
-    })
-}
-
 #[async_trait::async_trait]
 impl KeepWarmDriver for AutomaticWarmer {
     fn note_stop(&self, run_id: &RunId, reason: &str) {

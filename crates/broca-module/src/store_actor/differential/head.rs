@@ -1,11 +1,9 @@
-//! `session.head` on a session kept in the new storage, against today's head for the same sends.
+//! `session.head` on a session kept in the new storage.
 //!
-//! Each scenario drives the same sends through a module on today's storage and one that starts
-//! the session in the new storage, then compares the two heads as JSON, for an anonymous caller,
-//! the session's owner and another module. Only what each storage keeps for itself is taken out:
-//! the log identity (`incarnation`), the history version each storage counts for itself, the
-//! subscribe cursor (`head`), which names a WAL position, and wall-clock times, which are kept
-//! as whether they're present.
+//! Each scenario pins the head as JSON, for an anonymous caller, the session's owner and another
+//! module. Only what the storage keeps for itself is taken out: the log identity
+//! (`incarnation`), the history version the storage counts for itself, the subscribe cursor
+//! (`head`), and wall-clock times, which are kept as whether they're present.
 
 use std::sync::Arc;
 
@@ -14,8 +12,8 @@ use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, ProviderContr
 use broca_protocol::{SendScope, SubmissionRequest};
 use tokio::sync::Notify;
 
-use super::super::tests::{auth_failure, executor, request, text_step, Gated};
-use super::{BothLoops, Module, TodayLoop, IDLE};
+use super::super::tests::{auth_failure, executor, request, text_step};
+use super::{Module, IDLE};
 use crate::actor::{SendKey, SendOutcome, SendPlan};
 use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
@@ -53,20 +51,7 @@ async fn gated_module_in(
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
-        today: TodayLoop {
-            provider: Gated {
-                render_config: None,
-                notes_sends: false,
-                hold: None,
-                inner: broca_core::provider::StubProvider::new(steps.clone()),
-                gate: gate.clone(),
-            },
-            wal: Arc::clone(&wal),
-            planes: Default::default(),
-        },
-        store: executor(steps, gate),
-    });
+    let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, gate));
     let runtime =
         crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), IDLE)
             .await
@@ -99,11 +84,12 @@ async fn gated_module_in(
     }
 }
 
-/// Today's module and one whose sessions start in the new storage, over the same script.
+/// A module whose sessions start in the new storage, over `steps`, and the gate its model steps
+/// wait for when `gated`.
 pub(super) async fn both(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
-) -> (Module, Module, Option<Arc<Notify>>, Option<Arc<Notify>>) {
+) -> (Module, Option<Arc<Notify>>) {
     both_with_cipher(
         steps,
         gated,
@@ -117,24 +103,20 @@ pub(super) async fn both_with_cipher(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     cipher: broca_session_store::keys::Cipher,
-) -> (Module, Module, Option<Arc<Notify>>, Option<Arc<Notify>>) {
-    let today_gate = gated.then(|| Arc::new(Notify::new()));
-    let store_gate = gated.then(|| Arc::new(Notify::new()));
-    let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
-    let today = gated_module_in(false, steps.clone(), today_gate.clone(), deployment()).await;
-    let store = gated_module_in(true, steps, store_gate.clone(), deployment()).await;
-    (today, store, today_gate, store_gate)
+) -> (Module, Option<Arc<Notify>>) {
+    let gate = gated.then(|| Arc::new(Notify::new()));
+    let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    let store = gated_module_in(true, steps, gate.clone(), deployment).await;
+    (store, gate)
 }
 
-/// [`both`] without gates, whose store module creates sessions in mode `cipher`.
+/// [`both`] without a gate, creating sessions in mode `cipher`.
 pub(super) async fn both_in(
     steps: Vec<Vec<NormalizedEvent>>,
     cipher: broca_session_store::keys::Cipher,
-) -> (Module, Module) {
-    let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
-    let today = gated_module_in(false, steps.clone(), None, deployment()).await;
-    let store = gated_module_in(true, steps, None, deployment()).await;
-    (today, store)
+) -> Module {
+    let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    gated_module_in(true, steps, None, deployment).await
 }
 
 /// A send through the registry's own route, with the title and plan the serve layer hands over,
@@ -219,17 +201,16 @@ pub(super) fn occipital() -> BindPrincipal {
     }
 }
 
-/// Both heads, for an anonymous caller, core, and a module the session never heard from, must
-/// be equal, and so must reads with each opt-in. Returns the store's head for the anonymous
-/// caller, to check what it says.
-async fn heads_alike(today: &Module, store: &Module, label: &str) -> serde_json::Value {
-    assert!(store.head().exists() && !today.head().exists(), "{label}");
+/// Pins the session's head for an anonymous caller, core, and a module the session never heard
+/// from, and its reads with each opt-in. Returns the head for the anonymous caller, to check
+/// what it says.
+async fn heads(store: &Module, label: &str) -> serde_json::Value {
+    assert!(store.head().exists(), "{label}");
     for principal in [None, Some(core()), Some(occipital())] {
-        let old = head_json(today, principal.as_ref()).await;
-        let new = head_json(store, principal.as_ref()).await;
-        alike!(new, old, "{label}: heads differ for {principal:?}");
+        let head = head_json(store, principal.as_ref()).await;
+        broca_test_support::pin!(format!("{label}: head for {principal:?}"), head);
     }
-    super::opted_reads_alike(today, store, label).await;
+    super::opted_reads(store, label).await;
     head_json(store, None).await
 }
 
@@ -266,12 +247,12 @@ fn permanent_failure() -> Vec<NormalizedEvent> {
 /// first send's title, the whole transcript's ordinals and the session's usage, alike.
 #[tokio::test]
 async fn finished_runs_head_alike() {
-    let (today, store, _, _) = both(
+    let (store, _) = both(
         vec![text_step("a1", "hello"), text_step("a2", "again")],
         false,
     )
     .await;
-    for module in [&today, &store] {
+    for module in [&store] {
         let sent = send_titled(module, "r1", request("first"), Some("the title"), None).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         module.closed().await;
@@ -279,7 +260,7 @@ async fn finished_runs_head_alike() {
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         module.closed().await;
     }
-    let head = heads_alike(&today, &store, "finished").await;
+    let head = heads(&store, "finished").await;
     assert_eq!(
         head["last_run_state"],
         serde_json::json!({"run_id": "r2", "state": "completed", "reason": "completed"})
@@ -294,12 +275,12 @@ async fn finished_runs_head_alike() {
 /// alike.
 #[tokio::test]
 async fn a_failed_run_heads_alike() {
-    let (today, store, _, _) = both(vec![permanent_failure()], false).await;
-    for module in [&today, &store] {
+    let (store, _) = both(vec![permanent_failure()], false).await;
+    for module in [&store] {
         send_titled(module, "r1", request("first"), None, None).await;
         module.closed().await;
     }
-    let head = heads_alike(&today, &store, "failed").await;
+    let head = heads(&store, "failed").await;
     assert_eq!(head["last_run_state"]["state"], "error");
     assert!(head["last_run_error"].is_object(), "{head}");
 }
@@ -307,8 +288,8 @@ async fn a_failed_run_heads_alike() {
 /// A run cancelled while its model step was in flight: the head names it cancelled, alike.
 #[tokio::test]
 async fn a_cancelled_run_heads_alike() {
-    let (today, store, today_gate, store_gate) = both(vec![text_step("a1", "hello")], true).await;
-    for module in [&today, &store] {
+    let (store, store_gate) = both(vec![text_step("a1", "hello")], true).await;
+    for module in [&store] {
         let sent = send_titled(module, "r1", request("first"), None, None).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         module
@@ -317,18 +298,17 @@ async fn a_cancelled_run_heads_alike() {
             .await
             .expect("the cancel is routed");
     }
-    run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
-    let head = heads_alike(&today, &store, "cancelled").await;
+    let head = heads(&store, "cancelled").await;
     assert_eq!(head["last_run_state"]["state"], "cancelled");
-    streams_alike(&today, &store).await;
+    streams_pinned(&store).await;
 }
 
 #[tokio::test]
 async fn flow_and_run_routes_have_no_owner_authority_alike() {
     use crate::serve::{ServeError, ServeHandler};
-    let (today, store, today_gate, store_gate) = both(vec![text_step("a1", "hello")], true).await;
-    for module in [&today, &store] {
+    let (store, store_gate) = both(vec![text_step("a1", "hello")], true).await;
+    for module in [&store] {
         let mut sent = request("first");
         sent.principal = Some(core());
         assert!(matches!(
@@ -347,7 +327,7 @@ async fn flow_and_run_routes_have_no_owner_authority_alike() {
             bind.scope.run_id = Some("run-1".into());
         }
         let mut answers = Vec::new();
-        for module in [&today, &store] {
+        for module in [&store] {
             let mut refused = Vec::new();
             for answer in [
                 ServeHandler::authorize_session_cancel(
@@ -394,18 +374,14 @@ async fn flow_and_run_routes_have_no_owner_authority_alike() {
             assert!(head.sender.is_none(), "{route} route received owner grant");
             answers.push(refused);
         }
-        alike!(answers[1], answers[0], "{route} refusals");
+        broca_test_support::pin!(format!("{route} refusals"), answers[0]);
     }
-    run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
 }
 
-/// A subscriber from the start of each module's session gets the same control stream.
-async fn streams_alike(today: &Module, store: &Module) {
-    super::streams::assert_alike(
-        &super::streams::routed(&store.registry, &store.key).await,
-        &super::streams::routed(&today.registry, &today.key).await,
-    );
+/// Pins the control stream a subscriber from the start of the module's session gets.
+async fn streams_pinned(store: &Module) {
+    super::streams::pin(&super::streams::routed(&store.registry, &store.key).await);
 }
 
 /// A send queued behind a running run: while the run runs, the head names it active and the
@@ -413,39 +389,38 @@ async fn streams_alike(today: &Module, store: &Module) {
 /// alike.
 #[tokio::test]
 async fn a_queued_send_behind_a_running_run_heads_alike() {
-    let (today, store, today_gate, store_gate) = both(
+    let (store, store_gate) = both(
         vec![text_step("a1", "hello"), text_step("a2", "again")],
         true,
     )
     .await;
-    for module in [&today, &store] {
+    for module in [&store] {
         let sent = send_titled(module, "r1", request("first"), Some("running"), None).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         let sent = send_titled(module, "r2", request("second"), Some("queued"), None).await;
         assert!(matches!(sent, SendOutcome::Pending { .. }), "{sent:?}");
     }
-    let running = heads_alike(&today, &store, "running with a send queued").await;
+    let running = heads(&store, "running with a send queued").await;
     assert_eq!(running["last_run_state"]["state"], "active");
     assert_eq!(running["last_run_state"]["run_id"], "r1");
     assert_eq!(running["title"], "queued");
-    run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
-    let ended = heads_alike(&today, &store, "after both runs").await;
+    let ended = heads(&store, "after both runs").await;
     assert_eq!(ended["last_run_state"]["run_id"], "r2");
     assert_eq!(ended["last_run_state"]["state"], "completed");
-    streams_alike(&today, &store).await;
+    streams_pinned(&store).await;
 }
 
 /// A run paused for sign-in: the head names the pause and the input profile the run froze,
 /// alike.
 #[tokio::test]
 async fn a_sign_in_pause_heads_alike() {
-    let (today, store, _, _) = both(vec![auth_failure()], false).await;
-    for module in [&today, &store] {
+    let (store, _) = both(vec![auth_failure()], false).await;
+    for module in [&store] {
         send_titled(module, "r1", request("first"), None, None).await;
         module.closed().await;
     }
-    let head = heads_alike(&today, &store, "paused").await;
+    let head = heads(&store, "paused").await;
     assert_eq!(
         head["last_run_state"],
         serde_json::json!({"run_id": "r1", "state": "paused", "reason": "auth_required"})
@@ -456,7 +431,7 @@ async fn a_sign_in_pause_heads_alike() {
 /// of the run's, and tells the module the plan names as a sender what it may send, alike.
 #[tokio::test]
 async fn a_planned_session_heads_alike() {
-    let (today, store, _, _) = both(vec![text_step("a1", "hello")], false).await;
+    let (store, _) = both(vec![text_step("a1", "hello")], false).await;
     let plan = serde_json::json!({
         "model": {"provider": "stub", "model": "m", "variant": "high"},
         "senders": [{"module": "occipital", "idle_start": true}],
@@ -479,7 +454,7 @@ async fn a_planned_session_heads_alike() {
         fetches: vec![],
         declarations: vec![],
     };
-    for module in [&today, &store] {
+    for module in [&store] {
         let mut sent = request("first");
         sent.tools = None;
         sent.policy_allowed = Default::default();
@@ -493,15 +468,15 @@ async fn a_planned_session_heads_alike() {
         assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
         module.closed().await;
     }
-    heads_alike(&today, &store, "planned").await;
+    heads(&store, "planned").await;
     let head = head_json(&store, None).await;
     assert_eq!(
         head["model"],
         serde_json::json!({"provider": "stub", "model": "m", "variant": "high"})
     );
     assert_eq!(head["last_run_rich_ui"]["dialect"], "1.0");
-    // Reads with Rich UI stamps (compared with today's in `heads_alike`) serve the run's stamp
-    // on its assistant message.
+    // Reads with Rich UI stamps (pinned in `heads`) serve the run's stamp on its assistant
+    // message.
     let read = {
         use crate::serve::ServeHandler;
         store

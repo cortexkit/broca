@@ -1,12 +1,12 @@
 //! Sends with an ordered delivery list, and the string sends a plan's senders make, through
-//! today's actor and the store actor, compared reply by reply and by what each session recorded
-//! about them: each order, each queued send's sender, principal and mode, each ending, each
-//! delivery, and each run's start and end. Admission's refusals, a send expired on arrival, a
+//! the store actor, each reply pinned and what the session recorded about them: each order, each
+//! queued send's sender, principal and mode, each ending, each delivery, and each run's start and
+//! end. Admission's refusals, a send expired on arrival, a
 //! send whose expiry passes while the session is idle or while its run makes its last model call,
 //! a dedupe key superseding an undelivered send, an `idle_start` send starting a run, a send that
 //! outlives a run's end and rides on a later one, and interrupts (on an idle session, during a
 //! model step, during a tool call, and across a crash before the interrupt's run) are each
-//! answered and recorded alike. Each scenario's sessions then read alike: `session.read` in every
+//! answered and recorded. Each scenario's session then reads back, pinned: `session.read` in every
 //! opt-in mode on a few pages (a ride's notice among the carrying message's display facts, each
 //! delivered entry's `delivered_as`), and the control stream from the start, where a ride is one
 //! `notice_delivered`.
@@ -19,12 +19,12 @@ use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{OpaqueJson, PlanManifest, WalRecord};
+use broca_wal::{OpaqueJson, PlanManifest};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::super::tests::{self as store, LoopExecutor};
-use super::{display_reads_alike, store_starts, streams, today_restarted, today_riding, Today};
+use super::{display_reads, store_starts, streams};
 use crate::actor::{LineageCmd, LineageStatus, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
 use broca_session_store::keys::Cipher;
@@ -142,45 +142,33 @@ fn templated(
     )
 }
 
-/// One session on today's storage and one in the new storage, over the same script.
+/// A session in the new storage served by the store actor over a script.
 struct Pair {
-    today: Today,
     commands: store::Commands,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     store: Arc<LoopExecutor>,
     /// The store actor's setup parts, kept so its session's reads can name its runs' tools.
     parts: SharedParts,
-    /// Where the store's session is kept, which a restarted actor loads it from.
+    /// Where the session is kept, which a restarted actor loads it from.
     backend: &'static MemoryBackend,
-    gates: Vec<Arc<Notify>>,
+    gate: Option<Arc<Notify>>,
 }
 
 impl Pair {
     async fn new(script: Vec<Vec<NormalizedEvent>>, gated: bool, cipher: Cipher) -> Self {
-        Self::with_planes(
-            script,
-            gated,
-            Default::default(),
-            Default::default(),
-            cipher,
-        )
-        .await
+        Self::with_planes(script, gated, Default::default(), cipher).await
     }
 
-    /// [`Self::new`], with today's executor offering `today_planes` and the store's
-    /// `store_planes`.
+    /// [`Self::new`], with the executor offering `planes`.
     async fn with_planes(
         script: Vec<Vec<NormalizedEvent>>,
         gated: bool,
-        today_planes: store::Planes,
-        store_planes: store::Planes,
+        planes: store::Planes,
         cipher: Cipher,
     ) -> Self {
-        let today_gate = gated.then(|| Arc::new(Notify::new()));
-        let store_gate = gated.then(|| Arc::new(Notify::new()));
-        let today = today_riding(script.clone(), today_gate.clone(), today_planes);
-        let mut executor = store::executor(script, store_gate.clone());
-        executor.planes = store_planes;
+        let gate = gated.then(|| Arc::new(Notify::new()));
+        let mut executor = store::executor(script, gate.clone());
+        executor.planes = planes;
         let executor = Arc::new(executor);
         let backend: &'static MemoryBackend = Box::leak(Box::default());
         let session = Session::create(
@@ -203,49 +191,45 @@ impl Pair {
         let (commands, receiver) = mpsc::unbounded_channel();
         let served = tokio::spawn(actor.serve(receiver));
         Self {
-            today,
             commands: store::Commands::over(commands, backend),
             served,
             store: executor,
             parts,
             backend,
-            gates: today_gate.into_iter().chain(store_gate).collect(),
+            gate,
         }
     }
 
-    /// Both processes die where they stand and start again, each finding only its durable
-    /// records: today's module over a copy of its log, and a store actor loading the session.
-    /// Each new executor answers with `script`. The dead processes' runs never write again.
+    /// The process dies where it stands and starts again, finding only its durable records: a
+    /// store actor loading the session, whose new executor answers with `script`. The dead
+    /// process's runs never write again.
     async fn restarted(self, script: Vec<Vec<NormalizedEvent>>) -> Self {
-        let today = today_restarted(&self.today, script.clone());
         self.served.abort();
         let _ = self.served.await;
         let executor = Arc::new(store::executor(script, None));
         let (commands, served) =
             store::reopen(self.backend, Arc::clone(&executor), &self.parts).await;
         Self {
-            today,
             commands,
             served,
             store: executor,
             parts: self.parts,
             backend: self.backend,
-            gates: Vec::new(),
+            gate: None,
         }
     }
 
-    /// The session's first send, from its owner, carrying the plan; both sides start its run.
+    /// The session's first send, from its owner, carrying the plan, which starts its run.
     async fn first(&self, run_id: &str) {
-        let (old, new) = self
+        let reply = self
             .send(run_id, from(core(), "first"), None, Some(plan()), None)
             .await;
-        assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-        alike!(new, old, "the first send's replies differ");
+        assert!(matches!(reply, SendOutcome::Active { .. }), "{reply:?}");
+        broca_test_support::pin!("the first send's reply", reply);
     }
 
-    /// Sends `request` as `run_id` to both sessions with the delivery list `order`, or as a
-    /// plain queued send without one, under `key` when given. Returns today's reply and the
-    /// store's.
+    /// Sends `request` as `run_id` with the delivery list `order`, or as a plain queued send
+    /// without one, under `key` when given. Returns the reply.
     async fn send(
         &self,
         run_id: &str,
@@ -253,7 +237,7 @@ impl Pair {
         order: Option<Value>,
         plan: Option<Arc<PlanManifest>>,
         key: Option<&str>,
-    ) -> (SendOutcome, SendOutcome) {
+    ) -> SendOutcome {
         self.send_as(run_id, request, Delivery::Queue, order, plan, key)
             .await
     }
@@ -267,41 +251,18 @@ impl Pair {
         order: Option<Value>,
         plan: Option<Arc<PlanManifest>>,
         key: Option<&str>,
-    ) -> (SendOutcome, SendOutcome) {
+    ) -> SendOutcome {
         let order: Option<broca_protocol::DeliveryOrder> =
             order.map(|order| serde_json::from_value(order).unwrap());
-        let send_plan = || {
-            plan.as_ref().map(|manifest| SendPlan {
-                identity: manifest.plan_identity.clone(),
-                manifest: Some(Arc::clone(manifest)),
-                model_check: None,
-            })
-        };
-        let send_key = || match key {
+        let plan = plan.as_ref().map(|manifest| SendPlan {
+            identity: manifest.plan_identity.clone(),
+            manifest: Some(Arc::clone(manifest)),
+            model_check: None,
+        });
+        let key = match key {
             Some(key) => SendKey::SendId(key.into()),
             None => SendKey::Minted,
         };
-        let old = self
-            .today
-            .registry
-            .route_submission_with_order(
-                &self.today.key,
-                RunId(run_id.into()),
-                request.clone(),
-                RunKind::FreshOrResume,
-                send_key(),
-                false,
-                delivery,
-                send_plan(),
-                None,
-                None,
-                None,
-                None,
-                false,
-                order.clone(),
-            )
-            .await
-            .expect("today's actor opens");
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(LineageCmd::Send {
@@ -313,33 +274,32 @@ impl Pair {
                 run_id: RunId(run_id.into()),
                 request: Box::new(request),
                 kind: RunKind::FreshOrResume,
-                key: send_key(),
+                key,
                 skip_materialization: false,
                 delivery,
-                plan: send_plan().map(Box::new),
+                plan: plan.map(Box::new),
                 order: order.map(Box::new),
                 reply,
             })
             .unwrap();
-        (old, answer.await.unwrap())
+        answer.await.unwrap()
     }
 
-    /// A send with the string `delivery` and no list, on both sides; the replies must be equal.
-    /// Returns today's.
+    /// A send with the string `delivery` and no list, its reply pinned; returns it.
     async fn alike_as(
         &self,
         run_id: &str,
         request: SubmissionRequest,
         delivery: Delivery,
     ) -> SendOutcome {
-        let (old, new) = self
+        let reply = self
             .send_as(run_id, request, delivery, None, None, None)
             .await;
-        alike!(new, old, "the replies to {run_id} differ");
-        old
+        broca_test_support::pin!(format!("the reply to {run_id}"), reply);
+        reply
     }
 
-    /// Sends on both sides, and the replies must be equal; returns today's.
+    /// Sends, its reply pinned; returns it.
     async fn alike(
         &self,
         run_id: &str,
@@ -347,64 +307,75 @@ impl Pair {
         order: Option<Value>,
         key: Option<&str>,
     ) -> SendOutcome {
-        let (old, new) = self.send(run_id, request, order, None, key).await;
-        alike!(new, old, "the replies to {run_id} differ");
-        old
+        let reply = self.send(run_id, request, order, None, key).await;
+        broca_test_support::pin!(format!("the reply to {run_id}"), reply);
+        reply
     }
 
-    /// Lets one waiting model call through on each side.
+    /// `session.read` of the session as it stands, from a copy of its storage.
+    async fn read(
+        &self,
+        request: crate::serve::SessionReadRequest,
+    ) -> broca_wire::SessionReadResponse {
+        let backend = self.backend.snapshot();
+        let session = Session::load(
+            &backend,
+            SessionAddr(store::ADDR.into()),
+            &store::triple(),
+            &store::deployment(),
+        )
+        .await
+        .unwrap();
+        crate::store_read::serve_view(&session, &self.parts, &request)
+            .await
+            .expect("the session reads")
+    }
+
+    /// Lets one waiting model call through.
     fn release(&self) {
-        for gate in &self.gates {
+        if let Some(gate) = &self.gate {
             gate.notify_one();
         }
     }
 
     async fn idle(&self) {
-        self.today.idle().await;
         store::idle(&self.commands).await;
     }
 
-    /// Waits until both sessions run `run_id`, then lets one model call through on each side,
-    /// so each release meets that run's call, never an earlier run's.
+    /// Waits until the session runs `run_id`, then lets one model call through, so the release
+    /// meets that run's call, never an earlier run's.
     async fn release_into(&self, run_id: &str) {
         let running = |status: LineageStatus| matches!(&status, LineageStatus::Active { run_id: running, .. } if running.0 == run_id);
-        broca_test_support::wait_until(&format!("both sessions to run {run_id}"), || async {
-            let today = self
-                .today
-                .registry
-                .route_status(&self.today.key)
-                .await
-                .unwrap();
+        broca_test_support::wait_until(&format!("the session to run {run_id}"), || async {
             let store = store::status(&self.commands).await;
-            if running(today.clone()) && running(store.clone()) {
+            if running(store.clone()) {
                 Ok(())
             } else {
-                Err(format!("today {today:?}, store {store:?}"))
+                Err(format!("{store:?}"))
             }
         })
         .await;
         self.release();
     }
 
-    /// Ends the store session's actor, and checks the two sessions recorded their sends alike:
-    /// the same conversation, the same send ledger, the same sends still queued, the same runs'
-    /// starts, and every model call sent the same messages and results; and that they read
-    /// alike: the same control stream from the start, and the same `session.read` replies in
-    /// every opt-in mode. Returns the ledger, the queue, and how many notices the session holds:
-    /// `notice_delivered` events in its stream, and notices its `session.read` serves.
+    /// Ends the session's actor and pins what it recorded about its sends: the conversation,
+    /// the send ledger, the sends still queued, the runs' starts, and the messages and results
+    /// every model call was sent; and how it reads: the control stream from the start, and
+    /// `session.read` in every opt-in mode. Returns the ledger, the queue, and how many notices
+    /// the session holds: `notice_delivered` events in its stream, and notices its
+    /// `session.read` serves.
     async fn assert_alike(self) -> (Vec<Value>, Vec<String>, (usize, usize)) {
         self.assert_alike_ids(true).await
     }
 
-    /// [`Self::assert_alike`]; `same_ids` false permits only today's abandoned positional id
-    /// to be reused after cancellation (see [`streams::assert_alike_after_cancel`]).
+    /// [`Self::assert_alike`]; `same_ids` false pins the stream as
+    /// [`streams::pin_after_cancel`] reads it, after a cancel.
     async fn assert_alike_ids(self, same_ids: bool) -> (Vec<Value>, Vec<String>, (usize, usize)) {
         let stream = streams::store(&self.commands).await;
-        let today_stream = streams::routed(&self.today.registry, &self.today.key).await;
         if same_ids {
-            streams::assert_alike(&stream, &today_stream);
+            streams::pin(&stream);
         } else {
-            streams::assert_alike_after_cancel(&stream, &today_stream);
+            streams::pin_after_cancel(&stream);
         }
         let notices = stream
             .iter()
@@ -412,9 +383,9 @@ impl Pair {
             .count();
         drop(self.commands);
         let session = self.served.await.unwrap();
-        display_reads_alike(&self.today, &session, &self.parts).await;
-        let mut whole =
-            crate::serve::SessionReadRequest::new(self.today.key.clone(), None, Some(500));
+        display_reads(&session, &self.parts).await;
+        let key = broca_protocol::BindIdentity::new("/project", "store-actor", "s1");
+        let mut whole = crate::serve::SessionReadRequest::new(key, None, Some(500));
         whole.include_display_facts = true;
         let read = crate::store_read::serve_view(&session, &self.parts, &whole)
             .await
@@ -432,60 +403,22 @@ impl Pair {
             .map(|(_, record)| record)
             .collect();
         let ledger = store_ledger(&records);
-        broca_test_support::pin!(
-            "the sessions recorded their sends differently",
-            timeless(&ledger)
-        );
-        assert_eq!(
-            ledger,
-            today_ledger(&today_records(&self.today)),
-            "the sessions recorded their sends differently"
-        );
+        broca_test_support::pin!("the sends the session recorded", timeless(&ledger));
         let queue: Vec<String> = session
             .operations
             .queue
             .iter()
             .map(|pending| pending.submission_id.clone())
             .collect();
-        let today_queue: Vec<String> =
-            broca_core::queue::pending_submissions(&today_records(&self.today))
-                .into_iter()
-                .map(|pending| pending.submission_id.0)
-                .collect();
-        alike!(
-            queue,
-            today_queue,
-            "the sessions hold different sends queued"
+        broca_test_support::pin!("the sends queued", queue);
+        broca_test_support::pin!("the conversation", store::texts(&session));
+        broca_test_support::pin!("the runs' starts", store_starts(&session).await);
+        broca_test_support::pin!(
+            "the messages each model call was sent",
+            prompts(self.store.provider.inner.calls())
         );
-        alike!(
-            store::texts(&session),
-            self.today.texts().await,
-            "the conversations differ"
-        );
-        alike!(
-            store_starts(&session).await,
-            self.today.starts(),
-            "the runs' starts differ"
-        );
-        alike!(
-            prompts(self.store.provider.inner.calls()),
-            prompts(self.today.executor.provider.inner.calls()),
-            "the model calls were sent different messages"
-        );
-        assert!(self.today.registry.stop_and_seal().await);
         (ledger, queue, (notices, served))
     }
-}
-
-fn today_records(today: &Today) -> Vec<WalRecord> {
-    use broca_core::WalStore as _;
-    today
-        .wal
-        .read_records(&today.key)
-        .unwrap()
-        .into_iter()
-        .map(|frame| frame.record)
-        .collect()
 }
 
 /// Every message each model call was sent, as text: a text block, or a tool result's output.
@@ -506,59 +439,6 @@ fn prompts(calls: Vec<broca_protocol::request::CallOptions>) -> Vec<Vec<String>>
                     _ => None,
                 })
                 .collect()
-        })
-        .collect()
-}
-
-/// What today's log recorded about its sends, in the shape [`store_ledger`] reads them.
-fn today_ledger(records: &[WalRecord]) -> Vec<Value> {
-    records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::DeliveryOrdered {
-                submission_id,
-                order,
-                sent_by,
-            } => Some(json!({"ordered": submission_id, "order": order, "sent_by": sent_by})),
-            WalRecord::Queued {
-                submission_id,
-                sent_by,
-                principal,
-                delivery,
-                ..
-            } => Some(json!({
-                "queued": submission_id,
-                "sent_by": sent_by,
-                "principal": principal,
-                "delivery": delivery,
-            })),
-            WalRecord::SendEnded {
-                submission_id,
-                reason,
-            } => Some(json!({"ended": submission_id, "reason": reason})),
-            WalRecord::SendDelivered {
-                submission_id,
-                mode,
-                tool_call_id,
-                appended_text,
-                ..
-            } => Some(json!({
-                "delivered": submission_id,
-                "mode": mode,
-                "tool_call_id": tool_call_id,
-                "appended_text": appended_text,
-            })),
-            WalRecord::RunStarted {
-                run_id,
-                submission_id,
-                ..
-            } => Some(json!({"run": run_id, "submission_id": submission_id})),
-            WalRecord::RunFinished {
-                reason,
-                interrupt_reason,
-                ..
-            } => Some(json!({"run_ended": reason, "interrupt_reason": interrupt_reason})),
-            _ => None,
         })
         .collect()
 }
@@ -855,17 +735,13 @@ async fn an_idle_start_send_starts_a_run_alike(cipher: Cipher) {
         .await;
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     pair.idle().await;
-    use crate::serve::ServeHandler;
     let read = pair
-        .today
-        .registry
         .read(super::opted_request(
-            &pair.today.key,
+            &broca_protocol::BindIdentity::new("/project", "store-actor", "s1"),
             (Some(1), Some(100)),
             (true, false, false),
         ))
-        .await
-        .unwrap();
+        .await;
     for (text, id) in [
         ("wake up", None),
         ("go on", None),
@@ -949,21 +825,12 @@ async fn past(expires: u64) {
     .await;
 }
 
-/// Waits until both sessions' running run `r1` has its first model step in flight. Its step
+/// Waits until the session's running run `r1` has its first model step in flight. Its step
 /// boundary, the point before each model step where a run decides its queued ordered sends, has
 /// then passed, and the run reaches no other step boundary before it ends.
 async fn in_first_step(pair: &Pair) {
-    use crate::serve::ServeHandler;
     use crate::store_reads::{StoreReadOutcome, StoreReadReply, StoreReadRequest};
-    broca_test_support::wait_until("both runs' first model step in flight", || async {
-        let old = serde_json::to_value(
-            pair.today
-                .registry
-                .run_status_reply(&pair.today.key, RunId("r1".into()))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+    broca_test_support::wait_until("the run's first model step in flight", || async {
         let (reply, answer) = oneshot::channel();
         pair.commands
             .send(LineageCmd::StoreRead {
@@ -978,10 +845,10 @@ async fn in_first_step(pair: &Pair) {
             return Err("the run's status was refused".into());
         };
         let new = serde_json::to_value(answer).unwrap();
-        if old["step"]["step_id"] == 1 && new["step"]["step_id"] == 1 {
+        if new["step"]["step_id"] == 1 {
             Ok(())
         } else {
-            Err(format!("today {old}, store {new}"))
+            Err(format!("{new}"))
         }
     })
     .await;
@@ -1000,10 +867,10 @@ fn expiry_story(ledger: &[Value]) -> (Option<usize>, Option<usize>, Option<usize
     (ended, first_end, second_run)
 }
 
-/// A queued ordered send whose expiry passes while the session is idle stays queued, as today's
-/// actor leaves it, until the next run's first step boundary (where a run decides its queued
-/// ordered sends, before its first model step) ends it. The send is queued once the session is
-/// idle, so no run's end can come after its expiry. Alike.
+/// A queued ordered send whose expiry passes while the session is idle stays queued until the
+/// next run's first step boundary (where a run decides its queued ordered sends, before its first
+/// model step) ends it. The send is queued once the session is idle, so no run's end can come
+/// after its expiry.
 async fn an_expired_send_waits_on_an_idle_session_alike(cipher: Cipher) {
     let pair = Pair::new(hello(), true, cipher).await;
     pair.first("r1").await;
@@ -1096,11 +963,11 @@ async fn a_queued_ordered_sends_retry_is_answered_alike(cipher: Cipher) {
     assert_eq!(queue, vec!["sub-r-k1".to_owned()], "the keyed send waits");
 }
 
-/// A plan-named sender's string `delivery` is admitted as today's actor admits it: `steer` from
-/// a sender granted `idle_start` joins the running run as the list `[steer, idle_start]`, and
-/// `queue` starts a run on the idle session as `[idle_start]`; a sender without the grant is
-/// refused both, and an `interrupt` it isn't granted; a module the plan doesn't name is left to
-/// the owner check. Alike, records and reads included.
+/// A plan-named sender's string `delivery`: `steer` from a sender granted `idle_start` joins the
+/// running run as the list `[steer, idle_start]`, and `queue` starts a run on the idle session as
+/// `[idle_start]`; a sender without the grant is refused both, and an `interrupt` it isn't
+/// granted; a module the plan doesn't name is left to the owner check. Records and reads are
+/// pinned too.
 async fn string_sends_from_plan_named_senders_are_admitted_alike(cipher: Cipher) {
     let mut script = hello();
     script.push(store::text_step("a4", "last"));
@@ -1153,7 +1020,7 @@ async fn string_sends_from_plan_named_senders_are_admitted_alike(cipher: Cipher)
     pair.release();
     pair.idle().await;
     // A module the plan doesn't name is left to the owner check, which on this unscoped session
-    // admits its send as today's actor does while no refresh has set the session's senders.
+    // admits its send while no refresh has set the session's senders.
     let outcome = pair
         .alike_as("s7", from(module("stranger"), "hi"), Delivery::Queue)
         .await;
@@ -1240,8 +1107,7 @@ async fn an_interrupt_during_a_model_step_cancels_the_run_and_runs_first_alike(c
     pair.release_into("i1").await;
     pair.release_into("p1").await;
     pair.idle().await;
-    // r1's step announced an id it never placed; today's storage gives the interrupt's message
-    // that position id, the new storage a new one.
+    // r1's step announced an id it never placed; the interrupt's message gets a new one.
     let (ledger, queue, _) = pair.assert_alike_ids(false).await;
     assert!(queue.is_empty(), "{queue:?}");
     assert!(
@@ -1287,18 +1153,9 @@ fn reading_then_done() -> Vec<Vec<NormalizedEvent>> {
 /// run ends `cancelled` at its boundary, with the result kept, and the interrupt runs next,
 /// alike.
 async fn an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike(cipher: Cipher) {
-    let (today_planes, today_reached, today_release) = tool_gated();
     let (store_planes, store_reached, store_release) = tool_gated();
-    let pair = Pair::with_planes(
-        reading_then_done(),
-        false,
-        today_planes,
-        store_planes,
-        cipher,
-    )
-    .await;
+    let pair = Pair::with_planes(reading_then_done(), false, store_planes, cipher).await;
     pair.first("r1").await;
-    today_reached.notified().await;
     store_reached.notified().await;
     let interrupt = pair
         .alike_as("i1", from(core(), "stop and do this"), Delivery::Interrupt)
@@ -1307,35 +1164,25 @@ async fn an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike(cipher: Ci
         matches!(interrupt, SendOutcome::Pending { .. }),
         "{interrupt:?}"
     );
-    today_release.notify_one();
     store_release.notify_one();
     pair.idle().await;
-    let today_calls = pair.today.executor.provider.inner.calls().len();
+    let calls = pair.store.provider.inner.calls().len();
     let (ledger, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "{queue:?}");
     assert_eq!(
         run_story(&ledger),
         ["start r1", "end cancelled", "start i1", "end completed"]
     );
-    alike_today_first!(today_calls, 2, "r1's tool step and i1's answer");
+    assert_eq!(calls, 2, "r1's tool step and i1's answer");
 }
 
 /// A process that dies after an interrupt's message is durable and before the run it stopped
 /// has ended: the next open ends that run `interrupted` as a crash's orphan, never resuming it,
 /// and the interrupt runs first, alike.
 async fn a_crash_between_an_interrupt_and_its_run_is_recovered_alike(cipher: Cipher) {
-    let (today_planes, today_reached, _today_release) = tool_gated();
     let (store_planes, store_reached, _store_release) = tool_gated();
-    let pair = Pair::with_planes(
-        reading_then_done(),
-        false,
-        today_planes,
-        store_planes,
-        cipher,
-    )
-    .await;
+    let pair = Pair::with_planes(reading_then_done(), false, store_planes, cipher).await;
     pair.first("r1").await;
-    today_reached.notified().await;
     store_reached.notified().await;
     let interrupt = pair
         .alike_as("i1", from(core(), "stop and do this"), Delivery::Interrupt)
@@ -1373,13 +1220,13 @@ fn marked(mut request: SubmissionRequest, marks: Value) -> SubmissionRequest {
     request
 }
 
-/// The scoped session's first send, from its owner, carrying the plan; both sides start its run.
+/// The scoped session's first send, from its owner, carrying the plan, which starts its run.
 async fn first_scoped(pair: &Pair, run_id: &str) {
-    let (old, new) = pair
+    let reply = pair
         .send(run_id, scoped("first"), None, Some(plan()), None)
         .await;
-    assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
-    alike!(new, old, "the first send's replies differ");
+    assert!(matches!(reply, SendOutcome::Active { .. }), "{reply:?}");
+    broca_test_support::pin!("the first send's reply", reply);
 }
 
 /// Sends queued to ride on a tool batch keep their display marks: a plan sender's notice, and

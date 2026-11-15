@@ -1,4 +1,4 @@
-== Reserved { module_id: "stranger" } over Unstamped: replies differ
+== Reserved { module_id: "stranger" } over Unstamped: reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -18,7 +18,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: Some("flow-1"), sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: Some("flow-1"), sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -38,7 +38,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: None, sender: Some(Reserved { module_id: "basal" }), agent_id: Some("agent-1"), run_id: Some("parent-run"), agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: None, sender: Some(Reserved { module_id: "basal" }), agent_id: Some("agent-1"), run_id: Some("parent-run"), agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -58,7 +58,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "occipital" } over Unstamped: replies differ
+== Reserved { module_id: "occipital" } over Unstamped: reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -78,9 +78,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "occipital" } over Unstamped: replies differ
-Ack
-== alike
+== Reserved { module_id: "occipital" } over Unstamped: reply
 Ack
 == control stream
 [
@@ -158,11 +156,9 @@ Ack
     }
   }
 ]
-== Reserved { module_id: "prefrontal-core" } over Unstamped: replies differ
+== Reserved { module_id: "prefrontal-core" } over Unstamped: reply
 Ack
-== alike
-Ack
-== heads differ for None
+== head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -181,7 +177,7 @@ Object {
     },
     "updated_at": Bool(true),
 }
-== heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -210,7 +206,7 @@ Object {
     },
     "updated_at": Bool(true),
 }
-== heads differ for Some(Reserved { module_id: "occipital" })
+== head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -366,7 +362,7 @@ Object {
     }
   }
 ]
-== Reserved { module_id: "stranger" } over Unstamped: replies differ
+== Reserved { module_id: "stranger" } over Unstamped: reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -386,7 +382,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: Some("flow-1"), sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: Some("flow-1"), sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -406,7 +402,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: None, sender: Some(Reserved { module_id: "basal" }), agent_id: Some("agent-1"), run_id: Some("parent-run"), agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): replies differ
+== Reserved { module_id: "prefrontal-core" } over Stamped(BindScope { scope: SessionScope { owner: Reserved { module_id: "prefrontal-core" }, scope_ref: "parent-run", scope_epoch: 1, flow_id: None, sender: Some(Reserved { module_id: "basal" }), agent_id: Some("agent-1"), run_id: Some("parent-run"), agent_id_frozen: false }, kind: Head, parent: None, parent_state: None, owner_authorized: true }): reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -426,7 +422,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "occipital" } over Unstamped: replies differ
+== Reserved { module_id: "occipital" } over Unstamped: reply
 ScopeRefused(
     OwnerMismatch(
         OwnerOperation {
@@ -446,9 +442,7 @@ ScopeRefused(
         },
     ),
 )
-== Reserved { module_id: "occipital" } over Unstamped: replies differ
-Ack
-== alike
+== Reserved { module_id: "occipital" } over Unstamped: reply
 Ack
 == control stream
 [
@@ -526,11 +520,9 @@ Ack
     }
   }
 ]
-== Reserved { module_id: "prefrontal-core" } over Unstamped: replies differ
+== Reserved { module_id: "prefrontal-core" } over Unstamped: reply
 Ack
-== alike
-Ack
-== heads differ for None
+== head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -549,7 +541,7 @@ Object {
     },
     "updated_at": Bool(true),
 }
-== heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -578,7 +570,7 @@ Object {
     },
     "updated_at": Bool(true),
 }
-== heads differ for Some(Reserved { module_id: "occipital" })
+== head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {

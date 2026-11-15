@@ -1,25 +1,22 @@
 //! Sends into a session whose latest run is paused for a restart, and keyed retries of sends
-//! that never started a run of their own, through today's actor and the store actor, compared
-//! reply by reply and, through [`super::compare`], by what each session then holds: a steer into
-//! a run paused for a restart, kept for its resume; and the retries of a steer, of a retracted
-//! send, and of a send refused when it drained.
+//! that never started a run of their own, through the store actor, each reply pinned and,
+//! through [`super::compare`], what the session then holds: a steer into a run paused for a
+//! restart, kept for its resume; and the retries of a steer, of a retracted send, and of a send
+//! refused when it drained.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
-use broca_protocol::{Delivery, NormalizedEvent, PauseReason, RunId, SubmissionRequest};
+use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_protocol::{Delivery, PauseReason, RunId, SubmissionRequest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::super::tests::{self as store, request, Gated};
-use super::{
-    compare, hello, keyed, refused_at_admission, send, steered, tweaked, Step, Today, TodayLoop,
-};
+use super::super::tests::{self as store, request};
+use super::{compare, hello, keyed, refused_at_admission, send, steered, tweaked, Step};
 use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunJob};
-use crate::registry::LineageRegistry;
 
 /// A steer joins the running run; its retry under the same key is answered by that run, active
 /// while it runs and finished with the steer's delivery once it ended, and a retry with another
@@ -142,38 +139,6 @@ impl<E: RunExecutor> RunExecutor for StopsFirstRun<E> {
     }
 }
 
-/// Today's module whose first run pauses for a restart (see [`StopsFirstRun`]).
-fn today_stopping(steps: Vec<Vec<NormalizedEvent>>) -> Today {
-    let dir = super::scratch_dir();
-    let key = broca_protocol::BindIdentity::new(dir.join("project"), "store-actor", "s1");
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let executor = Arc::new(TodayLoop {
-        provider: Gated {
-            render_config: None,
-            notes_sends: false,
-            hold: None,
-            inner: broca_core::provider::StubProvider::new(steps),
-            gate: None,
-        },
-        wal: Arc::clone(&wal),
-        planes: Default::default(),
-    });
-    let opener = crate::opener::DefaultOpener::new(
-        Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
-        Arc::new(StopsFirstRun::new(Arc::clone(&executor))),
-    )
-    .with_idle_ttl(std::time::Duration::from_secs(60));
-    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
-    Today {
-        dir,
-        registry,
-        wal,
-        key,
-        executor,
-    }
-}
-
 /// A send under a restart policy that resumes the run after a restart.
 fn resumable(text: &str) -> SubmissionRequest {
     let mut sent = request(text);
@@ -183,10 +148,9 @@ fn resumable(text: &str) -> SubmissionRequest {
 
 /// A run paused for a restart takes a steer: the steer is recorded for the run's resume and
 /// answered naming the paused run; a retry of it is answered by that run, and one with another
-/// payload is refused naming what differs. A plain send waits behind the paused run. Alike.
+/// payload is refused naming what differs. A plain send waits behind the paused run.
 #[tokio::test]
 async fn a_steer_into_a_run_paused_for_a_restart_waits_for_its_resume_alike() {
-    let today = today_stopping(hello());
     let parts = broca_session_loop::parts::SharedParts::new(Box::new(
         broca_session_loop::parts::MemoryParts::default(),
     ));
@@ -230,14 +194,10 @@ async fn a_steer_into_a_run_paused_for_a_restart_waits_for_its_resume_alike() {
             None => SendKey::Minted,
         };
         let sent = caller.shape(run_id, &send_key(), resumable(text));
-        let old = today
-            .send(run_id, sent.clone(), send_key(), delivery, None)
-            .await;
         let new = store::send_exactly(&commands, run_id, sent, send_key(), delivery, None).await;
-        alike!(new, old, "the replies to {run_id} differ");
+        broca_test_support::pin!(format!("the replies to {run_id} differ"), new);
         if run_id == "r1" {
-            // Both runs pause at their first boundary before the next send.
-            today.idle().await;
+            // The run pauses at its first boundary before the next send.
             store::idle(&commands).await;
         }
         replies.push(new);
@@ -270,5 +230,4 @@ async fn a_steer_into_a_run_paused_for_a_restart_waits_for_its_resume_alike() {
             .collect::<Vec<_>>(),
         ["sub-r2"]
     );
-    assert!(today.registry.stop_and_seal().await);
 }

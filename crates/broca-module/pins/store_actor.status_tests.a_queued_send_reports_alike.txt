@@ -1,3 +1,30 @@
+== while r1 runs
+[
+    Object {
+        "state": String("pending"),
+    },
+    Object {
+        "state": String("active"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("active"),
+        "usage": Object {
+            "by_model": Array [],
+            "steps": Number(0),
+            "unreported_steps": Number(0),
+        },
+    },
+    Object {
+        "run_id": String("r1"),
+        "state": String("active"),
+    },
+]
 == run.status r1 after both ran
 Object {
     "final_step_finish_reason": String("stop"),

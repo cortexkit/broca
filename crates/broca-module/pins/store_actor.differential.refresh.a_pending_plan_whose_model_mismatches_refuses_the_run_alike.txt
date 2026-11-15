@@ -1,13 +1,13 @@
-== alike
+== the answers
 [
     "active",
     "Accepted { run_in_progress: false, applies_from_next_run: true }",
     "PlanRefused(PendingPlanModelMismatch { generation: 1, mismatch: PlanModelMismatch { provider: \"fixture\", plan_model: Object {\"id\": String(\"m2\"), \"provider\": String(\"stub\")}, send_model: Object {\"id\": String(\"m\"), \"provider\": String(\"stub\")} } })",
     "active",
 ]
-== alike
+== the baselines
 sha256:ac41de03d9d5785bbc696cfb70bebb1a0a9d453a61fb918d5c51a696f6b42f4a (2437 bytes)
-== alike
+== the runs
 [
     (
         "r1",
@@ -24,7 +24,7 @@ sha256:ac41de03d9d5785bbc696cfb70bebb1a0a9d453a61fb918d5c51a696f6b42f4a (2437 by
         "m2",
     ),
 ]
-== alike
+== the refreshes applied
 [
     1,
 ]

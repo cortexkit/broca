@@ -1,0 +1,45 @@
+== unstamped
+ScopeRefused(
+    OwnerMismatch(
+        Reserved {
+            owner: Reserved {
+                module_id: "prefrontal-core",
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "magic-context",
+                },
+            ),
+        },
+    ),
+)
+== another owner
+ScopeRefused(
+    OwnerMismatch(
+        Reserved {
+            owner: Reserved {
+                module_id: "prefrontal-core",
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "magic-context",
+                },
+            ),
+        },
+    ),
+)
+== another of core's scopes
+ScopeRefused(
+    OwnerMismatch(
+        Reserved {
+            owner: Reserved {
+                module_id: "prefrontal-core",
+            },
+            presented_principal: Some(
+                Reserved {
+                    module_id: "prefrontal-core",
+                },
+            ),
+        },
+    ),
+)

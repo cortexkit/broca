@@ -80,7 +80,7 @@ pub(super) fn sample(name: &str, body: &[u8]) {
 
 async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool) {
     let mut bodies = Vec::new();
-    for new_storage in [false, true] {
+    for new_storage in [true] {
         let (calls, mut inbox) = mpsc::unbounded_channel();
         let events =
             with_bus.then(|| Arc::new(StepEvents::start_on_bus(Arc::new(Capture { calls, fail }))));
@@ -244,18 +244,10 @@ async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool)
         bodies.push(body);
     }
     if with_bus {
-        let mut expected = normalized(&bodies[0]);
-        // Only today's reservation measures physical bytes. The new attempt's canonical
-        // length cannot stand in for it, so pin this documented evidence gap explicitly.
-        assert_eq!(
-            expected
-                .as_object_mut()
-                .unwrap()
-                .remove("request_body_bytes"),
-            Some(json!(10))
-        );
-        assert!(normalized(&bodies[1]).get("request_body_bytes").is_none());
-        assert_eq!(expected, normalized(&bodies[1]));
+        // The new storage's attempt records no physical request length, so the event leaves
+        // `request_body_bytes` out rather than stand a canonical length in for it.
+        assert!(normalized(&bodies[0]).get("request_body_bytes").is_none());
+        broca_test_support::pin!("the step event", normalized(&bodies[0]));
     }
 }
 
@@ -309,20 +301,8 @@ async fn handoff_evidence(new_storage: bool) {
         let synced = evidence.fields["synced_through"].parse::<u64>().unwrap();
         assert!(record_end > 0);
         assert!(synced >= record_end, "published before sync: {evidence:?}");
-    } else {
-        alike!(evidence.fields["storage"], "wal");
-        let synced = evidence.fields["synced_seq"].parse::<u64>().unwrap();
-        assert!(
-            synced >= published.seq,
-            "published before sync: {evidence:?}"
-        );
     }
     assert!(module.registry.stop_and_seal().await);
-}
-
-#[tokio::test]
-async fn wal_step_event_handoff_logs_the_actual_synced_position() {
-    handoff_evidence(false).await;
 }
 
 #[tokio::test]
@@ -372,7 +352,7 @@ async fn a_model_attempt_without_send_time_emits_no_step_event(cipher: Cipher) {
 
 async fn cached_anthropic_auto_step_events_match(cipher: Cipher) {
     let mut bodies = Vec::new();
-    for new_storage in [false, true] {
+    for new_storage in [true] {
         let (calls, mut inbox) = mpsc::unbounded_channel();
         let events = Arc::new(StepEvents::start_on_bus(Arc::new(Capture {
             calls,
@@ -420,7 +400,7 @@ async fn cached_anthropic_auto_step_events_match(cipher: Cipher) {
         body.as_object_mut().unwrap().remove("request_body_bytes");
         bodies.push(body);
     }
-    alike_today_first!(bodies[0], bodies[1]);
+    broca_test_support::pin!("alike", bodies[0]);
 }
 
 cipher_tests! { durable_step_events_match, no_bus_publishes_no_step_events, run_publishes_step_events_without_configuration, failing_step_publisher_does_not_fail_runs, a_model_attempt_without_send_time_emits_no_step_event, cached_anthropic_auto_step_events_match }

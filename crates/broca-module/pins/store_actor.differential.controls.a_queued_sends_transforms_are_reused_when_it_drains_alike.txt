@@ -1,11 +1,11 @@
-== alike
+== reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== alike
+== reply
 Pending {
     submission_id: SubmissionId(
         "sub-r2",
@@ -13,7 +13,7 @@ Pending {
 }
 == control stream
 sha256:0e6b6afd6f4d6dac8d3158d4d5f6425505a8759cc0e56cd24b3859ac0fff76e1 (3434 bytes)
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "[noted] first",
@@ -21,9 +21,9 @@ sha256:0e6b6afd6f4d6dac8d3158d4d5f6425505a8759cc0e56cd24b3859ac0fff76e1 (3434 by
     "[noted] second",
     "again",
 ]
-== the runs' starts differ
+== the runs' starts
 sha256:1c79db4e36ce44b9d406711de4c1c1e168c652049d064d77a93a69d24d15c326 (2064 bytes)
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",
@@ -222,12 +222,7 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:f2d77adaf0f610258dfd2832a44b9a458c2f258776ad0c94159a96d924fa057d (2921 bytes)
-== the queued send is transformed once, when it is queued
-(
-    2,
-    2,
-)
-== alike
+== send hooks
 [
     (
         "queued",

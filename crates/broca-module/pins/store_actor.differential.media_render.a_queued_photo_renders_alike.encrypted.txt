@@ -1,2 +1,6 @@
 == the queued photo's run: how many requests
 2
+== the queued photo's run: request 0
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}
+== the queued photo's run: request 1
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"},{"content":[{"text":"hello","type":"text"}],"role":"assistant"},{"content":[{"text":"look","type":"text"},{"source":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","media_type":"image/png","type":"base64"},"type":"image"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}

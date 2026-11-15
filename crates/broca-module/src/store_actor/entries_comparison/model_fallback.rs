@@ -20,14 +20,6 @@ async fn session(steps: Vec<Vec<NormalizedEvent>>) -> Side {
         None,
     );
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
-        today: Gated {
-            inner: provider.clone(),
-            gate: None,
-            render_config: None,
-            notes_sends: false,
-            hold: None,
-        },
-        wal: wal.clone(),
         store: provider.clone(),
         compaction: None,
         hooks: None,

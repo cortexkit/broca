@@ -1,8 +1,7 @@
-//! The run controls the store actor hands the new loop, compared with what today's actor hands
-//! today's loop, by sending the same sends to both: the compaction contract a planned session
-//! starts on, the compaction state a session keeps from one run to the next, whether a send
-//! named its own tools, and a plan's input transforms (`pre_user`) on a fresh run, a steer and a
-//! queued send.
+//! The run controls the store actor hands the new loop: the compaction contract a planned session
+//! starts on, the compaction state a session keeps from one run to the next, whether a send named
+//! its own tools, and a plan's input transforms (`pre_user`) on a fresh run, a steer and a queued
+//! send.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,12 +17,11 @@ use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{FrozenDeclaration, OpaqueJson, PlanManifest, WalRecord};
+use broca_wal::{FrozenDeclaration, OpaqueJson, PlanManifest};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::super::tests::{self as store, LoopExecutor, Planes};
-use super::{today_with, Today};
 use crate::actor::{LineageCmd, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
 
@@ -465,60 +463,48 @@ fn noting(noter: &Arc<Noter>) -> Planes {
     }
 }
 
-/// One session on today's storage and one in the new storage, run over the same script, each
-/// executor offering its own planes.
+/// A session in the new storage served by the store actor over a script, its executor offering
+/// `planes`.
 struct Pair {
-    today: Today,
     backend: &'static MemoryBackend,
     commands: mpsc::UnboundedSender<LineageCmd>,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     store: Arc<LoopExecutor>,
     /// The store actor's setup parts, which reads of its session name tools and plans from.
     parts: broca_session_loop::parts::SharedParts,
-    /// Each side's gate on its model calls, when the pair is gated: every model call waits for
-    /// one release.
-    gates: Vec<Arc<Notify>>,
+    /// The gate on its model calls, when the pair is gated: every model call waits for one
+    /// release.
+    gate: Option<Arc<Notify>>,
 }
 
-/// What a pair left once its store session's actor ended: both sessions, and the store side's
-/// executor.
+/// What a pair left once its session's actor ended: the session and its executor.
 struct Ended {
-    today: Today,
     session: Session<&'static MemoryBackend>,
     store: Arc<LoopExecutor>,
     parts: broca_session_loop::parts::SharedParts,
 }
 
 impl Pair {
-    async fn new(
-        script: Vec<Vec<NormalizedEvent>>,
-        gated: bool,
-        today_planes: Planes,
-        store_planes: Planes,
-    ) -> Self {
+    async fn new(script: Vec<Vec<NormalizedEvent>>, gated: bool, planes: Planes) -> Self {
         Self::new_in(
             script,
             gated,
-            today_planes,
-            store_planes,
+            planes,
             broca_session_store::keys::Cipher::XChaCha20Poly1305,
         )
         .await
     }
 
-    /// [`Pair::new`], with the store's session in mode `cipher`.
+    /// [`Pair::new`], with the session in mode `cipher`.
     async fn new_in(
         script: Vec<Vec<NormalizedEvent>>,
         gated: bool,
-        today_planes: Planes,
-        store_planes: Planes,
+        planes: Planes,
         cipher: broca_session_store::keys::Cipher,
     ) -> Self {
-        let today_gate = gated.then(|| Arc::new(Notify::new()));
-        let store_gate = gated.then(|| Arc::new(Notify::new()));
-        let today = today_with(script.clone(), today_gate.clone(), today_planes);
-        let mut executor = store::executor(script, store_gate.clone());
-        executor.planes = store_planes;
+        let gate = gated.then(|| Arc::new(Notify::new()));
+        let mut executor = store::executor(script, gate.clone());
+        executor.planes = planes;
         let executor = Arc::new(executor);
         let backend: &'static MemoryBackend = Box::leak(Box::default());
         let session = Session::create(
@@ -541,53 +527,29 @@ impl Pair {
         let (commands, receiver) = mpsc::unbounded_channel();
         let served = tokio::spawn(actor.serve(receiver));
         Self {
-            today,
             backend,
             commands,
             served,
             store: executor,
             parts,
-            gates: today_gate.into_iter().chain(store_gate).collect(),
+            gate,
         }
     }
 
-    /// Sends `request` as `run_id` to both sessions, delivered as `delivery` and carrying a
-    /// plan with `plan`'s manifest when one is given. Returns today's reply and the store's.
+    /// Sends `request` as `run_id`, delivered as `delivery` and carrying a plan with `plan`'s
+    /// manifest when one is given, and returns the reply.
     async fn send(
         &self,
         run_id: &str,
         request: SubmissionRequest,
         plan: Option<&Arc<PlanManifest>>,
         delivery: Delivery,
-    ) -> (SendOutcome, SendOutcome) {
-        let send_plan = || {
-            plan.map(|manifest| SendPlan {
-                identity: manifest.plan_identity.clone(),
-                manifest: Some(Arc::clone(manifest)),
-                model_check: None,
-            })
-        };
-        let old = self
-            .today
-            .registry
-            .route_submission_with_order(
-                &self.today.key,
-                RunId(run_id.into()),
-                request.clone(),
-                RunKind::FreshOrResume,
-                SendKey::Minted,
-                false,
-                delivery,
-                send_plan(),
-                None,
-                None,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-            .expect("today's actor opens");
+    ) -> SendOutcome {
+        let plan = plan.map(|manifest| SendPlan {
+            identity: manifest.plan_identity.clone(),
+            manifest: Some(Arc::clone(manifest)),
+            model_check: None,
+        });
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(LineageCmd::Send {
@@ -602,37 +564,31 @@ impl Pair {
                 key: SendKey::Minted,
                 skip_materialization: false,
                 delivery,
-                plan: send_plan().map(Box::new),
+                plan: plan.map(Box::new),
                 order: None,
                 reply,
             })
             .unwrap();
-        (old, answer.await.unwrap())
+        answer.await.unwrap()
     }
 
-    /// Lets one waiting model call through on each side.
+    /// Lets one waiting model call through.
     fn release(&self) {
-        for gate in &self.gates {
+        if let Some(gate) = &self.gate {
             gate.notify_one();
         }
     }
 
     async fn idle(&self) {
-        self.today.idle().await;
         store::idle(&self.commands).await;
     }
 
-    /// Ends the store session's actor, once both sessions' control streams from their start
-    /// were found the same.
+    /// Pins the session's control stream from its start, then ends its actor.
     async fn end(self) -> Ended {
-        super::streams::assert_alike(
-            &super::streams::store(&self.commands).await,
-            &super::streams::routed(&self.today.registry, &self.today.key).await,
-        );
+        super::streams::pin(&super::streams::store(&self.commands).await);
         drop(self.commands);
         Ended {
             session: self.served.await.unwrap(),
-            today: self.today,
             store: self.store,
             parts: self.parts,
         }
@@ -640,29 +596,6 @@ impl Pair {
 }
 
 impl Ended {
-    /// What each run's start recorded that these comparisons read, from today's log.
-    fn today_starts(&self) -> Vec<Value> {
-        self.today_records()
-            .into_iter()
-            .filter_map(|record| match record {
-                WalRecord::RunStarted {
-                    run_id,
-                    config,
-                    compaction_plan_version,
-                    hooks,
-                    ..
-                } => Some(json!({
-                    "run_id": run_id.0,
-                    "compaction_plan_version": compaction_plan_version,
-                    "context_limit": config.context_limit,
-                    "tools_were_omitted": config.tools_were_omitted,
-                    "hooks": hooks,
-                })),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The same facts of each run's start, from the store session.
     async fn store_starts(&self) -> Vec<Value> {
         self.store_records()
@@ -686,19 +619,6 @@ impl Ended {
             .collect()
     }
 
-    /// How each run ended, from today's log.
-    fn today_ends(&self) -> Vec<Value> {
-        self.today_records()
-            .into_iter()
-            .filter_map(|record| match record {
-                WalRecord::RunFinished { reason, error, .. } => {
-                    Some(json!({"reason": reason, "error": error}))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     /// How each run ended, from the store session.
     async fn store_ends(&self) -> Vec<Value> {
         self.store_records()
@@ -706,18 +626,6 @@ impl Ended {
             .into_iter()
             .filter_map(|record| match record {
                 Record::RunEnd(end) => Some(json!({"reason": end.reason, "error": end.error})),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The hooks each steer and queued send recorded, in order, from today's log.
-    fn today_send_hooks(&self) -> Vec<(&'static str, Value)> {
-        self.today_records()
-            .into_iter()
-            .filter_map(|record| match record {
-                WalRecord::Steered { hooks, .. } => Some(("steer", json!(hooks))),
-                WalRecord::Queued { hooks, .. } => Some(("queued", json!(hooks))),
                 _ => None,
             })
             .collect()
@@ -742,16 +650,6 @@ impl Ended {
             .collect()
     }
 
-    fn today_records(&self) -> Vec<WalRecord> {
-        self.today
-            .wal
-            .read_records(&self.today.key)
-            .unwrap()
-            .into_iter()
-            .map(|frame| frame.record)
-            .collect()
-    }
-
     async fn store_records(&self) -> Vec<Record> {
         self.session
             .open_log_records()
@@ -762,8 +660,8 @@ impl Ended {
             .collect()
     }
 
-    /// The text of every message each model call was sent, today's side first.
-    fn prompts(&self) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+    /// The text of every message each model call was sent.
+    fn prompts(&self) -> Vec<Vec<String>> {
         let texts = |calls: Vec<broca_protocol::request::CallOptions>| {
             calls
                 .iter()
@@ -779,58 +677,40 @@ impl Ended {
                 })
                 .collect()
         };
-        (
-            texts(self.today.executor.provider.inner.calls()),
-            texts(self.store.provider.inner.calls()),
-        )
+        texts(self.store.provider.inner.calls())
     }
 
-    /// The two sessions hold the same conversation, their runs' starts record the same
-    /// compaction, tool and hook facts, every model call was sent the same messages, and reads
-    /// with each opt-in serve the same.
-    async fn assert_alike(&self) {
-        alike!(
-            store::texts(&self.session),
-            self.today.texts().await,
-            "the conversations differ"
-        );
-        alike!(
-            self.store_starts().await,
-            self.today_starts(),
-            "the runs' starts differ"
-        );
-        let (old, new) = self.prompts();
-        alike!(new, old, "the model calls were sent different messages");
-        super::display_reads_alike(&self.today, &self.session, &self.parts).await;
-    }
-
-    async fn stop(self) {
-        assert!(self.today.registry.stop_and_seal().await);
+    /// Pins the session's conversation, the compaction, tool and hook facts its runs' starts
+    /// record, the messages each model call was sent, and reads with each opt-in.
+    async fn pin(&self) {
+        broca_test_support::pin!("the conversation", store::texts(&self.session));
+        broca_test_support::pin!("the runs' starts", self.store_starts().await);
+        broca_test_support::pin!("the messages each model call was sent", self.prompts());
+        super::display_reads(&self.session, &self.parts).await;
     }
 }
 
 /// A planned send whose plan names a compaction provider starts its session on the compaction
-/// contract on both storages, and both runs' starts record the same compaction facts. The
-/// second run keeps the compaction state the first left, as today's actor keeps it for its
-/// life: neither storage sends the provider Setup again.
+/// contract, and both runs' starts record its compaction facts. The second run keeps the
+/// compaction state the first left: the provider isn't sent Setup again.
 #[tokio::test]
 async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
-    let (pair, old, new) = compacting_pair(super::hello(), false).await;
+    let (pair, new) = compacting_pair(super::hello(), false).await;
     let plan = compacting_plan();
-    let (today, store) = pair
+    let store = pair
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
-    let (today, store) = pair
+    let store = pair
         .send("r2", limited("second"), None, Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
+    ended.pin().await;
     let starts = ended.store_starts().await;
     assert_eq!(starts.len(), 2);
     for start in &starts {
@@ -840,18 +720,12 @@ async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
             "{start}"
         );
     }
-    alike_today_first!(
-        old.setups(),
-        1,
-        "today's actor sends Setup once in its life"
-    );
-    alike!(
+    assert_eq!(
         new.setups(),
-        old.setups(),
+        1,
         "the store actor's second run sent Setup again: {:?}",
         new.methods.lock().unwrap()
     );
-    ended.stop().await;
 }
 
 /// A planned send whose plan subscribes a provider to `pre_user` has its input transformed on
@@ -859,53 +733,52 @@ async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
 /// input, and both conversations hold it.
 #[tokio::test]
 async fn a_planned_sends_input_is_transformed_alike() {
-    let (old, new) = (Arc::new(Noter::default()), Arc::new(Noter::default()));
-    let pair = Pair::new(super::hello(), false, noting(&old), noting(&new)).await;
+    let new = Arc::new(Noter::default());
+    let pair = Pair::new(super::hello(), false, noting(&new)).await;
     let plan = noting_plan("pass");
-    let (today, store) = pair
+    let store = pair
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    alike_today_first!((old.calls(), new.calls()), (1, 1));
+    ended.pin().await;
+    assert_eq!(new.calls(), 1);
     let starts = ended.store_starts().await;
     assert!(starts[0]["hooks"].is_object(), "{}", starts[0]);
-    let (_, prompts) = ended.prompts();
+    let prompts = ended.prompts();
     assert!(
         prompts[0].contains(&"[noted] first".to_owned()),
         "{prompts:?}"
     );
-    ended.stop().await;
 }
 
 /// A steer into a planned session's running run goes through the same transforms on both
 /// storages, and its record keeps the same hooks.
 #[tokio::test]
 async fn a_steers_input_is_transformed_alike() {
-    let (old, new) = (Arc::new(Noter::default()), Arc::new(Noter::default()));
-    let pair = Pair::new(super::hello(), true, noting(&old), noting(&new)).await;
+    let new = Arc::new(Noter::default());
+    let pair = Pair::new(super::hello(), true, noting(&new)).await;
     let plan = noting_plan("pass");
-    let (today, store) = pair
+    let store = pair
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
-    let (today, store) = pair
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
+    let store = pair
         .send("s1", untooled("more"), None, Delivery::Steer)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.release();
     pair.release();
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    alike_today_first!((old.calls(), new.calls()), (2, 2));
+    ended.pin().await;
+    assert_eq!(new.calls(), 2);
     let hooks = ended.store_send_hooks().await;
-    alike!(hooks, ended.today_send_hooks());
+    broca_test_support::pin!("send hooks", hooks);
     assert!(
         matches!(hooks.as_slice(), [("steer", Value::Object(_))]),
         "{hooks:?}"
@@ -915,7 +788,6 @@ async fn a_steers_input_is_transformed_alike() {
         "{:?}",
         store::texts(&ended.session)
     );
-    ended.stop().await;
 }
 
 /// A send queued behind a planned session's running run goes through the transforms when it is
@@ -924,31 +796,31 @@ async fn a_steers_input_is_transformed_alike() {
 /// is sent the same noted input.
 #[tokio::test]
 async fn a_queued_sends_transforms_are_reused_when_it_drains_alike() {
-    let (old, new) = (Arc::new(Noter::default()), Arc::new(Noter::default()));
-    let pair = Pair::new(super::hello(), true, noting(&old), noting(&new)).await;
+    let new = Arc::new(Noter::default());
+    let pair = Pair::new(super::hello(), true, noting(&new)).await;
     let plan = noting_plan("pass");
-    let (today, store) = pair
+    let store = pair
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
-    let (today, store) = pair
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
+    let store = pair
         .send("r2", untooled("second"), None, Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Pending { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Pending { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.release();
     pair.release();
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    alike_today_first!(
-        (old.calls(), new.calls()),
-        (2, 2),
+    ended.pin().await;
+    assert_eq!(
+        new.calls(),
+        2,
         "the queued send is transformed once, when it is queued"
     );
     let hooks = ended.store_send_hooks().await;
-    alike!(hooks, ended.today_send_hooks());
+    broca_test_support::pin!("send hooks", hooks);
     assert!(
         matches!(hooks.as_slice(), [("queued", Value::Object(_))]),
         "{hooks:?}"
@@ -956,34 +828,32 @@ async fn a_queued_sends_transforms_are_reused_when_it_drains_alike() {
     let starts = ended.store_starts().await;
     assert_eq!(starts.len(), 2);
     assert!(starts[1]["hooks"].is_object(), "{}", starts[1]);
-    let (_, prompts) = ended.prompts();
+    let prompts = ended.prompts();
     assert!(
         prompts[1].contains(&"[noted] second".to_owned()),
         "{prompts:?}"
     );
-    ended.stop().await;
 }
 
 /// A send naming no tools, into a session whose plan confines its tools, runs on the plan's
 /// tools, and both runs' starts record that the send left them out.
 #[tokio::test]
 async fn a_send_leaving_its_tools_to_a_confining_plan_records_it_alike() {
-    let pair = Pair::new(super::hello(), false, Planes::default(), Planes::default()).await;
+    let pair = Pair::new(super::hello(), false, Planes::default()).await;
     let plan = manifest(json!({"tool_items": [{"preset": "worker"}]}), vec![]);
     let mut request = untooled("first");
     request.principal = Some(super::core());
     request.scope = super::head_scope(super::core());
-    let (today, store) = pair.send("r1", request, Some(&plan), Delivery::Queue).await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    let store = pair.send("r1", request, Some(&plan), Delivery::Queue).await;
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
+    ended.pin().await;
     assert_eq!(
         ended.store_starts().await[0]["tools_were_omitted"],
         json!(true)
     );
-    ended.stop().await;
 }
 
 /// A fresh run whose input a refusing transform can't reach (`on_unavailable: refuse`, the
@@ -991,22 +861,20 @@ async fn a_send_leaving_its_tools_to_a_confining_plan_records_it_alike() {
 /// it ends with the same error before any model call.
 #[tokio::test]
 async fn a_refused_input_ends_its_run_before_the_model_alike() {
-    let (old, new) = (Arc::new(Noter::default()), Arc::new(Noter::default()));
-    for noter in [&old, &new] {
-        noter.unavailable.store(true, Ordering::SeqCst);
-    }
-    let pair = Pair::new(super::hello(), false, noting(&old), noting(&new)).await;
+    let new = Arc::new(Noter::default());
+    new.unavailable.store(true, Ordering::SeqCst);
+    let pair = Pair::new(super::hello(), false, noting(&new)).await;
     let plan = noting_plan("refuse");
-    let (today, store) = pair
+    let store = pair
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
+    ended.pin().await;
     let ends = ended.store_ends().await;
-    alike!(ends, ended.today_ends());
+    broca_test_support::pin!("run ends", ends);
     assert_eq!(ends.len(), 1);
     assert_eq!(ends[0]["reason"], json!("error"), "{}", ends[0]);
     assert_eq!(
@@ -1015,8 +883,7 @@ async fn a_refused_input_ends_its_run_before_the_model_alike() {
         "{}",
         ends[0]
     );
-    assert_eq!(ended.prompts(), (vec![], vec![]), "no model call was made");
-    ended.stop().await;
+    assert!(ended.prompts().is_empty(), "no model call was made");
 }
 
 /// Once the provider a refusing plan subscribes can't be reached, a steer into the running run
@@ -1024,35 +891,31 @@ async fn a_refused_input_ends_its_run_before_the_model_alike() {
 /// neither is written.
 #[tokio::test]
 async fn a_refused_steer_or_queued_send_writes_nothing_alike() {
-    let (old, new) = (Arc::new(Noter::default()), Arc::new(Noter::default()));
-    let pair = Pair::new(super::hello(), true, noting(&old), noting(&new)).await;
+    let new = Arc::new(Noter::default());
+    let pair = Pair::new(super::hello(), true, noting(&new)).await;
     let plan = noting_plan("refuse");
-    let (today, store) = pair
+    let store = pair
         .send("r1", untooled("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
-    for noter in [&old, &new] {
-        noter.unavailable.store(true, Ordering::SeqCst);
-    }
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
+    new.unavailable.store(true, Ordering::SeqCst);
     for (run_id, delivery) in [("s1", Delivery::Steer), ("r2", Delivery::Queue)] {
-        let (today, store) = pair.send(run_id, untooled("more"), None, delivery).await;
-        alike_today_first!(
-            today,
+        let store = pair.send(run_id, untooled("more"), None, delivery).await;
+        assert_eq!(
+            store,
             SendOutcome::PreUserUnavailable {
                 provider: "noter".into()
             },
             "{delivery:?}"
         );
-        alike!(store, today, "{delivery:?}");
+        broca_test_support::pin!(format!("{delivery:?}"), store);
     }
     pair.release();
     pair.idle().await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    assert_eq!(ended.today_send_hooks(), vec![]);
+    ended.pin().await;
     assert_eq!(ended.store_send_hooks().await, vec![]);
-    ended.stop().await;
 }
 
 /// The planes of an executor whose compaction provider is `compactor`.
@@ -1072,12 +935,9 @@ pub(super) fn limited(text: &str) -> SubmissionRequest {
     request
 }
 
-/// A pair whose executors each offer their own compaction provider, which keeps every call it
-/// is sent. Returns the pair, then today's side's provider, then the store side's.
-async fn compacting_pair(
-    script: Vec<Vec<NormalizedEvent>>,
-    gated: bool,
-) -> (Pair, Arc<Compactor>, Arc<Compactor>) {
+/// A pair whose executor offers a compaction provider that keeps every call it is sent.
+/// Returns the pair and the provider.
+async fn compacting_pair(script: Vec<Vec<NormalizedEvent>>, gated: bool) -> (Pair, Arc<Compactor>) {
     compacting_pair_in(
         script,
         gated,
@@ -1091,15 +951,11 @@ async fn compacting_pair_in(
     script: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     cipher: broca_session_store::keys::Cipher,
-) -> (Pair, Arc<Compactor>, Arc<Compactor>) {
-    let (old, new) = (
-        Arc::new(Compactor::default()),
-        Arc::new(Compactor::default()),
-    );
-    let pair = Pair::new_in(script, gated, compacting(&old), compacting(&new), cipher).await;
-    old.reads_today(Arc::clone(&pair.today.wal), pair.today.key.clone());
+) -> (Pair, Arc<Compactor>) {
+    let new = Arc::new(Compactor::default());
+    let pair = Pair::new_in(script, gated, compacting(&new), cipher).await;
     new.reads_memory(pair.backend);
-    (pair, old, new)
+    (pair, new)
 }
 
 /// A run on the compaction contract that reaches its step limit with a tool call unanswered
@@ -1109,7 +965,7 @@ async fn compacting_pair_in(
 /// calls follow.
 #[tokio::test]
 async fn a_change_at_a_runs_end_is_told_before_the_next_run_alike() {
-    let (pair, old, new) = compacting_pair(
+    let (pair, new) = compacting_pair(
         vec![store::read_step("a1"), store::text_step("a2", "again")],
         false,
     )
@@ -1117,68 +973,64 @@ async fn a_change_at_a_runs_end_is_told_before_the_next_run_alike() {
     let plan = compacting_plan();
     let mut first = limited("first");
     first.stop_when = vec![broca_protocol::request::StopCondition::StepCount { n: 1 }];
-    let (today, store) = pair.send("r1", first, Some(&plan), Delivery::Queue).await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    let store = pair.send("r1", first, Some(&plan), Delivery::Queue).await;
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
-    alike!(
-        new.calls(),
-        old.calls(),
-        "between the runs the compaction provider was told different things"
+    broca_test_support::pin!(
+        "what the compaction provider was told between the runs",
+        new.calls()
     );
-    let (today, store) = pair
+    let store = pair
         .send("r2", limited("second"), None, Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
-    alike!(new.calls(), old.calls());
+    broca_test_support::pin!("compaction calls", new.calls());
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    ended.stop().await;
+    ended.pin().await;
 }
 
-/// A tool batch's results are told to the compaction provider once they are durable, as
-/// today's actor has its runs tell it, not left for the next step's notice. So a message
-/// steered in during the step reaches the provider in a notice of its own after the results,
-/// on both storages.
+/// A tool batch's results are told to the compaction provider once they are durable, not left for
+/// the next step's notice. So a message steered in during the step reaches the provider in a
+/// notice of its own after the results.
 #[tokio::test]
 async fn a_tool_batchs_results_are_told_once_durable_alike() {
-    let (pair, old, new) = compacting_pair(
+    let (pair, new) = compacting_pair(
         vec![store::read_step("a1"), store::text_step("a2", "again")],
         true,
     )
     .await;
     let plan = compacting_plan();
-    let (today, store) = pair
+    let store = pair
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
-    let (today, store) = pair
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
+    let store = pair
         .send("s1", limited("more"), None, Delivery::Steer)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.release();
     pair.release();
     pair.idle().await;
-    alike!(new.calls(), old.calls());
+    broca_test_support::pin!("compaction calls", new.calls());
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    ended.stop().await;
+    ended.pin().await;
 }
 
 /// Count metadata travels through the real read routes and notice lanes on both storages.
 async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::keys::Cipher) {
-    let (pair, old, new) = compacting_pair_in(
+    let (pair, new) = compacting_pair_in(
         vec![store::read_step("a1"), store::text_step("a2", "answer")],
         false,
         cipher,
     )
     .await;
     let plan = compacting_plan();
-    let (today, store) = pair
+    let store = pair
         .send(
             "r1",
             limited("count these parts"),
@@ -1186,24 +1038,13 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
             Delivery::Queue,
         )
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
     let ended = pair.end().await;
     let request =
         serde_json::value::to_raw_value(&json!({"select": {"by": "after"}, "detail": "full"}))
             .unwrap();
-    let old_page = ended
-        .today
-        .registry
-        .route_compaction_v2(
-            &ended.today.key,
-            Some("compactor".into()),
-            "session.entries".into(),
-            request.clone(),
-        )
-        .await
-        .unwrap();
     let new_page = crate::store_entries::serve_compaction(
         &ended.parts,
         Some(&ended.session),
@@ -1216,7 +1057,6 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
     )
     .await
     .unwrap();
-    let old_page: Value = serde_json::from_str(old_page.get()).unwrap();
     let new_page: Value = serde_json::from_str(new_page.get()).unwrap();
     fn mask(value: &mut Value) {
         match value {
@@ -1238,11 +1078,7 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         mask(&mut value);
         value
     };
-    assert_eq!(
-        masked(&new_page),
-        masked(&old_page),
-        "full count-bearing pages"
-    );
+    broca_test_support::pin!("full count-bearing page", masked(&new_page));
     assert!(new_page["token_family"].is_string());
     assert!(
         new_page["entries"]
@@ -1253,14 +1089,6 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
             .any(|part| part["tokens"].get("output").is_some()),
         "a finished tool has its pair of counts"
     );
-    let old_notices: Vec<_> = old
-        .bodies
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(method, _)| method == "compaction.notice")
-        .map(|(_, body)| body.clone())
-        .collect();
     let new_notices: Vec<_> = new
         .bodies
         .lock()
@@ -1270,10 +1098,8 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         .map(|(_, body)| body.clone())
         .collect();
     assert!(!new_notices.is_empty());
-    // Today's loop never ties its reading to a view; the new loop names the view each reading's
-    // request was rendered under, none here (`0`). The new loop also states it takes no
-    // inserted images, which it renders only as markers; today's states what the model takes.
-    // Apart from those members the notices match.
+    // Each reading names the view its request was rendered under, none here (`0`), and the
+    // loop states it takes no inserted images, which it renders only as markers.
     let without_view = |notice: &Value| {
         let mut notice = notice.clone();
         let conditions = notice["conditions"].as_object_mut().unwrap();
@@ -1283,17 +1109,9 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         assert_eq!(conditions.remove("accepts_images"), Some(json!(false)));
         masked(&notice)
     };
-    let without_images = |notice: &Value| {
-        let mut notice = notice.clone();
-        notice["conditions"]
-            .as_object_mut()
-            .unwrap()
-            .remove("accepts_images");
-        masked(&notice)
-    };
-    assert_eq!(
-        new_notices.iter().map(without_view).collect::<Vec<_>>(),
-        old_notices.iter().map(without_images).collect::<Vec<_>>()
+    broca_test_support::pin!(
+        "the notices",
+        new_notices.iter().map(without_view).collect::<Vec<_>>()
     );
     for notice in &new_notices {
         assert!(notice["token_family"].is_string());
@@ -1319,8 +1137,7 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
             .unwrap();
         }
     }
-    ended.assert_alike().await;
-    ended.stop().await;
+    ended.pin().await;
 }
 
 /// A view the compaction provider hands over at a ride, here the one a run on another model
@@ -1328,7 +1145,7 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
 /// the view and its application, the model is sent the same messages with the dropped message
 /// left out, and a subscriber from each session's start gets the same control stream.
 async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_store::keys::Cipher) {
-    let (pair, old, new) = compacting_pair_in(
+    let (pair, new) = compacting_pair_in(
         vec![
             store::text_step("a1", "hello"),
             store::text_step("a2", "again"),
@@ -1338,60 +1155,49 @@ async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_sto
     )
     .await;
     let plan = compacting_plan();
-    let (today, store) = pair
+    let store = pair
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
     // The view drops the first run's answer, the session's second message.
-    old.drop_at_next_ride(2);
     new.drop_at_next_ride(2);
     let mut second = limited("second");
     second.model = broca_protocol::request::ModelHandle::new("stub", "another");
-    let (today, store) = pair.send("r2", second, None, Delivery::Queue).await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    let store = pair.send("r2", second, None, Delivery::Queue).await;
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
-    alike_today_first!(
-        (old.views(), new.views()),
-        (1, 1),
-        "a ride handed a view over"
-    );
-    alike!(new.calls(), old.calls());
+    assert_eq!(new.views(), 1, "a ride handed a view over");
+    broca_test_support::pin!("compaction calls", new.calls());
     super::super::subscribe_tests::every_unit_resumes(&pair.commands).await;
     let ended = pair.end().await;
-    ended.assert_alike().await;
-    let (prompts, _) = ended.prompts();
+    ended.pin().await;
+    let prompts = ended.prompts();
     let last = prompts.last().unwrap();
     let has = |text: &str| last.iter().any(|said| said.ends_with(text));
     assert!(
         has("second") && !has("hello"),
         "the second run's model call leaves the dropped answer out: {last:?}; the view {:?}, \
          the ids notices named {:?}, the events they told {:?}",
-        old.views.lock().unwrap(),
-        old.mids.lock().unwrap(),
-        old.events.lock().unwrap(),
+        new.views.lock().unwrap(),
+        new.mids.lock().unwrap(),
+        new.events.lock().unwrap(),
     );
-    let today_applied = ended
-        .today_records()
-        .iter()
-        .filter(|record| matches!(record, WalRecord::CompactionViewAppliedV2 { .. }))
-        .count();
     let store_applied = ended
         .store_records()
         .await
         .iter()
         .filter(|record| matches!(record, Record::ViewApplied(_)))
         .count();
-    alike_today_first!((today_applied, store_applied), (1, 1));
-    ended.stop().await;
+    assert_eq!(store_applied, 1);
 }
 
 /// A step whose two tool calls share an id: the first copy is dispatched and the second is
-/// answered with the duplicate error, alike. On the control lane the call starts once, and each
-/// copy's finish carries its own key, today's as the store's: the dispatched copy's from its
-/// intent, the refused copy's from its answer.
+/// answered with the duplicate error. On the control lane the call starts once, and each copy's
+/// finish carries its own key: the dispatched copy's from its intent, the refused copy's from its
+/// answer.
 #[tokio::test]
 async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
     use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason, ToolCall};
@@ -1425,18 +1231,17 @@ async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
         vec![repeated, store::text_step("a2", "done")],
         false,
         Planes::default(),
-        Planes::default(),
     )
     .await;
-    let (today, store) = pair
+    let store = pair
         .send("r1", store::request("first"), None, Delivery::Queue)
         .await;
-    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
-    alike!(store, today);
+    assert!(matches!(store, SendOutcome::Active { .. }), "{store:?}");
+    broca_test_support::pin!("reply", store);
     pair.idle().await;
-    // Today's control lane: one start, and two finishes under two distinct keys, the first
-    // the start's.
-    let stream = super::streams::routed(&pair.today.registry, &pair.today.key).await;
+    // The control lane: one start, and two finishes under two distinct keys, the first the
+    // start's.
+    let stream = super::streams::store(&pair.commands).await;
     let keys = |kind: &str| -> Vec<Value> {
         stream
             .iter()
@@ -1450,7 +1255,5 @@ async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
     assert!(finished.iter().all(Value::is_string), "{finished:?}");
     assert_eq!(finished[0], started[0]);
     assert_ne!(finished[0], finished[1]);
-    // And the store's stream is the same, unit for unit.
-    let ended = pair.end().await;
-    ended.stop().await;
+    pair.end().await;
 }

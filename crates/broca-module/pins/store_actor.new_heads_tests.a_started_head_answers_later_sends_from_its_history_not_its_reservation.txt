@@ -1,0 +1,2 @@
+== the later send's answer
+"Scoped { frozen: SessionScope { owner: Reserved { module_id: \"prefrontal-core\" }, scope_ref: \"head-1\", scope_epoch: 1, flow_id: None, sender: None, agent_id: None, run_id: None, agent_id_frozen: false }, presented_principal: Some(Reserved { module_id: \"magic-context\" }), presented_scope: None }"

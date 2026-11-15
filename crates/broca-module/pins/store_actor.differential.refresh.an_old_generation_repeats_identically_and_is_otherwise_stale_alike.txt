@@ -1,4 +1,4 @@
-== alike
+== the answers
 [
     "active",
     "Accepted { run_in_progress: false, applies_from_next_run: false }",
@@ -6,9 +6,9 @@
     "Accepted { run_in_progress: false, applies_from_next_run: false }",
     "Refused(GenerationStale { accepted: 2 })",
 ]
-== alike
+== the baselines
 sha256:d40b167c4abda5e804a5c3f52846635d73c5794afe06105f0323a02893091583 (2841 bytes)
-== alike
+== the runs
 [
     (
         "r1",
@@ -18,5 +18,5 @@ sha256:d40b167c4abda5e804a5c3f52846635d73c5794afe06105f0323a02893091583 (2841 by
         "m",
     ),
 ]
-== alike
+== the refreshes applied
 []

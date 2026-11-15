@@ -1,12 +1,11 @@
-//! Keep-warm on a session kept in the new storage, through the module's registry, against the
-//! same run on a session on today's storage.
+//! Keep-warm on a session kept in the new storage, through the module's registry.
 //!
-//! Both modules run the same scripted model, whose transport notes each request it sends on the
-//! seal its run gives it, as the real transport does. The model's frozen render config is a
-//! first-party Anthropic one with one-hour cache markers, so the session's cache policy allows a
-//! warm, read with the provider families' own rules, as the serving layer installs them. A send
-//! whose keep-warm is `auto` calls a tool, which is held while the scheduler warms: the warm
-//! re-sends the request the run's transport last sent, and its record goes in the session.
+//! The module runs a scripted model whose transport notes each request it sends on the seal its
+//! run gives it, as the real transport does. The model's frozen render config is a first-party
+//! Anthropic one with one-hour cache markers, so the session's cache policy allows a warm, read
+//! with the provider families' own rules, as the serving layer installs them. A send whose
+//! keep-warm is `auto` calls a tool, which is held while the scheduler warms: the warm re-sends
+//! the request the run's transport last sent, and its record goes in the session.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +17,7 @@ use broca_session_store::record::Record;
 use tokio::sync::{mpsc, Notify};
 
 use super::warm::{warmable, FamilyDeclarer};
-use super::{request, TodayLoop, IDLE};
+use super::{request, IDLE};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
 use crate::registry::LineageRegistry;
@@ -33,10 +32,9 @@ mod resumed;
 /// How long after a request a warm of its cache is sent: short, so the tool wait sees one.
 const WARM_AFTER_MS: u64 = 200;
 
-/// Today's loop and the new loop, warming through a provider that answers the first warm and
-/// never answers a later one, so each run records exactly one warm however long its wait lasts.
+/// The new loop, warming through a provider that answers the first warm and never answers a
+/// later one, so each run records exactly one warm however long its wait lasts.
 struct Loops {
-    today: TodayLoop,
     store: crate::store_actor::tests::LoopExecutor,
     /// The bytes of each warm sent.
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -46,10 +44,10 @@ struct Loops {
 impl RunExecutor for Loops {
     async fn execute(
         &self,
-        job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
+        _job: RunJob,
+        _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
-        self.today.execute(job, out).await
+        unreachable!("a store session's runs come through execute_on_store")
     }
 
     async fn execute_on_store(
@@ -205,22 +203,11 @@ async fn side_events(
         FileWalStore::new(dir.join("wal"))
     });
     let mut store_loop = super::executor(steps(), None);
-    store_loop.provider.render_config = render_config.clone();
+    store_loop.provider.render_config = render_config;
     store_loop.provider.notes_sends = true;
-    store_loop.planes = planes.clone();
+    store_loop.planes = planes;
     let sent = Arc::default();
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
-        today: TodayLoop {
-            provider: super::Gated {
-                inner: broca_core::provider::StubProvider::new(steps()),
-                gate: None,
-                render_config,
-                notes_sends: true,
-                hold: None,
-            },
-            wal: Arc::clone(&wal),
-            planes,
-        },
         store: store_loop,
         sent: Arc::clone(&sent),
     });
@@ -388,29 +375,21 @@ impl Side {
     }
 }
 
-/// A run whose keep-warm is `auto` warms while its tool call runs, as today's does: the warm
-/// re-sends the bytes the run's transport sent for the step that called the tool, and its record
-/// names that step, the request's digest, the warm's usage and the policy's lifetime counted from
-/// the warm's own send. The run then goes on to its end.
+/// A run whose keep-warm is `auto` warms while its tool call runs: the warm re-sends the bytes
+/// the run's transport sent for the step that called the tool, and its record names that step,
+/// the request's digest, the warm's usage and the policy's lifetime counted from the warm's own
+/// send. The run then goes on to its end.
 async fn a_keep_warm_resends_the_last_request_and_records_it_alike(cipher: Cipher) {
-    let today = side(false, cipher).await;
     let store = side(true, cipher).await;
-    today.keep_warm_once().await;
     store.keep_warm_once().await;
-    alike!(
-        *store.sent.lock().unwrap(),
-        *today.sent.lock().unwrap(),
-        "the same bytes warmed"
-    );
-    let warms = today.warms().await;
+    broca_test_support::pin!("the same bytes warmed", *store.sent.lock().unwrap());
+    let warms = store.warms().await;
     assert_eq!(warms.len(), 1, "{warms:?}");
     let (trigger, _, step_id, request, warmed, _, ttl_ms, lifetime) = &warms[0];
     assert_eq!(trigger.as_deref(), Some("keep_warm"));
     assert_eq!(*step_id, 1, "the step that called the tool");
     assert_eq!(request, warmed, "the warm re-sent the request it names");
     assert_eq!((*ttl_ms, *lifetime), (Some(3_600_000), Some(3_600_000)));
-    assert_eq!(store.warms().await, warms);
-    assert!(today.registry.stop_and_seal().await);
     assert!(store.registry.stop_and_seal().await);
 }
 
@@ -418,7 +397,7 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
     use super::step_events::{normalized, sample, Capture};
     use crate::step_events::StepEvents;
     let mut bodies = Vec::new();
-    for new_storage in [false, true] {
+    for new_storage in [true] {
         let (calls, mut inbox) = mpsc::unbounded_channel();
         let events = Arc::new(
             StepEvents::start("fixture", "broca", Arc::new(Capture { calls, fail: false }))
@@ -485,36 +464,7 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
                 .collect();
             assert_eq!(event.log_incarnation, incarnation);
         } else {
-            let records = side.wal.read_records(&side.key).unwrap();
-            let warms: Vec<_> = records
-                .iter()
-                .filter_map(|frame| match &frame.record {
-                    broca_wal::WalRecord::CacheWarmed {
-                        attempt_id,
-                        envelope: Some(envelope),
-                        ..
-                    } => Some((frame.seq, attempt_id, envelope)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(warms.len(), 1);
-            assert_eq!(event.seq, warms[0].0);
-            assert_eq!(
-                event.attempt_id.as_deref(),
-                warms[0].1.as_ref().map(|id| id.as_str())
-            );
-            assert_eq!(Some(event.started_at_ms), warms[0].2.sent_at_ms);
-            assert_eq!(Some(event.finished_at_ms), warms[0].2.finished_at_ms);
-            let writer = records
-                .iter()
-                .find_map(|frame| match &frame.record {
-                    broca_wal::WalRecord::WriterOpened { writer_id, .. } => Some(writer_id),
-                    _ => None,
-                })
-                .unwrap();
-            let writer: String = writer.iter().map(|b| format!("{b:02x}")).collect();
-            let lineage = side.wal.open(&side.key).unwrap().lineage_id().unwrap();
-            assert_eq!(event.log_incarnation, format!("{lineage}.{writer}"));
+            panic!("the module serves the new storage");
         }
         tokio::task::yield_now().await;
         assert!(inbox.try_recv().is_err(), "a warm published twice");
@@ -534,5 +484,5 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
         }
         bodies.push(body);
     }
-    alike_today_first!(normalized(&bodies[0]), normalized(&bodies[1]));
+    broca_test_support::pin!("alike", normalized(&bodies[0]));
 }

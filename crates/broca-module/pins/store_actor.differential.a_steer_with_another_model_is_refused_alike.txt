@@ -1,11 +1,11 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 1: replies differ
+== step 1: reply
 SteerSettingsConflict {
     field: "model",
 }
@@ -102,12 +102,12 @@ SteerSettingsConflict {
     }
   }
 ]
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 [
     Object {
         "model": Object {

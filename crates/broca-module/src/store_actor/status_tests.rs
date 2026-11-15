@@ -1,13 +1,12 @@
 //! `run.status`, `run.result`, `send.status` and the no-run `status` of a session kept in the new
-//! storage, compared with today's replies for the same sends through the module's registry.
+//! storage, through the module's registry.
 //!
-//! Each scenario drives the same sends through a module on today's storage and one on the new
-//! storage, then compares the replies as JSON with only what each storage keeps for itself taken
-//! out: message ids, wall-clock times (kept as whether they are present), and an active run's
-//! live `step`, which each actor keeps in memory and which is compared on its own, while a step is
-//! in flight on both (`an_active_runs_step_is_served_alike`). The crash scenarios read a session
-//! the new storage holds before any actor recovers it, then let its open recover it, and require
-//! the two reads to agree.
+//! Each scenario pins the replies as JSON with only what the storage keeps for itself taken out:
+//! message ids, wall-clock times (kept as whether they are present), and an active run's live
+//! `step`, which the actor keeps in memory and which is pinned on its own while a step is in
+//! flight (`an_active_runs_step_is_served_alike`). The crash scenarios read a session the new
+//! storage holds before any actor recovers it, then let its open recover it, and require the two
+//! reads to agree.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +16,8 @@ use broca_protocol::{BindIdentity, NormalizedEvent, RunId, SubmissionId};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
-use super::differential::{BothLoops, TodayLoop, IDLE};
-use super::tests::{executor, read_step, request, text_step, Gated};
+use super::differential::IDLE;
+use super::tests::{executor, read_step, request, text_step};
 use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
@@ -27,7 +26,7 @@ use crate::serve::ServeHandler;
 #[path = "cache_write_split_tests.rs"]
 mod cache_write_split;
 
-/// One module over a scratch folder: on today's storage, or on the new one (`store`).
+/// One module over a scratch folder, whose sessions start in the new storage when `store`.
 struct Side {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
@@ -67,20 +66,7 @@ async fn side_at(
     gate: Option<Arc<Notify>>,
 ) -> Side {
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
-        today: TodayLoop {
-            provider: Gated {
-                render_config: None,
-                notes_sends: false,
-                hold: None,
-                inner: broca_core::provider::StubProvider::new(steps.clone()),
-                gate: gate.clone(),
-            },
-            wal: Arc::clone(&wal),
-            planes: Default::default(),
-        },
-        store: executor(steps, gate),
-    });
+    let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, gate));
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -121,18 +107,13 @@ async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<No
     side_at(scratch(), store, steps, gate).await
 }
 
-/// Today's side and the new storage's, over the same script.
+/// The new storage's side over the script, and its gate when `gated`.
 async fn pair(
     steps: impl Fn() -> Vec<Vec<NormalizedEvent>>,
     gated: bool,
-) -> [(Side, Option<Arc<Notify>>); 2] {
-    let gate = || gated.then(|| Arc::new(Notify::new()));
-    let today_gate = gate();
-    let store_gate = gate();
-    [
-        (side(false, steps(), today_gate.clone()).await, today_gate),
-        (side(true, steps(), store_gate.clone()).await, store_gate),
-    ]
+) -> (Side, Option<Arc<Notify>>) {
+    let store_gate = gated.then(|| Arc::new(Notify::new()));
+    (side(true, steps(), store_gate.clone()).await, store_gate)
 }
 
 impl Side {
@@ -335,18 +316,8 @@ async fn admission_case(store: bool, scoped: bool) {
 }
 
 #[tokio::test]
-async fn run_admission_wal_freezes_class_and_aft_declarations() {
-    admission_case(false, false).await;
-}
-
-#[tokio::test]
 async fn run_admission_store_freezes_class_and_aft_declarations() {
     admission_case(true, false).await;
-}
-
-#[tokio::test]
-async fn run_admission_wal_serves_recorded_scope() {
-    admission_case(false, true).await;
 }
 
 #[tokio::test]
@@ -356,7 +327,7 @@ async fn run_admission_store_serves_recorded_scope() {
 
 #[tokio::test]
 async fn run_admission_unknown_is_absent_on_both_storages() {
-    for store in [false, true] {
+    for store in [true] {
         let side = side(store, vec![text_step("answer", "done")], None).await;
         side.send("known", "hello").await;
         side.closed().await;
@@ -385,8 +356,8 @@ fn masked(mut value: Value) -> Value {
     fn walk(value: &mut Value) {
         match value {
             Value::Object(object) => {
-                // A message's id takes each storage's own form; an active run's live step is
-                // kept only by today's actor.
+                // A message's id is minted per run; an active run's live step is pinned on its
+                // own.
                 object.remove("mid");
                 // Waits are new-storage-only; dedicated actor tests compare every wait surface.
                 object.remove("awaits");
@@ -424,18 +395,17 @@ fn failing_step() -> Vec<NormalizedEvent> {
     )]
 }
 
-/// Asserts the store's reply equals today's, and that it says `state` when given, so a
-/// comparison of two refusals never passes for a fact neither served.
-fn same(today: &Value, store: &Value, what: &str, state: Option<&str>) {
-    alike!(store, today, "{what}");
+/// Pins the store's reply, and asserts it says `state` when given.
+fn same(store: &Value, what: &str, state: Option<&str>) {
+    broca_test_support::pin!(what, store);
     if let Some(state) = state {
         assert_eq!(store["state"], json!(state), "{what}: {store}");
     }
 }
 
-/// While a run's model step is in flight, `run.status` serves the step as today's actor serves its
-/// run's in-flight step: the step's id and attempt, and whether each of its times is known. Both
-/// runs' first step calls a tool, so the second step is read too.
+/// While a run's model step is in flight, `run.status` serves the step: the step's id and attempt,
+/// and whether each of its times is known. The run's first step calls a tool, so the second step
+/// is read too.
 #[tokio::test]
 async fn an_active_runs_step_is_served_alike() {
     /// The status as served, with only wall-clock times kept as whether they are present, and the
@@ -461,8 +431,8 @@ async fn an_active_runs_step_is_served_alike() {
         value
     }
     let steps = || vec![read_step("a1"), text_step("a2", "done")];
-    let [(today, today_gate), (store, store_gate)] = pair(steps, true).await;
-    for side in [&today, &store] {
+    let (store, store_gate) = pair(steps, true).await;
+    for side in [&store] {
         assert!(matches!(
             side.send("r1", "first").await,
             SendOutcome::Active { .. }
@@ -470,7 +440,7 @@ async fn an_active_runs_step_is_served_alike() {
     }
     for step in [1, 2] {
         let mut served = Vec::new();
-        for side in [&today, &store] {
+        for side in [&store] {
             let status = broca_test_support::wait_until("the step is in flight", || async {
                 let status = serde_json::to_value(
                     side.registry
@@ -487,17 +457,12 @@ async fn an_active_runs_step_is_served_alike() {
             .await;
             served.push(timeless(status));
         }
-        assert_eq!(served[1], served[0], "step {step} in flight");
-        assert_eq!(served[1]["state"], json!("active"));
-        for gate in [&today_gate, &store_gate] {
-            gate.as_ref().unwrap().notify_one();
-        }
+        broca_test_support::pin!(format!("step {step} in flight"), served[0]);
+        assert_eq!(served[0]["state"], json!("active"));
+        store_gate.as_ref().unwrap().notify_one();
     }
-    for side in [&today, &store] {
-        side.closed().await;
-    }
+    store.closed().await;
     same(
-        &today.run_status("r1").await,
         &store.run_status("r1").await,
         "run.status once the run ended",
         Some("completed"),
@@ -509,8 +474,8 @@ async fn an_active_runs_step_is_served_alike() {
 #[tokio::test]
 async fn finished_runs_report_alike() {
     let steps = || vec![text_step("a1", "hello"), text_step("a2", "again")];
-    let [(today, _), (store, _)] = pair(steps, false).await;
-    for side in [&today, &store] {
+    let (store, _) = pair(steps, false).await;
+    for side in [&store] {
         assert!(matches!(
             side.send("r1", "first").await,
             SendOutcome::Active { .. }
@@ -522,16 +487,14 @@ async fn finished_runs_report_alike() {
         ));
         side.closed().await;
     }
-    assert!(store.in_store() && !today.in_store());
+    assert!(store.in_store());
     for run in ["r1", "r2"] {
         same(
-            &today.run_status(run).await,
             &store.run_status(run).await,
             &format!("run.status {run}"),
             Some("completed"),
         );
         same(
-            &today.run_result(run).await,
             &store.run_result(run).await,
             &format!("run.result {run}"),
             Some("completed"),
@@ -542,23 +505,16 @@ async fn finished_runs_report_alike() {
         json!("again")
     );
     same(
-        &today.run_status("nope").await,
         &store.run_status("nope").await,
         "an unknown run id",
         Some("unknown"),
     );
     same(
-        &today.run_result("nope").await,
         &store.run_result("nope").await,
         "run.result of an unknown run id",
         None,
     );
-    same(
-        &today.status().await,
-        &store.status().await,
-        "status",
-        Some("idle"),
-    );
+    same(&store.status().await, "status", Some("idle"));
     let runtime = store.registry.store_runtime().expect("the new storage");
     assert!(
         runtime.settled_runs().len() >= 2,
@@ -566,7 +522,6 @@ async fn finished_runs_report_alike() {
     );
     // A kept answer is the one read from the records.
     same(
-        &today.run_status("r1").await,
         &store.run_status("r1").await,
         "run.status r1 again",
         Some("completed"),
@@ -576,20 +531,18 @@ async fn finished_runs_report_alike() {
 /// A run its provider fails ends in error, with the provider's error, alike.
 #[tokio::test]
 async fn a_failed_run_reports_alike() {
-    let [(today, _), (store, _)] = pair(|| vec![failing_step()], false).await;
-    for side in [&today, &store] {
+    let (store, _) = pair(|| vec![failing_step()], false).await;
+    for side in [&store] {
         side.send("r1", "first").await;
         side.closed().await;
     }
     assert!(store.in_store());
     same(
-        &today.run_status("r1").await,
         &store.run_status("r1").await,
         "run.status of a failed run",
         Some("error"),
     );
     same(
-        &today.run_result("r1").await,
         &store.run_result("r1").await,
         "run.result of a failed run",
         Some("error"),
@@ -599,9 +552,8 @@ async fn a_failed_run_reports_alike() {
 /// A run its caller cancels while its first model call is in flight ends cancelled, alike.
 #[tokio::test]
 async fn a_cancelled_run_reports_alike() {
-    let [(today, today_gate), (store, store_gate)] =
-        pair(|| vec![text_step("a1", "hello")], true).await;
-    for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
+    let (store, store_gate) = pair(|| vec![text_step("a1", "hello")], true).await;
+    for (side, gate) in [(&store, &store_gate)] {
         assert!(matches!(
             side.send("r1", "first").await,
             SendOutcome::Active { .. }
@@ -618,13 +570,11 @@ async fn a_cancelled_run_reports_alike() {
     }
     assert!(store.in_store());
     same(
-        &today.run_status("r1").await,
         &store.run_status("r1").await,
         "run.status of a cancelled run",
         Some("cancelled"),
     );
     same(
-        &today.run_result("r1").await,
         &store.run_result("r1").await,
         "run.result of a cancelled run",
         Some("cancelled"),
@@ -637,9 +587,9 @@ async fn a_cancelled_run_reports_alike() {
 #[tokio::test]
 async fn a_queued_send_reports_alike() {
     let steps = || vec![text_step("a1", "hello"), text_step("a2", "again")];
-    let [(today, today_gate), (store, store_gate)] = pair(steps, true).await;
+    let (store, store_gate) = pair(steps, true).await;
     let mut while_running = Vec::new();
-    for side in [&today, &store] {
+    for side in [&store] {
         assert!(matches!(
             side.send("r1", "first").await,
             SendOutcome::Active { .. }
@@ -656,11 +606,11 @@ async fn a_queued_send_reports_alike() {
         ]);
     }
     assert!(store.in_store());
-    assert_eq!(while_running[1], while_running[0], "while r1 runs");
-    assert_eq!(while_running[1][0]["state"], json!("pending"));
-    assert_eq!(while_running[1][1]["state"], json!("active"));
-    assert_eq!(while_running[1][3]["run_id"], json!("r1"));
-    for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
+    broca_test_support::pin!("while r1 runs", while_running[0]);
+    assert_eq!(while_running[0][0]["state"], json!("pending"));
+    assert_eq!(while_running[0][1]["state"], json!("active"));
+    assert_eq!(while_running[0][3]["run_id"], json!("r1"));
+    for (side, gate) in [(&store, &store_gate)] {
         let gate = gate.as_ref().unwrap();
         gate.notify_one();
         gate.notify_one();
@@ -668,7 +618,6 @@ async fn a_queued_send_reports_alike() {
     }
     for run in ["r1", "r2"] {
         same(
-            &today.run_status(run).await,
             &store.run_status(run).await,
             &format!("run.status {run} after both ran"),
             Some("completed"),
@@ -680,8 +629,8 @@ async fn a_queued_send_reports_alike() {
 #[tokio::test]
 async fn a_retracted_queued_send_reports_alike() {
     let steps = || vec![text_step("a1", "hello")];
-    let [(today, today_gate), (store, store_gate)] = pair(steps, true).await;
-    for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
+    let (store, store_gate) = pair(steps, true).await;
+    for (side, gate) in [(&store, &store_gate)] {
         side.send("r1", "first").await;
         assert!(matches!(
             side.send("r2", "second").await,
@@ -699,7 +648,6 @@ async fn a_retracted_queued_send_reports_alike() {
     }
     assert!(store.in_store());
     same(
-        &today.run_status("r2").await,
         &store.run_status("r2").await,
         "run.status of a retracted send",
         Some("retracted"),
@@ -711,9 +659,9 @@ async fn a_retracted_queued_send_reports_alike() {
 #[tokio::test]
 async fn keyed_sends_report_their_status_alike() {
     let steps = || vec![text_step("a1", "hello"), text_step("a2", "again")];
-    let [(today, today_gate), (store, store_gate)] = pair(steps, true).await;
+    let (store, store_gate) = pair(steps, true).await;
     let mut pending = Vec::new();
-    for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
+    for (side, gate) in [(&store, &store_gate)] {
         assert!(matches!(
             side.send_keyed("r-k1", "first", SendKey::SendId("k1".into()))
                 .await,
@@ -734,16 +682,15 @@ async fn keyed_sends_report_their_status_alike() {
         side.closed().await;
     }
     assert!(store.in_store());
-    assert_eq!(pending[1], pending[0], "while k1 runs and k2 waits");
+    broca_test_support::pin!("while k1 runs and k2 waits", pending[0]);
     assert_eq!(
-        pending[1][1]["state"],
+        pending[0][1]["state"],
         json!("pending"),
         "{}",
-        pending[1][1]
+        pending[0][1]
     );
     for (run, key) in [("r-k1", "k1"), ("r-k2", "k2"), ("r-k9", "k9")] {
         same(
-            &today.send_status(run, key).await,
             &store.send_status(run, key).await,
             &format!("send.status {key}"),
             None,
@@ -791,22 +738,18 @@ async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
     .unwrap();
 }
 
-/// A run a crash cut off, with a send queued behind it, on a session no actor holds. Today's
-/// `run.status` opens the session on either storage, sealing the run and draining the queued
-/// send before any read observes the recovered state. The interrupted terminal is stable
+/// A run a crash cut off, with a send queued behind it, on a session no actor holds.
+/// `run.status` opens the session, sealing the run and draining the queued send before any read
+/// observes the recovered state. The interrupted terminal is stable
 /// across later reads and completion of the queued run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
-    let today_dir = scratch();
     let store_dir = scratch();
-    crash_with_a_queued_send(today_dir.clone(), false).await;
     crash_with_a_queued_send(store_dir.clone(), true).await;
     let steps = || vec![text_step("a2", "again")];
-    let today_gate = Arc::new(Notify::new());
     let store_gate = Arc::new(Notify::new());
-    let today = side_at(today_dir, false, steps(), Some(Arc::clone(&today_gate))).await;
     let store = side_at(store_dir, true, steps(), Some(Arc::clone(&store_gate))).await;
-    assert!(store.in_store() && !today.in_store());
+    assert!(store.in_store());
     // Before anything opens the store session.
     let before = [
         store.run_status("r1").await,
@@ -826,25 +769,20 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
         before[0]
     );
     assert_eq!(before[2]["state"], json!("active"), "{}", before[2]);
-    // Today's answers once its read sealed the run.
     same(
-        &today.run_status("r1").await,
         &before[0],
         "run.status of the crashed run",
         Some("interrupted"),
     );
     same(
-        &today.run_result("r1").await,
         &before[1],
         "run.result of the crashed run",
         Some("interrupted"),
     );
     // The session's own status recovers it; the queued send then runs, its model call held
     // until the status is read.
-    let statuses = [today.status().await, store.status().await];
-    today_gate.notify_one();
+    let statuses = [store.status().await];
     store_gate.notify_one();
-    today.closed().await;
     store.closed().await;
     let after = [store.run_status("r1").await, store.run_result("r1").await];
     assert_eq!(
@@ -854,18 +792,14 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
     );
     for run in ["r1", "r2"] {
         same(
-            &today.run_status(run).await,
             &store.run_status(run).await,
             &format!("run.status {run} once recovered"),
             None,
         );
     }
     assert_eq!(store.run_status("r2").await["state"], json!("completed"));
-    assert_eq!(
-        statuses[1], statuses[0],
-        "the session's status as it recovers"
-    );
-    assert_eq!(statuses[1]["run_id"], json!("r2"), "{}", statuses[1]);
+    broca_test_support::pin!("the session's status as it recovers", statuses[0]);
+    assert_eq!(statuses[0]["run_id"], json!("r2"), "{}", statuses[0]);
 }
 
 mod open_recovery {

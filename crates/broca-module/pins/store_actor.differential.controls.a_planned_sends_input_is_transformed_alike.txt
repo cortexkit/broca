@@ -1,4 +1,4 @@
-== alike
+== reply
 Active {
     run_id: RunId(
         "r1",
@@ -118,13 +118,13 @@ Active {
     }
   }
 ]
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "[noted] first",
     "hello",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "compaction_plan_version": Null,
@@ -164,7 +164,7 @@ Active {
         "tools_were_omitted": Bool(true),
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",
@@ -479,8 +479,3 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:9ce28532632a1d4e4fc7c3e66e8beff2607238ffb9e4711f1407b0df23dc4460 (2170 bytes)
-== alike
-(
-    1,
-    1,
-)

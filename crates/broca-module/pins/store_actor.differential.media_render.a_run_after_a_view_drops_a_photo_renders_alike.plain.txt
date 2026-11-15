@@ -1,2 +1,8 @@
-== how many requests
+== : how many requests
 3
+== : request 0
+{"max_tokens":2048,"messages":[{"content":[{"text":"§1§ first","type":"text"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"},{"text":"you are a worker","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"},"tool_choice":{"type":"auto"},"tools":[{"description":"reads a file","input_schema":{"type":"object"},"name":"read"}]}
+== : request 1
+{"max_tokens":2048,"messages":[{"content":[{"text":"§1§ first","type":"text"}],"role":"user"},{"content":[{"text":"§2§ hello","type":"text"}],"role":"assistant"},{"content":[{"text":"§3§ look","type":"text"},{"source":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","media_type":"image/png","type":"base64"},"type":"image"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"},{"text":"you are a worker","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"},"tool_choice":{"type":"auto"},"tools":[{"description":"reads a file","input_schema":{"type":"object"},"name":"read"}]}
+== : request 2
+{"max_tokens":2048,"messages":[{"content":[{"text":"§1§ first","type":"text"}],"role":"user"},{"content":[{"text":"§2§ hello","type":"text"}],"role":"assistant"},{"content":[{"text":"§4§ seen","type":"text"}],"role":"assistant"},{"content":[{"text":"§5§ next","type":"text"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"},{"text":"you are a worker","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"},"tool_choice":{"type":"auto"},"tools":[{"description":"reads a file","input_schema":{"type":"object"},"name":"read"}]}

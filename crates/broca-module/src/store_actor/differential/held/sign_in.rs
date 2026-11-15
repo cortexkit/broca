@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn run_awaits_sign_in_names_only_the_frozen_account_label() {
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(
             store,
             Cipher::None,
@@ -105,10 +105,7 @@ async fn retry(side: &Side) {
 }
 
 async fn compare_reads(sides: &[Side]) {
-    alike!(
-        comparable(sides[1].status().await),
-        comparable(sides[0].status().await)
-    );
+    broca_test_support::pin!("alike", comparable(sides[0].status().await));
     let normalize_result = |mut value: Value| {
         value.as_object_mut().unwrap().remove("awaits");
         if let Some(message) = value
@@ -119,14 +116,10 @@ async fn compare_reads(sides: &[Side]) {
         }
         value
     };
-    alike!(
-        normalize_result(sides[1].result().await),
-        normalize_result(sides[0].result().await)
-    );
-    alike!(head(&sides[1]).await, head(&sides[0]).await);
-    let old_records = record_meaning(&sides[0]).await;
-    let new_records = record_meaning(&sides[1]).await;
-    assert_eq!(new_records, old_records);
+    broca_test_support::pin!("alike", normalize_result(sides[0].result().await));
+    broca_test_support::pin!("alike", head(&sides[0]).await);
+    let new_records = record_meaning(&sides[0]).await;
+    broca_test_support::pin!("what the records mean", new_records);
     assert_eq!(
         new_records
             .iter()
@@ -134,9 +127,8 @@ async fn compare_reads(sides: &[Side]) {
             .count(),
         1
     );
-    let old = super::super::streams::routed(&sides[0].registry, &sides[0].key).await;
-    let new = super::super::streams::routed(&sides[1].registry, &sides[1].key).await;
-    super::super::streams::assert_alike(&new, &old);
+    let new = super::super::streams::routed(&sides[0].registry, &sides[0].key).await;
+    super::super::streams::pin(&new);
 }
 
 async fn head(side: &Side) -> Value {
@@ -199,7 +191,7 @@ cipher_tests!(
 
 async fn a_run_starts_paused_for_sign_in(cipher: Cipher) {
     let mut sides = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(
             store,
             cipher,
@@ -221,7 +213,7 @@ async fn a_run_starts_paused_for_sign_in(cipher: Cipher) {
 
 async fn a_held_resume_pauses_for_sign_in(cipher: Cipher) {
     let mut sides = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let initial = Side::new(
             store,
             cipher,
@@ -283,7 +275,7 @@ async fn a_held_resume_pauses_for_sign_in(cipher: Cipher) {
 #[tokio::test]
 async fn a_restart_resume_pauses_for_sign_in() {
     let mut sides = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let initial = Side::new(
             store,
             Cipher::None,

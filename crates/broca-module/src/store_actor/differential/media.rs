@@ -1,20 +1,14 @@
 //! `session.media_read` and the upload operations on a session kept in the new storage, through
-//! the module's registry, against the same operations on a session on today's storage.
+//! the module's registry.
 //!
-//! Both sessions hold the same image and the same owner. Today's session got the image from a
-//! photo send: an upload, then a send naming it, which today's actor stages and today's executor
-//! publishes into today's media store. The session in the new storage got it from a head import,
-//! which stores it as an input medium of the imported message. Every operation is then asked of
-//! both, and the replies must be equal.
+//! The session got its image from a head import, which stores it as an input medium of the
+//! imported message. Each reply is pinned (see `broca_test_support::pins`).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use broca_core::{
-    run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, FileLeaseStore, FileWalStore,
-    OutputEvent, RunError, RunSummary, StartMode, StubToolPlane, WalStore,
-};
+use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
 use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, RunId, SubmissionRequest};
 use broca_session_store::keys::Cipher;
 use serde_json::{json, Value};
@@ -94,32 +88,9 @@ pub(super) fn image_render_config() -> Value {
     serde_json::to_value(config).unwrap()
 }
 
-/// The scripted model, whose frozen render config accepts images, as a provider's does when
-/// its model takes them.
-struct ImageModel(super::super::tests::Gated);
-
-#[async_trait]
-impl broca_core::provider::Provider for ImageModel {
-    fn render_config_blob(&self) -> Value {
-        image_render_config()
-    }
-
-    async fn step(
-        &self,
-        step_id: broca_protocol::StepId,
-        opts: &broca_protocol::request::CallOptions,
-    ) -> mpsc::Receiver<NormalizedEvent> {
-        broca_core::provider::Provider::step(&self.0, step_id, opts).await
-    }
-}
-
-/// The module's executor in these scenarios. A run on today's storage is admitted as the
-/// module's executor admits a photo send: its images are checked against the provider's frozen
-/// media profile and published to today's media store before the run's start names them. A run
-/// of a session in the new storage goes through the new loop.
+/// The module's executor in these scenarios: the new loop, with the media profile of a model
+/// that takes images.
 struct Executor {
-    today: ImageModel,
-    wal: Arc<FileWalStore>,
     store: crate::store_actor::tests::LoopExecutor,
 }
 
@@ -134,34 +105,10 @@ impl RunExecutor for Executor {
 
     async fn execute(
         &self,
-        job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
+        _job: RunJob,
+        _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
-        if let Err(error) = job.admit_media(&self.today, self.wal.uploads().as_ref()) {
-            if let Some(ack) = job.on_admitted {
-                let _ = ack.send(Err(error.clone()));
-            }
-            return Err(error);
-        }
-        let mode = match job.kind {
-            RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-        };
-        Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &self.today,
-            &StubToolPlane::new(),
-            &AllowAll,
-            self.wal.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        ))
-        .await
+        unreachable!("a store session's runs come through execute_on_store")
     }
 
     async fn execute_on_store(
@@ -192,8 +139,8 @@ impl Drop for Side {
     }
 }
 
-/// A module whose sessions start in the new storage when `store`, else on today's storage, over
-/// the scripted model `steps`. Its new storage creates sessions in mode `cipher`.
+/// A module whose sessions start in the new storage when `store`, over the scripted model
+/// `steps`. Its new storage creates sessions in mode `cipher`.
 pub(super) async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>, cipher: Cipher) -> Side {
     side_gated(store, steps, false, cipher).await
 }
@@ -249,18 +196,10 @@ async fn registry_gated(
 ) -> LineageRegistry {
     broca_core::media_store::create_media_directories(dir).unwrap();
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    // The new storage's runs freeze the same media profile today's runs do.
-    let mut store_executor = crate::store_actor::tests::executor(steps.clone(), gate.clone());
+    // The runs freeze the media profile of a model that takes images.
+    let mut store_executor = crate::store_actor::tests::executor(steps, gate);
     store_executor.provider.render_config = Some(image_render_config());
     let executor: Arc<dyn RunExecutor> = Arc::new(Executor {
-        today: ImageModel(super::super::tests::Gated {
-            inner: broca_core::provider::StubProvider::new(steps),
-            gate,
-            render_config: None,
-            notes_sends: false,
-            hold: None,
-        }),
-        wal: Arc::clone(&wal),
         store: store_executor,
     });
     let runtime = crate::store_open::StoreRuntime::open(
@@ -511,8 +450,8 @@ pub(super) fn reads_of(sha256: &str, size: u64) -> Vec<Value> {
     ]
 }
 
-/// The upload operations and `session.media_read` answer alike on both storages: an upload's
-/// every step and its refusals, the image each session holds read whole, by byte range and as a
+/// The upload operations and `session.media_read` on a session in the new storage: an upload's
+/// every step and its refusals, the image the session holds read whole, by byte range and as a
 /// metadata probe, and the refusals of a digest the session doesn't hold. An upload no send named
 /// is not readable, and neither is a digest of another session, nor one malformed.
 async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
@@ -522,124 +461,71 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
             super::super::tests::text_step("a2", "seen"),
         ]
     };
-    let today = side(false, steps(), cipher).await;
     let store = side(true, steps(), cipher).await;
     let image = bytes_of(PNG);
     let unsent = bytes_of(WIDE);
 
-    // Before the session exists, an upload is refused alike.
+    // Before the session exists, an upload is refused.
     let begin = json!({"mime": "image/png", "bytes": unsent.len(), "sha256": digest(&unsent)});
-    alike!(
+    broca_test_support::pin!(
+        "an upload before the session's first send",
         store
             .upload(&core(), "session.upload_begin", begin.clone())
-            .await,
-        today
-            .upload(&core(), "session.upload_begin", begin.clone())
-            .await,
-        "an upload before the session's first send"
+            .await
     );
 
-    // Today's session: a first send, then a photo send naming an upload.
-    let mut first = request("first");
-    super::scoped_by_core(&mut first);
-    assert!(matches!(
-        today.send("r1", first).await,
-        SendOutcome::Active { .. }
-    ));
-    today.idle().await;
-    let id = today.uploaded(&image).await;
-    let sent = today.send("r2", photo("look", &[&id])).await;
-    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
-    today.idle().await;
-    // The session in the new storage: a head whose first message carries the same image.
+    // A head whose first message carries the image.
     import_with(&store, &image).await;
     assert_eq!(store.stored_mode(), cipher);
 
-    // Every step of an upload, and its refusals, answer alike.
-    let (old, new) = (
-        today
-            .upload(&core(), "session.upload_begin", begin.clone())
-            .await,
-        store
-            .upload(&core(), "session.upload_begin", begin.clone())
-            .await,
-    );
-    alike!(
-        masked(new.clone(), None),
-        masked(old.clone(), None),
-        "upload_begin"
-    );
-    let ids = [
-        old.unwrap()["upload_id"].as_str().unwrap().to_owned(),
-        new.unwrap()["upload_id"].as_str().unwrap().to_owned(),
-    ];
-    let both = |method: &'static str, params: [Value; 2]| {
-        let (today, store, ids) = (&today, &store, &ids);
-        async move {
-            let [old, new] = params;
-            (
-                masked(today.upload(&core(), method, old).await, Some(&ids[0])),
-                masked(store.upload(&core(), method, new).await, Some(&ids[1])),
-            )
-        }
-    };
-    let per_side = |make: &dyn Fn(&str) -> Value| [make(&ids[0]), make(&ids[1])];
+    // Every step of an upload, and its refusals.
+    let new = store
+        .upload(&core(), "session.upload_begin", begin.clone())
+        .await;
+    broca_test_support::pin!("upload_begin", masked(new.clone(), None));
+    let id = new.unwrap()["upload_id"].as_str().unwrap().to_owned();
     for (method, params) in [
+        ("session.upload_status", json!({"upload_id": id})),
         (
-            "session.upload_status",
-            per_side(&|id| json!({"upload_id": id})),
+            "session.upload_append",
+            json!({"upload_id": id, "offset": 3, "data": base64(&unsent)}),
         ),
         (
             "session.upload_append",
-            per_side(&|id| json!({"upload_id": id, "offset": 3, "data": base64(&unsent)})),
+            json!({"upload_id": id, "offset": 0, "data": base64(&unsent[..10])}),
         ),
+        ("session.upload_commit", json!({"upload_id": id})),
         (
             "session.upload_append",
-            per_side(&|id| json!({"upload_id": id, "offset": 0, "data": base64(&unsent[..10])})),
+            json!({"upload_id": id, "offset": 10, "data": base64(&unsent[10..])}),
         ),
+        ("session.upload_status", json!({"upload_id": id})),
+        ("session.upload_commit", json!({"upload_id": id})),
         (
             "session.upload_commit",
-            per_side(&|id| json!({"upload_id": id})),
-        ),
-        (
-            "session.upload_append",
-            per_side(&|id| json!({"upload_id": id, "offset": 10, "data": base64(&unsent[10..])})),
+            json!({"upload_id": "no-such-upload"}),
         ),
         (
             "session.upload_status",
-            per_side(&|id| json!({"upload_id": id})),
+            json!({"upload_id": "no-such-upload"}),
         ),
-        (
-            "session.upload_commit",
-            per_side(&|id| json!({"upload_id": id})),
-        ),
-        (
-            "session.upload_commit",
-            per_side(&|_| json!({"upload_id": "no-such-upload"})),
-        ),
-        (
-            "session.upload_status",
-            per_side(&|_| json!({"upload_id": "no-such-upload"})),
-        ),
-        ("session.upload_status", per_side(&|_| json!({}))),
+        ("session.upload_status", json!({})),
     ] {
-        let (old, new) = both(method, params.clone()).await;
-        alike!(new, old, "{method} {params:?}");
+        let new = masked(
+            store.upload(&core(), method, params.clone()).await,
+            Some(&id),
+        );
+        broca_test_support::pin!(format!("{method} {params:?}"), new);
     }
-    // Another module may not upload to core's session, on either storage.
-    let (old, new) = (
-        today
-            .upload(&stranger(), "session.upload_begin", begin.clone())
-            .await,
-        store
-            .upload(&stranger(), "session.upload_begin", begin)
-            .await,
-    );
-    assert!(old.is_err(), "{old:?}");
-    alike!(new, old, "another module's upload");
+    // Another module may not upload to core's session.
+    let new = store
+        .upload(&stranger(), "session.upload_begin", begin)
+        .await;
+    assert!(new.is_err(), "{new:?}");
+    broca_test_support::pin!("another module's upload", new);
 
-    // Each session's image reads back alike, whole, by range and as a probe; and what neither
-    // session's records name is refused alike.
+    // The session's image reads back whole, by range and as a probe; and what its records don't
+    // name is refused.
     let size = image.len() as u64;
     let mut reads = reads_of(&digest(&image), size);
     reads.extend([
@@ -649,11 +535,8 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
         json!({"sha256": digest(&image), "offset": 0}),
     ]);
     for params in reads {
-        let (old, new) = (
-            today.media_read(params.clone()).await,
-            store.media_read(params.clone()).await,
-        );
-        alike!(new, old, "media_read {params}");
+        let new = store.media_read(params.clone()).await;
+        broca_test_support::pin!(format!("media_read {params}"), new);
     }
     let whole = store
         .media_read(json!({"sha256": digest(&image), "offset": 0, "length": size}))

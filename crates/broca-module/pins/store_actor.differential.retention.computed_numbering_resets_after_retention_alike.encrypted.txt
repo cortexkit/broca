@@ -5,7 +5,7 @@ Active {
     ),
     delivered: None,
 }
-== alike
+== the next number after the sweep
 1
 == alike
 Active {
@@ -83,3 +83,5 @@ Active {
     ),
     delivered: None,
 }
+== the checkpoint r3 froze
+2

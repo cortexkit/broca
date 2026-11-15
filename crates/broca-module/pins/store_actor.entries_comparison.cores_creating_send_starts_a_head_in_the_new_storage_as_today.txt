@@ -5,27 +5,17 @@ Active {
     ),
     delivered: None,
 }
-== alike
-None
-== alike
-None
-== alike
-Some(
-    Durable,
-)
-== the store answers the retry as today's
+== the retry's answer
 SendIdReuse {
     differing: "model",
 }
-== the next turn ran in the new storage
-None
-== the store answers as today's
+== the answers
 Ok(
     Object {
         "answer": String("accepted"),
     },
 )
-== alike
+== the third turn's first request
 Array [
     Object {
         "content": Array [
@@ -344,7 +334,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== a head's three turns: from_mid at 1 (the store's id g82c34018a5af876c.5)
+== a head's three turns: from_mid at 1
 Object {
     "messages": Array [
         Object {
@@ -401,12 +391,12 @@ Object {
     ],
     "newer": Bool(true),
 }
-== a head's three turns: before_mid at 1 (the store's id g82c34018a5af876c.5)
+== a head's three turns: before_mid at 1
 Object {
     "messages": Array [],
     "newer": Bool(true),
 }
-== a head's three turns: from_mid at 3 (the store's id g82c34018a5af876c.13)
+== a head's three turns: from_mid at 3
 Object {
     "messages": Array [
         Object {
@@ -464,7 +454,7 @@ Object {
     "newer": Bool(true),
     "older": Bool(true),
 }
-== a head's three turns: before_mid at 3 (the store's id g82c34018a5af876c.13)
+== a head's three turns: before_mid at 3
 Object {
     "messages": Array [
         Object {
@@ -521,7 +511,7 @@ Object {
     ],
     "newer": Bool(true),
 }
-== a head's three turns: from_mid at 6 (the store's id g82c34018a5af876c.24)
+== a head's three turns: from_mid at 6
 Object {
     "messages": Array [
         Object {
@@ -553,7 +543,7 @@ Object {
     ],
     "older": Bool(true),
 }
-== a head's three turns: before_mid at 6 (the store's id g82c34018a5af876c.24)
+== a head's three turns: before_mid at 6
 Object {
     "messages": Array [
         Object {

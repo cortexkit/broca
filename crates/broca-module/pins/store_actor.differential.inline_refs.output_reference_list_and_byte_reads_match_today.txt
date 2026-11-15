@@ -1,22 +1,56 @@
-== alike
+== the listed references
+Object {
+    "records": Array [
+        Object {
+            "bytes": Number(13),
+            "format": String("text"),
+            "provider": Null,
+            "sha256": String("7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd"),
+            "state": String("resolved"),
+            "tag": String("2"),
+            "tool": String("read"),
+        },
+        Object {
+            "bytes": Null,
+            "format": Null,
+            "provider": Null,
+            "reason": String("not_a_tool_output"),
+            "sha256": Null,
+            "state": String("unresolved"),
+            "tag": String("1"),
+            "tool": Null,
+        },
+        Object {
+            "bytes": Null,
+            "format": Null,
+            "provider": Null,
+            "reason": String("unknown_tag"),
+            "sha256": Null,
+            "state": String("unresolved"),
+            "tag": String("999"),
+            "tool": Null,
+        },
+    ],
+}
+== 0+131072
 Object {
     "data": String("ZmlsZSBjb250ZW50cw=="),
     "format": String("text"),
     "size": Number(13),
 }
-== alike
+== 2+3
 Object {
     "data": String("bGUg"),
     "format": String("text"),
     "size": Number(13),
 }
-== alike
+== 0+0
 Object {
     "data": String(""),
     "format": String("text"),
     "size": Number(13),
 }
-== alike
+== 13+1
 Object {
     "data": String(""),
     "format": String("text"),

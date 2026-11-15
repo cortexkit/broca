@@ -12,7 +12,7 @@ const RESET: u64 = 61_000;
 
 #[tokio::test]
 async fn run_awaits_account_pause_keeps_the_future_floor_on_all_surfaces() {
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         let now = crate::store_awaits::now_ms();
         side.set_time(now);
@@ -755,7 +755,7 @@ fn normalized_pause(pause: Option<Value>) -> Option<Value> {
 #[tokio::test]
 async fn account_limit_timer_waits_then_resumes_the_same_run_alike() {
     let mut histories = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         side.paused().await;
         side.set_time(RESET - 1);
@@ -775,26 +775,30 @@ async fn account_limit_timer_waits_then_resumes_the_same_run_alike() {
         assert_eq!(side.state("r1").await["state"], "active");
         let requests = side.executor.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
-        alike_today_first!(
-            requests[0],
-            requests[1],
+        broca_test_support::pin!(
+            "the timer restores the run id and recorded policies",
+            requests[1]
+        );
+        assert_eq!(
+            requests[1], requests[0],
             "the timer restores the run id and recorded policies"
         );
         let sent = side.executor.provider.sent.lock().unwrap().clone();
-        alike_today_first!(sent[0], sent[1], "the frozen request is sent again");
+        broca_test_support::pin!("the frozen request is sent again", sent[1]);
+        assert_eq!(sent[1], sent[0], "the frozen request is sent again");
         side.executor.provider.release_success.notify_one();
         side.wait_state("r1", "completed").await;
         side.idle().await;
         side.stop().await;
         histories.push(side.records().await);
     }
-    alike_today_first!(histories[0], histories[1]);
+    broca_test_support::pin!("alike", histories[0]);
 }
 
 #[tokio::test]
 async fn account_limit_timer_rebuilds_when_the_actor_reopens_alike() {
     let mut histories = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         side.paused().await;
         side.stop().await;
@@ -812,13 +816,13 @@ async fn account_limit_timer_rebuilds_when_the_actor_reopens_alike() {
         reopened.stop().await;
         histories.push(reopened.records().await);
     }
-    alike_today_first!(histories[0], histories[1]);
+    broca_test_support::pin!("alike", histories[0]);
 }
 
 #[tokio::test]
 async fn account_limit_cancel_disarms_the_timer_alike() {
     let mut histories = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         side.paused().await;
         assert_eq!(
@@ -840,7 +844,7 @@ async fn account_limit_cancel_disarms_the_timer_alike() {
         side.stop().await;
         histories.push(side.records().await);
     }
-    alike_today_first!(histories[0], histories[1]);
+    broca_test_support::pin!("alike", histories[0]);
 }
 
 #[tokio::test]
@@ -848,7 +852,7 @@ async fn account_limit_refused_resume_seals_and_drains_alike() {
     let mut histories = Vec::new();
     let mut reads = Vec::new();
     let mut terminals = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         assert!(matches!(
             side.send("r1", broca_protocol::Delivery::Queue).await,
@@ -925,9 +929,9 @@ async fn account_limit_refused_resume_seals_and_drains_alike() {
                 .collect::<Vec<_>>(),
         );
     }
-    alike_today_first!(histories[0], histories[1]);
-    alike_today_first!(reads[0], reads[1]);
-    alike_today_first!(terminals[0], terminals[1]);
+    broca_test_support::pin!("alike", histories[0]);
+    broca_test_support::pin!("alike", reads[0]);
+    broca_test_support::pin!("alike", terminals[0]);
 }
 
 #[tokio::test]
@@ -989,7 +993,7 @@ impl Executor {
 #[tokio::test]
 async fn account_limit_wake_pauses_for_sign_in_alike() {
     let mut histories = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         side.paused().await;
         side.executor.signed_out.store(true, Ordering::SeqCst);
@@ -1016,20 +1020,21 @@ async fn account_limit_wake_pauses_for_sign_in_alike() {
         ));
         side.calls(2).await;
         let sent = side.executor.provider.sent.lock().unwrap().clone();
-        alike_today_first!(sent[0], sent[1]);
+        broca_test_support::pin!("alike", sent[1]);
+        assert_eq!(sent[1], sent[0]);
         side.executor.provider.release_success.notify_one();
         side.wait_state("r1", "completed").await;
         side.idle().await;
         side.stop().await;
         histories.push(side.records().await);
     }
-    alike!(histories[1], histories[0]);
+    broca_test_support::pin!("alike", histories[0]);
 }
 
 #[tokio::test]
 async fn account_limit_pause_uses_bound_session_evidence_on_both_storages() {
     let mut pauses = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Side::new(store).await;
         side.executor
             .provider
@@ -1058,5 +1063,5 @@ async fn account_limit_pause_uses_bound_session_evidence_on_both_storages() {
         ));
         side.stop().await;
     }
-    alike_today_first!(pauses[0], pauses[1]);
+    broca_test_support::pin!("alike", pauses[0]);
 }

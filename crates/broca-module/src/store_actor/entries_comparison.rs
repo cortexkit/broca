@@ -1,11 +1,9 @@
 //! `session.history` and the `compaction-runner/v1` route on a session kept in the new storage,
-//! through the module's registry, against the same sends on today's storage.
+//! through the module's registry.
 //!
-//! Each scenario drives the same sends through a module on today's storage and a module that
-//! starts the session in the new storage, then compares the replies as JSON with only what each
-//! storage keeps for itself taken out (see [`masked`]). The store actor doesn't put a planned
-//! session on the current compaction contract yet, so the compaction scenarios' executor does it
-//! for a store run whose plan names a compaction provider, as today's actor does for today's.
+//! Each scenario pins the replies as JSON with only what the storage keeps for itself taken out
+//! (see [`masked`]). The compaction scenarios' executor puts a store run whose plan names a
+//! compaction provider on the current compaction contract.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use broca_core::compaction_v2::protocol::read::{Detail, ReadPage, ReadRequest, Select};
 use broca_core::{
-    run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, FileLeaseStore, FileWalStore,
-    OutputEvent, RunError, RunSummary, StartMode, StubToolPlane,
+    AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, StubToolPlane,
 };
 use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
 use broca_protocol::{
@@ -73,14 +70,10 @@ impl broca_core::CompactionPlane for ReadyProvider {
     }
 }
 
-/// One executor for both storages, as the module's is: today's loop for a session on today's
-/// storage, the new loop for one in the new storage, over one scripted provider script each.
-/// With `compaction`, both have a ready compaction provider, and a run whose plan names one
-/// starts under the current compaction contract with a context limit. With `hooks`, both have a
-/// `pre_user` provider.
+/// The module's executor: the new loop over the scripted provider `store`. With `compaction`,
+/// it has a ready compaction provider, and a run whose plan names one starts under the current
+/// compaction contract with a context limit. With `hooks`, it has a `pre_user` provider.
 struct Loops<P = Gated> {
-    today: Gated,
-    wal: Arc<FileWalStore>,
     store: P,
     compaction: Option<Arc<ReadyProvider>>,
     hooks: Option<Arc<dyn broca_core::HookPlane>>,
@@ -109,32 +102,10 @@ impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
 
     async fn execute(
         &self,
-        mut job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
+        _job: RunJob,
+        _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
-        if self.compacts(&job.control) {
-            job.control.admitted_context_limit = Some(200_000);
-        }
-        let mode = match job.kind {
-            RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-        };
-        let tools = StubToolPlane::new().with_canned_text("read", "file contents");
-        Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &self.today,
-            &tools,
-            &AllowAll,
-            self.wal.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        ))
-        .await
+        unreachable!("a store session's runs come through execute_on_store")
     }
 
     async fn execute_on_store(
@@ -229,8 +200,8 @@ impl Drop for Side {
 
 const IDLE: Duration = Duration::from_millis(100);
 
-/// A module whose sessions start in the new storage when `store`, else on today's storage,
-/// over the scripted provider `steps`. With `gated`, every model step waits for the gate. With
+/// A module whose sessions start in the new storage when `store`, over the scripted provider
+/// `steps`. With `gated`, every model step waits for the gate. With
 /// `compaction`, the module has a ready compaction provider.
 async fn side(
     store: bool,
@@ -347,8 +318,6 @@ async fn side_with_events(
         gate: gate.clone(),
     };
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
-        today: scripted(),
-        wal: Arc::clone(&wal),
         store: scripted(),
         compaction: compaction.then(|| Arc::new(ReadyProvider)),
         hooks: hooks.then(|| Arc::new(Passes) as Arc<dyn broca_core::HookPlane>),
@@ -590,17 +559,11 @@ fn mid_at(reply: &Value, ordinal: u64) -> String {
         .to_owned()
 }
 
-/// Compares every raw `session.history` read worth telling apart on both sides: the newest
-/// page whole and in short pages, each side following its own cursors, seeks by ordinal and by
-/// each side's own message ids, and the refusals of a position the session doesn't hold.
-async fn compare_history(today: &Side, store: &Side, label: &str) {
-    assert!(store.holds() && !today.holds(), "{label}: the storages");
-    let both = |request: Value| async move {
-        (
-            today.history(request.clone()).await,
-            store.history(request).await,
-        )
-    };
+/// Pins every raw `session.history` read worth telling apart: the newest page whole and in
+/// short pages, the session following its own cursors, seeks by ordinal and by message id, and
+/// the refusals of a position the session doesn't hold.
+async fn compare_history(store: &Side, label: &str) {
+    assert!(store.holds(), "{label}: the storage");
     for request in [
         json!({}),
         json!({"limit": 1}),
@@ -614,69 +577,49 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
         json!({"cursor": "not-a-cursor"}),
         json!({"limit": 1, "max_bytes": 1}),
     ] {
-        let (old, new) = both(request.clone()).await;
-        alike!(masked(&new), masked(&old), "{label}: {request}");
+        let new = store.history(request.clone()).await;
+        broca_test_support::pin!(format!("{label}: {request}"), masked(&new));
     }
-    // Each side follows its own cursors back from the newest message, and forward again.
-    let (mut old, mut new) = both(json!({"limit": 1})).await;
+    // The session follows its own cursors back from the newest message, and forward again.
+    let mut new = store.history(json!({"limit": 1})).await;
     for step in 0..8 {
-        let (Ok(old_page), Ok(new_page)) = (&old, &new) else {
+        let Ok(new_page) = &new else {
             panic!("{label}: a page failed at step {step}");
         };
-        let (Some(older_old), Some(older_new)) = (
-            old_page["older"].as_str().map(str::to_owned),
-            new_page["older"].as_str().map(str::to_owned),
-        ) else {
-            alike!(masked(&new), masked(&old), "{label}: the oldest page");
+        let Some(older) = new_page["older"].as_str().map(str::to_owned) else {
+            broca_test_support::pin!(format!("{label}: the oldest page"), masked(&new));
             break;
         };
-        old = today.history(json!({"cursor": older_old})).await;
-        new = store.history(json!({"cursor": older_new})).await;
-        alike!(masked(&new), masked(&old), "{label}: older page {step}");
+        new = store.history(json!({"cursor": older})).await;
+        broca_test_support::pin!(format!("{label}: older page {step}"), masked(&new));
     }
-    if let (Ok(old_page), Ok(new_page)) = (&old, &new) {
-        if let (Some(newer_old), Some(newer_new)) =
-            (old_page["newer"].as_str(), new_page["newer"].as_str())
-        {
-            let old = today.history(json!({"cursor": newer_old})).await;
-            let new = store.history(json!({"cursor": newer_new})).await;
-            alike!(masked(&new), masked(&old), "{label}: a newer page");
+    if let Ok(new_page) = &new {
+        if let Some(newer) = new_page["newer"].as_str() {
+            let new = store.history(json!({"cursor": newer})).await;
+            broca_test_support::pin!(format!("{label}: a newer page"), masked(&new));
         }
     }
-    // A seek by message id, each side naming its own id of the same message.
-    let (Ok(old_all), Ok(new_all)) = both(json!({"from_ordinal": 1})).await else {
+    // A seek by message id.
+    let Ok(new_all) = store.history(json!({"from_ordinal": 1})).await else {
         panic!("{label}: the whole history reads");
     };
-    let last = old_all["messages"].as_array().unwrap().len() as u64;
+    let last = new_all["messages"].as_array().unwrap().len() as u64;
     for ordinal in [1, last.div_ceil(2).max(1), last] {
         for seek in ["from_mid", "before_mid"] {
-            let old = today
-                .history(json!({ seek: mid_at(&old_all, ordinal), "limit": 2 }))
-                .await;
             let new = store
                 .history(json!({ seek: mid_at(&new_all, ordinal), "limit": 2 }))
                 .await;
-            alike!(
-                masked(&new),
-                masked(&old),
-                "{label}: {seek} at {ordinal} (the store's id {})",
-                mid_at(&new_all, ordinal)
-            );
+            broca_test_support::pin!(format!("{label}: {seek} at {ordinal}"), masked(&new));
         }
     }
-    // The display form, newest page and from the first message, compared alike.
+    // The display form, newest page and from the first message.
     for params in [
         json!({"form": "display"}),
         json!({"form": "display", "from_ordinal": 1, "limit": 3}),
     ] {
-        let old = today.history(params.clone()).await;
         let new = store.history(params.clone()).await;
-        assert!(old.is_ok(), "{label}: today's display history {params}");
-        alike!(
-            masked_display(&new),
-            masked_display(&old),
-            "{label}: display {params}"
-        );
+        assert!(new.is_ok(), "{label}: the display history {params}");
+        broca_test_support::pin!(format!("{label}: display {params}"), masked_display(&new));
     }
 }
 
@@ -716,8 +659,8 @@ fn masked_display(reply: &Result<Value, crate::history::HistoryError>) -> Value 
 }
 
 /// The compaction route on a session off the compaction contract: every method is refused
-/// alike, before its parameters are read.
-async fn compare_compaction_refusals(today: &Side, store: &Side, label: &str) {
+/// before its parameters are read.
+async fn compare_compaction_refusals(store: &Side, label: &str) {
     for (caller, method, params) in [
         (Some("ck-mc"), "bind", json!({})),
         (None, "bind", json!({})),
@@ -730,23 +673,19 @@ async fn compare_compaction_refusals(today: &Side, store: &Side, label: &str) {
         (Some("ck-mc"), "session.apply_view", json!({"view": {}})),
         (Some("ck-mc"), "session.unknown", json!({})),
     ] {
-        let old = today.compaction(caller, method, params.clone()).await;
         let new = store.compaction(caller, method, params).await;
-        alike!(new, old, "{label}: {method} from {caller:?}");
-        alike_today_first!(
-            old.unwrap_err()["detail"]["reason"],
+        broca_test_support::pin!(format!("{label}: {method} from {caller:?}"), new);
+        assert_eq!(
+            new.unwrap_err()["detail"]["reason"],
             json!("session_not_held"),
             "{label}: {method}"
         );
     }
 }
 
-/// Both sides of a scenario over the same scripted provider steps.
-async fn both(steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> (Side, Side) {
-    (
-        side(false, steps.clone(), gated, false).await,
-        side(true, steps, gated, false).await,
-    )
+/// A module whose sessions start in the new storage, over the scripted provider steps.
+async fn both(steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> Side {
+    side(true, steps, gated, false).await
 }
 
 /// A step that calls the `read` tool, whose canned result the next step reads.
@@ -797,7 +736,7 @@ fn failing_step() -> Vec<NormalizedEvent> {
 /// (present on both), the module it was dispatched to, and that it isn't indeterminate.
 #[tokio::test]
 async fn finished_runs_read_as_the_same_history() {
-    let (today, store) = both(
+    let store = both(
         vec![
             text_step("a1", "hello"),
             tool_step("a2"),
@@ -806,7 +745,7 @@ async fn finished_runs_read_as_the_same_history() {
         false,
     )
     .await;
-    for side in [&today, &store] {
+    for side in [&store] {
         assert!(matches!(
             side.send("r1", "first").await,
             SendOutcome::Active { .. }
@@ -836,19 +775,19 @@ async fn finished_runs_read_as_the_same_history() {
     assert_eq!(calls.len(), 1, "{read}");
     assert!(calls[0]["call_key"].is_string(), "{read}");
     assert_eq!(calls[0]["indeterminate"], json!(false), "{read}");
-    compare_history(&today, &store, "finished").await;
-    compare_compaction_refusals(&today, &store, "finished").await;
+    compare_history(&store, "finished").await;
+    compare_compaction_refusals(&store, "finished").await;
 }
 
 /// A run the provider failed, and a run paused for sign-in, read alike.
 #[tokio::test]
 async fn failed_and_paused_runs_read_as_the_same_history() {
-    let (today, store) = both(
+    let store = both(
         vec![text_step("a1", "hello"), failing_step(), auth_failure()],
         false,
     )
     .await;
-    for side in [&today, &store] {
+    for side in [&store] {
         side.send("r1", "first").await;
         side.settled("r1").await;
         side.send("r2", "second").await;
@@ -856,8 +795,8 @@ async fn failed_and_paused_runs_read_as_the_same_history() {
         side.send("r3", "third").await;
         side.settled("r3").await;
     }
-    compare_history(&today, &store, "failed and paused").await;
-    compare_compaction_refusals(&today, &store, "failed and paused").await;
+    compare_history(&store, "failed and paused").await;
+    compare_compaction_refusals(&store, "failed and paused").await;
 }
 
 /// A run cancelled while its model step was in flight, then a send queued behind a running run
@@ -865,7 +804,7 @@ async fn failed_and_paused_runs_read_as_the_same_history() {
 /// cancel may or may not have taken its scripted answer, and that isn't what's compared.
 #[tokio::test]
 async fn cancelled_and_queued_runs_read_as_the_same_history() {
-    let (today, store) = both(
+    let store = both(
         vec![
             text_step("a1", "hello"),
             text_step("a2", "hello"),
@@ -875,7 +814,7 @@ async fn cancelled_and_queued_runs_read_as_the_same_history() {
         true,
     )
     .await;
-    for side in [&today, &store] {
+    for side in [&store] {
         assert!(matches!(
             side.send("r1", "first").await,
             SendOutcome::Active { .. }
@@ -900,8 +839,8 @@ async fn cancelled_and_queued_runs_read_as_the_same_history() {
         );
         side.settled("r3").await;
     }
-    compare_history(&today, &store, "cancelled and queued").await;
-    compare_compaction_refusals(&today, &store, "cancelled and queued").await;
+    compare_history(&store, "cancelled and queued").await;
+    compare_compaction_refusals(&store, "cancelled and queued").await;
 }
 
 /// A plan naming the compaction provider `ck-mc`, and, when `renders`, asking its runs to show
@@ -949,10 +888,10 @@ fn untooled(text: &str) -> SubmissionRequest {
     request
 }
 
-/// The same session on each storage, on the current compaction contract, whose plan names
-/// `ck-mc` and, when `renders`, renders part numbers: two runs, the second with a tool turn, and
-/// replies carrying part-number notation.
-async fn contract_sessions(renders: bool) -> (Side, Side) {
+/// A session on the current compaction contract, whose plan names `ck-mc` and, when `renders`,
+/// renders part numbers: two runs, the second with a tool turn, and replies carrying part-number
+/// notation.
+async fn contract_sessions(renders: bool) -> Side {
     contract_sessions_with(renders, Vec::new(), IDLE).await
 }
 
@@ -962,7 +901,7 @@ async fn contract_sessions_with(
     renders: bool,
     more: Vec<Vec<NormalizedEvent>>,
     idle: Duration,
-) -> (Side, Side) {
+) -> Side {
     contract_sessions_in(renders, more, idle, || {
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32])
     })
@@ -976,16 +915,15 @@ async fn contract_sessions_in(
     more: Vec<Vec<NormalizedEvent>>,
     idle: Duration,
     deployment: impl Fn() -> broca_session_store::keys::DeploymentKey,
-) -> (Side, Side) {
+) -> Side {
     let mut steps = vec![
         text_step("a1", "§2§ Done."),
         tool_step("a2"),
         text_step("a3", "§5§ §6§ It says file contents."),
     ];
     steps.extend(more);
-    let today = side_in(false, steps.clone(), false, true, idle, deployment()).await;
     let store = side_in(true, steps, false, true, idle, deployment()).await;
-    for side in [&today, &store] {
+    for side in [&store] {
         assert!(matches!(
             side.send_request(
                 "r1",
@@ -1017,7 +955,7 @@ async fn contract_sessions_in(
         crate::store_entries::on_contract(&view),
         "the store session is on the compaction contract"
     );
-    (today, store)
+    store
 }
 
 /// A compaction reply with what each storage keeps for itself taken out: message ids (each
@@ -1073,15 +1011,10 @@ async fn entry_mids(side: &Side) -> std::collections::BTreeMap<u64, String> {
 /// is cut, reads by ids and by part numbers, and compact detail.
 #[tokio::test]
 async fn the_compaction_route_serves_the_frozen_provider_alike() {
-    let (today, store) = contract_sessions(false).await;
+    let store = contract_sessions(false).await;
     let both = |caller: Option<&'static str>, method: &'static str, params: Value| {
-        let (today, store) = (&today, &store);
-        async move {
-            (
-                compaction_masked(today.compaction(caller, method, params.clone()).await),
-                compaction_masked(store.compaction(caller, method, params).await),
-            )
-        }
+        let store = &store;
+        async move { compaction_masked(store.compaction(caller, method, params).await) }
     };
     for (caller, method, params) in [
         (Some("ck-mc"), "bind", json!({})),
@@ -1098,8 +1031,8 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
             json!({"select": {"by": "after", "limit": 0}, "detail": "full"}),
         ),
     ] {
-        let (old, new) = both(caller, method, params.clone()).await;
-        alike!(new, old, "{method} from {caller:?}: {params}");
+        let new = both(caller, method, params.clone()).await;
+        broca_test_support::pin!(format!("{method} from {caller:?}: {params}"), new);
     }
     assert_eq!(
         store.compaction(Some("ck-mc"), "bind", json!({})).await,
@@ -1112,11 +1045,9 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
             .unwrap_err()["detail"]["reason"],
         json!("provider_mismatch")
     );
-    let today_mids = entry_mids(&today).await;
     let store_mids = entry_mids(&store).await;
-    let len = today_mids.len() as u64;
+    let len = store_mids.len() as u64;
     assert!(len >= 6, "{len} entries");
-    assert_eq!(store_mids.len() as u64, len);
     let mut requests = Vec::new();
     for after in (0..=len + 1).map(Some).chain([None]) {
         for limit in [Some(1), Some(2), Some(len), None] {
@@ -1135,45 +1066,36 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
     requests.push(json!({"select": {"by": "after"}, "detail": "full", "max_bytes": 600}));
     requests.push(json!({"select": {"by": "tags", "tags": [1, 3, 999]}, "detail": "compact"}));
     for request in requests {
-        let (old, new) = both(Some("ck-mc"), "session.entries", request.clone()).await;
-        alike!(new, old, "session.entries {request}");
+        let new = both(Some("ck-mc"), "session.entries", request.clone()).await;
+        broca_test_support::pin!(format!("session.entries {request}"), new);
     }
-    // A read by ids names each storage's own ids of the same messages.
+    // A read by ids names the session's own ids of its messages.
     let by_ids = |mids: &std::collections::BTreeMap<u64, String>| {
         json!({"select": {"by": "mids", "mids": [mids[&len], "nobody", mids[&1], mids[&3]]},
                "detail": "full"})
     };
-    let old = compaction_masked(
-        today
-            .compaction(Some("ck-mc"), "session.entries", by_ids(&today_mids))
-            .await,
-    );
     let new = compaction_masked(
         store
             .compaction(Some("ck-mc"), "session.entries", by_ids(&store_mids))
             .await,
     );
-    alike!(new, old, "session.entries by ids");
+    broca_test_support::pin!("session.entries by ids", new);
     assert_eq!(new.unwrap()["entries"].as_array().unwrap().len(), 3);
-    // Both storages refuse a malformed view (here an empty object) before reading the session.
+    // A malformed view (here an empty object) is refused before the session is read.
     let params = json!({"view": {}});
-    let old = today
-        .compaction(Some("ck-mc"), "session.apply_view", params.clone())
-        .await;
     let new = store
         .compaction(Some("ck-mc"), "session.apply_view", params)
         .await;
-    alike!(new, old);
+    broca_test_support::pin!("alike", new);
     assert_eq!(new.unwrap_err()["code"], json!("invalid_params"));
 }
 
-/// `session.entries` pages the session's entries exactly as today's paging pages the whole
-/// transcript (`views::page` over every entry, with the newest entry as the head). An `after`
+/// `session.entries` pages the session's entries exactly as paging the whole transcript does (`views::page` over every entry, with the newest entry as the head). An `after`
 /// read loads only the entries it needs, so this is what proves the bounded load serves the same
 /// page as paging everything would.
 #[tokio::test]
 async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
-    let (_today, store) = contract_sessions(false).await;
+    let store = contract_sessions(false).await;
     let session = store
         .registry
         .store_runtime()
@@ -1203,7 +1125,7 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
         &broca_session_loop::compaction::frozen(&admission),
         admission.manifest.as_deref(),
     );
-    let today = |request: &ReadRequest| {
+    let whole = |request: &ReadRequest| {
         let mut head = broca_core::compaction_v2::protocol::read::Head::new();
         head.newest = broca_core::compaction_v2::views::newest(&all);
         // Derive metadata before selecting and compacting, so the byte caps still compare the
@@ -1299,7 +1221,7 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
             .unwrap_or_else(|refusal| panic!("{refusal}"));
         assert_eq!(
             served,
-            today(request),
+            whole(request),
             "{}",
             serde_json::to_value(request).unwrap()
         );
@@ -1331,17 +1253,8 @@ async fn reads_clean_replies_where_their_facts_say_their_run_cleans_them() {
             .filter_map(|block| block["text"].as_str().map(str::to_owned))
             .collect()
     };
-    for (renders, today_expected) in [
-        (true, cleaned.clone()),
-        (false, raw.map(str::to_owned).to_vec()),
-    ] {
-        let (today, store) = contract_sessions(renders).await;
-        let old = today.history(json!({"from_ordinal": 1})).await.unwrap();
-        assert_eq!(
-            texts(old["messages"].as_array().unwrap()),
-            today_expected,
-            "today's history, renders {renders}"
-        );
+    for renders in [true, false] {
+        let store = contract_sessions(renders).await;
         let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
         assert_eq!(
             texts(new["messages"].as_array().unwrap()),
@@ -1426,7 +1339,7 @@ const WRITTEN: [&str; 4] = [
 /// before the third run and the deliveries it received.
 async fn served_session() -> (Side, Vec<crate::Delivery>) {
     use crate::serve::{ServeHandler, SubscribeFrom};
-    let (_today, store) = contract_sessions_with(
+    let store = contract_sessions_with(
         false,
         vec![text_step("a4", WRITTEN[3])],
         Duration::from_secs(600),
@@ -2164,7 +2077,7 @@ async fn dump_head_import_entries() {
 #[tokio::test]
 async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
-    let (today, store) = contract_sessions_with(
+    let store = contract_sessions_with(
         false,
         vec![text_step("a4", "after the view")],
         Duration::from_secs(60),
@@ -2177,7 +2090,7 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
         )
     };
     let mut answers = Vec::new();
-    for side in [&today, &store] {
+    for side in [&store] {
         let apply = |view: View| {
             side.compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }))
         };
@@ -2188,7 +2101,7 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
         let unknown = apply(drop(2, "no-such-message".into())).await;
         answers.push((first, retry, unknown));
     }
-    alike!(answers[1], answers[0], "the store answers as today's");
+    broca_test_support::pin!("the answers", answers[0]);
     assert_eq!(answers[0].0, Ok(json!({"answer": "accepted"})));
     for refused in [&answers[0].1, &answers[0].2] {
         assert!(
@@ -2196,7 +2109,7 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
             "{refused:?}"
         );
     }
-    for side in [&today, &store] {
+    for side in [&store] {
         assert!(matches!(
             side.send_request("r3", untooled("again"), Some(planned("plan-1", None)))
                 .await,
@@ -2207,7 +2120,7 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
     }
     // r3's first step is the provider's fourth request.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
-    alike!(prompt(&store), prompt(&today));
+    broca_test_support::pin!("alike", prompt(&store));
     assert!(
         !prompt(&store).to_string().contains("Done."),
         "the view dropped the first reply: {}",
@@ -2372,12 +2285,10 @@ async fn send_keyed(
 }
 
 /// Core's reader-bearing creating send starts a head in broca-session-store's durable root,
-/// even when the module creates no other session there. Legacy WAL storage refuses that plan
-/// without writing; the equivalent plan omitting readers still starts in its durable folder.
-/// Both admitted heads use compaction-provider/v2. Core's keyed retry writes nothing, and its
-/// next send runs as the next turn in the same storage. A view the synthetic compaction
-/// provider submits while the head is idle is accepted on both storages and applies at the
-/// next turn's first step; the two histories read the same.
+/// even when the module creates no other session there, on compaction-provider/v2. Core's keyed
+/// retry writes nothing, and its next send runs as the next turn in the same storage. A view the
+/// synthetic compaction provider submits while the head is idle is accepted and applies at the
+/// next turn's first step.
 #[tokio::test]
 async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
@@ -2414,44 +2325,9 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
             side
         }
     };
-    let today = side(false).await;
     let store = side(true).await;
-    let refused = send_keyed(
-        &today,
-        &first_id,
-        core_head_request(&first, true),
-        Some(core_head_plan(&first)),
-        class,
-    )
-    .await;
-    assert!(
-        matches!(
-            refused,
-            SendOutcome::DeliveryRefused {
-                code: "invalid_params",
-                field: "plan.readers",
-                ..
-            }
-        ),
-        "{refused:?}"
-    );
-    assert!(today.registry.slot_state(&today.key).is_none());
-    assert!(
-        !StorageClass::ALL.into_iter().any(|class| {
-            FileWalStore::new(today.dir.join("wal"))
-                .class_wal_path(class, &today.key)
-                .exists()
-        }),
-        "the refused reader plan created no legacy WAL"
-    );
-    let mut legacy_first = first.clone();
-    assert!(legacy_first["plan"]
-        .as_object_mut()
-        .unwrap()
-        .remove("readers")
-        .is_some());
     let mut replies = Vec::new();
-    for (side, first) in [(&today, &legacy_first), (&store, &first)] {
+    for (side, first) in [(&store, &first)] {
         let reply = send_keyed(
             side,
             &first_id,
@@ -2465,7 +2341,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         side.assert_completed(&format!("run-{first_id}")).await;
         replies.push(reply);
     }
-    alike!(replies[1], replies[0]);
+    broca_test_support::pin!("alike", replies[0]);
     let address = |side: &Side| broca_core::session_addr(&side.key);
     let wal_folder = |side: &Side| {
         let wal = FileWalStore::new(side.dir.join("wal"));
@@ -2477,12 +2353,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         broca_wal::session_storage_class(&store.dir, &address(&store)).unwrap(),
         Some(StorageClass::Durable)
     );
-    alike_today_first!(wal_folder(&store), None);
-    alike_today_first!(
-        broca_wal::session_storage_class(&today.dir, &address(&today)).unwrap(),
-        None
-    );
-    alike_today_first!(wal_folder(&today), Some(StorageClass::Durable));
+    assert_eq!(wal_folder(&store), None);
     let current = || async {
         store
             .registry
@@ -2500,7 +2371,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     // serve layer then fetches nothing and hands over the plan's identity alone.
     let written = current().await.open_log_records().await.unwrap().len();
     let mut retries = Vec::new();
-    for (side, first) in [(&today, &legacy_first), (&store, &first)] {
+    for (side, first) in [(&store, &first)] {
         let identity = core_head_plan(first).identity;
         retries.push(
             send_keyed(
@@ -2513,18 +2384,14 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
             .await,
         );
     }
-    alike!(
-        retries[1],
-        retries[0],
-        "the store answers the retry as today's"
-    );
+    broca_test_support::pin!("the retry's answer", retries[0]);
     assert!(
         !matches!(
-            retries[1],
+            retries[0],
             SendOutcome::Active { .. } | SendOutcome::Pending { .. }
         ),
         "the retry started nothing: {:?}",
-        retries[1]
+        retries[0]
     );
     assert_eq!(
         current().await.open_log_records().await.unwrap().len(),
@@ -2532,7 +2399,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         "the retry wrote nothing"
     );
 
-    for side in [&today, &store] {
+    for side in [&store] {
         let next = send_keyed(
             side,
             &second_id,
@@ -2551,7 +2418,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         side.settled(&format!("run-{second_id}")).await;
         side.assert_completed(&format!("run-{second_id}")).await;
     }
-    alike_today_first!(
+    assert_eq!(
         wal_folder(&store),
         None,
         "the next turn ran in the new storage"
@@ -2560,7 +2427,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     // Magic Context drops the first turn's reply, entry 2, while the head is idle; the turn
     // after applies the view at its first step.
     let mut answers = Vec::new();
-    for side in [&today, &store] {
+    for side in [&store] {
         let page = side
             .compaction(
                 Some("magic-context"),
@@ -2598,11 +2465,11 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         );
     }
     assert_eq!(answers[0], Ok(json!({"answer": "accepted"})));
-    alike!(answers[1], answers[0], "the store answers as today's");
+    broca_test_support::pin!("the answers", answers[0]);
     let mut third = second.clone();
     third["send_id"] = json!("send_sample_third_0123456789abcdef");
     third["prompt"] = json!("Carry on with the synthetic project.");
-    for side in [&today, &store] {
+    for side in [&store] {
         let next = send_keyed(
             side,
             "send_sample_third_0123456789abcdef",
@@ -2624,7 +2491,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     }
     // The third turn's first step is the provider's third request.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[2].prompt).unwrap();
-    alike!(prompt(&store), prompt(&today));
+    broca_test_support::pin!("the third turn's first request", prompt(&store));
     assert!(
         !prompt(&store).to_string().contains("Awake."),
         "the view dropped the first reply: {}",
@@ -2642,14 +2509,13 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         })
         .collect();
     assert_eq!(applied, [1], "the third turn's first step applied the view");
-    compare_history(&today, &store, "a head's three turns").await;
+    compare_history(&store, "a head's three turns").await;
 }
 
 /// A view the compaction provider applies with its build metadata (the entry it was built
 /// through and its policy for newly signed blocks, both covered by its checksum) is recorded
-/// alike by both storages, with the provider that applied it. Once the next run's first step
-/// applies it, that step's request renders it alike, and `session.applied_view` serves the same
-/// view and names the same provider.
+/// with the provider that applied it. Once the next run's first step applies it, that step's
+/// request renders it, and `session.applied_view` serves the view and names the provider.
 mod a_view_keeps_its_build_metadata_and_applier_alike {
     use broca_session_store::keys::Cipher;
 
@@ -2668,9 +2534,9 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
     cipher: broca_session_store::keys::Cipher,
 ) {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
-    use broca_core::WalStore as _;
+
     use std::collections::BTreeMap;
-    let (today, store) = contract_sessions_in(
+    let store = contract_sessions_in(
         false,
         vec![text_step("a4", "after the view")],
         Duration::from_secs(60),
@@ -2700,7 +2566,7 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
         }
     }
     let mut ids = Vec::new();
-    for side in [&today, &store] {
+    for side in [&store] {
         let mids = entry_mids(side).await;
         // The view drops the first run's reply, entry 2, and was built through the newest entry.
         let newest = mids.values().next_back().unwrap().clone();
@@ -2723,20 +2589,6 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
         );
         ids.push(mids);
     }
-    let old: Vec<Value> = FileWalStore::new(today.dir.join("wal"))
-        .read_records(&today.key)
-        .unwrap()
-        .into_iter()
-        .filter_map(|frame| match frame.record {
-            broca_wal::WalRecord::CompactionViewV2(view) => Some(json!({
-                "version": view.version,
-                "built_through": view.built_through,
-                "new_signed": view.new_signed,
-                "applied_by": view.applied_by,
-            })),
-            _ => None,
-        })
-        .collect();
     let session = store
         .registry
         .store_runtime()
@@ -2760,17 +2612,16 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
             _ => None,
         })
         .collect();
-    let [mut old, mut new] = [Value::from(old), Value::from(new)];
-    by_ordinal(&mut old, &ids[0]);
-    by_ordinal(&mut new, &ids[1]);
-    alike!(new, old, "both logs record the view alike");
+    let mut new = Value::from(new);
+    by_ordinal(&mut new, &ids[0]);
     let through = format!("entry {}", ids[0].keys().next_back().unwrap());
-    alike_today_first!(
-        old,
+    assert_eq!(
+        new,
         json!([{"version": 1, "built_through": through, "new_signed": "strip",
-                "applied_by": "ck-mc"}])
+                "applied_by": "ck-mc"}]),
+        "the log records the view"
     );
-    for side in [&today, &store] {
+    for side in [&store] {
         assert!(matches!(
             side.send_request("r3", untooled("again"), Some(planned("plan-1", None)))
                 .await,
@@ -2781,9 +2632,9 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
     }
     // r3's first step is the provider's fourth request.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
-    alike!(prompt(&store), prompt(&today));
+    broca_test_support::pin!("r3's first request", prompt(&store));
     let mut served = Vec::new();
-    for (side, mids) in [&today, &store].into_iter().zip(&ids) {
+    for (side, mids) in [&store].into_iter().zip(&ids) {
         let mut reply = side
             .compaction(Some("ck-mc"), "session.applied_view", json!({}))
             .await
@@ -2791,11 +2642,7 @@ async fn a_view_keeps_its_build_metadata_and_applier_alike(
         by_ordinal(&mut reply, mids);
         served.push(reply);
     }
-    alike!(
-        served[1],
-        served[0],
-        "the store serves the applied view as today's"
-    );
+    broca_test_support::pin!("the applied view", served[0]);
     assert_eq!(served[0]["applied_by"], json!("ck-mc"), "{}", served[0]);
     assert_eq!(
         served[0]["view"]["built_through"],
@@ -2908,15 +2755,6 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         text_step("a4", "seen"),
     ];
     let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
-    let today = side_in(
-        false,
-        steps.clone(),
-        false,
-        true,
-        Duration::from_secs(60),
-        deployment(),
-    )
-    .await;
     let store = side_in(
         true,
         steps,
@@ -2926,7 +2764,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         deployment(),
     )
     .await;
-    for side in [&today, &store] {
+    for side in [&store] {
         let first = side
             .send_request(
                 "r1",
@@ -2958,7 +2796,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         })
     };
     let mut named = Vec::new();
-    for side in [&today, &store] {
+    for side in [&store] {
         // The first run's reply, entry 2.
         let (mid, part, number) = numbered_part(side, 2).await;
         let mut request = owned("");
@@ -2969,14 +2807,10 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         side.assert_completed("t1").await;
         named.push((mid, part, number));
     }
-    alike!(
-        named[1].2,
-        named[0].2,
-        "both storages number the part alike"
-    );
+    broca_test_support::pin!("the part's number", named[0].2);
     // t1's first step is the provider's fourth request; its input is the rendered template.
     let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
-    alike!(prompt(&store), prompt(&today));
+    broca_test_support::pin!("t1's first request", prompt(&store));
     let input = prompt(&store)
         .as_array()
         .unwrap()
@@ -2992,7 +2826,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         named[0].2
     );
     let mut gone = Vec::new();
-    for (side, (mid, part, _)) in [&today, &store].into_iter().zip(&named) {
+    for (side, (mid, part, _)) in [&store].into_iter().zip(&named) {
         let view = View::seal(
             1,
             vec![Edit::new(
@@ -3011,7 +2845,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         request.input = Vec::new();
         gone.push(side.send_ordered("t2", request, order(mid, part)).await);
     }
-    alike!(gone[1], gone[0], "the store answers as today's");
+    broca_test_support::pin!("the answers", gone[0]);
     assert_eq!(
         gone[0],
         SendOutcome::TemplatePartGone {

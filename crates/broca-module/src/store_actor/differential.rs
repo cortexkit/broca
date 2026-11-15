@@ -1,10 +1,7 @@
-//! The same sends through today's session actor and the store actor, compared reply by reply.
-//!
-//! Today's side is the module's real path: a registry over a file lease store and a file WAL,
-//! today's actor, and today's loop ([`broca_core::run_loop_on_writer_admitted_with_prior_snapshot`])
-//! over a scripted provider. The store side is [`super::StoreActor`] over the new loop and the
-//! same script. Both replies must be equal; what the store actor doesn't serve yet is pinned by
-//! its own tests, each refused by name.
+//! Sends through the store actor over the new loop and a scripted provider, each reply, stream
+//! and read pinned (see `broca_test_support::pins`). The pins were recorded while these
+//! scenarios still ran today's actor beside the store actor and required the two to agree, so
+//! each pin is what both storages answered.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,108 +45,7 @@ macro_rules! cipher_tests {
     };
 }
 
-/// Today's executor in this harness: today's loop over the scripted provider, on the writer the
-/// actor hands it.
-pub(super) struct TodayLoop {
-    pub(super) provider: Gated,
-    pub(super) wal: Arc<FileWalStore>,
-    /// The planes the executor offers the session's runs, the same ones the store side's offers.
-    pub(super) planes: super::tests::Planes,
-}
-
-#[async_trait]
-impl RunExecutor for TodayLoop {
-    fn joining_temperature(
-        &self,
-        model: &broca_protocol::request::ModelHandle,
-        frozen: &serde_json::Value,
-        requested: f64,
-    ) -> Option<Option<f64>> {
-        temperature::current_temperature(model, frozen, requested)
-    }
-    fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
-        self.planes.hooks.clone()
-    }
-
-    fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
-        self.planes.compaction.clone()
-    }
-
-    async fn execute(
-        &self,
-        mut job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        // As the store side's executor does: the caller's context limit is the admitted one.
-        job.control.admitted_context_limit =
-            job.control.admitted_context_limit.or(job.req.context_limit);
-        // As the serve executor picks it (`start_mode_after_auth`) when the run's credential
-        // resolves, which this harness's always does: an ordinary caller's send, which arrives
-        // as `FreshOrResume`, resumes a sign-in pause.
-        let mode = match job.kind {
-            RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-        };
-        let tools = super::tests::GatedTools::new("file contents", self.planes.tool_gate.clone());
-        Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &self.provider,
-            &tools,
-            &AllowAll,
-            self.wal.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        ))
-        .await
-    }
-}
-
-/// Today's module over a scratch folder, which it removes when dropped.
-struct Today {
-    dir: std::path::PathBuf,
-    registry: LineageRegistry,
-    wal: Arc<FileWalStore>,
-    key: BindIdentity,
-    /// The module's executor, whose provider records what each model call was sent.
-    executor: Arc<TodayLoop>,
-}
-
-impl Drop for Today {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
-    today_with(steps, gate, super::tests::Planes::default())
-}
-
-/// [`today`] with an executor that offers `planes`.
-fn today_with(
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<Arc<Notify>>,
-    planes: super::tests::Planes,
-) -> Today {
-    today_opened(steps, gate, planes, false)
-}
-
-/// [`today`] whose WAL writer records each ride with its envelope (its call's key, sender and
-/// forms), as the writer does once rides are enabled, where a ride is a notice and its text
-/// isn't joined into the result. The new storage always records rides that way.
-fn today_riding(
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<Arc<Notify>>,
-    planes: super::tests::Planes,
-) -> Today {
-    today_opened(steps, gate, planes, true)
-}
-
-/// A fresh scratch folder for one of today's modules.
+/// A fresh scratch folder for a module.
 fn scratch_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -162,197 +58,7 @@ fn scratch_dir() -> std::path::PathBuf {
     dir
 }
 
-fn today_opened(
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<Arc<Notify>>,
-    planes: super::tests::Planes,
-    rides: bool,
-) -> Today {
-    let dir = scratch_dir();
-    let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
-    today_at(dir, key, steps, gate, planes, rides, None)
-}
-
-/// Today's module over a copy of `crashed`'s log as it stands, as a process that died now and
-/// started again finds it: no lease held, and nothing but the durable records. It rides as
-/// [`today_riding`]'s module does.
-fn today_restarted(crashed: &Today, steps: Vec<Vec<NormalizedEvent>>) -> Today {
-    fn copy(from: &std::path::Path, to: &std::path::Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let target = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).unwrap();
-            }
-        }
-    }
-    let dir = scratch_dir();
-    copy(&crashed.dir.join("wal"), &dir.join("wal"));
-    today_at(
-        dir,
-        crashed.key.clone(),
-        steps,
-        None,
-        super::tests::Planes::default(),
-        true,
-        None,
-    )
-}
-
-fn today_at(
-    dir: std::path::PathBuf,
-    key: BindIdentity,
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<Arc<Notify>>,
-    planes: super::tests::Planes,
-    rides: bool,
-    render_config: Option<serde_json::Value>,
-) -> Today {
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let executor = Arc::new(TodayLoop {
-        provider: Gated {
-            render_config,
-            notes_sends: false,
-            hold: None,
-            inner: broca_core::provider::StubProvider::new(steps),
-            gate,
-        },
-        wal: Arc::clone(&wal),
-        planes,
-    });
-    let mut opener = crate::opener::DefaultOpener::new(
-        Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
-        executor.clone(),
-    )
-    .with_idle_ttl(Duration::from_secs(60));
-    if rides {
-        opener = opener.with_ride_writer_for_test();
-    }
-    // A reader over the WAL alone: `session.read` serves from the log when no store is given.
-    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
-    Today {
-        dir,
-        registry,
-        wal,
-        key,
-        executor,
-    }
-}
-
-impl Today {
-    async fn send(
-        &self,
-        run_id: &str,
-        request: SubmissionRequest,
-        key: SendKey,
-        delivery: broca_protocol::Delivery,
-        session_class: Option<&str>,
-    ) -> SendOutcome {
-        self.registry
-            .route_submission_with_order(
-                &self.key,
-                RunId(run_id.into()),
-                request,
-                RunKind::FreshOrResume,
-                key,
-                false,
-                delivery,
-                None,
-                None,
-                None,
-                None,
-                session_class.map(str::to_owned),
-                false,
-                None,
-            )
-            .await
-            .expect("today's actor opens")
-    }
-
-    async fn idle(&self) {
-        broca_test_support::wait_until("today's session goes idle", || async {
-            match self.registry.route_status(&self.key).await.unwrap() {
-                LineageStatus::Idle => Ok(()),
-                status => Err(format!("{status:?}")),
-            }
-        })
-        .await
-    }
-
-    /// What each run's start recorded about its send, in the shape [`store_starts`] reads from
-    /// the store session.
-    fn starts(&self) -> Vec<serde_json::Value> {
-        self.wal
-            .read_records(&self.key)
-            .unwrap()
-            .into_iter()
-            .filter_map(|frame| match frame.record {
-                broca_wal::WalRecord::RunStarted {
-                    run_id,
-                    submission_id,
-                    send_id,
-                    request_identity_digest,
-                    title,
-                    sent_by,
-                    principal,
-                    scope,
-                    session_class,
-                    config,
-                    ..
-                } => Some(serde_json::json!({
-                    "run_id": run_id.0,
-                    "submission_id": submission_id.map(|id| id.0),
-                    "send_id": send_id,
-                    "request_identity_digest": request_identity_digest,
-                    "title": title,
-                    "sent_by": sent_by,
-                    "principal": principal,
-                    "scope": scope,
-                    "session_class": session_class,
-                    "model": config.model,
-                })),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The text of every message today's served history holds, in order, as [`texts`] reads
-    /// the store session's conversation. Read through `session.read`'s own path, so a steer or a
-    /// queued send lands where today's actor places it.
-    async fn texts(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut from = None;
-        loop {
-            let page = self
-                .registry
-                .route_read(&self.key, from, None)
-                .await
-                .expect("today's session reads");
-            for message in &page.messages {
-                out.extend(
-                    message
-                        .message
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text } => Some(text.clone()),
-                            _ => None,
-                        }),
-                );
-            }
-            match page.next_from_ordinal {
-                Some(next) if !page.messages.is_empty() => from = Some(next),
-                _ => return out,
-            }
-        }
-    }
-}
-
-/// One step of a scenario, done on both sides.
+/// One step of a scenario.
 enum Step {
     Send {
         run_id: &'static str,
@@ -434,9 +140,10 @@ fn tweaked(mut step: Step, change: fn(&mut SubmissionRequest)) -> Step {
     step
 }
 
-/// Runs `steps` on both sides over the same provider script, the first model step gated when
-/// `gated`. Every reply is compared as its step says; when every step is served alike, the two
-/// sessions' conversations must also be the same. Returns today's reply to each send, in order.
+/// Runs `steps` on the store actor over the provider script, the first model step gated when
+/// `gated`, and pins each reply (see `broca_test_support::pins`); then pins the session's control
+/// stream, its conversation, what each run's start recorded and its reads. Returns the reply to
+/// each send, in order.
 async fn compare(
     script: Vec<Vec<NormalizedEvent>>,
     gated: bool,
@@ -451,28 +158,15 @@ async fn compare_with_render(
     steps: Vec<Step>,
     render_config: Option<serde_json::Value>,
 ) -> Vec<SendOutcome> {
-    let today_gate = gated.then(|| Arc::new(Notify::new()));
-    let store_gate = gated.then(|| Arc::new(Notify::new()));
-    let dir = scratch_dir();
-    let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
-    let today = today_at(
-        dir,
-        key,
-        script.clone(),
-        today_gate.clone(),
-        super::tests::Planes::default(),
-        false,
-        render_config.clone(),
-    );
+    let gate = gated.then(|| Arc::new(Notify::new()));
     // The store actor's setup parts, kept so its session's reads after the steps can name the
     // tools and plans its runs started with.
     let parts = broca_session_loop::parts::SharedParts::new(Box::new(
         broca_session_loop::parts::MemoryParts::default(),
     ));
-    let mut store_executor = executor(script, store_gate.clone());
-    store_executor.provider.render_config = render_config;
-    let (commands, served, _) = super::tests::actor_with(store_executor, parts.clone()).await;
-    // Both sides get the request one caller shapes.
+    let mut executor = executor(script, gate.clone());
+    executor.provider.render_config = render_config;
+    let (commands, served, _) = super::tests::actor_with(executor, parts.clone()).await;
     let caller = super::tests::Caller::default();
     let mut answers = Vec::new();
     for (index, step) in steps.into_iter().enumerate() {
@@ -486,71 +180,42 @@ async fn compare_with_render(
                 delivery,
                 class,
             } => {
-                let send_key = || match key {
+                let send_key = match key {
                     Some(key) => SendKey::SendId(key.into()),
                     None => SendKey::Minted,
                 };
-                let mut sent = caller.shape(run_id, &send_key(), request(text));
+                let mut sent = caller.shape(run_id, &send_key, request(text));
                 sent.route_decision_id = route_decision.map(str::to_owned);
                 if let Some(tweak) = tweak {
                     tweak(&mut sent);
                 }
-                let old = today
-                    .send(run_id, sent.clone(), send_key(), delivery, class)
-                    .await;
-                let new = super::tests::send_exactly(
-                    &commands,
-                    run_id,
-                    sent,
-                    send_key(),
-                    delivery,
-                    class,
-                )
-                .await;
-                alike!(new, old, "step {index}: replies differ");
-                answers.push(old);
+                let reply =
+                    super::tests::send_exactly(&commands, run_id, sent, send_key, delivery, class)
+                        .await;
+                broca_test_support::pin!(format!("step {index}: reply"), reply);
+                answers.push(reply);
             }
             Step::Retract(submission_id) => {
-                let old = today
-                    .registry
-                    .route_retract(
-                        &today.key,
-                        broca_protocol::SubmissionId(submission_id.into()),
-                    )
-                    .await
-                    .expect("today's actor opens");
-                let new = super::tests::retract(&commands, submission_id).await;
-                alike!(new, old, "step {index}: retraction replies differ");
+                let reply = super::tests::retract(&commands, submission_id).await;
+                broca_test_support::pin!(format!("step {index}: retraction reply"), reply);
             }
             Step::Release => {
-                for gate in today_gate.iter().chain(store_gate.iter()) {
+                if let Some(gate) = &gate {
                     gate.notify_one();
                 }
             }
-            Step::Idle => {
-                today.idle().await;
-                super::tests::idle(&commands).await;
-            }
+            Step::Idle => super::tests::idle(&commands).await,
         }
     }
-    streams::assert_alike(
-        &streams::store(&commands).await,
-        &streams::routed(&today.registry, &today.key).await,
-    );
+    streams::pin(&streams::store(&commands).await);
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
-    alike!(
-        texts(&session),
-        today.texts().await,
-        "the conversations differ"
+    broca_test_support::pin!("the conversation", texts(&session));
+    broca_test_support::pin!(
+        "what each run's start recorded",
+        store_starts(&session).await
     );
-    alike!(
-        store_starts(&session).await,
-        today.starts(),
-        "the run starts record the sends differently"
-    );
-    display_reads_alike(&today, &session, &parts).await;
-    assert!(today.registry.stop_and_seal().await);
+    display_reads(&session, &parts).await;
     answers
 }
 
@@ -580,54 +245,40 @@ fn opted_request(
     request
 }
 
-/// `session.read` with what each opt-in adds, on a few pages: today's actor's reply and the
-/// store actor's session's, compared as [`comparable_read`] leaves them.
-async fn display_reads_alike(
-    today: &Today,
+/// `session.read` of the store actor's session with what each opt-in adds, on a few pages,
+/// each pinned as [`comparable_read`] leaves it.
+async fn display_reads(
     session: &Session<&'static MemoryBackend>,
     parts: &broca_session_loop::parts::SharedParts,
 ) {
-    use crate::serve::ServeHandler;
+    let key = BindIdentity::new("/project", "store-actor", "s1");
     for opted in OPTED {
         for page in PAGES {
-            let request = opted_request(&today.key, page, opted);
-            let old = today
-                .registry
-                .read(request.clone())
-                .await
-                .expect("today's session reads");
-            let new = crate::store_read::serve_view(session, parts, &request)
+            let request = opted_request(&key, page, opted);
+            let reply = crate::store_read::serve_view(session, parts, &request)
                 .await
                 .expect("the store's session reads");
-            alike!(
-                comparable_read(&new),
-                comparable_read(&old),
-                "display facts, tools, rich ui {opted:?}, page {page:?}"
+            broca_test_support::pin!(
+                format!("display facts, tools, rich ui {opted:?}, page {page:?}"),
+                comparable_read(&reply)
             );
         }
     }
 }
 
-/// The same reads through each module's registry: a session on today's storage, and one the
-/// new storage keeps.
-async fn opted_reads_alike(today: &Module, store: &Module, label: &str) {
+/// The same reads through a module's registry, each pinned as [`comparable_read`] leaves it.
+async fn opted_reads(store: &Module, label: &str) {
     use crate::serve::ServeHandler;
     for opted in OPTED {
         for page in PAGES {
-            let old = today
-                .registry
-                .read(opted_request(&today.key, page, opted))
-                .await
-                .expect("today's session reads");
-            let new = store
+            let reply = store
                 .registry
                 .read(opted_request(&store.key, page, opted))
                 .await
                 .expect("the store's session reads");
-            alike!(
-                comparable_read(&new),
-                comparable_read(&old),
-                "{label}: display facts, tools, rich ui {opted:?}, page {page:?}"
+            broca_test_support::pin!(
+                format!("{label}: display facts, tools, rich ui {opted:?}, page {page:?}"),
+                comparable_read(&reply)
             );
         }
     }
@@ -676,8 +327,7 @@ fn comparable_read(reply: &broca_wire::SessionReadResponse) -> serde_json::Value
     value
 }
 
-/// What each run's start in `session` recorded about its send, in the shape [`Today::starts`]
-/// reads from today's log.
+/// What each run's start in `session` recorded about its send.
 async fn store_starts(session: &Session<&'static MemoryBackend>) -> Vec<serde_json::Value> {
     use broca_session_store::record::Record;
     session
@@ -1409,32 +1059,6 @@ async fn an_agents_named_notice_is_kept_alike() {
     .await;
 }
 
-/// Both loops behind one executor, as the module's executor will be: a session on today's
-/// storage runs through today's loop, a session in the new storage through the new one.
-pub(super) struct BothLoops {
-    pub(super) today: TodayLoop,
-    pub(super) store: super::tests::LoopExecutor,
-}
-
-#[async_trait]
-impl RunExecutor for BothLoops {
-    async fn execute(
-        &self,
-        job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        self.today.execute(job, out).await
-    }
-
-    async fn execute_on_store(
-        &self,
-        job: crate::executor::StoreRunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> crate::executor::StoreRunEnd {
-        self.store.execute_on_store(job, out).await
-    }
-}
-
 /// A module over a scratch folder whose opener can serve the new storage, with the registry's
 /// new-session switch `on` or off.
 struct Module {
@@ -1495,27 +1119,14 @@ async fn module_options_with_render(
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    // Today's WAL store finds the new storage beside its own folder: its state root is `dir`.
+    // The WAL store's folder sits in the state root `dir`, beside the new storage.
     let wal = Arc::new(match cipher {
         Some(_) => FileWalStore::with_config(dir.join("wal"), broca_wal::WalConfig::OVERHAUL),
         None => FileWalStore::new(dir.join("wal")),
     });
     let mut store_loop = executor(steps.clone(), gate.clone());
-    store_loop.provider.render_config = render_config.clone();
-    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
-        today: TodayLoop {
-            provider: Gated {
-                render_config,
-                notes_sends: false,
-                hold: None,
-                inner: broca_core::provider::StubProvider::new(steps.clone()),
-                gate: gate.clone(),
-            },
-            wal: Arc::clone(&wal),
-            planes: Default::default(),
-        },
-        store: store_loop,
-    });
+    store_loop.provider.render_config = render_config;
+    let executor: Arc<dyn RunExecutor> = Arc::new(store_loop);
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32])
@@ -1702,7 +1313,7 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
         module.head().exists(),
         "the session's head is in the new storage"
     );
-    alike_today_first!(module.wal.wal_present(&module.key), Some(false));
+    assert_eq!(module.wal.wal_present(&module.key), Some(false));
     assert!(
         module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE),
         "{}",
@@ -1713,33 +1324,17 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
         SendOutcome::Active { .. }
     ));
     module.closed().await;
-    alike_today_first!(module.wal.wal_present(&module.key), Some(false));
+    assert_eq!(module.wal.wal_present(&module.key), Some(false));
     assert_eq!(
         module.store_texts().await,
         ["first", "hello", "second", "again"]
     );
 }
 
-/// With the switch off, a session starts on today's storage and the new storage holds nothing.
-#[tokio::test]
-async fn sessions_stay_on_todays_storage_when_the_switch_is_off() {
-    let module = module(false, vec![super::tests::text_step("a1", "hello")]).await;
-    assert!(matches!(
-        module.send("r1", "first", None).await,
-        SendOutcome::Active { .. }
-    ));
-    module.closed().await;
-    assert!(!module.head().exists());
-    alike_today_first!(module.wal.wal_present(&module.key), Some(true));
-    assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
-}
-
-/// One `session.read` reply as JSON, with what legitimately differs between the two storages
-/// taken out: the log identity (`incarnation`); the history version, which each storage counts
-/// for itself (a written WAL serves 1, a new store session 0, and either only rises); the
-/// subscribe cursor (`head`), a WAL position the new storage has none of; each message's id,
-/// which each storage mints in its own form; and wall-clock times, which each run stamps for
-/// itself. A time is kept as whether it's present.
+/// One `session.read` reply as JSON, with what a session keeps for itself taken out: the log
+/// identity (`incarnation`), the history version, the subscribe cursor (`head`), each message's
+/// id, and wall-clock times, which each run stamps for itself. A time is kept as whether it's
+/// present.
 async fn read_json(
     module: &Module,
     from_ordinal: Option<u64>,
@@ -1785,46 +1380,40 @@ async fn read_json(
     (value, mids)
 }
 
-/// A session in the new storage reads as the same history on today's storage does: the newest
-/// page, a page from an ordinal, and a page after a message's id. Each storage's own message ids
-/// continue a read in that storage.
+/// A session in the new storage reads its history: the newest page, a page from an ordinal, and
+/// a page after a message's id, each pinned. The session's own message ids continue a read.
 #[tokio::test]
 async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
-    let steps = || {
+    let store = module(
+        true,
         vec![
             super::tests::text_step("a1", "hello"),
             super::tests::text_step("a2", "again"),
-        ]
-    };
-    let today = module(false, steps()).await;
-    let store = module(true, steps()).await;
-    for module in [&today, &store] {
-        assert!(matches!(
-            module.send("r1", "first", None).await,
-            SendOutcome::Active { .. }
-        ));
-        module.closed().await;
-        assert!(matches!(
-            module.send("r2", "second", None).await,
-            SendOutcome::Active { .. }
-        ));
-        module.closed().await;
-    }
-    assert!(store.head().exists() && !today.head().exists());
+        ],
+    )
+    .await;
+    assert!(matches!(
+        store.send("r1", "first", None).await,
+        SendOutcome::Active { .. }
+    ));
+    store.closed().await;
+    assert!(matches!(
+        store.send("r2", "second", None).await,
+        SendOutcome::Active { .. }
+    ));
+    store.closed().await;
+    assert!(store.head().exists());
     for (from, limit) in [(None, None), (Some(1), Some(2)), (Some(3), Some(1))] {
-        let (old, _) = read_json(&today, from, limit, None).await;
-        let (new, _) = read_json(&store, from, limit, None).await;
-        alike!(new, old, "page from {from:?} limit {limit:?}");
+        let (page, _) = read_json(&store, from, limit, None).await;
+        broca_test_support::pin!(format!("page from {from:?} limit {limit:?}"), page);
     }
-    let (_, today_mids) = read_json(&today, Some(1), Some(1), None).await;
     let (_, store_mids) = read_json(&store, Some(1), Some(1), None).await;
-    let (old, _) = read_json(&today, None, Some(2), Some(today_mids[0].clone())).await;
-    let (new, _) = read_json(&store, None, Some(2), Some(store_mids[0].clone())).await;
-    alike!(new, old, "page after the first message");
+    let (page, _) = read_json(&store, None, Some(2), Some(store_mids[0].clone())).await;
+    broca_test_support::pin!("page after the first message", page);
     // The ids served are the ones the session stored when it placed each message.
     let (_, all) = read_json(&store, Some(1), None, None).await;
     assert_eq!(all, store.stored_mids().await);
-    opted_reads_alike(&today, &store, "two finished runs").await;
+    opted_reads(&store, "two finished runs").await;
     use cortexkit_role_llm_runner::read::MediaMode;
     for media in [
         MediaMode::Inline,
@@ -1834,55 +1423,47 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
     ] {
         for opted in OPTED {
             for page in PAGES {
+                let mut request = opted_request(&store.key, page, opted);
+                request.media = media;
+                let reply = store.registry.read(request).await.unwrap();
                 let mut roles = Vec::new();
-                for module in [&today, &store] {
-                    let mut request = opted_request(&module.key, page, opted);
-                    request.media = media;
-                    let reply = module.registry.read(request).await.unwrap();
-                    let mut envelope_roles = Vec::new();
-                    for entry in &reply.messages {
-                        let role = serde_json::to_value(entry.message.role).unwrap();
-                        let wire = serde_json::to_string(entry).unwrap();
-                        assert!(
-                            wire.ends_with(&format!(",\"role\":{role}}}")),
-                            "{media:?}, {opted:?}, {page:?}: role ends the read envelope: {wire}"
-                        );
-                        envelope_roles.push(role);
-                    }
-                    roles.push(envelope_roles);
+                for entry in &reply.messages {
+                    let role = serde_json::to_value(entry.message.role).unwrap();
+                    let wire = serde_json::to_string(entry).unwrap();
+                    assert!(
+                        wire.ends_with(&format!(",\"role\":{role}}}")),
+                        "{media:?}, {opted:?}, {page:?}: role ends the read envelope: {wire}"
+                    );
+                    roles.push(role);
                 }
-                alike!(roles[1], roles[0], "{media:?}, {opted:?}, {page:?}");
+                broca_test_support::pin!(format!("{media:?}, {opted:?}, {page:?}"), roles);
             }
         }
     }
-    let mut history_roles = Vec::new();
-    for module in [&today, &store] {
-        let request = serde_json::from_value(serde_json::json!({"form": "raw"})).unwrap();
-        let reply = crate::history::read(&module.registry, &module.key, &request)
-            .await
-            .unwrap();
-        let roles: Vec<_> = reply["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| {
-                assert_eq!(entry["role"], entry["message"]["role"]);
-                assert!(entry["role"].is_string(), "raw envelope role: {entry}");
-                (
-                    entry["role"].clone(),
-                    entry
-                        .as_object()
-                        .unwrap()
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        assert_eq!(roles.len(), 4);
-        history_roles.push(roles);
-    }
-    alike!(history_roles[1], history_roles[0]);
+    let request = serde_json::from_value(serde_json::json!({"form": "raw"})).unwrap();
+    let reply = crate::history::read(&store.registry, &store.key, &request)
+        .await
+        .unwrap();
+    let roles: Vec<_> = reply["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            assert_eq!(entry["role"], entry["message"]["role"]);
+            assert!(entry["role"].is_string(), "raw envelope role: {entry}");
+            (
+                entry["role"].clone(),
+                entry
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(roles.len(), 4);
+    broca_test_support::pin!("raw history roles", roles);
     // A cursor naming another history version is refused, never answered.
     use crate::serve::{ServeHandler, SessionReadRequest};
     let mut stale = SessionReadRequest::new(store.key.clone(), None, Some(1));
@@ -1894,6 +1475,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
     ));
 }
 
+mod absent;
 mod admission;
 mod controls;
 mod head;
@@ -1928,11 +1510,11 @@ mod held;
 async fn an_ordered_send_queued_behind_a_run_keeps_its_submission_id_on_both_storages() {
     use crate::serve::ServeHandler;
 
-    for on in [false, true] {
+    {
         let gate = Arc::new(Notify::new());
         let mut steps = hello();
         steps.extend(hello());
-        let module = module_options(on, steps, None, None, IDLE, Some(gate.clone())).await;
+        let module = module_options(true, steps, None, None, IDLE, Some(gate.clone())).await;
         let mut first = request("the running run");
         from_core(&mut first);
         let outcome = module.send_request("running", first, None).await;
@@ -1995,12 +1577,8 @@ async fn an_ordered_send_queued_behind_a_run_keeps_its_submission_id_on_both_sto
                 })
             })
             .expect("the ordered send's run placed its message");
-        assert_eq!(
-            placed.send_id.as_deref(),
-            Some(submission_id.0.as_str()),
-            "storage on: {on}"
-        );
-        if on {
+        assert_eq!(placed.send_id.as_deref(), Some(submission_id.0.as_str()));
+        {
             let session = module.load().await;
             let stored = session.entries(1, 100).await.unwrap();
             let facts = stored
@@ -2019,8 +1597,8 @@ async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
     use crate::serve::ServeHandler;
 
     let mut observed = Vec::new();
-    for on in [false, true] {
-        let module = module(on, hello()).await;
+    {
+        let module = module(true, hello()).await;
         let mut direct = request("unkeyed direct input");
         from_core(&mut direct);
         let outcome = module.send_request("unkeyed-direct", direct, None).await;
@@ -2085,38 +1663,25 @@ async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
         assert_eq!(raw.len(), 2);
         for (input, raw) in inputs.into_iter().zip(raw) {
             assert_eq!(input.sender.as_deref(), Some("prefrontal-core"));
-            observed.push((on, input.send_id.clone(), raw.get("send_id").cloned()));
+            observed.push((input.send_id.clone(), raw.get("send_id").cloned()));
         }
         assert!(module.registry.stop_and_seal().await);
     }
-    assert_eq!(
-        observed,
-        vec![
-            (false, None, None),
-            (false, None, None),
-            (true, None, None),
-            (true, None, None)
-        ]
-    );
+    assert_eq!(observed, vec![(None, None), (None, None)]);
 }
 
 #[tokio::test]
 async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storages() {
-    use crate::serve::ServeHandler;
-
     for delivery in [
         broca_protocol::Delivery::Queue,
         broca_protocol::Delivery::Steer,
     ] {
-        let old_gate = Arc::new(Notify::new());
-        let new_gate = Arc::new(Notify::new());
-        let today = today(hello(), Some(old_gate.clone()));
-        let old_calls = today.executor.provider.inner.clone();
+        let gate = Arc::new(Notify::new());
         let parts = broca_session_loop::parts::SharedParts::new(Box::new(
             broca_session_loop::parts::MemoryParts::default(),
         ));
-        let executor = executor(hello(), Some(new_gate.clone()));
-        let new_calls = executor.provider.inner.clone();
+        let executor = executor(hello(), Some(gate.clone()));
+        let calls = executor.provider.inner.clone();
         let (commands, served, _) = super::tests::actor_with(executor, parts.clone()).await;
         let caller = super::tests::Caller::default();
         let second_key = if delivery == broca_protocol::Delivery::Queue {
@@ -2136,56 +1701,50 @@ async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storage
         ] {
             let mut request = caller.shape(run, &key, request(text));
             from_core(&mut request);
-            let old = today
-                .send(run, request.clone(), key.clone(), mode, None)
-                .await;
-            let new = super::tests::send_exactly(&commands, run, request, key, mode, None).await;
-            alike!(new, old);
+            let reply = super::tests::send_exactly(&commands, run, request, key, mode, None).await;
+            broca_test_support::pin!("reply", reply);
             if run == "native-second" && delivery == broca_protocol::Delivery::Queue {
-                let SendOutcome::Pending { submission_id } = old else {
-                    panic!("queue returned {old:?}")
+                let SendOutcome::Pending { submission_id } = reply else {
+                    panic!("queue returned {reply:?}")
                 };
                 second_id = submission_id.0;
             }
         }
-        old_gate.notify_one();
-        new_gate.notify_one();
+        gate.notify_one();
         // Each scripted model call consumes one permit. Wait for the first permit to be
         // consumed before releasing the second, so Notify cannot coalesce the releases.
-        broca_test_support::wait_until(
-            "both first calls to consume their gate permits",
-            || async {
-                if !old_calls.calls().is_empty() && !new_calls.calls().is_empty() {
-                    Ok(())
-                } else {
-                    Err("a first model call is still gated".to_owned())
-                }
-            },
-        )
+        broca_test_support::wait_until("the first call to consume its gate permit", || async {
+            if !calls.calls().is_empty() {
+                Ok(())
+            } else {
+                Err("the first model call is still gated".to_owned())
+            }
+        })
         .await;
-        old_gate.notify_one();
-        new_gate.notify_one();
-        today.idle().await;
+        gate.notify_one();
         super::tests::idle(&commands).await;
         drop(commands);
         let session = served.await.unwrap();
-        let request = opted_request(&today.key, (Some(1), Some(100)), (true, false, false));
-        let old = today.registry.read(request.clone()).await.unwrap();
-        let new = crate::store_read::serve_view(&session, &parts, &request)
+        let key = BindIdentity::new("/project", "store-actor", "s1");
+        let request = opted_request(&key, (Some(1), Some(100)), (true, false, false));
+        let read = crate::store_read::serve_view(&session, &parts, &request)
             .await
             .unwrap();
-        for read in [&old, &new] {
-            for (text, id) in [
-                ("native keyed send", "start-key"),
-                ("native second send", second_id.as_str()),
-            ] {
-                let entry = read.messages.iter().find(|entry| entry.message.content.iter().any(|part|
-                    matches!(part, broca_protocol::ContentBlock::Text {text: actual} if actual == text)
-                )).unwrap();
-                assert_eq!(entry.sender.as_deref(), Some("prefrontal-core"));
-                assert_eq!(entry.send_id.as_deref(), Some(id), "{text}");
-            }
+        for (text, id) in [
+            ("native keyed send", "start-key"),
+            ("native second send", second_id.as_str()),
+        ] {
+            let entry = read
+                .messages
+                .iter()
+                .find(|entry| {
+                    entry.message.content.iter().any(|part|
+                matches!(part, broca_protocol::ContentBlock::Text {text: actual} if actual == text)
+            )
+                })
+                .unwrap();
+            assert_eq!(entry.sender.as_deref(), Some("prefrontal-core"));
+            assert_eq!(entry.send_id.as_deref(), Some(id), "{text}");
         }
-        assert!(today.registry.stop_and_seal().await);
     }
 }

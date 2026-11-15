@@ -1,4 +1,14 @@
 == the photo send's request: how many requests
 2
+== the photo send's request: request 0
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}
+== the photo send's request: request 1
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"},{"content":[{"text":"hello","type":"text"}],"role":"assistant"},{"content":[{"text":"look","type":"text"},{"source":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","media_type":"image/png","type":"base64"},"type":"image"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}
 == a later run holding the photo: how many requests
 3
+== a later run holding the photo: request 0
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}
+== a later run holding the photo: request 1
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"},{"content":[{"text":"hello","type":"text"}],"role":"assistant"},{"content":[{"text":"look","type":"text"},{"source":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","media_type":"image/png","type":"base64"},"type":"image"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}
+== a later run holding the photo: request 2
+{"max_tokens":2048,"messages":[{"content":[{"text":"first","type":"text"}],"role":"user"},{"content":[{"text":"hello","type":"text"}],"role":"assistant"},{"content":[{"text":"look","type":"text"},{"source":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","media_type":"image/png","type":"base64"},"type":"image"}],"role":"user"},{"content":[{"text":"seen","type":"text"}],"role":"assistant"},{"content":[{"text":"and now?","type":"text"}],"role":"user"}],"model":"m","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}

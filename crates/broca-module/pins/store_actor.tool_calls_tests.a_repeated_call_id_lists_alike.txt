@@ -1,0 +1,148 @@
+== by None, encrypted
+[
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {
+                    "n": Number(0),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("succeeded"),
+                "position": Number(0),
+                "result_bytes": Number(86),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+            Object {
+                "args": Object {
+                    "n": Number(1),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("refused"),
+                "position": Number(1),
+                "result_bytes": Number(112),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "run_id": String("r1"),
+    },
+]
+== by Some(1), encrypted
+[
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {
+                    "n": Number(0),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("succeeded"),
+                "position": Number(0),
+                "result_bytes": Number(86),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "next": Bool(true),
+        "run_id": String("r1"),
+    },
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {
+                    "n": Number(1),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("refused"),
+                "position": Number(1),
+                "result_bytes": Number(112),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "run_id": String("r1"),
+    },
+]
+== by None, plain
+[
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {
+                    "n": Number(0),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("succeeded"),
+                "position": Number(0),
+                "result_bytes": Number(86),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+            Object {
+                "args": Object {
+                    "n": Number(1),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("refused"),
+                "position": Number(1),
+                "result_bytes": Number(112),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "run_id": String("r1"),
+    },
+]
+== by Some(1), plain
+[
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {
+                    "n": Number(0),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("succeeded"),
+                "position": Number(0),
+                "result_bytes": Number(86),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "next": Bool(true),
+        "run_id": String("r1"),
+    },
+    Object {
+        "calls": Array [
+            Object {
+                "args": Object {
+                    "n": Number(1),
+                },
+                "call_key": Bool(true),
+                "name": String("read"),
+                "ordinal": Number(2),
+                "outcome": String("refused"),
+                "position": Number(1),
+                "result_bytes": Number(112),
+                "result_ordinal": Number(3),
+                "tool_call_id": String("c1"),
+            },
+        ],
+        "run_id": String("r1"),
+    },
+]

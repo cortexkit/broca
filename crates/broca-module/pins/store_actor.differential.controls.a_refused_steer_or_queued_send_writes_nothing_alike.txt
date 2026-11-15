@@ -1,4 +1,4 @@
-== alike
+== reply
 Active {
     run_id: RunId(
         "r1",
@@ -6,14 +6,6 @@ Active {
     delivered: None,
 }
 == Steer
-PreUserUnavailable {
-    provider: "noter",
-}
-== Steer
-PreUserUnavailable {
-    provider: "noter",
-}
-== Queue
 PreUserUnavailable {
     provider: "noter",
 }
@@ -134,13 +126,13 @@ PreUserUnavailable {
     }
   }
 ]
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "[noted] first",
     "hello",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "compaction_plan_version": Null,
@@ -180,7 +172,7 @@ PreUserUnavailable {
         "tools_were_omitted": Bool(true),
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",

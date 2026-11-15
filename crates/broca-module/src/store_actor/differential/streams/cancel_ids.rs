@@ -1,20 +1,17 @@
-//! Compare identities without treating a legacy position reused after cancel as a native alias.
+//! A stream's message ids after a cancel, renamed by first appearance, with the check that the
+//! store never reuses an id a cancelled run announced but never placed.
 
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
-/// Every unit and identity agrees, except that today's next message may reuse the position of
-/// an announced but unplaced message from a cancelled run. The native store must mint a fresh
-/// identity there; references to every other message and call remain compared.
-pub(in crate::store_actor::differential) fn assert_alike_after_cancel(
-    store: &[Value],
-    today: &[Value],
-) {
-    super::assert_alike(&identities(store, true), &identities(today, false));
+/// Pins the store's stream after a cancel, its message ids renamed by first appearance; the
+/// store never reuses an earlier message's id.
+pub(in crate::store_actor::differential) fn pin_after_cancel(store: &[Value]) {
+    super::pin(&identities(store));
 }
 
-fn identities(stream: &[Value], native: bool) -> Vec<Value> {
+fn identities(stream: &[Value]) -> Vec<Value> {
     let mut names = HashMap::new();
     let mut next = 0;
     let mut open = HashSet::new();
@@ -28,15 +25,10 @@ fn identities(stream: &[Value], native: bool) -> Vec<Value> {
                     .as_str()
                     .expect("a message start names its message");
                 if !abandoned.is_empty() {
-                    if native {
-                        assert!(
-                            !names.contains_key(mid),
-                            "the native store reuses earlier message id {mid}"
-                        );
-                    } else if abandoned.contains(mid) {
-                        // Only this first message after cancellation may take the abandoned position.
-                        names.remove(mid);
-                    }
+                    assert!(
+                        !names.contains_key(mid),
+                        "the store reuses earlier message id {mid}"
+                    );
                     abandoned.clear();
                 }
                 open.insert(mid.to_owned());
@@ -94,34 +86,13 @@ fn cancelled(next: &str) -> Vec<Value> {
 }
 
 #[test]
-fn only_the_abandoned_legacy_position_is_split() {
-    assert_alike_after_cancel(&cancelled("fresh"), &cancelled("old"));
+fn a_fresh_message_after_a_cancel_is_named_anew() {
+    let renamed = identities(&cancelled("fresh"));
+    assert_eq!(renamed[2]["unit"]["mid"], "mid#1");
 }
 
 #[test]
 #[should_panic(expected = "reuses earlier message id")]
-fn a_native_message_cannot_reuse_the_abandoned_id() {
-    assert_alike_after_cancel(&cancelled("old"), &cancelled("old"));
-}
-
-#[test]
-#[should_panic(expected = "control streams differ")]
-fn a_placed_message_cannot_be_aliased() {
-    let mut today = cancelled("old");
-    let mut store = cancelled("fresh");
-    for stream in [&mut today, &mut store] {
-        stream.insert(
-            1,
-            json!({"unit":{"type":"message_boundary","mid":"old"}, "event":{"type":"message_finished","mid":"old"}}),
-        );
-    }
-    assert_alike_after_cancel(&store, &today);
-}
-
-#[test]
-#[should_panic(expected = "control streams differ")]
-fn cancellation_does_not_mask_other_payload_differences() {
-    let mut store = cancelled("fresh");
-    store[2]["unit"]["unexpected"] = json!(true);
-    assert_alike_after_cancel(&store, &cancelled("old"));
+fn a_message_cannot_reuse_the_abandoned_id() {
+    identities(&cancelled("old"));
 }

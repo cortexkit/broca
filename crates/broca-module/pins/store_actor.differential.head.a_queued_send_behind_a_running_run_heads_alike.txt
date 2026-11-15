@@ -1,4 +1,4 @@
-== running with a send queued: heads differ for None
+== running with a send queued: head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -27,7 +27,7 @@ Object {
     "title": String("queued"),
     "updated_at": Bool(true),
 }
-== running with a send queued: heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== running with a send queued: head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -56,7 +56,7 @@ Object {
     "title": String("queued"),
     "updated_at": Bool(true),
 }
-== running with a send queued: heads differ for Some(Reserved { module_id: "occipital" })
+== running with a send queued: head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -429,7 +429,7 @@ Object {
     ],
     "tools_run_id": String("r1"),
 }
-== after both runs: heads differ for None
+== after both runs: head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -476,7 +476,7 @@ Object {
         "unreported_steps": Number(0),
     },
 }
-== after both runs: heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== after both runs: head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -523,7 +523,7 @@ Object {
         "unreported_steps": Number(0),
     },
 }
-== after both runs: heads differ for Some(Reserved { module_id: "occipital" })
+== after both runs: head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {

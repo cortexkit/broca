@@ -66,6 +66,21 @@ Object {
     },
     "updated_at": Bool(true),
 }
+== what the records mean
+[
+    Object {
+        "start": String("r1"),
+    },
+    Object {
+        "error": Object {
+            "class": String("auth_required"),
+            "credential_id": String("oauth:stub:synthetic"),
+            "message": String("Sign in to the synthetic account again"),
+            "provider_code": String("needs_reauth"),
+        },
+        "pause": String("auth_required"),
+    },
+]
 == control stream
 [
   {
@@ -212,6 +227,28 @@ Object {
         "unreported_steps": Number(0),
     },
 }
+== what the records mean
+[
+    Object {
+        "start": String("r1"),
+    },
+    Object {
+        "error": Object {
+            "class": String("auth_required"),
+            "credential_id": String("oauth:stub:synthetic"),
+            "message": String("Sign in to the synthetic account again"),
+            "provider_code": String("needs_reauth"),
+        },
+        "pause": String("auth_required"),
+    },
+    Object {
+        "resume": String("r1"),
+    },
+    Object {
+        "end": String("completed"),
+        "error": Null,
+    },
+]
 == control stream
 [
   {

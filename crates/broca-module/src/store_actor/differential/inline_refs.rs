@@ -1,4 +1,4 @@
-//! Public inline-import and reference replies compared across the two storage backends.
+//! Inline-import and output-reference replies of a session in the new storage, each pinned.
 
 use super::*;
 use crate::actor::LineageCmd;
@@ -25,7 +25,6 @@ fn text(role: Role, text: &str) -> Message {
 #[tokio::test]
 async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_today() {
     let script = vec![super::super::tests::text_step("continued", "next answer")];
-    let today = module(false, script.clone()).await;
     let store = module(true, script).await;
     let messages = vec![text(Role::System, "discarded"), text(Role::User, "question"),
         serde_json::from_value(serde_json::json!({"role":"assistant","content":[{
@@ -40,12 +39,8 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
         ("seed", vec![text(Role::User, "different")], "reuse"),
         ("other", messages, "nonempty"),
     ] {
-        let old = today
-            .registry
-            .import(imported(&today, run, payload.clone()))
-            .await;
         let new = store.registry.import(imported(&store, run, payload)).await;
-        alike!(format!("{new:?}"), format!("{old:?}"), "{expected}");
+        broca_test_support::pin!(expected, format!("{new:?}"));
         match expected {
             "ok" | "retry" => {
                 let reply = new.unwrap();
@@ -58,12 +53,12 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
             _ => assert!(new.is_err()),
         }
     }
-    opted_reads_alike(&today, &store, "inline import").await;
+    opted_reads(&store, "inline import").await;
     store.closed().await;
     assert!(store.head().exists());
-    alike_today_first!(store.wal.wal_present(&store.key), Some(false));
+    assert_eq!(store.wal.wal_present(&store.key), Some(false));
     let mut continued = Vec::new();
-    for module in [&today, &store] {
+    for module in [&store] {
         let mut request = request("continue");
         // An inline import froze no tools. A later send inherits that empty tool set rather
         // than trying to replace it with the harness's default read tool.
@@ -92,47 +87,40 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
                 .unwrap(),
         );
     }
-    alike!(continued[1], continued[0]);
+    broca_test_support::pin!("alike", continued[0]);
     assert!(
-        matches!(continued[1], SendOutcome::Active { .. }),
+        matches!(continued[0], SendOutcome::Active { .. }),
         "{:?}",
-        continued[1]
+        continued[0]
     );
-    today.closed().await;
     store.closed().await;
-    opted_reads_alike(&today, &store, "continued inline import").await;
+    opted_reads(&store, "continued inline import").await;
 }
 
 #[tokio::test]
 async fn inline_import_invalid_and_empty_payloads_match_today_and_leave_a_fillable_session() {
-    let today = module(false, vec![]).await;
     let store = module(true, vec![]).await;
     for messages in [
         vec![],
         vec![text(Role::System, "only system")],
         vec![Message::new(Role::User, vec![])],
     ] {
-        let old = today
-            .registry
-            .import(imported(&today, "seed", messages.clone()))
-            .await;
         let new = store
             .registry
             .import(imported(&store, "seed", messages))
             .await;
-        alike!(format!("{new:?}"), format!("{old:?}"));
+        broca_test_support::pin!("alike", format!("{new:?}"));
         assert!(new.is_err());
     }
-    for module in [&today, &store] {
+    for module in [&store] {
         module
             .registry
             .import(imported(module, "seed", vec![text(Role::User, "usable")]))
             .await
             .unwrap();
     }
-    opted_reads_alike(&today, &store, "valid import after refusals").await;
+    opted_reads(&store, "valid import after refusals").await;
     store.closed().await;
-    assert!(today.registry.stop_and_seal().await);
 }
 
 #[tokio::test]
@@ -143,42 +131,29 @@ async fn conversation_key_sends_and_subsequent_sends_are_admitted_alike() {
         super::super::tests::text_step("a1", "answer"),
         super::super::tests::text_step("a2", "next"),
     ];
-    let today = module(false, script.clone()).await;
     let store = module(true, script).await;
     for (run, key) in [("r1", Some("shared-conversation")), ("r2", None)] {
-        let old = today.send(run, "input", key).await;
         let new = store.send(run, "input", key).await;
-        alike!(new, old);
+        broca_test_support::pin!("alike", new);
         assert!(matches!(new, SendOutcome::Active { .. }));
-        today.closed().await;
         store.closed().await;
     }
     assert!(
         store.head().exists(),
         "a keyed creating send starts in the store"
     );
-    opted_reads_alike(&today, &store, "conversation-key sends").await;
+    opted_reads(&store, "conversation-key sends").await;
 }
 
 #[tokio::test]
 async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
-    let old_gate = Arc::new(Notify::new());
     let new_gate = Arc::new(Notify::new());
-    let old_reached = Arc::new(Notify::new());
     let new_reached = Arc::new(Notify::new());
     let script = vec![
         super::super::tests::read_step("a1"),
         super::super::tests::text_step("a2", "first answer"),
         super::super::tests::text_step("a3", "queued answer"),
     ];
-    let today = today_with(
-        script.clone(),
-        None,
-        super::super::tests::Planes {
-            tool_gate: Some((old_reached.clone(), old_gate.clone())),
-            ..Default::default()
-        },
-    );
     let parts = broca_session_loop::parts::SharedParts::new(Box::new(
         broca_session_loop::parts::MemoryParts::default(),
     ));
@@ -194,26 +169,6 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
     ] {
         let key = SendKey::SendId(id.into());
         let request = caller.shape(run, &key, request("input"));
-        let old = today
-            .registry
-            .route_submission_with_order(
-                &today.key,
-                RunId(run.into()),
-                request.clone(),
-                RunKind::FreshOrResume,
-                key.clone(),
-                false,
-                broca_protocol::Delivery::Queue,
-                None,
-                Some(conversation.into()),
-                None,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-            .unwrap();
         let (reply, answer) = oneshot::channel();
         commands
             .send(LineageCmd::Send {
@@ -234,7 +189,7 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
             })
             .unwrap();
         let new = answer.await.unwrap();
-        alike!(new, old, "{id}: {conversation}");
+        broca_test_support::pin!(format!("{id}: {conversation}"), new);
         if conversation == "changed" {
             assert!(matches!(
                 new,
@@ -244,24 +199,18 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
             ));
         }
     }
-    old_reached.notified().await;
     new_reached.notified().await;
     for messages in [vec![], vec![text(Role::User, "import while running")]] {
         let imported = broca_core::ImportRequest {
             project_id: None,
             principal: None,
             run_id: RunId("seed".into()),
-            session: today.key.clone(),
+            session: BindIdentity::new("/project", "store-actor", "s1"),
             messages,
             origin: broca_core::ImportOrigin {
                 source_ref: "fixture:busy".into(),
             },
         };
-        let old = today
-            .registry
-            .route_import(&today.key, imported.clone())
-            .await
-            .unwrap();
         let (reply, answer) = oneshot::channel();
         commands
             .send(LineageCmd::Import {
@@ -270,17 +219,14 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
             })
             .unwrap();
         let new = answer.await.unwrap();
-        alike!(new, old);
+        broca_test_support::pin!("alike", new);
         assert!(matches!(new, crate::actor::ImportOutcome::Busy));
     }
-    old_gate.notify_one();
     new_gate.notify_one();
-    today.idle().await;
     super::super::tests::idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    alike!(texts(&session), today.texts().await);
-    assert!(today.registry.stop_and_seal().await);
+    broca_test_support::pin!("alike", texts(&session));
 }
 
 async fn referencing(module: &Module) {
@@ -382,27 +328,19 @@ fn comparable_refs(mut page: serde_json::Value) -> serde_json::Value {
 
 #[tokio::test]
 async fn output_reference_list_and_byte_reads_match_today() {
-    let today = module(false, reference_script()).await;
     let store = module(true, reference_script()).await;
-    referencing(&today).await;
     referencing(&store).await;
-    let old = reference_set(&today).await;
     let new = reference_set(&store).await;
-    let old_page = listed(&today, &old.descriptor.set_id).await;
     let new_page = listed(&store, &new.descriptor.set_id).await;
-    assert_eq!(
-        comparable_refs(new_page.clone()),
-        comparable_refs(old_page.clone())
-    );
+    broca_test_support::pin!("the listed references", comparable_refs(new_page.clone()));
     assert_eq!(new_page["records"][0]["state"], "resolved");
     assert_eq!(new_page["records"][1]["reason"], "not_a_tool_output");
     assert_eq!(new_page["records"][2]["reason"], "unknown_tag");
-    let old_id = old_page["records"][0]["ref_id"].as_str().unwrap();
     let new_id = new_page["records"][0]["ref_id"].as_str().unwrap();
     for (offset, length) in [(0, 131_072), (2, 3), (0, 0), (13, 1)] {
-        alike!(
-            read_ref(&store, new_id, offset, length).await,
-            read_ref(&today, old_id, offset, length).await
+        broca_test_support::pin!(
+            format!("{offset}+{length}"),
+            read_ref(&store, new_id, offset, length).await
         );
     }
     assert_eq!(
@@ -419,8 +357,16 @@ async fn output_reference_list_and_byte_reads_match_today() {
         namespace,
         broca_session_store::codec::hex(&session.head().incarnation.0)
     );
+    // Another session's reference, to the same output of the same script.
+    let other = module(true, reference_script()).await;
+    referencing(&other).await;
+    let other_set = reference_set(&other).await;
+    let other_page = listed(&other, &other_set.descriptor.set_id).await;
+    let other_id = other_page["records"][0]["ref_id"].as_str().unwrap();
+    assert_ne!(other_id, new_id);
     let request =
-        serde_json::from_value(serde_json::json!({"ref_id":old_id,"offset":0,"length":1})).unwrap();
+        serde_json::from_value(serde_json::json!({"ref_id":other_id,"offset":0,"length":1}))
+            .unwrap();
     assert!(
         store
             .registry
@@ -484,96 +430,4 @@ async fn a_set_id_names_the_stored_history_version_and_resolves_across_the_raise
         ),
         "an id scoped to the served version names nothing"
     );
-}
-
-#[tokio::test]
-async fn an_output_reference_handed_out_before_conversion_still_resolves_after_reload() {
-    let module = module(false, reference_script()).await;
-    std::fs::create_dir_all(&module.dir).unwrap();
-    let history =
-        Arc::new(broca_store::SqliteStore::open(module.dir.join("run-index.db")).unwrap());
-    module.wal.set_served_history(history);
-    referencing(&module).await;
-    let set = reference_set(&module).await;
-    let before = listed(&module, &set.descriptor.set_id).await;
-    let id = before["records"][0]["ref_id"].as_str().unwrap();
-    let content = read_ref(&module, id, 0, 131_072).await;
-    let records = module.wal.read_records(&module.key).unwrap();
-    let page = module
-        .registry
-        .read(crate::serve::SessionReadRequest::new(
-            module.key.clone(),
-            None,
-            Some(100),
-        ))
-        .await
-        .unwrap();
-    assert!(
-        page.history_version > 1,
-        "the source's served-history row was allocated"
-    );
-    let root = module.dir.join(broca_wal::SESSION_STORAGE_DIR);
-    // The test publishes straight into its private scratch root; production publishes the staged
-    // head only after verifying the copy and checking that the WAL backend no longer owns it.
-    let staged = broca_session_convert::stage::stage(broca_session_convert::stage::Stage {
-        source_history_version: page.history_version,
-        records: &records,
-        lineage: Some(&page.incarnation),
-        session: &module.key,
-        deployment: &broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-        store_root: &root,
-        staging: &root,
-        media: None,
-        moved: &broca_session_store::record::Moved {
-            move_id: "fixture-move".into(),
-            source_activity_ms: 1,
-            source_lineage: None,
-        },
-    })
-    .await
-    .unwrap();
-    let runtime = module.registry.store_runtime().unwrap();
-    let mut parts = runtime
-        .parts_for(
-            broca_wal::StorageClass::Ordinary,
-            broca_session_store::keys::Cipher::XChaCha20Poly1305,
-        )
-        .clone();
-    use broca_session_loop::parts::Parts as _;
-    for part in staged
-        .converted
-        .records
-        .iter()
-        .flat_map(broca_session_convert::measure::named_parts)
-    {
-        let value = serde_json::from_slice(&staged.converted.parts[&part.digest]).unwrap();
-        assert_eq!(parts.put(part.kind, &value).unwrap(), *part);
-        parts.mark_stored(std::slice::from_ref(part));
-    }
-    let loaded = module.load().await;
-    assert_eq!(
-        loaded.operations.source_lineage.as_deref(),
-        Some(page.incarnation.as_str())
-    );
-    assert_ne!(
-        broca_session_store::codec::hex(&loaded.head().incarnation.0),
-        page.incarnation
-    );
-    let after = module
-        .registry
-        .read(crate::serve::SessionReadRequest::new(
-            module.key.clone(),
-            None,
-            Some(100),
-        ))
-        .await
-        .unwrap();
-    // The moved session serves the source's version raised by the new storage's exposure epoch:
-    // it serves replies cleaned that today's storage served with their tags.
-    assert_eq!(
-        after.history_version,
-        crate::store_exposure::served_history_version(page.history_version)
-    );
-    assert_eq!(listed(&module, &set.descriptor.set_id).await, before);
-    assert_eq!(read_ref(&module, id, 0, 131_072).await, content);
 }

@@ -32,7 +32,7 @@ Active {
     ),
     delivered: None,
 }
-== the store's runs' tools
+== the runs' tools
 [
     [
         "read",
@@ -229,7 +229,7 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:2837a9cadcef5b4d5c98050771880bd5f4d6711fe396ad9a589bd6299a097d7a (3041 bytes)
-== the sessions recorded their sends differently
+== the sends the session recorded
 [
     Object {
         "run": String("r-k1"),
@@ -248,16 +248,16 @@ sha256:2837a9cadcef5b4d5c98050771880bd5f4d6711fe396ad9a589bd6299a097d7a (3041 by
         "run_ended": String("completed"),
     },
 ]
-== the sessions hold different sends queued
+== the sends queued
 []
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
     "fourth",
     "again",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "model": Object {
@@ -290,7 +290,7 @@ sha256:2837a9cadcef5b4d5c98050771880bd5f4d6711fe396ad9a589bd6299a097d7a (3041 by
         "title": Null,
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "first",

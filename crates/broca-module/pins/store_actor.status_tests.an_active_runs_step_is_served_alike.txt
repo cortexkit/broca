@@ -1,3 +1,44 @@
+== step 1 in flight
+Object {
+    "state": String("active"),
+    "step": Object {
+        "attempt": Number(0),
+        "attempt_started_at_ms": Bool(true),
+        "started_at_ms": Bool(true),
+        "step_id": Number(1),
+    },
+    "usage": Object {
+        "by_model": Array [],
+        "steps": Number(0),
+        "unreported_steps": Number(0),
+    },
+}
+== step 2 in flight
+Object {
+    "state": String("active"),
+    "step": Object {
+        "attempt": Number(0),
+        "attempt_started_at_ms": Bool(true),
+        "started_at_ms": Bool(true),
+        "step_id": Number(2),
+    },
+    "usage": Object {
+        "by_model": Array [
+            Object {
+                "input_tokens": Number(100),
+                "model": String("m"),
+                "output_tokens": Number(20),
+                "provider": String("stub"),
+                "steps": Number(1),
+                "unreported_steps": Number(0),
+            },
+        ],
+        "input_tokens": Number(100),
+        "output_tokens": Number(20),
+        "steps": Number(1),
+        "unreported_steps": Number(0),
+    },
+}
 == run.status once the run ended
 Object {
     "final_step_finish_reason": String("stop"),

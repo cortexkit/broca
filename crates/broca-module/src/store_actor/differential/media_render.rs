@@ -1,11 +1,10 @@
-//! Requests holding media, rendered for a session kept in the new storage and for one on today's
-//! storage after the same sends: every request must be byte for byte the same.
+//! Requests holding media, rendered for a session kept in the new storage: every request is
+//! pinned byte for byte.
 //!
-//! Each side's executor installs a media renderer as the module's executor does: today's from
-//! the session's WAL and today's media store, the new storage's from the session's media fold and
-//! its own media objects (see `store_media`). The scripted model renders each request through
-//! the renderer it was given, as the transport does, and keeps the bytes, or the refusal when a
-//! request couldn't be rendered and so was never sent.
+//! The executor installs a media renderer as the module's executor does, from the session's
+//! media fold and its own media objects (see `store_media`). The scripted model renders each
+//! request through the renderer it was given, as the transport does, and keeps the bytes, or the
+//! refusal when a request couldn't be rendered and so was never sent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -672,56 +671,34 @@ fn with_photo_tool(text: &str) -> SubmissionRequest {
     .unwrap()
 }
 
-/// Both sides, each started by the same text send, its run finished, or still in its first model
-/// step when `gated`. The store side's session is in mode `cipher`.
-async fn both(
-    steps: Vec<Vec<NormalizedEvent>>,
-    gated: bool,
-    cipher: Cipher,
-) -> (Rendered, Rendered) {
+/// A side started by a text send, its run finished, or still in its first model step when
+/// `gated`. Its session is in mode `cipher`.
+async fn both(steps: Vec<Vec<NormalizedEvent>>, gated: bool, cipher: Cipher) -> Rendered {
     both_from(steps, gated, text("first"), cipher).await
 }
 
-/// [`both`], each side started by the send `first`.
+/// [`both`], started by the send `first`.
 async fn both_from(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     first: SubmissionRequest,
     cipher: Cipher,
-) -> (Rendered, Rendered) {
-    let mut sides = Vec::new();
-    for store in [false, true] {
-        let side = Rendered::new(store, steps.clone(), gated, cipher).await;
-        let sent = side.side.send("r1", first.clone()).await;
-        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
-        if store {
-            assert_eq!(side.side.stored_mode(), cipher);
-        }
-        if !gated {
-            side.side.idle().await;
-        }
-        sides.push(side);
+) -> Rendered {
+    let side = Rendered::new(true, steps, gated, cipher).await;
+    let sent = side.side.send("r1", first).await;
+    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+    assert_eq!(side.side.stored_mode(), cipher);
+    if !gated {
+        side.side.idle().await;
     }
-    let store = sides.pop().unwrap();
-    (sides.pop().unwrap(), store)
+    side
 }
 
-/// Every request either side's model was asked to send is the same, and the last one sent the
-/// image's bytes.
-fn sent_alike(today: &Rendered, store: &Rendered, when: &str) {
-    let (old, new) = (today.sent(), store.sent());
-    alike!(new.len(), old.len(), "{when}: how many requests");
-    for (index, (old, new)) in old.iter().zip(&new).enumerate() {
-        match (old, new) {
-            (Ok(old), Ok(new)) => assert!(
-                old == new,
-                "{when}: request {index} differs\ntoday's: {}\nstore's: {}",
-                String::from_utf8_lossy(old),
-                String::from_utf8_lossy(new)
-            ),
-            _ => alike!(new, old, "{when}: request {index}"),
-        }
-    }
+/// Pins every request the side's model was asked to send, and checks that the last one sent
+/// the image's bytes.
+fn sent_alike(store: &Rendered, when: &str) {
+    let new = store.sent();
+    sent_pinned(&new, when);
     let last = new
         .last()
         .expect("a request")
@@ -732,6 +709,22 @@ fn sent_alike(today: &Rendered, store: &Rendered, when: &str) {
         String::from_utf8_lossy(last).contains(&image),
         "{when}: the last request carries the image's bytes"
     );
+}
+
+/// Pins how many requests were sent and each one: its body as text, or why it wasn't sent.
+fn sent_pinned(sent: &[Result<Vec<u8>, String>], when: &str) {
+    broca_test_support::pin!(format!("{when}: how many requests"), sent.len());
+    for (index, request) in sent.iter().enumerate() {
+        match request {
+            Ok(body) => broca_test_support::pin!(
+                format!("{when}: request {index}"),
+                broca_test_support::pins::Text(String::from_utf8_lossy(body).into_owned())
+            ),
+            Err(refused) => {
+                broca_test_support::pin!(format!("{when}: request {index}"), refused)
+            }
+        }
+    }
 }
 
 /// Uploads the image on `side` and sends it as `delivery`.
@@ -767,18 +760,18 @@ fn three_texts() -> Vec<Vec<NormalizedEvent>> {
 /// A photo in the user's input renders alike, and so does the next run's request, whose history
 /// holds it.
 async fn a_photo_in_the_input_renders_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), false, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), false, cipher).await;
+    for side in [&store] {
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.idle().await;
     }
-    sent_alike(&today, &store, "the photo send's request");
-    for side in [&today, &store] {
+    sent_alike(&store, "the photo send's request");
+    for side in [&store] {
         side.side.send("r3", text("and now?")).await;
         side.side.idle().await;
     }
-    sent_alike(&today, &store, "a later run holding the photo");
+    sent_alike(&store, "a later run holding the photo");
 }
 
 /// A photo a tool returned renders alike in the request after its result.
@@ -788,30 +781,30 @@ async fn a_photo_in_a_tool_result_renders_alike(cipher: Cipher) {
         photo_step("a2"),
         text_step("a3", "I see it"),
     ];
-    let (today, store) = both_from(steps, false, with_photo_tool("first"), cipher).await;
-    for side in [&today, &store] {
+    let store = both_from(steps, false, with_photo_tool("first"), cipher).await;
+    for side in [&store] {
         side.side.send("r2", with_photo_tool("show me")).await;
         side.side.idle().await;
     }
-    sent_alike(&today, &store, "the request after the tool's image");
+    sent_alike(&store, "the request after the tool's image");
 }
 
 /// A queued photo renders alike when its run starts.
 async fn a_queued_photo_renders_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), true, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), true, cipher).await;
+    for side in [&store] {
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         assert!(matches!(sent, SendOutcome::Pending { .. }), "{sent:?}");
         side.side.release_to_idle().await;
     }
-    sent_alike(&today, &store, "the queued photo's run");
+    sent_alike(&store, "the queued photo's run");
 }
 
 /// A photo steered into a running run renders alike at the step that places it. The run steered
 /// into started from a photo send, so both sides render its requests with their media renderer.
 async fn a_steered_photo_renders_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), true, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), true, cipher).await;
+    for side in [&store] {
         side.side.release_to_idle().await;
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
@@ -824,7 +817,7 @@ async fn a_steered_photo_renders_alike(cipher: Cipher) {
         String::from_utf8_lossy(&last).contains(&base64(&bytes_of(WIDE))),
         "the step after the steer carries the steered image"
     );
-    sent_alike(&today, &store, "the step that places the steered photo");
+    sent_alike(&store, "the step that places the steered photo");
 }
 
 /// Uploads the image `hex` names on `side` and sends it with the ordered delivery list `modes`,
@@ -867,13 +860,11 @@ async fn send_ordered_image(
 /// storages write that boundary in the same order: the run's start, the send's delivery, then
 /// the step's start.
 ///
-/// Every request is the same on both, that step's included: each sends the delivered photo's
-/// bytes, never a `provenance` marker in their place. Today's own media fold, run over today's
-/// records from the first, binds the photo to the delivered message as the new storage's fold
-/// does; the new storage's delivered copy points at the bytes the queued record stored.
+/// That step sends the delivered photo's bytes, never a `provenance` marker in their place: the
+/// delivered copy points at the bytes the queued record stored.
 async fn an_ordered_steer_photo_lands_with_its_bytes_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), true, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), true, cipher).await;
+    for side in [&store] {
         side.side.release_to_idle().await;
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
@@ -886,16 +877,7 @@ async fn an_ordered_steer_photo_lands_with_its_bytes_alike(cipher: Cipher) {
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.release_to_idle().await;
     }
-    // Today's own fold, run over today's records from the first, binds the delivered photo.
-    let wide = {
-        use sha2::Digest as _;
-        hex_of(&sha2::Sha256::digest(bytes_of(WIDE)))
-    };
-    assert!(
-        today_fold_binds(&today, &wide),
-        "today's media fold binds the delivered photo"
-    );
-    sent_alike(&today, &store, "the step that delivers the ordered photo");
+    sent_alike(&store, "the step that delivers the ordered photo");
     let last = store.sent().last().cloned().unwrap().unwrap();
     let last = String::from_utf8_lossy(&last);
     assert!(
@@ -904,74 +886,32 @@ async fn an_ordered_steer_photo_lands_with_its_bytes_alike(cipher: Cipher) {
     );
 }
 
-/// Lowercase hex of `bytes`.
-fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Whether today's media fold, run over `side`'s whole log from its first record, binds a medium
-/// with digest `sha256` somewhere in the transcript that log replays to.
-fn today_fold_binds(side: &Rendered, sha256: &str) -> bool {
-    use broca_core::WalStore as _;
-    /// The fold only reads bytes when a request is prepared; binding never does.
-    #[derive(Debug)]
-    struct NoBytes;
-    impl broca_core::media_store::MediaBytes for NoBytes {
-        fn read_verified(
-            &self,
-            _: &broca_protocol::MediaRef,
-        ) -> Result<Vec<u8>, broca_core::media_store::MediaReadError> {
-            unreachable!("binding reads no bytes")
-        }
-    }
-    let records: Vec<_> = FileWalStore::new(side.side.dir.join("wal"))
-        .read_records(&side.side.key)
-        .unwrap()
-        .into_iter()
-        .map(|frame| frame.record)
-        .collect();
-    let mut media = broca_core::media_request::SessionMedia::new(NoBytes);
-    for record in &records {
-        media.fold(record).unwrap();
-    }
-    let mut prompt = broca_core::replay(&records).unwrap().prompt;
-    broca_protocol::content::stamp_ordinals(&mut prompt);
-    media
-        .bindings(&prompt)
-        .iter()
-        .any(|binding| binding.reference.sha256 == sha256)
-}
-
 /// A photo sent with the ordered list `[idle_start]` to an idle session starts its run alike,
 /// and the run's request carries its image alike.
 async fn an_idle_start_photo_starts_its_run_and_renders_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), false, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), false, cipher).await;
+    for side in [&store] {
         let sent = send_ordered_image(side, "o1", &["idle_start"], PNG).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.idle().await;
     }
-    sent_alike(&today, &store, "the run the ordered photo started");
+    sent_alike(&store, "the run the ordered photo started");
 }
 
 /// A photo sent with an ordered list naming neither `steer` nor `idle_start` has no mode that
 /// can carry it: a tool result carries text only, and turn-scoped system text is text. Both
 /// refuse it alike, as media the carrier can't take, and neither side sends anything for it.
 async fn an_ordered_photo_no_mode_can_carry_is_refused_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), false, cipher).await;
+    let store = both(three_texts(), false, cipher).await;
     for modes in [&["tool_result"][..], &["turn_system"][..]] {
         let mut replies = Vec::new();
-        for side in [&today, &store] {
+        for side in [&store] {
             let before = side.sent().len();
             replies.push(send_ordered_image(side, "o1", modes, PNG).await);
             side.side.idle().await;
             assert_eq!(side.sent().len(), before, "{modes:?}: nothing is sent");
         }
-        alike!(
-            replies[1],
-            replies[0],
-            "{modes:?}: the store answers as today's"
-        );
+        broca_test_support::pin!(format!("{modes:?}: the answer"), replies[0]);
         assert!(
             matches!(
                 replies[0],
@@ -989,23 +929,20 @@ async fn an_ordered_photo_no_mode_can_carry_is_refused_alike(cipher: Cipher) {
 /// After a restart, a run's request still carries the photo an earlier run's input held: the
 /// new storage's fold is rebuilt from the session's first record, and must hold its capture.
 async fn a_run_after_a_restart_renders_an_earlier_photo_alike(cipher: Cipher) {
-    let (today, store) = both(three_texts(), false, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), false, cipher).await;
+    for side in [&store] {
         send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         side.side.idle().await;
     }
-    let today = today
-        .restarted(false, vec![text_step("a4", "still here")])
-        .await;
     let store = store
         .restarted(true, vec![text_step("a4", "still here")])
         .await;
-    for side in [&today, &store] {
+    for side in [&store] {
         let sent = side.side.send("r3", text("still there?")).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.idle().await;
     }
-    sent_alike(&today, &store, "the first run after the restart");
+    sent_alike(&store, "the first run after the restart");
 }
 
 /// A tool's image survives a restart: the next run's request carries its bytes, read from the
@@ -1016,22 +953,19 @@ async fn a_tool_image_renders_alike_after_a_restart(cipher: Cipher) {
         photo_step("a2"),
         text_step("a3", "I see it"),
     ];
-    let (today, store) = both_from(steps, false, with_photo_tool("first"), cipher).await;
-    for side in [&today, &store] {
+    let store = both_from(steps, false, with_photo_tool("first"), cipher).await;
+    for side in [&store] {
         side.side.send("r2", with_photo_tool("show me")).await;
         side.side.idle().await;
     }
-    let today = today
-        .restarted(false, vec![text_step("a4", "still here")])
-        .await;
     let store = store
         .restarted(true, vec![text_step("a4", "still here")])
         .await;
-    for side in [&today, &store] {
+    for side in [&store] {
         side.side.send("r3", with_photo_tool("still there?")).await;
         side.side.idle().await;
     }
-    sent_alike(&today, &store, "the first run after the restart");
+    sent_alike(&store, "the first run after the restart");
 }
 
 /// [`with_photo_tool`], sent by core: a session whose runs may get a tool's image and whose user
@@ -1044,10 +978,9 @@ fn photo_tool_by_core(text: &str) -> SubmissionRequest {
 
 /// The first request of a session's latest run, rendered offline from the new storage: the
 /// session as the run holds it and its own media objects (`store_media::offline_render`). For a
-/// session holding a tool's image and a photo the user sent, that must be the bytes the store
-/// side's model was asked to send, which are the bytes today's side sent for the same sends. So
-/// a session checked offline (as a move checks the copy it writes) is checked against the request
-/// its run really renders.
+/// session holding a tool's image and a photo the user sent, that must be the bytes the model was
+/// asked to send. So the offline render, which a session move uses to check the copy it writes,
+/// is checked against the request the session's run really renders.
 async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) {
     use futures::FutureExt as _;
     let steps = vec![
@@ -1056,8 +989,8 @@ async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) 
         text_step("a3", "I see it"),
         text_step("a4", "a photo"),
     ];
-    let (today, store) = both_from(steps, true, photo_tool_by_core("first"), cipher).await;
-    for side in [&today, &store] {
+    let store = both_from(steps, true, photo_tool_by_core("first"), cipher).await;
+    for side in [&store] {
         side.side.release_to_idle().await;
         let sent = side.side.send("r2", photo_tool_by_core("show me")).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
@@ -1085,8 +1018,8 @@ async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) 
     }
     let image = base64(&bytes_of(PNG));
     let last = |side: &Rendered| side.sent().last().unwrap().clone().unwrap();
-    assert!(String::from_utf8_lossy(&last(&today)).contains(&image));
-    let text = String::from_utf8_lossy(&last(&today)).into_owned();
+    assert!(String::from_utf8_lossy(&last(&store)).contains(&image));
+    let text = String::from_utf8_lossy(&last(&store)).into_owned();
     assert_eq!(
         text.matches(&image).count(),
         2,
@@ -1147,14 +1080,14 @@ async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) 
         "the new storage's offline render is the request sent"
     );
     drop(view);
-    sent_alike(&today, &store, "the photo run's request");
-    for side in [&today, &store] {
+    sent_alike(&store, "the photo run's request");
+    for side in [&store] {
         side.side.release_to_idle().await;
     }
 }
 
-/// Media files under `dir` holding the image: today's media store object and the new storage's
-/// media object.
+/// Media files under `dir` holding the image: the new storage's media object, and a copy at the
+/// media store's object path.
 fn media_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1170,18 +1103,17 @@ fn media_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// A photo whose bytes can no longer be read refuses the request by name, alike, and nothing is
-/// sent: never a request without its image. On the new storage the bytes are read from the
-/// session's own object, so removing that object is what refuses it, even with the same bytes
-/// waiting where today's media store keeps them: a run of a session in the new storage never
-/// reads those.
+/// A photo whose bytes can no longer be read refuses the request by name, and nothing is sent:
+/// never a request without its image. The bytes are read from the session's own object, so
+/// removing that object is what refuses it, even with the same bytes waiting at the media store's
+/// object path: a run of a session in the new storage never reads those.
 async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(cipher: Cipher) {
-    let (today, store) = both(three_texts(), false, cipher).await;
-    for side in [&today, &store] {
+    let store = both(three_texts(), false, cipher).await;
+    for side in [&store] {
         send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         side.side.idle().await;
     }
-    for side in [&today, &store] {
+    for side in [&store] {
         let mut files = Vec::new();
         media_files(&side.side.dir, &mut files);
         assert!(!files.is_empty(), "the image is stored");
@@ -1202,13 +1134,13 @@ async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(ciph
         )
         .unwrap();
     }
-    for side in [&today, &store] {
+    for side in [&store] {
         side.side.send("r3", text("and now?")).await;
         side.side.idle().await;
     }
-    let (old, new) = (today.sent(), store.sent());
+    let new = store.sent();
     assert_eq!(new.last(), Some(&Err("media_object_missing".to_owned())));
-    alike!(new, old, "both refuse alike");
+    broca_test_support::pin!("both refuse alike", new);
 }
 
 /// Sends `request` on `side` as run `run_id` under the fetch plan `plan`, as a planned
@@ -1263,7 +1195,7 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
     let steps = three_texts();
     let mut sides = Vec::new();
     let mut compactors = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let compactor = Arc::new(super::controls::Compactor::default());
         let side = Rendered::with_compactor(
             store,
@@ -1298,22 +1230,12 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
             .iter()
             .map(|compactor| compactor.views())
             .collect::<Vec<_>>(),
-        [1, 1],
-        "a ride handed each side its view"
+        [1],
+        "a ride handed the side its view"
     );
-    let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
-    let (old, new) = (today.sent(), store.sent());
-    alike!(new.len(), old.len(), "how many requests");
-    for (index, (old, new)) in old.iter().zip(&new).enumerate() {
-        assert!(
-            old == new,
-            "request {index} differs\ntoday's: {:?}\nstore's: {:?}",
-            old.as_ref()
-                .map(|body| String::from_utf8_lossy(body).into_owned()),
-            new.as_ref()
-                .map(|body| String::from_utf8_lossy(body).into_owned()),
-        );
-    }
+    let store = sides.pop().unwrap();
+    let new = store.sent();
+    sent_pinned(&new, "");
     let image = base64(&bytes_of(PNG));
     let carried: Vec<bool> = new
         .iter()
@@ -1337,7 +1259,7 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
     let png = base64(&bytes_of(PNG));
     let mut sides = Vec::new();
     let mut stated = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let compactor = Arc::new(super::controls::Compactor::default());
         let side = Rendered::with_compactor(
             store,
@@ -1361,7 +1283,7 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
         stated.push(compactor.stated_accepts_images());
         sides.push(side);
     }
-    let (store_stated, today_stated) = (stated.pop().unwrap(), stated.pop().unwrap());
+    let store_stated = stated.pop().unwrap();
     assert!(
         !store_stated.is_empty(),
         "the store's calls state their conditions"
@@ -1370,23 +1292,9 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
         store_stated.iter().all(|value| *value == json!(false)),
         "the store states it takes no images: {store_stated:?}"
     );
-    assert!(
-        today_stated.iter().all(|value| *value == json!(true)),
-        "today's storage states what the model takes: {today_stated:?}"
-    );
-    let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
-    let (old, new) = (today.sent(), store.sent());
-    alike!(new.len(), old.len(), "how many requests");
-    for (index, (old, new)) in old.iter().zip(&new).enumerate() {
-        assert!(
-            old == new,
-            "request {index} differs\ntoday's: {:?}\nstore's: {:?}",
-            old.as_ref()
-                .map(|body| String::from_utf8_lossy(body).into_owned()),
-            new.as_ref()
-                .map(|body| String::from_utf8_lossy(body).into_owned()),
-        );
-    }
+    let store = sides.pop().unwrap();
+    let new = store.sent();
+    sent_pinned(&new, "");
     let last = String::from_utf8_lossy(new.last().unwrap().as_ref().unwrap()).into_owned();
     assert!(last.contains("Memories."), "the view applied: {last}");
     assert!(!last.contains(&png), "the image's bytes were sent: {last}");
@@ -1401,7 +1309,7 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
 /// provider must read the session's entries before answering a ride that drops that photo.
 async fn a_setup_covering_a_photo_teaches_its_id_without_a_notice(cipher: Cipher) {
     let plan = super::controls::compacting_plan();
-    for store in [false, true] {
+    for store in [true] {
         let compactor = Arc::new(super::controls::Compactor::default());
         let side = Rendered::with_compactor(
             store,
@@ -1425,12 +1333,12 @@ async fn a_setup_covering_a_photo_teaches_its_id_without_a_notice(cipher: Cipher
 }
 
 /// On a session whose plan shows part numbers, a request whose photo message sits between
-/// numbered messages renders alike: the loop leaves the photo's message for the media renderer
-/// to number, as today's loop does, and numbers the others itself.
+/// numbered messages: the loop leaves the photo's message for the media renderer to number, and
+/// numbers the others itself.
 async fn a_photo_between_numbered_messages_renders_alike(cipher: Cipher) {
     let plan = super::controls::manifest(json!({"render_tags": true}), vec![]);
     let mut sides = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let side = Rendered::new(store, three_texts(), false, cipher).await;
         let sent = send_planned(&side, "r1", planned(text("first")), &plan).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
@@ -1447,12 +1355,8 @@ async fn a_photo_between_numbered_messages_renders_alike(cipher: Cipher) {
         side.side.idle().await;
         sides.push(side);
     }
-    let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
-    sent_alike(
-        &today,
-        &store,
-        "a request with a photo between numbered messages",
-    );
+    let store = sides.pop().unwrap();
+    sent_alike(&store, "a request with a photo between numbered messages");
     let last = store.sent().last().cloned().unwrap().unwrap();
     assert!(
         String::from_utf8_lossy(&last).contains('§'),

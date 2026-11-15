@@ -1,27 +1,27 @@
-== the first send's replies differ
+== the first send's reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== the replies to r-k1 differ
+== the reply to r-k1
 Pending {
     submission_id: SubmissionId(
         "sub-r-k1",
     ),
 }
-== the replies to r-k1 differ
+== the reply to r-k1
 Pending {
     submission_id: SubmissionId(
         "sub-r-k1",
     ),
 }
-== the replies to r-k1 differ
+== the reply to r-k1
 SendIdReuse {
     differing: "delivery",
 }
-== the replies to r-k1 differ
+== the reply to r-k1
 SendIdReuse {
     differing: "delivery",
 }
@@ -449,7 +449,7 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 bytes)
-== the sessions recorded their sends differently
+== the sends the session recorded
 [
     Object {
         "run": String("r1"),
@@ -481,17 +481,17 @@ sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 by
         "run_ended": String("completed"),
     },
 ]
-== the sessions hold different sends queued
+== the sends queued
 [
     "sub-r-k1",
 ]
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "first",
     "hello",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "model": Object {
@@ -515,7 +515,7 @@ sha256:c7c677d06ba6e902c539792bb6d45c390e49bf15d26d00b2f7d213f9c2614f97 (2211 by
         "title": Null,
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",

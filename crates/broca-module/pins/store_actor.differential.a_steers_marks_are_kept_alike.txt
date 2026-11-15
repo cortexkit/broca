@@ -1,25 +1,25 @@
-== step 0: replies differ
+== step 0: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 1: replies differ
+== step 1: reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== step 5: replies differ
+== step 5: reply
 Active {
     run_id: RunId(
         "r2",
     ),
     delivered: None,
 }
-== step 6: replies differ
+== step 6: reply
 Active {
     run_id: RunId(
         "r2",
@@ -28,7 +28,7 @@ Active {
 }
 == control stream
 sha256:0b196c27c0b256e35c958f607c3e2e5d80074d4d04cdff8b46b76562e754743e (5132 bytes)
-== the conversations differ
+== the conversation
 [
     "first",
     "hello",
@@ -39,7 +39,7 @@ sha256:0b196c27c0b256e35c958f607c3e2e5d80074d4d04cdff8b46b76562e754743e (5132 by
     "steered again",
     "done",
 ]
-== the run starts record the sends differently
+== what each run's start recorded
 [
     Object {
         "model": Object {

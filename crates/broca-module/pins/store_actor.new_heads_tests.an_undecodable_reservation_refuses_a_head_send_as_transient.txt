@@ -1,0 +1,4 @@
+== the refusal
+Transient(
+    "cannot read the session's scope reservation: session-ref inventory unavailable: store error: scope reservation owner does not decode: expected ident at line 1 column 2",
+)

@@ -1,4 +1,4 @@
-== finished: heads differ for None
+== finished: head for None
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -45,7 +45,7 @@ Object {
         "unreported_steps": Number(0),
     },
 }
-== finished: heads differ for Some(Reserved { module_id: "prefrontal-core" })
+== finished: head for Some(Reserved { module_id: "prefrontal-core" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {
@@ -92,7 +92,7 @@ Object {
         "unreported_steps": Number(0),
     },
 }
-== finished: heads differ for Some(Reserved { module_id: "occipital" })
+== finished: head for Some(Reserved { module_id: "occipital" })
 Object {
     "first_ordinal": Number(1),
     "input": Object {

@@ -52,7 +52,7 @@ async fn closed(module: &Module) {
 #[tokio::test]
 async fn a_one_shot_closes_at_its_terminal_and_reads_back_alike() {
     let mut pages = Vec::new();
-    for store in [false, true] {
+    for store in [true] {
         let module = opened(store, hello(), None).await;
         assert!(matches!(
             send(&module, "r1", "first", true).await,
@@ -69,12 +69,12 @@ async fn a_one_shot_closes_at_its_terminal_and_reads_back_alike() {
         pages.push(page);
         assert!(module.registry.stop_and_seal().await);
     }
-    alike!(pages[1], pages[0], "closed sessions still read alike");
+    broca_test_support::pin!("closed sessions still read alike", pages[0]);
 }
 
 #[tokio::test]
 async fn an_ordinary_run_waits_for_idle_close_alike() {
-    for store in [false, true] {
+    for store in [true] {
         let module = module_options(store, hello(), None, None, Duration::from_secs(1), None).await;
         assert!(matches!(
             send(&module, "r1", "first", false).await,
@@ -89,18 +89,29 @@ async fn an_ordinary_run_waits_for_idle_close_alike() {
 
 #[tokio::test]
 async fn a_live_subscriber_holds_a_one_shot_open_alike() {
-    for store in [false, true] {
-        let module = module_options(store, hello(), None, None, Duration::from_secs(1), None).await;
+    for store in [true] {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let module = module_options(
+            store,
+            hello(),
+            None,
+            None,
+            Duration::from_secs(1),
+            Some(Arc::clone(&gate)),
+        )
+        .await;
+        assert!(matches!(
+            send(&module, "r1", "first", true).await,
+            SendOutcome::Active { .. }
+        ));
+        // The subscriber attaches while the run's model step waits.
         let (sink, deliveries) = mpsc::channel(64);
         module
             .registry
             .route_subscribe(&module.key, crate::fanout::FromCursor::Start, sink)
             .await
-            .expect("a subscriber opens the session");
-        assert!(matches!(
-            send(&module, "r1", "first", true).await,
-            SendOutcome::Active { .. }
-        ));
+            .expect("a subscriber attaches to the session");
+        gate.notify_one();
         idle(&module).await;
         assert_eq!(module.registry.slot_state(&module.key), Some("open"));
         assert_eq!(module.registry.idle_holds(&module.key), ["live_subscriber"]);
@@ -115,7 +126,7 @@ async fn a_live_subscriber_holds_a_one_shot_open_alike() {
 
 #[tokio::test]
 async fn queued_work_holds_a_one_shot_open_and_keeps_its_own_policy_alike() {
-    for store in [false, true] {
+    for store in [true] {
         for queued_one_shot in [false, true] {
             let gate = Arc::new(Notify::new());
             let module = opened(store, hello(), Some(gate.clone())).await;
@@ -158,7 +169,7 @@ async fn queued_work_holds_a_one_shot_open_and_keeps_its_own_policy_alike() {
 
 #[tokio::test]
 async fn a_one_shot_pause_stays_open_and_its_resume_keeps_the_hint_alike() {
-    for store in [false, true] {
+    for store in [true] {
         let mut steps = vec![auth_failure()];
         steps.extend(hello());
         let module = opened(store, steps, None).await;

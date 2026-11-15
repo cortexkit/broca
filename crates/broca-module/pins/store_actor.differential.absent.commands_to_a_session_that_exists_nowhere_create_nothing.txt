@@ -1,0 +1,20 @@
+== status
+"Ok(Idle)"
+== cancel
+"Ok(NotActive)"
+== retract
+"Ok(NotPending)"
+== warm
+"Ok(Refused(WarmRefusal { code: \"no_step_yet\", message: \"the session has sent no model request, so there is nothing to warm\", detail: NoStepYet }))"
+== flush prefix
+"Ok(Flushed { pending_generation: None })"
+== run state
+"Ok(None)"
+== live subscribe
+"Ok(Attached)"
+== tag location
+"Ok(None)"
+== a log on today's storage
+Some(
+    true,
+)

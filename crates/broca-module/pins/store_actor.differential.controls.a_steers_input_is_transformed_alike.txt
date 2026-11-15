@@ -1,11 +1,11 @@
-== alike
+== reply
 Active {
     run_id: RunId(
         "r1",
     ),
     delivered: None,
 }
-== alike
+== reply
 Active {
     run_id: RunId(
         "r1",
@@ -14,7 +14,7 @@ Active {
 }
 == control stream
 sha256:80adbf13a8a9b37d32cf5b2e8bd64503203e769dffe2d8d79aaba9b0646a9bda (2889 bytes)
-== the conversations differ
+== the conversation
 [
     "you are a worker",
     "[noted] first",
@@ -22,7 +22,7 @@ sha256:80adbf13a8a9b37d32cf5b2e8bd64503203e769dffe2d8d79aaba9b0646a9bda (2889 by
     "[noted] more",
     "again",
 ]
-== the runs' starts differ
+== the runs' starts
 [
     Object {
         "compaction_plan_version": Null,
@@ -62,7 +62,7 @@ sha256:80adbf13a8a9b37d32cf5b2e8bd64503203e769dffe2d8d79aaba9b0646a9bda (2889 by
         "tools_were_omitted": Bool(true),
     },
 ]
-== the model calls were sent different messages
+== the messages each model call was sent
 [
     [
         "you are a worker",
@@ -261,12 +261,7 @@ Object {
 }
 == display facts, tools, rich ui (true, true, true), page (Some(2), Some(3))
 sha256:daa821b940c71512b9a7b7432f70019ac704f3f03ae54ba64c06169884efa1cf (2920 bytes)
-== alike
-(
-    2,
-    2,
-)
-== alike
+== send hooks
 [
     (
         "steer",
