@@ -354,7 +354,6 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                         &entries,
                         received,
                         &conditions.rules,
-                        conditions.accepts_images == Some(true),
                         v2::host::view_floor(&conditions),
                     )
                     .await

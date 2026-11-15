@@ -241,7 +241,6 @@ async fn ride(
             at.entries,
             received,
             &at.conditions.rules,
-            at.conditions.accepts_images == Some(true),
             super::host::view_floor(at.conditions),
         )
         .await
@@ -276,7 +275,6 @@ async fn apply_ride_answer(
         step: at.step,
         entries: at.entries,
         rules: &at.conditions.rules,
-        accepts_images: at.conditions.accepts_images == Some(true),
         floor: super::host::view_floor(at.conditions),
         next_mid: at.next_mid,
     };

@@ -247,6 +247,17 @@ impl Compactor {
         );
     }
 
+    /// What each call stating its conditions (Setup, notice, ride) said of inserted images.
+    pub(super) fn stated_accepts_images(&self) -> Vec<Value> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, body)| body.get("conditions"))
+            .map(|conditions| conditions["accepts_images"].clone())
+            .collect()
+    }
+
     fn setups(&self) -> usize {
         self.methods
             .lock()
@@ -1260,18 +1271,29 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         .collect();
     assert!(!new_notices.is_empty());
     // Today's loop never ties its reading to a view; the new loop names the view each reading's
-    // request was rendered under, none here (`0`). Apart from that member the notices match.
+    // request was rendered under, none here (`0`). The new loop also states it takes no
+    // inserted images, which it renders only as markers; today's states what the model takes.
+    // Apart from those members the notices match.
     let without_view = |notice: &Value| {
         let mut notice = notice.clone();
         let conditions = notice["conditions"].as_object_mut().unwrap();
         let view = conditions.remove("last_prompt_view");
         let expected = conditions.get("last_prompt_tokens").map(|_| json!(0));
         assert_eq!(view, expected, "{notice:?}");
+        assert_eq!(conditions.remove("accepts_images"), Some(json!(false)));
+        masked(&notice)
+    };
+    let without_images = |notice: &Value| {
+        let mut notice = notice.clone();
+        notice["conditions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accepts_images");
         masked(&notice)
     };
     assert_eq!(
         new_notices.iter().map(without_view).collect::<Vec<_>>(),
-        old_notices.iter().map(masked).collect::<Vec<_>>()
+        old_notices.iter().map(without_images).collect::<Vec<_>>()
     );
     for notice in &new_notices {
         assert!(notice["token_family"].is_string());

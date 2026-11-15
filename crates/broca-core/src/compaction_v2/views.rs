@@ -15,7 +15,6 @@ pub fn check(
     previous: Option<&View>,
     next: &View,
     provider_rules: &ProviderRules,
-    accepts_images: bool,
     floor: Floor<'_>,
 ) -> Result<(), ViewRefusal> {
     if !next.verify() {
@@ -29,21 +28,33 @@ pub fn check(
         });
     }
     render::check_carried(previous, next)?;
-    check_boundary(entries, next, provider_rules, accepts_images, floor)
+    check_boundary(entries, next, provider_rules, floor)
 }
 
 /// Recheck against the current transcript: a running tool or a newly signed reply
 /// may have appeared after acceptance. A refusal must leave the old view applied.
+///
+/// A view's inserted image is accepted whatever the session stated it takes: a provider repeats
+/// an insert it made before (Magic Context repeats its image of the session's memories until its
+/// next fold), so refusing it would hold the session on an older view. Its request shows the
+/// image's provenance marker, never the image (`host::image_reference`).
 pub fn check_boundary(
     entries: &[Entry],
     view: &View,
     provider_rules: &ProviderRules,
-    accepts_images: bool,
     floor: Floor<'_>,
 ) -> Result<(), ViewRefusal> {
     for (index, edit) in view.edits.iter().enumerate() {
-        if !accepts_images
-            && matches!(&edit.op, EditOp::Insert { message, .. } if !message.images.is_empty())
+        let EditOp::Insert { message, .. } = &edit.op else {
+            continue;
+        };
+        // The view crate checks each image's media type and base64 (the compaction contract's
+        // rule W6.5); its bytes must also be the PNG they claim to be, or every request rendering
+        // the view would fail.
+        if message
+            .images
+            .iter()
+            .any(|image| super::host::image_reference(image).is_err())
         {
             return Err(ViewRefusal::UnsupportedEdit {
                 index: index as u64,

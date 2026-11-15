@@ -6189,7 +6189,6 @@ where
                     step: step_id.0,
                     entries: &transcript.entries,
                     rules: &conditions.rules,
-                    accepts_images: conditions.accepts_images == Some(true),
                     floor: crate::compaction_v2::host::view_floor(&conditions),
                     next_mid: &next_mid,
                 },

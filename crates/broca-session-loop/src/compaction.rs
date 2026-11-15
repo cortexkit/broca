@@ -949,6 +949,11 @@ fn conditions_for<W: Writer>(
         // applied, so its request carried none.
         conditions.last_prompt_view = conditions.last_prompt_tokens.map(|_| 0);
     }
+    // A view's inserted image renders here as its provenance marker, never the image (see
+    // `v2::host::image_reference`), so the session tells its provider it takes none, whatever
+    // its model takes, and the provider inserts none. One it inserted before is still accepted
+    // (`v2::views::check_boundary`).
+    conditions.accepts_images = Some(false);
     Ok(conditions)
 }
 
@@ -1026,7 +1031,6 @@ pub async fn apply_boundary<W: Writer, P, T>(
             step,
             entries: &entries,
             rules: &conditions.rules,
-            accepts_images: conditions.accepts_images == Some(true),
             floor: v2::host::view_floor(&conditions),
             next_mid: NEXT_MID,
         },

@@ -744,6 +744,7 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
         | "internal_error" => ErrorClass::Transient,
         AUTH_REQUIRED => ErrorClass::Auth,
         "admission_conflict"
+        | "account_unservable"
         | "invalid_request"
         | "unknown_decision"
         | "unscoped_caller"
@@ -752,6 +753,16 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
         // An unknown code is final until broca learns it (see the doc comment).
         _ => ErrorClass::Permanent,
     }
+}
+
+/// [`classify_refusal`], with routing's `detail` where it decides the class. `no_route` is final,
+/// except when every route was full of running admissions (`detail.reason` `concurrency_full`):
+/// that clears as they end, by `detail.reset_at_ms`, so it is a wait.
+fn classify_routing_refusal(code: &str, detail: &Value) -> ErrorClass {
+    if code == "no_route" && detail["reason"] == "concurrency_full" {
+        return ErrorClass::Transient;
+    }
+    classify_refusal(code)
 }
 
 #[derive(Deserialize)]
@@ -853,13 +864,14 @@ fn classify_account_for_reply_at(
                     } else {
                         detail["retry_after_s"].as_u64().or(reset_wait)
                     };
+                    let class = classify_routing_refusal(code, &detail);
                     AccountForOutcome::Refused(AccountSelectionRefusal {
                         routing_code: code.to_string(),
                         retry_after_s,
                         resets_at_ms,
                         routing_detail: (!detail.is_null()).then(|| Box::new(detail)),
                         decision_id,
-                        class: classify_refusal(code),
+                        class,
                     })
                 }
             }

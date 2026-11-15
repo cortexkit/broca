@@ -3151,7 +3151,7 @@ async fn compare_in_once(scenario: Scenario) {
         assert_eq!(new, today, "record {index}");
     }
     assert_eq!(new.records.len(), today.records.len(), "record count");
-    assert_eq!(new.calls, today.calls, "tool calls");
+    assert_calls_alike(&new.calls, &today.calls, "");
 }
 
 fn user(text: &str) -> Message {
@@ -3404,7 +3404,7 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
         } else {
             today.calls.clone()
         };
-        assert_eq!(new.calls, expected_calls, "{context}: tool calls");
+        assert_calls_alike(&new.calls, &expected_calls, &context);
     }
 }
 
@@ -4003,7 +4003,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         assert_eq!(new, today, "record {index}");
     }
     assert_eq!(new.records.len(), today.records.len(), "record count");
-    assert_eq!(new.calls, today.calls, "tool calls");
+    assert_calls_alike(&new.calls, &today.calls, "");
     let _ = NEW_REQUESTS.try_with(|seen| seen.lock().unwrap().extend(new.requests.clone()));
     // Every call as the new loop made it, `last_prompt_view` included.
     let _ = NEW_CALLS.try_with(|seen| {
@@ -5107,7 +5107,7 @@ async fn compare_actions_every_cut_once(
         } else {
             today.calls.clone()
         };
-        assert_eq!(new.calls, expected_calls, "{context}: tool calls");
+        assert_calls_alike(&new.calls, &expected_calls, &context);
         // On a route that can't take a turn-scoped system message, the provider renders a stored
         // one as user-authority text, never dropping it.
         if let Some(route) = route
@@ -5234,7 +5234,7 @@ fn assert_same(today: &Outcome, new: &Outcome) {
         assert_eq!(new, today, "record {index}");
     }
     assert_eq!(new.records.len(), today.records.len(), "record count");
-    assert_eq!(new.calls, today.calls, "tool calls");
+    assert_calls_alike(&new.calls, &today.calls, "");
 }
 
 #[tokio::test]
@@ -11433,3 +11433,40 @@ async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
 /// The probe placement of rides after a tool turn's results, run on the new loop alone.
 #[path = "differential/ride_placement.rs"]
 mod ride_placement;
+
+/// The new loop's compaction and tool calls match today's, but for the `accepts_images` member a
+/// compaction call states, at the top level or in its conditions: the new loop states it takes no
+/// inserted images, which it renders only as markers, where today's states what the model takes.
+/// A call is its method, any routing note, then its JSON body from the first `{`.
+fn assert_calls_alike(new: &[String], today: &[String], context: &str) {
+    assert!(
+        new.iter()
+            .filter(|call| call.contains("accepts_images"))
+            .all(|call| call.contains("\"accepts_images\":false")),
+        "{context}: the new loop states it takes no images: {new:?}"
+    );
+    let without = |calls: &[String]| -> Vec<String> {
+        calls
+            .iter()
+            .map(|call| {
+                let Some(start) = call.find('{').filter(|_| call.starts_with("compaction.")) else {
+                    return call.clone();
+                };
+                let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&call[start..]) else {
+                    return call.clone();
+                };
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("accepts_images");
+                    if let Some(conditions) = object
+                        .get_mut("conditions")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        conditions.remove("accepts_images");
+                    }
+                }
+                format!("{}{body}", &call[..start])
+            })
+            .collect()
+    };
+    assert_eq!(without(new), without(today), "{context}: tool calls");
+}

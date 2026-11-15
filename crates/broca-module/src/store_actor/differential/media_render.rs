@@ -1328,11 +1328,14 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
 /// A view that inserts a user message carrying an image, as Magic Context inserts the image it
 /// draws of its memories, renders alike. The image isn't a medium the session captured, so on
 /// both storages the request shows its provenance marker in its place, never its bytes. Until
-/// the new storage rendered it, such a view applied there and then failed every request.
+/// the new storage rendered it, such a view applied there and then failed every request. The
+/// new storage tells its provider it takes no images, whatever the model takes, yet accepts the
+/// view: a provider repeats an insert it made before, and refusing it would hold an older view.
 async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
     let plan = super::controls::compacting_plan();
     let png = base64(&bytes_of(PNG));
     let mut sides = Vec::new();
+    let mut stated = Vec::new();
     for store in [false, true] {
         let compactor = Arc::new(super::controls::Compactor::default());
         let side = Rendered::with_compactor(
@@ -1354,8 +1357,22 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.idle().await;
         assert_eq!(compactor.views(), 1, "a ride handed the view");
+        stated.push(compactor.stated_accepts_images());
         sides.push(side);
     }
+    let (store_stated, today_stated) = (stated.pop().unwrap(), stated.pop().unwrap());
+    assert!(
+        !store_stated.is_empty(),
+        "the store's calls state their conditions"
+    );
+    assert!(
+        store_stated.iter().all(|value| *value == json!(false)),
+        "the store states it takes no images: {store_stated:?}"
+    );
+    assert!(
+        today_stated.iter().all(|value| *value == json!(true)),
+        "today's storage states what the model takes: {today_stated:?}"
+    );
     let (store, today) = (sides.pop().unwrap(), sides.pop().unwrap());
     let (old, new) = (today.sent(), store.sent());
     assert_eq!(new.len(), old.len(), "how many requests");

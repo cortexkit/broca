@@ -1844,6 +1844,7 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
         "invalid_request",
         "unknown_decision",
         "admission_conflict",
+        "account_unservable",
         "unscoped_caller",
         "account_not_authorized",
         "account_selection_unsupported",
@@ -1866,6 +1867,51 @@ fn published_and_deployed_refusal_classes_are_mapped_by_name() {
             decision_id: Some("acd-off".into())
         }
     );
+}
+
+/// Routing's `no_route` is final, except when every route was full of running admissions
+/// (`concurrency_full`): that is a wait, timed by its `reset_at_ms`, and keeps routing's detail.
+#[test]
+fn a_concurrency_full_refusal_waits_and_any_other_no_route_is_final() {
+    let refused = |detail: Value| {
+        let outcome = classify_account_for_reply_at(
+            Err(serde_json::to_vec(&json!({
+                "code": "no_route", "message": "no route", "detail": detail,
+            }))
+            .unwrap()),
+            NOW as u64,
+        );
+        let AccountForOutcome::Refused(refusal) = outcome else {
+            panic!("expected a refusal, got {outcome:?}")
+        };
+        refusal
+    };
+    let full = refused(json!({"reason": "concurrency_full", "reset_at_ms": NOW as u64 + 30_000}));
+    assert_eq!(full.class, ErrorClass::Transient);
+    assert_eq!(full.routing_code, "no_route");
+    assert_eq!(full.resets_at_ms, Some(NOW as u64 + 30_000));
+    assert_eq!(full.retry_after_s, Some(30));
+    assert_eq!(
+        full.routing_detail
+            .as_deref()
+            .map(|detail| &detail["reason"]),
+        Some(&json!("concurrency_full"))
+    );
+    assert_eq!(
+        broca_wire::AccountSelectionRefused::new("no_route".into(), full.class, None, None).code,
+        broca_wire::ACCOUNT_SELECTION_REFUSED
+    );
+    for detail in [
+        json!({"reason": "no_available_model"}),
+        json!({}),
+        Value::Null,
+    ] {
+        assert_eq!(
+            refused(detail.clone()).class,
+            ErrorClass::Permanent,
+            "{detail}"
+        );
+    }
 }
 
 fn assert_hold_timing(detail: Value, reset: Option<u64>, wait: Option<u64>) {

@@ -425,37 +425,82 @@ fn compaction_v2_view_checks_use_full_original_text_and_deliveries() {
         )
     };
     let rules = rules::defaults("gpt-5");
-    assert!(views::check(
-        &entries,
-        None,
-        &replace("kept §99§"),
-        &rules,
-        true,
-        Floor::none()
-    )
-    .is_ok());
+    assert!(views::check(&entries, None, &replace("kept §99§"), &rules, Floor::none()).is_ok());
     assert!(matches!(
         views::check(
             &entries,
             None,
             &replace("foreign §98§"),
             &rules,
-            true,
             Floor::none()
         ),
         Err(ViewRefusal::ForeignTag { tag: 98, .. })
     ));
     let view = replace("replacement");
     assert!(matches!(
-        views::check(&entries, Some(&view), &view, &rules, true, Floor::none()),
+        views::check(&entries, Some(&view), &view, &rules, Floor::none()),
         Err(ViewRefusal::StaleVersion { .. })
     ));
     let mut bad = view;
     bad.checksum = "invalid".into();
     assert!(matches!(
-        views::check(&entries, None, &bad, &rules, true, Floor::none()),
+        views::check(&entries, None, &bad, &rules, Floor::none()),
         Err(ViewRefusal::BadChecksum)
     ));
+}
+
+/// A view's inserted image is accepted when its bytes are the PNG its media type names, however
+/// the session stated it takes images (a provider repeats an image it inserted before), and
+/// refused `unsupported_edit` when they aren't: no request could render it.
+#[test]
+fn compaction_v2_view_inserted_images_are_checked_as_png() {
+    use cortexkit_role_compaction::view::{InsertAt, InsertedImage, InsertedMessage};
+    let messages = vec![text(Role::User, "original")];
+    let entries = project(&messages, &facts(1), &Deliveries::new(), true);
+    let insert = |data: &str| {
+        View::seal(
+            1,
+            vec![Edit::new(
+                1,
+                EditOp::Insert {
+                    at: InsertAt::Start,
+                    message: InsertedMessage::new(
+                        "memories",
+                        cortexkit_role_compaction::read::Role::User,
+                        vec!["Memories.".into()],
+                    )
+                    .with_images(vec![InsertedImage::new("image/png", data)]),
+                },
+            )],
+        )
+    };
+    let rules = rules::defaults("gpt-5");
+    // A 1x1 PNG whose chunk checksums hold, as the media check requires (the media
+    // validation tests' fixture).
+    let png = {
+        use base64::Engine;
+        const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+        let bytes: Vec<u8> = (0..PNG.len() / 2)
+            .map(|i| u8::from_str_radix(&PNG[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let png = png.as_str();
+    assert_eq!(
+        views::check(&entries, None, &insert(png), &rules, Floor::none()),
+        Ok(())
+    );
+    // Standard padded base64 whose bytes are text, not a PNG.
+    assert_eq!(
+        views::check(
+            &entries,
+            None,
+            &insert("bm90IGEgcG5n"),
+            &rules,
+            Floor::none()
+        ),
+        Err(ViewRefusal::UnsupportedEdit { index: 0 })
+    );
 }
 
 #[test]
@@ -616,21 +661,14 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
     let provider_rules = rules::defaults("claude-opus-5-5");
     let strict = View::seal_with_policy(1, edits.clone(), Some(entries[0].mid.clone()), None);
     assert!(matches!(
-        views::check(
-            &entries,
-            None,
-            &strict,
-            &provider_rules,
-            true,
-            Floor::none()
-        ),
+        views::check(&entries, None, &strict, &provider_rules, Floor::none()),
         Err(ViewRefusal::Rule(
             cortexkit_role_compaction::rules::RuleBreak::SignedPartInvalid { .. }
         ))
     ));
     let strip =
         View::seal_with_policy(1, edits, Some(entries[0].mid.clone()), Some("strip".into()));
-    assert!(views::check(&entries, None, &strip, &provider_rules, true, Floor::none()).is_ok());
+    assert!(views::check(&entries, None, &strip, &provider_rules, Floor::none()).is_ok());
     let render = |view: &View| {
         render::prompt_view_with_rides(
             &messages,
@@ -737,18 +775,18 @@ async fn compaction_v2_a_view_editing_before_the_signed_floor_is_applied() {
         )],
     );
     assert!(matches!(
-        views::check(&entries, None, &view, &bound, true, Floor::none()),
+        views::check(&entries, None, &view, &bound, Floor::none()),
         Err(ViewRefusal::Rule(
             cortexkit_role_compaction::rules::RuleBreak::SignedPartInvalid { .. }
         ))
     ));
     let through = Floor::through(&floor.through);
-    assert!(views::check(&entries, None, &view, &bound, true, through).is_ok());
+    assert!(views::check(&entries, None, &view, &bound, through).is_ok());
 
     let journal = MemoryJournal::default();
     let mut state = state::State::default();
     state
-        .accept(&journal, &entries, view.clone(), &bound, true, through)
+        .accept(&journal, &entries, view.clone(), &bound, through)
         .await
         .unwrap()
         .unwrap();
@@ -759,7 +797,6 @@ async fn compaction_v2_a_view_editing_before_the_signed_floor_is_applied() {
                 step: 1,
                 entries: &entries,
                 rules: &bound,
-                accepts_images: true,
                 floor: through,
                 next_mid: "m12345678.4",
             },
@@ -1523,14 +1560,7 @@ async fn compaction_v2_acceptance_is_not_application_and_failed_sync_does_not_ac
         .fail
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(state
-        .accept(
-            &journal,
-            &entries,
-            view.clone(),
-            &rules,
-            true,
-            Floor::none()
-        )
+        .accept(&journal, &entries, view.clone(), &rules, Floor::none())
         .await
         .is_err());
     assert!(state.latest().is_none());
@@ -1538,14 +1568,7 @@ async fn compaction_v2_acceptance_is_not_application_and_failed_sync_does_not_ac
         .fail
         .store(false, std::sync::atomic::Ordering::SeqCst);
     state
-        .accept(
-            &journal,
-            &entries,
-            view.clone(),
-            &rules,
-            true,
-            Floor::none(),
-        )
+        .accept(&journal, &entries, view.clone(), &rules, Floor::none())
         .await
         .unwrap()
         .unwrap();
@@ -1558,7 +1581,6 @@ async fn compaction_v2_acceptance_is_not_application_and_failed_sync_does_not_ac
                 step: 3,
                 entries: &entries,
                 rules: &rules,
-                accepts_images: true,
                 floor: Floor::none(),
                 next_mid: "m12345678.2",
             },
@@ -1601,7 +1623,6 @@ async fn compaction_v2_recovery_finishes_marker_after_applied_barrier() {
                 step: 1,
                 entries: &entries,
                 rules: &rules,
-                accepts_images: true,
                 floor: Floor::none(),
                 next_mid: "m12345678.1",
             },
@@ -1617,7 +1638,6 @@ async fn compaction_v2_recovery_finishes_marker_after_applied_barrier() {
                 step: 1,
                 entries: &entries,
                 rules: &rules,
-                accepts_images: true,
                 floor: Floor::none(),
                 next_mid: "m12345678.1",
             },
@@ -1967,14 +1987,7 @@ async fn compaction_v2_midstep_acceptance_does_not_change_a_resumed_step_view() 
     let journal = MemoryJournal::default();
     let rules = rules::defaults("gpt-5");
     state
-        .accept(
-            &journal,
-            &entries,
-            next.clone(),
-            &rules,
-            true,
-            Floor::none(),
-        )
+        .accept(&journal, &entries, next.clone(), &rules, Floor::none())
         .await
         .unwrap()
         .unwrap();
@@ -2001,7 +2014,6 @@ async fn compaction_v2_midstep_acceptance_does_not_change_a_resumed_step_view() 
                 step: 2,
                 entries: &entries,
                 rules: &rules,
-                accepts_images: true,
                 floor: Floor::none(),
                 next_mid: "m12345678.1",
             },
