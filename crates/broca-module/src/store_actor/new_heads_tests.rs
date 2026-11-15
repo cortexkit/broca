@@ -293,61 +293,6 @@ async fn every_other_creating_send_still_starts_on_todays_storage() {
     assert!(module.store_leftovers().is_empty());
 }
 
-/// A head whose creating send carries media is refused `not_served_on_new_storage`, permanently,
-/// naming that feature.
-/// Nothing is created in either storage: no head, log or object in any of the new storage's roots,
-/// no WAL, no feature floor, and no actor.
-#[tokio::test]
-async fn a_head_the_new_storage_does_not_serve_is_refused_and_creates_nothing() {
-    let mut media = request("look");
-    media.content =
-        serde_json::from_value(json!([{"type": "upload", "upload_id": "up-1"}])).unwrap();
-    let cases = [("a send carrying media", media, None, None)];
-    for (feature, sent, retention, order) in cases {
-        let module = module(true, Vec::new(), None).await;
-        let refused = send(
-            &module,
-            "r1",
-            sent,
-            Some(HEAD_SESSION_CLASS),
-            retention,
-            order,
-        )
-        .await;
-        let error = match refused {
-            Err(error @ OpenError::NotServedOnNewStorage { .. }) => error,
-            other => panic!("{feature}: expected the head refused, got {other:?}"),
-        };
-        assert!(
-            matches!(error, OpenError::NotServedOnNewStorage { feature: named } if named == feature),
-            "{error:?}"
-        );
-        let body = crate::serve::admission_refusal::admission_refusal(
-            &crate::serve::ServeError::from(error),
-        )
-        .expect("the refusal has a wire body");
-        let body = serde_json::to_value(body).unwrap();
-        assert_eq!(body["code"], "not_served_on_new_storage", "{body}");
-        assert_eq!(
-            body["detail"],
-            json!({"class": "permanent", "feature": feature}),
-            "{body}"
-        );
-        assert!(
-            body["message"].as_str().unwrap().starts_with(feature),
-            "{body}"
-        );
-        assert!(module.store_leftovers().is_empty(), "{feature}");
-        assert_eq!(
-            module.wal.wal_present(&module.key),
-            Some(false),
-            "{feature}"
-        );
-        assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
-        assert_eq!(module.registry.slot_state(&module.key), None, "{feature}");
-    }
-}
-
 /// [`send`] of a head's creating send, asking to be delivered as `delivery`, with the run kind
 /// `kind` and the ordered delivery `order` when given.
 async fn head_send(
@@ -379,10 +324,6 @@ async fn head_send(
         .expect("the head opens")
 }
 
-/// A head created by a send that the new storage served only on a session it already held (an
-/// ordered delivery list, starting a run or waiting for one, and an interrupt) or not at all (a
-/// send resuming after sign-in, which has no paused run to resume on a new session) starts in the
-/// new storage, and is answered as today's storage answers the same send.
 #[tokio::test]
 async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answers_alike() {
     use broca_protocol::Delivery;

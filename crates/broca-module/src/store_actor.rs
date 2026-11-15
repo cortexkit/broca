@@ -4621,43 +4621,19 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
     }
 }
 
-/// The first thing a send creating a session asks for that this actor doesn't serve on such a
-/// send, named as its refusals name it, or `None` when the session may start in the new storage.
-/// It makes the same checks the actor makes on a send before writing anything. A send carrying
-/// media is not served either: a session's first send carrying media isn't yet proven against
-/// today's on the new storage, though later photo sends and the runs rendering them are.
-pub fn unserved_creating_send(
-    request: &SubmissionRequest,
-    kind: RunKind,
-    retention: bool,
-) -> Option<&'static str> {
-    unserved_request(kind, retention, false)
-        .or_else(|| carries_media(request).then_some("a send carrying media"))
-}
-
 /// The feature a send to a session compacted under the first compaction protocol is refused
 /// for: the session moved to the new storage read-only.
 pub(crate) const FIRST_PROTOCOL_COMPACTION: &str = "first_protocol_compaction";
 
 /// The message of a send refused because it asks the new storage for `feature`, which it
-/// doesn't serve: a creating send's feature ([`unserved_on_creation`]), or a send continuing a
-/// session compacted under the first compaction protocol.
+/// doesn't serve: a send continuing a session compacted under the first compaction protocol.
 pub(crate) fn unserved_message(feature: &str) -> String {
     if feature == FIRST_PROTOCOL_COMPACTION {
         return "this session was compacted under the first compaction protocol, which the new \
                 storage reads but can't continue; start a new session"
             .into();
     }
-    unserved_on_creation(feature)
-}
-
-/// The message of a head refused because its creating send asks for `feature`, which the new
-/// storage doesn't serve on a creating send (see [`unserved_creating_send`]).
-pub(crate) fn unserved_on_creation(feature: &str) -> String {
-    format!(
-        "{feature} is not served yet on a send creating a head, which starts only in the new \
-         storage"
-    )
+    format!("{feature} is not served on the new storage")
 }
 
 /// The media a run's model takes, as the run's start froze them, and the model's name, which a
@@ -4689,14 +4665,6 @@ fn unserved_request(kind: RunKind, _retention: bool, ran: bool) -> Option<&'stat
     } else {
         None
     }
-}
-
-/// Whether `request` carries media: attachments its `content` names, or media in its input.
-fn carries_media(request: &SubmissionRequest) -> bool {
-    !request.content.is_empty()
-        || broca_provider::person_media::references(&request.input)
-            .next()
-            .is_some()
 }
 
 /// Answers a command that raced the session's close, as today's actor answers one: the caller

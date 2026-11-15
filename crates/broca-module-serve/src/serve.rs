@@ -2950,14 +2950,7 @@ where
             .await;
         }
         if let Some((converting, reason)) = handler.conversion_refusal(&session) {
-            let body = ErrorBody::new(
-                if converting { "session_converting" } else { "session_unconverted" },
-                if converting { "live sessions are converting before service starts" } else { "this session could not be converted" },
-            ).with_detail(serde_json::json!({
-                "class": if converting { "transient" } else { "permanent" },
-                "retryable": converting,
-                "refusal_class": reason,
-            }));
+            let body = conversion_refusal(converting, &reason);
             return send_error_body(&writer, ver, channel, epoch, corr, body).await;
         }
         // Establish storage ownership before authorization or dispatch can answer from today's
@@ -5626,7 +5619,8 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
-        ServeError::SessionConverting => "session_converting".into(),
+        // Answered on the wire as the contract's `transient` code (see `conversion_refusal`).
+        ServeError::SessionConverting => "transient".into(),
         ServeError::SessionMoved { .. } => "session_moved".into(),
         ServeError::Expired { .. } => broca_module::retention::EXPIRED.into(),
         ServeError::RetentionInvalid(_) | ServeError::InvalidParams { .. } => {
@@ -5910,6 +5904,21 @@ async fn send_store_outcome<H: ServeHandler + ?Sized>(
     }
 }
 
+/// The refusal of an operation on a session that is converting to the new storage
+/// (`converting`, `reason` saying why: the background pass holds it, or the startup window holds
+/// every session), or that could not be converted (`reason` its refusal class).
+fn conversion_refusal(converting: bool, reason: &str) -> ErrorBody {
+    if converting {
+        // Clears by itself in seconds, so it's answered with the contract's retryable code;
+        // callers decide retries by code alone. The cause names what to wait for.
+        return ErrorBody::new("transient", reason)
+            .with_detail(serde_json::json!({"class": "transient", "cause": "session_converting"}));
+    }
+    ErrorBody::new("session_unconverted", "this session could not be converted").with_detail(
+        serde_json::json!({"class": "permanent", "refusal_class": reason, "retryable": false}),
+    )
+}
+
 async fn send_serve_error(
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -5971,8 +5980,7 @@ async fn send_serve_error(
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::SessionConverting => {
-            let body = ErrorBody::new("session_converting", err.to_string())
-                .with_detail(serde_json::json!({"class":"transient", "retryable":true}));
+            let body = conversion_refusal(true, &err.to_string());
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::SessionMoved { holder } => {
@@ -11682,7 +11690,7 @@ mod background_conversion_errors {
     #[tokio::test]
     async fn background_live_registry_refusal_is_retryable_session_converting_on_wire() {
         let error = ServeError::from(broca_module::registry::OpenError::SessionConverting);
-        assert_eq!(refused_send_code(&error), "session_converting");
+        assert_eq!(refused_send_code(&error), "transient");
         assert_eq!(refused_send_class(&error), "transient");
         let (writer, mut reader) = broca_diagnostics::channel(1, std::sync::Arc::default());
         send_serve_error(&writer, PROTOCOL_VERSION, 7, 3, 11, &error)
@@ -11691,9 +11699,9 @@ mod background_conversion_errors {
         let frame = reader.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
         let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(body.code, "session_converting");
+        assert_eq!(body.code, "transient");
         let detail = body.detail.unwrap();
         assert_eq!(detail["class"], "transient");
-        assert_eq!(detail["retryable"], true);
+        assert_eq!(detail["cause"], "session_converting");
     }
 }

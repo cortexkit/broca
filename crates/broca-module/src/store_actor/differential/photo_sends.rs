@@ -2,8 +2,8 @@
 //! same sends to a session on today's storage: a send that starts a run, a queued send, a steer
 //! and a retracted queued send.
 //!
-//! Each session is created by a text send first, since a send carrying media creates its session
-//! on today's storage. Then each side uploads the same image and sends it. Every reply must be
+//! An upload belongs to a session, so each session is created by a text send first. Then each
+//! side uploads the same image and sends it. Every reply must be
 //! equal, and so must `session.media_read` of the image (whole, by byte range, past its end, as a
 //! metadata probe) and the media each message of the session's history holds. On the new
 //! storage, the image's bytes are the session's own object: stored once, under the record that
@@ -20,6 +20,7 @@ use crate::actor::SendOutcome;
 use crate::serve::ServeHandler;
 
 cipher_tests!(
+    a_photo_send_creating_its_session_answers_alike,
     a_photo_send_starting_a_run_answers_alike,
     a_queued_photo_send_answers_alike_and_its_run_points_at_its_bytes,
     a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes,
@@ -172,6 +173,32 @@ async fn photo_send(
             .deliver(run_id, photo("look", &[&new_id]), delivery)
             .await,
     )
+}
+
+/// A photo send can't create its session with its photo: an upload needs a session to belong to,
+/// so a creating send naming one is refused alike on both storages, and each keeps the session
+/// the send opened, empty. The new storage is where such a session now starts.
+async fn a_photo_send_creating_its_session_answers_alike(cipher: Cipher) {
+    let (today, store) = (
+        side_gated(false, steps(), false, cipher).await,
+        side_gated(true, steps(), false, cipher).await,
+    );
+    let (mut old_send, mut new_send) = (
+        photo("look", &["no-such-upload"]),
+        photo("look", &["no-such-upload"]),
+    );
+    scoped_by_core(&mut old_send);
+    scoped_by_core(&mut new_send);
+    let old = today.send("r1", old_send).await;
+    assert!(!matches!(old, SendOutcome::Active { .. }), "{old:?}");
+    assert_eq!(
+        store.send("r1", new_send).await,
+        old,
+        "a photo send creating its session"
+    );
+    // Each storage keeps the session the send opened, as an empty one.
+    assert_eq!(today.registry.wal_written(&today.key), Some(true));
+    assert!(store.registry.store_holding(&store.key).unwrap().is_some());
 }
 
 /// A photo send that starts a run answers alike, and so does one naming an upload that doesn't

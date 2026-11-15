@@ -440,7 +440,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         match self.wal_store.wal_present_checked(key) {
             Ok(Some(false)) => Ok(Some(creation)),
             Ok(_) => Ok(None),
-            Err(error) if matches!(creation, StoreCreation::Head { .. }) => {
+            Err(error) if matches!(creation, StoreCreation::Head) => {
                 Err(OpenError::from_wal_read(error.to_string(), &error))
             }
             Err(_) => Ok(None),
@@ -566,15 +566,6 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 Some(creation) => self.creates_in_store(key, creation)?,
                 None => None,
             };
-            // While unserved creating sends can still fall back to legacy storage, that path
-            // cannot consume the encrypted floors of a store-expired address; it is
-            // a cross-format recreation limitation, not a reason to discard those markers.
-            if let Some(StoreCreation::Head {
-                unserved: Some(feature),
-            }) = creating
-            {
-                return Err(OpenError::NotServedOnNewStorage { feature });
-            }
             // A session marked for the new storage starts nowhere else: while the storage's key
             // hasn't loaded (the first seconds after a start), its creating send is refused as
             // retryable. Started in today's storage instead, it would stay there, since every
@@ -596,7 +587,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 }
                 let class = creating.map(|creation| {
                     let durable = match creation {
-                        StoreCreation::Send | StoreCreation::Head { .. } => {
+                        StoreCreation::Send | StoreCreation::Head => {
                             broca_wal::selected_for_backup(
                                 session_class.as_deref(),
                                 &self.wal_store.backup_classes(),

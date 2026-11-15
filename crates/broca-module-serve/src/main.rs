@@ -46,14 +46,6 @@ const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// even though its catalog row exists.
 const OPENAI_DECISIONS_SERVED: bool = false;
 
-/// Session classes whose new sessions start in the new session storage, when the creating send
-/// asks only for what it serves (other sends still start on today's storage). Heads always start
-/// there. These are every class core sends for its workers and seats: masons, one-shot calls,
-/// Athena consult seats and spec seats, besides sidekicks. A send naming no class still starts on
-/// today's storage until the cutover converts it.
-const NEW_STORAGE_SESSION_CLASSES: &[&str] =
-    &["sidekick", "mason", "oneshot", "consult", "spec", "summary"];
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
     broca_module_serve::serve::initialize_session_readers();
@@ -881,7 +873,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let registry =
         LineageRegistry::new_with_sources(Arc::new(opener_builder), Some(wal_reader), store_reader)
-            .with_store_new_session_classes(NEW_STORAGE_SESSION_CLASSES.iter().copied());
+            // Every new session starts in the new storage, whatever its class.
+            .with_store_new_sessions();
     registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
     // A session whose move startup couldn't settle isn't served from today's storage.
     unsettled_moves.sort();

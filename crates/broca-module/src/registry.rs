@@ -1009,10 +1009,9 @@ pub(crate) enum StoreCreation {
     /// durable whatever its label.
     Import,
     /// A send labelled [`HEAD_SESSION_CLASS`], placed as a send is. A head starts only in the
-    /// new storage: one whose send asks for `unserved`, a feature the store actor doesn't serve
-    /// on a creating send, or that the new storage can't create now, is refused, never started
-    /// on today's storage.
-    Head { unserved: Option<&'static str> },
+    /// new storage: one the new storage can't create now is refused, never started on today's
+    /// storage.
+    Head,
 }
 
 /// The session label of an agent head. A session a send with this label creates starts in the
@@ -3854,16 +3853,13 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
-        let unserved =
-            crate::store_actor::unserved_creating_send(&request, kind, retention.is_some());
         if let Some(manifest) = plan.as_ref().and_then(|plan| plan.manifest.as_ref()) {
             let policy: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text())
                 .expect("an opaque plan is valid JSON");
             if let Some(policy) = policy.as_object().filter(|policy| {
                 policy.contains_key(cortexkit_role_llm_runner::app_readers::PLAN_READERS)
             }) {
-                let starts_in_store = unserved.is_none()
-                    && self.wal_written(key) == Some(false)
+                let starts_in_store = self.wal_written(key) == Some(false)
                     && (session_class.as_deref() == Some(HEAD_SESSION_CLASS)
                         || self.starts_new_sessions_in_store(session_class.as_deref()));
                 let supported = self.store_holding(key)?.is_some()
@@ -3876,8 +3872,8 @@ impl LineageRegistry {
                         return Err(pending);
                     }
                 }
-                // A creating send may otherwise fall back to today's storage, for example when
-                // its first prompt carries media. Never freeze a reader policy in that format.
+                // A send creating a session where the module doesn't create sessions in the new
+                // storage starts it on today's storage. Never freeze a reader policy there.
                 if let Err(error) = crate::reader_admission::check_plan(policy, supported) {
                     let message = match error {
                         crate::serve::ServeError::InvalidParams { message, .. } => message,
@@ -3893,11 +3889,10 @@ impl LineageRegistry {
         }
         // How the session starts if this send creates it. A head starts only in the new
         // storage, and the opener refuses one it can't start there; any other send starts there
-        // only when the registry creates sessions there and the store actor serves the send.
+        // when the registry creates sessions there.
         let creation = if session_class.as_deref() == Some(HEAD_SESSION_CLASS) {
-            Some(StoreCreation::Head { unserved })
-        } else if unserved.is_none() && self.starts_new_sessions_in_store(session_class.as_deref())
-        {
+            Some(StoreCreation::Head)
+        } else if self.starts_new_sessions_in_store(session_class.as_deref()) {
             Some(StoreCreation::Send)
         } else {
             None

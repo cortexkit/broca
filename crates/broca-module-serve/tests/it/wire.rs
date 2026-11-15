@@ -8007,9 +8007,12 @@ async fn cutover_startup_send_is_retryable_session_converting() {
     let response = read_one(&mut reader).await;
     assert_eq!(response.header.ty, FrameType::Error);
     let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(error.code, "session_converting");
+    assert_eq!(error.code, "transient");
     assert_eq!(error.detail.as_ref().unwrap()["class"], "transient");
-    assert_eq!(error.detail.as_ref().unwrap()["retryable"], true);
+    assert_eq!(
+        error.detail.as_ref().unwrap()["cause"],
+        "session_converting"
+    );
     assert_eq!(std::fs::read(&source).unwrap(), b"damaged live source");
     engine
         .run_live(
