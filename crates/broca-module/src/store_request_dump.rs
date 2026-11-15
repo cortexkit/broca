@@ -4,8 +4,9 @@
 //! Each step is rebuilt as a warm-up rebuilds a recorded request
 //! (`store_actor::recorded_warm::request`), from the session's records read once, and rendered by the wire family the run
 //! froze, as a fork renders its base (`fork_answer::render`). Only a body whose SHA-256 equals
-//! the step's last attempt's recorded digest is written, so a written file is the request the
-//! provider received. A request carrying media isn't rebuilt: rendering it needs the media
+//! the step's last attempt's recorded digest is written as `s<step>.json`, so such a file is the
+//! request the provider received. A body that rebuilds to other bytes is written as
+//! `s<step>.mismatch.json`, beside the length the step sent, so what differs can be found. A request carrying media isn't rebuilt: rendering it needs the media
 //! delivery only the session's actor holds while a run runs.
 //!
 //! The read runs over a read-only view of the session as stored (`StoreRuntime::current_view`),
@@ -69,7 +70,7 @@ pub async fn serve(
     broca_owner_only::create_dir_all(&folder)
         .map_err(|error| unreadable("create the dump folder", error.to_string()))?;
     let mut dumps = Vec::with_capacity(steps.len());
-    for (step, recorded_sha256) in steps {
+    for (step, recorded_sha256, recorded_len) in steps {
         dumps.push(
             dump_step(
                 &view,
@@ -79,6 +80,7 @@ pub async fn serve(
                 run_id,
                 step,
                 recorded_sha256,
+                recorded_len,
                 &folder,
             )
             .await,
@@ -92,7 +94,8 @@ pub async fn serve(
 }
 
 /// Rebuild step `step` of run `run_id` from `records`, the session's whole history, as the session
-/// stood when the step sent, and write it when it renders to `recorded_sha256`.
+/// stood when the step sent, and write it: as its body when it renders to `recorded_sha256`, else
+/// as a mismatch, beside the step's `recorded_len`.
 #[allow(clippy::too_many_arguments)]
 async fn dump_step(
     view: &crate::store_read::StoredView<broca_session_store::backend::LocalBackend>,
@@ -102,6 +105,7 @@ async fn dump_step(
     run_id: &str,
     step: u64,
     recorded_sha256: String,
+    recorded_len: u64,
     folder: &Path,
 ) -> StepDump {
     let not_rebuilt = |detail: String| StepDump {
@@ -135,12 +139,20 @@ async fn dump_step(
     };
     let digest = broca_core::render::request_digest_hex(&body);
     if digest != request.request_body_sha256 {
+        let name = format!("s{step}.mismatch.json");
+        let written = match write_private(&folder.join(&name), &body) {
+            Ok(()) => format!("written as {name}"),
+            Err(error) => format!("not written: {error}"),
+        };
         return StepDump {
             step,
             recorded_sha256,
             outcome: StepDumpOutcome::DigestMismatch,
-            bytes: None,
-            detail: Some(format!("rebuilt to {digest}")),
+            bytes: Some(body.len() as u64),
+            detail: Some(format!(
+                "rebuilt to {digest}, {} bytes; the step sent {recorded_len} bytes; {written}",
+                body.len()
+            )),
         };
     }
     match write_private(&folder.join(format!("s{step}.json")), &body) {
@@ -162,18 +174,25 @@ fn starts(records: &[(u64, Record)], run_id: &str) -> bool {
         .any(|(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id))
 }
 
-/// Each step run `run_id` attempted, in step order, with the request digest its last attempt
-/// recorded.
-fn attempted_steps(records: &[(u64, Record)], run_id: &str) -> Vec<(u64, String)> {
+/// Each step run `run_id` attempted, in step order, with the request digest and length its last
+/// attempt recorded.
+fn attempted_steps(records: &[(u64, Record)], run_id: &str) -> Vec<(u64, String, u64)> {
     let mut steps = std::collections::BTreeMap::new();
     for (_, record) in records {
         if let Record::Attempt(attempt) = record {
             if attempt.run_id == run_id {
-                steps.insert(attempt.step_id, hex(&attempt.request_body_sha256.0));
+                let recorded = (
+                    hex(&attempt.request_body_sha256.0),
+                    attempt.request_body_len,
+                );
+                steps.insert(attempt.step_id, recorded);
             }
         }
     }
-    steps.into_iter().collect()
+    steps
+        .into_iter()
+        .map(|(step, (sha, len))| (step, sha, len))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {

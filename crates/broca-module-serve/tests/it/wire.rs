@@ -7932,6 +7932,45 @@ async fn account_route_wire_joins_inherit_and_queue_freezes_its_own_route() {
 
 /// The startup conversion barrier refuses a send before admission opens a WAL; after the
 /// recovery prerequisite and live pass finish, the same connection can serve session reads.
+/// A live log with no complete record (empty, or only its header) holds no session: the startup
+/// window moves it to the backup and refuses nothing at its address, so a later send there starts
+/// a new session instead of being refused `session_unconverted` for good.
+#[tokio::test]
+async fn cutover_a_log_holding_no_session_refuses_nothing() {
+    use broca_module_serve::session_conversion::{Config, Engine};
+    let dir = tmpdir("cutover-empty-log");
+    let (registry, wal) = registry_and_wal(&dir);
+    let empty = BindIdentity::new("broca-unscoped-v1", "runner", "cutover-empty");
+    let header_only = BindIdentity::new("broca-unscoped-v1", "runner", "cutover-header-only");
+    let empty_path = wal.wal_path(&empty);
+    std::fs::create_dir_all(empty_path.parent().unwrap()).unwrap();
+    std::fs::write(&empty_path, b"").unwrap();
+    drop(broca_wal::FileWal::open(wal.wal_path(&header_only)).unwrap());
+    let engine = Engine::configured(
+        &dir,
+        Config {
+            archives: false,
+            live_at_startup: true,
+            backup_root: Some(dir.with_extension("converted-sources")),
+        },
+    )
+    .unwrap()
+    .unwrap();
+    engine.install_guard(registry.as_ref());
+    engine
+        .run_live(
+            &broca_session_store::keys::DeploymentKey::unloaded(1),
+            None,
+            Some(registry.as_ref()),
+        )
+        .await
+        .unwrap();
+    for session in [&empty, &header_only] {
+        assert_eq!(registry.conversion_refusal(session), None, "{session:?}");
+        assert!(!wal.wal_path(session).exists(), "{session:?}");
+    }
+}
+
 #[tokio::test]
 async fn cutover_startup_send_is_retryable_session_converting() {
     use broca_module_serve::session_conversion::{Config, Engine};

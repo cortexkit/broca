@@ -3,9 +3,10 @@
 //!
 //! The new storage keeps each attempt's request digest, not its bytes. This operation rebuilds
 //! each step's request through the same path broca's warm-ups use, renders it with the run's
-//! frozen render config, and writes it only when its SHA-256 equals the digest the step's last
-//! attempt recorded. The bodies go to a private folder under broca's state root; the reply names
-//! the folder and each step's outcome, never any content.
+//! frozen render config, and writes it as the step's body only when its SHA-256 equals the digest
+//! the step's last attempt recorded. A body that rebuilds to other bytes is written beside, under
+//! a name that says so, for finding what differs. The bodies go to a private folder under broca's
+//! state root; the reply names the folder and each step's outcome, never any content.
 //!
 //! Operator only, and outside the runner role.
 
@@ -26,7 +27,8 @@ pub struct RequestDumpParams {
 #[serde(deny_unknown_fields)]
 pub struct RequestDumpResponse {
     pub run_id: String,
-    /// The private folder holding the written bodies, one `s<step>.json` per written step.
+    /// The private folder holding the written bodies: `s<step>.json` per written step, and
+    /// `s<step>.mismatch.json` per step that rebuilt to other bytes.
     pub folder: String,
     /// Every step the run attempted, in step order.
     pub steps: Vec<StepDump>,
@@ -40,10 +42,12 @@ pub struct StepDump {
     /// The SHA-256 the step's last attempt recorded for the request it sent, in lowercase hex.
     pub recorded_sha256: String,
     pub outcome: StepDumpOutcome,
-    /// The written body's length in bytes; present when `outcome` is `written`.
+    /// The written body's length in bytes; present when `outcome` is `written` or
+    /// `digest_mismatch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
-    /// Why the step wasn't written: the digest it rebuilt to, or why it couldn't be rebuilt.
+    /// Why the step wasn't written as its body: the digest it rebuilt to and the length the step
+    /// sent, or why it couldn't be rebuilt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -53,7 +57,7 @@ pub struct StepDump {
 pub enum StepDumpOutcome {
     /// Rebuilt to the recorded digest and written.
     Written,
-    /// Rebuilt, but to other bytes than the step sent; nothing was written.
+    /// Rebuilt, but to other bytes than the step sent; written as `s<step>.mismatch.json`.
     DigestMismatch,
     /// Couldn't be rebuilt (for example, a request carrying media); nothing was written.
     NotRebuilt,

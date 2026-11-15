@@ -903,7 +903,22 @@ impl Engine {
             }
         };
         let (records, alias_lineage, alias_digest) =
-            read_source(&path, source.member.as_deref()).map_err(unidentified)?;
+            match read_source(&path, source.member.as_deref()) {
+                // A log with no complete record holds no session: nothing was ever durable in
+                // it. It moves to the backup like any converted source and refuses nothing, so
+                // a later send at the address starts a new session.
+                Err(error) if error.class == NO_SESSION => {
+                    self.step(source, "awaiting_backup", Some("empty"), None)?;
+                    return self.backup_ready(source);
+                }
+                // The live log was deleted since it was found (retention deletes an expired
+                // session's): there is nothing to convert or back up.
+                Err(error) if error.class == SOURCE_GONE => {
+                    self.step(source, "done", Some("gone"), None)?;
+                    return Ok(());
+                }
+                read => read.map_err(unidentified)?,
+            };
         let session = records
             .iter()
             .find_map(|frame| match &frame.record {
@@ -1540,6 +1555,11 @@ fn remove_staging(path: &Path) -> Result<(), Failure> {
     }
 }
 
+/// The failure class of a source that holds no session: no complete record.
+const NO_SESSION: &str = "no_session";
+/// The failure class of a live source deleted since it was discovered.
+const SOURCE_GONE: &str = "source_gone";
+
 fn read_source(
     path: &Path,
     member: Option<&str>,
@@ -1559,7 +1579,16 @@ fn read_source(
                 .collect::<String>(),
         )
     } else {
-        let length = std::fs::metadata(path).map_err(source_io)?.len();
+        let length = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Failure::refused(SOURCE_GONE, "the log is gone"))
+            }
+            Err(error) => return Err(source_io(error)),
+        };
+        if length == 0 {
+            return Err(Failure::refused(NO_SESSION, "the log is empty"));
+        }
         (
             broca_wal::read_records_range(path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
                 .map_err(source_wal)?,
@@ -1567,20 +1596,26 @@ fn read_source(
             source_digest(path, None)?,
         )
     };
-    if length == 0 || read.complete_byte_end != Some(length) {
-        return Err(Failure::refused(
-            "damaged",
-            "log is empty or does not decode completely",
-        ));
-    }
-    let lineage = read.lineage_id;
+    let (lineage, complete) = (read.lineage_id, read.complete_byte_end);
     match read.into_records() {
-        broca_wal::WalRangeRecords::Complete(records) if !records.is_empty() => {
+        // A log opens with its lineage frame, and a writer syncs each record before acting on it,
+        // so a log whose identity reads but whose first record never completed (a creating send
+        // that failed, or a torn first record) recorded nothing that happened. Bytes that don't
+        // read as a log at all are damage, not an empty session.
+        broca_wal::WalRangeRecords::Complete(records)
+            if records.is_empty() && lineage.is_some() =>
+        {
+            Err(Failure::refused(
+                NO_SESSION,
+                "the log holds no complete record",
+            ))
+        }
+        broca_wal::WalRangeRecords::Complete(records) if length > 0 && complete == Some(length) => {
             Ok((records, lineage, digest))
         }
         _ => Err(Failure::refused(
             "damaged",
-            "log contains no complete records",
+            "log does not decode completely",
         )),
     }
 }
@@ -1795,20 +1830,24 @@ mod tests {
     }
 
     #[test]
-    fn cutover_missing_empty_and_garbage_are_damage_but_io_denials_are_not() {
+    fn cutover_empty_and_missing_hold_no_session_garbage_is_damage_io_denials_are_not() {
         let root = broca_test_support::scratch_root().join("conversion-damage");
         std::fs::create_dir_all(&root).unwrap();
-        for (name, bytes) in [
-            ("empty", Some(&b""[..])),
-            ("garbage", Some(&b"garbage"[..])),
-            ("missing", None),
+        let header_only = root.join("header-only.wal");
+        drop(broca_wal::FileWal::open(&header_only).unwrap());
+        assert!(std::fs::metadata(&header_only).unwrap().len() > 0);
+        for (name, bytes, class) in [
+            ("empty", Some(&b""[..]), NO_SESSION),
+            ("header-only", None, NO_SESSION),
+            ("garbage", Some(&b"garbage"[..]), "damaged"),
+            ("missing", None, SOURCE_GONE),
         ] {
             let path = root.join(format!("{name}.wal"));
             if let Some(bytes) = bytes {
                 std::fs::write(&path, bytes).unwrap();
             }
             let failure = read_source(&path, None).unwrap_err();
-            assert_eq!(failure.class, "damaged", "{name}");
+            assert_eq!(failure.class, class, "{name}");
             assert!(failure.terminal, "{name}");
         }
         assert!(!source_io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).terminal);
