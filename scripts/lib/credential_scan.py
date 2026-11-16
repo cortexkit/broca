@@ -35,7 +35,8 @@ def lower_worker_priority():
 
 
 def chooser_selects_accounts(selection: dict) -> bool:
-    # Mirror auth_routing::frozen_selection_credential, then account_routing::selects_accounts.
+    # Mirror auth_routing::frozen_selection_credential, then account_routing's
+    # metadata_in_chooser_scope: a subscription sign-in is judged, an API key isn't.
     # An explicit auth_method belongs to an opaque vault id, which must never be parsed.
     # Without it, AuthSelection's documented legacy format is a Broca method:provider[:account] key.
     method = selection.get("auth_method")
@@ -45,9 +46,9 @@ def chooser_selects_accounts(selection: dict) -> bool:
         if len(parts) < 2 or not parts[1]:
             raise CannotCompare("a recent auth selection has no recognizable authentication method")
         method = parts[0]
-    if method in ("oauth", "chatgpt"):
+    if method in ("oauth", "chatgpt", "antigravity"):
         return True
-    if method in ("apikey", "antigravity"):
+    if method == "apikey":
         return False
     raise CannotCompare("a recent auth selection has an unknown authentication method")
 

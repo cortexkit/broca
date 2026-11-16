@@ -190,7 +190,8 @@ class MetadataDeployGate(unittest.TestCase):
         for row in rows:
             row["categories"] = ["llm-provider"]
         self.assertEqual(GATE.flag_credentials({"v": 1, "credentials": rows}), {
-            "unknown": ("recognized auth_method",), "missing": ("auth_method",)
+            "unknown": ("recognized auth_method",), "missing": ("auth_method",),
+            "antigravity": ("provider_ids",),
         })
 
     def test_metadata_scope_agrees_with_rust_on_the_same_rows(self):
@@ -315,7 +316,7 @@ class MetadataDeployGate(unittest.TestCase):
     def test_method_predicate_honors_explicit_metadata_before_legacy_key_spelling(self):
         self.assertTrue(GATE.chooser_selects_accounts({"credential_id": "apikey:cline-pass", "auth_method": "oauth"}))
         self.assertFalse(GATE.chooser_selects_accounts({"credential_id": "oauth:anthropic", "auth_method": "apikey"}))
-        self.assertFalse(GATE.chooser_selects_accounts({"credential_id": "antigravity:new-provider"}))
+        self.assertTrue(GATE.chooser_selects_accounts({"credential_id": "antigravity:new-provider"}))
         with self.assertRaisesRegex(GATE.CannotCompare, "unknown authentication method"):
             GATE.chooser_selects_accounts({"credential_id": "opaque", "auth_method": "future-method"})
         with self.assertRaisesRegex(GATE.CannotCompare, "no recognizable authentication method"):
