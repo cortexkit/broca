@@ -1535,6 +1535,17 @@ pub(crate) mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
             assert_eq!(publication.event_key, expected);
+            // The stored body for this event key is what `run.event.get` serves: it belongs to
+            // the session that wrote it and matches the digest the bus message carried.
+            let (owner, body) = store
+                .get_bus_event(&publication.event_key)
+                .unwrap()
+                .expect("the published event's body is kept for run.event.get");
+            assert_eq!(owner, session);
+            assert_eq!(
+                cortexkit_bus_trait::ContentDigest::of_bytes(&body),
+                publication.digest()
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }

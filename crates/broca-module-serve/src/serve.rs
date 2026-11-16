@@ -5824,13 +5824,16 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         // Both forms page through the store (`crate::history`): the raw form through its
         // `session.read`, the display form with the per-call facts the store records.
         cortexkit_role_llm_runner::ops::SESSION_HISTORY => true,
+        // A run event's body, kept in the run index's outbox for every session whichever
+        // storage keeps it (`store_run_events`), and served to the session that wrote it.
+        OP_RUN_EVENT_GET => true,
         _ => false,
     }
 }
 
 #[cfg(test)]
 #[test]
-fn the_store_gate_serves_inline_import_and_both_output_reference_ops() {
+fn the_store_gate_serves_inline_import_output_references_and_run_event_bodies() {
     for method in [
         OP_IMPORT,
         cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS,
@@ -5845,7 +5848,9 @@ fn the_store_gate_serves_inline_import_and_both_output_reference_ops() {
         OP_IMPORT,
         &serde_json::json!({"source":{}})
     ));
-    assert!(!served_on_new_storage(
+    // Basal fetches each run event's body before it trusts the event; refusing it made every
+    // program model call wait for its scheduled check instead.
+    assert!(served_on_new_storage(
         "run.event.get",
         &serde_json::json!({})
     ));
