@@ -495,8 +495,15 @@ impl Driver {
             }
         }
     }
+    /// The sessions `refs` name, looked up in the session-ref index. Every session is in it:
+    /// binding a new identity writes its row in the same transaction that mints the identity
+    /// (`session_address`), and a moved-in session's row is written before broca replies to
+    /// the mover's `activate`. So a ref the index lacks is not on this machine, and the stored
+    /// sessions are never searched: a ref is a one-way hash, so a search must read every stored
+    /// head, and on a machine with about 190,000 sessions that took 37 s, past a mover's 30 s
+    /// deadline.
     fn local_sessions(&self, refs: &Refs) -> SessionInventory {
-        let mut inventory = match self
+        match self
             .index
             .resolve_refs(&refs.iter().map(|r| r.r#ref.as_str()).collect::<Vec<_>>())
         {
@@ -516,44 +523,7 @@ impl Driver {
                 sessions: BTreeMap::new(),
                 unreadable: vec![error.to_string()],
             },
-        };
-        if let Some(store) = &self.store {
-            for class in broca_wal::StorageClass::ALL {
-                let backend =
-                    broca_session_store::backend::LocalBackend::new(class.store_root(&self.root));
-                let found = (|| -> Result<(), String> {
-                    for addr in backend.stored_sessions().map_err(|e| format!("{e:?}"))? {
-                        let (bytes, _) = backend
-                            .read_stored_head(&addr)
-                            .map_err(|e| format!("{e:?}"))?
-                            .ok_or("head vanished")?;
-                        let triple = broca_session_store::head::stored_triple(&bytes)
-                            .map_err(|e| format!("{e:?}"))?;
-                        let reference = contract::session_ref(
-                            &triple.harness,
-                            &triple.project_root,
-                            &triple.session,
-                        );
-                        if refs.iter().any(|wanted| wanted.r#ref == reference) {
-                            inventory.sessions.insert(
-                                reference,
-                                BindIdentity {
-                                    project_root: triple.project_root.into(),
-                                    harness: triple.harness,
-                                    session: triple.session,
-                                },
-                            );
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = found {
-                    inventory.unreadable.push(error);
-                }
-            }
-            let _ = store;
         }
-        inventory
     }
 }
 

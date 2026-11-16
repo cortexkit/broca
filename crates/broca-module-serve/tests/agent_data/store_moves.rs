@@ -68,7 +68,20 @@ async fn rig(path: PathBuf, door: Arc<FakeDoor>, key: DeploymentKey) -> Rig {
     }
 }
 
+/// Stores `session` as binding it would, with its ref in the session-ref index.
 async fn seed(rig: &Rig, session: &BindIdentity, terminal: bool) {
+    store_session(rig, session, terminal).await;
+    // Binding a session records its ref in the index in production; moves find it there.
+    broca_core::SessionRefIndex::record_session(
+        rig.index.as_ref(),
+        &broca_core::session_addr(session),
+        session,
+    )
+    .unwrap();
+}
+
+/// Writes `session`'s records into the store, and nothing into the session-ref index.
+async fn store_session(rig: &Rig, session: &BindIdentity, terminal: bool) {
     let runtime = rig.registry.store_runtime().unwrap();
     let backend = LocalBackend::new(StorageClass::Durable.store_root(&rig.root));
     let mut writer = Session::create(
@@ -120,6 +133,40 @@ async fn seed(rig: &Rig, session: &BindIdentity, terminal: bool) {
     }
     writer.append(&converted.records, true).await.unwrap();
     writer.close().await.unwrap();
+}
+
+/// A move finds a session through the session-ref index alone, never by searching the stored
+/// sessions: a ref is a one-way hash, so a search reads every stored head, and on a machine
+/// with about 190,000 sessions that took 37 s, past the mover's 30 s deadline. So a stored
+/// session the index doesn't name is not this machine's to move.
+#[tokio::test]
+async fn busy_and_prepare_find_a_stored_session_through_the_ref_index_alone() {
+    let door = Arc::new(FakeDoor::default());
+    let source = rig(
+        root("store-busy-index"),
+        door,
+        DeploymentKey::new(7, &[4; 32]),
+    )
+    .await;
+    let indexed = source.session("indexed");
+    seed(&source, &indexed, true).await;
+    let unindexed = source.session("unindexed");
+    store_session(&source, &unindexed, true).await;
+    let mut from = Wire::new(&source, entorhinal(), true).await;
+
+    let params = source.params(CUT, std::slice::from_ref(&indexed));
+    let busy = from
+        .call("busy", json!({"refs":params["refs"]}))
+        .await
+        .unwrap();
+    assert_eq!(busy["refs"][0]["state"], "idle", "{busy}");
+
+    let params = source.params(CUT, std::slice::from_ref(&unindexed));
+    assert_code(
+        from.call("busy", json!({"refs":params["refs"]})).await,
+        "unknown_ref",
+    );
+    assert_code(from.call("prepare", params).await, "unknown_ref");
 }
 
 #[tokio::test]

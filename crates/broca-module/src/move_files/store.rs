@@ -329,6 +329,14 @@ impl FileCutArtifacts {
                     &addr,
                 )
                 .map_err(unavailable)?;
+                // A later move finds the session by its ref in the session-ref index alone, so
+                // its row is written before the session is published. If the index can't take
+                // it, the guard leaves the index marked incomplete until a census repairs it, so
+                // a move asking meanwhile is told to retry rather than that the ref is unknown.
+                let _admission = self
+                    .wal
+                    .record_session_before_install(&addr.0, &plan.session)
+                    .map_err(unavailable)?;
                 export
                     .activate(
                         &self.store_staged(cut, plan),
