@@ -367,6 +367,20 @@ DRIFT
 }
 # END EXPLAIN A FAILED RELEASE BUILD
 
+# Cargo never removes a superseded build output, so the release folder only grows: 287 GiB by
+# 16 Nov, most of it artifacts no build still uses, and with the debug folder it filled the
+# shared build drive. Past RELEASE_TARGET_CAP_GIB the release folder is cleared before the
+# build, which then builds everything once.
+release_dir="${CARGO_TARGET_DIR:-target}/release"
+RELEASE_TARGET_CAP_GIB=${RELEASE_TARGET_CAP_GIB:-60}
+if [[ -d $release_dir ]]; then
+    release_kib=$(du -sk "$release_dir" | cut -f1)
+    if (( release_kib > RELEASE_TARGET_CAP_GIB * 1024 * 1024 )); then
+        echo "stage-release: $release_dir holds $(( release_kib / 1024 / 1024 )) GiB, over its ${RELEASE_TARGET_CAP_GIB} GiB cap; clearing it, so this build is a full one" >&2
+        rm -rf "$release_dir"
+    fi
+fi
+
 # The build's stderr goes to the terminal as it happens and to BUILD_LOG, so the failure can be
 # classified from what Cargo actually printed.
 BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/broca-release-build.XXXXXX")
