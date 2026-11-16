@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOKIO_FREE_MEMBERS = {
     "broca-owner-only",
     "broca-memory-relief",
+    "broca-records",
     "broca-session-store",
     "broca-wal-reader",
 }

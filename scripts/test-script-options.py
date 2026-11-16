@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ScriptOptionValues(unittest.TestCase):
     OPTIONS = {
-        "place-release.sh": (2, ("--staged", "--session-staged", "--run-staged", "--dest", "--report")),
+        "place-release.sh": (2, ("--staged", "--session-staged", "--dest", "--report")),
         "deploy.sh": (2, ("--marker", "--control")),
         "mint-lineage-specimen.sh": (2, ("--count", "--victim", "--donor", "--project-root", "--harness")),
         "verify-deploy.sh": (64, ("--marker", "--control", "--bin", "--sha", "--staged")),
