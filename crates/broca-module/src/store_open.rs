@@ -24,12 +24,11 @@ use std::time::Duration;
 
 use broca_protocol::BindIdentity;
 use broca_session_loop::durable::SetupParts;
-use broca_session_loop::parts::{DeploymentParts, SharedParts};
+use broca_session_loop::parts::{DeploymentParts, SetupSource, SharedParts};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::session::{Position, Session, SessionError};
-use broca_session_store::setup::SetupStore;
 use broca_wal::StorageClass;
 use tokio::sync::mpsc;
 
@@ -115,7 +114,7 @@ impl StoreRuntime {
             idle_ttl,
         )
         .await?;
-        let parts = runtime.load_encrypted_parts(&deployment).await?;
+        let parts = runtime.encrypted_parts(&deployment)?;
         runtime.install_key(deployment, parts)?;
         Ok(runtime)
     }
@@ -134,24 +133,19 @@ impl StoreRuntime {
         crate::store_import_stage::clear_import_staging(state_root).map_err(|error| {
             format!("the new storage's import staging could not be cleared: {error}")
         })?;
-        let plain = broca_session_store::setup::SetupKey::plain();
         let mut roots = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
             let backend = LocalBackend::new(class.store_root(state_root));
             recovery_index::prepare(&class.store_root(state_root))
                 .map_err(|error| format!("prepare {class} recovery candidates: {error}"))?;
-            let loaded = SetupStore::new(&backend, &plain)
-                .load_all()
-                .await
-                .map_err(|error| {
-                    format!(
-                        "the new storage's plain setup parts in its {class} root could not be \
-                         loaded: {error:?}"
-                    )
-                })?;
             roots.push(RootParts {
                 parts: SharedParts::new(Box::new(DeploymentParts::default())),
-                plain_parts: SharedParts::new(Box::new(DeploymentParts::loaded(loaded))),
+                plain_parts: SharedParts::new(Box::new(DeploymentParts::stored(Arc::new(
+                    SetupSource {
+                        backend,
+                        key: broca_session_store::setup::SetupKey::plain(),
+                    },
+                )))),
             });
         }
         let roots: [RootParts; 3] = roots
@@ -185,39 +179,30 @@ impl StoreRuntime {
     }
 
     /// The encrypted sessions' setup parts of each class root, by [`StorageClass::index`], read
-    /// under `deployment`, which must have loaded.
-    async fn load_encrypted_parts(
-        &self,
-        deployment: &DeploymentKey,
-    ) -> Result<Vec<LoadedParts>, String> {
-        let key = deployment
-            .setup_key_for(Cipher::XChaCha20Poly1305)
-            .ok_or("the deployment key offered has not loaded")?;
-        let mut loaded = Vec::with_capacity(StorageClass::ALL.len());
-        for class in StorageClass::ALL {
-            let backend = self.backend(class);
-            loaded.push(
-                SetupStore::new(&backend, &key)
-                    .load_all()
-                    .await
-                    .map_err(|error| {
-                        format!(
-                        "the new storage's setup parts in its {class} root could not be loaded: \
-                         {error:?}"
-                    )
-                    })?,
-            );
-        }
-        Ok(loaded)
+    /// from the root's setup store under `deployment`, which must have loaded. Nothing is read
+    /// until a session names a part.
+    fn encrypted_parts(&self, deployment: &DeploymentKey) -> Result<Vec<DeploymentParts>, String> {
+        StorageClass::ALL
+            .iter()
+            .map(|class| {
+                let key = deployment
+                    .setup_key_for(Cipher::XChaCha20Poly1305)
+                    .ok_or("the deployment key offered has not loaded")?;
+                Ok(DeploymentParts::stored(Arc::new(SetupSource {
+                    backend: self.backend(*class),
+                    key,
+                })))
+            })
+            .collect()
     }
 
     /// Installs the deployment key and the encrypted sessions' setup parts read under it, one
-    /// list per class root, so encrypted sessions are served from now on. The parts go in first:
+    /// per class root, so encrypted sessions are served from now on. The parts go in first:
     /// whoever sees the key installed finds them. A runtime keeps the first key installed.
     fn install_key(
         &self,
         deployment: DeploymentKey,
-        parts: Vec<LoadedParts>,
+        parts: Vec<DeploymentParts>,
     ) -> Result<(), String> {
         if deployment.id() != self.key_id {
             return Err(format!(
@@ -234,8 +219,7 @@ impl StoreRuntime {
                 .parts
                 .0
                 .lock()
-                .map_err(|_| "a holder of the encrypted setup parts panicked")? =
-                Box::new(DeploymentParts::loaded(parts));
+                .map_err(|_| "a holder of the encrypted setup parts panicked")? = Box::new(parts);
         }
         let _ = self
             .deployment
@@ -997,7 +981,7 @@ impl StoreSlot {
         }
         self.open_without_key(setup).await?;
         let runtime = self.runtime().expect("the runtime was just opened");
-        let parts = runtime.load_encrypted_parts(&deployment).await?;
+        let parts = runtime.encrypted_parts(&deployment)?;
         // Installed under the lock `holding` records refusals under, so a session refused just
         // before the key arrived is in the set `take_refused` returns afterwards.
         let _refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
@@ -1129,9 +1113,6 @@ fn stored_cipher(
     broca_session_store::head::stored_cipher(&stored)
         .map_err(|error| unreadable(format!("{error:?}")))
 }
-
-/// Setup parts as a setup store's `load_all` reads them.
-type LoadedParts = Vec<(broca_session_store::codec::Digest, Arc<[u8]>)>;
 
 /// The triple a session is created and loaded under: the bind identity's, spelled as
 /// `broca_core::session_addr` spells it, so the triple and the address name one session.

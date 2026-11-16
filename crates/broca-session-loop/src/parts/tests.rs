@@ -150,3 +150,106 @@ fn a_downgraded_render_config_leaves_the_shared_value_as_decoded() {
         }
     }
 }
+
+/// A setup store in memory that counts its reads.
+#[derive(Default)]
+struct Counting {
+    parts: std::sync::Mutex<BTreeMap<Digest, Arc<[u8]>>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl StoredParts for Counting {
+    fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, String> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.parts.lock().unwrap().get(digest).cloned())
+    }
+}
+
+/// A system text of about `len` bytes, different for each `n`.
+fn text(n: usize, len: usize) -> Value {
+    json!(format!("{n:08}{}", "x".repeat(len)))
+}
+
+/// A deployment over a store holds a stored part only once a session names it, and reads it
+/// from the store once while it stays held.
+#[test]
+fn a_stored_part_is_read_when_named_and_then_held() {
+    let store = Arc::new(Counting::default());
+    let (bytes, digest) = canonical(&text(1, 100)).unwrap();
+    store.parts.lock().unwrap().insert(digest, bytes.into());
+    let deployment = DeploymentParts::stored(store.clone());
+    assert_eq!(
+        deployment.held_bytes(),
+        0,
+        "nothing is held before a part is named"
+    );
+    let part = PartRef {
+        kind: PartKind::SystemText,
+        digest,
+    };
+    assert_eq!(deployment.get(&part).unwrap(), text(1, 100));
+    assert_eq!(deployment.get(&part).unwrap(), text(1, 100));
+    assert_eq!(store.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let missing = PartRef {
+        kind: PartKind::SystemText,
+        digest: canonical(&text(2, 100)).unwrap().1,
+    };
+    assert_eq!(deployment.get(&missing).unwrap_err(), "setup part missing");
+}
+
+/// Putting a part the store already holds lists nothing for a writer to store.
+#[test]
+fn putting_a_stored_part_leaves_nothing_to_store() {
+    let store = Arc::new(Counting::default());
+    let (bytes, digest) = canonical(&text(1, 100)).unwrap();
+    store.parts.lock().unwrap().insert(digest, bytes.into());
+    let mut deployment = DeploymentParts::stored(store);
+    deployment.put(PartKind::SystemText, &text(1, 100)).unwrap();
+    assert!(deployment.unstored().is_empty());
+    deployment.put(PartKind::SystemText, &text(2, 100)).unwrap();
+    assert_eq!(deployment.unstored().len(), 1);
+}
+
+/// Held parts stay within [`HELD_PART_BYTES`], the least recently named dropped first and read
+/// again when named; a part not yet stored is kept, whatever it weighs, until a writer stores it.
+#[test]
+fn held_parts_stay_within_their_bound_and_unstored_ones_are_kept() {
+    let store = Arc::new(Counting::default());
+    let mut deployment = DeploymentParts::stored(store.clone());
+    let size = HELD_PART_BYTES / 8;
+    let parts: Vec<PartRef> = (0..20)
+        .map(|n| {
+            deployment
+                .put(PartKind::SystemText, &text(n, size))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        deployment.unstored().len(),
+        20,
+        "nothing stored yet, so all are kept"
+    );
+    assert!(deployment.held_bytes() > 2 * HELD_PART_BYTES);
+    for (part, bytes) in deployment.unstored() {
+        store
+            .parts
+            .lock()
+            .unwrap()
+            .insert(part.digest, bytes.into());
+    }
+    deployment.mark_stored(&parts);
+    assert!(deployment.unstored().is_empty());
+    assert!(
+        deployment.held_bytes() <= HELD_PART_BYTES,
+        "{} bytes held",
+        deployment.held_bytes()
+    );
+    // The newest are held; the oldest were dropped and are read from the store again.
+    let reads = || store.reads.load(std::sync::atomic::Ordering::Relaxed);
+    let before = reads();
+    assert_eq!(deployment.get(&parts[19]).unwrap(), text(19, size));
+    assert_eq!(reads(), before, "the newest part is still held");
+    assert_eq!(deployment.get(&parts[0]).unwrap(), text(0, size));
+    assert_eq!(reads(), before + 1, "the oldest is read again");
+}

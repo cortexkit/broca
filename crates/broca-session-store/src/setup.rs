@@ -177,6 +177,23 @@ impl<'a, B: SessionBackend> SetupStore<'a, B> {
         Ok((part, true))
     }
 
+    /// The bytes of the part with `digest`, checked against it, or `None` when no such part is
+    /// stored: [`Self::get`] for a reader that knows the digest and not the kind of part it
+    /// names. A part that fails its check is reported under its stored name.
+    pub async fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, SetupError> {
+        // The kind only names the part in `get`'s errors, which are mapped here.
+        let part = PartRef {
+            kind: crate::record::PartKind::Tools,
+            digest: *digest,
+        };
+        match self.get(&part).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(SetupError::Missing(_)) => Ok(None),
+            Err(SetupError::Corrupt(_)) => Err(SetupError::CorruptStored(self.key.name(digest))),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The bytes of `part`, checked against its digest.
     pub async fn get(&self, part: &PartRef) -> Result<Arc<[u8]>, SetupError> {
         if let Some(bytes) = self.cached(&part.digest) {

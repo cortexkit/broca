@@ -270,33 +270,134 @@ impl Parts for SharedParts {
     }
 }
 
-/// The deployment's setup parts, shared by every session in the process: what its setup store
-/// held when the process loaded it, and what runs have put since. A part put here is held in
-/// memory and listed by [`Parts::unstored`] until a writer stores it. The list is the
-/// deployment's, not a session's: one session may name a part another session put first, so
-/// whichever writer appends first stores it. Their decoded values are shared the same way.
+/// Where a deployment's stored parts are read from once memory holds them no longer.
+pub trait StoredParts: Send + Sync {
+    /// The stored bytes of the part with `digest`, checked against it; `None` when no such part
+    /// is stored.
+    fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, String>;
+}
+
+/// A setup store's parts in one cipher mode, read on the caller's task, as the store's other
+/// reads are. A read of the local backend returns at once; a backend whose reads would wait
+/// can't be read here, and the read says so rather than block.
+pub struct SetupSource<B> {
+    pub backend: B,
+    pub key: broca_session_store::setup::SetupKey,
+}
+
+impl<B: broca_session_store::backend::SessionBackend + Send + Sync> StoredParts for SetupSource<B> {
+    fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, String> {
+        use futures::FutureExt as _;
+        broca_session_store::setup::SetupStore::new(&self.backend, &self.key)
+            .read(digest)
+            .now_or_never()
+            .ok_or("the setup store's backend can't be read inline")?
+            .map_err(|error| format!("a stored setup part can't be read: {error:?}"))
+    }
+}
+
+/// Parts held in a map and read from it: the stored parts of a deployment a test loaded.
+struct MapSource(BTreeMap<Digest, Arc<[u8]>>);
+
+impl StoredParts for MapSource {
+    fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, String> {
+        Ok(self.0.get(digest).cloned())
+    }
+}
+
+/// How many bytes of recently read or stored parts a deployment keeps in memory. Every run
+/// start names its parts, and most runs name the same few (a project's tools, a role's system
+/// text), so those stay held; a part only an old session names is read from the store when that
+/// session runs again. The store holds every part ever stored, converted sessions' included:
+/// 177,000 parts and 385 MB at one count, all of which this process once held at once.
+pub const HELD_PART_BYTES: usize = 32 * 1024 * 1024;
+
+/// The deployment's setup parts, shared by every session in the process. A part put here is held
+/// in memory and listed by [`Parts::unstored`] until a writer stores it: the list is the
+/// deployment's, not a session's, since one session may name a part another session put first,
+/// so whichever writer appends first stores it. A stored part is read from the setup store when
+/// it is named, and the most recently named stay held, up to [`HELD_PART_BYTES`]. Their decoded
+/// values are shared the same way.
 #[derive(Clone, Default)]
 pub struct DeploymentParts {
-    state: std::sync::Arc<std::sync::Mutex<DeploymentState>>,
+    state: Arc<std::sync::Mutex<DeploymentState>>,
     decoded: DecodedParts,
+    /// Where stored parts are read from; none for a deployment that stores nothing.
+    stored: Option<Arc<dyn StoredParts>>,
 }
 
 #[derive(Default)]
 struct DeploymentState {
-    parts: BTreeMap<Digest, std::sync::Arc<[u8]>>,
-    unstored: BTreeMap<Digest, PartKind>,
+    /// Parts put here that no writer has stored yet, kept until one does.
+    unstored: BTreeMap<Digest, (PartKind, Arc<[u8]>)>,
+    held: HeldParts,
+}
+
+/// Parts read or stored recently, the least recently named dropped first once they hold more
+/// than [`HELD_PART_BYTES`].
+#[derive(Default)]
+struct HeldParts {
+    parts: HashMap<Digest, (Arc<[u8]>, u64)>,
+    /// Each held part's digest by when it was last named.
+    order: BTreeMap<u64, Digest>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl HeldParts {
+    fn get(&mut self, digest: &Digest) -> Option<Arc<[u8]>> {
+        let (bytes, named) = self.parts.get_mut(digest)?;
+        self.order.remove(named);
+        self.clock += 1;
+        *named = self.clock;
+        self.order.insert(self.clock, *digest);
+        Some(Arc::clone(bytes))
+    }
+
+    fn hold(&mut self, digest: Digest, bytes: Arc<[u8]>) {
+        if self.get(&digest).is_some() {
+            return;
+        }
+        self.clock += 1;
+        self.bytes += bytes.len();
+        self.parts.insert(digest, (bytes, self.clock));
+        self.order.insert(self.clock, digest);
+        while self.bytes > HELD_PART_BYTES {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some((bytes, _)) = self.parts.remove(&oldest) {
+                self.bytes -= bytes.len();
+            }
+        }
+    }
 }
 
 impl DeploymentParts {
-    /// The parts the deployment's setup store holds, as its `load_all` read them.
-    pub fn loaded(parts: impl IntoIterator<Item = (Digest, std::sync::Arc<[u8]>)>) -> Self {
+    /// The parts of a deployment whose setup store is `stored`, none of them held yet.
+    pub fn stored(stored: Arc<dyn StoredParts>) -> Self {
         Self {
-            state: std::sync::Arc::new(std::sync::Mutex::new(DeploymentState {
-                parts: parts.into_iter().collect(),
-                unstored: BTreeMap::new(),
-            })),
-            decoded: DecodedParts::default(),
+            stored: Some(stored),
+            ..Self::default()
         }
+    }
+
+    /// A deployment whose stored parts are `parts`, as a setup store holding them would serve
+    /// them.
+    pub fn loaded(parts: impl IntoIterator<Item = (Digest, Arc<[u8]>)>) -> Self {
+        Self::stored(Arc::new(MapSource(parts.into_iter().collect())))
+    }
+
+    /// The bytes of the parts held in memory now, stored or not.
+    pub fn held_bytes(&self) -> usize {
+        self.lock().map_or(0, |state| {
+            state.held.bytes
+                + state
+                    .unstored
+                    .values()
+                    .map(|(_, bytes)| bytes.len())
+                    .sum::<usize>()
+        })
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, DeploymentState>, String> {
@@ -304,26 +405,45 @@ impl DeploymentParts {
             .lock()
             .map_err(|_| "a holder of the deployment's parts panicked while using them".to_owned())
     }
+
+    /// The bytes of the part with `digest`, held, not yet stored, or read from the store.
+    fn bytes(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, String> {
+        {
+            let mut state = self.lock()?;
+            if let Some((_, bytes)) = state.unstored.get(digest) {
+                return Ok(Some(Arc::clone(bytes)));
+            }
+            if let Some(bytes) = state.held.get(digest) {
+                return Ok(Some(bytes));
+            }
+        }
+        // Read without the lock held, so other sessions' parts aren't kept waiting on a file.
+        let Some(stored) = &self.stored else {
+            return Ok(None);
+        };
+        let read = stored.read(digest)?;
+        if let Some(bytes) = &read {
+            self.lock()?.held.hold(*digest, Arc::clone(bytes));
+        }
+        Ok(read)
+    }
 }
 
 impl Parts for DeploymentParts {
     fn put(&mut self, kind: PartKind, value: &Value) -> Result<PartRef, String> {
         let (bytes, digest) = canonical(value)?;
-        let mut state = self.lock()?;
-        if let std::collections::btree_map::Entry::Vacant(entry) = state.parts.entry(digest) {
-            entry.insert(bytes.into());
-            state.unstored.insert(digest, kind);
+        let part = PartRef { kind, digest };
+        if self.bytes(&digest)?.is_none() {
+            self.lock()?.unstored.insert(digest, (kind, bytes.into()));
         }
-        Ok(PartRef { kind, digest })
+        Ok(part)
     }
 
     fn get(&self, part: &PartRef) -> Result<Value, String> {
-        let state = self.lock()?;
-        let bytes = state
-            .parts
-            .get(&part.digest)
+        let bytes = self
+            .bytes(&part.digest)?
             .ok_or_else(|| "setup part missing".to_string())?;
-        decode_bytes(bytes)
+        decode_bytes(&bytes)
     }
 
     fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
@@ -333,15 +453,14 @@ impl Parts for DeploymentParts {
         state
             .unstored
             .iter()
-            .filter_map(|(digest, kind)| {
-                let bytes = state.parts.get(digest)?;
-                Some((
+            .map(|(digest, (kind, bytes))| {
+                (
                     PartRef {
                         kind: *kind,
                         digest: *digest,
                     },
                     bytes.to_vec(),
-                ))
+                )
             })
             .collect()
     }
@@ -349,7 +468,9 @@ impl Parts for DeploymentParts {
     fn mark_stored(&mut self, parts: &[PartRef]) {
         if let Ok(mut state) = self.lock() {
             for part in parts {
-                state.unstored.remove(&part.digest);
+                if let Some((_, bytes)) = state.unstored.remove(&part.digest) {
+                    state.held.hold(part.digest, bytes);
+                }
             }
         }
     }
