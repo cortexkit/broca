@@ -89,6 +89,8 @@ suites=(
     scripts/test-cargo-watchdog.py
     scripts/tests/test_clock_safety.py
     scripts/tests/test_release_fences.py
+    # The release gate finds WAL features the way the Rust crates re-export them.
+    scripts/tests/test_wal_gate_reexports.py
     # Maintenance scripts refuse to write while a writer's liveness is unknown.
     scripts/lib/test_liveness.py
     # Every suite file in scripts/ is listed in one of the arrays in this file.
