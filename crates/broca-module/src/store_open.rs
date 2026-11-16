@@ -76,7 +76,7 @@ pub struct StoreRuntime {
     views: crate::store_reads::ViewCache<crate::store_read::StoredView<LocalBackend>>,
     /// Reads of a log's file, but for those of only its checkpoint frame, in tests.
     #[cfg(all(test, feature = "test-clock"))]
-    log_reads: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) log_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Reads of only a log's checkpoint frame, which a view's stream head takes, in tests.
     #[cfg(all(test, feature = "test-clock"))]
     checkpoint_frame_reads: Arc<std::sync::atomic::AtomicUsize>,

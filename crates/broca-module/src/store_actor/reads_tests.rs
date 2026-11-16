@@ -441,6 +441,27 @@ async fn module(steps: Vec<Vec<NormalizedEvent>>) -> Module {
     module_with(|gate| Arc::new(executor(steps, Some(gate)))).await
 }
 
+/// [`module`] with retention's service installed, as production runs it: every operation's
+/// expiry check then reads the retention clock rather than taking the clockless early return.
+#[cfg(feature = "test-clock")]
+async fn module_with_retention(steps: Vec<Vec<NormalizedEvent>>) -> Module {
+    let m = module(steps).await;
+    let wal = Arc::new(FileWalStore::new(m.dir.join("wal")));
+    let leases = Arc::new(FileLeaseStore::new(m.dir.join("leases")));
+    let index = Arc::new(broca_store::SqliteStore::open(m.dir.join("run-index.db")).unwrap());
+    m.registry.set_retention_service(Arc::new(
+        crate::retention::RetentionService::new(
+            wal,
+            index.clone(),
+            leases,
+            index,
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+        )
+        .unwrap(),
+    ));
+    m
+}
+
 async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecutor>) -> Module {
     use std::sync::atomic::AtomicU64;
     static N: AtomicU64 = AtomicU64::new(0);
@@ -1661,3 +1682,59 @@ const BEFORE_STORED: &[&str] = &[
     "RunToolCalls(ToolCallsRequest { run_id: \"r2\", after: None, limit: None })",
     "Media { sha256: \"0000000000000000000000000000000000000000000000000000000000000000\" }",
 ];
+
+/// What a busy session's operations cost: with its actor open and its log growing, its sends,
+/// the status polls waiting on its runs, `session.head`, `run.status`, a subscribe's authorization and a `session.read` page each
+/// read none of the session's log. The fixture runs retention's clock, as production does:
+/// without it every operation's expiry check skipped loading the session, which hid that check's
+/// full read of a running session's log from every other test.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn operations_on_a_busy_session_read_none_of_its_log() {
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    let m = module_with_retention(vec![
+        text_step("a1", "one"),
+        text_step("a2", "two"),
+        text_step("a3", "three"),
+    ])
+    .await;
+    let runtime = m.runtime();
+    let reads = || runtime.log_reads.load(Ordering::Relaxed);
+    for (n, run) in ["r1", "r2", "r3"].into_iter().enumerate() {
+        // Counted from before the run, so the status polls that wait for its end count too:
+        // each lands on a position the log has just moved past.
+        runtime.log_reads.store(0, Ordering::Relaxed);
+        active(m.send(run, &format!("message {n}")).await);
+        m.gate.notify_one();
+        m.ended(run, "completed").await;
+        assert!(
+            m.registry.open_handle(&m.key).is_some(),
+            "the actor stays open"
+        );
+        let running = reads();
+        runtime.log_reads.store(0, Ordering::Relaxed);
+        m.registry.head(&m.key).await.unwrap();
+        let head = reads();
+        m.status(run).await;
+        let status = reads() - head;
+        ServeHandler::authorize_session_read(
+            &m.registry,
+            &m.key,
+            &crate::reader_admission::ReadAccess::default(),
+        )
+        .await
+        .unwrap();
+        let authorize = reads() - head - status;
+        m.registry
+            .read(SessionReadRequest::new(m.key.clone(), Some(1), None))
+            .await
+            .unwrap();
+        let page = reads() - head - status - authorize;
+        assert_eq!(
+            (running, head, status, authorize, page),
+            (0, 0, 0, 0, 0),
+            "round {n}: log reads of the run's sends and polls, head, status, authorization \
+             and a page"
+        );
+    }
+}
