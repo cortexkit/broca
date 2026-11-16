@@ -142,6 +142,11 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
             .await
             .unwrap();
         assert_eq!((sweep.recovered, sweep.failed.len()), (1, 0), "{sweep:?}");
+        assert_eq!(
+            sweep.opened_for,
+            [("run_interrupted", 1)].into_iter().collect(),
+            "the sweep says it opened the session for its run cut with a call out: {sweep:?}"
+        );
         side.side.idle().await;
         assert!(
             side.sent().is_empty(),

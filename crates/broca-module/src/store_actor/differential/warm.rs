@@ -412,6 +412,11 @@ async fn reboot_an_automatic_head(
 async fn startup_rearms_an_untouched_automatic_head() {
     let (sweep, warm) = reboot_an_automatic_head(crate::actor::epoch_ms()).await;
     assert_eq!(sweep.recovered, 1);
+    assert_eq!(
+        sweep.opened_for,
+        [("warm_cache", 1)].into_iter().collect(),
+        "the sweep says it opened the head for its cache: {sweep:?}"
+    );
     assert!(warm, "startup restores the timer without a session command");
 }
 

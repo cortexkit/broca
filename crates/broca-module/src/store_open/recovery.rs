@@ -59,12 +59,38 @@ pub(crate) fn owes_recovery(
     billing: bool,
     parts: Option<&dyn broca_session_loop::parts::Parts>,
 ) -> bool {
-    !operations.queue.is_empty()
-        || (billing && !operations.billing_owed.is_empty())
-        || operations.run.as_ref().is_some_and(|run| {
-            run.finished.is_none()
-                && !parts.is_some_and(|parts| waits_only_on_a_sign_in(run, parts))
-        })
+    recovery_owed(operations, billing, parts).is_some()
+}
+
+/// What the session owes that keeps it a recovery candidate, named for the boot sweep's
+/// counts, or `None` when it owes nothing ([`owes_recovery`] is `false`). The first thing owed
+/// is named: queued sends, then unwritten billing, then the unfinished run by how it stands.
+pub(crate) fn recovery_owed(
+    operations: &broca_session_store::fold::operations::Operations,
+    billing: bool,
+    parts: Option<&dyn broca_session_loop::parts::Parts>,
+) -> Option<&'static str> {
+    use broca_protocol::PauseReason;
+    use broca_session_store::fold::operations::Resolution;
+    if !operations.queue.is_empty() {
+        return Some("queued_sends");
+    }
+    if billing && !operations.billing_owed.is_empty() {
+        return Some("billing_owed");
+    }
+    let run = operations.run.as_ref().filter(|run| {
+        run.finished.is_none() && !parts.is_some_and(|parts| waits_only_on_a_sign_in(run, parts))
+    })?;
+    Some(match run.resolution() {
+        Resolution::Idle(_) => "run_unsealed",
+        Resolution::Interrupted(_) => "run_interrupted",
+        Resolution::ProviderHeld(_) => "run_held",
+        Resolution::Paused(PauseReason::AuthRequired) => "run_paused_sign_in",
+        Resolution::Paused(PauseReason::Restart) => "run_paused_restart",
+        Resolution::Paused(PauseReason::AccountLimit) => "run_paused_account_limit",
+        Resolution::Paused(_) => "run_paused_other",
+        Resolution::Resume => "run_resume",
+    })
 }
 
 /// Whether `run` is paused for sign-in with nothing opening could do for it: no cancel to
@@ -163,6 +189,10 @@ pub struct StoreRecoverySweep {
     pub lease_held: usize,
     pub deferred: usize,
     pub failed: Vec<String>,
+    /// The sessions opened, counted by what they owed ([`recovery_owed`]), or `warm_cache` for
+    /// a head opened only to keep its cache warm. A count that stays the same across restarts
+    /// names something opening doesn't settle.
+    pub opened_for: std::collections::BTreeMap<&'static str, usize>,
 }
 
 fn now_ms() -> u64 {
@@ -281,7 +311,7 @@ impl crate::registry::LineageRegistry {
                     // nothing for an open to do. A registration only says a session might owe
                     // something; when it owes nothing the registration is retired here, without
                     // opening the session.
-                    match Session::view(
+                    let opened_for = match Session::view(
                         runtime.backend(class),
                         addr.clone(),
                         &triple,
@@ -289,28 +319,32 @@ impl crate::registry::LineageRegistry {
                     )
                     .await
                     {
-                        Ok(view)
-                            if {
-                                let parts = runtime.parts_for(class, cipher)
-                                    as &dyn broca_session_loop::parts::Parts;
-                                !owes_recovery(
-                                    &view.operations,
-                                    runtime.billing.is_some(),
-                                    Some(parts),
-                                ) && !(warms_itself(&view.operations)
+                        Ok(view) => {
+                            let parts = runtime.parts_for(class, cipher)
+                                as &dyn broca_session_loop::parts::Parts;
+                            let owed = recovery_owed(
+                                &view.operations,
+                                runtime.billing.is_some(),
+                                Some(parts),
+                            )
+                            .or_else(|| {
+                                (warms_itself(&view.operations)
                                     && self.idle_cache_live(&view.operations, parts, now_ms()))
-                            } =>
-                        {
-                            if registered.contains(&addr.0) {
-                                super::recovery_index::remove(&root, &addr)
-                                    .map_err(|error| format!("retire recovery: {error}"))?;
-                                sweep.retired += 1;
-                            }
-                            return Ok(());
+                                .then_some("warm_cache")
+                            });
+                            let Some(owed) = owed else {
+                                if registered.contains(&addr.0) {
+                                    super::recovery_index::remove(&root, &addr)
+                                        .map_err(|error| format!("retire recovery: {error}"))?;
+                                    sweep.retired += 1;
+                                }
+                                return Ok(());
+                            };
+                            owed
                         }
-                        Ok(_) | Err(SessionError::NeedsRecovery) => {}
+                        Err(SessionError::NeedsRecovery) => "needs_recovery",
                         Err(error) => return Err(format!("read operational state: {error:?}")),
-                    }
+                    };
                     super::recovery_index::insert(&root, &addr)
                         .map_err(|error| format!("register recovery: {error}"))?;
                     let recovered = async {
@@ -336,7 +370,10 @@ impl crate::registry::LineageRegistry {
                     }
                     .await;
                     match recovered {
-                        Ok(_) => sweep.recovered += 1,
+                        Ok(_) => {
+                            sweep.recovered += 1;
+                            *sweep.opened_for.entry(opened_for).or_default() += 1;
+                        }
                         Err(OpenError::LeaseHeld(_)) => sweep.lease_held += 1,
                         Err(error) => return Err(format!("open recovery: {error}")),
                     }
