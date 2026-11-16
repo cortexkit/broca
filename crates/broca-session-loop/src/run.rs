@@ -60,9 +60,6 @@ use crate::entries::{Placed, Tags};
 use crate::parts::{canonical, Parts};
 use crate::writer::Writer;
 
-/// The step limit a run gets when it names no stop condition, as today's loop.
-pub const DEFAULT_MAX_STEPS: u64 = 100;
-
 /// The cache-marker placement every new run freezes, as today's loop.
 pub const MARKER_ORDER_VERSION: u32 = 1;
 
@@ -84,7 +81,8 @@ pub struct Admission {
     /// changes its own copies it first.
     pub render_config: Arc<Value>,
     pub renderer_version: u32,
-    /// Termination predicates, OR'd. Empty means a [`DEFAULT_MAX_STEPS`] step limit.
+    /// Termination predicates, OR'd. Empty means no limit: the run goes on until the model
+    /// stops, and broca never caps a run's steps on its own.
     pub stop_when: Vec<StopCondition>,
     /// What the run does when the runner stops while it runs: end interrupted (the default),
     /// or pause and continue as the same run after the runner starts again.
@@ -2441,13 +2439,7 @@ where
             stop: Some(&seams.stop),
             seal: None,
         });
-    let stop_when = if admission.stop_when.is_empty() {
-        vec![StopCondition::StepCount {
-            n: DEFAULT_MAX_STEPS,
-        }]
-    } else {
-        admission.stop_when.clone()
-    };
+    let stop_when = admission.stop_when.clone();
     // A crash after every call of a batch had its result but before the batch closed: it
     // closes now.
     if let Some(batch) = run_state(writer).open_batch.as_ref() {
