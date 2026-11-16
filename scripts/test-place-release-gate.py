@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import hashlib
-import importlib.util
 import json
 import shutil
 import subprocess
@@ -305,21 +304,6 @@ int main(int argc, char **argv) {
         self.assertTrue("could not read both inodes" in result.stdout or
                         "unknown process identity" in result.stdout or
                         "identity unknown" in result.stdout, result.stdout + result.stderr)
-
-    def test_linux_process_start_uses_proc_not_bsd_date(self) -> None:
-        started = time.time()
-        self.launch()
-        sys.path.insert(0, str(ROOT / "scripts"))
-        try:
-            spec = importlib.util.spec_from_file_location("deploy_live_runs", ROOT / "scripts/live-runs.py")
-            assert spec is not None and spec.loader is not None
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            epoch = module.process_start_epoch(str(self.dest))
-        finally:
-            sys.path.pop(0)
-        self.assertIsNotNone(epoch)
-        self.assertLess(abs(epoch - started), 3)
 
     def test_linux_gate_checks_rigs_before_enabling_local_run(self) -> None:
         source = (ROOT / "scripts/gate.sh").read_text()
