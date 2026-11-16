@@ -652,6 +652,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self
     }
 
+    /// Hands the run events of the session's durable records to `sink` from now on (see
+    /// [`crate::store_run_events`]).
+    pub fn with_run_events(mut self, sink: Arc<dyn crate::store_run_events::RunEventSink>) -> Self {
+        crate::store_run_events::observe(&mut self.session, &self.key, sink);
+        self
+    }
+
     /// Attaches a subscriber from `from`, or after the session's last record when `live`.
     fn subscribe(
         &mut self,
@@ -4932,6 +4939,8 @@ mod plan_view_tests;
 mod read_cost;
 #[cfg(test)]
 mod reads_tests;
+#[cfg(test)]
+mod run_events_tests;
 #[cfg(test)]
 mod sign_in_probe_tests;
 #[cfg(all(test, feature = "test-clock"))]

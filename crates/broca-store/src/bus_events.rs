@@ -249,6 +249,16 @@ pub trait RunEventStore: Send + Sync {
     ) -> Result<(), StoreError>;
     fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError>;
     fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError>;
+    /// Records the run events a session in the new storage derived from records a barrier
+    /// made durable, as lifecycle publications. `false`, recording nothing, while the machine
+    /// account isn't known, since each event's subject and id name it.
+    fn record_run_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        events: &mut [RunEvent],
+        now_ms: u64,
+    ) -> Result<bool, StoreError>;
 }
 
 /// Drain orchestration belongs to the publisher, not the object-safe storage port.
@@ -346,6 +356,16 @@ impl RunEventStore for SqliteStore {
     }
     fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
         self.prune_bus_events(now_ms)
+    }
+    fn record_run_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        events: &mut [RunEvent],
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        self.event_store()
+            .record_run_events(session, epoch, events, now_ms)
     }
 }
 
@@ -1052,6 +1072,60 @@ impl EventStore<'_> {
             tracing::warn!(target: "bus", dropped, "dropping recovered run events older than 24 hours");
         }
         Ok(())
+    }
+
+    /// See [`RunEventStore::record_run_events`]. Each event keeps the publication id, headers
+    /// and retention rules the events projected from today's storage have, and recording one
+    /// twice adds nothing.
+    pub fn record_run_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        events: &mut [RunEvent],
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
+            return Ok(false);
+        };
+        let (inserted, oversize, dropped) = self.write(true, |tx| {
+            let (mut inserted, mut oversize, mut dropped) = (0, 0, 0);
+            for event in events.iter_mut() {
+                match event.fit_send_ids() {
+                    Ok(_)
+                        if event.at_ms != 0
+                            && event.at_ms.saturating_add(RETENTION_MS) < now_ms =>
+                    {
+                        dropped += 1;
+                    }
+                    Ok(bytes) => {
+                        let (_, new_row) = insert_event(
+                            tx, &account, session, epoch, event, &bytes, now_ms, false,
+                        )?;
+                        inserted += u64::from(new_row);
+                    }
+                    Err(EncodeError::Oversize(_)) => {
+                        oversize += 1;
+                        tracing::warn!(target: "bus", seq = event.seq, "refusing oversize run lifecycle event");
+                    }
+                    Err(error) => return Err(StoreError::BusEvent(error.to_string())),
+                }
+            }
+            Ok((inserted, oversize, dropped))
+        })?;
+        let metrics = self.bus_metrics();
+        metrics
+            .bus_outbox_depth
+            .fetch_add(inserted, Ordering::Relaxed);
+        metrics
+            .bus_events_oversize
+            .fetch_add(oversize, Ordering::Relaxed);
+        if dropped > 0 {
+            metrics
+                .bus_outbox_dropped
+                .fetch_add(dropped, Ordering::Relaxed);
+            tracing::warn!(target: "bus", dropped, "dropping run events older than 24 hours");
+        }
+        Ok(true)
     }
 
     pub fn get_bus_event(

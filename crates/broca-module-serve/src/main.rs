@@ -825,6 +825,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .creating(session_storage.new_sessions()),
     );
     broca_module_serve::store_key::publish(Arc::clone(&store_slot));
+    // With run events on, a session in the new storage hands the events of its durable records
+    // to the outbox the publisher drains, as a session in today's storage does from its WAL.
+    let store_run_events = bus_event_config.enabled.then(|| {
+        broca_module_serve::bus_events::StoreRunEvents::new(run_index.as_ref().unwrap().clone())
+    });
     let store_setup = broca_module::store_open::StoreRuntimeSetup {
         state_root: state_root.clone(),
         executor: executor.clone(),
@@ -840,6 +845,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 index: legacy.clone(),
                 resolver: charge_basis_table.clone(),
             }),
+        run_events: store_run_events
+            .clone()
+            .map(|events| events as Arc<dyn broca_module::store_run_events::RunEventSink>),
     };
     if let Err(error) = store_slot.open_without_key(&store_setup).await {
         // Plain sessions stay unserved until the key loads, which opens the runtime again.
@@ -1148,6 +1156,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         registry: registry.as_ref().clone(),
         connector: Some(bus_connector),
         hints: bus_hints,
+        store_events: store_run_events,
         stop: bus_stop,
     }
     .spawn();

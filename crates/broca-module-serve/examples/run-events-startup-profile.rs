@@ -451,6 +451,7 @@ async fn main() {
             ),
             connector: Some(Arc::new(StubConnector(bus.clone()))),
             hints,
+            store_events: None,
             stop: stop.clone(),
         }
         .spawn();

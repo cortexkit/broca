@@ -161,6 +161,7 @@ impl Rig {
                 idle_ttl: Duration::from_secs(600),
                 import_roots: None,
                 billing: None,
+                run_events: None,
             },
             backoff: Backoff::default(),
         }

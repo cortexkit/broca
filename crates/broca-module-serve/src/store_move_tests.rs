@@ -993,6 +993,7 @@ fn setup(dir: &Path) -> broca_module::store_open::StoreRuntimeSetup {
         idle_ttl: Duration::from_millis(100),
         import_roots: None,
         billing: None,
+        run_events: None,
     }
 }
 

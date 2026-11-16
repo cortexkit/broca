@@ -113,6 +113,7 @@ async fn module_placing(
         idle_ttl: OPEN,
         import_roots: None,
         billing,
+        run_events: None,
     };
     Module {
         dir,

@@ -16,7 +16,7 @@ use broca_store::{
 };
 use cortexkit_bus_naming::AccountNames;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -55,6 +55,13 @@ struct Liveness {
     /// When the loop last began a pass, on `broca_diagnostics`' monotonic clock; zero before the
     /// first pass.
     pass_started_ms: AtomicU64,
+    /// Batches of run events from sessions in the new storage recorded in the outbox.
+    store_batches_recorded: AtomicU64,
+    /// Batches of them waiting to be recorded, because the machine account isn't known yet or
+    /// recording failed. A count that stays above zero means none reach the outbox.
+    store_batches_waiting: AtomicU64,
+    /// Batches of them dropped because too many were waiting.
+    store_batches_dropped: AtomicU64,
 }
 
 impl Liveness {
@@ -67,6 +74,9 @@ impl Liveness {
             recovery_walks: AtomicU64::new(0),
             recovery_visits: AtomicU64::new(0),
             pass_started_ms: AtomicU64::new(0),
+            store_batches_recorded: AtomicU64::new(0),
+            store_batches_waiting: AtomicU64::new(0),
+            store_batches_dropped: AtomicU64::new(0),
         }
     }
 
@@ -106,6 +116,18 @@ pub fn health() -> serde_json::Value {
         fields.insert(
             "bus_recovery_visits".into(),
             count(&LIVENESS.recovery_visits),
+        );
+        fields.insert(
+            "bus_store_batches_recorded".into(),
+            count(&LIVENESS.store_batches_recorded),
+        );
+        fields.insert(
+            "bus_store_batches_waiting".into(),
+            count(&LIVENESS.store_batches_waiting),
+        );
+        fields.insert(
+            "bus_store_batches_dropped".into(),
+            count(&LIVENESS.store_batches_dropped),
         );
         // Milliseconds since the loop began its latest pass. A running loop begins one every
         // quarter second, so a value that keeps growing means a pass is stuck. Null when no
@@ -190,6 +212,137 @@ impl Hints {
             std::mem::take(&mut state.heads),
             std::mem::take(&mut state.recovery),
         )
+    }
+}
+
+/// The run events of sessions kept in the new storage (see [`broca_module::store_run_events`]),
+/// on their way to the outbox.
+///
+/// A session's writer hands each durable batch's events here, and they are recorded in the
+/// outbox there and then, before the writer goes on. So a run's `run.ended` is in the outbox
+/// before its end can retire the session's recovery registration, and a crash can lose it only
+/// between the barrier and that write. Recording needs the machine account, which is known once
+/// the bus has connected; until then the events wait here, in order, and the publisher's loop
+/// records them. Once any wait, later ones queue behind them, keeping each session's order.
+pub struct StoreRunEvents {
+    store: Arc<dyn RunEventStore>,
+    waiting: Mutex<VecDeque<WaitingEvents>>,
+    /// Each session's epoch and the seq of its last durable record, which a `run.progress`
+    /// beat carries as its `seq`.
+    positions: Mutex<HashMap<BindIdentity, (String, u64)>>,
+}
+
+struct WaitingEvents {
+    session: BindIdentity,
+    epoch: String,
+    events: Vec<RunEvent>,
+}
+
+/// The most batches that wait for the account. Past it the oldest are dropped: a module that
+/// can't reach the bus for that long has readers on their fallback polls already.
+const STORE_EVENTS_WAITING_CAP: usize = 10_000;
+
+impl StoreRunEvents {
+    pub fn new(store: Arc<dyn RunEventStore>) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            waiting: Mutex::default(),
+            positions: Mutex::default(),
+        })
+    }
+
+    /// Records the batches waiting, oldest first: `false` while the account isn't known or a
+    /// recording failed, leaving the rest waiting.
+    fn record_waiting(&self, now_ms: u64) -> bool {
+        let mut waiting = self.waiting.lock().unwrap();
+        while let Some(batch) = waiting.front_mut() {
+            match self.store.record_run_events(
+                &batch.session,
+                &batch.epoch,
+                &mut batch.events,
+                now_ms,
+            ) {
+                Ok(true) => {
+                    waiting.pop_front();
+                    LIVENESS
+                        .store_batches_recorded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(target: "bus", %error, "could not record waiting run events; retrying on the next pass");
+                    break;
+                }
+            }
+        }
+        LIVENESS
+            .store_batches_waiting
+            .store(waiting.len() as u64, Ordering::Relaxed);
+        waiting.is_empty()
+    }
+
+    /// The session's epoch and last durable seq, while its writer has told one.
+    fn position(&self, session: &BindIdentity) -> Option<(String, u64)> {
+        self.positions.lock().unwrap().get(session).cloned()
+    }
+
+    /// Forgets the positions of sessions with no run in flight, which no beat names.
+    fn keep_positions(&self, active: &HashSet<BindIdentity>) {
+        self.positions
+            .lock()
+            .unwrap()
+            .retain(|session, _| active.contains(session));
+    }
+}
+
+impl broca_module::store_run_events::RunEventSink for StoreRunEvents {
+    fn durable(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        through: u64,
+        mut events: Vec<RunEvent>,
+    ) {
+        self.positions
+            .lock()
+            .unwrap()
+            .insert(session.clone(), (epoch.to_owned(), through));
+        if events.is_empty() {
+            return;
+        }
+        let mut waiting = self.waiting.lock().unwrap();
+        if waiting.is_empty() {
+            match self
+                .store
+                .record_run_events(session, epoch, &mut events, now_ms())
+            {
+                Ok(true) => {
+                    LIVENESS
+                        .store_batches_recorded
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(target: "bus", %error, "could not record run events; they wait for the publisher's next pass");
+                }
+            }
+        }
+        if waiting.len() >= STORE_EVENTS_WAITING_CAP {
+            waiting.pop_front();
+            LIVENESS
+                .store_batches_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(target: "bus", "too many run event batches wait for the bus; dropping the oldest");
+        }
+        waiting.push_back(WaitingEvents {
+            session: session.clone(),
+            epoch: epoch.to_owned(),
+            events,
+        });
+        LIVENESS
+            .store_batches_waiting
+            .store(waiting.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -447,6 +600,8 @@ pub struct Service {
     pub registry: LineageRegistry,
     pub connector: Option<Arc<dyn BusConnector>>,
     pub hints: Arc<Hints>,
+    /// The run events of sessions in the new storage, when they are installed.
+    pub store_events: Option<Arc<StoreRunEvents>>,
     pub stop: CancellationToken,
 }
 
@@ -459,6 +614,7 @@ impl Service {
             registry,
             connector,
             hints,
+            store_events,
             stop,
         } = self;
         let _ = METRICS.set(store.bus_metrics_arc());
@@ -567,6 +723,14 @@ impl Service {
                 }
                 let (mut heads, overflow) = hints.take();
                 recovery |= overflow;
+                if let Some(events) = store_events.as_ref().filter(|_| account_known) {
+                    let events = Arc::clone(events);
+                    let _ = broca_diagnostics::spawn_blocking(
+                        broca_diagnostics::JobKind::StoreWrite,
+                        move || events.record_waiting(now),
+                    )
+                    .await;
+                }
                 // Once an account is known, WAL projection continues during a broker outage.
                 if account_known && period_ready {
                     // Barriers whose projection failed on an earlier pass are tried again here,
@@ -755,7 +919,11 @@ impl Service {
                         continue;
                     }
                     progress_at = tokio::time::Instant::now() + Duration::from_secs(30);
-                    for session in registry.active_event_sessions() {
+                    let active = registry.active_event_sessions();
+                    if let Some(events) = &store_events {
+                        events.keep_positions(&active.iter().cloned().collect());
+                    }
+                    for session in active {
                         if let Ok(StatusResponse::Active { run_id, .. }) =
                             registry.status(&session).await
                         {
@@ -769,16 +937,32 @@ impl Service {
                                 if !progress.due(&run_id, tokio::time::Instant::now()) {
                                     continue;
                                 }
-                                let range = match wal.read_records_range(&session, 0, Some(0), None)
-                                {
-                                    Ok(r) => r,
-                                    Err(_) => continue,
+                                // A session in the new storage beats at its last durable
+                                // record; one in today's storage at its projection checkpoint.
+                                let stored = store_events
+                                    .as_ref()
+                                    .and_then(|events| events.position(&session));
+                                let (epoch, seq) = match stored {
+                                    Some(position) => position,
+                                    None => {
+                                        let range = match wal.read_records_range(
+                                            &session,
+                                            0,
+                                            Some(0),
+                                            None,
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(_) => continue,
+                                        };
+                                        let Some(epoch) = range.lineage_id else {
+                                            continue;
+                                        };
+                                        let epoch = epoch.to_string();
+                                        let seq =
+                                            store.bus_event_position(&session, &epoch).unwrap_or(0);
+                                        (epoch, seq)
+                                    }
                                 };
-                                let Some(epoch) = range.lineage_id else {
-                                    continue;
-                                };
-                                let epoch = epoch.to_string();
-                                let seq = store.bus_event_position(&session, &epoch).unwrap_or(0);
                                 if seq == 0 {
                                     continue;
                                 }
@@ -1188,6 +1372,7 @@ pub(crate) mod tests {
             ),
             connector: Some(Arc::new(Connector(bus.clone()))),
             hints: hints.clone(),
+            store_events: None,
             stop: stop.clone(),
         }
         .spawn()
@@ -1239,6 +1424,119 @@ pub(crate) mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    /// A session in the new storage hands its run events to [`StoreRunEvents`]. Before the
+    /// machine account is known they wait, in order; once it is, the first pass records them,
+    /// and later ones are recorded as they arrive. Each is published with the id, subject and
+    /// headers prefrontal checks, the ones a run event of today's storage carries.
+    #[test]
+    fn store_run_events_wait_for_the_account_then_publish_in_order() {
+        use broca_module::store_run_events::RunEventSink;
+        use broca_protocol::RunFinishReason;
+        use cortexkit_bus_trait::PublishReceipt;
+        use sha2::Digest as _;
+        let root = broca_test_support::scratch_root().join(format!("store-events-{}", now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
+        let events = StoreRunEvents::new(store.clone());
+        let session = BindIdentity::new(&root, "broca", "s1");
+        let session_ref = broca_core::wal_writer::agent_session_ref(&session);
+        let event = |seq: u64, detail: RunEventDetail| RunEvent {
+            v: 1,
+            session_ref: session_ref.clone(),
+            run_id: "r1".into(),
+            seq,
+            at_ms: now_ms(),
+            detail,
+        };
+        let epoch = "0123456789abcdef0123456789abcdef";
+        events.durable(
+            &session,
+            epoch,
+            2,
+            vec![event(2, RunEventDetail::Started {})],
+        );
+        events.durable(&session, epoch, 5, Vec::new());
+        assert!(
+            store.pending_bus_event().unwrap().is_none(),
+            "nothing is recorded before the account is known"
+        );
+        assert_eq!(events.position(&session), Some((epoch.to_owned(), 5)));
+        store.enable_bus_events("box_test").unwrap();
+        assert!(
+            events.record_waiting(now_ms()),
+            "the account is known: nothing waits"
+        );
+        events.durable(
+            &session,
+            epoch,
+            9,
+            vec![event(
+                9,
+                RunEventDetail::Ended {
+                    terminal: RunFinishReason::Completed,
+                    error_class: None,
+                    structured_output: Some(
+                        broca_protocol::run_events::StructuredOutputStatus::Absent,
+                    ),
+                },
+            )],
+        );
+        let mut published = Vec::new();
+        while let Some(publication) = store.pending_bus_event().unwrap() {
+            store
+                .acknowledge_bus_event(&publication, PublishReceipt::new(1, false), now_ms())
+                .unwrap();
+            published.push(publication);
+        }
+        let shapes: Vec<_> = published
+            .iter()
+            .map(|p| {
+                (
+                    p.subject.clone(),
+                    p.headers["kind"].clone(),
+                    p.headers["run_id"].clone(),
+                    p.headers["session_ref"].clone(),
+                    p.headers["epoch"].clone(),
+                    p.headers["seq"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                (
+                    "ck.box_test.event.broca.run.started.v1".to_owned(),
+                    "run.started".to_owned(),
+                    "r1".to_owned(),
+                    session_ref.clone(),
+                    epoch.to_owned(),
+                    "2".to_owned(),
+                ),
+                (
+                    "ck.box_test.event.broca.run.ended.v1".to_owned(),
+                    "run.ended".to_owned(),
+                    "r1".to_owned(),
+                    session_ref.clone(),
+                    epoch.to_owned(),
+                    "9".to_owned(),
+                ),
+            ]
+        );
+        // The id prefrontal dedupes on: the SHA-256 of the JSON Canonicalization Scheme (RFC
+        // 8785) encoding of `[epoch, run_id, seq, subject, null]`.
+        for publication in &published {
+            let seq: u64 = publication.headers["seq"].parse().unwrap();
+            let key =
+                serde_jcs::to_vec(&(epoch, "r1", seq, &publication.subject, None::<u64>)).unwrap();
+            let expected: String = sha2::Sha256::digest(key)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(publication.event_key, expected);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(start_paused = true)]

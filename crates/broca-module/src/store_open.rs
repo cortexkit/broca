@@ -74,6 +74,9 @@ pub struct StoreRuntime {
     settled: Arc<crate::store_status::SettledRuns>,
     /// Views of sessions no actor holds, kept by position (see `store_reads`).
     views: crate::store_reads::ViewCache<crate::store_read::StoredView<LocalBackend>>,
+    /// Where each session's run events go once their records are durable; none in tests and
+    /// while run events are off.
+    run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
     /// Reads of a log's file, but for those of only its checkpoint frame, in tests.
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) log_reads: Arc<std::sync::atomic::AtomicUsize>,
@@ -164,6 +167,7 @@ impl StoreRuntime {
             executor,
             idle_ttl,
             billing: None,
+            run_events: None,
             import_roots: Arc::new(crate::store_import::ImportRoots::with_default(
                 None,
                 Some(&crate::store_import::default_import_folder(state_root)),
@@ -323,6 +327,12 @@ impl StoreRuntime {
     /// usage export, as today's runs are written.
     pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {
         self.billing = Some(billing);
+        self
+    }
+
+    /// Sessions opened from now on hand their run events to `sink`.
+    pub fn with_run_events(mut self, sink: Arc<dyn crate::store_run_events::RunEventSink>) -> Self {
+        self.run_events = Some(sink);
         self
     }
 
@@ -778,6 +788,9 @@ impl StoreRuntime {
         if let Some(billing) = &self.billing {
             actor = actor.with_billing(billing.clone());
         }
+        if let Some(sink) = &self.run_events {
+            actor = actor.with_run_events(Arc::clone(sink));
+        }
         let first_episode = actor
             .first_episode_handle(&registry)
             .map_err(OpenError::Open)?;
@@ -824,6 +837,8 @@ pub struct StoreRuntimeSetup {
     pub import_roots: Option<Vec<PathBuf>>,
     /// Where spend facts are written (see [`StoreRuntime::with_billing`]).
     pub billing: Option<crate::store_billing::StoreBilling>,
+    /// Where run events go (see [`StoreRuntime::with_run_events`]).
+    pub run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
 }
 
 impl StoreRuntimeSetup {
@@ -862,6 +877,9 @@ impl StoreRuntimeSetup {
         let mut runtime = runtime.with_import_roots(self.import_roots.clone());
         if let Some(billing) = &self.billing {
             runtime = runtime.with_billing(billing.clone());
+        }
+        if let Some(sink) = &self.run_events {
+            runtime = runtime.with_run_events(Arc::clone(sink));
         }
         runtime
     }
