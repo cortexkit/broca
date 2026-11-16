@@ -20,7 +20,11 @@ pub fn register_candidate(root: &Path, addr: &SessionAddr) -> std::io::Result<()
 
 /// Whether a session's stored state leaves its open-time recovery anything to do: queued sends,
 /// usage billing still owed (when `billing` runs), an unfinished run that opening acts on, or a
-/// durable head that warms itself and so opens once at boot to rebuild its warming timer.
+/// durable head that warms itself and so opens once at boot to rebuild its warming timer. The
+/// boot sweep opens such a head only while its cache is live (see
+/// [`LineageRegistry::idle_cache_live`]). Installing a converted old session
+/// ([`retire_settled_install`]) happens with no module to ask for the route's cache policy, so
+/// it keeps such a head registered and leaves the decision to the next boot's sweep.
 ///
 /// The one unfinished run opening leaves as it is: a run paused for sign-in on an account
 /// routing didn't choose. Only a person signing in or a caller's own command moves it, so
@@ -34,13 +38,17 @@ pub(crate) fn needs_recovery(
     billing: bool,
     parts: Option<&dyn broca_session_loop::parts::Parts>,
 ) -> bool {
-    owes_recovery(operations, billing, parts)
-        || operations.run.as_ref().is_some_and(|run| {
-            run.start.as_ref().is_some_and(|start| {
-                start.session_class.as_deref() == Some("head")
-                    && start.keep_warm.as_ref() == Some(&serde_json::json!("auto"))
-            })
+    owes_recovery(operations, billing, parts) || warms_itself(operations)
+}
+
+/// Whether the session's latest run started a head that warms its cache while idle.
+fn warms_itself(operations: &broca_session_store::fold::operations::Operations) -> bool {
+    operations.run.as_ref().is_some_and(|run| {
+        run.start.as_ref().is_some_and(|start| {
+            start.session_class.as_deref() == Some("head")
+                && start.keep_warm.as_ref() == Some(&serde_json::json!("auto"))
         })
+    })
 }
 
 /// [`needs_recovery`] without a durable head's warming timer: what keeps a session registered
@@ -157,7 +165,56 @@ pub struct StoreRecoverySweep {
     pub failed: Vec<String>,
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 impl crate::registry::LineageRegistry {
+    /// Whether a finished head that warms itself still has a cache to keep warm at `now_ms`:
+    /// its last cached request is within the cache lifetime its route declares. Opening it then
+    /// rebuilds its warming timer. Past that, or when the run's config or its route's cache
+    /// policy can't be read, its actor would arm no timer (see `StoreActor::idle_warm_due`), so
+    /// opening it at boot would do nothing but load it. Every head started on a route that keeps
+    /// its cache warm was opened at each boot, however long ago it last ran: 860 at one restart.
+    fn idle_cache_live(
+        &self,
+        operations: &broca_session_store::fold::operations::Operations,
+        parts: &dyn broca_session_loop::parts::Parts,
+        now_ms: u64,
+    ) -> bool {
+        let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_some()) else {
+            return false;
+        };
+        let (Some(start), Some(send)) = (run.start.as_ref(), operations.last_cache_send.as_ref())
+        else {
+            return false;
+        };
+        let Ok(config) = crate::store_actor::warm_run_config(run, start, parts) else {
+            return false;
+        };
+        let Some(ttl_ms) = self
+            .cache_declaration(&config)
+            .filter(|declaration| declaration.warm.is_ok())
+            .and_then(|declaration| declaration.ttl_ms)
+            .filter(|ttl| *ttl > 0)
+        else {
+            return false;
+        };
+        broca_core::cache_warm::check_warm_expiry(
+            Some(broca_core::CacheClockReading {
+                last_sent_at_ms: send.sent_at_ms,
+                ttl_ms: Some(ttl_ms),
+                prefix_tokens: None,
+            }),
+            now_ms,
+        )
+        .is_ok()
+    }
+
     /// Opens candidate store sessions under the ordinary lease in the background. The
     /// actor's open-time recovery seals crash orphans, parks held calls, and finishes pending
     /// durable tool-batch writes before it answers the status command. Finished automatic heads also open
@@ -233,12 +290,16 @@ impl crate::registry::LineageRegistry {
                     .await
                     {
                         Ok(view)
-                            if !needs_recovery(
-                                &view.operations,
-                                runtime.billing.is_some(),
-                                Some(runtime.parts_for(class, cipher)
-                                    as &dyn broca_session_loop::parts::Parts),
-                            ) =>
+                            if {
+                                let parts = runtime.parts_for(class, cipher)
+                                    as &dyn broca_session_loop::parts::Parts;
+                                !owes_recovery(
+                                    &view.operations,
+                                    runtime.billing.is_some(),
+                                    Some(parts),
+                                ) && !(warms_itself(&view.operations)
+                                    && self.idle_cache_live(&view.operations, parts, now_ms()))
+                            } =>
                         {
                             if registered.contains(&addr.0) {
                                 super::recovery_index::remove(&root, &addr)

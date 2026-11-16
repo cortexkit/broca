@@ -4900,6 +4900,7 @@ mod retries;
 mod scopes;
 mod service_tier;
 mod warm;
+pub(crate) use warm::run_config as warm_run_config;
 
 #[cfg(test)]
 mod account_move_tests;

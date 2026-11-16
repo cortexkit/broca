@@ -335,8 +335,12 @@ fn attempted_step(id: &str, text: &str, sent_at_ms: u64) -> Vec<NormalizedEvent>
     step
 }
 
-#[tokio::test]
-async fn startup_rearms_an_untouched_automatic_head() {
+/// An automatic head whose last request reached the provider at `sent_at_ms`, run to its end and
+/// its module restarted: what the restarted module's recovery sweep did, and whether the head
+/// has its idle warming timer back.
+async fn reboot_an_automatic_head(
+    sent_at_ms: u64,
+) -> (crate::store_open::recovery::StoreRecoverySweep, bool) {
     let dir = scratch();
     let config = warmable();
     let sent = Arc::default();
@@ -345,7 +349,7 @@ async fn startup_rearms_an_untouched_automatic_head() {
         true,
         true,
         Some(&config),
-        vec![attempted_step("a1", "hello", crate::actor::epoch_ms())],
+        vec![attempted_step("a1", "hello", sent_at_ms)],
         &sent,
         Cipher::None,
     )
@@ -376,11 +380,10 @@ async fn startup_rearms_an_untouched_automatic_head() {
             .unwrap(),
         SendOutcome::Active { .. }
     ));
-    broca_test_support::wait_until("the automatic head is idle", || async {
-        if registry.handle().has_idle_warm(&key) {
-            Ok(())
-        } else {
-            Err("no idle warm timer".into())
+    broca_test_support::wait_until("the automatic head's run ends", || async {
+        match registry.route_status(&key).await {
+            Ok(LineageStatus::Idle) => Ok(()),
+            other => Err(format!("{other:?}")),
         }
     })
     .await;
@@ -399,13 +402,28 @@ async fn startup_rearms_an_untouched_automatic_head() {
     assert!(!reboot.handle().has_idle_warm(&key));
     let sweep = reboot.recover_store_crash_orphans().await.unwrap();
     assert!(sweep.failed.is_empty(), "{sweep:?}");
-    assert_eq!(sweep.recovered, 1);
-    assert!(
-        reboot.handle().has_idle_warm(&key),
-        "startup restores the timer without a session command"
-    );
+    let warm = reboot.handle().has_idle_warm(&key);
     assert!(reboot.stop_and_seal().await);
     std::fs::remove_dir_all(dir).unwrap();
+    (sweep, warm)
+}
+
+#[tokio::test]
+async fn startup_rearms_an_untouched_automatic_head() {
+    let (sweep, warm) = reboot_an_automatic_head(crate::actor::epoch_ms()).await;
+    assert_eq!(sweep.recovered, 1);
+    assert!(warm, "startup restores the timer without a session command");
+}
+
+/// A head whose cache has expired has nothing to keep warm, so the sweep leaves it closed.
+/// Opening it would only load it: every such head was opened at each restart, 860 at one.
+#[tokio::test]
+async fn startup_leaves_closed_an_automatic_head_whose_cache_expired() {
+    let two_hours_ago = crate::actor::epoch_ms() - 2 * 60 * 60 * 1000;
+    let (sweep, warm) = reboot_an_automatic_head(two_hours_ago).await;
+    assert_eq!(sweep.recovered, 0, "{sweep:?}");
+    assert!(sweep.inspected >= 1, "the sweep read the head: {sweep:?}");
+    assert!(!warm);
 }
 
 /// The refusals decided before anything is sent answer alike: a warm naming a lineage, a module

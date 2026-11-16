@@ -464,7 +464,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
 
 /// The config `run` runs under: the one its start `start` froze, with the refreezes it recorded
 /// since applied, as today's `latest_episode_config` reads an episode's config from its log.
-pub(super) fn run_config(
+pub(crate) fn run_config(
     run: &broca_session_store::fold::operations::Run,
     start: &broca_session_store::record::RunStart,
     parts: &dyn broca_session_loop::parts::Parts,
