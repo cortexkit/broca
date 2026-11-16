@@ -241,6 +241,8 @@ fn a_refrozen_persona_reaches_the_refusal_fallbacks_config() {
 struct OffersAccount {
     credential_id: &'static str,
     account: &'static str,
+    /// How long routing takes to answer.
+    answer_after: Duration,
     requests: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
@@ -255,6 +257,7 @@ impl broca_module_serve::account_routing::RoutingTransport for OffersAccount {
             .lock()
             .unwrap()
             .push(serde_json::from_slice(&body).unwrap());
+        tokio::time::sleep(self.answer_after).await;
         let valid_until_ms = epoch_millis().max(0) as u64 + 300_000;
         Ok(Ok(serde_json::to_vec(&serde_json::json!({"result": {
             "kind": "offer",
@@ -278,6 +281,19 @@ async fn a_chatgpt_wall_offered_b(
     Vec<serde_json::Value>,
     Vec<(String, serde_json::Value)>,
 ) {
+    a_chatgpt_wall_offered_b_after(label, vault_account, Duration::ZERO).await
+}
+
+/// [`a_chatgpt_wall_offered_b`], with routing taking `answer_after` to answer.
+async fn a_chatgpt_wall_offered_b_after(
+    label: &str,
+    vault_account: &'static str,
+    answer_after: Duration,
+) -> (
+    broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>,
+    Vec<serde_json::Value>,
+    Vec<(String, serde_json::Value)>,
+) {
     let root = fresh_vault_root(label);
     let daemon = CapturingVaultDaemon::start_expiring(
         &root,
@@ -291,6 +307,7 @@ async fn a_chatgpt_wall_offered_b(
     let routing = Arc::new(OffersAccount {
         credential_id: "chatgpt:openai:second",
         account: "chatgpt-b",
+        answer_after,
         requests: Default::default(),
     });
     executor.routing = Some(Arc::new(
@@ -393,6 +410,24 @@ async fn the_executor_moves_to_an_offer_the_vault_serves_for_the_offered_account
         .iter()
         .any(|(method, params)| method == "credential.get_scoped"
             && params["credential_id"] == "chatgpt:openai:second"));
+}
+
+/// Through the executor: an offer routing takes 3 s to make is still taken. A run stopped at a
+/// wall waits for routing longer than an admission does (on 16 Nov a 3.2 s offer arrived after
+/// the admission budget and the run ended with it unused).
+#[tokio::test]
+async fn the_executor_waits_for_an_offer_slower_than_an_admission_budget() {
+    let (answer, asked, _) = a_chatgpt_wall_offered_b_after(
+        "move-offer-slow",
+        "chatgpt-b",
+        Duration::from_secs(3),
+    )
+    .await;
+    let broca_session_loop::account_move::Answer::Move(moved) = answer else {
+        panic!("the slow offer is taken");
+    };
+    assert_eq!(moved.account, "chatgpt-b");
+    assert_eq!(asked.len(), 1, "{asked:#?}");
 }
 
 /// Through the executor: an offer whose credential the vault serves for another account than

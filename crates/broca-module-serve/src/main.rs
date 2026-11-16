@@ -3276,7 +3276,7 @@ mod executor {
             cortexkit_role_routing::account_continue::ContinueOffer,
             broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>,
         > {
-            use broca_module_serve::account_routing::{ContinueOutcome, ADMISSION_BUDGET};
+            use broca_module_serve::account_routing::{ContinueOutcome, CONTINUE_BUDGET};
             use broca_session_loop::account_move::Answer;
             use cortexkit_role_routing::account_continue::ContinueAnswer;
             let Some(routing) = self.executor.routing.as_ref() else {
@@ -3296,7 +3296,7 @@ mod executor {
                 .lock()
                 .unwrap()
                 .entry(wall.attempt_seq)
-                .or_insert_with(|| tokio::time::Instant::now() + ADMISSION_BUDGET);
+                .or_insert_with(|| tokio::time::Instant::now() + CONTINUE_BUDGET);
             let outcome = routing.account_continue_if_served(&request, deadline).await;
             if wall.limit_window == "signed_out"
                 && !matches!(

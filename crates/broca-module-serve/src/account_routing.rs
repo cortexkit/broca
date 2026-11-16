@@ -85,6 +85,13 @@ pub const ACCOUNT_NOT_AUTHORIZED: &str = "account_not_authorized";
 /// until the admission answers. A route to routing that is still opening when the budget runs
 /// out keeps opening in the background, so the next admission finds it ready.
 pub const ADMISSION_BUDGET: Duration = Duration::from_millis(1500);
+/// The most a run stopped at an account's usage wall waits for routing to answer its
+/// continuation request. Unlike an admission, no caller waits on this reply and the session's
+/// actor is free: the run is already stopped, and giving up ends it, which costs far more than
+/// waiting. Routing answers a repeated request on the same selection idempotently, so a late
+/// answer is safe. On 16 Nov a weekly wall's offer took 3.2 s and arrived after a 1.5 s budget,
+/// so the run ended with the offer unused.
+pub const CONTINUE_BUDGET: Duration = Duration::from_secs(10);
 /// The most one report waits for routing's reply. Reports are sent from a task of their own,
 /// so this bounds how far a stuck routing module can delay the NEXT report, never a run.
 pub const OBSERVE_BUDGET: Duration = Duration::from_secs(5);
