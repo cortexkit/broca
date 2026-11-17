@@ -531,6 +531,9 @@ impl<W: Writer> Writer for Before<'_, W> {
     async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
         self.writer.entry_by_mid(mid).await
     }
+    async fn entry_at(&self, ordinal: u64) -> Result<Option<StoredEntry>, SessionError> {
+        self.writer.entry_at(ordinal).await
+    }
     async fn entries_by_mid(&self, mids: &[String]) -> Result<Vec<StoredEntry>, SessionError> {
         self.writer.entries_by_mid(mids).await
     }

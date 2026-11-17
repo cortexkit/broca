@@ -1669,6 +1669,8 @@ enum Ride {
     Cut(u64),
     /// A view that cuts through the first ordinal and shortens the tool output at the second.
     CutAndTrim(u64, u64),
+    /// No view: the ride is answered `nothing`, as an empty script answers every ride.
+    Nothing,
 }
 
 /// A compaction provider that answers from a script and records every call, so both loops must
@@ -1945,7 +1947,7 @@ impl broca_core::CompactionPlane for CompactionSpy {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
             "compaction.ride" => match self.rides.lock().unwrap().pop_front() {
-                None => json!({"answer": "nothing"}),
+                None | Some(Ride::Nothing) => json!({"answer": "nothing"}),
                 Some(ride) => {
                     use cortexkit_role_compaction::view::{Edit, EditOp, View};
                     let mid = |ordinal: u64| self.mids.lock().unwrap()[&ordinal].clone();
@@ -1974,6 +1976,7 @@ impl broca_core::CompactionPlane for CompactionSpy {
                         Ride::CutAndTrim(cut, tool) => {
                             vec![EditOp::Cut { through: mid(cut) }, trim(tool)]
                         }
+                        Ride::Nothing => unreachable!("answered above"),
                     };
                     let view = View::seal(
                         version,
@@ -2442,6 +2445,13 @@ impl Writer for Recording<'_, '_> {
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Writer::entry_by_mid(&*self.session, mid).await
+    }
+
+    async fn entry_at(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        Writer::entry_at(&*self.session, ordinal).await
     }
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
@@ -6802,6 +6812,94 @@ async fn a_compacted_run_whose_tools_change_reports_the_signed_floor_alike() {
             })
             .collect();
         assert_eq!(floors.len(), 2, "{floors:?}");
+    }
+}
+
+/// The signed floor goes on being stated after a cut seals the entry it goes through, when no
+/// view names that entry. The second run's tools differ from the first's, so the floor goes
+/// through the first run's answer (the second run's first step rides, and gets no view). The
+/// second run's tool call returns more than the window holds, so the provider refuses its next
+/// request as too long; the step rides `over_limit`, and the view cuts through the second run's
+/// question and shortens the long output. The cut seals the first run's answer, and the view
+/// names only the question and the call, so the floor's entry is in no transcript a call holds.
+/// The second run spans the cut and stays in the window, so the floor doesn't move. From the
+/// first compaction call that states a floor onward, every Setup, notice and ride states that
+/// same floor.
+#[tokio::test]
+async fn the_signed_floor_is_stated_after_its_entry_is_sealed() {
+    let mut refreshed = compacted_scenario(Vec::new()).tools;
+    refreshed[0].description = "read something, skipping binary content".into();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let model = "claude-opus-5-5";
+    let runs = ["r1", "r2", "r3"].map(|run| format!("{run}@{model}"));
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 3_000,
+                    rides: vec![Ride::Nothing, Ride::CutAndTrim(3, 4)],
+                })),
+                RUN_TOOLS.scope(
+                    runs[1..]
+                        .iter()
+                        .map(|run| (run.clone(), refreshed.clone()))
+                        .collect(),
+                    NEW_CALLS.scope(
+                        Arc::clone(&seen),
+                        Box::pin(compare_runs_in(
+                            compacted_scenario(vec![
+                                text_step("a1", "one"),
+                                answer(
+                                    "a2",
+                                    vec![call("c1", "big", json!({}))],
+                                    FinishReason::ToolCalls,
+                                ),
+                                text_step("a3", "two"),
+                                text_step("a4", "three"),
+                            ]),
+                            &[
+                                (runs[0].as_str(), vec![user("first")]),
+                                (runs[1].as_str(), vec![user("second")]),
+                                (runs[2].as_str(), vec![user("third")]),
+                            ],
+                        )),
+                    ),
+                ),
+            ),
+        )
+        .await;
+    let comparisons = seen.lock().unwrap();
+    assert!(!comparisons.is_empty());
+    for calls in comparisons.iter() {
+        let compaction: Vec<_> = calls
+            .iter()
+            .filter(|call| call.starts_with("compaction."))
+            .collect();
+        let first_floor = compaction
+            .iter()
+            .position(|call| call.contains("\"signed_floor\""))
+            .expect("a call states the signed floor");
+        // The cutting ride is the second; calls follow it, with the floor's entry sealed.
+        let cut = compaction
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.starts_with("compaction.ride"))
+            .nth(1)
+            .map(|(at, _)| at)
+            .expect("the second run rides over the limit");
+        assert!(compaction.len() > cut + 1, "{compaction:#?}");
+        let floors: std::collections::BTreeSet<_> = compaction[first_floor..]
+            .iter()
+            .map(|call| {
+                let at = call
+                    .find("\"signed_floor\"")
+                    .unwrap_or_else(|| panic!("a later call without the floor: {call}"));
+                call[at..].split('}').next().unwrap().to_owned()
+            })
+            .collect();
+        // The tools change once, so there is one floor.
+        assert_eq!(floors.len(), 1, "{floors:?}");
     }
 }
 

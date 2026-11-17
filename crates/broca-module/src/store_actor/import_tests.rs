@@ -1300,6 +1300,12 @@ impl Writer for Unsealed<'_> {
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Writer::entry_by_mid(&*self.0, mid).await
     }
+    async fn entry_at(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        Writer::entry_at(&*self.0, ordinal).await
+    }
 }
 
 /// A model step answering `text` in two text parts, `Reply to <text>` and `More on <text>`.

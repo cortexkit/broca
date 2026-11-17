@@ -35,7 +35,7 @@ pub fn request_options(
             &transcript.entries,
             false,
             None,
-            transcript.signed_floor,
+            super::host::floor_entry(transcript.signed_floor, &transcript.entries),
         )?;
         prompt_view_with_rides(
             &boundary.prompt,

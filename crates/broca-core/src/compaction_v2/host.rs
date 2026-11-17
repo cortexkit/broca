@@ -76,14 +76,13 @@ pub fn context_of(config: &Frozen<'_>, manifest: Option<&PlanManifest>) -> SendC
 
 /// The conditions a notice, ride or view check states. Entries retain billed usage; the
 /// host-only fill overrides it only for the newest step that reported input usage.
-/// `signed_floor` is the session's signed floor as an ordinal ([`crate::signed_floor`]); the
-/// conditions carry it as the entry it goes through ([`signed_floor`]).
+/// `signed_floor` is the id of the entry the session's signed floor goes through ([`signed_floor`]).
 pub fn conditions(
     config: &RunConfig,
     entries: &[Entry],
     chained: bool,
     newest_step_fill: Option<(&str, u64)>,
-    signed_floor: Option<u64>,
+    signed_floor: Option<&str>,
 ) -> Result<Conditions, String> {
     // Today's loop doesn't tie its reading to the view its request was rendered under, so its
     // conditions never name one (`last_prompt_view` stays absent).
@@ -99,29 +98,36 @@ pub fn conditions(
 }
 
 /// The session's signed floor as the compaction contract names it (`signed_floor.through`): the
-/// entry it goes through, by its stable id. `floor` is the ordinal of the first message whose
-/// signed reasoning requests still send ([`crate::signed_floor::SignedFloor::floor`]), so the
-/// floor goes through the message before it, whose entry's one-based ordinal is that same
-/// number. This is the one place broca turns its floor into what the compaction provider and
-/// the view checks read.
+/// entry it goes through, by its stable id. `through` is that entry's id. The floor itself is
+/// the ordinal of the first message whose signed reasoning requests still send
+/// ([`crate::signed_floor::SignedFloor::floor`]), so the floor goes through the message before
+/// it, whose entry's one-based ordinal is that same number; the caller finds that entry
+/// wherever the session holds it, sealed history included, so the floor is stated the same on
+/// every call, whatever entries the call has in hand. This is the one place broca turns its
+/// floor into what the compaction provider and the view checks read.
 ///
-/// `None` when no run changed the tool set, when the change came before any message (there is
-/// no earlier reasoning to drop), when `rules` say the model doesn't bind signed parts to the
-/// request prefix (the floor then constrains nothing), or when `entries` don't hold the entry.
-/// An absent floor keeps every view check as strict as it was before floors existed.
+/// `None` when the session has no floor (no run changed the tool set, or the change came before
+/// any message, so there is no earlier reasoning to drop), or when `rules` say the model doesn't
+/// bind signed parts to the request prefix (the floor then constrains nothing). An absent floor
+/// keeps every view check as strict as it was before floors existed.
 pub fn signed_floor(
-    floor: Option<u64>,
-    entries: &[Entry],
+    through: Option<&str>,
     rules: &ProviderRules,
 ) -> Option<cortexkit_role_compaction::SignedFloor> {
     if rules.signed_parts == SignedParts::None {
         return None;
     }
+    through.map(cortexkit_role_compaction::SignedFloor::new)
+}
+
+/// The id of the entry with ordinal `floor` among `entries`, for a caller that holds every
+/// entry its floor can name. `None` when `floor` is absent or zero, or `entries` don't hold it.
+pub fn floor_entry(floor: Option<u64>, entries: &[Entry]) -> Option<&str> {
     let through = floor.filter(|floor| *floor > 0)?;
     entries
         .iter()
         .find(|entry| entry.ordinal == through)
-        .map(|entry| cortexkit_role_compaction::SignedFloor::new(entry.mid.as_str()))
+        .map(|entry| entry.mid.as_str())
 }
 
 /// The floor the view checks honour under `conditions`: signed parts it covers are already
@@ -144,7 +150,7 @@ pub fn conditions_of(
     entries: &[Entry],
     chained: bool,
     newest_step_fill: Option<(&str, u64)>,
-    signed_floor: Option<u64>,
+    signed_floor: Option<&str>,
     prompt_view: &dyn Fn(&Entry) -> Option<u64>,
     statement_seq: Option<u64>,
 ) -> Result<Conditions, String> {
@@ -187,7 +193,7 @@ pub fn conditions_of(
     conditions.last_prompt_view = reading.and_then(|(entry, _)| prompt_view(entry));
     // Every condition carries the floor; the runtime sends it only to a provider that declares
     // it reads one (`runtime::Runtime`).
-    conditions.signed_floor = self::signed_floor(signed_floor, entries, &conditions.rules);
+    conditions.signed_floor = self::signed_floor(signed_floor, &conditions.rules);
     Ok(conditions)
 }
 
@@ -377,7 +383,7 @@ pub async fn notice(
         &transcript.entries,
         false,
         transcript.newest_step_fill(),
-        transcript.signed_floor,
+        floor_entry(transcript.signed_floor, &transcript.entries),
         &|_| None,
         frames.last().map(|frame| frame.seq),
     )?;

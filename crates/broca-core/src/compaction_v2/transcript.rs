@@ -27,6 +27,12 @@ impl Transcript {
             .as_ref()
             .map(|(mid, fill)| (mid.as_str(), *fill))
     }
+
+    /// The id of the entry the signed floor names, which a projection that replayed every run
+    /// holds among its entries.
+    pub fn floor_entry(&self) -> Option<&str> {
+        super::host::floor_entry(self.signed_floor, &self.entries)
+    }
 }
 
 pub fn project(records: &[FramedRecord], lineage: &str) -> Result<Transcript, String> {

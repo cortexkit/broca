@@ -920,7 +920,7 @@ fn conditions_for<W: Writer>(
     admission: &Admission,
     entries: &[cortexkit_role_compaction::read::Entry],
     chained: bool,
-    signed_floor: Option<u64>,
+    signed_floor: Option<&str>,
 ) -> Result<cortexkit_role_compaction::notice::Conditions, String> {
     let conversation = writer.conversation();
     let operations = writer.operations();
@@ -955,6 +955,29 @@ fn conditions_for<W: Writer>(
     // (`v2::views::check_boundary`).
     conditions.accepts_images = Some(false);
     Ok(conditions)
+}
+
+/// The id of the entry the session's signed floor goes through (`floor` is the floor's ordinal,
+/// [`crate::run::signed_floor`]), wherever the session holds that entry: among `entries` when
+/// they hold it, else read from the session, sealed history included. The floor is stated by
+/// this id on every notice, ride and check. Were it looked for only among the entries a call
+/// has in hand, the floor would come and go with them, and vanish once its entry is sealed;
+/// a provider reads each such absence as no floor at all.
+pub async fn floor_through<W: Writer>(
+    writer: &W,
+    entries: &[cortexkit_role_compaction::read::Entry],
+    floor: Option<u64>,
+) -> Result<Option<String>, LoopError> {
+    let Some(through) = floor.filter(|floor| *floor > 0) else {
+        return Ok(None);
+    };
+    if let Some(mid) = v2::host::floor_entry(Some(through), entries) {
+        return Ok(Some(mid.to_owned()));
+    }
+    Ok(writer
+        .entry_at(through)
+        .await?
+        .and_then(|entry| entry.state.facts.as_ref().map(|facts| facts.mid.clone())))
 }
 
 /// The version of the view the request that `entry` reports the usage of was rendered under,
@@ -1016,9 +1039,10 @@ pub async fn apply_boundary<W: Writer, P, T>(
     signed_floor: Option<u64>,
 ) -> Result<Result<(), String>, LoopError> {
     let entries = transcript(writer, ctx).await?.entries;
+    let floor = floor_through(writer, &entries, signed_floor).await?;
     // The last serving model's fill isn't measured on this storage yet, so the newest entry's
     // own reported prompt stands for the session's fill.
-    let conditions = match conditions_for(writer, admission, &entries, false, signed_floor) {
+    let conditions = match conditions_for(writer, admission, &entries, false, floor.as_deref()) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Err(message)),
     };
@@ -1073,13 +1097,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
     // The request carries the session's signed floor, which the compaction calls report.
-    let conditions = match conditions_for(
-        writer,
-        admission,
-        &entries,
-        chained,
-        opts.render_episodes.signed_floor,
-    ) {
+    let floor = floor_through(writer, &entries, opts.render_episodes.signed_floor).await?;
+    let conditions = match conditions_for(writer, admission, &entries, chained, floor.as_deref()) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Send::Unavailable(message)),
     };
@@ -1196,7 +1215,8 @@ pub async fn notice<W: Writer, P, T>(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .configure(&frozen(admission), admission.manifest.as_deref());
-    let conditions = conditions_for(writer, admission, &entries, false, signed_floor)
+    let floor = floor_through(writer, &entries, signed_floor).await?;
+    let conditions = conditions_for(writer, admission, &entries, false, floor.as_deref())
         .map_err(LoopError::Parts)?;
     let applied = ctx.session.state.lock().await.applied_identity();
     let mut setup =

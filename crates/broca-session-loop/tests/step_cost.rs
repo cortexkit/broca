@@ -213,6 +213,13 @@ impl Writer for Counting<'_, '_> {
         Writer::entry_by_mid(&*self.session, mid).await
     }
 
+    async fn entry_at(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        Writer::entry_at(&*self.session, ordinal).await
+    }
+
     async fn entries_by_mid(
         &self,
         mids: &[String],

@@ -153,6 +153,14 @@ pub trait Writer {
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError>;
 
+    /// The entry at `ordinal` (counting from 1 over the whole conversation), read back from
+    /// sealed history when it's no longer in the window. `None` when the conversation has
+    /// placed no message there.
+    async fn entry_at(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError>;
+
     /// The entries whose message ids `mids` lists, in ordinal order, each once; an id no entry
     /// has is left out. A session reads named entries close to each other in one pass.
     async fn entries_by_mid(
@@ -342,6 +350,16 @@ impl<B: SessionBackend> Writer for Session<B> {
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Session::entry_by_mid(self, mid).await
+    }
+
+    async fn entry_at(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        Ok(Session::entries(self, ordinal, 1)
+            .await?
+            .into_iter()
+            .find(|entry| entry.ordinal == ordinal))
     }
 
     async fn entries_by_mid(

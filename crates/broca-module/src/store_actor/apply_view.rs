@@ -144,14 +144,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .await
         .map_err(|error| format!("{error:?}"))?;
-        let conditions = v2::host::conditions(&config, &entries, false, None, floor)?;
+        let floor = broca_session_loop::compaction::floor_through(&self.session, &entries, floor)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let conditions = v2::host::conditions(&config, &entries, false, None, floor.as_deref())?;
         #[cfg(test)]
         self.check_alike_against_every_entry(
             &entries,
             state.latest(),
             received.view(),
             &config,
-            floor,
+            floor.as_deref(),
         )
         .await?;
         let journal = ActorJournal {
@@ -264,7 +267,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         latest: Option<&ProviderView>,
         view: &ProviderView,
         config: &broca_wal::RunConfig,
-        floor: Option<u64>,
+        floor: Option<&str>,
     ) -> Result<(), String> {
         if crate::store_read::transcript_len(&self.session) > CROSS_CHECK_ENTRIES {
             return Ok(());

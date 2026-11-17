@@ -289,7 +289,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .await
         .map_err(|error| format!("{error:?}"))?;
-        let conditions = v2::host::conditions(&config, &entries, false, None, floor)?;
+        let floor = broca_session_loop::compaction::floor_through(&self.session, &entries, floor)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let conditions = v2::host::conditions(&config, &entries, false, None, floor.as_deref())?;
         if crate::store_entries::frozen_provider(&self.parts, &self.session)?.is_none() {
             return v2::shown::next_request(&Default::default(), &entries, &conditions);
         }

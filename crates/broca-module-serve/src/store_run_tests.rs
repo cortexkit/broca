@@ -128,6 +128,7 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::RunStart { .. } => "run start",
         Request::ToolIntent { .. } => "tool intent",
         Request::EntryByMid { .. } => "entry by mid",
+        Request::EntryAt { .. } => "entry at",
         Request::EntriesByMid { .. } => "entries by mid",
         Request::SealedDerived { .. } => "sealed derived",
         Request::KeepSealedDerived { .. } => "keep sealed derived",

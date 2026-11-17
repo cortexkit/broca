@@ -448,6 +448,13 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.entry_by_mid(mid).await
     }
 
+    async fn entry_at(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        self.inner.entry_at(ordinal).await
+    }
+
     async fn entries_by_mid(
         &self,
         mids: &[String],

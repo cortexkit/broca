@@ -6166,7 +6166,7 @@ where
                 &transcript.entries,
                 false,
                 None,
-                transcript.signed_floor,
+                transcript.floor_entry(),
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {
@@ -6390,7 +6390,7 @@ where
                 &transcript.entries,
                 chained,
                 transcript.newest_step_fill(),
-                transcript.signed_floor,
+                transcript.floor_entry(),
                 &|_| None,
                 frames.last().map(|frame| frame.seq),
             ) {

@@ -749,7 +749,8 @@ async fn compaction_v2_a_view_editing_before_the_signed_floor_is_applied() {
     ];
     let entries = project(&messages, &facts(4), &Deliveries::new(), true);
     let bound = rules::defaults("claude-opus-5-5");
-    let floor = super::host::signed_floor(Some(2), &entries, &bound).expect("a floor");
+    let through = super::host::floor_entry(Some(2), &entries);
+    let floor = super::host::signed_floor(through, &bound).expect("a floor");
     assert_eq!(
         floor.through, entries[1].mid,
         "through the message before the run"
@@ -757,9 +758,10 @@ async fn compaction_v2_a_view_editing_before_the_signed_floor_is_applied() {
     // No floor where nothing is bound, where the change came before any message, or where no
     // run changed its tools.
     let unbound = rules::defaults("gpt-5");
-    assert_eq!(super::host::signed_floor(Some(2), &entries, &unbound), None);
-    assert_eq!(super::host::signed_floor(Some(0), &entries, &bound), None);
-    assert_eq!(super::host::signed_floor(None, &entries, &bound), None);
+    assert_eq!(super::host::signed_floor(through, &unbound), None);
+    assert_eq!(super::host::floor_entry(Some(0), &entries), None);
+    assert_eq!(super::host::floor_entry(None, &entries), None);
+    assert_eq!(super::host::signed_floor(None, &bound), None);
 
     let view = View::seal(
         1,

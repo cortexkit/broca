@@ -1014,7 +1014,7 @@ async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_ren
             &transcript.entries,
             false,
             None,
-            transcript.signed_floor,
+            v2::host::floor_entry(transcript.signed_floor, &transcript.entries),
         )
         .unwrap();
         (
@@ -1502,7 +1502,7 @@ async fn compaction_v2_fallback_fill_survives_resume_after_step_completion() {
         &transcript.entries,
         false,
         transcript.newest_step_fill(),
-        transcript.signed_floor,
+        v2::host::floor_entry(transcript.signed_floor, &transcript.entries),
     )
     .unwrap();
     assert_eq!(offline.last_prompt_tokens, Some(1_000));
