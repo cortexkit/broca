@@ -108,6 +108,21 @@ pub async fn store_snapshot(
                 .unwrap_or(false);
             let frozen =
                 serde_json::from_slice(config).map_err(|e| format!("render config: {e}"))?;
+            let render_config: Value =
+                serde_json::from_slice(config).map_err(|e| format!("render config: {e}"))?;
+            // The next message gets its `EntryFacts` record (its id, time and part numbers) as
+            // the run loop writes one: on a session on the compaction contract a message's
+            // compaction entry, and so the request, can't be built without it. `tags` are the
+            // numbering rules those facts follow.
+            let manifest = broca_session_store::fold::operations::ManifestRef::of_start(&start)
+                .map(|reference| broca_session_loop::run::stored_manifest(&reference, &parts))
+                .transpose()
+                .map_err(|e| format!("the latest run's manifest: {e:?}"))?;
+            let tags = broca_session_loop::entries::Tags::for_session(
+                start.compaction_plan_version.is_some(),
+                manifest.as_deref(),
+                &render_config,
+            );
             let mut writer = Session::load(&memory, addr.clone(), triple, deployment)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
@@ -117,35 +132,51 @@ pub async fn store_snapshot(
             start.request_identity_digest = None;
             start.ts_ms = Some(at);
             start.written_at_ms = Some(at);
+            let next = vec![
+                Record::RunStart(Box::new(start)),
+                Record::Input(Input {
+                    run_id: NEXT_RUN.into(),
+                    placement: Placement::RunInput,
+                    message: std::sync::Arc::new(broca_protocol::content::Message::new(
+                        broca_protocol::content::Role::User,
+                        vec![broca_protocol::content::ContentBlock::Text {
+                            text: "The next message after the move.".into(),
+                        }],
+                    )),
+                    written_at_ms: Some(at),
+                    submission_id: None,
+                    notice: None,
+                    tags_v1: None,
+                    receipt_seq: None,
+                    pruned: vec![],
+                    media: vec![],
+                }),
+                Record::StepStart(StepStart {
+                    run_id: NEXT_RUN.into(),
+                    step_id: 1,
+                    mid: None,
+                }),
+            ];
+            use broca_session_loop::Writer as _;
+            let prefix = writer.message_id_prefix();
+            let calls = Default::default();
+            let next = broca_session_loop::entries::with_facts(
+                next,
+                &broca_session_loop::entries::Placing {
+                    conversation: writer.conversation(),
+                    first_seq: writer.next_seq(),
+                    prefix: &prefix,
+                    session: &writer.session_id(),
+                    tags,
+                    view: None,
+                    operations: writer.operations(),
+                    calls: &calls,
+                    rich_ui: None,
+                    runner: None,
+                },
+            )?;
             writer
-                .append(
-                    &[
-                        Record::RunStart(Box::new(start)),
-                        Record::Input(Input {
-                            run_id: NEXT_RUN.into(),
-                            placement: Placement::RunInput,
-                            message: std::sync::Arc::new(broca_protocol::content::Message::new(
-                                broca_protocol::content::Role::User,
-                                vec![broca_protocol::content::ContentBlock::Text {
-                                    text: "The next message after the move.".into(),
-                                }],
-                            )),
-                            written_at_ms: Some(at),
-                            submission_id: None,
-                            notice: None,
-                            tags_v1: None,
-                            receipt_seq: None,
-                            pruned: vec![],
-                            media: vec![],
-                        }),
-                        Record::StepStart(StepStart {
-                            run_id: NEXT_RUN.into(),
-                            step_id: 1,
-                            mid: None,
-                        }),
-                    ],
-                    true,
-                )
+                .append(&next, true)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
             let reader = export

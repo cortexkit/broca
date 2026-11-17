@@ -82,6 +82,13 @@ async fn seed(rig: &Rig, session: &BindIdentity, terminal: bool) {
 
 /// Writes `session`'s records into the store, and nothing into the session-ref index.
 async fn store_session(rig: &Rig, session: &BindIdentity, terminal: bool) {
+    store_session_on(rig, session, terminal, false).await;
+}
+
+/// As [`store_session`], for a session on the compaction contract when `contract` is set: its
+/// runs carry a compaction plan version, so a message renders only with its `EntryFacts` record
+/// (its id, time and part numbers).
+async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, contract: bool) {
     let runtime = rig.registry.store_runtime().unwrap();
     let backend = LocalBackend::new(StorageClass::Durable.store_root(&rig.root));
     let mut writer = Session::create(
@@ -106,7 +113,14 @@ async fn store_session(rig: &Rig, session: &BindIdentity, terminal: bool) {
                 "system_prompt":broca_provider::policy::SystemPromptPolicy::SystemMessage,"usage":broca_provider::policy::UsagePolicy::OpenAiUsage});
         }
     }
-    let converted = broca_session_convert::convert(&records, None).unwrap();
+    let mut converted = broca_session_convert::convert(&records, None).unwrap();
+    if contract {
+        for record in &mut converted.records {
+            if let broca_session_store::record::Record::RunStart(start) = record {
+                start.compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
+            }
+        }
+    }
     let key = runtime
         .deployment()
         .setup_key_for(runtime.deployment().new_sessions())
@@ -167,6 +181,44 @@ async fn busy_and_prepare_find_a_stored_session_through_the_ref_index_alone() {
         "unknown_ref",
     );
     assert_code(from.call("prepare", params).await, "unknown_ref");
+}
+
+/// The move check renders the request a next message would send. On a session on the
+/// compaction contract a message renders only with its `EntryFacts` record (its id, time and
+/// part numbers), so the check writes one for its made-up next message as the run loop writes
+/// one for a real message; without it `busy` and `prepare` refused every such session as
+/// unavailable.
+#[tokio::test]
+async fn busy_and_prepare_answer_for_a_session_on_the_compaction_contract() {
+    let door = Arc::new(FakeDoor::default());
+    let source = rig(
+        root("store-busy-contract"),
+        door,
+        DeploymentKey::new(7, &[4; 32]),
+    )
+    .await;
+    let session = source.session("contract");
+    store_session_on(&source, &session, true, true).await;
+    broca_core::SessionRefIndex::record_session(
+        source.index.as_ref(),
+        &broca_core::session_addr(&session),
+        &session,
+    )
+    .unwrap();
+    let mut from = Wire::new(&source, entorhinal(), true).await;
+    let params = source.params(CUT, std::slice::from_ref(&session));
+    let busy = from
+        .call("busy", json!({"refs":params["refs"]}))
+        .await
+        .unwrap();
+    assert_eq!(busy["refs"][0]["state"], "idle", "{busy}");
+    let prepared = from.call("prepare", params).await.unwrap();
+    assert!(
+        prepared["items"][0]["format"]
+            .as_str()
+            .is_some_and(|format| format.starts_with("broca-store-export/1")),
+        "{prepared}"
+    );
 }
 
 #[tokio::test]
