@@ -559,6 +559,8 @@ enum VaultSeedOrder {
     /// handle, production's shape after a provider refused the key.
     InvalidateThenMint,
     /// Mints a handle and revokes it: a live credential whose handle is gone.
+    // Used only by the unix-only aimock tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     MintThenRevokeHandle,
 }
 
@@ -1256,6 +1258,8 @@ impl Daemon {
             .expect("probe broca health")
     }
 
+    // Used only by the unix-only aimock tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn ck_auth_command(&self) -> std::process::Command {
         let mut command =
             broca_test_support::ckdev_command(ck_auth_bin(), broca_test_support::scratch_root());
@@ -1281,6 +1285,8 @@ impl Daemon {
     /// That is also how a real re-login writes, so the resume under test is reached the way
     /// production reaches it. A failed repair is asserted here rather than left to surface
     /// later as a resume that did not happen.
+    // Used only by the unix-only aimock tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn repair_vault_credential(&self, credential_id: &str) {
         let payload = self.dir.join("repaired.payload");
         std::fs::write(&payload, "sk-repaired").expect("write the repaired credential's payload");
@@ -1522,6 +1528,8 @@ impl ConcurrencyProbe {
     }
 }
 
+// Used only by the unix-only aimock tests.
+#[cfg_attr(not(unix), allow(dead_code))]
 /// Run the broca-session client binary to completion against the daemon.
 /// Poll a module's WAL directory until every marker appears in one file, or time out.
 ///
@@ -1561,6 +1569,8 @@ async fn stored_session(daemon: &Daemon, session: &str) -> Vec<Record> {
 }
 
 /// Whether `records` hold a pause for re-authentication.
+// Used only by the unix-only aimock tests.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn paused_for_sign_in(records: &[Record]) -> bool {
     records.iter().any(|record| {
         matches!(record, Record::Pause(pause) if matches!(pause.reason, PauseReason::AuthRequired))
