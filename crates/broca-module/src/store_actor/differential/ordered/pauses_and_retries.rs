@@ -197,6 +197,7 @@ fn checking(id: &str) -> Arc<broca_fetch_plan::Plan> {
         }],
         compaction_item: None,
         step_items: Vec::new(),
+        cache: None,
         composition: Default::default(),
         composition_digest: "composition".into(),
         composed: Default::default(),

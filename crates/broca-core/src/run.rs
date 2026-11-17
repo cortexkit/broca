@@ -55,8 +55,8 @@ use broca_protocol::{
         ToolResult,
     },
     request::{
-        BudgetConfig, BudgetKind, CacheRequest, CallOptions, ExecutionMode, GenerationConfig,
-        ModelHandle, StopCondition, SubmissionRequest, Tool, ToolChoice,
+        BudgetConfig, BudgetKind, CallOptions, ExecutionMode, GenerationConfig, ModelHandle,
+        StopCondition, SubmissionRequest, Tool, ToolChoice,
     },
     ApprovalResponse, BatchId, DisplayEvent, ErrorClass, ModelAttempt, NormalizedEvent,
     ProviderControl, ProviderError, RunId, StepId, ToolCallId, Usage,
@@ -112,7 +112,8 @@ pub struct RunRequest {
     /// included in a provider request. Resuming an existing episode cannot change its policy.
     pub retention: Option<u64>,
     pub on_restart: Option<broca_protocol::request::OnRestart>,
-    /// This send's warming policy, restored from RunStarted when resuming the same episode.
+    /// The run's warming, which admission takes from the session's cache policy; restored from
+    /// the run's start when it resumes. `None` warms nothing.
     pub keep_warm: Option<broca_protocol::request::KeepWarm>,
     /// The producer's bind project id, recorded on RunStarted for later inspection.
     /// Excluded from the session key so Some/None binds still open the same lineage.
@@ -135,10 +136,10 @@ pub struct RunRequest {
     pub policy_allowed: HashSet<String>,
     pub tool_choice: ToolChoice,
     pub generation: GenerationConfig,
-    /// Admission-only prompt-cache preferences. The executor resolves this once for a fresh
-    /// run and freezes the result into the provider render config; renderers never read this
-    /// request field directly.
-    pub cache: Option<CacheRequest>,
+    /// The session's cache policy for this run (llm-runner `cache`): its plan's `cache`, or a
+    /// planless session's creating send's. The executor resolves it once for a fresh run and
+    /// freezes the result into the provider render config; renderers never read it.
+    pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
     /// Tool-call-count budget, frozen into the durable run config at admission.
     pub budget: Option<BudgetConfig>,
     /// Caller-supplied context-window override, resolved against the catalog before execution.
@@ -185,11 +186,10 @@ pub struct RunRequest {
     /// head's turn, which routing admits ahead of background work. Known only while broca runs;
     /// a run resumed after a restart reads false.
     pub head_turn: bool,
-    /// Take the cache policy and caller cache key the session's previous episode froze in its
-    /// render config instead of resolving `cache`. Set for a steer or interrupt into the session
-    /// that omitted `cache`, so its requests carry the same cache markers and cache key as the
-    /// session's earlier requests and keep hitting the provider's cache. Every other runner
-    /// parameter such a send omits is already filled into this request.
+    /// Take the cache policy and caller cache key the session's previous run froze in its render
+    /// config instead of resolving `cache`: a planless session keeps its creating send's policy
+    /// for life, so its later runs carry the same cache markers and key and keep hitting the
+    /// provider's cache. Admission sets it; a request never carries it.
     pub inherit_frozen_cache: bool,
     /// The schema-shaped output this run asks for. The module resolves it into the frozen
     /// render config when it resolves the provider; core reads the frozen value, never this
@@ -216,7 +216,6 @@ impl RunRequest {
             content: Vec::new(),
             directives: self.directives.clone(),
             on_restart: self.on_restart,
-            keep_warm: self.keep_warm,
             scope: Default::default(),
             project_id: self.project_id.clone(),
             principal: self.principal.clone(),
@@ -235,11 +234,7 @@ impl RunRequest {
             service_tier: self.service_tier,
             stop_when: self.stop_when.clone(),
             context_management: self.context_management.clone(),
-            inherit_frozen: if self.inherit_frozen_cache {
-                [broca_protocol::request::InheritedParam::Cache].into()
-            } else {
-                Default::default()
-            },
+            inherit_frozen: Default::default(),
             structured_output: self.structured_output.clone(),
             // The run keeps a send's client_message_id only inside `request_identity_digest`.
             client_message_id: None,
@@ -266,7 +261,7 @@ impl RunRequest {
             session_class: None,
             retention: None,
             on_restart: req.on_restart,
-            keep_warm: req.keep_warm,
+            keep_warm: None,
             project_id: req.project_id,
             principal: req.principal,
             run_id,
@@ -295,9 +290,7 @@ impl RunRequest {
             // Decided by admission from the session's history, never carried by the request.
             scope: None,
             head_turn: false,
-            inherit_frozen_cache: req
-                .inherit_frozen
-                .contains(&broca_protocol::request::InheritedParam::Cache),
+            inherit_frozen_cache: false,
             structured_output: req.structured_output,
         }
     }
@@ -899,9 +892,7 @@ fn warm_wait<'a>(
     unsupported_logged: &'a std::sync::atomic::AtomicBool,
     warm_missed: &'a std::sync::atomic::AtomicBool,
 ) -> Option<crate::keep_warm_wait::WarmWait<'a>> {
-    if req.keep_warm != Some(broca_protocol::request::KeepWarm::Auto) {
-        return None;
-    }
+    req.keep_warm.as_ref().filter(|mode| mode.warms())?;
     Some(crate::keep_warm_wait::WarmWait {
         driver: control.keep_warm.as_ref()?,
         config: config?,
@@ -909,9 +900,11 @@ fn warm_wait<'a>(
         cancel: control.cancel.as_ref(),
         unsupported_logged,
         warm_missed,
+        keep_warm: &AUTO_WARMING, // write-ahead-log sessions could only ever ask for `auto`
+        warms_before: 0,
     })
 }
-
+static AUTO_WARMING: broca_protocol::request::KeepWarm = broca_protocol::request::KeepWarm::Auto;
 fn remember_warm_config(
     config: RunConfig,
     slot: &mut Option<RunConfig>,
@@ -2655,7 +2648,7 @@ where
             })
         });
     prior.marker_order_version = episode.and_then(|episode| episode.marker_order_version);
-    prior.keep_warm = episode.and_then(|episode| episode.keep_warm);
+    prior.keep_warm = episode.and_then(|episode| episode.keep_warm.clone());
     prior.cancel_at = episode.and_then(|episode| episode.cancel_at);
     prior.input_budget = snapshot
         .checkpoint_at_head
@@ -4317,7 +4310,7 @@ where
         })
         .map(|selection| selection.credential_id.clone());
     if is_resume && !append_episode {
-        req.keep_warm = prior.keep_warm;
+        req.keep_warm = prior.keep_warm.clone();
         req.on_restart = prior.on_restart;
     }
     let unsupported_logged = std::sync::atomic::AtomicBool::new(false);
@@ -4338,7 +4331,7 @@ where
             writer.note_step_event_run_config(
                 &resolved_run_id,
                 config,
-                Some(req.keep_warm.unwrap_or_default()),
+                Some(req.keep_warm.clone().unwrap_or_default()),
             );
         }
     }

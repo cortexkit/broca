@@ -1993,6 +1993,7 @@ mod tests {
             composition_digest: String::new(),
             composed: BTreeMap::new(),
             senders: Vec::new(),
+            cache: None,
         }
     }
 

@@ -173,16 +173,6 @@ pub struct GenerationConfig {
     pub stop_sequences: Vec<String>,
 }
 
-/// The caller's session role for admission-time prompt-cache policy resolution.
-/// The default role is applied by the resolver, not serde, so an absent `role`
-/// can still be distinguished from an absent cache request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheRole {
-    Primary,
-    Ephemeral,
-}
-
 /// The caller's assertion about whether the FINAL message of its prompt repeats.
 ///
 /// This is a declaration, not something broca can derive. Two prompts can be identical in
@@ -203,19 +193,6 @@ pub enum CacheTail {
     Volatile,
 }
 
-/// The caller's explicit choice to switch provider prompt caching off for a send.
-///
-/// Some providers get cache breakpoints by default when a send says nothing about caching
-/// (first-party Anthropic does). This is how a caller declines them. One variant on purpose:
-/// "on" is what an absent value already means wherever a default applies, and a caller who
-/// wants caching with particular settings says so with `role` or `ttl`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheMode {
-    /// Place no cache breakpoints and send no cache hints, whatever the provider's default.
-    None,
-}
-
 /// Admission-only credential selection supplied by the caller. It remains a string until
 /// admission so an unknown method can be reported in the caller-facing error taxonomy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,28 +204,6 @@ pub struct AuthRequest {
     pub pool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<String>,
-}
-
-/// Admission-only prompt-cache preferences supplied by the caller. Renderers never
-/// read this request field directly; the module resolves it into the frozen render
-/// config before the run starts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<CacheRole>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl: Option<String>,
-    /// An opaque caller-selected provider-cache scope, resolved and frozen at admission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    /// Whether the caller declares its final message varies between requests. Absent means
-    /// no assertion was made and marker placement is unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tail: Option<CacheTail>,
-    /// `none` switches prompt caching off for this send. Absent means no such request, which
-    /// leaves the provider's default in place and serializes to no bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<CacheMode>,
 }
 
 /// The run identity for ONE step — the run this step belongs to, and which step it is.
@@ -493,14 +448,101 @@ pub enum BudgetKind {
     Finalize,
 }
 
-/// Controls prompt-cache warming during this send's tool waits. This runner setting is not
-/// part of the request rendered for the provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// How a run keeps the provider's prompt cache warm (llm-runner `keep_warm`), as its admission
+/// took it from the session's cache policy. A run's start records it: `"auto"`, `"always"` or
+/// `{"hours": {"from", "to", "tz"}}`; `off` records nothing. Never part of the rendered request.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeepWarm {
+    /// Warm between turns and during tool waits, until the warms since the last real request
+    /// cost as much as one cache rewrite.
     Auto,
     #[default]
     Off,
+    /// Warm at any time, up to [`WARM_COUNT_CAP`] warms since the last real request.
+    Always,
+    /// Warm only inside the local-time window, up to [`WARM_COUNT_CAP`] warms since the last
+    /// real request.
+    Hours(WarmHours),
+}
+
+/// How many warms `always` and `hours` send after a real request before they stop.
+pub const WARM_COUNT_CAP: u32 = 24;
+
+impl KeepWarm {
+    /// The warming a cache request asks for: its `keep_warm`, with its `hours` window. `None`
+    /// for `off`, so an off run's start records no `keep_warm`.
+    pub fn of(cache: &cortexkit_role_llm_runner::cache::Cache) -> Option<Self> {
+        use cortexkit_role_llm_runner::cache::KeepWarm as Requested;
+        match cache.keep_warm() {
+            Requested::Auto => Some(Self::Auto),
+            Requested::Always => Some(Self::Always),
+            // The request's shape was checked at admission, so a window is present; a request
+            // that somehow lacks one warms nothing rather than warming at any hour.
+            Requested::Hours => cache.hours.as_ref().map(|hours| {
+                Self::Hours(WarmHours {
+                    from: hours.from.clone(),
+                    to: hours.to.clone(),
+                    tz: hours.tz.clone(),
+                })
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode warms at all.
+    pub fn warms(&self) -> bool {
+        *self != Self::Off
+    }
+}
+
+/// A `keep_warm: hours` window: from `from` up to, not including, `to`, both `HH:MM` local time
+/// in the IANA zone `tz`. `to` before `from` crosses midnight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmHours {
+    pub from: String,
+    pub to: String,
+    pub tz: String,
+}
+
+impl WarmHours {
+    /// Whether `tz` names a zone in broca's bundled time-zone database. The database is built
+    /// in, not read from the host, so every machine answers alike.
+    pub fn known_zone(tz: &str) -> bool {
+        jiff::tz::db().get(tz).is_ok()
+    }
+
+    /// Whether the instant `at_ms` (Unix milliseconds) falls inside the window. An unknown zone
+    /// or a malformed time is outside, so a window broca can't read never warms.
+    pub fn contains(&self, at_ms: u64) -> bool {
+        let (Some(from), Some(to)) = (minute_of_day(&self.from), minute_of_day(&self.to)) else {
+            return false;
+        };
+        let Ok(zone) = jiff::tz::db().get(&self.tz) else {
+            return false;
+        };
+        let Some(now) = i64::try_from(at_ms)
+            .ok()
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+        else {
+            return false;
+        };
+        let local = now.to_zoned(zone);
+        let minute =
+            u32::from(local.hour().unsigned_abs()) * 60 + u32::from(local.minute().unsigned_abs());
+        if from < to {
+            (from..to).contains(&minute)
+        } else {
+            minute >= from || minute < to
+        }
+    }
+}
+
+/// `HH:MM` as minutes after midnight.
+fn minute_of_day(time: &str) -> Option<u32> {
+    let (hour, minute) = time.split_once(':')?;
+    let (hour, minute) = (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?);
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
 }
 
 /// The caller's request PAYLOAD for one submission — everything that defines a turn EXCEPT
@@ -534,9 +576,6 @@ pub struct SubmissionRequest {
     /// The restart policy applies only to this send. If omitted, a graceful daemon stop interrupts the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_restart: Option<OnRestart>,
-    /// If `keep_warm` is omitted, this send does not warm, even if an earlier send enabled it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_warm: Option<KeepWarm>,
     /// Bind observation carried through durable queuing to RunStarted. Excluded from
     /// send-id identity and render configuration: a changed bind must not split a lineage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,10 +609,11 @@ pub struct SubmissionRequest {
     pub tool_choice: ToolChoice,
     #[serde(default)]
     pub generation: GenerationConfig,
-    /// Admission-only cache preferences. They ride the durable queued request so a
-    /// queued run resolves the same policy as the identical idle send.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<CacheRequest>,
+    /// The cache policy a planless session's creating send carries (llm-runner `cache`). Only a
+    /// creating send may carry one, and a creating send never waits in the queue, so it is never
+    /// stored with a queued request.
+    #[serde(skip)]
+    pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetConfig>,
     /// Caller-scoped credential selection, resolved and frozen when this submission is admitted.
@@ -654,9 +694,6 @@ pub enum InheritedParam {
     ToolChoice,
     Generation,
     StopWhen,
-    /// The cache policy and caller cache key, as the latest episode's render config froze them
-    /// (resolved from that episode's `cache` request).
-    Cache,
     Budget,
     ContextLimit,
     WorkClass,
@@ -665,12 +702,11 @@ pub enum InheritedParam {
 
 impl InheritedParam {
     /// Every inheritable parameter, paired with the `session.send` member that carries it.
-    pub const ALL: [(InheritedParam, &'static str); 9] = [
+    pub const ALL: [(InheritedParam, &'static str); 8] = [
         (InheritedParam::Model, "model"),
         (InheritedParam::ToolChoice, "tool_choice"),
         (InheritedParam::Generation, "generation"),
         (InheritedParam::StopWhen, "stop_when"),
-        (InheritedParam::Cache, "cache"),
         (InheritedParam::Budget, "budget"),
         (InheritedParam::ContextLimit, "context_limit"),
         (InheritedParam::WorkClass, "work_class"),
@@ -877,7 +913,6 @@ mod tests {
             content: Vec::new(),
             directives: None,
             on_restart: None,
-            keep_warm: None,
             scope: Default::default(),
             project_id: None,
             principal: None,
@@ -973,7 +1008,6 @@ mod budget_compat_tests {
             content: Vec::new(),
             directives: None,
             on_restart: None,
-            keep_warm: None,
             scope: Default::default(),
             project_id: None,
             principal: None,
@@ -1106,5 +1140,80 @@ mod tool_reply_tests {
             serde_json::to_string(&tool).unwrap(),
             r#"{"name":"research","description":"","input_schema":{"type":"object"},"execution_mode":"parallel"}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod keep_warm_tests {
+    use super::{KeepWarm, WarmHours};
+    use cortexkit_role_llm_runner::cache::{Cache, Hours, KeepWarm as Requested};
+
+    /// 2026-11-17 22:30 UTC, in Unix milliseconds.
+    const LATE_EVENING_UTC_MS: u64 = 1_794_954_600_000;
+
+    fn hours(from: &str, to: &str, tz: &str) -> WarmHours {
+        WarmHours {
+            from: from.into(),
+            to: to.into(),
+            tz: tz.into(),
+        }
+    }
+
+    #[test]
+    fn a_run_start_records_the_contract_spellings() {
+        assert_eq!(serde_json::to_value(KeepWarm::Auto).unwrap(), "auto");
+        assert_eq!(serde_json::to_value(KeepWarm::Always).unwrap(), "always");
+        assert_eq!(
+            serde_json::to_value(KeepWarm::Hours(hours("22:00", "06:00", "Etc/UTC"))).unwrap(),
+            serde_json::json!({"hours": {"from": "22:00", "to": "06:00", "tz": "Etc/UTC"}})
+        );
+        // What runs recorded before the other modes existed still reads back.
+        assert_eq!(
+            serde_json::from_value::<KeepWarm>(serde_json::json!("auto")).unwrap(),
+            KeepWarm::Auto
+        );
+    }
+
+    #[test]
+    fn a_request_off_or_omitted_warms_nothing() {
+        assert_eq!(KeepWarm::of(&Cache::default()), None);
+        let mut cache = Cache::default();
+        cache.keep_warm = Some(Requested::Off);
+        assert_eq!(KeepWarm::of(&cache), None);
+        cache.keep_warm = Some(Requested::Always);
+        assert_eq!(KeepWarm::of(&cache), Some(KeepWarm::Always));
+        cache.keep_warm = Some(Requested::Hours);
+        cache.hours = Some(Hours::new("09:00", "17:00", "Europe/Istanbul"));
+        assert_eq!(
+            KeepWarm::of(&cache),
+            Some(KeepWarm::Hours(hours("09:00", "17:00", "Europe/Istanbul")))
+        );
+    }
+
+    #[test]
+    fn a_window_is_half_open_and_may_cross_midnight() {
+        let night = hours("22:00", "06:00", "Etc/UTC");
+        assert!(night.contains(LATE_EVENING_UTC_MS));
+        let ends_at_the_minute = hours("21:00", "22:30", "Etc/UTC");
+        assert!(!ends_at_the_minute.contains(LATE_EVENING_UTC_MS));
+        let starts_at_the_minute = hours("22:30", "23:00", "Etc/UTC");
+        assert!(starts_at_the_minute.contains(LATE_EVENING_UTC_MS));
+        let day = hours("06:00", "22:00", "Etc/UTC");
+        assert!(!day.contains(LATE_EVENING_UTC_MS));
+    }
+
+    #[test]
+    fn a_window_reads_local_time_in_its_zone() {
+        // 22:30 UTC is 01:30 the next day in Istanbul (UTC+3).
+        assert!(hours("01:00", "02:00", "Europe/Istanbul").contains(LATE_EVENING_UTC_MS));
+        assert!(!hours("22:00", "23:00", "Europe/Istanbul").contains(LATE_EVENING_UTC_MS));
+    }
+
+    #[test]
+    fn zones_come_from_the_bundled_database() {
+        assert!(WarmHours::known_zone("Etc/UTC"));
+        assert!(WarmHours::known_zone("America/Sao_Paulo"));
+        assert!(!WarmHours::known_zone("Mars/Olympus_Mons"));
+        assert!(!hours("22:00", "06:00", "Mars/Olympus_Mons").contains(LATE_EVENING_UTC_MS));
     }
 }

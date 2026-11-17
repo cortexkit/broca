@@ -97,49 +97,6 @@ fn marker_policy(ttl: broca_provider::wire::CacheTtl) -> broca_provider::wire::C
     }
 }
 
-/// What `resolve_marker_policy` produces for a caller that declared a volatile tail on a
-/// marker family: the declaration is frozen into the policy and reaches `plan_markers`.
-fn marker_policy_honouring_tail(
-    ttl: broca_provider::wire::CacheTtl,
-) -> broca_provider::wire::CachePolicy {
-    broca_provider::wire::CachePolicy {
-        version: 1,
-        class: broca_provider::wire::CacheClass::Markers {
-            syntax: broca_provider::wire::MarkerSyntax::AnthropicCacheControl,
-            ttl,
-            max_breakpoints: 4,
-            lookback_blocks: 20,
-            tail: Some(broca_protocol::request::CacheTail::Volatile),
-            omit_ttl: false,
-        },
-    }
-}
-
-fn hints_policy() -> broca_provider::wire::CachePolicy {
-    broca_provider::wire::CachePolicy {
-        version: 1,
-        class: broca_provider::wire::CacheClass::Hints {
-            cache_key: "k".into(),
-            retention: None,
-        },
-    }
-}
-
-fn cache_request(
-    role: Option<broca_protocol::request::CacheRole>,
-    ttl: Option<&str>,
-    key: Option<&str>,
-    tail: Option<broca_protocol::request::CacheTail>,
-) -> broca_protocol::request::CacheRequest {
-    broca_protocol::request::CacheRequest {
-        role,
-        ttl: ttl.map(str::to_string),
-        key: key.map(str::to_string),
-        tail,
-        mode: None,
-    }
-}
-
 fn a_tool() -> broca_protocol::request::Tool {
     broca_protocol::request::Tool {
         name: "read".into(),
@@ -217,86 +174,6 @@ fn cache_markers_warn_only_when_the_run_cannot_read_them_back() {
 
     // No policy at all is the common case and must stay silent.
     assert!(single_call_cache_marker_warning(&None, &[]).is_none());
-}
-
-/// A caller states a fact about their own prompt with `cache.tail`. Two resolutions
-/// throw it away, and a thrown-away declaration is indistinguishable from an honoured
-/// one from where the caller stands -- so both must be said out loud.
-#[test]
-fn a_dropped_cache_tail_declaration_is_reported_to_the_caller() {
-    use broca_protocol::request::{CacheRole, CacheTail};
-
-    // Key-only: no role and no ttl, so resolution returns no policy at all and there is
-    // no breakpoint plan for the declaration to change.
-    let key_only = cache_request(
-        None,
-        None,
-        Some("alfonso-classify-v1"),
-        Some(CacheTail::Volatile),
-    );
-    let warning = dropped_cache_tail_warning(Some(&key_only), &None, "anthropic")
-        .expect("a tail declaration with no resolved marker policy is dropped");
-    assert!(
-        warning.contains("cache.role") && warning.contains("cache.ttl"),
-        "the warning names what the caller must send to turn markers on: {warning:?}"
-    );
-
-    // Hint families carry a cache key rather than placed breakpoints, so there is no
-    // message anchor for the declaration to withhold.
-    let declared = cache_request(
-        Some(CacheRole::Primary),
-        None,
-        None,
-        Some(CacheTail::Volatile),
-    );
-    let warning = dropped_cache_tail_warning(Some(&declared), &Some(hints_policy()), "openai")
-        .expect("a tail declaration on a hint family is dropped");
-    assert!(
-        warning.contains("openai") && warning.contains("hints"),
-        "the warning names the provider and why it cannot act on the declaration: \
-                 {warning:?}"
-    );
-}
-
-/// The controls. A warning that also fires when the declaration was honoured, or when
-/// none was made, is noise the caller learns to skip -- which costs exactly the
-/// visibility the warning was added for.
-#[test]
-fn an_honoured_or_absent_cache_tail_declaration_stays_silent() {
-    use broca_protocol::request::{CacheRole, CacheTail};
-    let ttl = broca_provider::wire::CacheTtl::FiveMinutes;
-
-    let declared = cache_request(
-        Some(CacheRole::Primary),
-        Some("5m"),
-        None,
-        Some(CacheTail::Volatile),
-    );
-    assert!(
-        dropped_cache_tail_warning(
-            Some(&declared),
-            &Some(marker_policy_honouring_tail(ttl)),
-            "anthropic"
-        )
-        .is_none(),
-        "a declaration the marker plan acts on has not been dropped"
-    );
-
-    // The same two drop paths, with no declaration to drop.
-    let key_only = cache_request(None, None, Some("alfonso-classify-v1"), None);
-    assert!(
-        dropped_cache_tail_warning(Some(&key_only), &None, "anthropic").is_none(),
-        "a key-only request that declared nothing is the common case and stays silent"
-    );
-    let role_only = cache_request(Some(CacheRole::Primary), None, None, None);
-    assert!(
-        dropped_cache_tail_warning(Some(&role_only), &Some(hints_policy()), "openai").is_none(),
-        "a hint-family request that declared nothing stays silent"
-    );
-    assert!(
-        dropped_cache_tail_warning(None, &None, "anthropic").is_none(),
-        "a request with no cache preferences at all stays silent"
-    );
 }
 
 /// A mock launch must not read the developer's auth-methods config.

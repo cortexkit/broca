@@ -2451,6 +2451,8 @@ async fn provider_held_pause_stops_keep_warm_for_a_day() {
         cancel: None,
         unsupported_logged: &unsupported,
         warm_missed: &missed,
+        keep_warm: &broca_protocol::request::KeepWarm::Auto,
+        warms_before: 0,
     };
     let manifest = ToolManifest::from_tools(vec![Tool {
         name: "edit".into(),

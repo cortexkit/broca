@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use broca_protocol::content::{Message, Role};
 use broca_protocol::request::{
-    BudgetConfig, CacheRequest, CacheTail, GenerationConfig, ModelHandle, ResponseFormat,
-    StopCondition, Tool, ToolChoice,
+    BudgetConfig, GenerationConfig, ModelHandle, ResponseFormat, StopCondition, Tool, ToolChoice,
 };
 use broca_protocol::RunId;
 use broca_wal::{ComputedTagRules, PlanManifest, RunConfig, WalRecord};
@@ -78,24 +77,6 @@ pub fn request_config<P: Provider>(
             )));
         }
     }
-    // `cache.tail = volatile` tells the renderer to withhold the cache breakpoint on the final
-    // message. On a run that can call tools that breakpoint is not waste, it is the entire
-    // mechanism: each step re-sends the previous step's messages, so the anchor one step plants
-    // on its last message is exactly what the next step reads back. Honouring the declaration
-    // there would quietly make caching WORSE on the one leg where it already pays off, and
-    // quietly is the problem -- so refuse, and name which of the two the caller should drop.
-    //
-    // Judged on the tools actually admitted (after the policy intersection) rather than the
-    // ones requested: a run whose tools were all filtered out makes exactly one provider call,
-    // and the declaration is sound for it.
-    if tail_is_volatile(req.cache.as_ref()) && !tools.is_empty() {
-        return Err(RunError::Config(
-            "cache.tail 'volatile' conflicts with tools: a tool-bearing run re-sends each step's \
-             messages, so the final-message breakpoint it withholds is what the next step reads \
-             back; drop cache.tail or drop tools"
-                .into(),
-        ));
-    }
     Ok(RequestConfig {
         model: std::mem::replace(&mut req.model, ModelHandle::new("", "")),
         budget: std::mem::take(&mut req.budget),
@@ -126,16 +107,6 @@ fn admitted_generation<P: Provider>(
     // request offline must not apply today's bounds again, including to older runs.
     effective.temperature = provider.admit_temperature(generation.temperature);
     Ok(effective)
-}
-
-/// Whether the caller declared its final message varies between requests. The refusal above is
-/// the only consumer in the loop; the placement it implies is resolved and frozen by the module
-/// before the run starts, so nothing here reads it again on a resume.
-fn tail_is_volatile(cache: Option<&CacheRequest>) -> bool {
-    matches!(
-        cache.and_then(|cache| cache.tail),
-        Some(CacheTail::Volatile)
-    )
 }
 
 /// A new episode's frozen run config: its request config, the request's routing and directive
@@ -231,7 +202,7 @@ pub fn run_started(req: &RunRequest, control: &RunControl, start: EpisodeStart) 
             hooks
         }),
         on_restart: req.on_restart,
-        keep_warm: req.keep_warm,
+        keep_warm: req.keep_warm.clone(),
         marker_order_version: start.marker_order_version,
         // Must-understand: a manifest makes this a gated frame requiring `plan-manifest/v1`, and
         // the WAL raises the feature floor to that name before writing it.

@@ -1015,12 +1015,7 @@ fn keep_warm_record_metadata_matches_goldens() {
         let mut record: WalRecord = serde_json::from_str(base).unwrap();
         match &mut record {
             WalRecord::RunStarted { keep_warm, .. } => *keep_warm = Some(KeepWarm::Auto),
-            WalRecord::Queued {
-                keep_warm, request, ..
-            } => {
-                *keep_warm = Some(KeepWarm::Auto);
-                request.keep_warm = Some(KeepWarm::Auto);
-            }
+            WalRecord::Queued { keep_warm, .. } => *keep_warm = Some(KeepWarm::Auto),
             WalRecord::CacheWarmed { trigger, .. } => *trigger = Some("keep_warm".into()),
             _ => panic!("expected run, queue or warm"),
         }

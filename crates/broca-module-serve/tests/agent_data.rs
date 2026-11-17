@@ -1920,7 +1920,6 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
             content: Vec::new(),
             directives: None,
             on_restart: None,
-            keep_warm: None,
             scope: Default::default(),
             project_id: None,
             principal: None,

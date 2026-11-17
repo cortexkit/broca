@@ -300,11 +300,7 @@ async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
         let mut actor = reopened(&side, history, cipher, Arc::clone(&executor)).await;
         let mut media = Some(actor.run_media().await);
         let (driver, mut warming) = actor
-            .keep_warm_for(
-                &super::super::request("ignored"),
-                StoreRunMode::Resume,
-                &mut media,
-            )
+            .keep_warm_for(None, StoreRunMode::Resume, &mut media)
             .await
             .unwrap();
         warming.refresh(actor.session.operations.run.as_ref().unwrap(), &actor.parts);
@@ -365,11 +361,7 @@ async fn resumed_warm_waits_for_the_media_fold(cipher: Cipher) {
         .with_media_build_gate(Arc::clone(&gate));
     let mut media = Some(actor.run_media().await);
     let (driver, mut warming) = actor
-        .keep_warm_for(
-            &super::super::request("ignored"),
-            StoreRunMode::Resume,
-            &mut media,
-        )
+        .keep_warm_for(None, StoreRunMode::Resume, &mut media)
         .await
         .unwrap();
     warming.refresh(actor.session.operations.run.as_ref().unwrap(), &actor.parts);
@@ -400,11 +392,7 @@ async fn mismatched_recorded_digest_never_warms(cipher: Cipher) {
     let mut actor = reopened(&side, history, cipher, Arc::clone(&executor)).await;
     let mut media = Some(actor.run_media().await);
     let (driver, mut warming) = actor
-        .keep_warm_for(
-            &super::super::request("ignored"),
-            StoreRunMode::Resume,
-            &mut media,
-        )
+        .keep_warm_for(None, StoreRunMode::Resume, &mut media)
         .await
         .unwrap();
     warming.refresh(actor.session.operations.run.as_ref().unwrap(), &actor.parts);

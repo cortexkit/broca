@@ -20,11 +20,12 @@ pub fn register_candidate(root: &Path, addr: &SessionAddr) -> std::io::Result<()
 
 /// Whether a session's stored state leaves its open-time recovery anything to do: queued sends,
 /// usage billing still owed (when `billing` runs), an unfinished run that opening acts on, or a
-/// durable head that warms itself and so opens once at boot to rebuild its warming timer. The
-/// boot sweep opens such a head only while its cache is live (see
-/// [`LineageRegistry::idle_cache_live`]). Installing a converted old session
-/// ([`retire_settled_install`]) happens with no module to ask for the route's cache policy, so
-/// it keeps such a head registered and leaves the decision to the next boot's sweep.
+/// session whose latest run asked for warming and so opens once at boot to rebuild its warming
+/// timer. The boot sweep opens such a session only while its cache is live (see
+/// [`LineageRegistry::idle_cache_live`]), and retires its registration once the cache is gone.
+/// Installing a converted old session ([`retire_settled_install`]) happens with no module to ask
+/// for the route's cache policy, so it keeps such a session registered and leaves the decision
+/// to the next boot's sweep.
 ///
 /// The one unfinished run opening leaves as it is: a run paused for sign-in on an account
 /// routing didn't choose. Only a person signing in or a caller's own command moves it, so
@@ -41,20 +42,22 @@ pub(crate) fn needs_recovery(
     owes_recovery(operations, billing, parts) || warms_itself(operations)
 }
 
-/// Whether the session's latest run started a head that warms its cache while idle.
+/// Whether the session's latest run froze a keep-warm mode, so its cache is warmed while idle.
 fn warms_itself(operations: &broca_session_store::fold::operations::Operations) -> bool {
     operations.run.as_ref().is_some_and(|run| {
-        run.start.as_ref().is_some_and(|start| {
-            start.session_class.as_deref() == Some("head")
-                && start.keep_warm.as_ref() == Some(&serde_json::json!("auto"))
-        })
+        run.start
+            .as_ref()
+            .and_then(|start| start.keep_warm.clone())
+            .and_then(|keep_warm| {
+                serde_json::from_value::<broca_protocol::request::KeepWarm>(keep_warm).ok()
+            })
+            .is_some_and(|keep_warm| keep_warm.warms())
     })
 }
 
-/// [`needs_recovery`] without a durable head's warming timer: what keeps a session registered
-/// for recovery. The actor retires its registration when this is false; durable heads need no
-/// registration to be found at boot, since every durable head is read there.
-pub(crate) fn owes_recovery(
+/// [`needs_recovery`] without the warming timer: what an open does for a session whatever its
+/// cache.
+fn owes_recovery(
     operations: &broca_session_store::fold::operations::Operations,
     billing: bool,
     parts: Option<&dyn broca_session_loop::parts::Parts>,
@@ -266,11 +269,11 @@ impl crate::registry::LineageRegistry {
 
     /// Opens candidate store sessions under the ordinary lease in the background. The
     /// actor's open-time recovery seals crash orphans, parks held calls, and finishes pending
-    /// durable tool-batch writes before it answers the status command. Finished automatic heads also open
-    /// once to rebuild their idle cache timers; their actors close on the ordinary idle deadline.
-    /// The flag that closes a one-shot session immediately after its run is not durable. Core
-    /// never gives those sessions the long-lived `head` class; if a caller did, a restart would
-    /// re-arm that head too, still bounded by the durable auto warm cap.
+    /// durable tool-batch writes before it answers the status command. Finished sessions that
+    /// warm themselves also open once to rebuild their idle cache timers; their actors close on
+    /// the ordinary idle deadline. The flag that closes a one-shot session immediately after its
+    /// run is not durable, so a one-shot session whose cache policy asked for warming is re-armed
+    /// by a restart too, still bounded by its warming's cap.
     pub async fn recover_store_crash_orphans(&self) -> Result<StoreRecoverySweep, String> {
         let Some(runtime) = self.store_runtime() else {
             return Ok(StoreRecoverySweep::default());
@@ -287,8 +290,9 @@ impl crate::registry::LineageRegistry {
                 .flatten()
                 .map(|addr| addr.0.clone())
                 .collect();
-            // Automatic idle warming belongs to durable heads. Workers' idle sessions in
-            // the other roots must not turn each restart into an all-session read.
+            // Every durable head is read; other sessions only when registered, so workers' idle
+            // sessions don't turn each restart into an all-session read. A session that warms
+            // itself stays registered for that (see `StoreActor::retire_recovery`).
             let addresses = candidate_addresses(indexed, class, || {
                 backend
                     .stored_sessions()

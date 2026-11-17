@@ -11,58 +11,9 @@ cipher_tests!(
     idle_head_uses_hour_lifetime_and_stops_at_durable_cap,
     idle_warm_rebuilds_after_restart_without_changing_prompt_state,
     idle_warm_failure_and_no_cache_read_stop,
-    idle_warm_never_arms_off_non_head_or_one_shot,
+    idle_warm_follows_the_frozen_warming_not_the_class,
     idle_real_run_cancels_timer_and_end_rearms,
-    idle_warm_recognises_an_adopted_head,
 );
-
-async fn idle_warm_recognises_an_adopted_head(cipher: Cipher) {
-    let side = super::super::side(false, cipher).await;
-    let mut actor = head(
-        &side,
-        cipher,
-        Arc::new(Warming::default()),
-        converted("finished-head-unclassed"),
-        Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
-    )
-    .await
-    .with_class_placement(broca_wal::StorageClass::Durable, vec!["head".into()]);
-    assert_eq!(actor.idle_warm_due().await.unwrap_err(), "not_auto_head");
-    let mut start = actor
-        .session
-        .operations()
-        .owner
-        .first_start
-        .clone()
-        .unwrap();
-    start.run_id = "adopting".into();
-    start.session_class = actor.session_class(Some("head")).unwrap();
-    let end = broca_session_store::record::RunEnd {
-        run_id: "adopting".into(),
-        reason: broca_protocol::RunFinishReason::Completed,
-        usage: None,
-        ts_ms: None,
-        retries_used: 0,
-        interrupt_reason: None,
-        error: None,
-    };
-    actor
-        .session
-        .append(
-            &[Record::RunStart(Box::new(start)), Record::RunEnd(end)],
-            true,
-        )
-        .await
-        .unwrap();
-    assert_eq!(actor.frozen_session_class().as_deref(), Some("head"));
-    // The adopted head and its route's declared cache lifetime pass eligibility. Only the
-    // new run's missing prefix-token usage keeps idle warming from arming.
-    assert_eq!(
-        actor.idle_warm_due().await.unwrap_err(),
-        "prefix_tokens_unavailable"
-    );
-    side.registry.stop_and_seal().await;
-}
 
 async fn head(
     side: &super::super::Side,
@@ -113,7 +64,10 @@ async fn idle_head_uses_hour_lifetime_and_stops_at_durable_cap(cipher: Cipher) {
             crate::actor::WarmOutcome::Warmed(_)
         ));
     }
-    assert_eq!(actor.idle_warm_due().await.unwrap_err(), "cap");
+    assert_eq!(
+        actor.idle_warm_due().await.unwrap_err(),
+        broca_core::keep_warm::STOP_BUDGET
+    );
     assert!(!side.registry.handle().has_idle_warm(&bind()));
     assert_eq!(executor.sent.lock().unwrap().len(), 2);
     // A skipped warm cannot date the cache: expiry still follows the last successful send.
@@ -257,7 +211,10 @@ async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: 
         real_facts.len() + 2,
         "startup recovery inserts a missing late-warm fact without new billing debt"
     );
-    assert_eq!(restarted.idle_warm_due().await.unwrap_err(), "cap");
+    assert_eq!(
+        restarted.idle_warm_due().await.unwrap_err(),
+        broca_core::keep_warm::STOP_BUDGET
+    );
     reboot.registry.stop_and_seal().await;
     side.registry.stop_and_seal().await;
 }
@@ -285,7 +242,6 @@ async fn idle_real_run_cancels_timer_and_end_rearms(cipher: Cipher) {
     start.run_id = RunId("r2".into());
     start.request = super::super::super::request("again");
     start.request.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
-    start.request.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
     start.session_class = Some("head".into());
     actor
         .start_run(start, None, None, StoreRunMode::Fresh)
@@ -340,7 +296,9 @@ async fn idle_warm_failure_and_no_cache_read_stop(cipher: Cipher) {
     }
 }
 
-async fn idle_warm_never_arms_off_non_head_or_one_shot(cipher: Cipher) {
+/// Idle warming follows the warming the last finished run froze, whatever the session's class:
+/// an unclassed session warms like a head, while an off run and a one-shot run never arm.
+async fn idle_warm_follows_the_frozen_warming_not_the_class(cipher: Cipher) {
     for case in ["off", "non_head", "one_shot"] {
         let side = super::super::side(false, cipher).await;
         let history = converted(match case {
@@ -360,7 +318,11 @@ async fn idle_warm_never_arms_off_non_head_or_one_shot(cipher: Cipher) {
             actor.one_shot_runs.insert(RunId("r1".into()));
         }
         actor.arm_idle_warm().await;
-        assert!(!side.registry.handle().has_idle_warm(&bind()), "{case}");
+        assert_eq!(
+            side.registry.handle().has_idle_warm(&bind()),
+            case == "non_head",
+            "{case}"
+        );
         side.registry.stop_and_seal().await;
     }
 }

@@ -36,9 +36,7 @@ use broca_module_serve::{CacheTtlTable, CredentialId};
 use broca_protocol::content::{
     AssistantMessage, ContentBlock, Message, Role, ToolOutput, ToolResult,
 };
-use broca_protocol::request::{
-    CacheRequest, CacheRole, CallOptions, ModelHandle, Tool, ToolChoice,
-};
+use broca_protocol::request::{CallOptions, ModelHandle, Tool, ToolChoice};
 use broca_protocol::{BindIdentity, NormalizedEvent, ProviderControl, StepId, Usage};
 use broca_provider::spec::WireFamilyId;
 use broca_subc::{SubcConnection, VaultClient};
@@ -215,17 +213,15 @@ async fn run_conversation(token: &str, model: &str, run_label: &str) -> Outcome 
     let cache_policy = broca_module_serve::resolve_cache_policy(
         WireFamilyId::AnthropicMessages,
         provider_id,
-        Some(&CacheRequest {
-            role: Some(CacheRole::Ephemeral),
-            ttl: None,
-            key: None,
-            tail: None,
-            mode: None,
+        Some(&{
+            let mut cache = cortexkit_role_llm_runner::cache::Cache::default();
+            cache.ttl = Some(cortexkit_role_llm_runner::cache::Ttl::Short);
+            cache
         }),
         &CacheTtlTable::shipped_defaults(),
         &bind,
-    )
-    .expect("anthropic has a marker cache row");
+    );
+    assert!(cache_policy.is_some(), "anthropic has a marker cache row");
     let options = ResolveOptions {
         auth_method: Some(AuthMethod::Oauth),
         cache_policy,

@@ -15,6 +15,7 @@ cortexkit-bus-naming.workspace = true
 cortexkit-compaction-view.workspace = true
 # Draft 2020-12 validation of structured-output schemas and values, with no remote retriever.
 jsonschema.workspace = true
+jiff.workspace = true
 serde_jcs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

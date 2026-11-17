@@ -25,7 +25,7 @@ use broca_module_serve::{
     claude_code_identity, vault_config::load_devtools_handle, CacheTtlTable, CredentialId,
 };
 use broca_protocol::{
-    request::{CacheRequest, CacheRole, CallOptions, ModelHandle, Tool, ToolChoice},
+    request::{CallOptions, ModelHandle, Tool, ToolChoice},
     BindIdentity, ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
 };
 use broca_provider::{spec::WireFamilyId, wire::ClaudeCodePersona};
@@ -107,20 +107,17 @@ fn seed_options() -> CallOptions {
 fn cache_policy(
     session: &BindIdentity,
 ) -> Result<Option<broca_provider::wire::CachePolicy>, Box<dyn std::error::Error>> {
-    broca_module_serve::resolve_cache_policy(
+    Ok(broca_module_serve::resolve_cache_policy(
         WireFamilyId::AnthropicMessages,
         "anthropic",
-        Some(&CacheRequest {
-            role: Some(CacheRole::Ephemeral),
-            ttl: None,
-            key: None,
-            tail: None,
-            mode: None,
+        Some(&{
+            let mut cache = cortexkit_role_llm_runner::cache::Cache::default();
+            cache.ttl = Some(cortexkit_role_llm_runner::cache::Ttl::Short);
+            cache
         }),
         &CacheTtlTable::shipped_defaults(),
         session,
-    )
-    .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
+    ))
 }
 
 fn resolve_provider(

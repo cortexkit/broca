@@ -81,7 +81,6 @@ pub fn submission_difference(
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
         on_restart: existing_on_restart,
-        keep_warm: existing_keep_warm,
         model: existing_model,
         input: _,
         tools: existing_tools,
@@ -115,7 +114,6 @@ pub fn submission_difference(
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
         on_restart: requested_on_restart,
-        keep_warm: requested_keep_warm,
         model: requested_model,
         input: _,
         tools: requested_tools,
@@ -151,10 +149,6 @@ pub fn submission_difference(
         (
             existing_on_restart.unwrap_or_default() != requested_on_restart.unwrap_or_default(),
             "on_restart",
-        ),
-        (
-            existing_keep_warm.unwrap_or_default() != requested_keep_warm.unwrap_or_default(),
-            "keep_warm",
         ),
         (existing_model != requested_model, "model"),
         (logical_input(existing) != logical_input(requested), "input"),
@@ -224,8 +218,6 @@ struct SubmissionIdentityDigestV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     on_restart: Option<String>,
     version: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    keep_warm: Option<String>,
     model: String,
     input: String,
     tools: String,
@@ -336,7 +328,6 @@ fn identity_digest_v1(
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
         on_restart,
-        keep_warm,
         model,
         input: _,
         tools,
@@ -372,8 +363,6 @@ fn identity_digest_v1(
         version: 1,
         on_restart: (*on_restart == Some(broca_protocol::request::OnRestart::Resume))
             .then(|| digest_json(serde_json::json!("resume"))),
-        keep_warm: (*keep_warm == Some(broca_protocol::request::KeepWarm::Auto))
-            .then(|| "auto".to_owned()),
         model: digest_json(serde_json::json!(model)),
         input: digest_json(serde_json::json!(logical_input(request))),
         tools: digest_json(serde_json::json!(tools)),
@@ -481,7 +470,6 @@ pub fn send_identity_difference_with_conversation_key(
         ),
         (stored.content != requested.content, "content"),
         (stored.directives != requested.directives, "directives"),
-        (stored.keep_warm != requested.keep_warm, "keep_warm"),
         (stored.delivery != requested.delivery, "delivery"),
         (
             stored.conversation_key != requested.conversation_key,
@@ -1204,7 +1192,7 @@ impl AdmissionCheckpointV1 {
                     cancel_at: None,
                     on_restart: *on_restart,
                     pause_reason: None,
-                    keep_warm: *keep_warm,
+                    keep_warm: keep_warm.clone(),
                     marker_order_version: *marker_order_version,
                     run_id: run_id.clone(),
                     config: (**config).clone(),
@@ -1326,7 +1314,6 @@ impl AdmissionCheckpointV1 {
                 remove_pending(&mut self.pending_fifo, submission_id);
             }
             WalRecord::Queued {
-                keep_warm,
                 message_marks,
                 sent_by: display_sent_by,
                 written_at_ms,
@@ -1350,11 +1337,7 @@ impl AdmissionCheckpointV1 {
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
                     submission_id: submission_id.clone(),
-                    request: {
-                        let mut request = request.as_ref().clone();
-                        request.keep_warm = keep_warm.or(request.keep_warm);
-                        request
-                    },
+                    request: request.as_ref().clone(),
                     request_identity_digest: request_identity_digest.clone(),
                     principal: principal.clone(),
                     send_id: send_id.clone(),
@@ -3446,31 +3429,6 @@ mod tests {
         assert_eq!(submission_difference(&plain, &with_a), None);
     }
 
-    #[test]
-    fn keep_warm_identity_is_per_send_and_off_matches_omission() {
-        use broca_protocol::request::KeepWarm;
-        let absent = request("hello");
-        let mut off = absent.clone();
-        off.keep_warm = Some(KeepWarm::Off);
-        let mut auto = absent.clone();
-        auto.keep_warm = Some(KeepWarm::Auto);
-        assert_eq!(submission_difference(&absent, &off), None);
-        assert_eq!(
-            submission_identity_digest(&absent),
-            submission_identity_digest(&off)
-        );
-        assert!(!submission_identity_digest(&absent).contains("keep_warm"));
-        assert_eq!(submission_difference(&absent, &auto), Some("keep_warm"));
-        assert_eq!(
-            submission_identity_difference(&submission_identity_digest(&absent), &auto),
-            Some("keep_warm")
-        );
-        assert_eq!(
-            submission_identity_difference(&submission_identity_digest(&auto), &off),
-            Some("keep_warm")
-        );
-    }
-
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
             message_marks: Default::default(),
@@ -3481,7 +3439,6 @@ mod tests {
             content: Vec::new(),
             directives: None,
             on_restart: None,
-            keep_warm: None,
             scope: Default::default(),
             project_id: None,
             principal: None,

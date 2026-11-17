@@ -95,10 +95,9 @@ pub use provider::{
     RATELIMIT_UNIFIED_HEADER_PREFIX,
 };
 pub use request::{
-    AuthRequest, BudgetConfig, BudgetKind, BudgetNudge, CacheMode, CacheRequest, CacheRole,
-    CacheTail, CallOptions, Delivery, DeliveryMode, DeliveryOrder, ExecutionMode, GenerationConfig,
-    ModelHandle, ResponseFormat, StepContext, StopCondition, SubmissionRequest, Tool, ToolChoice,
-    ToolReply,
+    AuthRequest, BudgetConfig, BudgetKind, BudgetNudge, CacheTail, CallOptions, Delivery,
+    DeliveryMode, DeliveryOrder, ExecutionMode, GenerationConfig, ModelHandle, ResponseFormat,
+    StepContext, StopCondition, SubmissionRequest, Tool, ToolChoice, ToolReply,
 };
 pub use session::{
     canonical_module, canonical_owner, other_module_name, same_module, same_owner_string,

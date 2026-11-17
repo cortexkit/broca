@@ -4,10 +4,7 @@ use broca_catalog::live::{
 };
 use broca_module_serve::wire::{SendParams, SendParamsExt};
 use broca_module_serve::{resolve_cache_policy, resolve_prompt_cache_key, CacheTtlTable};
-use broca_protocol::{
-    request::{CacheRequest, CallOptions},
-    BindIdentity, RunId,
-};
+use broca_protocol::{request::CallOptions, BindIdentity, RunId};
 use broca_provider::{
     families::{openai_chat_frozen_config, OpenAiChat},
     wire::{FrozenRenderConfig, WireFamily},
@@ -200,14 +197,9 @@ fn openai_chat_rendered_prompt_cache_key(cache_key: &str) -> Option<String> {
 }
 
 #[test]
-fn key_only_cache_request_is_admitted_on_every_wire_family() {
-    let cache = CacheRequest {
-        role: None,
-        ttl: None,
-        key: Some(SHARED_KEY.into()),
-        tail: None,
-        mode: None,
-    };
+fn a_key_only_cache_policy_resolves_on_every_wire_family() {
+    let mut cache = cortexkit_role_llm_runner::cache::Cache::default();
+    cache.key = Some(SHARED_KEY.into());
     let table = CacheTtlTable::shipped_defaults();
     let session = BindIdentity::new("/tmp/comment-review-project", "runner", "one-shot-session");
     for (family, provider) in [
@@ -219,10 +211,7 @@ fn key_only_cache_request_is_admitted_on_every_wire_family() {
         (WireFamilyId::Gemini, "google"),
         (WireFamilyId::GoogleCodeAssist, "google"),
     ] {
-        let policy = resolve_cache_policy(family, provider, Some(&cache), &table, &session)
-            .unwrap_or_else(|error| {
-                panic!("key-only cache request refused by {family:?}/{provider}: {error}")
-            });
+        let policy = resolve_cache_policy(family, provider, Some(&cache), &table, &session);
         assert_eq!(
             resolve_prompt_cache_key(provider, Some(&cache), &table, &session).as_deref(),
             Some(SHARED_KEY),

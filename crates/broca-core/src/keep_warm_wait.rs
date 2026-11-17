@@ -109,6 +109,11 @@ pub struct WarmWait<'a, C: ?Sized + Sync = RunConfig> {
     pub unsupported_logged: &'a std::sync::atomic::AtomicBool,
     /// A missed refresh disables automatic warming across all tool waits in this run.
     pub warm_missed: &'a std::sync::atomic::AtomicBool,
+    /// The run's warming mode, which decides when it stops (`crate::keep_warm::allows_warm`).
+    pub keep_warm: &'a broca_protocol::request::KeepWarm,
+    /// Warms this wait's batch already sent before a restart, which count toward `always` and
+    /// `hours`'s cap as its spend counts toward `auto`'s.
+    pub warms_before: u32,
 }
 
 impl<C: ?Sized + Sync> WarmWait<'_, C> {
@@ -186,6 +191,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
     let mut next = Some(tokio::time::Instant::now() + initial);
     let mut tick: Option<std::pin::Pin<Box<dyn Future<Output = WarmTick> + Send + '_>>> = None;
     let mut spent = initial_spend;
+    let mut warms = warm.warms_before;
     let mut tick_cost = 0.0;
     let mut stopped = false;
     loop {
@@ -210,14 +216,17 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                 tick = None;
                 match outcome {
                     WarmTick::Sent => {
+                        warms += 1;
                         spent += tick_cost;
                         next = delay(warm.driver.as_ref(), timing).map(|delay| tokio::time::Instant::now() + delay);
                     }
                     WarmTick::SentWithCost { cost } => {
+                        warms += 1;
                         spent += cost;
                         next = delay(warm.driver.as_ref(), timing).map(|delay| tokio::time::Instant::now() + delay);
                     }
                     WarmTick::ResponsesSent { usage, cost } => {
+                        warms += 1;
                         spent += cost;
                         let missed = usage.cached_input_tokens.zip(usage.input_tokens).map(|(cached, fresh)| (cached, cached.saturating_add(fresh)));
                         if let Some((cached, total)) = missed.filter(|(cached, total)| *cached < total.saturating_sub(*cached)) {
@@ -254,16 +263,17 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
             }
             _ = async { match next { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } }, if tick.is_none() => {
                 next = None;
-                match warm.driver.costs(warm.config) {
-                    Ok(costs) if costs.allows_next(spent) => {
-                        tick_cost = costs.warm;
+                let costs = warm.driver.costs(warm.config);
+                match crate::keep_warm::allows_warm(warm.keep_warm, costs.clone(), spent, warms, now_ms()) {
+                    Ok(()) => {
+                        // Only `auto` is gated on price, but every mode keeps its spend.
+                        tick_cost = costs.map_or(0.0, |costs| costs.warm);
                         tick = Some(warm.driver.warm(warm.config, warm.run_id));
                     }
-                    result => {
-                        warm.driver.note_stop(warm.run_id, "budget");
+                    Err((reason, detail)) => {
+                        warm.driver.note_stop(warm.run_id, reason);
                         stopped = true;
-                        let detail = result.err().unwrap_or_else(|| "one cache bust costs no more than the next warm".into());
-                        tracing::info!(target: "cache_warm", stop = "budget", detail = %detail, "keep_warm stopped");
+                        tracing::info!(target: "cache_warm", stop = reason, detail = %detail, warms, "keep_warm stopped");
                     }
                 }
             }
@@ -441,6 +451,8 @@ mod tests {
                 cancel: None,
                 unsupported_logged: &unsupported,
                 warm_missed: missed,
+                keep_warm: &broca_protocol::request::KeepWarm::Auto,
+                warms_before: 0,
             }),
         )
         .await;
@@ -527,6 +539,8 @@ mod tests {
                         cancel: None,
                         unsupported_logged: &unsupported,
                         warm_missed: &missed,
+                        keep_warm: &broca_protocol::request::KeepWarm::Auto,
+                        warms_before: 0,
                     }),
                     0.0,
                 )

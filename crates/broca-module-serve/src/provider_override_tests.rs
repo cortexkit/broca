@@ -241,12 +241,10 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
     // DeepSeek caches automatically. Switch to the overridden Anthropic provider and
     // request cache markers explicitly to verify that mock routing does not disable them.
     req.model.provider_module_id = "anthropic".into();
-    req.cache = Some(broca_protocol::request::CacheRequest {
-        role: Some(broca_protocol::request::CacheRole::Primary),
-        ttl: None,
-        key: None,
-        tail: None,
-        mode: None,
+    req.cache = Some({
+        let mut cache = cortexkit_role_llm_runner::cache::Cache::default();
+        cache.ttl = Some(cortexkit_role_llm_runner::cache::Ttl::Short);
+        cache
     });
     assert!(executor
         .cache_policy_for_episode(true, Some(WireFamilyId::AnthropicMessages), &req, req.model.provider_module_id.as_str(), None)

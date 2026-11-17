@@ -47,6 +47,50 @@ impl WarmCosts {
     }
 }
 
+/// Why a keep-warm sends no more warms, as the step report maps them (llm-runner `warming`):
+/// `auto` reached the cost of one cache rewrite (`cost-cap`).
+pub const STOP_BUDGET: &str = "budget";
+/// `always` or `hours` sent [`WARM_COUNT_CAP`] warms since the last real request (`count-cap`).
+pub const STOP_COUNT_CAP: &str = "count_cap";
+/// `hours`, and the warm fell due outside its window (`outside-hours`).
+pub const STOP_OUTSIDE_HOURS: &str = "outside_hours";
+
+pub use broca_protocol::request::WARM_COUNT_CAP;
+
+/// Whether `keep_warm` lets one more warm go out at `now_ms`, after `warms` warms costing
+/// `spent` since the last real request. Only `auto` is priced: it buys reads while they stay
+/// below one cache rewrite (`costs`). `always` and `hours` stop at [`WARM_COUNT_CAP`], and `hours`
+/// sends only inside its window. Answers the stop reason, with a detail for the log, otherwise.
+pub fn allows_warm(
+    keep_warm: &broca_protocol::request::KeepWarm,
+    costs: Result<WarmCosts, String>,
+    spent: f64,
+    warms: u32,
+    now_ms: u64,
+) -> Result<(), (&'static str, String)> {
+    use broca_protocol::request::KeepWarm;
+    match keep_warm {
+        KeepWarm::Auto => match costs {
+            Ok(costs) if costs.allows_next(spent) => Ok(()),
+            Ok(_) => Err((
+                STOP_BUDGET,
+                "one cache rewrite costs no more than the next warm".into(),
+            )),
+            Err(detail) => Err((STOP_BUDGET, detail)),
+        },
+        KeepWarm::Always | KeepWarm::Hours(_) if warms >= WARM_COUNT_CAP => Err((
+            STOP_COUNT_CAP,
+            format!("{warms} warms since the last real request"),
+        )),
+        KeepWarm::Hours(hours) if !hours.contains(now_ms) => Err((
+            STOP_OUTSIDE_HOURS,
+            format!("outside {}-{} in {}", hours.from, hours.to, hours.tz),
+        )),
+        KeepWarm::Always | KeepWarm::Hours(_) => Ok(()),
+        KeepWarm::Off => Err(("unsupported", "keep_warm is off".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +150,94 @@ mod tests {
         assert!(!WarmCosts::from_ratios(100, 1e-20, 1e-20, 0.0, 0)
             .unwrap()
             .allows_next(0.0));
+    }
+
+    mod modes {
+        use super::super::{
+            allows_warm, WarmCosts, STOP_BUDGET, STOP_COUNT_CAP, STOP_OUTSIDE_HOURS, WARM_COUNT_CAP,
+        };
+        use broca_protocol::request::{KeepWarm, WarmHours};
+
+        /// 2026-11-17 22:30 UTC, in Unix milliseconds.
+        const LATE_EVENING_UTC_MS: u64 = 1_794_954_600_000;
+
+        fn costs() -> Result<WarmCosts, String> {
+            Ok(WarmCosts {
+                warm: 1.0,
+                bust: 10.0,
+            })
+        }
+
+        fn night() -> KeepWarm {
+            KeepWarm::Hours(WarmHours {
+                from: "22:00".into(),
+                to: "06:00".into(),
+                tz: "Etc/UTC".into(),
+            })
+        }
+
+        #[test]
+        fn auto_stops_at_the_cost_of_one_rewrite_whatever_the_count() {
+            assert!(allows_warm(&KeepWarm::Auto, costs(), 8.0, 100, LATE_EVENING_UTC_MS).is_ok());
+            assert_eq!(
+                allows_warm(&KeepWarm::Auto, costs(), 9.0, 0, LATE_EVENING_UTC_MS)
+                    .unwrap_err()
+                    .0,
+                STOP_BUDGET
+            );
+            assert_eq!(
+                allows_warm(
+                    &KeepWarm::Auto,
+                    Err("no rate".into()),
+                    0.0,
+                    0,
+                    LATE_EVENING_UTC_MS
+                )
+                .unwrap_err()
+                .0,
+                STOP_BUDGET
+            );
+        }
+
+        #[test]
+        fn always_ignores_price_and_stops_at_the_count_cap() {
+            assert!(allows_warm(
+                &KeepWarm::Always,
+                Err("no rate".into()),
+                1e9,
+                WARM_COUNT_CAP - 1,
+                LATE_EVENING_UTC_MS
+            )
+            .is_ok());
+            assert_eq!(
+                allows_warm(
+                    &KeepWarm::Always,
+                    costs(),
+                    0.0,
+                    WARM_COUNT_CAP,
+                    LATE_EVENING_UTC_MS
+                )
+                .unwrap_err()
+                .0,
+                STOP_COUNT_CAP
+            );
+        }
+
+        #[test]
+        fn hours_warms_only_inside_its_window_and_under_the_count_cap() {
+            assert!(allows_warm(&night(), costs(), 1e9, 0, LATE_EVENING_UTC_MS).is_ok());
+            // Noon the same day is outside 22:00-06:00.
+            let noon = LATE_EVENING_UTC_MS - 10 * 3_600_000 - 30 * 60_000;
+            assert_eq!(
+                allows_warm(&night(), costs(), 0.0, 0, noon).unwrap_err().0,
+                STOP_OUTSIDE_HOURS
+            );
+            assert_eq!(
+                allows_warm(&night(), costs(), 0.0, WARM_COUNT_CAP, LATE_EVENING_UTC_MS)
+                    .unwrap_err()
+                    .0,
+                STOP_COUNT_CAP
+            );
+        }
     }
 }

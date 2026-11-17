@@ -323,6 +323,14 @@ fn attempted_step(id: &str, text: &str, sent_at_ms: u64) -> Vec<NormalizedEvent>
 async fn reboot_an_automatic_head(
     sent_at_ms: u64,
 ) -> (crate::store_open::recovery::StoreRecoverySweep, bool) {
+    reboot_an_automatic_session(sent_at_ms, Some("head")).await
+}
+
+/// As [`reboot_an_automatic_head`], for a session of class `class`.
+async fn reboot_an_automatic_session(
+    sent_at_ms: u64,
+    class: Option<&str>,
+) -> (crate::store_open::recovery::StoreRecoverySweep, bool) {
     let dir = scratch();
     let config = warmable();
     let sent = Arc::default();
@@ -338,7 +346,7 @@ async fn reboot_an_automatic_head(
     let key = BindIdentity::new(dir.join("project"), "store-actor", "automatic-head");
     let mut first = request("hello");
     first.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
-    first.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
+    first.cache = Some(serde_json::from_value(serde_json::json!({"keep_warm": "auto"})).unwrap());
     assert!(matches!(
         registry
             .route_submission_with_order(
@@ -353,7 +361,7 @@ async fn reboot_an_automatic_head(
                 None,
                 None,
                 None,
-                Some("head".into()),
+                class.map(str::to_owned),
                 false,
                 None,
             )
@@ -378,6 +386,15 @@ async fn reboot_an_automatic_head(
     assert!(reboot.stop_and_seal().await);
     std::fs::remove_dir_all(dir).unwrap();
     (sweep, warm)
+}
+
+/// Warming follows the session's cache policy, not its class: a session with no class whose
+/// run asked for `keep_warm: auto` is warmed between turns like a head.
+#[tokio::test]
+async fn startup_rearms_a_classless_session_that_asked_for_warming() {
+    let (sweep, warm) = reboot_an_automatic_session(crate::actor::epoch_ms(), None).await;
+    assert_eq!(sweep.opened_for, [("warm_cache", 1)].into_iter().collect());
+    assert!(warm, "{sweep:?}");
 }
 
 #[tokio::test]

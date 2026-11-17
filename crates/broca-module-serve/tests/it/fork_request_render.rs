@@ -149,8 +149,7 @@ fn an_anthropic_fork_request_is_the_head_request_plus_its_messages_and_one_moved
         None,
         &broca_module_serve::CacheTtlTable::shipped_defaults(),
         &broca_protocol::BindIdentity::new("/tmp/project", "runner", "session"),
-    )
-    .unwrap();
+    );
     let base = head_request();
     let base_bytes = AnthropicMessages.render(&frozen, &base);
     let fork_bytes = AnthropicMessages.render(&frozen, &fork_of(&base));

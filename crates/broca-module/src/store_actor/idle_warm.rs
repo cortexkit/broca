@@ -1,4 +1,7 @@
-//! Idle heads may buy cache reads only while their total cost stays below one cache rewrite.
+//! Warming a session's prompt cache between turns, by the mode its latest run froze
+//! (llm-runner `keep_warm`): `auto` buys reads only while their cost since the last real request
+//! stays below one cache rewrite; `always` and `hours` stop after a fixed count, and `hours`
+//! warms only inside its window.
 
 use broca_core::keep_warm_wait::WarmTiming;
 use broca_session_loop::writer::Writer as _;
@@ -15,9 +18,6 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
 
     pub(super) async fn bill_recorded_idle_warms(&self) {
         let Some(billing) = &self.billing else { return };
-        if self.frozen_session_class().as_deref() != Some("head") {
-            return;
-        }
         let Some(run) = self
             .session
             .operations()
@@ -71,10 +71,13 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         {
             return Err("unfinished_or_one_shot".into());
         }
-        if self.frozen_session_class().as_deref() != Some("head")
-            || start.keep_warm.as_ref() != Some(&serde_json::json!("auto"))
-        {
-            return Err("not_auto_head".into());
+        let keep_warm: broca_protocol::request::KeepWarm = start
+            .keep_warm
+            .clone()
+            .and_then(|keep_warm| serde_json::from_value(keep_warm).ok())
+            .unwrap_or_default();
+        if !keep_warm.warms() {
+            return Err("keep_warm_off".into());
         }
         let config =
             super::warm::run_config(run, start, &self.parts).map_err(|e| format!("{e:?}"))?;
@@ -98,14 +101,20 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             (self.now_ms)(),
         )
         .map_err(|_| "cache_expired")?;
-        let prefix = run
-            .last_step_usage
-            .and_then(broca_core::cache_warm::prefix_tokens)
-            .ok_or("prefix_tokens_unavailable")?;
-        let costs = self.executor.warm_costs(&config, prefix, ttl_ms)?;
-        // Sealed history matters too: actor eviction and log rotation must not reset the cap.
+        // Only `auto` is priced; the other modes warm without a rate.
+        let auto = keep_warm == broca_protocol::request::KeepWarm::Auto;
+        let costs = if auto {
+            let prefix = run
+                .last_step_usage
+                .and_then(broca_core::cache_warm::prefix_tokens)
+                .ok_or("prefix_tokens_unavailable")?;
+            Some(self.executor.warm_costs(&config, prefix, ttl_ms)?)
+        } else {
+            None
+        };
+        // Sealed history matters too: actor eviction and log rotation must not reset the caps.
         let records = self.idle_warm_records().await?;
-        let mut spent = 0.0;
+        let (mut spent, mut warms) = (0.0, 0_u32);
         for (_, record) in &records {
             match record {
                 Record::Attempt(_) => break,
@@ -113,22 +122,24 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
                     if warm.usage.cached_input_tokens == Some(0) {
                         return Err("no_cache_read".into());
                     }
-                    spent += if super::keep_warm::responses(&config) {
-                        self.executor.responses_warm_cost(&config, warm.usage)?
-                    } else {
-                        costs.warm
+                    warms = warms.saturating_add(1);
+                    spent += match costs {
+                        Some(_) if super::keep_warm::responses(&config) => {
+                            self.executor.responses_warm_cost(&config, warm.usage)?
+                        }
+                        Some(costs) => costs.warm,
+                        None => 0.0,
                     };
                 }
                 _ => {}
             }
         }
-        if !costs.allows_next(spent) {
-            return Err("cap".into());
-        }
-        Ok(
-            WarmTiming::for_ttl(ttl_ms, self.executor.warm_after_send_ms(&config))
-                .next_due_ms(send.sent_at_ms),
-        )
+        let due = WarmTiming::for_ttl(ttl_ms, self.executor.warm_after_send_ms(&config))
+            .next_due_ms(send.sent_at_ms);
+        let costs = costs.ok_or_else(|| "not priced".to_owned());
+        broca_core::keep_warm::allows_warm(&keep_warm, costs, spent, warms, due)
+            .map_err(|(reason, _)| reason.to_owned())?;
+        Ok(due)
     }
 
     pub(super) async fn arm_idle_warm(&self) {

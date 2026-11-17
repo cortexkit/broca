@@ -188,10 +188,11 @@ impl RunExecutor for Executor {
             mode,
             ..
         } = job;
-        self.requests
-            .lock()
-            .unwrap()
-            .push((req.run_id.clone(), req.keep_warm, req.on_restart));
+        self.requests.lock().unwrap().push((
+            req.run_id.clone(),
+            req.keep_warm.clone(),
+            req.on_restart,
+        ));
         let result = async {
             if self.refuse.swap(false, Ordering::SeqCst) {
                 return Err(StoreRunError::Admission(RunError::Config(
@@ -334,7 +335,6 @@ impl Side {
         let mut request = request("hello");
         request.tools = None;
         request.policy_allowed.clear();
-        request.keep_warm = Some(broca_protocol::request::KeepWarm::Off);
         request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
         self.registry
             .route_submission_with_order(

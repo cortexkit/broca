@@ -179,7 +179,7 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             sent_by: display_sent_by,
             written_at_ms,
             ts_ms,
-            keep_warm,
+            keep_warm: _,
             submission_id,
             request,
             request_identity_digest,
@@ -204,11 +204,7 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
                     submission_id: submission_id.clone(),
-                    request: {
-                        let mut request = request.as_ref().clone();
-                        request.keep_warm = keep_warm.or(request.keep_warm);
-                        request
-                    },
+                    request: request.as_ref().clone(),
                     request_identity_digest: request_identity_digest.clone(),
                     principal: principal.clone(),
                     send_id: send_id.clone(),
@@ -390,7 +386,6 @@ mod tests {
                 content: Vec::new(),
                 directives: None,
                 on_restart: None,
-                keep_warm: None,
                 scope: Default::default(),
                 project_id: None,
                 principal: None,
@@ -415,46 +410,6 @@ mod tests {
             }),
             request_identity_digest: None,
             principal: None,
-        }
-    }
-
-    #[test]
-    fn queued_keep_warm_survives_replay_and_drain_without_freezing_the_next_send() {
-        use broca_protocol::request::KeepWarm;
-        for policy in [None, Some(KeepWarm::Auto), Some(KeepWarm::Off)] {
-            let mut record = queued("one", "hello");
-            let WalRecord::Queued { keep_warm, .. } = &mut record else {
-                unreachable!()
-            };
-            *keep_warm = policy;
-            let restored: WalRecord =
-                serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
-            let pending = pending_submissions(std::slice::from_ref(&restored));
-            let run = crate::RunRequest::from_submission(
-                pending[0].request.clone(),
-                RunId("r".into()),
-                BindIdentity::new("/tmp/p", "h", "s"),
-                SubmissionId("one".into()),
-            );
-            assert_eq!(run.keep_warm, policy);
-            assert_eq!(run.to_submission().keep_warm, policy);
-            let mut checkpoint = crate::AdmissionCheckpointV1::empty();
-            checkpoint.fold_record(1, &restored).unwrap();
-            assert_eq!(checkpoint.pending_fifo[0].request.keep_warm, policy);
-            let mut started = consumed("r", "one");
-            let WalRecord::RunStarted { keep_warm, .. } = &mut started else {
-                unreachable!()
-            };
-            *keep_warm = policy;
-            checkpoint.fold_record(2, &started).unwrap();
-            assert_eq!(checkpoint.last_episode.as_ref().unwrap().keep_warm, policy);
-            assert_eq!(crate::replay(&[started]).unwrap().keep_warm, policy);
-            assert_eq!(
-                pending_submissions(&[queued("next", "next")])[0]
-                    .request
-                    .keep_warm,
-                None
-            );
         }
     }
 

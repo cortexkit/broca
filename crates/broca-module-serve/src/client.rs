@@ -23,9 +23,9 @@ use broca_subc::connection::{
 };
 
 use crate::wire::{
-    AuthParams, CacheParams, CancelParams, FromWire, ImportOriginKind, ImportOriginParams,
-    ImportParams, ImportResult, ModelParams, ReadParams, ReadResult, RetractParams, SendParams,
-    SendResult, StatusParams, SubscribeParams,
+    AuthParams, CancelParams, FromWire, ImportOriginKind, ImportOriginParams, ImportParams,
+    ImportResult, ModelParams, ReadParams, ReadResult, RetractParams, SendParams, SendResult,
+    StatusParams, SubscribeParams,
 };
 
 use broca_wire::RunResultParams;
@@ -62,7 +62,7 @@ pub struct SendSpec<'a> {
     pub send_id: Option<&'a str>,
     /// Per-send output-token cap, forwarded as `generation.max_output_tokens`.
     pub max_output_tokens: Option<u64>,
-    pub cache: Option<CacheParams>,
+    pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
     pub budget: Option<broca_protocol::BudgetConfig>,
     pub auth: Option<AuthParams>,
     /// `Some(true)` skips transcript materialization while keeping the WAL readable.
@@ -524,7 +524,6 @@ fn send_params(spec: SendSpec<'_>) -> SendRequest {
             title: None,
             client_message_id: None,
             on_restart: None,
-            keep_warm: None,
             retention: None,
             conversation_key: None,
             service_tier: spec.service_tier,
@@ -852,12 +851,11 @@ mod tests {
             tools: None,
             send_id: None,
             max_output_tokens: Some(137),
-            cache: Some(CacheParams {
-                role: Some(broca_protocol::request::CacheRole::Primary),
-                ttl: Some("1h".into()),
-                key: Some(cache_key.into()),
-                tail: None,
-                mode: None,
+            cache: Some({
+                let mut cache = cortexkit_role_llm_runner::cache::Cache::default();
+                cache.ttl = Some(cortexkit_role_llm_runner::cache::Ttl::Long);
+                cache.key = Some(cache_key.into());
+                cache
             }),
             budget: None,
             auth: None,
@@ -916,7 +914,6 @@ mod tests {
             session_class: None,
             title: None,
             on_restart: None,
-            keep_warm: None,
             retention: None,
             conversation_key: None,
             service_tier: None,

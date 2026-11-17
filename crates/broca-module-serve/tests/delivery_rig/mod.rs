@@ -210,6 +210,19 @@ pub struct Script {
     /// Optional serving-family config for media tests; other scripts keep their legacy bytes.
     pub media_frozen: Mutex<Option<broca_provider::wire::FrozenRenderConfig>>,
     pub omit_media_profile: Mutex<bool>,
+    /// The cache policy each fresh run was admitted with, in start order.
+    pub run_caches: Mutex<Vec<RunCache>>,
+}
+
+/// The prompt-cache policy the store actor admitted one fresh run with.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunCache {
+    /// The policy the run resolves its lifetime and key from.
+    pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
+    /// The warming the run froze.
+    pub keep_warm: Option<broca_protocol::request::KeepWarm>,
+    /// Whether the run takes the previous run's frozen policy instead of `cache`.
+    pub inherit: bool,
 }
 
 impl Script {
@@ -563,6 +576,13 @@ impl RunExecutor for CoreExec {
             ..
         } = job;
         control.hook_plane = self.hook_plane();
+        if matches!(mode, StoreRunMode::Fresh) {
+            self.script.run_caches.lock().unwrap().push(RunCache {
+                cache: req.cache.clone(),
+                keep_warm: req.keep_warm.clone(),
+                inherit: req.inherit_frozen_cache,
+            });
+        }
         if let Some(selection) = self.script.auth_selection.lock().unwrap().clone() {
             control.auth_selection = Some(selection);
         }

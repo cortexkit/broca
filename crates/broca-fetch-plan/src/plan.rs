@@ -80,6 +80,9 @@ pub struct Plan {
     pub render_tags: bool,
     /// The modules other than the session's owner that may send into it (see [`plan_senders`]).
     pub senders: Vec<PlanSender>,
+    /// The session's cache policy (llm-runner `cache_policy`), which each run takes from the plan
+    /// it starts under (see [`plan_cache`]). `None` leaves the lifetime to broca, with no warming.
+    pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
 }
 
 pub use cortexkit_role_llm_runner::delivery_order::{
@@ -571,6 +574,7 @@ pub fn parse_plan_with(
     }
 
     let senders = plan_senders(object)?;
+    let cache = plan_cache(object)?;
 
     for (index, step) in step_items.iter().enumerate() {
         for (position, subscription) in step.subscriptions.iter().enumerate() {
@@ -610,7 +614,119 @@ pub fn parse_plan_with(
         composed,
         render_tags,
         senders,
+        cache,
     })
+}
+
+/// A plan's `cache` member: shape-checked by the contract's own rules, which name the field they
+/// refuse, and its `hours.tz`, if any, checked against broca's bundled time-zone database.
+pub fn plan_cache(
+    plan: &Map<String, Value>,
+) -> Result<Option<cortexkit_role_llm_runner::cache::Cache>, Refusal> {
+    let cache = cortexkit_role_llm_runner::cache::check_plan(plan).map_err(|body| {
+        Refusal::InvalidParams {
+            detail: body.detail,
+        }
+    })?;
+    if let Some(cache) = &cache {
+        check_zone(cache, "plan.cache").map_err(|body| Refusal::InvalidParams {
+            detail: body.detail,
+        })?;
+    }
+    Ok(cache)
+}
+
+/// Refuses a `keep_warm: hours` window whose zone broca doesn't know, naming `<prefix>.hours.tz`.
+/// The contract's shape checks leave zones to the runner.
+pub fn check_zone(
+    cache: &cortexkit_role_llm_runner::cache::Cache,
+    prefix: &str,
+) -> Result<(), cortexkit_role_llm_runner::cache::ErrorBody> {
+    match &cache.hours {
+        Some(hours) if !broca_protocol::request::WarmHours::known_zone(&hours.tz) => {
+            Err(cortexkit_role_llm_runner::cache::ErrorBody::invalid_params(
+                format!("{prefix}.hours.tz"),
+                format!("unknown IANA time zone {:?}", hours.tz),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cache(value: Value) -> Result<Option<cortexkit_role_llm_runner::cache::Cache>, Refusal> {
+        plan_cache(json!({ "cache": value }).as_object().unwrap())
+    }
+
+    fn refused_field(value: Value) -> String {
+        match cache(value) {
+            Err(Refusal::InvalidParams { detail }) => detail["field"].as_str().unwrap().to_owned(),
+            other => panic!("expected an invalid_params refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plan_without_cache_has_no_policy() {
+        assert_eq!(plan_cache(json!({}).as_object().unwrap()).unwrap(), None);
+    }
+
+    #[test]
+    fn the_contract_example_is_admitted() {
+        let admitted = cache(json!({
+            "key": "shared-prefix-v1",
+            "ttl": "long",
+            "keep_warm": "hours",
+            "hours": {"from": "22:00", "to": "06:00", "tz": "Etc/UTC"}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(admitted.key.as_deref(), Some("shared-prefix-v1"));
+        assert_eq!(admitted.hours.unwrap().tz, "Etc/UTC");
+    }
+
+    #[test]
+    fn each_shape_problem_names_its_plan_field() {
+        assert_eq!(refused_field(json!({"key": ""})), "plan.cache.key");
+        assert_eq!(refused_field(json!({"key": "has space"})), "plan.cache.key");
+        assert_eq!(refused_field(json!({"key": 7})), "plan.cache.key");
+        assert_eq!(
+            refused_field(json!({"ttl": "none", "keep_warm": "auto"})),
+            "plan.cache.keep_warm"
+        );
+        assert_eq!(
+            refused_field(json!({"keep_warm": "hours"})),
+            "plan.cache.hours"
+        );
+        assert_eq!(
+            refused_field(
+                json!({"keep_warm": "hours", "hours": {"from": "24:00", "to": "06:00", "tz": "Etc/UTC"}})
+            ),
+            "plan.cache.hours.from"
+        );
+        assert_eq!(
+            refused_field(
+                json!({"keep_warm": "hours", "hours": {"from": "06:00", "to": "06:00", "tz": "Etc/UTC"}})
+            ),
+            "plan.cache.hours.to"
+        );
+        // A lifetime from the removed per-send shape, such as `"1h"`, is refused rather than
+        // read as `short` or `long`.
+        assert_eq!(refused_field(json!({"ttl": "1h"})), "plan.cache");
+    }
+
+    #[test]
+    fn an_unknown_zone_is_refused_by_name() {
+        assert_eq!(
+            refused_field(
+                json!({"keep_warm": "hours", "hours": {"from": "22:00", "to": "06:00", "tz": "Mars/Olympus_Mons"}})
+            ),
+            "plan.cache.hours.tz"
+        );
+    }
 }
 
 #[cfg(test)]

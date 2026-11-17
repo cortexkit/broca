@@ -64,6 +64,9 @@ mod attempt;
 use attempt::attempt_record;
 mod display;
 use display::restream;
+mod warming;
+pub(crate) use warming::Warming;
+pub use warming::{warm_count, warm_spend};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
 
@@ -3835,6 +3838,7 @@ async fn admit<W: Writer>(
         hooks: to_value(admission.send.hooks.as_ref())?,
         keep_warm: admission
             .keep_warm
+            .as_ref()
             .map(serde_json::to_value)
             .transpose()
             .map_err(|e| LoopError::Parts(e.to_string()))?,
@@ -5095,11 +5099,12 @@ where
     };
     // While the calls run, the run's keep-warm refreshes the prompt cache, as today's loop
     // does around the same wait. A wait resumed after a restart counts the warms it already
-    // sent toward its spending cap.
+    // sent toward its caps.
     let spend = warming.map_or(0.0, |warming| warming.spent(writer.operations(), step_id));
+    let sent = warming.map_or(0, |_| warm_count(writer.operations(), step_id));
     let dispatched = broca_core::keep_warm_wait::wait_tools_with_spend(
         dispatch_all(writer, seams, &plan),
-        warming.map(|warming| warming.wait(&seams.cancel)),
+        warming.map(|warming| warming.wait(&seams.cancel, sent)),
         spend,
     )
     .await?;
@@ -5610,103 +5615,6 @@ fn structured_of(
     broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(
         &admission.render_config,
     ))
-}
-
-/// A run's keep-warm: today's scheduler warms the prompt cache while the run waits on tool
-/// calls, through the driver the caller gave, for a run whose keep-warm is `auto`.
-pub(crate) struct Warming<'a> {
-    driver: &'a Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>,
-    admission: &'a Admission,
-    run_id: broca_protocol::RunId,
-    /// Whether the run already logged that its cache can't be warmed, so later waits don't
-    /// repeat it.
-    unsupported_logged: std::sync::atomic::AtomicBool,
-    /// A warm that missed the cache stops warming for the rest of the run.
-    warm_missed: std::sync::atomic::AtomicBool,
-}
-
-impl<'a> Warming<'a> {
-    /// The run's keep-warm, if it asked for one and the caller gave a driver.
-    pub(crate) fn of<P, T>(admission: &'a Admission, seams: &'a Seams<'_, P, T>) -> Option<Self> {
-        if admission.keep_warm != Some(broca_protocol::request::KeepWarm::Auto) {
-            return None;
-        }
-        Some(Self {
-            driver: seams.keep_warm.as_ref()?,
-            admission,
-            run_id: broca_protocol::RunId(admission.run_id.clone()),
-            unsupported_logged: Default::default(),
-            warm_missed: Default::default(),
-        })
-    }
-
-    fn wait<'w>(
-        &'w self,
-        cancel: &'w CancellationToken,
-    ) -> broca_core::keep_warm_wait::WarmWait<'w, Admission> {
-        broca_core::keep_warm_wait::WarmWait {
-            driver: self.driver,
-            config: self.admission,
-            run_id: &self.run_id,
-            cancel: Some(cancel),
-            unsupported_logged: &self.unsupported_logged,
-            warm_missed: &self.warm_missed,
-        }
-    }
-
-    /// What the run's keep-warm already spent warming during the wait after step `step_id`.
-    fn spent(
-        &self,
-        operations: &broca_session_store::fold::operations::Operations,
-        step_id: u64,
-    ) -> f64 {
-        warm_spend(self.driver.as_ref(), self.admission, operations, step_id)
-    }
-}
-
-/// What a run's keep-warm already spent warming during the wait after step `step_id`, priced as
-/// today's loop prices it after a restart (`broca_core::keep_warm_wait::batch_spend`): a warm
-/// that reached the cache at its recorded price, a failed one that was sent and reported usage
-/// at its measured price, any other at nothing. A warm the driver can't price counts as
-/// unaffordable, so the wait sends no more.
-pub fn warm_spend<C: ?Sized + Sync>(
-    driver: &dyn broca_core::keep_warm_wait::KeepWarmDriver<C>,
-    config: &C,
-    operations: &broca_session_store::fold::operations::Operations,
-    step_id: u64,
-) -> f64 {
-    let Some(run) = operations.run.as_ref() else {
-        return 0.0;
-    };
-    run.warms
-        .iter()
-        .filter(|warm| warm.step_id == step_id)
-        .map(|warm| {
-            let billing = |key: &str| warm.billing.as_ref().and_then(|billing| billing.get(key));
-            let envelope: Option<broca_wal::record::AttemptEnvelope> = billing("envelope")
-                .and_then(|envelope| serde_json::from_value(envelope.clone()).ok());
-            if warm.reached_cache {
-                return driver
-                    .recorded_cost(config, &warm.usage)
-                    .unwrap_or(f64::INFINITY);
-            }
-            match envelope {
-                Some(envelope) if broca_core::cache_warm::warm_budget_needs_pricing(&envelope) => {
-                    let reservation: Option<broca_wal::record::AttemptReservation> =
-                        billing("reservation").and_then(|reservation| {
-                            serde_json::from_value(reservation.clone()).ok()
-                        });
-                    match reservation {
-                        Some(reservation) => driver
-                            .failed_cost(config, &reservation, &envelope, warm.ttl_ms)
-                            .unwrap_or(f64::INFINITY),
-                        None => f64::INFINITY,
-                    }
-                }
-                _ => 0.0,
-            }
-        })
-        .sum()
 }
 
 /// The account the run uses: the one routing gives it now, else the one it froze at admission,

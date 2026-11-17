@@ -438,8 +438,11 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
         cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
         // A part number the model cites in a call resolves in the request that made the call
-        // (`session.read {tag, call_key}`), from the numbers each answered attempt recorded.
+        // (`session.read {tag, call_key}`), from the numbers its tool batch's start recorded.
         cortexkit_role_llm_runner::capabilities::TAG_READ,
+        // A session's cache lifetime and warming are its plan's `cache`, or a planless session's
+        // creating send's, frozen per run whoever starts it.
+        cortexkit_role_llm_runner::capabilities::CACHE_POLICY,
         cortexkit_role_llm_runner::capabilities::SEND_IDS,
         cortexkit_role_llm_runner::capabilities::STEP_EVENTS,
     ]
@@ -1296,6 +1299,7 @@ mod pinned_reply_bytes {
                 broca_protocol::FORK_ANSWER_SERVED.then_some(broca_protocol::FORK_IDLE_S)
             );
             assert!(checked.declares(cortexkit_role_llm_runner::capabilities::TAG_READ));
+            assert!(checked.declares(cortexkit_role_llm_runner::capabilities::CACHE_POLICY));
             // The person's steer hands calls back exactly when this build records notices.
             assert_eq!(
                 checked.declares(cortexkit_role_llm_runner::capabilities::CALL_YIELD),
@@ -1304,7 +1308,6 @@ mod pinned_reply_bytes {
             for group in [
                 "adopt_open",
                 "stop_all",
-                "cache_policy",
                 "history_intake",
                 "plan_notes",
                 "restart_survival",
@@ -1432,7 +1435,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "9487def5151ade8c0961e656525cad3a12b48d6dcd007525d7265f60dcb29b14",
+            "1d4d4a9ee179108a913ec07be29337e8016d909f94f8dd27135ea3d63e95fb92",
         );
     }
 
@@ -1629,7 +1632,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "e28fe5a24372c7079a66410a76435c87b29ba4a8d826c2120cf69327df998978";
+        "baaaa162fba804f738481c3fe15ca1415c2f23513716846af40c40300c5b17f3";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

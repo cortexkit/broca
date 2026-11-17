@@ -3187,7 +3187,7 @@ impl StepEventObserver {
 
     fn note_cache(&mut self, run_id: &broca_protocol::RunId, mut cache: StepEventCache) {
         if let Some(prior) = self.caches.get(&run_id.0) {
-            cache.keep_warm = cache.keep_warm.or(prior.keep_warm);
+            cache.keep_warm = cache.keep_warm.or(prior.keep_warm.clone());
             cache.stop_reason.clone_from(&prior.stop_reason);
         }
         self.caches.insert(run_id.0.clone(), cache);
@@ -3231,7 +3231,7 @@ impl StepEventObserver {
                     run_id,
                     StepEventCache {
                         frozen_render_config: config.frozen_render_config.clone(),
-                        keep_warm: Some(keep_warm.unwrap_or_default()),
+                        keep_warm: Some(keep_warm.clone().unwrap_or_default()),
                         stop_reason: None,
                     },
                 );

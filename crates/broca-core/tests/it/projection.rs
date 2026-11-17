@@ -1074,7 +1074,6 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         content: Vec::new(),
         directives: None,
         on_restart: None,
-        keep_warm: None,
         scope: Default::default(),
         project_id: None,
         principal: None,

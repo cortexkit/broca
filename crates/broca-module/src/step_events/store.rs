@@ -207,7 +207,7 @@ impl Observer {
         super::cache_report(
             frozen,
             &event.provider,
-            stops.as_ref().and(run.keep_warm),
+            stops.as_ref().and(run.keep_warm.as_ref()),
             stops
                 .as_ref()
                 .and_then(|stops| stops.get(&event.run_id))

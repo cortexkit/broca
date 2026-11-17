@@ -9,13 +9,14 @@ use broca_catalog::live::WireFamilyId;
 use broca_module_serve::{resolve_cache_policy, CacheTtlTable};
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult},
-    request::{CacheMode, CacheRequest, CacheRole, CallOptions, Tool, ToolChoice},
+    request::{CallOptions, Tool, ToolChoice},
     BindIdentity, ToolCallId,
 };
 use broca_provider::families::{
     anthropic_frozen_config, bedrock_frozen_config, AnthropicMessages, BedrockConverse,
 };
 use broca_provider::wire::WireFamily;
+use cortexkit_role_llm_runner::cache::{Cache, Ttl};
 use serde_json::{json, Value};
 
 const GOLDEN: &str = "tests/fixtures/anthropic_no_cache_request_render_golden.json";
@@ -79,8 +80,8 @@ fn tool_loop_step() -> CallOptions {
 }
 
 /// Render the step exactly as a fresh first-party Anthropic episode would: resolve the
-/// caller's cache request against the shipped provider table, freeze the result, render.
-fn render_admitted(provider: &str, request: Option<&CacheRequest>) -> Vec<u8> {
+/// session's cache policy against the shipped provider table, freeze the result, render.
+fn render_admitted(provider: &str, request: Option<&Cache>) -> Vec<u8> {
     let mut frozen = anthropic_frozen_config("claude-opus-4-8");
     frozen.cache = resolve(WireFamilyId::AnthropicMessages, provider, request);
     AnthropicMessages.render(&frozen, &tool_loop_step())
@@ -89,7 +90,7 @@ fn render_admitted(provider: &str, request: Option<&CacheRequest>) -> Vec<u8> {
 fn resolve(
     family: WireFamilyId,
     provider: &str,
-    request: Option<&CacheRequest>,
+    request: Option<&Cache>,
 ) -> Option<broca_provider::wire::CachePolicy> {
     resolve_cache_policy(
         family,
@@ -98,7 +99,14 @@ fn resolve(
         &CacheTtlTable::shipped_defaults(),
         &BindIdentity::new("/tmp/project", "runner", "session"),
     )
-    .expect("every request shape used here resolves")
+}
+
+/// A cache policy naming `ttl` and `key`.
+fn policy(ttl: Option<Ttl>, key: Option<&str>) -> Cache {
+    let mut cache = Cache::default();
+    cache.ttl = ttl;
+    cache.key = key.map(str::to_owned);
+    cache
 }
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -178,14 +186,8 @@ fn a_send_without_a_cache_request_gets_four_default_markers_with_no_ttl() {
 }
 
 #[test]
-fn a_key_only_send_keeps_the_default_markers() {
-    let key_only = CacheRequest {
-        role: None,
-        ttl: None,
-        key: Some("caller-scope".into()),
-        tail: None,
-        mode: None,
-    };
+fn a_key_only_policy_keeps_the_default_markers() {
+    let key_only = policy(None, Some("caller-scope"));
     assert_eq!(
         render_admitted("anthropic", Some(&key_only)),
         render_admitted("anthropic", None)
@@ -193,14 +195,8 @@ fn a_key_only_send_keeps_the_default_markers() {
 }
 
 #[test]
-fn cache_mode_none_renders_the_bytes_from_before_the_default() {
-    let none = CacheRequest {
-        role: None,
-        ttl: None,
-        key: None,
-        tail: None,
-        mode: Some(CacheMode::None),
-    };
+fn ttl_none_renders_the_bytes_from_before_the_default() {
+    let none = policy(Some(Ttl::None), None);
     let rendered = render_admitted("anthropic", Some(&none));
     assert!(markers(&rendered).is_empty());
     assert_eq!(
@@ -210,19 +206,9 @@ fn cache_mode_none_renders_the_bytes_from_before_the_default() {
 }
 
 #[test]
-fn an_explicit_request_keeps_its_ttl_on_the_wire() {
-    for (ttl, role, expected) in [
-        (Some("1h"), None, "1h"),
-        // No TTL named: the primary role's default, now 5m, still written out explicitly.
-        (None, Some(CacheRole::Primary), "5m"),
-    ] {
-        let request = CacheRequest {
-            role,
-            ttl: ttl.map(str::to_string),
-            key: None,
-            tail: None,
-            mode: None,
-        };
+fn a_requested_lifetime_is_written_on_the_wire() {
+    for (ttl, expected) in [(Ttl::Long, "1h"), (Ttl::Short, "5m")] {
+        let request = policy(Some(ttl), None);
         let rendered = render_admitted("anthropic", Some(&request));
         assert_eq!(
             positions(&rendered),

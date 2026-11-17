@@ -247,7 +247,7 @@ fn event(runner: &str, attempt: &DurableAttempt) -> Option<StepFinished> {
         event.cache = cache_report(
             &cache.frozen_render_config,
             &event.provider,
-            cache.keep_warm,
+            cache.keep_warm.as_ref(),
             cache.stop_reason.as_deref(),
         );
     }
@@ -258,7 +258,7 @@ fn event(runner: &str, attempt: &DurableAttempt) -> Option<StepFinished> {
 fn cache_report(
     frozen: &serde_json::Value,
     provider: &str,
-    keep_warm: Option<broca_protocol::request::KeepWarm>,
+    keep_warm: Option<&broca_protocol::request::KeepWarm>,
     stop: Option<&str>,
 ) -> Option<cortexkit_role_llm_runner::cache::Report> {
     use broca_provider::wire::{cache_lifetime, CacheLifetime};
@@ -282,7 +282,11 @@ fn cache_report(
     };
     report.warming = match keep_warm {
         Some(broca_protocol::request::KeepWarm::Off) => Some(Warming::new(false)),
-        Some(broca_protocol::request::KeepWarm::Auto) => match stop {
+        Some(
+            broca_protocol::request::KeepWarm::Auto
+            | broca_protocol::request::KeepWarm::Always
+            | broca_protocol::request::KeepWarm::Hours(_),
+        ) => match stop {
             None | Some("tools_done" | "cancelled") => Some(Warming::new(true)),
             Some("budget") => Some(Warming::stopped("cost-cap")),
             Some("count_cap") => Some(Warming::stopped("count-cap")),
@@ -570,29 +574,29 @@ mod tests {
             ("session_moving", "session-ended"),
             ("session_moved", "session-ended"),
         ] {
-            let report = cache_report(&implicit, "openai", Some(Auto), Some(stop)).unwrap();
+            let report = cache_report(&implicit, "openai", Some(&Auto), Some(stop)).unwrap();
             assert_eq!(report.warming, Some(Warming::stopped(reason)));
             report.check().unwrap();
         }
         for stop in [None, Some("tools_done"), Some("cancelled")] {
             assert_eq!(
-                cache_report(&implicit, "openai", Some(Auto), stop)
+                cache_report(&implicit, "openai", Some(&Auto), stop)
                     .unwrap()
                     .warming,
                 Some(Warming::new(true))
             );
         }
         assert_eq!(
-            cache_report(&implicit, "openai", Some(Off), Some("budget"))
+            cache_report(&implicit, "openai", Some(&Off), Some("budget"))
                 .unwrap()
                 .warming,
             Some(Warming::new(false))
         );
-        let unknown = cache_report(&implicit, "openai", Some(Auto), Some("future-stop")).unwrap();
+        let unknown = cache_report(&implicit, "openai", Some(&Auto), Some("future-stop")).unwrap();
         assert_eq!(unknown.implicit, Some(true));
         assert_eq!(unknown.warming, None);
         // No lifetime means no cache object, even when warming is known.
-        for keep_warm in [None, Some(Auto), Some(Off)] {
+        for keep_warm in [None, Some(&Auto), Some(&Off)] {
             assert_eq!(
                 cache_report(&Value::Null, "synthetic", keep_warm, Some("budget")),
                 None

@@ -3240,7 +3240,7 @@ fn replay_seeded_with_compaction<'a>(
                     *admitted_at_ms,
                 );
                 marker_order_version = *version;
-                keep_warm = *policy;
+                keep_warm = policy.clone();
                 on_restart = *on_restart_policy;
                 run_config = Some((**config).clone());
                 run_id = Some(rid.clone());

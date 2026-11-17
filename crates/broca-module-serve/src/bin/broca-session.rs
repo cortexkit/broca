@@ -24,13 +24,14 @@ use std::path::PathBuf;
 use broca_module::serve::SubscribeFrom;
 use broca_module_serve::client::UnrecognizedRunState;
 use broca_module_serve::client::{decode_subscribe_event, SendOutcome, SendSpec, SubscribeEvent};
-use broca_module_serve::wire::{AuthParams, CacheParams};
+use broca_module_serve::wire::AuthParams;
 use broca_module_serve::wire::{VaultAuditResponse, VaultAuditRow};
 use broca_module_serve::SessionClient;
 use broca_protocol::caller::{ControlUnit, OpenRunFinishReason, OpenState, RunFinishReason};
-use broca_protocol::request::{CacheRole, Tool};
+use broca_protocol::request::Tool;
 use broca_subc::SubcConnection;
 use clap::{Parser, Subcommand, ValueEnum};
+use cortexkit_role_llm_runner::cache::{Cache, Ttl};
 use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
@@ -149,17 +150,23 @@ fn local_storage_root(root: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-enum CliCacheRole {
-    Primary,
-    Ephemeral,
+/// A creating send's cache lifetime (llm-runner `cache.ttl`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliCacheTtl {
+    /// No explicit cache: no markers and no hints, not even a route's default ones.
+    None,
+    /// The shortest explicit lifetime the route offers.
+    Short,
+    /// The longest explicit lifetime the route offers.
+    Long,
 }
 
-impl From<CliCacheRole> for CacheRole {
-    fn from(value: CliCacheRole) -> Self {
+impl From<CliCacheTtl> for Ttl {
+    fn from(value: CliCacheTtl) -> Self {
         match value {
-            CliCacheRole::Primary => CacheRole::Primary,
-            CliCacheRole::Ephemeral => CacheRole::Ephemeral,
+            CliCacheTtl::None => Ttl::None,
+            CliCacheTtl::Short => Ttl::Short,
+            CliCacheTtl::Long => Ttl::Long,
         }
     }
 }
@@ -218,16 +225,10 @@ enum Cmd {
         /// Per-send tool-call budget JSON.
         #[arg(long = "budget-json")]
         budget_json: Option<String>,
-        /// Admission-time cache role for this send.
-        #[arg(long = "cache-role")]
-        cache_role: Option<CliCacheRole>,
-        /// Admission-time cache TTL preference, e.g. "5m" or "1h".
-        #[arg(long = "cache-ttl")]
-        cache_ttl: Option<String>,
-        /// Send `cache.mode: "none"`: no prompt-cache markers, not even a provider's default
-        /// ones (first-party Anthropic places them when a send states no cache preference).
-        #[arg(long = "no-cache", conflicts_with_all = ["cache_role", "cache_ttl"])]
-        no_cache: bool,
+        /// The cache lifetime a planless session's creating send asks for. Only the creating
+        /// send may carry one; the session keeps it for life.
+        #[arg(long = "cache-ttl", value_enum)]
+        cache_ttl: Option<CliCacheTtl>,
         /// Auth method to pin for this send, e.g. "oauth" or "apikey". Overrides the provider's
         /// configured default.
         #[arg(long = "auth-method")]
@@ -280,19 +281,12 @@ enum Cmd {
         /// Maximum output tokens for every send. Must be greater than zero.
         #[arg(long = "max-output-tokens")]
         max_output_tokens: Option<u64>,
-        /// Shared provider prompt-cache key for every send.
+        /// Shared provider prompt-cache key, on the creating send of a planless session.
         #[arg(long = "cache-key")]
         cache_key: Option<String>,
-        /// Admission-time cache role for each send in this invocation.
-        #[arg(long = "cache-role")]
-        cache_role: Option<CliCacheRole>,
-        /// Admission-time cache TTL preference, e.g. "5m" or "1h".
-        #[arg(long = "cache-ttl")]
-        cache_ttl: Option<String>,
-        /// Send `cache.mode: "none"`: no prompt-cache markers, not even a provider's default
-        /// ones (first-party Anthropic places them when a send states no cache preference).
-        #[arg(long = "no-cache", conflicts_with_all = ["cache_role", "cache_ttl", "cache_key"])]
-        no_cache: bool,
+        /// The cache lifetime the creating send of a planless session asks for.
+        #[arg(long = "cache-ttl", value_enum)]
+        cache_ttl: Option<CliCacheTtl>,
         /// Reasoning variant for the model, e.g. "high".
         #[arg(long)]
         variant: Option<String>,
@@ -554,7 +548,7 @@ struct SendKnobs {
     plan: Option<serde_json::Value>,
     max_output_tokens: Option<u64>,
     budget: Option<broca_protocol::BudgetConfig>,
-    cache: Option<CacheParams>,
+    cache: Option<Cache>,
     auth: Option<AuthParams>,
     context_management: Option<broca_protocol::request::ContextManagement>,
     variant: Option<String>,
@@ -575,24 +569,15 @@ fn parse_service_tier(
         .transpose()
 }
 
-fn cache_params(
-    role: Option<CliCacheRole>,
-    ttl: Option<String>,
-    key: Option<String>,
-    no_cache: bool,
-) -> Option<CacheParams> {
-    if role.is_none() && ttl.is_none() && key.is_none() && !no_cache {
+/// The cache policy a creating send carries from `--cache-ttl` and `--cache-key`, if either.
+fn cache_params(ttl: Option<CliCacheTtl>, key: Option<String>) -> Option<Cache> {
+    if ttl.is_none() && key.is_none() {
         return None;
     }
-    Some(CacheParams {
-        role: role.map(Into::into),
-        ttl,
-        key,
-        // This proof CLI exposes no flag for the tail declaration; a caller that needs it
-        // sends `cache.tail` over the JSON-RPC surface directly.
-        tail: None,
-        mode: no_cache.then_some(broca_protocol::request::CacheMode::None),
-    })
+    let mut cache = Cache::default();
+    cache.ttl = ttl.map(Into::into);
+    cache.key = key;
+    Some(cache)
 }
 
 fn content_import_id(messages: &[broca_protocol::Message]) -> Result<String, String> {
@@ -747,9 +732,7 @@ async fn run(args: Args) -> Result<i32, String> {
             tools,
             max_output_tokens,
             budget_json,
-            cache_role,
             cache_ttl,
-            no_cache,
             auth_method,
             auth_account,
             context_management,
@@ -767,7 +750,7 @@ async fn run(args: Args) -> Result<i32, String> {
                     plan,
                     max_output_tokens,
                     budget: parse_budget(&budget_json)?,
-                    cache: cache_params(cache_role, cache_ttl, None, no_cache),
+                    cache: cache_params(cache_ttl, None),
                     auth: auth_params(auth_method, auth_account),
                     context_management: parse_context_management(context_management)?,
                     variant,
@@ -787,9 +770,7 @@ async fn run(args: Args) -> Result<i32, String> {
             send_id,
             max_output_tokens,
             cache_key,
-            cache_role,
             cache_ttl,
-            no_cache,
             variant,
             service_tier,
         } => {
@@ -798,7 +779,7 @@ async fn run(args: Args) -> Result<i32, String> {
                 return Err("send needs at least one --prompt".into());
             }
             let system = resolve_system_prompt(system, system_file)?;
-            let cache = cache_params(cache_role, cache_ttl, cache_key, no_cache);
+            let cache = cache_params(cache_ttl, cache_key);
             let (provider, model_id) = split_model(&model)?;
             let tools = parse_tools(&tools)?;
             let budget = parse_budget(&budget_json)?;
@@ -825,7 +806,8 @@ async fn run(args: Args) -> Result<i32, String> {
                         tools: tools.clone(),
                         send_id: prompt_send_id.as_deref(),
                         max_output_tokens,
-                        cache: cache.clone(),
+                        // Only a session's creating send may carry its cache policy.
+                        cache: if idx == 0 { cache.clone() } else { None },
                         budget: budget.clone(),
                         auth: None,
                         one_shot: None,
@@ -3319,7 +3301,7 @@ mod tests {
     }
 
     #[test]
-    fn send_flags_build_cache_key_with_role_and_ttl() {
+    fn send_flags_build_the_contract_cache_policy() {
         let args = Args::try_parse_from([
             "broca-session",
             "--subc",
@@ -3335,10 +3317,8 @@ mod tests {
             "provider/model",
             "--cache-key",
             "shared-key/東京",
-            "--cache-role",
-            "primary",
             "--cache-ttl",
-            "1h",
+            "long",
             "--max-output-tokens",
             "137",
         ])
@@ -3346,9 +3326,7 @@ mod tests {
         let Cmd::Send {
             max_output_tokens,
             cache_key,
-            cache_role,
             cache_ttl,
-            no_cache,
             ..
         } = args.cmd
         else {
@@ -3356,13 +3334,10 @@ mod tests {
         };
 
         assert_eq!(max_output_tokens, Some(137));
-        let cache = cache_params(cache_role, cache_ttl, cache_key, no_cache).unwrap();
+        let cache = cache_params(cache_ttl, cache_key).unwrap();
         assert_eq!(cache.key.as_deref(), Some("shared-key/東京"));
-        assert_eq!(cache.ttl.as_deref(), Some("1h"));
-        assert!(matches!(
-            cache.role,
-            Some(broca_protocol::request::CacheRole::Primary)
-        ));
+        assert_eq!(cache.ttl, Some(cortexkit_role_llm_runner::cache::Ttl::Long));
+        assert!(cache_params(None, None).is_none());
     }
 
     #[tokio::test]
@@ -3389,28 +3364,6 @@ mod tests {
             run(args).await.unwrap_err(),
             "--max-output-tokens must be greater than 0"
         );
-    }
-
-    #[test]
-    fn send_cache_key_conflicts_with_no_cache() {
-        let result = Args::try_parse_from([
-            "broca-session",
-            "--subc",
-            "/tmp/subc.json",
-            "--project-root",
-            "/tmp/project",
-            "--session",
-            "s1",
-            "send",
-            "--prompt",
-            "hello",
-            "--model",
-            "provider/model",
-            "--cache-key",
-            "shared-key",
-            "--no-cache",
-        ]);
-        assert!(result.is_err());
     }
 
     /// `restore-from-backup` takes `--all`, prints each session's report line (or its JSON

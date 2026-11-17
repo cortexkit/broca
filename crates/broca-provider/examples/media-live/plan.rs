@@ -203,11 +203,8 @@ impl Route {
         if self.family == WireFamilyId::AnthropicMessages && frozen.cache.is_none() {
             // Use the same no-override default as production cache routing. A prompt cache
             // key is an OpenAI hint and cannot enable Anthropic's explicit breakpoints.
-            frozen.cache = broca_module_serve::cache_routing::default_cache_policy(
-                self.family,
-                "anthropic",
-                None,
-            );
+            frozen.cache =
+                broca_module_serve::cache_routing::default_cache_policy(self.family, "anthropic");
         }
         if let Some(url) = &self.base_url {
             frozen.base_url = Some(url.clone());

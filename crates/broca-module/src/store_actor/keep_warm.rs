@@ -433,12 +433,12 @@ pub(super) fn warmed(
 }
 
 impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> super::StoreActor<B> {
-    /// The keep-warm of a run started in `mode` from `request`, when the run keeps its cache warm:
-    /// a new run when its send asks for it, a run going on when its start froze it. Without the
-    /// module's registry no cache policy can be read, so no run warms.
+    /// The keep-warm of a run started in `mode`, when the run keeps its cache warm: a new run
+    /// whose admission chose a warming mode (`fresh`), a run going on when its start froze one.
+    /// Without the module's registry no cache policy can be read, so no run warms.
     pub(super) async fn keep_warm_for(
         &self,
-        request: &broca_protocol::request::SubmissionRequest,
+        fresh: Option<&broca_protocol::request::KeepWarm>,
         mode: crate::executor::StoreRunMode,
         media: &mut Option<crate::store_media::StoreRunMediaWait>,
     ) -> Option<(Arc<StoreWarmer>, RunWarming)> {
@@ -447,18 +447,18 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         use broca_session_loop::writer::Writer as _;
         let operations = self.session.operations();
         let latest = operations.run.as_ref();
-        let auto = match mode {
-            StoreRunMode::Fresh => request.keep_warm == Some(KeepWarm::Auto),
+        let warms = match mode {
+            StoreRunMode::Fresh => fresh.is_some_and(KeepWarm::warms),
             StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn => {
                 latest
                     .and_then(|run| run.start.as_ref())
                     .and_then(|start| start.keep_warm.clone())
-                    .and_then(|keep_warm| serde_json::from_value(keep_warm).ok())
-                    == Some(KeepWarm::Auto)
+                    .and_then(|keep_warm| serde_json::from_value::<KeepWarm>(keep_warm).ok())
+                    .is_some_and(|keep_warm| keep_warm.warms())
             }
             StoreRunMode::Seal(_) => false,
         };
-        let registry = self.registry.clone().filter(|_| auto)?;
+        let registry = self.registry.clone().filter(|_| warms)?;
         // The session's cache clock, as its records date it: the last request that reached the
         // cache, with the lifetime the latest run's cache policy declares, and that run's last
         // measured request.

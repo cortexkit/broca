@@ -326,7 +326,8 @@ async fn cached_anthropic_auto_step_events_match(cipher: Cipher) {
         let mut request = request("hello");
         request.model.provider_module_id = "anthropic".into();
         request.model.model_id = "claude-opus-4-8".into();
-        request.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
+        request.cache =
+            Some(serde_json::from_value(serde_json::json!({"keep_warm": "auto"})).unwrap());
         assert!(matches!(
             module.send_request("cached-step", request, None).await,
             SendOutcome::Active { .. }

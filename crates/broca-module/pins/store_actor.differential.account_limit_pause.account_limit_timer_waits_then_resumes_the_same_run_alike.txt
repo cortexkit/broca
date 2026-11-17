@@ -3,9 +3,7 @@
     RunId(
         "r1",
     ),
-    Some(
-        Off,
-    ),
+    None,
     Some(
         Resume,
     ),
@@ -180,7 +178,7 @@
     Array [
         String("start"),
         String("r1"),
-        String("off"),
+        Null,
         String("resume"),
     ],
     Array [

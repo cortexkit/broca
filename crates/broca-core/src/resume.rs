@@ -271,7 +271,7 @@ pub fn reconstruct_from_offsets(
     state.run_config = current.map(|e| e.config.clone());
     state.run_id = current.map(|e| e.run_id.clone());
     state.on_restart = current.and_then(|e| e.on_restart);
-    state.keep_warm = current.and_then(|e| e.keep_warm);
+    state.keep_warm = current.and_then(|e| e.keep_warm.clone());
     state.cancel_at = current.and_then(|e| e.cancel_at);
     state.marker_order_version = current.and_then(|e| e.marker_order_version);
     state.input_budget = checkpoint

@@ -17,9 +17,7 @@ pub mod warm;
 pub use warm::*;
 
 use broca_protocol::caller::SharedProviderError;
-use broca_protocol::request::{
-    CacheMode, CacheRole, CacheTail, GenerationConfig, StopCondition, Tool, ToolChoice,
-};
+use broca_protocol::request::{GenerationConfig, StopCondition, Tool, ToolChoice};
 use broca_protocol::{BudgetConfig, DisplayEvent, FinishReason, ToolCallId, Usage};
 use serde::{Deserialize, Serialize};
 
@@ -105,9 +103,6 @@ pub struct SendParams {
         deserialize_with = "deserialize_on_restart"
     )]
     pub on_restart: Option<broca_protocol::request::OnRestart>,
-    /// Enables prompt-cache warming only while this send's run waits on tools. Omitted means off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_warm: Option<broca_protocol::request::KeepWarm>,
     /// Requested transcript retention in seconds. Admission refuses it until retention is offered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<u64>,
@@ -171,9 +166,10 @@ pub struct SendParams {
     pub generation: GenerationConfig,
     #[serde(default, deserialize_with = "deserialize_stop_when")]
     pub stop_when: Vec<StopCondition>,
-    /// Admission-only prompt-cache preferences.
-    #[serde(default)]
-    pub cache: Option<CacheParams>,
+    /// A planless session's cache policy (llm-runner `cache`), on its creating send only. The
+    /// serve layer checks the raw member with the contract's own field names before decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -952,28 +948,6 @@ pub struct ModelParams {
     pub variant: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<CacheRole>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl: Option<String>,
-    /// An opaque caller-chosen cache scope. Callers that share a key share provider cache
-    /// affinity; changing it starts a newly frozen scope for the admitted run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    /// The caller's declaration that its final message varies between requests, so a
-    /// breakpoint there would be paid for and never read. Absent means no declaration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tail: Option<CacheTail>,
-    /// `"none"` switches prompt caching off for this send, including a provider's default
-    /// breakpoints (first-party Anthropic places them when a send carries no cache request).
-    /// Absent leaves that default in place. Admission refuses `none` combined with `role`,
-    /// `ttl` or `tail`, because those fields configure the caching `none` switches off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<CacheMode>,
-}
-
 /// `session.retract` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetractParams {
@@ -996,7 +970,7 @@ pub struct CancelParams {
 ///
 /// Check caller compatibility before applying strict decoding to another operation. Tests
 /// and `docs/module-surface.md` document supported request fields and compatibility rules.
-/// `SendParams` and `CacheParams` remain extensible so a newer caller can send optional fields
+/// `SendParams` remains extensible so a newer caller can send optional fields
 /// to an older daemon during a rolling upgrade without every request being refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4844,15 +4818,6 @@ mod tests {
         assert_json_round_trip::<ModelParams>(serde_json::json!({
             "provider": "stub", "model": "m"
         }));
-        assert_json_round_trip::<CacheParams>(serde_json::json!({
-            "role": "ephemeral", "ttl": "5m"
-        }));
-        assert_json_round_trip::<CacheParams>(serde_json::json!({
-            "role": "ephemeral", "ttl": "5m", "key": "alfonso-classify-v1"
-        }));
-        assert_json_round_trip::<CacheParams>(serde_json::json!({
-            "role": "ephemeral", "ttl": "5m", "tail": "volatile"
-        }));
         assert_json_round_trip::<SendParams>(serde_json::json!({
             "prompt": "hello",
             "system": "be concise",
@@ -4862,7 +4827,7 @@ mod tests {
             "tool_choice": {"type": "auto"},
             "generation": {},
             "stop_when": [],
-            "cache": {"role": "ephemeral", "ttl": "5m", "key": "alfonso-classify-v1"},
+            "cache": {"key": "alfonso-classify-v1", "ttl": "short"},
             "budget": {
                 "nudges": [],
                 "finalize_at_tool_calls": 30,
@@ -4928,7 +4893,6 @@ mod tests {
                 "directives",
                 "session_class",
                 "on_restart",
-                "keep_warm",
                 "retention",
                 "prompt",
                 "prompt_blocks",
@@ -5002,7 +4966,7 @@ mod tests {
         assert_eq!(legacy.retention, None);
         assert_eq!(
             serde_json::to_vec(&legacy).unwrap(),
-            br#"{"prompt":"hello","system":null,"send_id":null,"model":{"provider":"openai","model":"gpt-5"},"tool_choice":{"type":"auto"},"generation":{},"stop_when":[],"cache":null,"append_episode":false}"#
+            br#"{"prompt":"hello","system":null,"send_id":null,"model":{"provider":"openai","model":"gpt-5"},"tool_choice":{"type":"auto"},"generation":{},"stop_when":[],"append_episode":false}"#
         );
     }
 
@@ -5920,55 +5884,8 @@ mod delivery_order_params {
 }
 
 #[cfg(test)]
-mod keep_warm_tests {
+mod cache_tests {
     use super::*;
-    use broca_protocol::request::KeepWarm;
-
-    #[test]
-    fn send_keep_warm_is_strict_and_names_the_invalid_field() {
-        for value in [
-            serde_json::json!("always"),
-            serde_json::json!(true),
-            serde_json::json!(1),
-            serde_json::json!({"auto": true}),
-        ] {
-            let params = serde_json::json!({"prompt": "hello", "keep_warm": value});
-            let error = serde_json::from_value::<SendParams>(params.clone()).unwrap_err();
-            assert_eq!(
-                role::failing_field::<SendParams>(&params, &error).as_deref(),
-                Some("keep_warm")
-            );
-        }
-        assert!(send_params_keys().contains(&"keep_warm"));
-        let absent: SendParams =
-            serde_json::from_value(serde_json::json!({"prompt": "hello"})).unwrap();
-        assert_eq!(absent.keep_warm.unwrap_or_default(), KeepWarm::Off);
-        assert!(serde_json::to_value(&absent)
-            .unwrap()
-            .get("keep_warm")
-            .is_none());
-    }
-
-    #[test]
-    fn send_keep_warm_auto_and_off_match_goldens() {
-        for (policy, file, hash) in [
-            (
-                "auto",
-                "send_params.keep_warm_auto.json",
-                "234f9522e4aa8c99aa67cf5baffda9456e3dfd704a8cebf7eb18ae91f11241d9",
-            ),
-            (
-                "off",
-                "send_params.keep_warm_off.json",
-                "3bfe44f6013f981dcfd6939581512a5f6e7054881d0ac9d92f3ba60a741aa5c3",
-            ),
-        ] {
-            let params: SendParams =
-                serde_json::from_value(serde_json::json!({"prompt": "hello", "keep_warm": policy}))
-                    .unwrap();
-            scope_refusal_golden::assert_golden(params, file, hash);
-        }
-    }
 
     #[test]
     fn send_params_cache_shared_prefix_matches_golden() {
@@ -6037,7 +5954,7 @@ mod send_tool_shape_tests {
     }
 
     const SEND_PARAMS_TOOL_REPLY_SHA256: &str =
-        "501fb9c1284bb31577d149b884d2828771a0b5f76f319f5b3bab944612886338";
+        "0c7559841e3b868974cefc5f8e55257faa7b0e36f4c5e945e95468f7531e645a";
 
     /// Each malformed `tools[i].reply` is refused naming its exact member, and serde's own decode
     /// of the send refuses it too, so no path reads it as "no deadline".

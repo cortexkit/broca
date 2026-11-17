@@ -142,7 +142,6 @@ async fn idle_open_recovery_never_reinserts_older_runs(cipher: Cipher) {
     start.run_id = RunId("r2".into());
     start.request = super::super::super::super::request("again");
     start.request.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
-    start.request.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
     start.session_class = Some("head".into());
     actor
         .start_run(start, None, None, StoreRunMode::Fresh)

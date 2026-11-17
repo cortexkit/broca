@@ -23,8 +23,8 @@ use broca_protocol::{
     content::{AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput},
     provider::{NormalizedEvent, ProviderControl},
     request::{
-        BudgetConfig, BudgetKind, BudgetNudge, CacheRequest, CacheTail, ExecutionMode, ModelHandle,
-        StopCondition, Tool, ToolChoice,
+        BudgetConfig, BudgetKind, BudgetNudge, ExecutionMode, ModelHandle, StopCondition, Tool,
+        ToolChoice,
     },
     ApprovalResponse, DisplayEvent, FinishReason, GenerationConfig, MessageId, RunId, StepId,
     SubmissionId, ToolCallId, ToolResult, Usage,
@@ -1119,177 +1119,6 @@ async fn zero_context_limit_in_frozen_config_remains_resumable() {
     collector.await.unwrap();
 
     let summary = result.expect("a frozen zero context limit must not wedge resume admission");
-    assert_eq!(summary.reason, RunFinishReason::Completed);
-    assert_eq!(summary.steps, 1);
-    assert_eq!(
-        provider.calls().len(),
-        1,
-        "resume must use the previously admitted frozen config"
-    );
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(lease_dir);
-}
-
-/// The caller declaring that its final message differs next request.
-fn volatile_tail_cache() -> CacheRequest {
-    CacheRequest {
-        role: None,
-        ttl: None,
-        key: None,
-        tail: Some(CacheTail::Volatile),
-        mode: None,
-    }
-}
-
-/// The declaration says "do not spend a breakpoint on my last message". On a run that can call
-/// tools that breakpoint is the whole mechanism for step-to-step reuse, so honouring the
-/// declaration would quietly degrade the one leg where marker caching already pays. Refuse the
-/// combination instead of silently picking one of the two meanings.
-#[tokio::test]
-async fn volatile_cache_tail_with_tools_fails_fresh_admission_before_provider_call() {
-    let (store, dir) = tmp_lease_store("volatile-tail-with-tools");
-    let provider = StubProvider::new(vec![text_step("must not be billed")]);
-    let mut request = req(
-        "volatile-tail-with-tools",
-        vec![tool("edit", ExecutionMode::Parallel)],
-        vec![],
-    );
-    request.cache = Some(volatile_tail_cache());
-
-    let (result, _) = drive(
-        request,
-        provider.clone(),
-        &StubToolPlane::new(),
-        &store,
-        &AllowAll,
-    )
-    .await;
-
-    assert!(
-        provider.calls().is_empty(),
-        "invalid fresh admission must not reach the provider"
-    );
-    let error = result.expect_err("a volatile tail declared alongside tools must fail admission");
-    assert_eq!(
-        error.admission_error_class(),
-        broca_protocol::ErrorClass::Permanent
-    );
-    match error {
-        RunError::Config(message) => {
-            assert!(
-                message.contains("cache.tail") && message.contains("tools"),
-                "the message names the conflict: {message}"
-            );
-            assert!(
-                message.contains("drop cache.tail or drop tools"),
-                "the message names the action: {message}"
-            );
-        }
-        other => panic!("expected typed Config error, got {other:?}"),
-    }
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// The other half of the refusal's scope: the declaration is exactly what a tool-less run
-/// wants, so it must still admit.
-#[tokio::test]
-async fn volatile_cache_tail_without_tools_is_admitted() {
-    let (store, dir) = tmp_lease_store("volatile-tail-no-tools");
-    let provider = StubProvider::new(vec![text_step("one call, stable prefix")]);
-    let mut request = req("volatile-tail-no-tools", vec![], vec![]);
-    request.cache = Some(volatile_tail_cache());
-
-    let (result, _) = drive(
-        request,
-        provider.clone(),
-        &StubToolPlane::new(),
-        &store,
-        &AllowAll,
-    )
-    .await;
-
-    let summary = result.expect("a tool-less volatile tail declaration must admit");
-    assert_eq!(summary.reason, RunFinishReason::Completed);
-    assert_eq!(provider.calls().len(), 1);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// The refusal is a FRESH-admission rule only. A lineage admitted before it existed (or one
-/// whose tools were added by a caller that also sends the declaration) must still resume off
-/// its frozen config -- scoping the check too broadly would wedge live runs that are already
-/// mid-flight, which is a far worse failure than the one being prevented.
-#[tokio::test]
-async fn volatile_cache_tail_with_tools_in_frozen_config_remains_resumable() {
-    let (lease_store, lease_dir) = tmp_lease_store("volatile-tail-resume");
-    let wal_dir = broca_test_support::scratch_root().join(format!(
-        "broca-runtest-volatile-tail-resume-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&wal_dir);
-    let wal_store = FileWalStore::new(&wal_dir);
-    let mut request = req(
-        "volatile-tail-resume",
-        vec![tool("edit", ExecutionMode::Parallel)],
-        vec![],
-    );
-    request.cache = Some(volatile_tail_cache());
-
-    {
-        let mut wal = wal_store
-            .open(&request.session)
-            .expect("open legacy WAL for seed");
-        wal.append(
-            1,
-            &WalRecord::RunStarted {
-                message_marks: None,
-                compaction_plan_version: None,
-                sent_by: None,
-                written_at_ms: None,
-                tags: None,
-                session_class: None,
-                retention: None,
-                hooks: None,
-                title: None,
-                on_restart: None,
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
-                ts_ms: None,
-                run_id: request.run_id.clone(),
-                session: request.session.clone(),
-                config: Box::new(resumable_frozen_config(&request, Vec::new())),
-                input: request.input.clone().into(),
-                origin: broca_wal::RunOrigin::Fresh,
-                submission_id: None,
-            },
-            true,
-        )
-        .expect("seed legacy RunStarted with tools and a volatile tail declaration");
-    }
-
-    let provider = StubProvider::new(vec![text_step("legacy resume")]);
-    let (tx, mut rx) = mpsc::channel(64);
-    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = run_loop(
-        request,
-        &provider,
-        &StubToolPlane::new(),
-        &lease_store,
-        &AllowAll,
-        &wal_store,
-        &tx,
-    )
-    .await;
-    drop(tx);
-    collector.await.unwrap();
-
-    let summary =
-        result.expect("a frozen volatile tail alongside tools must not wedge resume admission");
     assert_eq!(summary.reason, RunFinishReason::Completed);
     assert_eq!(summary.steps, 1);
     assert_eq!(
@@ -5065,7 +4894,7 @@ mod keep_warm_scheduler {
             vec![tool("held", ExecutionMode::Parallel)],
             vec![],
         );
-        request.keep_warm = policy;
+        request.keep_warm = policy.clone();
         let writer = Arc::new(WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap());
         let timing = WarmTiming {
             // The scheduler reads SystemTime as well as Tokio's timer clock, so pausing

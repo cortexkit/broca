@@ -234,17 +234,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .run
             .as_ref()
             .expect("the pause owns the latest run");
-        let start = self.recovery_start(run).and_then(|mut start| {
-            // The recovery request provides routing information, but the actor also reads
-            // keep-warm before handing the run to the executor. Restore the recorded policy here.
-            start.request.keep_warm = run
-                .keep_warm
-                .clone()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|error| format!("account-limit pause keep-warm policy: {error}"))?;
-            Ok(start)
-        });
+        // A resumed run's warming is read from its start, as for every resume.
+        let start = self.recovery_start(run);
         match start {
             Ok(start) => {
                 self.start_run(start, None, None, StoreRunMode::Resume)

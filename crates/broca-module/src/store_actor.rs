@@ -499,12 +499,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// Retires the session's recovery registration once its durable state owes a boot nothing,
-    /// by the boot sweep's own rule (`recovery::owes_recovery`): a run paused for sign-in on an
+    /// by the boot sweep's own rule (`recovery::needs_recovery`): a run paused for sign-in on an
     /// account routing didn't choose stays paused but is retired, since opening does nothing for
-    /// it.
+    /// it. A session whose latest run asked for warming stays registered, so a restart can find
+    /// it and rebuild its warming timer while its cache lives; the boot sweep retires it after.
     fn retire_recovery(&mut self) {
         if self.run.is_some()
-            || crate::store_open::recovery::owes_recovery(
+            || crate::store_open::recovery::needs_recovery(
                 self.session.operations(),
                 self.billing.is_some(),
                 Some(&self.parts as &dyn broca_session_loop::parts::Parts),
@@ -1211,6 +1212,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 // order's, not the string `delivery` beside it. So is an interrupt.
                 // Import already fixed the owner and scope. Its first owner send applies the
                 // plan through ordinary admission, without replacing that recorded ownership.
+                if !self.admits_send_cache(request.cache.as_ref()) {
+                    let _ = reply.send(SendOutcome::DeliveryRefused {
+                        code: "invalid_params",
+                        field: "cache",
+                        message: cache_policy::CACHE_ON_EXISTING_SESSION.into(),
+                    });
+                    return false;
+                }
                 if self.session.operations().owner.awaiting_import_admission() {
                     if let Err(outcome) = self
                         .send_scope(&run_id, &request, delivery, false, false)
@@ -2126,8 +2135,26 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
-        // A run whose keep-warm is `auto` warms the prompt cache while it waits on tool calls.
-        let (keep_warm, warming) = match self.keep_warm_for(&request, mode, &mut media).await {
+        let run_cache = match mode {
+            StoreRunMode::Fresh => {
+                match self.run_cache(request.cache.as_ref(), manifest.as_deref()) {
+                    Ok(run_cache) => Some(run_cache),
+                    Err(error) => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(SendOutcome::Error(error.clone()));
+                        }
+                        tracing::error!(target: "lifecycle", %error, "run refused: its cache policy could not be read");
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        // A run whose keep-warm is not off warms the prompt cache while it waits on tool calls.
+        let fresh_warming = run_cache
+            .as_ref()
+            .and_then(|run_cache| run_cache.keep_warm.as_ref());
+        let (keep_warm, warming) = match self.keep_warm_for(fresh_warming, mode, &mut media).await {
             Some((driver, warming)) => (
                 Some(driver as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<_>>),
                 Some(warming),
@@ -2155,6 +2182,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 req.submission_id = None;
                 req.input_written_at_ms = prepared.at_ms.or_else(broca_core::clock::epoch_millis);
             }
+        }
+        if let Some(run_cache) = run_cache {
+            req.cache = run_cache.cache;
+            req.keep_warm = run_cache.keep_warm;
+            req.inherit_frozen_cache = run_cache.inherit;
         }
         req.title = title;
         req.send_id = send_id;
@@ -4828,6 +4860,7 @@ mod account_limit_pause;
 mod admission;
 mod apply_view;
 mod builders;
+mod cache_policy;
 mod expiry;
 mod held;
 mod idle_warm;

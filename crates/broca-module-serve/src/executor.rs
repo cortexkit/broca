@@ -2102,62 +2102,6 @@ fn warn_single_call_cache_markers(
     }
 }
 
-/// Report that the caller's `cache.tail` declaration was resolved away and will not reach
-/// any request.
-///
-/// `cache.tail` is a statement of fact the caller has and broca does not -- that their final
-/// message differs next request. Two resolutions discard it:
-///
-///  - a request carrying only `cache.key` resolves to NO policy at all (key alone fixes a
-///    cache scope, it does not turn breakpoints on), so there is no marker plan to change.
-///    First-party Anthropic is the exception: a key-only request there gets the default
-///    marker policy, and that policy does honour `cache.tail`;
-///  - a hint-family provider gets a cache key rather than placed breakpoints, so there is no
-///    message anchor to withhold in the first place.
-///
-/// Neither costs the caller anything, which is exactly why this must be said out loud. The
-/// value of a declaration is that broca acts on it; a declaration silently dropped looks
-/// identical to one honoured, and the caller has no way to tell which they got. Inert is not
-/// the property that matters here -- undetectable is.
-///
-/// A WARNING rather than a refusal, on purpose. The declaration is MEANINGLESS on these two
-/// paths, not harmful, and an admission error for a case that costs nothing would reject
-/// working callers to make a point. (Contrast the tool-bearing conflict, refused in
-/// `request_config`: there honouring the declaration would actively degrade caching.)
-fn dropped_cache_tail_warning(
-    request: Option<&broca_protocol::request::CacheRequest>,
-    policy: &Option<broca_provider::wire::CachePolicy>,
-    provider_id: &str,
-) -> Option<String> {
-    request?.tail?;
-    match policy.as_ref().map(|policy| &policy.class) {
-        Some(broca_provider::wire::CacheClass::Markers { .. }) => None,
-        Some(broca_provider::wire::CacheClass::Hints { .. }) => Some(format!(
-            "cache.tail declared for provider '{provider_id}', whose wire family uses \
-                 prompt-cache hints instead of placed breakpoints; there is no message anchor to \
-                 withhold, so the declaration has no effect -- drop cache.tail for this provider"
-        )),
-        Some(broca_provider::wire::CacheClass::None) | None => Some(
-            "cache.tail declared but this request resolved no marker policy, so there \
-                 is no breakpoint plan for it to change and the declaration has no effect; broca \
-                 plans markers only when the request also carries cache.role or cache.ttl \
-                 (cache.key alone fixes a cache scope without enabling breakpoints), except on \
-                 first-party anthropic, which places them by default"
-                .to_string(),
-        ),
-    }
-}
-
-fn warn_dropped_cache_tail(
-    request: Option<&broca_protocol::request::CacheRequest>,
-    policy: &Option<broca_provider::wire::CachePolicy>,
-    provider_id: &str,
-) {
-    if let Some(message) = dropped_cache_tail_warning(request, policy, provider_id) {
-        tracing::warn!(target: "cache", "{message}");
-    }
-}
-
 struct EpisodeAccountPreference<'a> {
     pin: (Option<AuthMethod>, Option<&'a str>),
     pool: Option<&'a str>,
@@ -3681,9 +3625,8 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                         req.cache.as_ref(),
                         &self.cache_table,
                         &req.session,
-                    )?;
+                    );
                     warn_single_call_cache_markers(&policy, &req.tools);
-                    warn_dropped_cache_tail(req.cache.as_ref(), &policy, provider);
                     policy
                 }
                 None => None,

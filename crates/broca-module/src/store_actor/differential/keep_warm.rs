@@ -258,7 +258,8 @@ impl Side {
     async fn keep_warm_once(&self) {
         let mut first = request("hello");
         first.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
-        first.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
+        first.cache =
+            Some(serde_json::from_value(serde_json::json!({"keep_warm": "auto"})).unwrap());
         let outcome = self
             .registry
             .route_submission_with_order(

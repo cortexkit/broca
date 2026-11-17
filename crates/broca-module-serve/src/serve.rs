@@ -3305,6 +3305,10 @@ where
             } else {
                 None
             };
+            if let Some(body) = crate::cache_routing::send_cache_refusal(&req.params) {
+                let error = ErrorBody::new(body.code, body.message).with_detail(body.detail);
+                return send_error_body(writer, ver, channel, epoch, corr, error).await;
+            }
             let mut params: SendParams = match serde_json::from_value(send_params) {
                 Ok(p) => p,
                 Err(e) => {
@@ -3400,23 +3404,6 @@ where
                     corr,
                     Some("client_message_id".into()),
                     "client_message_id requires send_id: broca stores it with the send's identity",
-                )
-                .await;
-            }
-            if params
-                .cache
-                .as_ref()
-                .is_some_and(|cache| cache.mode == Some(broca_protocol::request::CacheMode::None))
-                && params.keep_warm == Some(broca_protocol::request::KeepWarm::Auto)
-            {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some("keep_warm".into()),
-                    "cache.mode \"none\" cannot be combined with keep_warm \"auto\"",
                 )
                 .await;
             }

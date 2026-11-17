@@ -106,8 +106,8 @@ pub(crate) fn check_structured_output(
 
 /// Fill each runner parameter `request` left to the session (`inherit_frozen`) from `frozen`, the
 /// session's latest episode's config, so the new turn renders the same request prefix that
-/// episode did. The cache is not filled here: its frozen form is a resolved policy, which the
-/// executor takes from the render config (`RunRequest::inherit_frozen_cache`).
+/// episode did. The cache policy is not a send's parameter: each run takes it from the session
+/// (`store_actor::cache_policy`).
 pub(crate) fn inherit_frozen_parameters(
     request: &mut SubmissionRequest,
     frozen: &broca_wal::RunConfig,
@@ -133,7 +133,6 @@ pub(crate) fn inherit_frozen_parameters(
             InheritedParam::ContextLimit => request.context_limit = frozen.context_limit,
             InheritedParam::WorkClass => request.work_class.clone_from(&frozen.work_class),
             InheritedParam::ServiceTier => request.service_tier = frozen.service_tier,
-            InheritedParam::Cache => {}
         }
     }
 }

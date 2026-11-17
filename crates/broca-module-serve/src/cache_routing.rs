@@ -5,8 +5,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use broca_catalog::live::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, WireFamilyId};
-use broca_protocol::request::{CacheMode, CacheRequest, CacheRole, CacheTail};
 use broca_protocol::BindIdentity;
+use cortexkit_role_llm_runner::cache::{Cache, Ttl};
 use serde::Deserialize;
 
 /// The env var that overrides the module config file path.
@@ -223,23 +223,11 @@ impl CacheTtlTable {
             _ => None,
         }
     }
-
-    #[cfg(test)]
-    fn with_marker(mut self, provider: &str, primary: CacheTtl, ephemeral: CacheTtl) -> Self {
-        self.rows.insert(
-            provider.to_string(),
-            ProviderCacheRow::Markers {
-                primary,
-                ephemeral,
-                also_allowed: None,
-            },
-        );
-        self
-    }
 }
 
-/// One marker provider's TTLs: the default for each role, plus any other lifetime a caller
-/// may request by name.
+/// One marker provider's lifetimes, as its row names them: the two a config row sets (`primary`
+/// and `ephemeral`), plus one more the shipped row offers. A cache policy's `short` and `long`
+/// take the shortest and longest of them.
 #[derive(Debug, Clone, Copy)]
 struct MarkerRow {
     primary: CacheTtl,
@@ -248,18 +236,13 @@ struct MarkerRow {
 }
 
 impl MarkerRow {
-    fn allows(&self, ttl: CacheTtl) -> bool {
-        ttl == self.primary || ttl == self.ephemeral || Some(ttl) == self.also_allowed
-    }
-
-    /// The allowed lifetimes for an error message, shortest first, e.g. `5m|1h`.
-    fn allowed_list(&self) -> String {
+    /// The lifetimes this provider offers, shortest first.
+    fn offered(&self) -> impl Iterator<Item = CacheTtl> + '_ {
         [CacheTtl::FiveMinutes, CacheTtl::OneHour]
             .into_iter()
-            .filter(|ttl| self.allows(*ttl))
-            .map(CacheTtl::as_str)
-            .collect::<Vec<_>>()
-            .join("|")
+            .filter(|ttl| {
+                *ttl == self.primary || *ttl == self.ephemeral || Some(*ttl) == self.also_allowed
+            })
     }
 }
 
@@ -293,145 +276,114 @@ fn parse_provider_row(
     }
 }
 
-/// Resolve role and TTL cache preferences from the resolved wire family, provider table, and
-/// bind identity.
-///
-/// Three request shapes:
-///  - `mode: none` switches caching off: no policy, on every family.
-///  - no request, or a key-only one, states no marker preference. It gets the provider's
-///    default policy (see [`default_cache_policy`]); for every provider but first-party
-///    Anthropic that is no policy, the shape these requests always had. A key's caller scope
-///    is frozen separately at admission either way.
-///  - anything else is an explicit request, resolved against the provider table.
+/// Resolve a run's cache policy (llm-runner `cache`) into the policy its render config freezes,
+/// by route. A policy is a request, never a requirement, so this never refuses:
+///  - `ttl: none` places no markers and sends no hints;
+///  - an omitted `ttl`, or no policy, takes the route's default ([`default_cache_policy`]);
+///  - `short` and `long` take the shortest and longest explicit lifetime the provider's row
+///    offers. A route with no explicit lifetime to choose keeps its provider's own caching.
 pub fn resolve_cache_policy(
     family: WireFamilyId,
     provider_id: &str,
-    request: Option<&CacheRequest>,
+    cache: Option<&Cache>,
     table: &CacheTtlTable,
     bind: &BindIdentity,
-) -> Result<Option<CachePolicy>, String> {
-    if let Some(request) = request.filter(|request| request.mode == Some(CacheMode::None)) {
-        if request.role.is_some() || request.ttl.is_some() || request.tail.is_some() {
-            return Err(
-                "cache.mode \"none\" switches prompt caching off, so it cannot be \
-                        combined with cache.role, cache.ttl or cache.tail, which configure it"
-                    .to_string(),
-            );
-        }
-        return Ok(None);
-    }
-    let request = match request {
-        Some(request)
-            if !(request.key.is_some() && request.role.is_none() && request.ttl.is_none()) =>
-        {
-            request
-        }
-        // No marker preference stated. A key-only request's `tail` still describes its prompt,
-        // so it reaches the default policy's placement.
-        unstated => {
-            return Ok(default_cache_policy(
-                family,
-                provider_id,
-                unstated.and_then(|request| request.tail),
-            ))
-        }
+) -> Option<CachePolicy> {
+    let ttl = match cache.and_then(|cache| cache.ttl) {
+        Some(Ttl::None) => return None,
+        None => return default_cache_policy(family, provider_id),
+        Some(ttl) => ttl,
     };
-
+    let long = ttl == Ttl::Long;
+    let markers = |syntax| {
+        let row = table.marker_row(family, provider_id)?;
+        let mut offered = row.offered();
+        let ttl = if long { offered.last() } else { offered.next() }?;
+        Some(CachePolicy {
+            version: CACHE_POLICY_VERSION,
+            class: CacheClass::Markers {
+                syntax,
+                ttl,
+                max_breakpoints: MAX_BREAKPOINTS,
+                lookback_blocks: LOOKBACK_BLOCKS,
+                tail: None,
+                // A requested lifetime is written on every marker; only the route default
+                // leaves it to the provider.
+                omit_ttl: false,
+            },
+        })
+    };
     match family {
-        WireFamilyId::AnthropicMessages => resolve_marker_policy(
-            family,
-            provider_id,
-            request,
-            table,
-            MarkerSyntax::AnthropicCacheControl,
-        )
-        .map(Some),
-        WireFamilyId::BedrockConverse => resolve_marker_policy(
-            family,
-            provider_id,
-            request,
-            table,
-            MarkerSyntax::BedrockCachePoint,
-        )
-        .map(Some),
+        WireFamilyId::AnthropicMessages => markers(MarkerSyntax::AnthropicCacheControl),
+        WireFamilyId::BedrockConverse => markers(MarkerSyntax::BedrockCachePoint),
         WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses => {
-            let Some(mut retention) = table.hints_row(provider_id) else {
-                return Err(unsupported_cache_message(family, provider_id));
+            let row = table.hints_row(provider_id)?;
+            // `long` asks OpenAI's own API for its extended retention; `short` keeps the
+            // provider's in-memory default, which has no provable lifetime.
+            let retention = match (long, provider_id) {
+                (true, OPENAI_API_PROVIDER) => Some(OPENAI_EXTENDED_RETENTION.to_owned()),
+                (true, _) => row,
+                (false, _) => None,
             };
-            match request.ttl.as_deref() {
-                None => {}
-                // OpenAI's API-key endpoints keep a cached prefix for up to 24 hours when the
-                // request says `prompt_cache_retention: "24h"`. Named explicitly, that lifetime
-                // is frozen whatever the configured row says, like a marker provider's TTL.
-                Some(OPENAI_EXTENDED_RETENTION) if provider_id == OPENAI_API_PROVIDER => {
-                    retention = Some(OPENAI_EXTENDED_RETENTION.to_string());
-                }
-                Some(ttl) => {
-                    return Err(format!(
-                        "provider '{provider_id}' uses prompt-cache hints and does not support \
-                         explicit cache ttl '{ttl}'{}",
-                        if ttl == OPENAI_EXTENDED_RETENTION {
-                            " (24h retention is offered only by OpenAI's own API-key endpoints)"
-                        } else {
-                            ""
-                        }
-                    ));
-                }
-            }
-            Ok(Some(CachePolicy {
+            Some(CachePolicy {
                 version: CACHE_POLICY_VERSION,
                 class: CacheClass::Hints {
                     cache_key: cache_key(bind),
                     retention,
                 },
-            }))
+            })
         }
-        // The ChatGPT backend answers a request carrying `prompt_cache_retention` with HTTP 400,
-        // so a 24h request there is refused at admission rather than at the first step.
-        WireFamilyId::OpenAiResponsesChatgpt
-            if request.ttl.as_deref() == Some(OPENAI_EXTENDED_RETENTION) =>
-        {
-            Err(format!(
-                "cache ttl '24h' is not available for provider '{provider_id}' on the ChatGPT \
-                 backend, which rejects prompt_cache_retention; it is offered only on OpenAI's \
-                 API-key endpoints"
-            ))
-        }
+        // The ChatGPT backend refuses `prompt_cache_retention`, and Gemini and Code Assist have
+        // no lifetime to name here: their own caching applies.
         WireFamilyId::OpenAiResponsesChatgpt
         | WireFamilyId::Gemini
-        | WireFamilyId::GoogleCodeAssist => Err(unsupported_cache_message(family, provider_id)),
+        | WireFamilyId::GoogleCodeAssist => None,
     }
+}
+
+/// The refusal a `session.send` gets for its `cache` member before anything is decoded or
+/// written: `cache` beside `plan`, since a planned session's policy is `plan.cache`, or a policy
+/// the contract's shape checks or broca's time-zone database refuse, each naming its field.
+/// Whether the session already exists is the session's to check. `None` admits the member.
+pub fn send_cache_refusal(
+    params: &serde_json::Value,
+) -> Option<cortexkit_role_llm_runner::cache::ErrorBody> {
+    let cache = params.get("cache")?;
+    if params.get("plan").is_some() {
+        return Some(cortexkit_role_llm_runner::cache::ErrorBody::invalid_params(
+            "cache",
+            "a send carrying plan sets its cache policy as plan.cache",
+        ));
+    }
+    cortexkit_role_llm_runner::cache::check_send_value(cache)
+        .and_then(|cache| broca_fetch_plan::check_zone(&cache, "cache"))
+        .err()
 }
 
 /// The provider id of OpenAI's own API, the one hint provider whose endpoints accept a 24h
 /// prompt-cache retention.
 const OPENAI_API_PROVIDER: &str = "openai";
 
-/// The `cache.ttl` spelling, and the `prompt_cache_retention` value, of OpenAI's extended
-/// retention.
+/// OpenAI's extended `prompt_cache_retention`.
 const OPENAI_EXTENDED_RETENTION: &str = "24h";
 
 /// The provider-id of first-party Anthropic, the one provider that caches by default.
 const FIRST_PARTY_ANTHROPIC: &str = "anthropic";
 
-/// The policy a send gets when it states no marker preference.
+/// The policy a run gets when its cache policy names no lifetime.
 ///
 /// First-party Anthropic caches nothing without `cache_control` markers, so a caller who never
 /// thought about caching re-sent its whole prefix at full price every step. It therefore gets
-/// markers by default, as it does in other harnesses: the same four-slot planner an explicit
-/// request uses, at Anthropic's default 5-minute lifetime, written without a `ttl` field.
+/// markers by default, as it does in other harnesses: placed exactly where a requested
+/// lifetime places them, at Anthropic's default 5-minute lifetime, written without a `ttl` field.
 ///
 /// Every other provider keeps no policy. Amazon Bedrock and third-party gateways that speak the
 /// Anthropic Messages grammar are left alone on purpose: their support for, and pricing of,
-/// cache markers is not the first-party API's, and a caller can still opt in explicitly.
+/// cache markers is not the first-party API's, and a caller can still ask for a lifetime.
 ///
-/// No hint cache key is set here: the explicit marker path sets none for Anthropic either (only
-/// hint families carry `cache_key(bind)`), because Anthropic keys its cache on prefix content.
-pub fn default_cache_policy(
-    family: WireFamilyId,
-    provider_id: &str,
-    tail: Option<CacheTail>,
-) -> Option<CachePolicy> {
+/// No hint cache key is set here: the marker path sets none for Anthropic either (only hint
+/// families carry `cache_key(bind)`), because Anthropic keys its cache on prefix content.
+pub fn default_cache_policy(family: WireFamilyId, provider_id: &str) -> Option<CachePolicy> {
     if family != WireFamilyId::AnthropicMessages || provider_id != FIRST_PARTY_ANTHROPIC {
         return None;
     }
@@ -442,94 +394,39 @@ pub fn default_cache_policy(
             ttl: CacheTtl::FiveMinutes,
             max_breakpoints: MAX_BREAKPOINTS,
             lookback_blocks: LOOKBACK_BLOCKS,
-            tail,
+            tail: None,
             omit_ttl: true,
         },
     })
 }
 
-/// Clamp a caller scope before it is persisted in the frozen render config. The value is
-/// available to all families even though only OpenAI renderers emit it.
-pub fn resolve_caller_cache_key(request: Option<&CacheRequest>) -> Option<String> {
-    request
-        .and_then(|request| request.key.as_deref())
+/// A caller's `cache.key`, clamped to what a provider's cache hint takes, before the render
+/// config freezes it. Only hint routes send it.
+pub fn resolve_caller_cache_key(cache: Option<&Cache>) -> Option<String> {
+    cache
+        .and_then(|cache| cache.key.as_deref())
         .map(broca_provider::hash::clamp_prompt_cache_key)
 }
 
-/// The prompt-cache scope a fresh episode freezes into its render config.
+/// The prompt-cache scope a fresh run freezes into its render config.
 ///
-/// A caller's own `cache.key` always wins. Without one, a provider the table lists in
+/// The policy's own `key` always wins. Without one, a provider the table lists in
 /// `session_key_providers` gets the session id, clamped by the same rule the ChatGPT backend's
 /// session-derived key uses, so every step, retry and warm of the session names one scope. A
-/// resume does not call this: it re-reads the key frozen in the episode's render config.
-/// `cache.mode: "none"` suppresses the session default, as it suppresses every other default
-/// cache hint; it does not drop a key the caller named explicitly.
+/// resume does not call this: it re-reads the key frozen in the run's render config.
+/// `ttl: none` suppresses the session default, as it suppresses every other default cache hint;
+/// it does not drop a key the policy named.
 pub fn resolve_prompt_cache_key(
     provider_id: &str,
-    request: Option<&CacheRequest>,
+    cache: Option<&Cache>,
     table: &CacheTtlTable,
     bind: &BindIdentity,
 ) -> Option<String> {
-    resolve_caller_cache_key(request).or_else(|| {
-        let caching_off = request.is_some_and(|request| request.mode == Some(CacheMode::None));
+    resolve_caller_cache_key(cache).or_else(|| {
+        let caching_off = cache.and_then(|cache| cache.ttl) == Some(Ttl::None);
         (!caching_off && table.defaults_to_session_key(provider_id))
             .then(|| broca_provider::hash::clamp_prompt_cache_key(&bind.session))
     })
-}
-
-fn resolve_marker_policy(
-    family: WireFamilyId,
-    provider_id: &str,
-    request: &CacheRequest,
-    table: &CacheTtlTable,
-    syntax: MarkerSyntax,
-) -> Result<CachePolicy, String> {
-    let Some(row) = table.marker_row(family, provider_id) else {
-        return Err(unsupported_cache_message(family, provider_id));
-    };
-    let role = request.role.unwrap_or(CacheRole::Primary);
-    let row_ttl = match role {
-        CacheRole::Primary => row.primary,
-        CacheRole::Ephemeral => row.ephemeral,
-    };
-    let ttl = match request.ttl.as_deref() {
-        Some(raw) => {
-            let requested = parse_ttl(raw)?;
-            if !row.allows(requested) {
-                return Err(format!(
-                    "cache ttl '{}' is not allowed for provider '{provider_id}' (allowed: {})",
-                    requested.as_str(),
-                    row.allowed_list()
-                ));
-            }
-            requested
-        }
-        None => row_ttl,
-    };
-    Ok(CachePolicy {
-        version: CACHE_POLICY_VERSION,
-        class: CacheClass::Markers {
-            syntax,
-            ttl,
-            max_breakpoints: MAX_BREAKPOINTS,
-            lookback_blocks: LOOKBACK_BLOCKS,
-            // Frozen here for the same reason as `ttl`: marker placement must be decided once,
-            // at admission, so a resumed step reproduces the original bytes instead of
-            // re-deciding from a request the resume path does not read.
-            tail: request.tail,
-            // An explicit request keeps writing `ttl` on every marker, so what it renders is
-            // unchanged; only the no-request default (`default_cache_policy`) omits the field.
-            omit_ttl: false,
-        },
-    })
-}
-
-fn unsupported_cache_message(family: WireFamilyId, provider_id: &str) -> String {
-    format!(
-        "provider '{provider_id}' with wire family {:?} does not support broca cache \
-         preferences",
-        family
-    )
 }
 
 fn parse_ttl(raw: &str) -> Result<CacheTtl, String> {
@@ -668,356 +565,182 @@ pub(crate) fn strip_trailing_commas(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_protocol::request::CacheTail;
-
-    fn req(role: Option<CacheRole>, ttl: Option<&str>) -> CacheRequest {
-        CacheRequest {
-            role,
-            ttl: ttl.map(str::to_string),
-            key: None,
-            tail: None,
-            mode: None,
-        }
-    }
-
-    fn req_with_key(key: &str) -> CacheRequest {
-        CacheRequest {
-            role: None,
-            ttl: None,
-            key: Some(key.to_string()),
-            tail: None,
-            mode: None,
-        }
-    }
 
     fn bind(session: &str) -> BindIdentity {
         BindIdentity::new("/tmp/project", "runner", session)
     }
 
-    fn marker_ttl(policy: Option<CachePolicy>) -> CacheTtl {
-        match policy.expect("policy").class {
-            CacheClass::Markers { ttl, .. } => ttl,
-            other => panic!("expected markers, got {other:?}"),
-        }
+    fn cache(ttl: Option<Ttl>, key: Option<&str>) -> Cache {
+        let mut cache = Cache::default();
+        cache.ttl = ttl;
+        cache.key = key.map(str::to_owned);
+        cache
     }
 
-    fn marker_tail(policy: Option<CachePolicy>) -> Option<CacheTail> {
-        match policy.expect("policy").class {
-            CacheClass::Markers { tail, .. } => tail,
-            other => panic!("expected markers, got {other:?}"),
-        }
-    }
-
-    /// A send with no cache request used to resolve no policy on every family. First-party
-    /// Anthropic is now the one exception, because it caches nothing without markers; every
-    /// other provider, including Bedrock and the third-party gateways that speak the Anthropic
-    /// grammar, still resolves none and so renders the bytes it always did.
-    #[test]
-    fn no_request_resolves_no_policy_except_on_first_party_anthropic() {
-        let table = CacheTtlTable::shipped_defaults();
-        for (family, provider) in [
-            (WireFamilyId::AnthropicMessages, "minimax"),
-            (WireFamilyId::AnthropicMessages, "thinkingmachines"),
-            (WireFamilyId::BedrockConverse, "amazon-bedrock"),
-            (WireFamilyId::OpenAiChat, "openai"),
-            (WireFamilyId::OpenAiResponses, "openai"),
-            (WireFamilyId::OpenAiResponsesChatgpt, "openai"),
-            (WireFamilyId::Gemini, "google"),
-            (WireFamilyId::GoogleCodeAssist, "google"),
-            // The provider id alone is not enough: only the Anthropic grammar carries markers.
-            (WireFamilyId::BedrockConverse, "anthropic"),
-            (WireFamilyId::OpenAiChat, "anthropic"),
-        ] {
-            assert_eq!(
-                resolve_cache_policy(family, provider, None, &table, &bind("s1")).unwrap(),
-                None,
-                "{family:?}/{provider} with no caller cache request stays byte-identical"
-            );
-        }
-    }
-
-    #[test]
-    fn no_request_on_first_party_anthropic_resolves_the_five_minute_default() {
-        // The table is not consulted: a config row changing `primary` cannot move the default.
-        for table in [
-            CacheTtlTable::shipped_defaults(),
-            CacheTtlTable::empty().with_marker("anthropic", CacheTtl::OneHour, CacheTtl::OneHour),
-        ] {
-            assert_eq!(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    None,
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap(),
-                Some(CachePolicy {
-                    version: CACHE_POLICY_VERSION,
-                    class: CacheClass::Markers {
-                        syntax: MarkerSyntax::AnthropicCacheControl,
-                        ttl: CacheTtl::FiveMinutes,
-                        max_breakpoints: 4,
-                        lookback_blocks: 20,
-                        tail: None,
-                        omit_ttl: true,
-                    },
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn mode_none_resolves_no_policy_on_every_family() {
-        let none = CacheRequest {
-            mode: Some(CacheMode::None),
-            ..req(None, None)
-        };
-        let with_key = CacheRequest {
-            key: Some("scope".into()),
-            ..none.clone()
-        };
-        for (family, provider) in [
-            (WireFamilyId::AnthropicMessages, "anthropic"),
-            (WireFamilyId::BedrockConverse, "amazon-bedrock"),
-            (WireFamilyId::OpenAiChat, "openai"),
-            (WireFamilyId::OpenAiResponses, "openai"),
-        ] {
-            for request in [&none, &with_key] {
-                assert_eq!(
-                    resolve_cache_policy(
-                        family,
-                        provider,
-                        Some(request),
-                        &CacheTtlTable::shipped_defaults(),
-                        &bind("s1")
-                    )
-                    .unwrap(),
-                    None,
-                    "{family:?}/{provider}: mode none switches caching off"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn mode_none_refuses_settings_that_configure_caching() {
-        for request in [
-            req(Some(CacheRole::Primary), None),
-            req(None, Some("1h")),
-            CacheRequest {
-                tail: Some(CacheTail::Volatile),
-                ..req(None, None)
-            },
-        ] {
-            let request = CacheRequest {
-                mode: Some(CacheMode::None),
-                ..request
-            };
-            let err = resolve_cache_policy(
-                WireFamilyId::AnthropicMessages,
-                "anthropic",
-                Some(&request),
-                &CacheTtlTable::shipped_defaults(),
-                &bind("s1"),
-            )
-            .unwrap_err();
-            assert!(err.contains("cache.mode"), "got {err}");
-        }
-    }
-
-    #[test]
-    fn explicit_one_hour_is_still_honoured_on_anthropic() {
-        for table in [CacheTtlTable::shipped_defaults(), CacheTtlTable::empty()] {
-            let policy = resolve_cache_policy(
-                WireFamilyId::AnthropicMessages,
-                "anthropic",
-                Some(&req(None, Some("1h"))),
-                &table,
-                &bind("s1"),
-            )
-            .unwrap();
-            assert!(matches!(
-                policy.as_ref().map(|policy| &policy.class),
-                Some(CacheClass::Markers {
-                    ttl: CacheTtl::OneHour,
-                    omit_ttl: false,
-                    ..
-                })
-            ));
-        }
-    }
-
-    #[test]
-    fn class_matrix_resolves_supported_families_only() {
-        let table = CacheTtlTable::shipped_defaults();
-        assert!(matches!(
-            resolve_cache_policy(
-                WireFamilyId::AnthropicMessages,
-                "anthropic",
-                Some(&req(None, None)),
-                &table,
-                &bind("s1")
-            )
-            .unwrap()
-            .unwrap()
-            .class,
-            CacheClass::Markers {
-                syntax: MarkerSyntax::AnthropicCacheControl,
-                ..
-            }
-        ));
-        assert!(matches!(
-            resolve_cache_policy(
-                WireFamilyId::BedrockConverse,
-                "amazon-bedrock",
-                Some(&req(None, None)),
-                &table,
-                &bind("s1")
-            )
-            .unwrap()
-            .unwrap()
-            .class,
-            CacheClass::Markers {
-                syntax: MarkerSyntax::BedrockCachePoint,
-                ..
-            }
-        ));
-        for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
-            assert!(matches!(
-                resolve_cache_policy(
-                    family,
-                    "openai",
-                    Some(&req(None, None)),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-                .unwrap()
-                .class,
-                CacheClass::Hints {
-                    retention: Some(_),
-                    ..
-                }
-            ));
-        }
-        for family in [
-            WireFamilyId::OpenAiResponsesChatgpt,
-            WireFamilyId::Gemini,
-            WireFamilyId::GoogleCodeAssist,
-        ] {
-            assert!(resolve_cache_policy(
-                family,
-                "openai",
-                Some(&req(None, None)),
-                &table,
-                &bind("s1")
-            )
-            .is_err());
-        }
-    }
-
-    /// What an explicit cache request on an OpenAI API-key route freezes today: the bind's hint
-    /// key and the shipped row's 24h retention. Pinned exactly, so naming the lifetime in the
-    /// request cannot change what the same request without one already froze.
-    #[test]
-    fn explicit_openai_request_freezes_the_shipped_24h_retention() {
-        for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
-            assert_eq!(
-                resolve_cache_policy(
-                    family,
-                    "openai",
-                    Some(&req(Some(CacheRole::Primary), None)),
-                    &CacheTtlTable::shipped_defaults(),
-                    &bind("s1")
-                )
-                .unwrap(),
-                Some(CachePolicy {
-                    version: CACHE_POLICY_VERSION,
-                    class: CacheClass::Hints {
-                        cache_key: cache_key(&bind("s1")),
-                        retention: Some("24h".into()),
-                    },
-                }),
-                "{family:?}"
-            );
-        }
-    }
-
-    /// `ttl: "24h"` on OpenAI's own API-key routes freezes a 24h retention, on Responses and on
-    /// Chat, and even over a configured row that keeps no retention.
-    #[test]
-    fn openai_24h_ttl_freezes_24h_retention_on_api_key_routes() {
-        let configured = CacheTtlTable {
-            rows: HashMap::from([(
-                "openai".to_string(),
-                ProviderCacheRow::Hints { retention: None },
-            )]),
-            session_key_providers: BTreeSet::new(),
-        };
-        for table in [CacheTtlTable::shipped_defaults(), configured] {
-            for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
-                assert_eq!(
-                    resolve_cache_policy(
-                        family,
-                        "openai",
-                        Some(&req(None, Some("24h"))),
-                        &table,
-                        &bind("s1")
-                    )
-                    .unwrap(),
-                    Some(CachePolicy {
-                        version: CACHE_POLICY_VERSION,
-                        class: CacheClass::Hints {
-                            cache_key: cache_key(&bind("s1")),
-                            retention: Some("24h".into()),
-                        },
-                    }),
-                    "{family:?}"
-                );
-            }
-        }
-    }
-
-    /// The ChatGPT backend rejects `prompt_cache_retention` with HTTP 400, so a 24h request on
-    /// it is refused at admission, naming why.
-    #[test]
-    fn openai_24h_ttl_is_refused_on_the_chatgpt_backend() {
-        let err = resolve_cache_policy(
-            WireFamilyId::OpenAiResponsesChatgpt,
-            "openai",
-            Some(&req(None, Some("24h"))),
+    fn resolve(family: WireFamilyId, provider: &str, cache: Option<&Cache>) -> Option<CachePolicy> {
+        resolve_cache_policy(
+            family,
+            provider,
+            cache,
             &CacheTtlTable::shipped_defaults(),
             &bind("s1"),
         )
-        .unwrap_err();
-        assert!(err.contains("ChatGPT backend"), "got {err}");
-        assert!(err.contains("prompt_cache_retention"), "got {err}");
     }
 
-    /// Every provider other than OpenAI's API-key endpoints refuses a 24h lifetime.
+    fn marker_ttl(policy: Option<CachePolicy>) -> (CacheTtl, bool) {
+        match policy.expect("policy").class {
+            CacheClass::Markers { ttl, omit_ttl, .. } => (ttl, omit_ttl),
+            other => panic!("expected markers, got {other:?}"),
+        }
+    }
+
+    fn retention(policy: Option<CachePolicy>) -> Option<String> {
+        match policy.expect("policy").class {
+            CacheClass::Hints { retention, .. } => retention,
+            other => panic!("expected hints, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_24h_ttl_is_refused_on_every_other_provider() {
+    fn no_policy_or_no_ttl_takes_the_route_default() {
+        for policy in [None, Some(cache(None, None)), Some(cache(None, Some("k")))] {
+            assert_eq!(
+                marker_ttl(resolve(
+                    WireFamilyId::AnthropicMessages,
+                    "anthropic",
+                    policy.as_ref()
+                )),
+                (CacheTtl::FiveMinutes, true),
+                "first-party Anthropic gets 5m markers, lifetime left to the provider"
+            );
+            for (family, provider) in [
+                (WireFamilyId::AnthropicMessages, "a-gateway"),
+                (WireFamilyId::BedrockConverse, "amazon-bedrock"),
+                (WireFamilyId::OpenAiResponses, "openai"),
+                (WireFamilyId::OpenAiResponsesChatgpt, "openai"),
+                (WireFamilyId::Gemini, "google"),
+            ] {
+                assert_eq!(
+                    resolve(family, provider, policy.as_ref()),
+                    None,
+                    "{family:?} {provider}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ttl_none_places_nothing_on_every_route() {
+        let none = cache(Some(Ttl::None), None);
         for (family, provider) in [
-            (WireFamilyId::OpenAiChat, "xai"),
-            (WireFamilyId::OpenAiResponses, "fireworks-ai"),
             (WireFamilyId::AnthropicMessages, "anthropic"),
             (WireFamilyId::BedrockConverse, "amazon-bedrock"),
-            (WireFamilyId::Gemini, "google"),
-            (WireFamilyId::GoogleCodeAssist, "google"),
+            (WireFamilyId::OpenAiChat, "openai"),
+            (WireFamilyId::OpenAiResponses, "xai"),
         ] {
-            assert!(
-                resolve_cache_policy(
-                    family,
-                    provider,
-                    Some(&req(None, Some("24h"))),
-                    &CacheTtlTable::shipped_defaults(),
-                    &bind("s1")
-                )
-                .is_err(),
-                "{family:?}/{provider} must refuse a 24h ttl"
+            assert_eq!(
+                resolve(family, provider, Some(&none)),
+                None,
+                "{family:?} {provider}"
             );
         }
+    }
+
+    #[test]
+    fn short_and_long_take_the_shortest_and_longest_lifetime_the_row_offers() {
+        let (short, long) = (cache(Some(Ttl::Short), None), cache(Some(Ttl::Long), None));
+        let anthropic = |policy| {
+            marker_ttl(resolve(
+                WireFamilyId::AnthropicMessages,
+                "anthropic",
+                Some(policy),
+            ))
+        };
+        assert_eq!(anthropic(&short), (CacheTtl::FiveMinutes, false));
+        assert_eq!(anthropic(&long), (CacheTtl::OneHour, false));
+        let bedrock = |policy| {
+            marker_ttl(resolve(
+                WireFamilyId::BedrockConverse,
+                "amazon-bedrock",
+                Some(policy),
+            ))
+        };
+        assert_eq!(bedrock(&short), (CacheTtl::FiveMinutes, false));
+        assert_eq!(
+            bedrock(&long),
+            (CacheTtl::FiveMinutes, false),
+            "Bedrock offers 5m alone"
+        );
+    }
+
+    #[test]
+    fn openai_long_asks_its_extended_retention_and_short_keeps_in_memory() {
+        let (short, long) = (cache(Some(Ttl::Short), None), cache(Some(Ttl::Long), None));
+        for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
+            assert_eq!(
+                retention(resolve(family, "openai", Some(&long))).as_deref(),
+                Some("24h")
+            );
+            assert_eq!(retention(resolve(family, "openai", Some(&short))), None);
+            assert_eq!(
+                retention(resolve(family, "xai", Some(&long))),
+                None,
+                "xai offers no retention"
+            );
+            assert_eq!(
+                retention(resolve(family, "fireworks-ai", Some(&short))),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_without_a_lifetime_to_name_keeps_its_own_caching_and_never_refuses() {
+        for ttl in [Ttl::Short, Ttl::Long] {
+            let policy = cache(Some(ttl), None);
+            for (family, provider) in [
+                (WireFamilyId::OpenAiResponsesChatgpt, "openai"),
+                (WireFamilyId::Gemini, "google"),
+                (WireFamilyId::GoogleCodeAssist, "google"),
+                (WireFamilyId::OpenAiChat, "a-provider-with-no-row"),
+            ] {
+                assert_eq!(
+                    resolve(family, provider, Some(&policy)),
+                    None,
+                    "{family:?} {provider}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_policy_key_wins_and_meta_alone_defaults_to_its_session() {
+        let table = CacheTtlTable::shipped_defaults();
+        let long_key = "alfonso-classify-cache-scope-".repeat(6);
+        let keyed = cache(None, Some(&long_key));
+        assert_eq!(
+            resolve_prompt_cache_key("openai", Some(&keyed), &table, &bind("s1")),
+            Some(broca_provider::hash::clamp_prompt_cache_key(&long_key))
+        );
+        assert_eq!(
+            resolve_prompt_cache_key("openai", None, &table, &bind("s1")),
+            None
+        );
+        assert_eq!(
+            resolve_prompt_cache_key("meta", None, &table, &bind("s1")),
+            Some(broca_provider::hash::clamp_prompt_cache_key("s1"))
+        );
+        let off = cache(Some(Ttl::None), None);
+        assert_eq!(
+            resolve_prompt_cache_key("meta", Some(&off), &table, &bind("s1")),
+            None
+        );
+        let off_keyed = cache(Some(Ttl::None), Some("k"));
+        assert_eq!(
+            resolve_prompt_cache_key("meta", Some(&off_keyed), &table, &bind("s1")),
+            Some("k".to_owned()),
+            "ttl none drops the session default, never a key the policy named"
+        );
     }
 
     #[test]
@@ -1042,233 +765,6 @@ mod tests {
         }
     }
 
-    /// Meta caches a prefix only when the request names a scope, so a Meta send without a
-    /// caller key freezes its session id as the key. This default comes from the shipped table:
-    /// an empty table supplies no default for Meta, the shipped table lists only Meta, and every
-    /// other provider still freezes only the key its caller named.
-    #[test]
-    fn shipped_table_gives_meta_alone_a_session_prompt_cache_key() {
-        let shipped = CacheTtlTable::shipped_defaults();
-        assert_eq!(
-            shipped.session_key_providers,
-            BTreeSet::from(["meta".to_string()]),
-            "the shipped session-key providers"
-        );
-        assert_eq!(
-            resolve_prompt_cache_key("meta", None, &shipped, &bind("muse-session")).as_deref(),
-            Some("muse-session")
-        );
-        assert_eq!(
-            resolve_prompt_cache_key("meta", Some(&req(None, None)), &shipped, &bind("s1"))
-                .as_deref(),
-            Some("s1"),
-            "a cache request without a key still gets the session default"
-        );
-        let long_session = "meta-session-".repeat(8);
-        assert_eq!(
-            resolve_prompt_cache_key("meta", None, &shipped, &bind(&long_session)),
-            Some(broca_provider::hash::clamp_prompt_cache_key(&long_session)),
-            "a long session id is clamped by the same rule as a caller key"
-        );
-        assert_eq!(
-            resolve_prompt_cache_key(
-                "meta",
-                Some(&req_with_key("caller-scope")),
-                &shipped,
-                &bind("s1")
-            )
-            .as_deref(),
-            Some("caller-scope"),
-            "a caller-supplied scope wins over the session default"
-        );
-        let off = CacheRequest {
-            mode: Some(CacheMode::None),
-            ..req(None, None)
-        };
-        assert_eq!(
-            resolve_prompt_cache_key("meta", Some(&off), &shipped, &bind("s1")),
-            None,
-            "cache.mode none sends no default cache hint"
-        );
-        assert_eq!(
-            resolve_prompt_cache_key("meta", None, &CacheTtlTable::empty(), &bind("s1")),
-            None,
-            "the default comes from the table, not from the provider name"
-        );
-        for provider in ["openai", "xai", "fireworks-ai", "anthropic", "google"] {
-            assert_eq!(
-                resolve_prompt_cache_key(provider, None, &shipped, &bind("s1")),
-                None,
-                "{provider} keeps sending no key without a caller scope"
-            );
-            assert_eq!(
-                resolve_prompt_cache_key(
-                    provider,
-                    Some(&req_with_key("caller-scope")),
-                    &shipped,
-                    &bind("s1")
-                ),
-                resolve_caller_cache_key(Some(&req_with_key("caller-scope"))),
-                "{provider} freezes exactly the caller key it froze before"
-            );
-        }
-    }
-
-    #[test]
-    fn marker_ttl_precedence_request_then_table_then_shipped_default() {
-        let empty = CacheTtlTable::empty();
-        assert_eq!(
-            marker_ttl(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&req(None, None)),
-                    &empty,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            // Was 1h. The Anthropic primary default is now 5m, the lifetime a send with no
-            // cache request also gets, so asking for caching without a TTL does not quietly
-            // buy the dearer 1h write. 1h is still available by asking for it.
-            CacheTtl::FiveMinutes,
-            "shipped primary default applies when the table has no row"
-        );
-
-        // A configured row whose primary differs from the shipped 5m, so the assertion below
-        // can only pass if an explicit request really reads the table's row.
-        let table = CacheTtlTable::empty().with_marker(
-            "anthropic",
-            CacheTtl::OneHour,
-            CacheTtl::FiveMinutes,
-        );
-        assert_eq!(
-            marker_ttl(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&req(None, None)),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            CacheTtl::OneHour,
-            "table row overrides the shipped primary default"
-        );
-
-        let table = CacheTtlTable::empty().with_marker(
-            "anthropic",
-            CacheTtl::OneHour,
-            CacheTtl::FiveMinutes,
-        );
-        assert_eq!(
-            marker_ttl(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&req(Some(CacheRole::Primary), Some("5m"))),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            CacheTtl::FiveMinutes,
-            "explicit ttl wins when the row allows it"
-        );
-    }
-
-    #[test]
-    fn role_defaults_to_primary_and_ephemeral_selects_short_ttl() {
-        let table = CacheTtlTable::empty();
-        assert_eq!(
-            marker_ttl(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&req(None, None)),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            // Was 1h; the primary default is now 5m (see the precedence test above).
-            CacheTtl::FiveMinutes
-        );
-        assert_eq!(
-            marker_ttl(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&req(Some(CacheRole::Ephemeral), None)),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            CacheTtl::FiveMinutes
-        );
-    }
-
-    #[test]
-    fn unsupported_prefs_and_disallowed_ttl_fail_loud() {
-        let table = CacheTtlTable::shipped_defaults();
-        let err = resolve_cache_policy(
-            WireFamilyId::Gemini,
-            "google",
-            Some(&req(Some(CacheRole::Primary), None)),
-            &table,
-            &bind("s1"),
-        )
-        .unwrap_err();
-        assert!(err.contains("does not support"));
-
-        let err = resolve_cache_policy(
-            WireFamilyId::BedrockConverse,
-            "amazon-bedrock",
-            Some(&req(None, Some("1h"))),
-            &table,
-            &bind("s1"),
-        )
-        .unwrap_err();
-        assert!(err.contains("not allowed"), "got {err}");
-    }
-
-    #[test]
-    fn caller_tail_declaration_is_frozen_into_the_marker_policy() {
-        let table = CacheTtlTable::shipped_defaults();
-        let mut request = req(None, None);
-        request.tail = Some(CacheTail::Volatile);
-
-        for (family, provider) in [
-            (WireFamilyId::AnthropicMessages, "anthropic"),
-            (WireFamilyId::BedrockConverse, "amazon-bedrock"),
-        ] {
-            assert_eq!(
-                marker_tail(
-                    resolve_cache_policy(family, provider, Some(&request), &table, &bind("s1"))
-                        .unwrap()
-                ),
-                Some(CacheTail::Volatile),
-                "{family:?} freezes the caller's tail declaration at admission"
-            );
-            assert_eq!(
-                marker_tail(
-                    resolve_cache_policy(
-                        family,
-                        provider,
-                        Some(&req(None, None)),
-                        &table,
-                        &bind("s1")
-                    )
-                    .unwrap()
-                ),
-                None,
-                "{family:?} leaves the declaration absent when the caller made none"
-            );
-        }
-    }
-
     #[test]
     fn cache_key_is_deterministic_session_scoped_and_length_prefixed() {
         let s1 = bind("s1");
@@ -1287,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn config_loader_accepts_jsonc_and_overrides_rows() {
+    fn a_config_row_sets_what_a_provider_offers() {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-cache-config-{}-{}",
             std::process::id(),
@@ -1308,169 +804,18 @@ mod tests {
         )
         .unwrap();
         let table = CacheTtlTable::load(&path).unwrap();
+        let long = cache(Some(Ttl::Long), None);
         assert_eq!(
-            marker_ttl(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&req(None, None)),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            CacheTtl::FiveMinutes
+            marker_ttl(resolve_cache_policy(
+                WireFamilyId::AnthropicMessages,
+                "anthropic",
+                Some(&long),
+                &table,
+                &bind("s1")
+            )),
+            (CacheTtl::FiveMinutes, false),
+            "a row offering 5m alone makes long 5m"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn canonical_fireworks_provider_resolves_hint_policy() {
-        let policy = resolve_cache_policy(
-            WireFamilyId::OpenAiChat,
-            "fireworks-ai",
-            Some(&req(Some(CacheRole::Primary), None)),
-            &CacheTtlTable::shipped_defaults(),
-            &bind("s1"),
-        )
-        .unwrap()
-        .unwrap();
-        match policy.class {
-            CacheClass::Hints {
-                cache_key,
-                retention,
-            } => {
-                assert!(!cache_key.is_empty());
-                assert_eq!(retention, None);
-            }
-            other => panic!("expected hints, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn caller_key_is_clamped_without_planning_cache_policy() {
-        let long_key = "alfonso-classify-cache-scope-".repeat(4);
-        let request = req_with_key(&long_key);
-        for family in [WireFamilyId::OpenAiChat, WireFamilyId::OpenAiResponses] {
-            assert_eq!(
-                resolve_cache_policy(
-                    family,
-                    "openai",
-                    Some(&request),
-                    &CacheTtlTable::shipped_defaults(),
-                    &bind("different-session"),
-                )
-                .unwrap(),
-                None,
-                "{family:?} does not plan policy for a key-only request"
-            );
-        }
-        assert_eq!(
-            resolve_caller_cache_key(Some(&request)),
-            Some(broca_provider::hash::clamp_prompt_cache_key(&long_key))
-        );
-    }
-
-    /// A key names a cache scope; it is not a request for markers. So a key-only request resolves
-    /// exactly as a send with no cache request does. That used to be "no policy" everywhere; on
-    /// first-party Anthropic it is now the default policy, and the key must not take it away:
-    /// otherwise adding a scope key would silently switch Anthropic caching off.
-    #[test]
-    fn key_only_resolves_like_no_request_and_enables_nothing_itself() {
-        let table = CacheTtlTable::shipped_defaults();
-        let mut keyed_tail = req_with_key("shared");
-        keyed_tail.tail = Some(CacheTail::Volatile);
-        assert_eq!(
-            resolve_cache_policy(
-                WireFamilyId::AnthropicMessages,
-                "anthropic",
-                Some(&req_with_key("shared")),
-                &table,
-                &bind("s1")
-            )
-            .unwrap(),
-            resolve_cache_policy(
-                WireFamilyId::AnthropicMessages,
-                "anthropic",
-                None,
-                &table,
-                &bind("s1")
-            )
-            .unwrap(),
-            "first-party Anthropic keeps its default for a key-only request"
-        );
-        assert_eq!(
-            marker_tail(
-                resolve_cache_policy(
-                    WireFamilyId::AnthropicMessages,
-                    "anthropic",
-                    Some(&keyed_tail),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap()
-            ),
-            Some(CacheTail::Volatile),
-            "the default placement honours a key-only request's tail declaration"
-        );
-        for (family, provider) in [
-            (WireFamilyId::AnthropicMessages, "minimax"),
-            (WireFamilyId::Gemini, "google"),
-            (WireFamilyId::GoogleCodeAssist, "google"),
-        ] {
-            assert_eq!(
-                resolve_cache_policy(
-                    family,
-                    provider,
-                    Some(&req_with_key("shared")),
-                    &table,
-                    &bind("s1")
-                )
-                .unwrap(),
-                None,
-                "{family:?} keeps its cache policy disabled for a key-only request"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_key_only_skips_policy_resolution() {
-        let policy = resolve_cache_policy(
-            WireFamilyId::OpenAiResponsesChatgpt,
-            "openai",
-            Some(&req_with_key("alfonso-classify-v1")),
-            &CacheTtlTable::shipped_defaults(),
-            &bind("s1"),
-        )
-        .unwrap();
-        assert_eq!(policy, None);
-    }
-
-    #[test]
-    fn marker_policy_still_resolves_when_role_and_ttl_accompany_a_key() {
-        let request = CacheRequest {
-            role: Some(CacheRole::Ephemeral),
-            ttl: Some("5m".into()),
-            key: Some("shared".into()),
-            tail: None,
-            mode: None,
-        };
-        assert!(matches!(
-            resolve_cache_policy(
-                WireFamilyId::AnthropicMessages,
-                "anthropic",
-                Some(&request),
-                &CacheTtlTable::shipped_defaults(),
-                &bind("s1"),
-            )
-            .unwrap()
-            .expect("role and TTL still plan markers")
-            .class,
-            CacheClass::Markers { .. }
-        ));
-        assert_eq!(
-            resolve_caller_cache_key(Some(&request)).as_deref(),
-            Some("shared")
-        );
     }
 }

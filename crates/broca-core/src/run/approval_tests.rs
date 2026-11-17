@@ -1510,6 +1510,8 @@ async fn restart_wait_spend_uses_batch_cache_warmed_usage_and_starts_no_extra_wa
         cancel: None,
         unsupported_logged: &unsupported,
         warm_missed: &missed,
+        keep_warm: &broca_protocol::request::KeepWarm::Auto,
+        warms_before: 0,
     };
     let usage = Usage {
         output_tokens: Some(11),

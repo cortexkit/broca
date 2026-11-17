@@ -72,7 +72,7 @@ pub fn admission<P: Provider>(
         // A new run takes it from its plan.
         render_tags: false,
         budget: request.budget,
-        keep_warm: req.keep_warm,
+        keep_warm: req.keep_warm.clone(),
         auth_selection: control.auth_selection.clone(),
         account_limit_pause: control.account_limit_pause,
         route_decision_id: req.route_decision_id.clone(),

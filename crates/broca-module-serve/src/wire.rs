@@ -7,13 +7,13 @@
 use broca_module::executor::RunKind;
 use broca_module::serve::{SendRequest, SessionImportResponse, SubscribeFrom};
 use broca_protocol::content::{ContentBlock, Message, Role};
-use broca_protocol::request::{AuthRequest, CacheRequest, ModelHandle};
+use broca_protocol::request::{AuthRequest, ModelHandle};
 use broca_protocol::{BindIdentity, RunId, SubmissionRequest};
 use serde::{Deserialize, Serialize};
 
 pub use broca_wire::{
-    AuthParams, CacheParams, CancelParams, CursorWire, FromWire, ModelParams, ReadParams,
-    ReadResult, RetractParams, RouteRequest, RunStatusResponse, SendParams, SendResult,
+    AuthParams, CancelParams, CursorWire, FromWire, ModelParams, ReadParams, ReadResult,
+    RetractParams, RouteRequest, RunStatusResponse, SendParams, SendResult,
     SessionReadLineageState, SessionReadMessage, SessionReadResponse, StatusParams, SubscribeEvent,
     SubscribeParams, VaultAuditMissing, VaultAuditParams, VaultAuditResponse, VaultAuditRow,
 };
@@ -117,7 +117,6 @@ impl SendParamsExt for SendParams {
             directives,
             session_class,
             on_restart,
-            keep_warm,
             retention,
             prompt,
             prompt_blocks,
@@ -233,7 +232,6 @@ impl SendParamsExt for SendParams {
             content,
             directives,
             on_restart,
-            keep_warm,
             scope: Default::default(),
             project_id: None,
             principal: None,
@@ -247,13 +245,7 @@ impl SendParamsExt for SendParams {
             policy_allowed,
             tool_choice,
             generation,
-            cache: cache.map(|cache| CacheRequest {
-                role: cache.role,
-                ttl: cache.ttl,
-                key: cache.key,
-                tail: cache.tail,
-                mode: cache.mode,
-            }),
+            cache,
             budget,
             auth,
             context_limit,
@@ -286,9 +278,10 @@ impl SendParamsExt for SendParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_protocol::request::{CacheRole, CacheTail, CallOptions, ServiceTier};
+    use broca_protocol::request::{CallOptions, ServiceTier};
     use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
     use broca_provider::wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, WireFamily};
+    use cortexkit_role_llm_runner::cache::{Cache, Ttl};
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -416,7 +409,6 @@ mod tests {
             title: None,
             client_message_id: None,
             on_restart: None,
-            keep_warm: None,
             retention: None,
             conversation_key: None,
             service_tier: None,
@@ -450,54 +442,19 @@ mod tests {
     }
 
     #[test]
-    fn send_params_map_cache_preferences_to_run_request() {
+    fn a_creating_send_carries_its_cache_policy_to_the_run_request() {
         let mut params = make_send_params(None, "hello");
-        params.cache = Some(CacheParams {
-            role: Some(CacheRole::Ephemeral),
-            ttl: Some("5m".into()),
-            key: Some("alfonso-classify-v1".into()),
-            tail: Some(CacheTail::Volatile),
-            mode: None,
-        });
+        let mut cache = Cache::default();
+        cache.ttl = Some(Ttl::Long);
+        cache.key = Some("alfonso-classify-v1".into());
+        params.cache = Some(cache.clone());
         let request = params
             .into_send_request(
                 BindIdentity::new("/tmp/proj", "runner", "s1"),
                 RunId("run-cache".into()),
             )
             .unwrap();
-        let cache = request.request.cache.expect("cache request is carried");
-        assert_eq!(cache.role, Some(CacheRole::Ephemeral));
-        assert_eq!(cache.ttl.as_deref(), Some("5m"));
-        assert_eq!(cache.key.as_deref(), Some("alfonso-classify-v1"));
-        assert_eq!(cache.tail, Some(CacheTail::Volatile));
-        assert_eq!(cache.mode, None, "absent mode stays absent");
-    }
-
-    #[test]
-    fn send_params_carry_an_explicit_cache_opt_out() {
-        let params: SendParams = serde_json::from_value(serde_json::json!({
-            "prompt": "hello",
-            "model": {"provider": "anthropic", "model": "claude-opus-4-8"},
-            "cache": {"mode": "none"}
-        }))
-        .unwrap();
-        let request = params
-            .into_send_request(
-                BindIdentity::new("/tmp/proj", "runner", "s1"),
-                RunId("run-no-cache".into()),
-            )
-            .unwrap();
-        let cache = request.request.cache.expect("cache request is carried");
-        assert_eq!(cache.mode, Some(broca_protocol::request::CacheMode::None));
-        assert!(
-            serde_json::from_value::<SendParams>(serde_json::json!({
-                "prompt": "hello",
-                "model": {"provider": "anthropic", "model": "claude-opus-4-8"},
-                "cache": {"mode": "off"}
-            }))
-            .is_err(),
-            "an unknown mode is refused rather than read as no request"
-        );
+        assert_eq!(request.request.cache, Some(cache));
     }
 
     #[test]
@@ -834,12 +791,10 @@ mod tests {
         let mut params = make_send_params(None, "");
         params.prompt_blocks = Some(vec!["invariant head".into(), "varying tail".into()]);
         params.one_shot = Some(true);
-        params.cache = Some(CacheParams {
-            role: None,
-            ttl: None,
-            key: Some("comment-review-3f9a1c2b7d5e0a91".into()),
-            tail: None,
-            mode: None,
+        params.cache = Some({
+            let mut cache = Cache::default();
+            cache.key = Some("comment-review-3f9a1c2b7d5e0a91".into());
+            cache
         });
         let request = params
             .into_send_request(BindIdentity::new("/tmp", "h", "s"), RunId("r".into()))
@@ -852,8 +807,7 @@ mod tests {
             request.request.cache.as_ref(),
             &crate::cache_routing::CacheTtlTable::shipped_defaults(),
             &request.session,
-        )
-        .unwrap();
+        );
         match &cache_policy
             .as_ref()
             .expect("the key-only request gets first-party Anthropic defaults")
