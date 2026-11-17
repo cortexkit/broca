@@ -28,8 +28,9 @@ counts=$(git ls-files -z --cached --others --exclude-standard -- 'crates/*.rs' |
   [ -f "$path" ] && printf '%s %s\n' "$(wc -l < "$path" | tr -d ' ')" "$path"
 done)
 
+source "$root/scripts/lib/exit-guard.sh"
 committed=$(mktemp "${TMPDIR:-/tmp}/file-size-committed.XXXXXX") || exit 2
-trap 'rm -f "$committed"' EXIT
+trap 'broca_exit_guard rm -f "$committed"' EXIT
 git show "HEAD:$allowlist" > "$committed" 2>/dev/null || : > "$committed"
 
 printf '%s\n' "$counts" | awk -v allowlist="$allowlist" -v committed="$committed" -v limit=5000 '
@@ -77,3 +78,6 @@ printf '%s\n' "$counts" | awk -v allowlist="$allowlist" -v committed="$committed
     if (malformed) exit 2
     exit failed
   }'
+status=$?
+BROCA_EXIT_GUARD_FINISHED=1
+exit "$status"
