@@ -59,7 +59,7 @@ impl<B: SessionBackend> Journal for ActorJournal<'_, B> {
         Ok(())
     }
 
-    async fn applied(&self, _: u64, _: &ProviderView) -> Result<(), String> {
+    async fn applied(&self, _: u64, _: &ProviderView, _: bool) -> Result<(), String> {
         Err("a view is applied by a run's step, never by session.apply_view".into())
     }
 

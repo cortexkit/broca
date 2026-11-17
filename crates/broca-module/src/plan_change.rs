@@ -282,6 +282,28 @@ pub(crate) fn adds_compaction(
         })
 }
 
+/// Whether the prefix a pending change waits for was rebuilt by this run start: the session's
+/// records say so since the change's acceptance (`recorded`: a view that changed the
+/// conversation's head, a model switch or a flush), the change adds a compaction provider, or
+/// the session's prompt cache has provably lapsed. The cache lapsed when no request reached it,
+/// and no keep-warm request refreshed it, within the lifetime the latest of those asked for
+/// (`last_cache`). A run on a lapsed cache writes its whole prompt again in any case, so a
+/// change applied there causes no extra rewrite.
+pub(crate) fn prefix_rebuilt(
+    recorded: bool,
+    adds_compaction: bool,
+    last_cache: Option<&broca_session_store::fold::operations::CacheSend>,
+    now_ms: u64,
+) -> bool {
+    recorded
+        || adds_compaction
+        || broca_core::compaction_v2::conditions::cache_proven_expired(
+            last_cache.and_then(|send| send.requested_ttl_ms),
+            last_cache.map(|send| send.sent_at_ms),
+            now_ms,
+        )
+}
+
 /// The pending change, when it applies at a run start on `model`: `rebuild` and `flushed` say
 /// whether a prefix rebuild and a flush happened since it was accepted, and `last_model` is the
 /// previous run's model key.
@@ -893,5 +915,26 @@ mod tests {
             )
         );
         assert!(unresolved.retryable());
+    }
+
+    /// A run start counts as the prefix rebuild a pending change waits for when the records
+    /// say one happened, when the change adds a compaction provider, or when the session's
+    /// prompt cache has provably lapsed: no request reached it within the lifetime it asked
+    /// for. A cache with no lifetime, or none sent yet, proves nothing.
+    #[test]
+    fn a_lapsed_prompt_cache_counts_as_a_prefix_rebuild() {
+        use broca_session_store::fold::operations::CacheSend;
+        let sent = |requested_ttl_ms| CacheSend {
+            sent_at_ms: 1_000,
+            run_id: "r1".into(),
+            requested_ttl_ms,
+        };
+        let hour = Some(3_600_000);
+        assert!(!prefix_rebuilt(false, false, Some(&sent(hour)), 3_600_999));
+        assert!(prefix_rebuilt(false, false, Some(&sent(hour)), 3_601_000));
+        assert!(!prefix_rebuilt(false, false, Some(&sent(None)), u64::MAX));
+        assert!(!prefix_rebuilt(false, false, None, u64::MAX));
+        assert!(prefix_rebuilt(true, false, Some(&sent(hour)), 2_000));
+        assert!(prefix_rebuilt(false, true, None, 2_000));
     }
 }

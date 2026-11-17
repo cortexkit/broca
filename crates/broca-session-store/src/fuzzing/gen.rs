@@ -864,7 +864,8 @@ mod records {
     crate::fuzzing::gen::fields!(ViewApplied {
         step_id,
         version,
-        checksum
+        checksum,
+        head_kept
     });
     crate::fuzzing::gen::fields!(QueuedSend {
         submission_id,

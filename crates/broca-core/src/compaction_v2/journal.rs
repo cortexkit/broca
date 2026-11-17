@@ -48,7 +48,9 @@ impl Journal for WalJournal<'_> {
         .await
     }
 
-    async fn applied(&self, step: u64, view: &View) -> Result<(), String> {
+    /// The WAL records no `head_kept` (whether a view kept the conversation's first message),
+    /// so every view it applied counts as a prefix rebuild.
+    async fn applied(&self, step: u64, view: &View, _head_kept: bool) -> Result<(), String> {
         self.commit(WalRecord::CompactionViewAppliedV2 {
             step_id: step,
             version: view.version,

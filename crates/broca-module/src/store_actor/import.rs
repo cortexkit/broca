@@ -474,6 +474,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 step_id: 0,
                 version: reply.version,
                 checksum: reply.checksum.clone(),
+                head_kept: None,
             }),
         ];
         // The cut's marker, as the first step would write it when it applies the view

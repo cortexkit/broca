@@ -457,6 +457,7 @@ fn an_accepted_view_waits_for_a_step_to_apply_it() {
         step_id: 1,
         version: 1,
         checksum: "c1".into(),
+        head_kept: None,
     });
     let operations = fold(&[start(), view(1), step_start(), applied, view(2)]).unwrap();
     assert_eq!(
@@ -781,5 +782,33 @@ fn the_latest_refresh_gives_the_senders_manifest_and_the_latest_choice_gives_the
         plan.selection,
         Some(chosen),
         "a refresh choosing no model keeps the earlier choice"
+    );
+}
+
+/// A view applied after a refresh counts as the prefix rebuild the refresh waits for unless it
+/// kept the conversation's first message. One applied before `head_kept` was recorded counts,
+/// as every view did then.
+#[test]
+fn a_view_that_kept_the_conversations_head_is_no_prefix_rebuild() {
+    let applied = |head_kept| {
+        Record::ViewApplied(crate::record::ViewApplied {
+            step_id: 1,
+            version: 1,
+            checksum: "c1".into(),
+            head_kept,
+        })
+    };
+    let rebuilt = |head_kept| {
+        fold(&[start(), refresh(1, "plan-2", None), applied(head_kept)])
+            .unwrap()
+            .plan
+            .expect("the session took a refresh")
+            .rebuild_since_accept
+    };
+    assert!(!rebuilt(Some(true)), "a view that kept the head");
+    assert!(rebuilt(Some(false)), "a view that changed the head");
+    assert!(
+        rebuilt(None),
+        "a view recorded before the head was told apart"
     );
 }

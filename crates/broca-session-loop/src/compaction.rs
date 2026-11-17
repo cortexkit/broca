@@ -211,11 +211,13 @@ impl<W: Writer> Journal for StoreJournal<'_, W> {
         &self,
         step: u64,
         view: &cortexkit_role_compaction::view::View,
+        head_kept: bool,
     ) -> Result<(), String> {
         self.commit(Record::ViewApplied(ViewApplied {
             step_id: step,
             version: view.version,
             checksum: view.checksum.to_string(),
+            head_kept: Some(head_kept),
         }))
         .await
     }
@@ -748,10 +750,13 @@ pub fn carried_views(state: &State, operations: &Operations) -> Result<Vec<Recor
     let applied = match (state.applied_received(), &operations.view_applied) {
         (Some(applied), Some(slot)) => {
             carry.push(record(None, applied, state.applied_by())?);
+            // A copy of a view the session already applied, which rebuilds nothing, so a plan
+            // change waiting for a prefix rebuild never counts it.
             carry.push(Record::ViewApplied(ViewApplied {
                 step_id: slot.step_id,
                 version: applied.view().version,
                 checksum: applied.view().checksum.to_string(),
+                head_kept: Some(true),
             }));
             Some(applied)
         }

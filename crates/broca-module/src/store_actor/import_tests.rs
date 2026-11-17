@@ -1607,6 +1607,7 @@ async fn an_installed_cut_seals_the_history_before_the_first_step() {
                     step_id: 0,
                     version: 1,
                     checksum: cut.checksum.to_string(),
+                    head_kept: None,
                 }),
             ],
             true,

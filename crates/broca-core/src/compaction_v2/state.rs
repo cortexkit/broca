@@ -44,7 +44,9 @@ pub trait Journal {
         previous: Option<&ReceivedView>,
         view: &ReceivedView,
     ) -> Result<(), String>;
-    async fn applied(&self, step: u64, view: &View) -> Result<(), String>;
+    /// `view` applied at `step`. `head_kept` says it renders the conversation's first message
+    /// as the view applied before it did (see [`head_kept`]).
+    async fn applied(&self, step: u64, view: &View, head_kept: bool) -> Result<(), String>;
     async fn marker(
         &self,
         view: &View,
@@ -231,8 +233,9 @@ impl State {
                     refusal,
                 }]);
             }
+            let previous = self.applied.as_ref().map(ReceivedView::view);
             journal
-                .applied(boundary.step, view)
+                .applied(boundary.step, view, head_kept(&boundary, previous, view))
                 .await
                 .inspect_err(|_| {
                     journal.view_refused(
@@ -299,6 +302,25 @@ impl State {
             });
         }
         Ok(events)
+    }
+}
+
+/// Whether `view` renders the conversation's first message as `previous` (or no view, before
+/// any) did over `boundary`'s entries: the first item of each one's render plan is the same.
+/// A view that keeps it rewrites the request only from a later message, so the provider still
+/// reads the cached prefix through the first message. A view that changes the first message
+/// (as a compaction provider's fold of the oldest history does) rewrites the whole
+/// conversation. A plan either view can't make counts as changed, as every view did before
+/// this was told apart.
+fn head_kept(boundary: &Boundary<'_>, previous: Option<&View>, view: &View) -> bool {
+    let first = |view: Option<&View>| {
+        super::render::plan_for_render(boundary.entries, view, boundary.rules, boundary.floor)
+            .ok()
+            .and_then(|(_, plan)| plan.items.into_iter().next())
+    };
+    match (first(previous), first(Some(view))) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
     }
 }
 

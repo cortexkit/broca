@@ -2770,12 +2770,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 })
             })
             .transpose()?;
-        let rebuild = plan.rebuild_since_accept
-            || crate::plan_change::adds_compaction(
+        let rebuild = crate::plan_change::prefix_rebuilt(
+            plan.rebuild_since_accept,
+            crate::plan_change::adds_compaction(
                 self.session.operations().on_contract(),
                 current.as_deref(),
                 pending.as_ref(),
-            );
+            ),
+            self.session.operations().last_cache_send.as_ref(),
+            (self.now_ms)(),
+        );
         let applying = crate::plan_change::pending_applying(
             pending.as_ref(),
             rebuild,

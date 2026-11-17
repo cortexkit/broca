@@ -1228,6 +1228,8 @@ impl Plan {
                 change.policy_changed(policy.generation, &policy.policy);
             }
             Record::PrefixFlush(_) => change.flushed(),
+            // A view that kept the conversation's first message rebuilt no cached prefix.
+            Record::ViewApplied(applied) if applied.head_kept == Some(true) => {}
             Record::ViewApplied(_) | Record::Event(_) => change.view_applied(),
             Record::RunStart(start) => {
                 change.run_started(model_key(&start.model), ManifestRef::of_start(start));

@@ -663,6 +663,7 @@ fn a_seal_carries_ledger_records_into_the_new_log(cipher: Cipher) {
             step_id: 7,
             version: 3,
             checksum: "c3".into(),
+            head_kept: None,
         });
         let before = session.next_seq();
         session

@@ -35,6 +35,7 @@ fn views_restore_with_their_build_metadata_and_applier_across_a_seal() {
                 step_id: 1,
                 version: 1,
                 checksum: applied.view().checksum.to_string(),
+                head_kept: None,
             }),
         ),
         (

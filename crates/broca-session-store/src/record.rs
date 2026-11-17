@@ -1042,6 +1042,13 @@ message! {
         1 req step_id: u64,
         2 req version: u64,
         3 req checksum: String,
+        /// The view renders the conversation's first message as the view applied before it
+        /// did, so it rebuilt no cached prefix: a plan change waiting for a prefix rebuild
+        /// doesn't count it. Absent when nothing told it apart (a view applied before this
+        /// was recorded, or the one an import installs), which counts as a rebuild, as every
+        /// view did before. A reader that doesn't know it counts every view, as before, so it
+        /// isn't must-understand.
+        4 opt head_kept: bool,
     }
 }
 

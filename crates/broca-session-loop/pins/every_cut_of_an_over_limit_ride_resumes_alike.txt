@@ -9,7 +9,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 4 of 22: record count
 19
 == cut after record 4 of 22: records
-sha256:7528a0f3664e509bfb32209679fe7bc757d0d5fabcc6a9e3b0dc3969ea7b3ded (13656 bytes)
+sha256:f543a105b47ad4c5b562aaa9f0b83c88fa96f71446fb2b1568ada0fba56d9996 (13673 bytes)
 == cut after record 4 of 22: tool calls
 sha256:55d216ab16e002491d2bc52eebaeb093ec83e75eb4226ad4779f266f614d6c2f (4194 bytes)
 == cut after record 5 of 22: request count
@@ -23,7 +23,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 5 of 22: record count
 19
 == cut after record 5 of 22: records
-sha256:7528a0f3664e509bfb32209679fe7bc757d0d5fabcc6a9e3b0dc3969ea7b3ded (13656 bytes)
+sha256:f543a105b47ad4c5b562aaa9f0b83c88fa96f71446fb2b1568ada0fba56d9996 (13673 bytes)
 == cut after record 5 of 22: tool calls
 sha256:55d216ab16e002491d2bc52eebaeb093ec83e75eb4226ad4779f266f614d6c2f (4194 bytes)
 == cut after record 8 of 22: request count
@@ -69,7 +69,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 15 of 22: record count
 8
 == cut after record 15 of 22: records
-sha256:ae605d85ff0d78d1a531ef0205db112d77958679d22649fdfa53b0f2cc8dba8b (2306 bytes)
+sha256:a949a582ff7f7347f751b00ff0a0ab7169b76133641dd3fba748eb2c3f6dbcea (2323 bytes)
 == cut after record 15 of 22: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
@@ -85,7 +85,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 16 of 22: record count
 8
 == cut after record 16 of 22: records
-sha256:ae605d85ff0d78d1a531ef0205db112d77958679d22649fdfa53b0f2cc8dba8b (2306 bytes)
+sha256:a949a582ff7f7347f751b00ff0a0ab7169b76133641dd3fba748eb2c3f6dbcea (2323 bytes)
 == cut after record 16 of 22: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
@@ -103,7 +103,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 17 of 22: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"ViewApplied":{"checksum":"checksum#4","kind":"ViewApplied","step_id":2,"version":1}}
+{"ViewApplied":{"checksum":"checksum#4","head_kept":true,"kind":"ViewApplied","step_id":2,"version":1}}
 {"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
 {"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
 {"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":{"checksum":"checksum#4","version":1},"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
@@ -152,7 +152,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 4 of 22: record count
 19
 == cut after record 4 of 22: records
-sha256:7528a0f3664e509bfb32209679fe7bc757d0d5fabcc6a9e3b0dc3969ea7b3ded (13656 bytes)
+sha256:f543a105b47ad4c5b562aaa9f0b83c88fa96f71446fb2b1568ada0fba56d9996 (13673 bytes)
 == cut after record 4 of 22: tool calls
 sha256:55d216ab16e002491d2bc52eebaeb093ec83e75eb4226ad4779f266f614d6c2f (4194 bytes)
 == cut after record 5 of 22: request count
@@ -166,7 +166,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 5 of 22: record count
 19
 == cut after record 5 of 22: records
-sha256:7528a0f3664e509bfb32209679fe7bc757d0d5fabcc6a9e3b0dc3969ea7b3ded (13656 bytes)
+sha256:f543a105b47ad4c5b562aaa9f0b83c88fa96f71446fb2b1568ada0fba56d9996 (13673 bytes)
 == cut after record 5 of 22: tool calls
 sha256:55d216ab16e002491d2bc52eebaeb093ec83e75eb4226ad4779f266f614d6c2f (4194 bytes)
 == cut after record 8 of 22: request count
@@ -212,7 +212,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 15 of 22: record count
 8
 == cut after record 15 of 22: records
-sha256:ae605d85ff0d78d1a531ef0205db112d77958679d22649fdfa53b0f2cc8dba8b (2306 bytes)
+sha256:a949a582ff7f7347f751b00ff0a0ab7169b76133641dd3fba748eb2c3f6dbcea (2323 bytes)
 == cut after record 15 of 22: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
@@ -228,7 +228,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 16 of 22: record count
 8
 == cut after record 16 of 22: records
-sha256:ae605d85ff0d78d1a531ef0205db112d77958679d22649fdfa53b0f2cc8dba8b (2306 bytes)
+sha256:a949a582ff7f7347f751b00ff0a0ab7169b76133641dd3fba748eb2c3f6dbcea (2323 bytes)
 == cut after record 16 of 22: tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
@@ -246,7 +246,7 @@ sha256:fc1afa11e45b53849fe70a506de59550817451aff0ea6dbebe3485714558dc79 (4559 by
 == cut after record 17 of 22: records
 {"Resumed":{"indeterminate":[],"kind":"Resumed","messages":3,"model_steps":1,"redone":[{"step_id":2,"tool_call_id":null}],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
 {"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
-{"ViewApplied":{"checksum":"checksum#4","kind":"ViewApplied","step_id":2,"version":1}}
+{"ViewApplied":{"checksum":"checksum#4","head_kept":true,"kind":"ViewApplied","step_id":2,"version":1}}
 {"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"stub"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
 {"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"stub","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
 {"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":{"checksum":"checksum#4","version":1},"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}

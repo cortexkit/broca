@@ -1493,6 +1493,8 @@ async fn compaction_v2_ride_flushes_changed_entries_and_completion_alone_is_sile
 #[derive(Default)]
 struct MemoryJournal {
     facts: std::sync::Mutex<Vec<String>>,
+    /// Each applied view's `head_kept`, in order.
+    heads: std::sync::Mutex<Vec<bool>>,
     fail: std::sync::atomic::AtomicBool,
 }
 impl state::Journal for MemoryJournal {
@@ -1516,7 +1518,8 @@ impl state::Journal for MemoryJournal {
             .push(format!("accepted:{}", view.view().version));
         Ok(())
     }
-    async fn applied(&self, step: u64, view: &View) -> Result<(), String> {
+    async fn applied(&self, step: u64, view: &View, head_kept: bool) -> Result<(), String> {
+        self.heads.lock().unwrap().push(head_kept);
         self.facts
             .lock()
             .unwrap()
@@ -2914,4 +2917,71 @@ fn the_output_reserve_falls_back_to_the_models_output_cap() {
     };
     assert_eq!(reserve(config(None)), 128_000);
     assert_eq!(reserve(config(Some(4_096))), 4_096);
+}
+
+/// Each applied view is recorded with whether it renders the conversation's first message as
+/// the view applied before it (or no view) did: a view that edits only later messages keeps the
+/// head, and one that rewrites the first message changes it.
+#[tokio::test]
+async fn an_applied_view_records_whether_it_kept_the_conversations_head() {
+    let entries = project(
+        &[
+            text(Role::User, "first"),
+            text(Role::Assistant, "second"),
+            text(Role::User, "third"),
+            text(Role::Assistant, "fourth"),
+        ],
+        &facts(4),
+        &Deliveries::new(),
+        true,
+    );
+    let replace = |seq: u64, index: usize, value: &str| {
+        Edit::new(
+            seq,
+            EditOp::Replace {
+                mid: entries[index].mid.clone(),
+                part: "0".into(),
+                field: "text".into(),
+                value: json!(value),
+                expect: entries[index].parts[0].digest.clone(),
+            },
+        )
+    };
+    let later = View::seal(1, vec![replace(1, 2, "third, shorter")]);
+    let head = View::seal(
+        2,
+        vec![replace(1, 2, "third, shorter"), replace(2, 0, "a summary")],
+    );
+    let after = View::seal(
+        3,
+        vec![
+            replace(1, 2, "third, shorter"),
+            replace(2, 0, "a summary"),
+            replace(3, 3, "fourth, shorter"),
+        ],
+    );
+    let rules = rules::defaults("gpt-5");
+    let journal = MemoryJournal::default();
+    let mut state = state::State::default();
+    for (step, view) in [(1, later), (2, head), (3, after)] {
+        state
+            .accept(&journal, &entries, view, &rules, Floor::none())
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .apply(
+                &journal,
+                state::Boundary {
+                    step,
+                    entries: &entries,
+                    rules: &rules,
+                    floor: Floor::none(),
+                    next_mid: "m12345678.5",
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(*journal.heads.lock().unwrap(), [true, false, true]);
 }
