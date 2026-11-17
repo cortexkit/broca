@@ -1541,17 +1541,26 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
             }
         })
         .await;
+        // An orphan goes to the nearest ancestor that is a child subreaper (a systemd user
+        // manager, a container init) and to pid 1 only without one, so a stand-in counts as
+        // orphaned once its parent is none of the killed helpers.
+        let helper_pids: Vec<u32> = helpers.iter().map(|process| process.pid).collect();
         broca_test_support::wait_until("stand-ins reparented before rig drop", || async {
             let orphaned = recorded_processes(&root)
                 .iter()
                 .filter(|(role, process)| {
-                    role == "stand-in" && process.parent_pid().is_ok_and(|pid| pid == 1)
+                    role == "stand-in"
+                        && process
+                            .parent_pid()
+                            .is_ok_and(|pid| !helper_pids.contains(&pid))
                 })
                 .count();
             if orphaned >= 2 {
                 Ok(())
             } else {
-                Err(format!("only {orphaned} stand-ins reparented to pid 1"))
+                Err(format!(
+                    "only {orphaned} stand-ins left their killed helpers"
+                ))
             }
         })
         .await;

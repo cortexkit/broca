@@ -1180,12 +1180,19 @@ mod import_config_tests {
     #[test]
     fn import_roots_default_to_brocas_import_folder() {
         assert_eq!(ImportConfig::parse("{}").unwrap(), ImportConfig::default());
-        let config = ImportConfig::parse(
-            r#"{"import": {"roots": ["/srv/heads",],}, // a comment
-            }"#,
-        )
+        // An absolute folder on the platform the test runs on.
+        let root = if cfg!(windows) {
+            r"C:\srv\heads"
+        } else {
+            "/srv/heads"
+        };
+        let config = ImportConfig::parse(&format!(
+            r#"{{"import": {{"roots": [{},],}}, // a comment
+            }}"#,
+            serde_json::Value::from(root)
+        ))
         .unwrap();
-        assert_eq!(config.roots, Some(vec!["/srv/heads".into()]));
+        assert_eq!(config.roots, Some(vec![root.into()]));
         assert!(ImportConfig::parse(r#"{"import": {"roots": ["heads"]}}"#).is_err());
         assert!(ImportConfig::parse(r#"{"import": {"root": ["/x"]}}"#).is_err());
     }

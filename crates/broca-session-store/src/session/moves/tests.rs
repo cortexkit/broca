@@ -311,7 +311,10 @@ fn frozen_reads_work_writers_refuse_release_fences_both_and_abort_is_cut_owned()
             .await
             .unwrap();
         for kept in store.head_versions(&addr()).unwrap() {
-            std::fs::File::open(source.0.join(format!("heads/{}/v/{kept}", addr().0)))
+            // Opened for writing: Windows refuses to set a read-only handle's times.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(source.0.join(format!("heads/{}/v/{kept}", addr().0)))
                 .unwrap()
                 .set_modified(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap();

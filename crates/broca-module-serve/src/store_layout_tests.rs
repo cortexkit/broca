@@ -22,7 +22,8 @@ struct NeverRuns;
 #[async_trait::async_trait]
 impl broca_module::executor::RunExecutor for NeverRuns {}
 
-const MOVE_ID: &str = "store-move:00000000-0000-4000-8000-000000000000";
+// A colon would be a valid move id but not a valid folder name on Windows.
+const MOVE_ID: &str = "store-move-00000000-0000-4000-8000-000000000000";
 const SETUP_PART: &[u8] = br#"{"system":"a setup part"}"#;
 
 fn deployment() -> DeploymentKey {

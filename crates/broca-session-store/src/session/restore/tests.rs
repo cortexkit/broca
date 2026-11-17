@@ -116,7 +116,9 @@ impl Walk {
                 continue;
             };
             let target = to.join(file);
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            // Restored as into a state root broca made: owner-only folders, whose files inherit
+            // that, since the store refuses a file other accounts can read.
+            broca_owner_only::create_dir_all(target.parent().unwrap()).unwrap();
             std::fs::write(target, bytes).unwrap();
         }
     }
