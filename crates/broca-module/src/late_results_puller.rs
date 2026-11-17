@@ -360,8 +360,11 @@ impl LateResultsIntake {
             .store
             .registration_page(after.as_ref(), REGISTRATION_SWEEP_LIMIT)?;
         let mut views = HashMap::new();
+        // Calls retired here. Those no withdrawal can be owed for (see
+        // `withdrawal_never_owed`) give up their withdrawal watches with their registrations, so
+        // the watches don't pile up for recovery to read at every start; the rest keep theirs.
         let mut settled = Vec::new();
-        let mut inline = Vec::new();
+        let mut spent = Vec::new();
         let mut retired = Vec::new();
         for row in &rows {
             if !views.contains_key(&row.call.bind) {
@@ -374,21 +377,24 @@ impl LateResultsIntake {
             match &view.source {
                 Source::Stored(stored) => {
                     if let Some(reason) = stored.retirement_reason(&row.call.call_key) {
-                        settled.push((row.call.module.clone(), row.call.call_key.clone()));
+                        let key = (row.call.module.clone(), row.call.call_key.clone());
+                        if stored.withdrawal_never_owed(&row.call.call_key) {
+                            spent.push(key);
+                        } else {
+                            settled.push(key);
+                        }
                         retired.push((&row.call, reason));
                     }
                 }
                 Source::Gone => {
-                    let key = (row.call.module.clone(), row.call.call_key.clone());
-                    inline.push(key.clone());
-                    settled.push(key);
+                    spent.push((row.call.module.clone(), row.call.call_key.clone()));
                     retired.push((&row.call, "session_deleted"));
                 }
                 Source::Unknown => {}
             }
         }
         self.store.remove_calls(&settled)?;
-        self.store.remove_inline_calls(&inline)?;
+        self.store.remove_spent_calls(&spent)?;
         for (call, reason) in retired {
             log_retirement(call, reason);
         }
@@ -398,7 +404,7 @@ impl LateResultsIntake {
         } else {
             None
         };
-        Ok(settled.len() + inline.len())
+        Ok(settled.len() + spent.len())
     }
 
     fn puller(&self, module: &str) -> Option<Arc<Puller>> {
@@ -560,8 +566,10 @@ impl LateResultsIntake {
     pub async fn module_holds_calls(&self, module: &str) -> Result<bool, String> {
         let mut holds = false;
         let mut views = HashMap::new();
-        let mut inline = Vec::new();
+        // Calls retired here, their withdrawal watches with them where none can be owed, as in
+        // the registration sweep.
         let mut settled = Vec::new();
+        let mut spent = Vec::new();
         let mut retired = Vec::new();
         let rows = self.store.registrations_for(module)?;
         for row in &rows {
@@ -575,23 +583,27 @@ impl LateResultsIntake {
             match &view.source {
                 Source::Stored(stored) => {
                     if let Some(reason) = stored.retirement_reason(&row.call.call_key) {
-                        settled.push((module.to_owned(), row.call.call_key.clone()));
+                        let key = (module.to_owned(), row.call.call_key.clone());
+                        if stored.withdrawal_never_owed(&row.call.call_key) {
+                            spent.push(key);
+                        } else {
+                            settled.push(key);
+                        }
                         retired.push((&row.call, reason));
                     } else {
                         holds |= stored.needs_intake(&row.call.call_key);
                     }
                 }
                 Source::Gone => {
-                    inline.push((module.to_owned(), row.call.call_key.clone()));
-                    settled.push((module.to_owned(), row.call.call_key.clone()));
+                    spent.push((module.to_owned(), row.call.call_key.clone()));
                     retired.push((&row.call, "session_deleted"));
                 }
                 // Until the store answers, a registration may still hide a hold.
                 Source::Unknown => holds = true,
             }
         }
-        self.store.remove_inline_calls(&inline)?;
         self.store.remove_calls(&settled)?;
+        self.store.remove_spent_calls(&spent)?;
         for (call, reason) in retired {
             log_retirement(call, reason);
         }

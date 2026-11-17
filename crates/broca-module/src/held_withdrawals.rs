@@ -189,7 +189,7 @@ impl HeldWithdrawals {
                     let held: Vec<_> = held.iter().filter_map(|w| module(&w.call_key)).collect();
                     match self
                         .store
-                        .remove_inline_calls(&inline)
+                        .remove_spent_calls(&inline)
                         .and_then(|inline| Ok(inline + self.store.retire_watches(&held)?))
                     {
                         Ok(removed) => rows_settled += removed,

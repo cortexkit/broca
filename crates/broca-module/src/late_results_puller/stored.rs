@@ -307,6 +307,14 @@ impl StoredLineage {
             .is_some_and(|call| call.terminal && call.held.is_none())
     }
 
+    /// Whether no withdrawal can ever be owed for the call: it finished with a result, or no
+    /// provider ever held it. A held call left unfinished when its run ended may be owed one,
+    /// since a cancelled hold is withdrawn, so its watch stays for withdrawal to settle.
+    pub(super) fn withdrawal_never_owed(&self, key: &str) -> bool {
+        self.call(key)
+            .is_some_and(|call| call.terminal || call.held.is_none())
+    }
+
     pub(super) fn retirement_reason(&self, key: &str) -> Option<&'static str> {
         let call = self.call(key)?;
         if call.run_ended {

@@ -652,6 +652,40 @@ async fn stale_inline_rows_are_swept_in_bounded_pages_without_a_feed() {
     assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 1);
     assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 0);
     assert!(rig.store.registrations().unwrap().is_empty());
+    assert!(
+        rig.store.withdrawal_rows().unwrap().is_empty(),
+        "an inline call's withdrawal watch is retired with its registration"
+    );
+}
+
+/// The sweep retires a held call left unfinished when its run ended, but keeps its withdrawal
+/// watch: a cancelled hold is withdrawn, so the watch is for withdrawal to settle, not the sweep.
+/// A call answered inline beside it gives up both.
+#[tokio::test]
+async fn a_held_call_its_run_left_unfinished_keeps_its_withdrawal_watch() {
+    let bind = session("sweep-held-ended");
+    let rig = Rig::new("sweep-held-ended", None, Vec::new()).await;
+    let mut records = inline_then_held_records();
+    records.push(run_end("run", RunFinishReason::Cancelled));
+    rig.seed(&bind, &records).await;
+    register_more(
+        &rig.store,
+        &[
+            registration("lineage:4", "basal", &bind),
+            registration("lineage:6", "basal", &bind),
+        ],
+    )
+    .await;
+    assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 2);
+    assert!(rig.store.registrations().unwrap().is_empty());
+    let watched: Vec<String> = rig
+        .store
+        .withdrawal_rows()
+        .unwrap()
+        .into_iter()
+        .map(|(call, _, _)| call.call_key)
+        .collect();
+    assert_eq!(watched, ["lineage:6"]);
 }
 
 struct NoInlineWithdrawal;

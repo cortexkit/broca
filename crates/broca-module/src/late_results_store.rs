@@ -759,10 +759,11 @@ impl LateResultsStore {
         ).map_err(|error| error.to_string())
     }
 
-    /// An inline terminal removes its registration and unattempted withdrawal watch in one
-    /// transaction. Keep attempted withdrawals available for recovery if the process crashes
-    /// before withdrawal finishes, independently of ordinary intake pruning.
-    pub fn remove_inline_calls(&self, calls: &[(String, String)]) -> Result<usize, String> {
+    /// Removes the registrations of calls no withdrawal can be owed for (calls that finished with
+    /// a result, calls no provider ever held, and calls whose session is gone), with their
+    /// unattempted withdrawal watches, in one transaction. A watch a withdrawal already attempted
+    /// stays, so withdrawal recovery can finish it after a crash.
+    pub fn remove_spent_calls(&self, calls: &[(String, String)]) -> Result<usize, String> {
         if calls.is_empty() {
             return Ok(0);
         }
@@ -876,7 +877,7 @@ impl LateResultsIntake for LateResultsStore {
     }
 
     async fn prune_inline(&self, calls: &[(String, String)]) -> Result<(), String> {
-        self.remove_inline_calls(calls).map(|_| ())
+        self.remove_spent_calls(calls).map(|_| ())
     }
 }
 
