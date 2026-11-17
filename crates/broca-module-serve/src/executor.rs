@@ -1012,6 +1012,7 @@ fn store_seams<'a, P: broca_core::provider::Provider>(
     max_same_account_wait: broca_core::SameAccountWait,
 ) -> broca_session_loop::Seams<'a, P, SubcToolPlane> {
     broca_session_loop::Seams {
+        person_steers: control.person_steers.clone(),
         provider,
         tools,
         bind: req.session.clone(),

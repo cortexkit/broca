@@ -297,6 +297,9 @@ pub(super) struct LoopExecutor {
     /// Whether each model call first waits for the media the actor sends the run, as a run
     /// whose provider renders media does.
     pub(super) waits_for_media: bool,
+    /// The count of the person's steers the actor handed the latest run, as the module's
+    /// executor hands it to the run's tool calls.
+    pub(super) person_steers: std::sync::Mutex<Option<broca_core::tool_plane::PersonSteers>>,
 }
 
 /// Waits for the media the actor sends a run, without rendering any.
@@ -404,6 +407,7 @@ pub(super) fn executor(
         approval_gate: None,
         tool_text: "file contents".into(),
         waits_for_media: false,
+        person_steers: Default::default(),
     }
 }
 
@@ -482,7 +486,9 @@ impl RunExecutor for LoopExecutor {
                 )
             };
             let approval = GatedApproval(self.approval_gate.clone());
+            *self.person_steers.lock().unwrap() = control.person_steers.clone();
             let seams = Seams {
+                person_steers: control.person_steers.clone(),
                 provider: &self.provider,
                 tools: &tools,
                 bind: req.session.clone(),

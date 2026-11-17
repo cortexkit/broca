@@ -750,6 +750,7 @@ fn tool_step(run: &str, step: u64, ordinal: &mut u64) -> Vec<Vec<Record>> {
         ],
         vec![
             Record::ToolOutcome(ToolOutcome {
+                yielded_by: None,
                 run_id: run.into(),
                 batch_id: batch.clone(),
                 tool_call_id: ToolCallId(call),

@@ -900,6 +900,9 @@ type LateGoodbyeHandoffHook = Arc<dyn Fn(LateGoodbyeHandoffStage) + Send + Sync>
 
 struct ConnectionShared {
     aft_harness_answer: Mutex<Option<bool>>,
+    /// Keys of calls whose provider accepted a hand-back for the person's steer
+    /// (`person_message`), until the plane takes each one with the call's terminal frame.
+    person_yields: Mutex<std::collections::HashSet<String>>,
     #[cfg(test)]
     late_goodbye_handoff: Mutex<Option<LateGoodbyeHandoffHook>>,
     route_closer: std::sync::OnceLock<Arc<crate::route_close::RouteCloser>>,
@@ -1009,6 +1012,17 @@ impl SubcConnection {
         .await
     }
 
+    /// Whether broca asked the call `call_key` to hand back for the person's steer (a
+    /// `person_message` yield), and forgets it. Asked once, when the call's terminal frame
+    /// arrives; only a held reply marked `yielded` then hands the call back.
+    pub fn took_person_yield(&self, call_key: &str) -> bool {
+        self.shared
+            .person_yields
+            .lock()
+            .expect("person yields")
+            .remove(call_key)
+    }
+
     /// The module id of the consumer identity this connection presents on route opens, or
     /// `None` when it presents none. With an identity, the daemon attests each route as the
     /// `Reserved` principal of that module; without one, every route arrives as `Direct`, and a
@@ -1060,6 +1074,7 @@ impl SubcConnection {
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
             aft_harness_answer: Mutex::new(None),
+            person_yields: Mutex::default(),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),
@@ -2583,11 +2598,37 @@ impl SubcConnection {
             } => terminal,
             _ = async {
                 if let (Some(signals), Some(yielding)) = (signals, yielding.as_mut()) {
-                    signals.stopping().await;
-                    let answer = self.yield_call(route, yielding.call_key, "runner_restart").await;
+                    // A call is asked once, for whichever comes first: the runner stopping, or
+                    // a person's steer arriving after the call was sent. Either way its answer
+                    // is still the call's own terminal frame, awaited above.
+                    let reason = match signals.person_steers_seen() {
+                        Some(seen) => tokio::select! {
+                            _ = signals.stopping() => "runner_restart",
+                            _ = signals.person_steered(seen) => {
+                                cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE
+                            }
+                        },
+                        None => {
+                            signals.stopping().await;
+                            "runner_restart"
+                        }
+                    };
+                    // Noted before asking, not on the answer: the provider's yielded final frame
+                    // and its answer to this request are separate frames, and the final frame
+                    // may arrive first, which ends this wait before the answer is read. A held
+                    // reply saying `yielded` is the provider's own word that it honoured the
+                    // request, so the note only has to say which reason it was asked for.
+                    if reason == cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE {
+                        self.shared
+                            .person_yields
+                            .lock()
+                            .expect("person yields")
+                            .insert(yielding.call_key.to_owned());
+                    }
+                    let answer = self.yield_call(route, yielding.call_key, reason).await;
                     yielding.accepted = matches!(answer, Ok(cortexkit_role_tool_provider::call_yield::YieldAnswer::Accepted));
                     tracing::debug!(provider = yielding.provider, tool = yielding.tool,
-                        call_key = yielding.call_key, ?answer, "tool yield requested for runner stop");
+                        call_key = yielding.call_key, reason, ?answer, "tool yield requested");
                 }
                 std::future::pending::<()>().await;
             } => unreachable!(),
@@ -4977,6 +5018,7 @@ impl SubcConnection {
         let conn = SubcConnection {
             shared: Arc::new(ConnectionShared {
                 aft_harness_answer: Mutex::new(None),
+                person_yields: Mutex::default(),
                 #[cfg(test)]
                 late_goodbye_handoff: Mutex::new(None),
                 route_closer: std::sync::OnceLock::new(),

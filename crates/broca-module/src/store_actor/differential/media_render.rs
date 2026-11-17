@@ -322,6 +322,7 @@ impl RunExecutor for RenderExecutor {
             let tools = PhotoPlane::new();
             let now = || 1;
             let seams = broca_session_loop::Seams {
+                person_steers: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

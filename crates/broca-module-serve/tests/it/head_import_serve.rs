@@ -95,6 +95,7 @@ impl RunExecutor for HeadRunner {
             let tools = broca_core::stub_plane::StubToolPlane::new();
             let now = || 10_000;
             let seams = broca_session_loop::run::Seams {
+                person_steers: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

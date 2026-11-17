@@ -176,6 +176,7 @@ impl RunExecutor for StoreLoop {
                 attempts: self.attempts,
             };
             let seams = broca_session_loop::run::Seams {
+                person_steers: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

@@ -38,8 +38,8 @@ use crate::late_results_store::{
 };
 
 mod stored;
-pub use stored::rebuild_store_from_sessions_with_progress;
 use stored::StoredLineage;
+pub use stored::{is_notice_send_id, notice_send_id, rebuild_store_from_sessions_with_progress};
 
 /// How often a started feed is pulled.
 pub const PULL_INTERVAL: Duration = Duration::from_secs(3);
@@ -126,6 +126,37 @@ pub trait HeldDelivery: Send + Sync {
         tool_call_id: &ToolCallId,
         entry: &LateEntry,
     ) -> Result<(), String>;
+
+    /// Deliver the entry, the terminal of a call handed back for the person's steer, to the
+    /// call's session as a notice from the call's provider. `Ok` means the notice is durable in
+    /// the session, or that the session refused it for good; `Err` is retried on a later pull.
+    async fn notice(
+        &self,
+        _registration: &LateResultRegistration,
+        _call: &YieldedCall,
+        _entry: &LateEntry,
+    ) -> Result<NoticeOutcome, String> {
+        Err("this intake delivers no notices".into())
+    }
+}
+
+/// A call handed back for the person's steer (llm-runner `call_yield`), whose provider's
+/// terminal for it the session receives as a notice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct YieldedCall {
+    pub tool_call_id: ToolCallId,
+    /// The call's tool, as the notice names it; empty when its intent didn't record one.
+    pub tool_name: String,
+}
+
+/// What became of a handed-back call's notice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoticeOutcome {
+    /// The notice is durable in the session.
+    Delivered,
+    /// The session refused it for a reason a retry can't change, such as a plan that doesn't
+    /// name the provider as a sender. The entry is settled without delivery.
+    Refused(String),
 }
 
 /// What one tick concluded about a module's puller.
@@ -917,12 +948,39 @@ impl LateResultsIntake {
             else {
                 continue;
             };
-            let held_call_id = match views
+            let stored = views
                 .get(&row.call.bind)
                 .and_then(|view| match &view.source {
-                    Source::Stored(stored) => stored.held_call_id(&entry.call_key),
+                    Source::Stored(stored) => Some(stored),
                     Source::Gone | Source::Unknown => None,
-                }) {
+                });
+            if let Some((tool_call_id, tool_name)) =
+                stored.and_then(|stored| stored.yielded_call(&entry.call_key))
+            {
+                let call = YieldedCall {
+                    tool_call_id,
+                    tool_name,
+                };
+                let disposition = match self.delivery.notice(&row.call, &call, entry).await? {
+                    NoticeOutcome::Delivered => Disposition::Delivered,
+                    NoticeOutcome::Refused(reason) => {
+                        tracing::warn!(
+                            target: "late_results",
+                            module,
+                            call_key = entry.call_key,
+                            "a handed-back call's result could not be delivered as a notice: {reason}"
+                        );
+                        Disposition::NoOp
+                    }
+                };
+                if let Some(view) = views.get_mut(&row.call.bind) {
+                    view.delivered.insert(entry.call_key.clone());
+                }
+                self.store.record_receipt(&key, &entry.kind, disposition)?;
+                continue;
+            }
+            let held_call_id = match stored.and_then(|stored| stored.held_call_id(&entry.call_key))
+            {
                 Some(id) => id,
                 None => {
                     // Nothing to deliver as a tool result: settle the entry as a no-op.

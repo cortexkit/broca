@@ -670,6 +670,7 @@ impl RunExecutor for CoreExec {
                 model_call_ready = Some(lazy as Arc<dyn broca_session_loop::run::ModelCallReady>);
             }
             let seams = broca_session_loop::run::Seams {
+                person_steers: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

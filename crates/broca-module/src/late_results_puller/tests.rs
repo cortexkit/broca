@@ -70,6 +70,9 @@ struct RecordedDelivery {
     delivered: Mutex<Vec<(String, String)>>,
     refuse: Mutex<Option<String>>,
     refuse_only: Mutex<Option<String>>,
+    /// Each notice the stand-in delivered for a handed-back call: the call's key, the call,
+    /// and the event id of the late-results entry that carried its terminal.
+    noticed: Mutex<Vec<(String, YieldedCall, String)>>,
 }
 
 impl Default for RecordedDelivery {
@@ -78,12 +81,27 @@ impl Default for RecordedDelivery {
             delivered: Mutex::new(Vec::new()),
             refuse: Mutex::new(None),
             refuse_only: Mutex::new(None),
+            noticed: Mutex::new(Vec::new()),
         }
     }
 }
 
 #[async_trait]
 impl HeldDelivery for RecordedDelivery {
+    async fn notice(
+        &self,
+        registration: &LateResultRegistration,
+        call: &YieldedCall,
+        entry: &LateEntry,
+    ) -> Result<NoticeOutcome, String> {
+        self.noticed.lock().unwrap().push((
+            registration.call_key.clone(),
+            call.clone(),
+            entry.event_id.clone(),
+        ));
+        Ok(NoticeOutcome::Delivered)
+    }
+
     async fn deliver(
         &self,
         registration: &LateResultRegistration,
@@ -239,6 +257,7 @@ fn held(batch: &str, id: &str, call_key: &str, module: &str) -> Record {
 
 fn outcome(run: &str, batch: &str, id: &str, outcome: CallOutcome) -> Record {
     Record::ToolOutcome(ToolOutcome {
+        yielded_by: None,
         run_id: run.into(),
         batch_id: batch.into(),
         tool_call_id: ToolCallId(id.into()),
@@ -2158,4 +2177,54 @@ async fn a_delivery_that_times_out_is_delivered_from_its_pin_and_acked() {
     if let Some(puller) = intake.puller("tools") {
         puller.stop();
     }
+}
+
+/// A call handed back for the person's steer is terminal in the session, its outcome naming its
+/// provider. The provider's later terminal for it is no held call's answer: it is delivered as a
+/// notice, even though the call's run has ended since, and then acked.
+#[tokio::test]
+async fn a_handed_back_calls_terminal_is_delivered_as_a_notice() {
+    let call_key = "lineage:7";
+    let bind = session("handed-back");
+    let rig = Rig::new(
+        "handed-back",
+        None,
+        vec![registration(call_key, "tools", &bind)],
+    )
+    .await;
+    let mut handed_back = outcome("run", "b", "a", CallOutcome::Completed);
+    if let Record::ToolOutcome(record) = &mut handed_back {
+        record.yielded_by = Some("tools".into());
+    }
+    rig.seed(
+        &bind,
+        &[
+            run_start("run"),
+            batch_start("run", "b", &["a"]),
+            intent("run", "b", "a", "tools", Some(call_key)),
+            handed_back,
+            batch_end("run", "b"),
+            run_end("run", RunFinishReason::Completed),
+        ],
+    )
+    .await;
+    // No batch waits on the call, yet its provider's terminal is still owed, so the provider's
+    // feed must be read.
+    assert!(rig.intake.module_needs_feed("tools").await.unwrap());
+    let _puller = rig.puller("tools");
+    rig.feed.replies(vec![reply(
+        vec![entry(kinds::RESULT, call_key, "ev-1")],
+        1,
+        false,
+    )]);
+    rig.intake.tick("tools").await.unwrap();
+    let noticed = rig.delivery.noticed.lock().unwrap().clone();
+    assert_eq!(noticed.len(), 1, "{noticed:?}");
+    assert_eq!(noticed[0].0, call_key);
+    assert_eq!(noticed[0].1.tool_call_id, ToolCallId("a".into()));
+    assert!(
+        rig.delivery.delivered.lock().unwrap().is_empty(),
+        "no batch waits for it"
+    );
+    assert_eq!(rig.feed.acks(), vec![cursor(1)]);
 }

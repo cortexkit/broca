@@ -196,6 +196,9 @@ fn completed(result: DispatchResult) -> ToolResult {
         DispatchResult::ScopeDrained { reason, sent } => {
             panic!("tool route was drained ({reason}, sent: {sent})")
         }
+        DispatchResult::Yielded { carrier, .. } => {
+            panic!("tool call was handed back by {carrier}")
+        }
     }
 }
 

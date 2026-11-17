@@ -81,6 +81,36 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         })
     }
 
+    /// Whether a steer from `sender` carrying `marks` is the person's own message (llm-runner
+    /// `call_yield`): `sender` is a module the session's plan marks `person`, and the message is
+    /// neither a notice nor words spoken for an agent. A plan that can't be read names no one.
+    pub(super) fn is_person_steer(
+        &self,
+        sender: Option<&BindPrincipal>,
+        marks: Option<&broca_protocol::MessageMarks>,
+    ) -> bool {
+        let Some(BindPrincipal::Reserved { module_id }) = sender else {
+            return false;
+        };
+        if marks.is_some_and(|marks| marks.notice || marks.speaks_for.is_some()) {
+            return false;
+        }
+        self.plan_senders().is_ok_and(|plan| {
+            plan.senders
+                .iter()
+                .any(|listed| &listed.module == module_id && listed.person)
+        })
+    }
+
+    /// Tells the running run that the person's own steer is durable: each of its waiting calls
+    /// whose provider can hand calls back is asked to, so the steer lands at the next step
+    /// boundary without waiting for that call's work. Without a running run nothing is waiting.
+    pub(super) fn person_steered(&self) {
+        if let Some(active) = &self.run {
+            active.person_steers.send_modify(|count| *count += 1);
+        }
+    }
+
     /// How a send with a string `delivery` is admitted, as today's actor admits it
     /// (`string_sender`): from the owner, or a caller the owner check decides on, unchanged; from
     /// a module the plan names, `queue` and `steer` as the lists they stand for (`[idle_start]`
@@ -161,6 +191,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &self,
         request: &SubmissionRequest,
         order: &DeliveryOrder,
+        key: &crate::session_cmd::SendKey,
     ) -> Result<Option<BindPrincipal>, SendOutcome> {
         let ownership = self.sender_ownership()?;
         if broca_core::scope_admission::decide_owner_access(
@@ -187,6 +218,26 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         let senders = self.plan_senders()?.senders;
         let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
+            // Broca's own delivery of a handed-back call's late result (llm-runner `call_yield`):
+            // the contract sends it as the call's provider whether or not the plan names that
+            // module. A caller never sends with the internal scope: serve sets every caller's
+            // scope from its route, so only broca's own code makes one; this one also carries
+            // the notice's send id. It never starts a run for a module the plan doesn't name; it
+            // waits for the session's next run.
+            let late_notice = matches!(
+                key,
+                crate::session_cmd::SendKey::SendId(send_id)
+                    if crate::late_results_puller::is_notice_send_id(send_id)
+            );
+            if late_notice && request.scope == broca_protocol::SendScope::Internal {
+                if order.starts_runs() {
+                    return Err(refused(
+                        errors::INVALID_PARAMS,
+                        format!("the session's plan does not let module {module_id} start runs"),
+                    ));
+                }
+                return frozen_principal(&ownership).map(Some);
+            }
             return Err(refused(
                 errors::SCOPE_OWNER_MISMATCH,
                 format!("the session's plan does not name module {module_id} as a sender"),
@@ -599,6 +650,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.append_own_batch_with_media(&records, &staged)
             .await
             .map_err(|error| SendOutcome::Error(format!("{error:?}")))?;
+        // The person's steer hands back the running run's waiting calls only once it is durable,
+        // and never waits for them.
+        if !expired
+            && order.modes.first() == Some(&DeliveryMode::Steer)
+            && self.is_person_steer(sender.as_ref(), message_marks.as_ref())
+        {
+            self.person_steered();
+        }
         if expired {
             return Err(SendOutcome::SendEnded {
                 submission_id,

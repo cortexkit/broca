@@ -629,6 +629,7 @@ async fn a_definite_rejection_cannot_authorize_a_later_steps_uncertain_rejection
     let moves = AccountMoves::new(&rig.executor, &request, None, None);
     let now = || now_ms() as u64;
     let seams = broca_session_loop::Seams {
+        person_steers: None,
         provider: &resolved.provider,
         tools: &tools,
         bind: request.session.clone(),

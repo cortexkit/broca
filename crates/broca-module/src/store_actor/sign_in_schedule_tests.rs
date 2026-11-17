@@ -149,6 +149,7 @@ impl RunExecutor for ScriptedExecutor {
                 Some(broca_session_loop::admit::admission(&mut req, &control, &provider, writer.operations(), Some(now())).map_err(StoreRunError::Admission)?)
             } else { None };
             let seams = broca_session_loop::Seams {
+                person_steers: None,
                 provider:&provider, tools:&tools, bind:req.session.clone(), out:Some(&out), cancel:control.cancel.clone().unwrap_or_default(), stop:Default::default(),
                 held:None, approval:&broca_core::AllowAll, hook_plane:None, now_ms:&now, session_address:None, compaction_plane:None,
                 compaction_session:None, compaction_changes:false, keep_warm:None, account_reports:None, max_same_account_wait:Default::default(),

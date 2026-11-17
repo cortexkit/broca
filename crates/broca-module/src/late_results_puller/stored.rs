@@ -188,6 +188,25 @@ struct Call<'a> {
     batch_committed: bool,
     run_ended: bool,
     closing: bool,
+    /// The provider the call was handed back from for the person's steer, whose terminal for
+    /// it is delivered as a notice.
+    yielded_by: Option<&'a str>,
+    /// Whether that notice is already in the session.
+    noticed: bool,
+}
+
+/// The send id of the notice that delivers a handed-back call's terminal: one per call, so a
+/// redelivered entry finds its notice already sent.
+pub fn notice_send_id(call_key: &str) -> String {
+    format!("{NOTICE_SEND_ID_PREFIX}{call_key}")
+}
+
+const NOTICE_SEND_ID_PREFIX: &str = "late-notice:";
+
+/// Whether `send_id` has the form of a notice's send id ([`notice_send_id`]). It checks the
+/// prefix only, not that the call exists.
+pub fn is_notice_send_id(send_id: &str) -> bool {
+    send_id.starts_with(NOTICE_SEND_ID_PREFIX)
 }
 
 impl StoredLineage {
@@ -256,14 +275,21 @@ impl StoredLineage {
             batch_committed: false,
             run_ended: false,
             closing: false,
+            yielded_by: None,
+            noticed: false,
         };
+        let notice = notice_send_id(key);
         for (_, record) in records {
             match record {
+                Record::QueuedSend(queued) if queued.send_id.as_deref() == Some(&notice) => {
+                    call.noticed = true;
+                }
                 Record::ToolOutcome(outcome) if outcome.run_id == intent.run_id => {
                     if outcome.batch_id == intent.batch_id
                         && outcome.tool_call_id == intent.tool_call_id
                     {
                         call.terminal = true;
+                        call.yielded_by = outcome.yielded_by.as_deref();
                     }
                     if matches!(
                         outcome.outcome,
@@ -295,16 +321,32 @@ impl StoredLineage {
         self.call(key)?.held.map(|held| held.tool_call_id.clone())
     }
 
-    pub(super) fn needs_intake(&self, key: &str) -> bool {
-        // A missing intent or unreadable store may hide a hold. A readable ordinary dispatch
-        // starts no feed; its held-record callback starts one if the provider later holds it.
-        self.call(key).is_none_or(|call| call.held.is_some())
+    /// The id and tool of a call handed back for the person's steer whose notice isn't in the
+    /// session yet.
+    pub(super) fn yielded_call(&self, key: &str) -> Option<(ToolCallId, String)> {
+        let call = self.call(key)?;
+        (call.yielded_by.is_some() && !call.noticed).then(|| {
+            (
+                call.intent.tool_call_id.clone(),
+                call.intent.tool_name.clone().unwrap_or_default(),
+            )
+        })
     }
 
-    /// Whether the call finished without its provider holding it.
+    pub(super) fn needs_intake(&self, key: &str) -> bool {
+        // A missing intent or unreadable store may hide a hold. A readable ordinary dispatch
+        // starts no feed; its held-record callback starts one if the provider later holds it. A
+        // call handed back for the person's steer needs the feed until its notice is in the
+        // session, since its provider's own terminal for it is still owed.
+        self.call(key)
+            .is_none_or(|call| call.held.is_some() || (call.yielded_by.is_some() && !call.noticed))
+    }
+
+    /// Whether the call finished without its provider holding it. A handed-back call didn't:
+    /// its provider's terminal for it is still owed.
     pub(super) fn answered_inline(&self, key: &str) -> bool {
         self.call(key)
-            .is_some_and(|call| call.terminal && call.held.is_none())
+            .is_some_and(|call| call.terminal && call.held.is_none() && call.yielded_by.is_none())
     }
 
     /// Whether no withdrawal can ever be owed for the call: it finished with a result, or no
@@ -317,6 +359,11 @@ impl StoredLineage {
 
     pub(super) fn retirement_reason(&self, key: &str) -> Option<&'static str> {
         let call = self.call(key)?;
+        // A handed-back call's registration lives until its notice is in the session, however
+        // its run ended: a Stop ends the turn only.
+        if call.yielded_by.is_some() {
+            return call.noticed.then_some("notice_delivered");
+        }
         if call.run_ended {
             Some("run_ended")
         } else if call.terminal && (call.held.is_none() || call.batch_committed) {
@@ -338,6 +385,17 @@ impl StoredLineage {
         let Some(call) = self.call(&entry.call_key) else {
             return Classified::Blocked("intent_missing".into());
         };
+        // A call handed back for the person's steer takes its provider's terminal as a notice,
+        // whether or not its run has ended since.
+        if let Some(carrier) = call.yielded_by {
+            return if call.noticed {
+                settled_without_delivery(module, entry, "already_noticed")
+            } else if carrier != module {
+                settled_without_delivery(module, entry, "dispatched_elsewhere")
+            } else {
+                Classified::Delivered
+            };
+        }
         if call.terminal {
             return settled_without_delivery(module, entry, "already_terminal");
         }

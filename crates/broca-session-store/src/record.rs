@@ -934,6 +934,10 @@ message! {
         /// Absent for a dispatched call, whose key is its intent's, and on outcomes written
         /// before it was recorded.
         11 opt call_key: String,
+        /// Owned by the tool router: the provider a call was handed back from for the person's
+        /// steer (llm-runner `call_yield`), whose later terminal for it becomes a notice. Absent
+        /// for every other call. A build without it skips it and settles that terminal unread.
+        12 opt yielded_by: String,
     }
 }
 

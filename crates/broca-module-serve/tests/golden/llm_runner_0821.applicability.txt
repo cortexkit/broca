@@ -17,23 +17,23 @@ N/A restart_survival_history_identity: adapter declares host_survives_restart: f
 N/A restart_survival_event_log: adapter declares host_survives_restart: false
 N/A restart_survival_unknown_host_stop: adapter declares host_survives_restart: false
 N/A restart_survival_recovery_operations: adapter declares host_survives_restart: false
-N/A call_yield_without_plans: runner does not declare call_yield
-N/A call_yield_without_delivery_order: runner does not declare call_yield
-N/A call_yield_without_notices: runner does not declare call_yield
-N/A call_yield_without_message_marks: runner does not declare call_yield
+PASS call_yield_without_plans
+PASS call_yield_without_delivery_order
+PASS call_yield_without_notices
+PASS call_yield_without_message_marks
 N/A stop_all_without_run_cancel_by_interrupt: runner does not declare stop_all
 N/A stop_all_after_durable_turn_end: runner does not declare stop_all
 N/A stop_all_request_id_replays: runner does not declare stop_all
 N/A stop_all_provider_failure_isolated: runner does not declare stop_all
 N/A stop_all_plan_union_only: runner does not declare stop_all
 N/A stop_all_interrupt_grant_required: runner does not declare stop_all
-N/A call_yield_queue_does_not_yield: runner does not declare call_yield
-N/A call_yield_marked_message_does_not_yield: runner does not declare call_yield
-N/A call_yield_unmarked_sender_does_not_yield: runner does not declare call_yield
-N/A call_yield_held_reply_never_pauses: runner does not declare call_yield
-N/A call_yield_late_result_is_notice: runner does not declare call_yield
-N/A call_yield_steer_stored_before_waiting: runner does not declare call_yield
-N/A call_yield_stop_never_withdraws: runner does not declare call_yield
+PASS call_yield_queue_does_not_yield
+PASS call_yield_marked_message_does_not_yield
+PASS call_yield_unmarked_sender_does_not_yield
+PASS call_yield_held_reply_never_pauses
+PASS call_yield_late_result_is_notice
+N/A call_yield_steer_stored_before_waiting: adapter supplies no scripted call-yield provider
+PASS call_yield_stop_never_withdraws
 PASS fork_answer_base_matches_digest
 N/A fork_answer_refuses_mismatched_base: fork_answer_refuses_mismatched_base requires revert_session: broca serves no transcript revert
 PASS fork_answer_refuses_tool_call

@@ -1,6 +1,6 @@
 use super::*;
 use crate::connection::{ApprovedCallError, InProcessModuleEnd, ToolReplyDeadline};
-use broca_core::tool_plane::{DispatchSignals, ToolOpenGuard};
+use broca_core::tool_plane::{DispatchSignals, PersonSteers, ToolOpenGuard};
 use subc_protocol::FrameType;
 
 /// Keep the real request, reply, and abandonment machinery; only route discovery is local.
@@ -15,6 +15,9 @@ struct Wire {
 impl ToolPlaneConnection for Wire {
     fn consumer_module_id(&self) -> Option<&str> {
         Some("broca")
+    }
+    fn took_person_yield(&self, call_key: &str) -> bool {
+        self.conn.took_person_yield(call_key)
     }
     async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
         if self.catalog.lock().unwrap().is_some() {
@@ -265,6 +268,227 @@ async fn missing_frozen_yield_facts_never_send_yield() {
             assert_eq!(cancel.header.ty, FrameType::Cancel);
             assert_eq!(cancel.header.corr, original.header.corr);
         }
+    })
+    .await
+    .unwrap();
+}
+
+/// The person's steer asks a waiting call to hand back once, and the held reply answering it
+/// closes the call with its interim content: the call is never held, so nothing pauses the run.
+/// A steer the run took before the call was sent asks nothing. The batch's end keeps the call's
+/// registration, since its provider still owes the terminal that becomes the notice.
+#[tokio::test]
+async fn a_person_steer_hands_the_call_back_once_and_its_interim_content_closes_it() {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let (wire, mut provider) = wire();
+        let rig = Rig::new(true, true, true, true);
+        let plane = SubcToolPlane::with_connection(wire, "provider")
+            .with_provider_held_support(rig.clone(), rig.clone());
+        let ctx = ctx();
+        let call = call("call");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_with_yield(Some("tool-result/v1"), true, true),
+            )
+            .await
+            .unwrap();
+        plane
+            .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
+            .await
+            .unwrap();
+        let (steers, seen) = tokio::sync::watch::channel(0u64);
+        steers.send_replace(1);
+        let guard = ToolOpenGuard::new(None, None).with_person_steers(Some(PersonSteers(seen)));
+        let mut dispatch = Box::pin(plane.dispatch_guarded(
+            &ctx,
+            &call,
+            Some(DispatchKey {
+                call_key: "lineage:1",
+                held_recorder: Some(rig.as_ref()),
+            }),
+            &guard,
+        ));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let original = provider.next_request().await;
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        assert!(
+            provider.try_frame().is_none(),
+            "a steer taken before the call was sent hands nothing back"
+        );
+        steers.send_modify(|count| *count += 1);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let yielding = provider.next_request().await;
+        assert_eq!(
+            (yielding.header.channel, yielding.header.epoch),
+            (original.header.channel, original.header.epoch)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&yielding.body).unwrap();
+        assert_eq!(body["name"], "tool.yield");
+        assert_eq!(
+            body["arguments"],
+            json!({"call_key":"lineage:1","reason":"person_message"})
+        );
+        assert!(provider.reply(&yielding, br#"{"answer":"accepted"}"#.to_vec()));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        steers.send_modify(|count| *count += 1);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        assert!(provider.try_frame().is_none(), "a call is handed back once");
+        let interim = json!({"content":[{"type":"text","text":"still building"}],
+            "held":{"reason":"running","yielded":true,"detail":{"id":"opaque"}}});
+        assert!(provider.reply(&original, serde_json::to_vec(&interim).unwrap()));
+        match dispatch.await {
+            DispatchResult::Yielded { result, carrier } => {
+                assert_eq!(carrier, "provider");
+                assert_eq!(
+                    result.output,
+                    ToolOutput::Text {
+                        text: "still building".into()
+                    }
+                );
+            }
+            other => panic!("expected a handed-back call, got {other:?}"),
+        }
+        assert!(
+            !rig.held_synced.load(Ordering::SeqCst),
+            "a handed-back call is never recorded as held"
+        );
+        assert!(
+            provider.try_frame().is_none(),
+            "a final frame disarms CANCEL"
+        );
+        plane.batch_finished(&ctx).await.unwrap();
+        assert!(
+            rig.pruned.lock().unwrap().is_empty(),
+            "the batch's end keeps a handed-back call's registration"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A provider may send the call's yielded final frame before its answer to the yield request,
+/// since the two travel as separate frames. The call is still handed back: what makes it so is
+/// that broca asked it to yield for the person, not the order the provider's frames arrive in.
+#[tokio::test]
+async fn a_handed_back_call_closes_even_when_its_final_frame_beats_the_yield_answer() {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let (wire, mut provider) = wire();
+        let rig = Rig::new(true, true, true, true);
+        let plane = SubcToolPlane::with_connection(wire, "provider")
+            .with_provider_held_support(rig.clone(), rig.clone());
+        let ctx = ctx();
+        let call = call("call");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_with_yield(Some("tool-result/v1"), true, true),
+            )
+            .await
+            .unwrap();
+        plane
+            .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
+            .await
+            .unwrap();
+        let (steers, seen) = tokio::sync::watch::channel(0u64);
+        let guard = ToolOpenGuard::new(None, None).with_person_steers(Some(PersonSteers(seen)));
+        let mut dispatch = Box::pin(plane.dispatch_guarded(
+            &ctx,
+            &call,
+            Some(DispatchKey {
+                call_key: "lineage:1",
+                held_recorder: Some(rig.as_ref()),
+            }),
+            &guard,
+        ));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let original = provider.next_request().await;
+        steers.send_modify(|count| *count += 1);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let yielding = provider.next_request().await;
+        let body: serde_json::Value = serde_json::from_slice(&yielding.body).unwrap();
+        assert_eq!(body["arguments"]["reason"], "person_message");
+        let interim = json!({"content":[{"type":"text","text":"still building"}],
+            "held":{"reason":"running","yielded":true}});
+        assert!(provider.reply(&original, serde_json::to_vec(&interim).unwrap()));
+        match dispatch.await {
+            DispatchResult::Yielded { result, carrier } => {
+                assert_eq!(carrier, "provider");
+                assert_eq!(
+                    result.output,
+                    ToolOutput::Text {
+                        text: "still building".into()
+                    }
+                );
+            }
+            other => panic!("expected a handed-back call, got {other:?}"),
+        }
+        assert!(
+            !rig.held_synced.load(Ordering::SeqCst),
+            "a handed-back call is never recorded as held"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// Without a hand-back asked for the person, a yielded held reply (a restart's) still goes the
+/// held path: only the person's yield turns interim content into the call's result.
+#[tokio::test]
+async fn a_restart_yield_still_holds_the_call() {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let (wire, mut provider) = wire();
+        let rig = Rig::new(true, true, true, true);
+        let plane = SubcToolPlane::with_connection(wire, "provider")
+            .with_provider_held_support(rig.clone(), rig.clone());
+        let ctx = ctx();
+        let call = call("call");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_with_yield(Some("tool-result/v1"), true, true),
+            )
+            .await
+            .unwrap();
+        plane
+            .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
+            .await
+            .unwrap();
+        let (_steers, seen) = tokio::sync::watch::channel(0u64);
+        let stop = CancellationToken::new();
+        let guard =
+            ToolOpenGuard::new(None, Some(&stop)).with_person_steers(Some(PersonSteers(seen)));
+        let mut dispatch = Box::pin(plane.dispatch_guarded(
+            &ctx,
+            &call,
+            Some(DispatchKey {
+                call_key: "lineage:1",
+                held_recorder: Some(rig.as_ref()),
+            }),
+            &guard,
+        ));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let original = provider.next_request().await;
+        stop.cancel();
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let yielding = provider.next_request().await;
+        let body: serde_json::Value = serde_json::from_slice(&yielding.body).unwrap();
+        assert_eq!(body["arguments"]["reason"], "runner_restart");
+        assert!(provider.reply(&yielding, br#"{"answer":"accepted"}"#.to_vec()));
+        let interim = json!({"content":[{"type":"text","text":"running"}],
+            "held":{"reason":"running","yielded":true,"detail":{"id":"opaque"}}});
+        assert!(provider.reply(&original, serde_json::to_vec(&interim).unwrap()));
+        let result = completed(dispatch.await);
+        assert_eq!(
+            result.output,
+            ToolOutput::Text {
+                text: "late terminal".into()
+            }
+        );
+        assert!(rig.held_synced.load(Ordering::SeqCst));
     })
     .await
     .unwrap();

@@ -449,6 +449,17 @@ pub fn broca_role_describe_with_writers(
             .position(|name| name == cortexkit_role_llm_runner::capabilities::CALL_IDENTITY)
             .unwrap();
         capabilities.insert(at, cortexkit_role_llm_runner::capabilities::NOTICES.into());
+        // The person's steer hands back a waiting call whose provider can, and that call's
+        // final result reaches the session as a notice: the group needs `notices`, beside the
+        // plans, ordered sends and message marks this runner always declares.
+        let at = capabilities
+            .iter()
+            .position(|name| name == DELIVERY_ORDER_GROUP)
+            .unwrap();
+        capabilities.insert(
+            at + 1,
+            cortexkit_role_llm_runner::capabilities::CALL_YIELD.into(),
+        );
     }
     if broca_core::scope_admission::NOTICE_WITH_SPEAKS_FOR {
         // Admission reads the same constant: a notice may carry a speaker, and a speaker may
@@ -1281,9 +1292,13 @@ mod pinned_reply_bytes {
                 checked.fork_idle_s,
                 broca_protocol::FORK_ANSWER_SERVED.then_some(broca_protocol::FORK_IDLE_S)
             );
+            // The person's steer hands calls back exactly when this build records notices.
+            assert_eq!(
+                checked.declares(cortexkit_role_llm_runner::capabilities::CALL_YIELD),
+                broca_core::delivery_order::RIDES_V2_WRITER_ENABLED
+            );
             for group in [
                 "adopt_open",
-                "call_yield",
                 "stop_all",
                 "cache_policy",
                 "history_intake",
@@ -1413,7 +1428,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "712c0504cee97d3e9a2112f7e76ea7313e3fdd0530571fc4c7658e91581c10ae",
+            "224da1bb9af15adb1f4105d38484f8f41e0f30442c20909d378b8ba2ebcd4ee3",
         );
     }
 
@@ -1610,7 +1625,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "709adf6d8ce6975b54eab2f2910e06b6b3b269853ea7f9b2458edfd4b0b4db0f";
+        "d332c2bebee8776afc50ffd55f7e6739c9f39f440808a9c2a964c12cb5a4f381";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

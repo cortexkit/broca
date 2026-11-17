@@ -797,6 +797,20 @@ impl ToolPlane for Spy {
         if call.tool_name == "photo" {
             return photo(ctx, call).await;
         }
+        // A call its provider handed back for the person's steer: the interim content it
+        // answered the hand-back with closes the call, and the work goes on at the provider.
+        if call.tool_name == "handback" {
+            return DispatchResult::Yielded {
+                result: ToolResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    output: ToolOutput::Text {
+                        text: "still building".into(),
+                    },
+                    is_error: false,
+                },
+                carrier: "provider".into(),
+            };
+        }
         // A call slow enough that keep-warm sends its warms while it runs.
         if call.tool_name == "slow" {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2771,6 +2785,7 @@ async fn new_source(
     let cancel = TEST_CANCEL.try_with(Clone::clone).unwrap_or_default();
     let display_out = DISPLAY_OUT.try_with(Clone::clone).ok();
     let seams = Seams {
+        person_steers: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -3687,6 +3702,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     let now = harness_now;
     let bind = bind();
     let seams = Seams {
+        person_steers: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -4376,6 +4392,7 @@ async fn new_with_actions(
     let now = harness_now;
     let bind = bind();
     let seams = Seams {
+        person_steers: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -4410,6 +4427,7 @@ async fn new_with_actions(
     }));
     plane.cancel_on_hold(cancel.clone());
     let seams = Seams {
+        person_steers: None,
         held: Some(&*lifecycle),
         cancel,
         ..seams
@@ -4423,6 +4441,7 @@ async fn new_with_actions(
             plane.held.deposit_all();
         }
         let restarted = Seams {
+            person_steers: None,
             stop: Default::default(),
             ..seams
         };
@@ -4924,6 +4943,7 @@ async fn compare_auth_pause_in_once(
     let now = harness_now;
     let bind = bind();
     let seams = Seams {
+        person_steers: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -4961,6 +4981,7 @@ async fn compare_auth_pause_in_once(
     provider.resuming();
     let refrozen_to = resume_account.clone();
     let seams = Seams {
+        person_steers: None,
         auth_selection: resume_account.or(seams.auth_selection.clone()),
         // A resume waits for its requests as a new run does.
         model_call_ready: provider.model_call_ready(),
@@ -9068,6 +9089,7 @@ async fn enroll_run_with(
     let bind = bind();
     let now = harness_now;
     let seams = Seams {
+        person_steers: None,
         provider,
         tools: &tools,
         bind: bind.clone(),
@@ -9129,6 +9151,7 @@ async fn enroll_resume_with(
     let bind = bind();
     let now = harness_now;
     let seams = Seams {
+        person_steers: None,
         provider,
         tools: &tools,
         bind: bind.clone(),
@@ -10750,3 +10773,69 @@ async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
 /// The probe placement of rides after a tool turn's results, run on the new loop alone.
 #[path = "differential/ride_placement.rs"]
 mod ride_placement;
+
+/// A call handed back for the person's steer is closed by the interim content its provider
+/// answered with, and its outcome names that provider. That result is written as soon as the
+/// hand-back is answered, without waiting for the other calls dispatched in the same step to
+/// finish. The provider's later result for the call then reaches the session as a notice.
+/// Nothing waits on it as a held call, and a call dispatched beside it ends as usual.
+#[tokio::test]
+async fn a_handed_back_call_is_closed_by_its_interim_content_and_names_its_provider() {
+    let scenario = Scenario {
+        input: vec![user("build it")],
+        tools: vec![
+            tool("handback", ExecutionMode::Parallel),
+            tool("read", ExecutionMode::Parallel),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "handback", json!({})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let outcome = new_loop(&scenario).await;
+    let at = |name: &str, id: &str| {
+        outcome
+            .records
+            .iter()
+            .position(|record| {
+                record
+                    .get(name)
+                    .is_some_and(|body| body["tool_call_id"] == id)
+            })
+            .unwrap_or_else(|| panic!("no {name} for {id}: {:?}", outcome.records))
+    };
+    let handed_back = &outcome.records[at("ToolOutcome", "c1")]["ToolOutcome"];
+    assert_eq!(handed_back["yielded_by"], "provider", "{handed_back}");
+    assert_eq!(handed_back["outcome"], "Completed", "{handed_back}");
+    let beside = &outcome.records[at("ToolOutcome", "c2")]["ToolOutcome"];
+    assert!(beside["yielded_by"].is_null(), "{beside}");
+    let reply = outcome
+        .records
+        .iter()
+        .filter_map(|record| record.get("ToolReply"))
+        .find(|reply| reply["result"]["tool_call_id"] == "c1")
+        .unwrap_or_else(|| panic!("no reply for c1: {:?}", outcome.records));
+    assert!(reply.to_string().contains("still building"), "{reply}");
+    assert!(
+        at("ToolOutcome", "c1") < at("ToolOutcome", "c2"),
+        "the handed-back call is durable as it answers, before the batch ends: {:?}",
+        outcome.records
+    );
+    assert!(
+        !outcome
+            .records
+            .iter()
+            .any(|record| record.get("ToolHeld").is_some()),
+        "a handed-back call is never held: {:?}",
+        outcome.records
+    );
+}

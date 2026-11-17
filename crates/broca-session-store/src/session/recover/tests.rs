@@ -193,6 +193,7 @@ fn answered(run: &str, id: &str) -> [Record; 2] {
             media: Vec::new(),
         }),
         Record::ToolOutcome(ToolOutcome {
+            yielded_by: None,
             run_id: run.into(),
             batch_id: "b".into(),
             tool_call_id: ToolCallId(id.into()),

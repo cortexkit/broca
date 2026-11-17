@@ -348,6 +348,7 @@ pub(crate) fn reply(run: &str, step: u64, id: &str, images: &[&str]) -> Record {
 
 pub(crate) fn outcome(run: &str, step: u64, id: &str) -> Record {
     Record::ToolOutcome(ToolOutcome {
+        yielded_by: None,
         run_id: run.into(),
         batch_id: format!("b{step}"),
         tool_call_id: ToolCallId(id.into()),

@@ -1,17 +1,15 @@
 # Hand-written Rust files over the 5,000-line limit, as `<lines> <path> <reason>`: the size
 # each had when the limit began, which it may not grow past. scripts/check-file-sizes.sh reads
 # this. Lower or drop an entry when its file shrinks.
-19584 crates/broca-core/src/run.rs the run loop of the WAL runner the session store replaced; deleted with the WAL code
+15881 crates/broca-core/src/run.rs the run loop of the WAL runner the session store replaced; deleted with the WAL code
 15142 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
 11596 crates/broca-module-serve/src/serve.rs every route's handler; split by op family
-9586 crates/broca-subc/src/subc_plane.rs tool dispatch plane; split held calls, yields and routing
-9358 crates/broca-subc/src/connection.rs subc connection and tool calls; split route opens, calls and yields
+5862 crates/broca-subc/src/connection.rs subc connection and tool calls; split route opens, calls and yields
 8411 crates/broca-core/src/wal_writer.rs the WAL's writer (the write-ahead log the session store replaced); deleted with the WAL code
 7977 crates/broca-core/src/replay.rs replay of the WAL (the write-ahead log the session store replaced); deleted with the WAL code
-7568 crates/broca-session-loop/src/run.rs the run loop; split step, tool batch and boundary areas
+7409 crates/broca-session-loop/src/run.rs the run loop; split step, tool batch and boundary areas
 7429 crates/broca-wire/src/lib.rs wire types of every op; split by op family
 7204 crates/broca-core/src/admission.rs send admission (plan, auth, cache, budgets); split by area
 7193 crates/broca-store/src/lib.rs run-index.db projections of the WAL (the write-ahead log the session store replaced); most go with the WAL code
 7159 crates/broca-wal/src/file_wal.rs the WAL's file store (the write-ahead log the session store replaced); deleted with the WAL code
 6141 crates/broca-catalog/src/runtime.rs catalog resolution; split poller, cache and resolution
-5035 crates/broca-module/src/store_actor.rs the session actor; split setup, sends and reads

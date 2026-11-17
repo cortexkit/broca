@@ -176,6 +176,7 @@ impl RunExecutor for MovingExecutor {
             let tools = broca_core::StubToolPlane::new().with_canned_text("read", "contents");
             let now = now_ms;
             let seams = broca_session_loop::Seams {
+                person_steers: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

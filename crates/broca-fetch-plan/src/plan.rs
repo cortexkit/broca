@@ -424,6 +424,13 @@ pub fn parse_plan_with(
         )
         .map_err(Refusal::invalid)?;
         check_fork_callers(object, FORK_ANSWER_SERVED).map_err(Refusal::invalid)?;
+        // Broca declares `call_yield`, so a sender's boolean `person` mark is admitted; it
+        // doesn't declare `notice_yield`, so any `yields` mark is refused by name.
+        cortexkit_role_llm_runner::call_yield::check_plan(
+            object,
+            &[cortexkit_role_llm_runner::capabilities::CALL_YIELD],
+        )
+        .map_err(Refusal::invalid)?;
     }
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
@@ -670,6 +677,45 @@ mod sender_tests {
             (
                 json!([{"module":"b","succeeds":"a"},{"module":"c","succeeds":"a"}]),
                 "plan.senders[1].succeeds",
+            ),
+        ] {
+            assert_eq!(
+                parse_plan(&json!({"senders":senders}), CompactionSupport::Unsupported)
+                    .unwrap_err(),
+                Refusal::invalid(field)
+            );
+        }
+    }
+
+    /// Broca declares `call_yield`, so a sender's boolean `person` mark is read; it doesn't
+    /// declare `notice_yield`, so `yields` is refused by name, even false.
+    #[test]
+    fn a_person_mark_is_read_and_a_yields_mark_refused() {
+        let composition = json!({"providers": [{"provider": "p", "tools": []}],
+            "step_transform_items": []});
+        let plan = parse_plan(
+            &json!({
+                "tool_items": [{"provider": "p", "params": {}}],
+                "system_text_items": [], "step_transform_items": [],
+                "composition_digest":
+                    cortexkit_role_tool_provider::catalog::composition_digest(&composition)
+                        .unwrap(),
+                "composition": composition,
+                "senders": [{"module": "gateway", "person": true}, {"module": "aft"}],
+            }),
+            CompactionSupport::Unsupported,
+        )
+        .unwrap();
+        assert!(plan.senders[0].person);
+        assert!(!plan.senders[1].person);
+        for (senders, field) in [
+            (
+                json!([{"module":"gateway","person":"yes"}]),
+                "plan.senders[0].person",
+            ),
+            (
+                json!([{"module":"gateway","yields":false}]),
+                "plan.senders[0].yields",
             ),
         ] {
             assert_eq!(

@@ -3302,6 +3302,15 @@ impl LlmRunnerSubject for BrocaSubject {
         // Harness principals include the reserved: label; plan sender modules use only
         // the daemon-attested module id, including the flow fixture's opener.
         if let Some(senders) = members.get_mut("senders").and_then(Value::as_array_mut) {
+            // The kit names each call_yield case's session after the case, and arms its call
+            // only after the plan is sent. The provider must declare late results and
+            // `call.yield/v1` to the session from its first run, under a preset of its own:
+            // broca keeps a provider's declarations for a minute by provider and preset, and
+            // the preset is fixed by this plan. The case's sender may be unmarked, so the
+            // session's name is the one signal every case carries.
+            if session.contains("call_yield_") {
+                held_late_results::mark_call_yield_session(&self.shared, session);
+            }
             for sender in senders {
                 let module = sender
                     .get("module")
@@ -3728,6 +3737,126 @@ impl LlmRunnerSubject for BrocaSubject {
 
     async fn await_held_reply(&self, arguments: &Value) -> Result<String, HarnessError> {
         held_late_results::await_held_reply(&self.shared, arguments).await
+    }
+
+    /// The provider keeps the call open until broca asks it to hand back. A provider that
+    /// withholds its answer to that request isn't scripted here, so that case doesn't apply.
+    async fn install_call_yield(
+        &self,
+        session: &str,
+        arguments: &Value,
+        block_answer: bool,
+    ) -> Result<bool, HarnessError> {
+        if block_answer {
+            return Ok(false);
+        }
+        held_late_results::install_call_yield(&self.shared, session, arguments);
+        Ok(true)
+    }
+
+    /// The yields and withdrawals the provider received for the call, and each notice the
+    /// session's store holds durably, with its sender and its text: one placed in the
+    /// conversation, or one queued for the session's next run.
+    async fn observe_call_yield(
+        &self,
+        session: &str,
+        arguments: &Value,
+        _send_id: &str,
+    ) -> Result<cortexkit_role_llm_runner_conformance::CallYieldObservation, HarnessError> {
+        let (call_key, yield_requests, withdraw_requests) =
+            held_late_results::yields_seen(&self.shared, arguments);
+        let root = self
+            .shared
+            .session_roots
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .ok_or_else(|| HarnessError::new(format!("no state root for session {session}")))?;
+        // A notice is durable once it is in the conversation: an input message (a steer, or
+        // the input of a run it started on an idle session) followed by the facts that name
+        // its sender and marks. Read those, as `session.read` serves them with display facts.
+        let mut notices = Vec::new();
+        let mut placed: Option<String> = None;
+        let text_of = |message: &broca_protocol::Message| -> String {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::content::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // A queued send names its module sender on the `DeliveryOrdered` record written just
+        // before it, as a principal; take the module id out of it.
+        let mut ordered_by: std::collections::HashMap<String, String> = Default::default();
+        for record in stored_log::stored_records(&root, &self.bind_identity(session)).await {
+            match record {
+                Record::DeliveryOrdered(ordered) => {
+                    let sender = match ordered
+                        .sent_by
+                        .clone()
+                        .map(serde_json::from_value::<broca_protocol::BindPrincipal>)
+                    {
+                        Some(Ok(broca_protocol::BindPrincipal::Reserved { module_id })) => {
+                            module_id
+                        }
+                        _ => String::new(),
+                    };
+                    ordered_by.insert(ordered.submission_id.clone(), sender);
+                }
+                Record::QueuedSend(queued)
+                    if queued
+                        .message_marks
+                        .as_ref()
+                        .is_some_and(|marks| marks["notice"] == true) =>
+                {
+                    notices.push(json!({
+                        "sender": ordered_by.get(&queued.submission_id).cloned().unwrap_or_default(),
+                        "notice": true,
+                        "text": queued.input.iter().map(text_of).collect::<String>(),
+                    }));
+                }
+                Record::Input(input) => {
+                    placed = Some(
+                        input
+                            .message
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                broca_protocol::content::ContentBlock::Text { text } => {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                }
+                Record::EntryFacts(facts) => {
+                    let text = placed.take();
+                    if facts
+                        .marks
+                        .as_ref()
+                        .is_some_and(|marks| marks["notice"] == true)
+                    {
+                        notices.push(json!({
+                            "sender": facts.sender.as_deref().unwrap_or_default(),
+                            "notice": true,
+                            "text": text.unwrap_or_default(),
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut observation =
+            cortexkit_role_llm_runner_conformance::CallYieldObservation::default();
+        observation.call_key = call_key;
+        observation.yield_requests = yield_requests;
+        observation.withdraw_requests = withdraw_requests;
+        observation.notices = notices;
+        Ok(observation)
     }
 
     async fn publish_late_entry(

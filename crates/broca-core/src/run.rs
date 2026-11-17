@@ -725,6 +725,9 @@ pub struct RunControl {
     pub provider_held_close_out: Arc<std::sync::Mutex<ProviderHeldCloseOut>>,
     /// Cheap actor-owned status; never a durability or cancellation input.
     pub step_progress: Option<crate::provider::LiveStepProgress>,
+    /// The person's steers the session's owner counts while this run runs; a waiting call
+    /// whose provider can hand it back is asked to on each one. `None` hands nothing back.
+    pub person_steers: Option<crate::tool_plane::PersonSteers>,
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) approval_wait_probe: Option<Arc<ApprovalWaitProbe>>,
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
@@ -958,6 +961,7 @@ impl Default for RunControl {
             provider_held_lifecycle: None,
             provider_held_close_out: Default::default(),
             step_progress: None,
+            person_steers: None,
             #[cfg(all(test, feature = "test-clock"))]
             approval_wait_probe: None,
             clock: None,
@@ -12131,7 +12135,9 @@ async fn resolve<T: ToolPlane>(
                 }
             };
             match result {
-                DispatchResult::Completed(mut result) => {
+                // This loop counts no person's steers, so no call is ever handed back here.
+                DispatchResult::Completed(mut result)
+                | DispatchResult::Yielded { mut result, .. } => {
                     let captured = ctx
                         .media_capture
                         .as_ref()
@@ -14805,7 +14811,7 @@ mod approval_gate {
     }
     fn dispatch_resolution(id: &ToolCallId, result: DispatchResult) -> CallResolution {
         match result {
-            DispatchResult::Completed(result) => {
+            DispatchResult::Completed(result) | DispatchResult::Yielded { result, .. } => {
                 CallResolution::plain(result, Some(DispatchOutcome::Completed))
             }
             DispatchResult::NotSent { reason } => {

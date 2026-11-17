@@ -235,6 +235,7 @@ impl RunExecutor for ReadyExecutor {
             let tools = broca_core::StubToolPlane::new().with_canned_text("read", "file contents");
             let now = || 1;
             let seams = broca_session_loop::Seams {
+                person_steers: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

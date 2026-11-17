@@ -188,8 +188,7 @@
           "succeeds": "thalamus-harness"
         },
         {
-          "module": "prefrontal-core",
-          "yields": true
+          "module": "prefrontal-core"
         },
         {
           "module": "magic-context"

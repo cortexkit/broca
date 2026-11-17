@@ -439,6 +439,7 @@ async fn codex_store_two_completed_runs_reuse_the_websocket_lease() {
         let control = broca_core::RunControl::default();
         let admission = broca_session_loop::admit::admission(&mut request, &control, &provider, session.operations(), Some(1)).unwrap();
         let seams = broca_session_loop::Seams {
+            person_steers: None,
             provider: &provider, tools: &tools, bind: bind.clone(), out: Some(&out),
             cancel: Default::default(), stop: Default::default(), held: None, approval: &AllowAll,
             hook_plane: None, now_ms: &|| 1000, session_address: None, compaction_plane: None,

@@ -432,6 +432,11 @@ trait ToolPlaneConnection: Send + Sync {
     fn consumer_module_id(&self) -> Option<&str> {
         None
     }
+    /// Whether the call `call_key` was handed back for the person's steer (see
+    /// [`SubcConnection::took_person_yield`]). A connection that sends no yields never was.
+    fn took_person_yield(&self, _call_key: &str) -> bool {
+        false
+    }
 
     async fn route_open_dispatch(
         &self,
@@ -536,6 +541,9 @@ impl ToolPlaneConnection for SubcConnection {
     }
     fn consumer_module_id(&self) -> Option<&str> {
         SubcConnection::consumer_module_id(self)
+    }
+    fn took_person_yield(&self, call_key: &str) -> bool {
+        SubcConnection::took_person_yield(self, call_key)
     }
 
     async fn route_open_dispatch(
@@ -751,6 +759,11 @@ pub struct SubcToolPlane {
     batch_manifests: Mutex<HashMap<BatchRouteKey, broca_core::capability::ToolManifest>>,
     registered_keys: Mutex<RegisteredKeys>,
     inline_keys: Mutex<HashSet<String>>,
+    /// Call keys handed back for the person's steer in batches still open. Their provider still
+    /// owes each call its own terminal, which reaches the session as a notice, so the batch's end
+    /// keeps the call's late-results registration; the registration sweep removes it once that
+    /// notice is in the session.
+    yielded_keys: Mutex<HashSet<String>>,
     #[cfg(debug_assertions)]
     reply_fallback_ms: u64,
     /// Lives across batches for the plane's lifetime, but is reused only as the source snapshot
@@ -1096,6 +1109,7 @@ impl SubcToolPlane {
             batch_manifests: Mutex::new(HashMap::new()),
             registered_keys: Mutex::new(HashMap::new()),
             inline_keys: Mutex::new(HashSet::new()),
+            yielded_keys: Mutex::new(HashSet::new()),
             #[cfg(debug_assertions)]
             reply_fallback_ms: 120_000,
             catalog_memo: Mutex::new(None),
@@ -1864,6 +1878,8 @@ impl SubcToolPlane {
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> DispatchResult {
         let scope = ctx.scope.as_ref();
+        // Taken whatever the outcome, so a yield accepted for a call that then failed is forgotten.
+        let person_yield = key.is_some_and(|key| self.conn.took_person_yield(key.call_key));
         match outcome {
             Ok(raw) => {
                 let content_v1 = self.frozen_tool_is_content_v1(ctx, module_id, &call.tool_name);
@@ -1904,6 +1920,46 @@ impl SubcToolPlane {
                                 registered_module == module_id && registered_key == key.call_key
                             })
                     });
+                    // The person's steer had this call handed back (llm-runner `call_yield`): a
+                    // held reply answering that yield closes the call now, with its interim
+                    // content as the result. The call is never held and never pauses the run;
+                    // its registration stays, so the provider's later terminal for it reaches
+                    // the session as a notice.
+                    if person_yield
+                        && late_results
+                        && self.provider_held.is_some()
+                        && eligible_key.is_some()
+                        && held.is_some_and(|held| held.yielded == Some(true))
+                    {
+                        let mut interim = decoded
+                            .as_ref()
+                            .and_then(|reply| reply.as_ref().ok())
+                            .cloned()
+                            .expect("a held reply was decoded");
+                        interim.held = None;
+                        let result =
+                            crate::content_v1::map_content_v1_result(&call.tool_call_id, &interim)
+                                .unwrap_or_else(|error| {
+                                    route_failure_result(
+                                        call,
+                                        format!("malformed handed-back tool reply: {error:?}"),
+                                    )
+                                });
+                        self.fence
+                            .lock()
+                            .unwrap()
+                            .insert(&ctx.batch_id, fence_key, result.clone());
+                        if let Some(key) = eligible_key {
+                            self.yielded_keys
+                                .lock()
+                                .unwrap()
+                                .insert(key.call_key.to_owned());
+                        }
+                        return DispatchResult::Yielded {
+                            result,
+                            carrier: module_id.into(),
+                        };
+                    }
                     if let (Some(support), Some(held), Some(key), Some(_)) = (
                         self.provider_held.as_ref(),
                         held,
@@ -3833,6 +3889,13 @@ impl SubcToolPlane {
                 .into_iter()
                 .partition(|(_, key)| keys.remove(key))
         };
+        // A handed-back call's terminal is still owed by its provider: keep its registration.
+        let held: Vec<_> = {
+            let mut yielded = self.yielded_keys.lock().unwrap();
+            held.into_iter()
+                .filter(|(_, key)| !yielded.remove(key))
+                .collect()
+        };
         let prune = if let Some(support) = &self.provider_held {
             match support.intake.prune_inline(&inline).await {
                 Ok(()) => support.intake.prune(&held).await,
@@ -4498,521 +4561,12 @@ mod tests;
 mod held_dispatch_tests;
 
 #[cfg(test)]
-mod approval_digest_contract_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn approved_connection_omits_approval_digest_and_preserves_saved_bytes() {
-        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
-        let saved = r#"{"n":1e+30,"a":2}"#;
-        let call = ToolCall {
-            tool_call_id: broca_protocol::ToolCallId("approved".into()),
-            tool_name: "edit".into(),
-            input: serde_json::from_str(saved).unwrap(),
-            thought_signature: None,
-        };
-        let args = ApprovedArgs {
-            bytes: saved.into(),
-            key: "lineage:7".into(),
-            signals: Default::default(),
-        };
-        let (result, body) = tokio::join!(
-            ToolPlaneConnection::tool_call_approved(
-                &conn,
-                &route,
-                &call,
-                crate::connection::ToolReplyDeadline {
-                    duration: Duration::from_secs(1),
-                    declared: false,
-                    yield_provider: None,
-                },
-                Some("head"),
-                &args,
-                None
-            ),
-            async {
-                let request = module.next_request().await;
-                let body = request.body.clone();
-                assert!(module.reply(&request, br#"{"content":[]}"#.to_vec()));
-                body
-            }
-        );
-        result.unwrap();
-        assert!(String::from_utf8(body.clone())
-            .unwrap()
-            .contains(&format!("\"arguments\":{saved}")));
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["call_key"], "lineage:7");
-        assert_eq!(value["preset"], "head");
-        assert!(value.get("approval_digest").is_none(), "consent execution must omit approval_digest rather than sending an empty or legacy digest");
-    }
-}
+mod approval_digest_contract_tests;
 
 #[cfg(test)]
-mod approved_queue_contract_tests {
-    // The queue probes inject already-open, role-less routes. Seed their matching catalog
-    // snapshot too, so only the enqueue boundary can consume the scripted transport.
-    fn cached_plane(conn: SubcConnection) -> SubcToolPlane {
-        let plane = SubcToolPlane::new(conn, "aft");
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
-        plane
-    }
-    #[tokio::test]
-    async fn ordinary_send_certainty_tracks_the_real_enqueue_boundary() {
-        for pre_enqueue in [true, false] {
-            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
-            if pre_enqueue {
-                module.close_writer_for_test();
-            }
-            let plane = cached_plane(conn);
-            let ctx = BatchCtx {
-                media_capture: None,
-                batch_id: BatchId("ordinary".into()),
-                bind: BindIdentity::new("/project", "test", "ordinary"),
-                run_id: broca_protocol::RunId("run".into()),
-                scope: None,
-            };
-            plane.routes.lock().unwrap().insert(
-                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
-                RouteState {
-                    handle: route,
-                    sem: Arc::new(Semaphore::new(1)),
-                    stamp: None,
-                    last_used: Instant::now(),
-                },
-            );
-            let call = ToolCall {
-                tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
-                tool_name: "edit".into(),
-                input: serde_json::json!({}).into(),
-                thought_signature: None,
-            };
-            let result = if pre_enqueue {
-                plane.dispatch(&ctx, &call).await
-            } else {
-                let (result, ()) = tokio::join!(plane.dispatch(&ctx, &call), async {
-                    let request = module.next_request().await;
-                    assert!(module.reply(&request, b"invalid-json".to_vec()));
-                });
-                result
-            };
-            if pre_enqueue {
-                assert!(
-                    matches!(result, DispatchResult::NotSent { .. }),
-                    "{result:?}"
-                );
-            } else {
-                assert!(
-                    matches!(result, DispatchResult::SentButOutcomeUnknown { .. }),
-                    "{result:?}"
-                );
-            }
-            assert_eq!(module.pending_count_for_test(), 0);
-        }
-    }
-
-    use super::*;
-    use futures::FutureExt;
-
-    #[tokio::test]
-    async fn approved_setup_failures_are_not_sent() {
-        for setup in ["raw-body", "registration", "frame-build"] {
-            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
-            if setup == "registration" {
-                module.fill_pending_for_test();
-            }
-            const {
-                assert!(
-                    subc_protocol::MAX_FRAME_BODY_LEN <= 64 * 1024 * 1024,
-                    "oversized-frame probe must stay bounded"
-                );
-            }
-            let oversized = if setup == "frame-build" {
-                "x".repeat(subc_protocol::MAX_FRAME_BODY_LEN as usize + 1)
-            } else {
-                "edit".into()
-            };
-            let args = if setup == "raw-body" { "{" } else { "{}" };
-            let result = conn
-                .tool_call_raw_yieldable_guarded(
-                    &route,
-                    &oversized,
-                    args,
-                    Some("approved"),
-                    Duration::from_millis(20),
-                    false,
-                    None,
-                    Some("call-key"),
-                    None,
-                    &Default::default(),
-                    None,
-                )
-                .await;
-            assert!(
-                matches!(
-                    SendAttempt::approved_reply(result),
-                    SendAttempt::NotSent { .. }
-                ),
-                "{setup} failed before enqueue and must be recorded not-sent"
-            );
-            assert!(
-                module.take_written_for_test().is_empty(),
-                "{setup} must not enqueue a request or cancel"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn approved_failure_after_real_push_remains_unknown() {
-        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
-        let plane = cached_plane(conn);
-        let ctx = BatchCtx {
-            media_capture: None,
-            batch_id: broca_protocol::BatchId("after-push".into()),
-            bind: BindIdentity::new("/project", "test", "after-push"),
-            run_id: broca_protocol::RunId("run".into()),
-            scope: None,
-        };
-        plane.routes.lock().unwrap().insert(
-            SubcToolPlane::route_key(&ctx.bind, None, "aft"),
-            RouteState {
-                handle: route,
-                sem: Arc::new(Semaphore::new(1)),
-                stamp: None,
-                last_used: Instant::now(),
-            },
-        );
-        let call = ToolCall {
-            tool_call_id: broca_protocol::ToolCallId("approved".into()),
-            tool_name: "edit".into(),
-            input: serde_json::json!({}).into(),
-            thought_signature: None,
-        };
-        let signals = Default::default();
-        let (result, ()) = tokio::join!(
-            plane.dispatch_approved(&ctx, &call, "{}", "call-key", &signals),
-            async {
-                let request = module.next_request().await;
-                assert!(module.reply(&request, b"invalid-json".to_vec()));
-            }
-        );
-        assert!(
-            matches!(result, DispatchResult::SentButOutcomeUnknown { .. }),
-            "a malformed provider reply is after the real push: {result:?}"
-        );
-        assert!(module.take_written_for_test().is_empty());
-    }
-
-    #[tokio::test]
-    async fn approved_closed_writer_queue_is_not_sent() {
-        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
-        module.close_writer_for_test();
-        let plane = cached_plane(conn);
-        let ctx = BatchCtx {
-            media_capture: None,
-            batch_id: broca_protocol::BatchId("closed-queue".into()),
-            bind: BindIdentity::new("/project", "test", "closed-queue"),
-            run_id: broca_protocol::RunId("run".into()),
-            scope: None,
-        };
-        plane.routes.lock().unwrap().insert(
-            SubcToolPlane::route_key(&ctx.bind, None, "aft"),
-            RouteState {
-                handle: route,
-                sem: Arc::new(Semaphore::new(1)),
-                stamp: None,
-                last_used: Instant::now(),
-            },
-        );
-        let call = ToolCall {
-            tool_call_id: broca_protocol::ToolCallId("approved".into()),
-            tool_name: "edit".into(),
-            input: serde_json::json!({}).into(),
-            thought_signature: None,
-        };
-        let result = plane
-            .dispatch_approved(&ctx, &call, "{}", "call-key", &Default::default())
-            .await;
-        assert!(
-            matches!(result, DispatchResult::NotSent { ref reason } if reason == "subc transport: writer task closed before enqueue"),
-            "a failed reservation never commits a send: {result:?}"
-        );
-        assert!(module.take_written_for_test().is_empty());
-        assert_eq!(module.pending_count_for_test(), 0);
-    }
-
-    #[tokio::test]
-    async fn approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
-        for cancel in [true, false] {
-            let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
-            let plane = cached_plane(conn);
-            let ctx = BatchCtx {
-                media_capture: None,
-                batch_id: broca_protocol::BatchId("queue".into()),
-                bind: BindIdentity::new("/project", "test", "queue"),
-                run_id: broca_protocol::RunId("run".into()),
-                scope: None,
-            };
-            plane.routes.lock().unwrap().insert(
-                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
-                RouteState {
-                    handle: route,
-                    sem: Arc::new(Semaphore::new(1)),
-                    stamp: None,
-                    last_used: Instant::now(),
-                },
-            );
-            let call = ToolCall {
-                tool_call_id: broca_protocol::ToolCallId("approved".into()),
-                tool_name: "edit".into(),
-                input: serde_json::json!({}).into(),
-                thought_signature: None,
-            };
-            let token = CancellationToken::new();
-            let signals = broca_core::tool_plane::DispatchSignals::new(
-                if cancel { Some(&token) } else { None },
-                if cancel { None } else { Some(&token) },
-            );
-            let mut dispatch =
-                Box::pin(plane.dispatch_approved(&ctx, &call, "{}", "call-key", &signals));
-            assert!(dispatch.as_mut().now_or_never().is_none());
-            assert_eq!(
-                module.pending_count_for_test(),
-                1,
-                "the real tool request must already be waiting for writer capacity"
-            );
-            token.cancel();
-            let result = tokio::time::timeout(Duration::from_millis(250), dispatch)
-                .await
-                .expect("cancelled approved enqueue must not wait for writer capacity");
-            assert!(
-                matches!(result, DispatchResult::NotSent { .. }),
-                "pre-enqueue interruption is typed not-sent, never unknown: {result:?}"
-            );
-            let frames = module.take_written_for_test();
-            assert_eq!(frames.len(), 256);
-            assert!(
-                frames
-                    .iter()
-                    .all(|frame| frame.header.ty == subc_protocol::FrameType::Ping),
-                "no tool request or provider cancel may be enqueued before the send boundary"
-            );
-            assert_eq!(module.pending_count_for_test(), 0);
-            tokio::task::yield_now().await;
-            assert!(module.take_written_for_test().is_empty());
-        }
-    }
-
-    /// An ordinary (not approved) call goes through the real writer queue with its run's
-    /// signals: a cancel or stop that trips while the request waits for writer capacity, after
-    /// the open and the permit, leaves it unsent, and no request frame is ever written.
-    #[tokio::test]
-    async fn ordinary_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
-        for cancel in [true, false] {
-            let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
-            let plane = cached_plane(conn);
-            let ctx = BatchCtx {
-                media_capture: None,
-                batch_id: broca_protocol::BatchId("ordinary-queue".into()),
-                bind: BindIdentity::new("/project", "test", "ordinary-queue"),
-                run_id: broca_protocol::RunId("run".into()),
-                scope: None,
-            };
-            plane.routes.lock().unwrap().insert(
-                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
-                RouteState {
-                    handle: route,
-                    sem: Arc::new(Semaphore::new(1)),
-                    stamp: None,
-                    last_used: Instant::now(),
-                },
-            );
-            let call = ToolCall {
-                tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
-                tool_name: "read".into(),
-                input: serde_json::json!({}).into(),
-                thought_signature: None,
-            };
-            let token = CancellationToken::new();
-            let guard = ToolOpenGuard::new(
-                if cancel { Some(&token) } else { None },
-                if cancel { None } else { Some(&token) },
-            );
-            let mut dispatch = Box::pin(plane.dispatch_guarded(&ctx, &call, None, &guard));
-            assert!(dispatch.as_mut().now_or_never().is_none());
-            assert_eq!(
-                module.pending_count_for_test(),
-                1,
-                "the real tool request must already be waiting for writer capacity"
-            );
-            token.cancel();
-            let result = tokio::time::timeout(Duration::from_millis(250), dispatch)
-                .await
-                .expect("an interrupted enqueue must not wait for writer capacity");
-            assert!(
-                matches!(&result, DispatchResult::NotSent { reason } if reason == "dispatch_stopped_before_send"),
-                "an interruption before the push is typed not-sent, never unknown: {result:?}"
-            );
-            let frames = module.take_written_for_test();
-            assert_eq!(frames.len(), 256);
-            assert!(
-                frames
-                    .iter()
-                    .all(|frame| frame.header.ty == subc_protocol::FrameType::Ping),
-                "no tool request may be enqueued once the run is interrupted"
-            );
-            assert_eq!(module.pending_count_for_test(), 0);
-            tokio::task::yield_now().await;
-            assert!(module.take_written_for_test().is_empty());
-        }
-    }
-}
+mod approved_queue_contract_tests;
 
 /// The tool plane's route opens against a module that is down: the opens of every session to
 /// that module are paced by the module's availability gate.
 #[cfg(test)]
-mod module_gate_tests {
-    use std::sync::atomic::{AtomicU16, Ordering};
-
-    use super::*;
-
-    /// A daemon whose one module is stopped until `up_at`: every route.open before then is
-    /// refused `target_unavailable`, every one after opens a fresh route. Each open takes 5 ms,
-    /// so opens started together are really in flight together.
-    struct StoppedModuleConnection {
-        up_at: Instant,
-        /// When each route.open started, and for which session.
-        attempts: Mutex<Vec<(Instant, String)>>,
-        next_channel: AtomicU16,
-        gate: Arc<ModuleGate>,
-    }
-
-    #[async_trait]
-    impl ToolPlaneConnection for StoppedModuleConnection {
-        async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
-            Ok(Vec::new())
-        }
-
-        async fn route_open(
-            &self,
-            _module_id: &str,
-            identity: &BindIdentity,
-            _scope: Option<&ScopeSelector>,
-        ) -> Result<RouteHandle, ConnError> {
-            let now = Instant::now();
-            self.attempts
-                .lock()
-                .unwrap()
-                .push((now, identity.session.clone()));
-            sleep(Duration::from_millis(5)).await;
-            if now >= self.up_at {
-                Ok(RouteHandle::synthetic(
-                    self.next_channel.fetch_add(1, Ordering::SeqCst),
-                ))
-            } else {
-                let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(
-                    subc_protocol::error_codes::TARGET_UNAVAILABLE,
-                    "supervised_not_registered".to_owned(),
-                ))
-                .unwrap();
-                Err(ConnError::Rejected(crate::connection::decode_error_body(
-                    &body,
-                )))
-            }
-        }
-
-        async fn route_close(&self, _route: &RouteHandle) -> Result<(), ConnError> {
-            Ok(())
-        }
-
-        async fn tool_call(
-            &self,
-            _route: &RouteHandle,
-            _name: &str,
-            _arguments: &serde_json::Value,
-            _tool_call_id: Option<&str>,
-            _deadline: Duration,
-            _preset: Option<&str>,
-        ) -> Result<serde_json::Value, ConnError> {
-            unreachable!("these tests only open routes")
-        }
-
-        async fn server_capabilities(&self) -> Result<Vec<String>, ConnError> {
-            Ok(Vec::new())
-        }
-
-        fn route_is_open(&self, _route: &RouteHandle) -> bool {
-            true
-        }
-
-        fn module_gate(&self, _module_id: &str) -> Option<Arc<ModuleGate>> {
-            Some(Arc::clone(&self.gate))
-        }
-    }
-
-    /// Fifty sessions, so fifty different routes, to one module stopped for ten seconds. All
-    /// fifty try once at the start, before any refusal is back; after that the module sees one
-    /// route.open per backoff tick in total, through its gate, rather than one per session.
-    /// Every session's route opens once the module is back.
-    #[tokio::test(start_paused = true)]
-    async fn fifty_routes_to_a_stopped_module_are_paced_by_its_gate() {
-        let start = Instant::now();
-        let up_at = start + Duration::from_secs(10);
-        let conn = Arc::new(StoppedModuleConnection {
-            up_at,
-            attempts: Mutex::new(Vec::new()),
-            next_channel: AtomicU16::new(1),
-            // No jitter, so the probe schedule is exact.
-            gate: Arc::new(ModuleGate::with_jitter(
-                |envelope| envelope,
-                CancellationToken::new(),
-            )),
-        });
-        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
-        let lifecycle = CancellationToken::new();
-        let binds: Vec<BindIdentity> = (0..50)
-            .map(|n| BindIdentity::new("/project", "harness", format!("worker-{n}")))
-            .collect();
-        let patience = RouteOpenPatience {
-            deadline: Duration::from_secs(30),
-            max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
-            waits_out_outage: false,
-        };
-        let guard = ToolOpenGuard::default();
-        let results = join_all(binds.iter().map(|bind| {
-            plane.ensure_route_for_lifecycle_inner(
-                bind, None, "aft", &lifecycle, None, &guard, patience,
-            )
-        }))
-        .await;
-        let attempts = conn.attempts.lock().unwrap().clone();
-        let first_round = attempts.iter().filter(|(at, _)| *at == start).count();
-        let while_down = attempts
-            .iter()
-            .filter(|(at, _)| *at > start && *at < up_at)
-            .count();
-        assert_eq!(
-            first_round, 50,
-            "each session tries once before anything is known"
-        );
-        assert!(
-            while_down <= 8,
-            "while the module is down, fifty routes must make about one route.open per tick \
-             between them (100 ms doubling to 5 s gives 6 in ten seconds), got {while_down}"
-        );
-        let after_return: BTreeSet<&str> = attempts
-            .iter()
-            .filter(|(at, _)| *at >= up_at)
-            .map(|(_, session)| session.as_str())
-            .collect();
-        assert_eq!(after_return.len(), 50, "each session opens its own route");
-        let channels: BTreeSet<u16> = results
-            .into_iter()
-            .map(|result| match result {
-                Ok((handle, _)) => handle.channel,
-                Err(error) => panic!("the route must open: {}", error.into_plane()),
-            })
-            .collect();
-        assert_eq!(channels.len(), 50);
-    }
-}
+mod module_gate_tests;

@@ -45,6 +45,7 @@ cipher_tests!(
     a_crash_between_an_interrupt_and_its_run_is_recovered_alike,
     a_rides_marks_are_kept_alike,
     an_idle_start_sends_marks_are_kept_alike,
+    broca_delivers_a_late_notice_for_a_provider_its_plan_does_not_name,
 );
 
 /// The session's owner.
@@ -609,6 +610,84 @@ async fn ordered_admission_refusals_are_answered_alike(cipher: Cipher) {
     );
     let (_, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "nothing refused is queued: {queue:?}");
+}
+
+/// Broca's own delivery of a handed-back call's late result, an internal-scope send as the call's
+/// provider under the notice's own send id, is admitted though the plan doesn't name that module:
+/// on an idle session it waits for the next run, and asking to start one is refused, so it never
+/// starts a run. The same send arriving over a route (an unstamped one here), or an internal send
+/// without the notice's send id, is still refused.
+async fn broca_delivers_a_late_notice_for_a_provider_its_plan_does_not_name(cipher: Cipher) {
+    use broca_protocol::SendScope;
+    let pair = Pair::new(hello(), false, cipher).await;
+    pair.first("r1").await;
+    pair.idle().await;
+    let notice = |scope: SendScope| {
+        let mut request = marked(
+            from(module("stranger"), "the call finished"),
+            json!({"notice": true}),
+        );
+        request.scope = scope;
+        request
+    };
+    let key = crate::late_results_puller::notice_send_id("lineage:1");
+    let refused = |outcome: &SendOutcome, expected: &str| {
+        assert!(
+            matches!(outcome, SendOutcome::DeliveryRefused { code, .. } if *code == expected),
+            "{outcome:?}"
+        );
+    };
+    let starting = pair
+        .alike(
+            "n1",
+            notice(SendScope::Internal),
+            Some(json!({"modes": ["tool_result", "steer", "idle_start"]})),
+            Some(&key),
+        )
+        .await;
+    refused(&starting, cortexkit_role_llm_runner::errors::INVALID_PARAMS);
+    let waiting = pair
+        .alike(
+            "n2",
+            notice(SendScope::Internal),
+            Some(json!({"modes": ["tool_result", "steer"]})),
+            Some(&key),
+        )
+        .await;
+    assert!(
+        matches!(waiting, SendOutcome::Pending { .. }),
+        "{waiting:?}"
+    );
+    let outside = pair
+        .alike(
+            "n3",
+            notice(SendScope::Unstamped),
+            Some(json!({"modes": ["tool_result", "steer"]})),
+            Some(&crate::late_results_puller::notice_send_id("lineage:2")),
+        )
+        .await;
+    refused(
+        &outside,
+        cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+    );
+    let unkeyed = pair
+        .alike(
+            "n4",
+            notice(SendScope::Internal),
+            Some(json!({"modes": ["tool_result", "steer"]})),
+            Some("some-other-send"),
+        )
+        .await;
+    refused(
+        &unkeyed,
+        cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+    );
+    let (_, queue, _) = pair.assert_alike().await;
+    assert_eq!(
+        queue.len(),
+        1,
+        "only the internal, notice-keyed send waits: {queue:?}"
+    );
 }
 
 /// A script whose second run calls `read` once, then answers.
@@ -1306,3 +1385,86 @@ async fn an_idle_start_sends_marks_are_kept_alike(cipher: Cipher) {
 
 mod frozen_tools;
 mod pauses_and_retries;
+
+/// The plan of [`plan`], with a gateway sender the plan marks as carrying the person's own
+/// messages (llm-runner `call_yield`).
+fn person_plan() -> Arc<PlanManifest> {
+    let senders = json!({"senders": [
+        {"module": "gateway", "person": true},
+        {"module": AFT},
+    ]});
+    let mut manifest = (*plan()).clone();
+    manifest.plan = OpaqueJson::from_json_text(senders.to_string()).unwrap();
+    Arc::new(manifest)
+}
+
+/// The count of the person's steers the actor hands the running run, which the run's waiting
+/// calls hand back on.
+fn person_steers(pair: &Pair) -> u64 {
+    let steers = pair.store.person_steers.lock().unwrap();
+    let count = *steers.as_ref().expect("the run took a count").0.borrow();
+    count
+}
+
+/// Only the person's own steer asks the running run's waiting calls to hand back: a steer from
+/// the sender the plan marks `person`, carrying no notice mark, once it is durable. A steer from
+/// another sender, a notice from the person's sender, and a queued send ask nothing.
+#[tokio::test]
+async fn only_the_persons_own_steer_hands_calls_back() {
+    let pair = Pair::new(reading(), true, Cipher::None).await;
+    let reply = pair
+        .send("r1", from(core(), "first"), None, Some(person_plan()), None)
+        .await;
+    assert!(matches!(reply, SendOutcome::Active { .. }), "{reply:?}");
+    assert_eq!(person_steers(&pair), 0);
+    let steer = || Some(json!({"modes": ["steer"]}));
+    let other = pair
+        .send(
+            "q1",
+            from(module(AFT), "a file changed"),
+            steer(),
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(other, SendOutcome::Pending { .. }), "{other:?}");
+    let notice = pair
+        .send(
+            "q2",
+            marked(from(module("gateway"), "relayed"), json!({"notice": true})),
+            steer(),
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(notice, SendOutcome::Pending { .. }), "{notice:?}");
+    let queued = pair
+        .send(
+            "q3",
+            from(module("gateway"), "later"),
+            Some(json!({"modes": ["tool_result"]})),
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
+    assert_eq!(
+        person_steers(&pair),
+        0,
+        "none of those is the person's steer"
+    );
+    let person = pair
+        .send(
+            "q4",
+            from(module("gateway"), "stop and look"),
+            steer(),
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(person, SendOutcome::Pending { .. }), "{person:?}");
+    assert_eq!(person_steers(&pair), 1);
+    pair.release();
+    pair.release();
+    pair.idle().await;
+}

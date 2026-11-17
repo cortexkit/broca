@@ -235,6 +235,7 @@ fn one_of_each() -> Vec<Record> {
             key_derived: None,
         }),
         Record::ToolOutcome(ToolOutcome {
+            yielded_by: None,
             run_id: "run-1".into(),
             batch_id: "b1".into(),
             tool_call_id: ToolCallId("c1".into()),

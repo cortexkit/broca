@@ -295,6 +295,9 @@ struct ActiveRun {
     /// Where the run leaves a weak handle on the compaction transcript it keeps, which the
     /// memory report sizes while the run holds it.
     window: broca_session_loop::shared::RunWindow,
+    /// Counts the person's steers this run took (llm-runner `call_yield`): each one asks the
+    /// run's waiting calls whose provider can hand them back to do so.
+    person_steers: tokio::sync::watch::Sender<u64>,
 }
 
 /// A run to start: the send's request and what the run's start records about the send.
@@ -1323,7 +1326,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let interrupting =
                     order.is_none() && delivery == broca_protocol::Delivery::Interrupt;
                 if let Some(order) = &order {
-                    let admitted = match self.ordered_sender(&request, order) {
+                    let admitted = match self.ordered_sender(&request, order, &key) {
                         Ok(owner) => match &order.template {
                             Some(template) => self
                                 .render_ordered_template(&mut request, template)
@@ -2161,7 +2164,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.session_class = session_class;
         req.retention = prepared.retention;
         let step: broca_core::provider::LiveStepProgress = Arc::default();
+        let (person_steers, person_steers_seen) = tokio::sync::watch::channel(0);
         let control = RunControl {
+            person_steers: Some(broca_core::tool_plane::PersonSteers(person_steers_seen)),
             clock: self.retention_clock.clone(),
             conversation_key,
             cancel: Some(cancel.clone()),
@@ -2269,6 +2274,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             tool_media,
             warming,
             window,
+            person_steers,
         });
     }
 
@@ -4174,6 +4180,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .queue_transformed(start, broca_protocol::Delivery::Steer, prepared, &staged)
                 .await;
         }
+        let person = self.is_person_steer(start.sent_by.as_ref(), start.message_marks.as_ref());
         let receipt = queue::SteerReceipt {
             sent_by: start.sent_by,
             send_id: start.send_id,
@@ -4195,6 +4202,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         if let Err(error) = self.append_own_with_media(record, &staged).await {
             return SendOutcome::Error(format!("{error:?}"));
+        }
+        // Only once the person's steer is durable are the run's waiting calls handed back.
+        if person {
+            self.person_steered();
         }
         SendOutcome::Active {
             run_id: active,

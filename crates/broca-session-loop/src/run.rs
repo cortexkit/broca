@@ -268,6 +268,10 @@ pub struct Seams<'a, P, T> {
     /// Asks for another routed account at a usage wall or definite sign-in loss (see
     /// [`crate::account_move`]). Without it the run ends or pauses as before.
     pub account_continue: Option<&'a dyn crate::account_move::AccountContinue<P>>,
+    /// The person's steers the session's owner counts while the run runs. A call waiting on a
+    /// provider that can hand calls back (llm-runner `call_yield`) is asked to on each one.
+    /// Without it no call is handed back for a steer.
+    pub person_steers: Option<broca_core::tool_plane::PersonSteers>,
 }
 
 impl<'a, P, T> Seams<'a, P, T> {
@@ -279,6 +283,7 @@ impl<'a, P, T> Seams<'a, P, T> {
         auth_selection: broca_wal::AuthSelection,
     ) -> Seams<'b, P, T> {
         Seams {
+            person_steers: self.person_steers.clone(),
             provider,
             tools: self.tools,
             bind: self.bind.clone(),
@@ -4836,7 +4841,8 @@ where
     // The plane learns of the batch first, so it can say where each call goes; the intents then
     // record that, with each call's key, before anything is sent. A plane that refuses the batch
     // leaves every call unsent, with a terminal saying why.
-    let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop));
+    let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop))
+        .with_person_steers(seams.person_steers.clone());
     let refusal = seams
         .tools
         .batch_started_guarded(&ctx, planned, manifest, &guard)
@@ -5523,6 +5529,7 @@ fn no_dispatch(
         media: Vec::new(),
     }));
     records.push(Record::ToolOutcome(ToolOutcome {
+        yielded_by: None,
         run_id: run_id.into(),
         batch_id: batch_id.into(),
         tool_call_id: id.clone(),
@@ -5598,6 +5605,7 @@ fn terminal_with_reason(
         media: Vec::new(),
     }));
     records.push(Record::ToolOutcome(ToolOutcome {
+        yielded_by: None,
         run_id: run_id.into(),
         batch_id: batch_id.into(),
         tool_call_id,
@@ -6541,6 +6549,9 @@ struct Resolved {
     outcome: CallOutcome,
     reason: Option<String>,
     hooks: Option<Value>,
+    /// The provider of a call handed back for the person's steer, whose later terminal for it
+    /// becomes a notice (see [`DispatchResult::Yielded`]).
+    yielded_by: Option<String>,
 }
 
 impl From<(ToolResult, CallOutcome)> for Resolved {
@@ -6550,6 +6561,7 @@ impl From<(ToolResult, CallOutcome)> for Resolved {
             outcome,
             reason: None,
             hooks: None,
+            yielded_by: None,
         }
     }
 }
@@ -6790,27 +6802,53 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         outcome,
         reason,
         hooks,
+        yielded_by,
     } = resolved;
     *tripped |= outcome == CallOutcome::Unknown;
     let id = plan.calls[index].tool_call_id.clone();
-    let durable = open_held.contains(&id);
+    // A handed-back call is durable at once too, naming its provider: from then on the
+    // provider's terminal for it is a notice, even across a crash before the batch ends.
+    let yielded = yielded_by.is_some();
+    let durable = open_held.contains(&id) || yielded;
     if durable {
         let mut records = Vec::new();
-        terminal(
-            &mut records,
-            plan.run_id,
-            plan.batch_id,
-            result.clone(),
-            outcome,
-            (seams.now_ms)(),
-        );
+        if yielded {
+            terminal_with_reason(
+                &mut records,
+                plan.run_id,
+                plan.batch_id,
+                result.clone(),
+                outcome,
+                reason.clone(),
+                Some((seams.now_ms)()),
+            );
+            if let Some(Record::ToolOutcome(record)) = records.last_mut() {
+                record.hooks = hooks.clone().map(Into::into);
+                record.yielded_by = yielded_by.clone();
+            }
+        } else {
+            terminal(
+                &mut records,
+                plan.run_id,
+                plan.batch_id,
+                result.clone(),
+                outcome,
+                (seams.now_ms)(),
+            );
+        }
         writer.append(&records, true).await?;
         open_held.retain(|held| *held != id);
         if let Some(changes) = plan.changes {
             changes.tell(writer, seams).await;
         }
         if let Some(lifecycle) = seams.held {
-            lifecycle.terminal_synced(plan.ctx, &id).await;
+            match &yielded_by {
+                // The provider still owes the handed-back call its own terminal, which arrives
+                // on the provider's late-results feed; a handed-back call was never in a
+                // waiting slot, so there is nothing to release.
+                Some(carrier) => lifecycle.yielded_synced(plan.ctx, carrier).await,
+                None => lifecycle.terminal_synced(plan.ctx, &id).await,
+            }
         }
     }
     answers[index] = Some(Answer {
@@ -6905,6 +6943,11 @@ async fn dispatch_one<T: ToolPlane>(
         DispatchResult::Completed(result) => {
             post_tool(plan.hooks, plan.step_id, call, call_key, result).await
         }
+        // The interim content a hand-back answered with is the call's result, as any result is.
+        DispatchResult::Yielded { result, carrier } => Resolved {
+            yielded_by: Some(carrier),
+            ..post_tool(plan.hooks, plan.step_id, call, call_key, result).await
+        },
         other => resolve(call, other).into(),
     }
 }
@@ -6914,7 +6957,8 @@ async fn dispatch_one<T: ToolPlane>(
 /// reference to stored bytes, or one with the right digest and other metadata, isn't evidence
 /// that this call produced them. Today's loop does the same in `resolve`.
 fn checked(ctx: &BatchCtx, mut answer: DispatchResult) -> DispatchResult {
-    if let DispatchResult::Completed(result) = &mut answer {
+    if let DispatchResult::Completed(result) | DispatchResult::Yielded { result, .. } = &mut answer
+    {
         let captured = ctx
             .media_capture
             .as_ref()
@@ -6999,6 +7043,7 @@ async fn post_tool(
         outcome: CallOutcome::Completed,
         reason,
         hooks: hooks.map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes")),
+        yielded_by: None,
     }
 }
 
@@ -7014,7 +7059,9 @@ fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome)
         is_error: true,
     };
     match result {
-        DispatchResult::Completed(result) => (result, CallOutcome::Completed),
+        DispatchResult::Completed(result) | DispatchResult::Yielded { result, .. } => {
+            (result, CallOutcome::Completed)
+        }
         DispatchResult::NotSent { reason } => (
             error(format!("tool not dispatched: {reason}")),
             CallOutcome::Completed,

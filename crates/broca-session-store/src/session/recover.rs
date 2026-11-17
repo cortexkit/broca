@@ -441,6 +441,7 @@ impl<B: SessionBackend> Session<B> {
                         )
                     };
                     closing_ledger.push(Record::ToolOutcome(ToolOutcome {
+                        yielded_by: None,
                         run_id: run_id.clone(),
                         batch_id: batch_id.clone(),
                         tool_call_id: id.clone(),

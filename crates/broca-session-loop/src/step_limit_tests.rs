@@ -137,6 +137,7 @@ async fn a_run_without_a_stop_condition_has_no_step_limit() {
     );
     let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
     let seams = Seams {
+        person_steers: None,
         provider: &provider,
         tools: &tools,
         bind,

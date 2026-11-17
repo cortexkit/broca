@@ -123,6 +123,12 @@ pub trait ProviderHeldLifecycle: Send + Sync {
     /// acked); before this point a crash could still lose it.
     async fn terminal_synced(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) {}
 
+    /// The batch has synced the terminal of a call its provider, `carrier`, handed back for the
+    /// person's steer ([`DispatchResult::Yielded`]). The provider still owes the call's own
+    /// terminal, which arrives on its late-results feed and becomes a notice, so that feed must
+    /// be read even though no batch waits on the call.
+    async fn yielded_synced(&self, _ctx: &BatchCtx, _carrier: &str) {}
+
     /// Best-effort provider withdrawal after the run's seal is durable. A transport failure
     /// cannot reopen the call; late entries for it are already no-ops.
     async fn withdraw_held(&self, _call: &ProviderHeldReply) -> Result<(), String> {
@@ -257,6 +263,14 @@ pub enum DispatchResult {
         reason: String,
         sent: bool,
     },
+    /// The call was handed back for the person's steer (llm-runner `call_yield`): `result` is
+    /// the interim content the provider answered the yield with, and it is the call's result
+    /// from now on. The work goes on at `carrier`, the call's provider, whose later terminal for
+    /// the call reaches the session as a notice.
+    Yielded {
+        result: ToolResult,
+        carrier: String,
+    },
 }
 
 /// Run signals carried to an approved adapter's final physical-send boundary.
@@ -268,6 +282,8 @@ pub struct DispatchSignals {
     /// The run's absolute step deadline, carried so the route-open wait in front of the send
     /// ends with it (see [`ToolOpenGuard`]). It never makes an enqueued call count as unsent.
     deadline: Option<tokio::time::Instant>,
+    /// Counts the person's own steers the run took (see [`PersonSteers`]).
+    person: Option<PersonSteers>,
 }
 impl DispatchSignals {
     pub fn new(
@@ -278,6 +294,25 @@ impl DispatchSignals {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
             deadline: None,
+            person: None,
+        }
+    }
+
+    /// The person's steers the run has taken so far, or `None` when the run counts none.
+    /// A call reads this as it is sent, then waits in [`Self::person_steered`] for a later one.
+    pub fn person_steers_seen(&self) -> Option<u64> {
+        self.person.as_ref().map(|steers| *steers.0.borrow())
+    }
+
+    /// Resolves once the run takes a person's steer after the `seen`-th, and never when the run
+    /// counts none (or its count can no longer change).
+    pub async fn person_steered(&self, seen: u64) {
+        let Some(PersonSteers(steers)) = &self.person else {
+            return std::future::pending().await;
+        };
+        let mut steers = steers.clone();
+        if steers.wait_for(|count| *count > seen).await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
     pub fn interrupted(&self) -> bool {
@@ -328,10 +363,18 @@ impl From<&DispatchSignals> for ToolOpenGuard {
         Self {
             cancel: signals.cancel.clone(),
             stop: signals.stop.clone(),
+            person: signals.person.clone(),
             deadline: signals.deadline,
         }
     }
 }
+
+/// How many of the person's own steers a run has taken (llm-runner `call_yield`): a steer
+/// whose sender the session's plan marks `person`, carrying no notice mark and no words spoken
+/// for an agent. The session's owner counts them as each one becomes durable; a call waiting on
+/// a provider that can hand calls back asks for that once a steer arrives after it was sent.
+#[derive(Clone, Debug)]
+pub struct PersonSteers(pub tokio::sync::watch::Receiver<u64>);
 
 /// What ends a tool-dispatch route-open wait early: the run's cancel and stop/shutdown
 /// tokens, and the run's absolute step deadline when it has one. A batch builds one guard
@@ -344,6 +387,7 @@ impl From<&DispatchSignals> for ToolOpenGuard {
 pub struct ToolOpenGuard {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    person: Option<PersonSteers>,
     /// The run's step deadline, as an absolute instant: no route-open wait of the batch, and
     /// no open attempt in flight, outlasts it. `None` when the run has none, which leaves the
     /// plane's own patience as the only bound.
@@ -357,8 +401,14 @@ impl ToolOpenGuard {
         Self {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
+            person: None,
             deadline: None,
         }
+    }
+    /// The same guard, with the count of the person's steers its calls hand back on.
+    pub fn with_person_steers(mut self, person: Option<PersonSteers>) -> Self {
+        self.person = person;
+        self
     }
     /// The same guard ending at the absolute `deadline` (the run's step deadline).
     pub fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
@@ -372,6 +422,7 @@ impl ToolOpenGuard {
             cancel: self.cancel.clone(),
             stop: self.stop.clone(),
             deadline: self.deadline,
+            person: self.person.clone(),
         }
     }
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {

@@ -226,6 +226,7 @@ async fn tell(session: &Session<&MemoryBackend>, spy: &CompactionSpy) {
     .unwrap();
     let tools = enrollment_plane();
     let seams = Seams {
+        person_steers: None,
         provider: &provider,
         tools: &tools,
         bind: bind(),

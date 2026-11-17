@@ -495,6 +495,101 @@ impl HeldRunResumer for LateBoundResumer {
             None => Err("the session registry is not running yet".into()),
         }
     }
+
+    /// Sent as the provider's own notice would be, inside broca: it rides the next tool result
+    /// while a call is open, else it arrives as a steer marked `notice`. On an idle session it
+    /// starts a run when the plan lets the provider start runs, and otherwise waits for the
+    /// session's next run. One send id per call, so a redelivered entry is the same send.
+    async fn deliver_late_notice(
+        &self,
+        session: &BindIdentity,
+        notice: broca_module::held_slots::LateNotice,
+    ) -> Result<broca_module::late_results_puller::NoticeOutcome, String> {
+        use broca_module::late_results_puller::NoticeOutcome;
+        use broca_module::ServeHandler;
+        let Some(registry) = self.0.get() else {
+            return Err("the session registry is not running yet".into());
+        };
+        let send_id = broca_module::late_results_puller::notice_send_id(&notice.call_key);
+        let run_id = {
+            let seed = format!("{}\u{1f}{send_id}", broca_core::session_addr(session));
+            broca_protocol::RunId(format!(
+                "run-notice-{}",
+                broca_provider::hash::base62(broca_provider::hash::fnv1a128(&seed))
+            ))
+        };
+        let mut refused = None;
+        for modes in [
+            &["tool_result", "steer", "idle_start"][..],
+            &["tool_result", "steer"],
+        ] {
+            let send = late_notice_send(session, &run_id, &send_id, &notice, modes)?;
+            match registry.send(send).await {
+                Ok(_) => return Ok(NoticeOutcome::Delivered),
+                Err(error) if notice_retryable(&error) => return Err(error.to_string()),
+                Err(error) => refused = Some(error.to_string()),
+            }
+        }
+        Ok(NoticeOutcome::Refused(
+            refused.unwrap_or_else(|| "refused".into()),
+        ))
+    }
+}
+
+/// Builds the send that delivers a handed-back call's late result as a notice, tried with the
+/// delivery `modes`. Its sender is the call's provider (`notice.carrier`), over the internal
+/// scope. It names no model or other run setting, so the session supplies every one
+/// (`InheritedParam::ALL`).
+fn late_notice_send(
+    session: &BindIdentity,
+    run_id: &broca_protocol::RunId,
+    send_id: &str,
+    notice: &broca_module::held_slots::LateNotice,
+    modes: &[&str],
+) -> Result<broca_module::serve::SendRequest, String> {
+    let mut params: broca_wire::SendParams = serde_json::from_value(serde_json::json!({
+        "prompt": notice.text,
+        "send_id": send_id,
+        "delivery": modes,
+    }))
+    .map_err(|error| format!("the notice's send doesn't decode: {error}"))?;
+    // An empty placeholder, as the serve adapter fills an omitted model: the session's frozen
+    // model replaces it before the send is queued or admitted (`InheritedParam::Model`).
+    params.model = Some(crate::wire::ModelParams {
+        provider: String::new(),
+        model: String::new(),
+        variant: None,
+    });
+    let mut send =
+        crate::wire::SendParamsExt::into_send_request(params, session.clone(), run_id.clone())
+            .map_err(|error| format!("the notice's send is malformed: {error}"))?;
+    send.request.inherit_frozen = broca_protocol::request::InheritedParam::ALL
+        .iter()
+        .map(|(param, _)| *param)
+        .collect();
+    send.request.message_marks = [("notice".to_owned(), serde_json::json!(true))]
+        .into_iter()
+        .collect();
+    send.request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: notice.carrier.clone(),
+    });
+    send.request.scope = broca_protocol::SendScope::Internal;
+    Ok(send)
+}
+
+/// Whether a refused notice may be sent again unchanged later: the session or broca was busy,
+/// not the send wrong.
+fn notice_retryable(error: &broca_module::ServeError) -> bool {
+    use broca_module::ServeError;
+    matches!(
+        error,
+        ServeError::Transient(_)
+            | ServeError::Open(_, Some(broca_protocol::ErrorClass::Transient))
+            | ServeError::ModuleStopping(_)
+            | ServeError::SessionHeld(_)
+            | ServeError::SessionMoving { .. }
+            | ServeError::CredentialsUnavailable
+    )
 }
 
 #[cfg(test)]
@@ -504,6 +599,52 @@ mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notice send for a late result builds for both delivery lists broca tries. It names no
+    /// model: the model and every other run setting come from the session. Its sender is the
+    /// call's provider, over the internal scope.
+    #[test]
+    fn a_late_notice_send_builds_and_takes_every_parameter_from_the_session() {
+        let session = BindIdentity::new("/p", "h", "s");
+        let notice = broca_module::held_slots::LateNotice {
+            carrier: "tools".into(),
+            call_key: "lineage:1".into(),
+            text: "the call finished".into(),
+        };
+        for modes in [
+            &["tool_result", "steer", "idle_start"][..],
+            &["tool_result", "steer"],
+        ] {
+            let send = late_notice_send(
+                &session,
+                &broca_protocol::RunId("run-notice-1".into()),
+                "notice-1",
+                &notice,
+                modes,
+            )
+            .unwrap();
+            assert_eq!(send.request.model, broca_protocol::ModelHandle::new("", ""));
+            assert!(send
+                .request
+                .inherit_frozen
+                .contains(&broca_protocol::request::InheritedParam::Model));
+            assert_eq!(
+                send.request.inherit_frozen.len(),
+                broca_protocol::request::InheritedParam::ALL.len()
+            );
+            assert_eq!(
+                send.request.message_marks["notice"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                send.request.principal,
+                Some(broca_protocol::BindPrincipal::Reserved {
+                    module_id: "tools".into()
+                })
+            );
+            assert_eq!(send.request.scope, broca_protocol::SendScope::Internal);
+        }
+    }
 
     #[test]
     fn review_regression_activation_docs_do_not_promise_exactly_once_withdrawal_packets() {

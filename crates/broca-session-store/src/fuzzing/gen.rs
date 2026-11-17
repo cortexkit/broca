@@ -834,6 +834,7 @@ mod records {
         detail,
         hooks,
         call_key,
+        yielded_by,
     });
     crate::fuzzing::gen::fields!(Compaction { version, body });
     crate::fuzzing::gen::fields!(Marker {

@@ -105,6 +105,7 @@ fn intent(id: &str) -> Record {
 
 fn outcome(id: &str, outcome: CallOutcome) -> Record {
     Record::ToolOutcome(ToolOutcome {
+        yielded_by: None,
         run_id: "r".into(),
         batch_id: "b".into(),
         tool_call_id: ToolCallId(id.into()),

@@ -39,6 +39,7 @@ where
     let result = async {
         let now = || 1;
         let seams = broca_session_loop::run::Seams {
+            person_steers: None,
             provider,
             tools,
             bind: req.session.clone(),

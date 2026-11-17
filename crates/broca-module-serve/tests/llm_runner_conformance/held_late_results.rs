@@ -158,7 +158,14 @@ pub(super) fn answer_yield(
     if request["name"] != "tool.yield" {
         return None;
     }
-    assert_eq!(request["arguments"]["reason"], "runner_restart");
+    // Broca asks a call to hand back when it stops for a restart, or on the person's steer.
+    assert!(
+        matches!(
+            request["arguments"]["reason"].as_str(),
+            Some("runner_restart" | "person_message")
+        ),
+        "{request}"
+    );
     assert!(request.get("call_key").is_none());
     let key = request["arguments"]["call_key"].as_str().unwrap();
     let mut feed = shared.held_feed.lock().unwrap();
@@ -187,7 +194,7 @@ pub(super) async fn answer_waiting_yield(
     arguments: &str,
     request: &Value,
 ) -> Option<subc_client_rs::HandlerOutcome> {
-    let receiver = {
+    let (receiver, key) = {
         let mut feed = shared.held_feed.lock().unwrap();
         if !feed.yield_arguments.contains(arguments) || !feed.yield_routes.contains(&route) {
             return None;
@@ -198,8 +205,11 @@ pub(super) async fn answer_waiting_yield(
             .to_owned();
         feed.held_keys.insert(arguments.to_owned(), key.clone());
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        assert!(feed.waiting_yields.insert(key, (route, sender)).is_none());
-        receiver
+        assert!(feed
+            .waiting_yields
+            .insert(key.clone(), (route, sender))
+            .is_none());
+        (receiver, key)
     };
     *shared
         .invocations
@@ -207,7 +217,22 @@ pub(super) async fn answer_waiting_yield(
         .unwrap()
         .entry(arguments.to_owned())
         .or_default() += 1;
-    receiver.await.expect("runner asked the live call to yield");
+    // A call the suite holds shows as arrived, and its release ends the wait without a yield:
+    // the provider then answers it as any finished call, with its scripted result.
+    let gate = shared.holds.lock().unwrap().get(arguments).cloned();
+    match gate {
+        Some(gate) => {
+            HoldGate::set(&gate.arrived, &gate.arrived_wake);
+            tokio::select! {
+                yielded = receiver => yielded.expect("runner asked the live call to yield"),
+                () = HoldGate::wait(&gate.released, &gate.released_wake) => {
+                    shared.held_feed.lock().unwrap().waiting_yields.remove(&key);
+                    return None;
+                }
+            }
+        }
+        None => receiver.await.expect("runner asked the live call to yield"),
+    }
     Some(subc_client_rs::HandlerOutcome::Response(
         serde_json::to_vec(&json!({
             "content":[{"type":"text","text":INTERIM}],"held":{"reason":"running","yielded":true}
@@ -1411,4 +1436,44 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
     );
     drop(live);
     case.finish();
+}
+
+/// Arm the call with `arguments` in `session` to hand back on request (llm-runner
+/// `call_yield`): the provider declares `call.yield/v1` and late results to that session's
+/// routes, and keeps the call open until broca asks it to yield or the suite releases it.
+pub(super) fn install_call_yield(shared: &Shared, session: &str, arguments: &Value) {
+    mark_call_yield_session(shared, session);
+    let mut feed = shared.held_feed.lock().unwrap();
+    feed.yield_arguments.insert(arguments.to_string());
+}
+
+/// Declare late results and `call.yield/v1` to `session`'s routes.
+pub(super) fn mark_call_yield_session(shared: &Shared, session: &str) {
+    let mut feed = shared.held_feed.lock().unwrap();
+    feed.enabled = true;
+    feed.sessions.insert(session.into());
+    feed.yield_sessions.insert(session.into());
+}
+
+/// What the provider saw of the call with `arguments`: its key, and the yields and withdrawals
+/// broca asked for it.
+pub(super) fn yields_seen(shared: &Shared, arguments: &Value) -> (String, Vec<Value>, Vec<Value>) {
+    let feed = shared.held_feed.lock().unwrap();
+    let key = feed
+        .held_keys
+        .get(&arguments.to_string())
+        .cloned()
+        .unwrap_or_default();
+    let of_call = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|request| !key.is_empty() && request["arguments"]["call_key"] == key)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    (
+        key.clone(),
+        of_call(&feed.yield_requests),
+        of_call(&feed.withdrawals),
+    )
 }

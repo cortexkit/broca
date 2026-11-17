@@ -216,6 +216,7 @@ impl RunExecutor for Executor {
             };
             let now = || self.provider.clock.now_ms();
             let seams = broca_session_loop::run::Seams {
+                person_steers: None,
                 provider: &self.provider,
                 tools: &StubToolPlane::new(),
                 bind: req.session.clone(),

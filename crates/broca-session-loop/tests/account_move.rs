@@ -834,6 +834,7 @@ fn seams<'a>(
     stop: tokio_util::sync::CancellationToken,
 ) -> Seams<'a, Box<dyn Provider>, StubToolPlane> {
     Seams {
+        person_steers: None,
         provider,
         tools,
         bind: bind(),

@@ -34,7 +34,7 @@ use broca_protocol::{BindIdentity, ToolCall, ToolCallId, ToolResult};
 use cortexkit_role_tool_provider::late_results::LateEntry;
 use tokio::sync::{oneshot, Notify};
 
-use crate::late_results_puller::HeldDelivery;
+use crate::late_results_puller::{HeldDelivery, NoticeOutcome, YieldedCall};
 
 /// One held call's waiting slot.
 #[derive(Default)]
@@ -57,8 +57,9 @@ struct Slot {
 #[derive(Default)]
 pub struct HeldSlots {
     slots: Mutex<HashMap<(BindIdentity, ToolCallId), Slot>>,
-    /// Told the provider module each time a batch starts waiting on a held call, so that
-    /// module's puller runs while the call waits.
+    /// Told the provider module each time a batch starts waiting on a held call, or syncs a
+    /// call that module handed back, so that module's puller runs while the call waits or its
+    /// own terminal is owed.
     on_hold: std::sync::OnceLock<OnHold>,
     withdrawals: std::sync::OnceLock<Arc<dyn HeldWithdrawal>>,
 }
@@ -78,8 +79,9 @@ impl HeldSlots {
         Arc::new(Self::default())
     }
 
-    /// Install what to do when a batch starts waiting on a call held by a module: start that
-    /// module's puller. Installed once; a later call is ignored.
+    /// Install what to do when a batch starts waiting on a call held by a module, or syncs a
+    /// call the module handed back: start that module's puller. Installed once; a later call is
+    /// ignored.
     pub fn on_hold(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
         let _ = self.on_hold.set(Box::new(hook));
     }
@@ -208,6 +210,12 @@ impl ProviderHeldLifecycle for HeldSlots {
         }
     }
 
+    async fn yielded_synced(&self, _ctx: &BatchCtx, carrier: &str) {
+        if let Some(hook) = self.on_hold.get() {
+            hook(carrier);
+        }
+    }
+
     async fn terminal_synced(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) {
         let slot = self
             .slots
@@ -232,6 +240,53 @@ pub type EntryMapper = dyn Fn(&ToolCallId, &LateEntry) -> Option<ToolResult> + S
 #[async_trait]
 pub trait HeldRunResumer: Send + Sync {
     async fn resume_for_late_result(&self, session: &BindIdentity) -> Result<(), String>;
+
+    /// Send `notice` to `session` as a notice from the call's provider (llm-runner
+    /// `call_yield`): it rides the next tool result while a call is open, else it arrives as a
+    /// steer marked `notice`.
+    async fn deliver_late_notice(
+        &self,
+        _session: &BindIdentity,
+        _notice: LateNotice,
+    ) -> Result<NoticeOutcome, String> {
+        Err("this resumer delivers no notices".into())
+    }
+}
+
+/// A handed-back call's terminal, as the notice its session receives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LateNotice {
+    /// The call's provider, the notice's sender.
+    pub carrier: String,
+    pub call_key: String,
+    /// What the model reads: which call it is, and its final result.
+    pub text: String,
+}
+
+/// The words a handed-back call's final result reaches the model in. The model already took
+/// the call's interim result, so the notice names the call it belongs to: by the id the model
+/// called it under, and by `call_key`, the key its provider knows it by.
+pub fn notice_text(
+    call: &YieldedCall,
+    call_key: &str,
+    result: &broca_protocol::ToolResult,
+) -> String {
+    let tool = if call.tool_name.is_empty() {
+        "tool".to_owned()
+    } else {
+        format!("`{}`", call.tool_name)
+    };
+    let ended = if result.is_error {
+        "failed"
+    } else {
+        "finished"
+    };
+    format!(
+        "The {tool} call {} (key {call_key}) you got an interim result for has now {ended}. \
+         Its final result:\n\n{}",
+        call.tool_call_id.0,
+        broca_core::tool_results::post_tool_text(result)
+    )
 }
 
 #[async_trait]
@@ -298,6 +353,25 @@ impl HeldDelivery for SlotDelivery {
             Ok(Err(_)) => Err("the held call's slot closed before its terminal was synced".into()),
             Err(_) => Err("the run did not sync the held call's terminal in time".into()),
         }
+    }
+
+    async fn notice(
+        &self,
+        registration: &LateResultRegistration,
+        call: &YieldedCall,
+        entry: &LateEntry,
+    ) -> Result<NoticeOutcome, String> {
+        let Some(result) = (self.mapper)(&call.tool_call_id, entry) else {
+            return Err(format!("a {} entry settles no call", entry.kind));
+        };
+        let notice = LateNotice {
+            carrier: registration.module.clone(),
+            call_key: registration.call_key.clone(),
+            text: notice_text(call, &registration.call_key, &result),
+        };
+        self.resumer
+            .deliver_late_notice(&registration.bind, notice)
+            .await
     }
 }
 

@@ -80,6 +80,7 @@ impl RunExecutor for Executor {
             let now = || 1;
             let holding = Holding;
             let mut seams = broca_session_loop::run::Seams {
+                person_steers: None,
                 provider: &self.provider,
                 tools: &self.plane,
                 bind: req.session.clone(),
