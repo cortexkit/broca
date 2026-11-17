@@ -2547,10 +2547,19 @@ mod tests {
     /// production overlay carried a real one (deepseek-chat) until upstream withdrew that id
     /// on 2026-09-18; a refusal message contract must not depend on a vendor keeping a dead
     /// row, so the subject lives here. No other test in this module resolves the model.
-    fn seed_catalog_for_resolution() {
-        use std::sync::Once;
-        static SEEDED: Once = Once::new();
-        SEEDED.call_once(|| {
+    ///
+    /// The returned guard holds the process's catalog gate for the rest of the test. The cache
+    /// is one slot for the whole test binary, and a test that installs a catalog of its own
+    /// leaves it there, so each caller installs the seeded catalog again under the gate rather
+    /// than trusting that an earlier install is still in place.
+    #[must_use = "the seeded catalog stays installed only while the guard is held"]
+    fn seed_catalog_for_resolution() -> std::sync::MutexGuard<'static, ()> {
+        static SEEDED: std::sync::OnceLock<std::sync::Arc<crate::CatalogCache>> =
+            std::sync::OnceLock::new();
+        let held = crate::test_catalog_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let cache = SEEDED.get_or_init(|| {
             let mut overlay: serde_json::Value =
                 serde_json::from_str(include_str!("../data/overlay.json"))
                     .expect("bundled overlay is JSON");
@@ -2575,8 +2584,10 @@ mod tests {
             .expect("bundled snapshot is well formed");
             let cache = std::sync::Arc::new(crate::CatalogCache::empty());
             cache.install_parsed_for_test(&catalog, 0, crate::CatalogSource::Fusiform);
-            crate::install_global_catalog_cache(cache);
+            cache
         });
+        crate::install_global_catalog_cache(std::sync::Arc::clone(cache));
+        held
     }
 
     #[test]
@@ -2603,7 +2614,7 @@ mod tests {
     /// run recorded.
     #[test]
     fn moonshot_routes_freeze_schema_typing_and_v6_and_other_chat_routes_stay_v5() {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let options = ResolveOptions::default();
         let fresh = |model: &str| {
             resolve_catalog_episode_with_client(
@@ -2698,7 +2709,7 @@ mod tests {
 
     #[test]
     fn opencode_go_resume_restores_recorded_family_and_base_url() {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let options = ResolveOptions::default();
         let session_id = ClaudeCodePersona::derive_session_id("opaque-session-ref");
         let fresh = resolve_catalog_episode_with_client(
@@ -2792,7 +2803,7 @@ mod tests {
 
     #[test]
     fn catalog_refusal_distinguishes_overlay_retirement_from_unknown_model() {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let resolve_error = |model| {
             resolve_provider(
                 model,
@@ -2888,7 +2899,7 @@ mod tests {
     /// Resolve an id on the ChatGPT override path the way the serve layer does, with no
     /// credential (the pause-only constructor), returning the frozen config or the refusal.
     fn resolve_chatgpt(model: &str) -> Result<FrozenRenderConfig, String> {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         resolve_chatgpt_pause_provider_with_client(
             model,
             None,
@@ -2917,7 +2928,7 @@ mod tests {
         assert_eq!(frozen.reasoning_effort, None);
         assert_eq!(frozen.service_tier, None);
         // On the ordinary catalog path.
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let resolved = resolve_provider(
             "deepseek/deepseek-v4-pro",
             None,
@@ -2961,7 +2972,7 @@ mod tests {
     }
 
     fn resolved_anthropic(method: AuthMethod) -> (ProviderResolution, FrozenRenderConfig) {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let resolved = resolve_provider(
             "anthropic/claude-opus-4-8",
             None,
@@ -3116,7 +3127,7 @@ mod tests {
             without.as_object_mut().unwrap().remove("ride_placement");
             assert_eq!(without, fresh, "the member is the only difference");
         });
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let other = resolve("openai/gpt-5.5-pro", EpisodeRenderConfig::default());
         assert_ne!(other["family_id"], "anthropic_messages");
         assert!(other.get("ride_placement").is_none(), "{other}");
@@ -3325,7 +3336,7 @@ mod tests {
         fallback: Option<&str>,
         render: EpisodeRenderConfig<'_>,
     ) -> (FrozenRenderConfig, Vec<u8>) {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let persona = test_persona();
         let cache = CachePolicy {
             version: 1,
@@ -3368,7 +3379,7 @@ mod tests {
     /// variant, and an endpoint for a model the catalog doesn't list, which gives none.
     #[test]
     fn the_refresh_time_context_limit_is_the_one_a_fresh_run_freezes() {
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let client = broca_provider::build_provider_http_client;
         let secret = AuthMode::Secret(TOP_LEVEL.to_owned());
         let plain = ResolveOptions::default();
@@ -4219,11 +4230,14 @@ mod tests {
     }
 
     #[tokio::test]
+    // The catalog gate is held for the whole test, awaits included: it is a plain mutex
+    // that only orders tests, each on its own runtime thread.
+    #[allow(clippy::await_holding_lock)]
     async fn xai_subscription_method_survives_step_resolution_and_recorded_warm() {
         use broca_protocol::{ErrorClass, NormalizedEvent, ProviderControl};
         use tokio::io::AsyncWriteExt;
 
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         for (method, expected_code, expected_class) in [
             (
                 AuthMethod::Oauth,
@@ -4313,6 +4327,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The catalog gate is held for the whole test, awaits included: it is a plain mutex
+    // that only orders tests, each on its own runtime thread.
+    #[allow(clippy::await_holding_lock)]
     async fn websocket_step_and_recorded_https_warm_share_cache_affinity() {
         use futures::{SinkExt, StreamExt};
         use tokio::io::AsyncWriteExt;
@@ -4337,7 +4354,7 @@ mod tests {
             }
         }
 
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let long_key = "caller-cache-scope-".repeat(8);
         for (caller_key, session_id, served_account) in [
             (
@@ -4489,10 +4506,13 @@ mod tests {
     }
 
     #[tokio::test]
+    // The catalog gate is held for the whole test, awaits included: it is a plain mutex
+    // that only orders tests, each on its own runtime thread.
+    #[allow(clippy::await_holding_lock)]
     async fn recorded_codex_warm_sends_the_same_session_headers_as_a_step() {
         use tokio::io::AsyncWriteExt;
 
-        seed_catalog_for_resolution();
+        let _catalog = seed_catalog_for_resolution();
         let long_key = "caller-cache-scope-".repeat(8);
         // Exercise caller scope precedence, clamping, session-derived scope and legacy fallback.
         for (caller_key, session_id, served_account) in [
