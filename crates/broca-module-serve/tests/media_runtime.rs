@@ -2,6 +2,8 @@
 mod delivery_rig;
 #[path = "media_runtime/refusals.rs"]
 mod refusals;
+#[path = "media_runtime/tool_outputs.rs"]
+mod tool_outputs;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
@@ -262,8 +264,10 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         assert!(next.to_string().contains("reason=modality"), "{next}");
         assert!(!next.to_string().contains(&STANDARD.encode(PNG)));
     }
-    let inline = result(&call(&mut rig, "session.read", json!({})).await);
-    let blocks = result(&call(&mut rig, "session.read", json!({"media":"blocks"})).await);
+    let inline_frame = call(&mut rig, "session.read", json!({})).await;
+    let inline = result(&inline_frame);
+    let blocks_frame = call(&mut rig, "session.read", json!({"media":"blocks"})).await;
+    let blocks = result(&blocks_frame);
     let output = |page: &Value| {
         page["messages"]
             .as_array()
@@ -281,6 +285,33 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         .contains("reason=not_requested"));
     assert_eq!(output(&blocks)["kind"], "parts");
     assert_eq!(output(&blocks)["parts"][1]["media"]["sha256"], digest(PNG));
+    // The image a tool returned reads back by its digest, as a photo the person sent does.
+    let media_frame = call(
+        &mut rig,
+        "session.media_read",
+        json!({"sha256": digest(PNG), "offset": 0, "length": PNG.len()}),
+    )
+    .await;
+    assert_eq!(
+        result(&media_frame)["data"],
+        json!(STANDARD.encode(PNG)),
+        "the tool's image reads back whole"
+    );
+    let refs_frame = call(&mut rig, "session.read", json!({"media":"media_refs"})).await;
+    // `media_refs` keeps a tool result's inline text and markers: only media the inline read
+    // serves in place becomes a reference, and a tool's image is a marker there.
+    assert_eq!(
+        output(&result(&refs_frame)),
+        output(&inline),
+        "{}",
+        String::from_utf8_lossy(&refs_frame.body)
+    );
+    if accepts_images {
+        sample("tool-image", "session-read-default", &[inline_frame]);
+        sample("tool-image", "session-read-media-refs", &[refs_frame]);
+        sample("tool-image", "session-read-blocks", &[blocks_frame]);
+        sample("tool-image", "session-media-read", &[media_frame]);
+    }
     let configs = rig.run_configs().await;
     assert_eq!(configs.len(), 1);
     assert_eq!(

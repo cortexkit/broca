@@ -1586,6 +1586,28 @@ async fn run_client(
     run_client_with_probe(daemon, project_root, session, args, None).await
 }
 
+/// [`run_client`] for the first send on a rig with a live vault. Broca loads the vault's
+/// credential listing on the first send that needs it, and refuses that send with the contract's
+/// retryable `transient` until the listing arrives; a refused send starts no run, so a client
+/// sends it again, as core does. A send that started is returned as it finished.
+async fn run_client_when_listed(
+    daemon: &Daemon,
+    project_root: &Path,
+    session: &str,
+    args: &[&str],
+) -> ClientRun {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let run = run_client(daemon, project_root, session, args).await;
+        let unlisted =
+            run.saw("vault credential listing has not loaded yet") && !run.saw("SEND state=active");
+        if !unlisted || std::time::Instant::now() >= deadline {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Run one `broca-session` command and return its raw stdout and stderr, for byte comparisons.
 async fn run_client_output(
     daemon: &Daemon,
@@ -1898,7 +1920,7 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
     let project_root = daemon.dir.join("meta-muse-project");
     std::fs::create_dir_all(&project_root).unwrap();
     let session = "meta-muse";
-    let run = run_client(
+    let run = run_client_when_listed(
         &daemon,
         &project_root,
         session,
@@ -2043,7 +2065,7 @@ async fn anthropic_oauth_run_through_the_module_sends_the_claude_code_persona() 
 
     let project_root = daemon.dir.join("anthropic-persona-project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let run = run_client(
+    let run = run_client_when_listed(
         &daemon,
         &project_root,
         "anthropic-persona",
@@ -2567,7 +2589,7 @@ async fn a_lone_dead_api_key_is_refused_before_any_run() {
 
     let run = timeout(
         Duration::from_secs(60),
-        run_client(
+        run_client_when_listed(
             &daemon,
             &project_root,
             "dead-cred",
@@ -2706,7 +2728,7 @@ async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_ca
 
     let rejected = timeout(
         Duration::from_secs(60),
-        run_client(
+        run_client_when_listed(
             &daemon,
             &project_root,
             "vault-provider-rejection",
@@ -2820,7 +2842,7 @@ async fn a_repaired_credential_resumes_the_paused_run() {
 
     timeout(
         Duration::from_secs(60),
-        run_client(&daemon, &project_root, "resume", &send_args),
+        run_client_when_listed(&daemon, &project_root, "resume", &send_args),
     )
     .await
     .expect("the first send must terminate");
@@ -2920,7 +2942,7 @@ async fn a_revoked_handle_does_not_change_a_grant_read() {
     std::fs::create_dir_all(&project_root).unwrap();
     let run = timeout(
         Duration::from_secs(60),
-        run_client(
+        run_client_when_listed(
             &daemon,
             &project_root,
             "revoked-handle",
