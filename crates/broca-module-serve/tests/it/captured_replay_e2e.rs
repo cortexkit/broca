@@ -1143,14 +1143,31 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
     );
     assert_eq!(error.message,
         "open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]");
-    // Every file of every session, compared whole: a refused send writes nothing anywhere,
+    // Every file of every session, compared whole: a refused send leaves nothing anywhere,
     // whatever address it would have keyed. The two admitted sessions were read back from these
-    // same roots above, which proves the snapshot sees where sessions are written.
-    assert_eq!(
-        super::stored_log::stored_files(&daemon.broca_state_root()),
-        stored_before_refusal,
-        "a refused send writes nothing to the new storage"
-    );
+    // same roots above, which proves the snapshot sees where sessions are written. A creating
+    // send opens its session to resolve the run, and a refused one deletes that session again,
+    // which can finish after the refusal is answered; so the files are compared once the store
+    // has settled, and a session that is never deleted fails here, showing what it left.
+    let state_root = daemon.broca_state_root();
+    broca_test_support::wait_for(
+        "the refused send's session to be deleted",
+        async {
+            while super::stored_log::stored_files(&state_root) != stored_before_refusal {
+                sleep(Duration::from_millis(50)).await;
+            }
+        },
+        || {
+            format!(
+                "left behind: {:?}",
+                super::stored_log::stored_files(&state_root)
+                    .into_iter()
+                    .filter(|(path, size)| stored_before_refusal.get(path) != Some(size))
+                    .collect::<Vec<_>>()
+            )
+        },
+    )
+    .await;
     assert_eq!(
         replay.request_bodies.lock().unwrap().len(),
         requests_before_refusal,
