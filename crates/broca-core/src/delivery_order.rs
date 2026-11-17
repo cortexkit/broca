@@ -62,6 +62,23 @@ impl Boundary {
     };
 }
 
+/// `senders` with each module spelled by its canonical id ([`broca_protocol::canonical_module`]).
+/// The contract's delivery checks compare ids exactly; a plan written before a module's rename
+/// names its old id and a caller after it presents the new one, so both sides are passed
+/// through the canonical spelling.
+pub fn canonical_senders(
+    senders: &[cortexkit_role_llm_runner::delivery_order::PlanSender],
+) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+    senders
+        .iter()
+        .cloned()
+        .map(|mut sender| {
+            sender.module = broca_protocol::canonical_module(&sender.module).to_owned();
+            sender
+        })
+        .collect()
+}
+
 /// The first mode of `order` possible at `boundary`, or `None` when the send must wait.
 /// `has_text` says whether the send's input is text only (required by `tool_result`).
 pub fn choose_mode(
@@ -738,6 +755,29 @@ impl RideLedger {
             forms: forms.clone(),
             form: broca_wal::record::RideForm::Append,
         })
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use cortexkit_role_llm_runner::delivery_order::{admit, Mode, PlanSender};
+
+    /// A plan written before a module's rename names its old id; the module sends under its new
+    /// one afterwards, and keeps the plan's grants. A near name gets none.
+    #[test]
+    fn a_plan_naming_a_modules_old_id_grants_its_new_one() {
+        let senders: Vec<PlanSender> = serde_json::from_value(serde_json::json!([
+            {"module": "prefrontal-core", "idle_start": true}
+        ]))
+        .unwrap();
+        let senders = super::canonical_senders(&senders);
+        let owner = Some("reserved:cingulate");
+        for caller in ["prefrontal", "prefrontal-core"] {
+            let caller = broca_protocol::canonical_module(caller);
+            assert_eq!(admit(caller, owner, &senders, &[Mode::IdleStart]), Ok(()));
+        }
+        let near = broca_protocol::canonical_module("prefrontal2");
+        assert!(admit(near, owner, &senders, &[Mode::IdleStart]).is_err());
     }
 }
 

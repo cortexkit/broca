@@ -371,13 +371,16 @@ pub fn head_sender(
         .as_ref()
         .map(|scope| &scope.owner)
         .or(ownership.first_principal.as_ref())?
-        .as_owner_string();
+        .canonical_owner_string();
+    // The contract compares ids exactly; a renamed module's two ids compare as one.
+    let module_id = broca_protocol::canonical_module(module_id);
+    let senders = &crate::delivery_order::canonical_senders(senders);
     let granted = modes
         .iter()
         .filter(|mode| delivery_order::admit(module_id, Some(&owner), senders, &[**mode]).is_ok())
         .map(|mode| mode.as_str().to_owned())
         .collect::<Vec<_>>();
-    senders.iter().find(|sender| &sender.module == module_id)?;
+    senders.iter().find(|sender| sender.module == module_id)?;
     let interrupt = delivery_order::admit_delivery(
         module_id,
         Some(&owner),

@@ -96,9 +96,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return false;
         }
         self.plan_senders().is_ok_and(|plan| {
-            plan.senders
-                .iter()
-                .any(|listed| &listed.module == module_id && listed.person)
+            plan.senders.iter().any(|listed| {
+                broca_protocol::same_module(&listed.module, module_id) && listed.person
+            })
         })
     }
 
@@ -138,7 +138,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let PlanSenders { senders, refreshed } = self.plan_senders()?;
         // Without a sender policy from a refresh, a module the plan doesn't name is left to the
         // owner check further on, as today's actor leaves it.
-        if !senders.iter().any(|sender| &sender.module == module_id) {
+        if !senders
+            .iter()
+            .any(|sender| broca_protocol::same_module(&sender.module, module_id))
+        {
             if refreshed {
                 return Err(SendOutcome::DeliveryRefused {
                     code: errors::SCOPE_OWNER_MISMATCH,
@@ -158,10 +161,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 cortexkit_role_llm_runner::send::Delivery::Interrupt
             }
         };
+        // The contract compares ids exactly; a renamed module's two ids compare as one.
         role::admit_delivery(
-            module_id,
-            Some(&frozen.as_owner_string()),
-            &senders,
+            broca_protocol::canonical_module(module_id),
+            Some(&frozen.canonical_owner_string()),
+            &broca_core::delivery_order::canonical_senders(&senders),
             role_delivery,
         )
         .map_err(|(code, field)| SendOutcome::DeliveryRefused {
@@ -217,7 +221,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ));
         };
         let senders = self.plan_senders()?.senders;
-        let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
+        let Some(sender) = senders
+            .iter()
+            .find(|sender| broca_protocol::same_module(&sender.module, module_id))
+        else {
             // Broca's own delivery of a handed-back call's late result (llm-runner `call_yield`):
             // the contract sends it as the call's provider whether or not the plan names that
             // module. A caller never sends with the internal scope: serve sets every caller's
@@ -273,7 +280,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let senders = self.plan_senders()?.senders;
         let templates = senders
             .iter()
-            .find(|sender| &sender.module == module_id)
+            .find(|sender| broca_protocol::same_module(&sender.module, module_id))
             .map(|sender| sender.templates.as_slice())
             .unwrap_or_default();
         let numbers = if templates

@@ -417,7 +417,7 @@ impl StoredLineage {
                 settled_without_delivery(module, entry, "not_held")
             };
         };
-        if held.module != module {
+        if !broca_protocol::same_module(&held.module, module) {
             return settled_without_delivery(module, entry, "dispatched_elsewhere");
         }
         if call.closing {

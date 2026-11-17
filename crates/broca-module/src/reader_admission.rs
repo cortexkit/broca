@@ -131,7 +131,7 @@ pub async fn admit<B: SessionBackend>(
         Some(BindPrincipal::Direct) if direct => caller,
         _ => &unmatched_owner,
     };
-    let own_send = if caller != owner {
+    let own_send = if !broca_protocol::same_module(caller, owner) {
         if let Some((run, send_id)) = &access.send {
             crate::store_status::authorization_own_send(
                 session,
@@ -150,11 +150,12 @@ pub async fn admit<B: SessionBackend>(
     let facts = ReadAdmission::new(current.is_ok())
         .with_local_operator(direct)
         .with_own_send(own_send);
+    // The contract compares ids exactly; a renamed module's two ids compare as one.
     let allowed = app_readers::admit(
         &effective,
         Some(&accepted),
-        caller,
-        owner,
+        broca_protocol::canonical_module(caller),
+        broca_protocol::canonical_module(owner),
         &access.op,
         facts,
     )

@@ -488,6 +488,9 @@ impl LateResultsIntake {
     /// this process only: a puller never outlives its process, so a crash leaves nothing that
     /// could keep the next process from starting one.
     pub async fn ensure_puller(self: &Arc<Self>, module: &str) -> Result<StartOutcome, String> {
+        // One puller per module, whichever of a renamed module's ids its calls were made under:
+        // its feed opens under the id the daemon lists now (see `LateResultsFeed::open`).
+        let module = broca_protocol::canonical_module(module);
         if !self.module_needs_feed(module).await? {
             return Ok(StartOutcome::Idle);
         }
@@ -833,7 +836,10 @@ impl LateResultsIntake {
         let kind = self.classify(module, entry, rows, views).await?;
         let session_address = rows
             .iter()
-            .find(|row| row.call.module == module && row.call.call_key == entry.call_key)
+            .find(|row| {
+                broca_protocol::same_module(&row.call.module, module)
+                    && row.call.call_key == entry.call_key
+            })
             .map(|row| broca_core::session_addr(&row.call.bind));
         match kind {
             Classified::NoOp => {
@@ -889,10 +895,10 @@ impl LateResultsIntake {
             );
             return Ok(Classified::NoOp);
         }
-        let Some(row) = rows
-            .iter()
-            .find(|row| row.call.module == module && row.call.call_key == entry.call_key)
-        else {
+        let Some(row) = rows.iter().find(|row| {
+            broca_protocol::same_module(&row.call.module, module)
+                && row.call.call_key == entry.call_key
+        }) else {
             // No registration names this lineage. Every call that can still settle was
             // registered before its key was sent, so this entry can never be delivered.
             return Ok(Classified::NoOp);
@@ -942,10 +948,10 @@ impl LateResultsIntake {
             if self.store.receipt(&key)?.is_some() {
                 continue;
             }
-            let Some(row) = rows
-                .iter()
-                .find(|row| row.call.module == module && row.call.call_key == entry.call_key)
-            else {
+            let Some(row) = rows.iter().find(|row| {
+                broca_protocol::same_module(&row.call.module, module)
+                    && row.call.call_key == entry.call_key
+            }) else {
                 continue;
             };
             let stored = views
@@ -1153,7 +1159,7 @@ fn settled_without_delivery(module: &str, entry: &LateEntry, reason: &str) -> Cl
 fn scope_matches(registration: &LateResultRegistration, entry: &LateEntry) -> bool {
     match &registration.scope {
         Some(scope) => {
-            scope.owner.as_owner_string() == entry.owner
+            broca_protocol::same_owner_string(&scope.owner.as_owner_string(), &entry.owner)
                 && scope.scope_ref == entry.scope_ref
                 && scope.scope_epoch == entry.scope_epoch
         }

@@ -86,9 +86,16 @@ impl HeldCalls {
             }),
             _ => None,
         };
-        if identity.as_ref() != Some(&row.scope)
+        let same_scope = identity.as_ref().is_some_and(|identity| {
+            broca_protocol::same_owner_string(&identity.owner, &row.scope.owner)
+                && identity.scope_ref == row.scope.scope_ref
+                && identity.scope_epoch == row.scope.scope_epoch
+        });
+        if !same_scope
             || row.batch_scope != admission.scope
-            || principal.map(BindPrincipal::as_owner_string).as_deref() != Some(&row.principal)
+            || !principal.is_some_and(|principal| {
+                broca_protocol::same_owner_string(&principal.as_owner_string(), &row.principal)
+            })
             || call_key != row.call_key
         {
             return Err(refusal(
@@ -253,7 +260,9 @@ impl HeldCalls {
 
     // The wire cursor has no principal field. Binding its opaque incarnation to the caller
     // prevents a cursor copied from another custodian from acknowledging this caller's work.
+    // The canonical spelling keeps a custodian's cursor valid across its module's rename.
     fn caller_incarnation(&self, principal: &str) -> String {
+        let principal = broca_protocol::canonical_owner(principal);
         super::admission::hash(&json!({"launch":self.incarnation,"principal":principal}))
     }
 }

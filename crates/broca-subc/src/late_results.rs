@@ -229,12 +229,15 @@ impl LateResultsFeed {
             });
         }
         let catalog = crate::provider_catalog::ProviderCatalog::from(conn.catalog_list().await?);
+        // Calls keep the id their module had when they were made; the feed opens under the id
+        // the daemon lists now, so a renamed module's late results reach its old calls.
+        let live = crate::provider_catalog::live_module_id(&catalog, module);
         // The feed aggregates the custodian's calls across conversations; its dedicated
         // maintenance identity must never become a conversation's compaction identity.
         let policy =
-            crate::connection::ToolProviderRoutePolicy::for_provider(&catalog, module, false);
+            crate::connection::ToolProviderRoutePolicy::for_provider(&catalog, &live, false);
         let route = conn
-            .route_open_tool_provider_with_policy(module, identity, None, policy)
+            .route_open_tool_provider_with_policy(&live, identity, None, policy)
             .await?;
         Ok(Self {
             conn,

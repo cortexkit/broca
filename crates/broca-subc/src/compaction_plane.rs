@@ -46,23 +46,22 @@ impl CapabilityCatalog {
         let result = tokio::time::timeout(CATALOG_READ_BUDGET, read).await;
         let mut last = self.last.lock().unwrap_or_else(|error| error.into_inner());
         match result {
-            Ok(Ok(entries)) => match entries
-                .into_iter()
-                .find(|entry| entry.module_id == provider)
-            {
-                Some(entry) => {
-                    let provides = entry
-                        .capabilities
-                        .map(|caps| caps.provides)
-                        .unwrap_or_default();
-                    last.insert(provider.to_owned(), provides.clone());
-                    ProviderCapabilities::Declared(provides)
+            Ok(Ok(entries)) => {
+                match crate::provider_catalog::find_module(&entries, provider).cloned() {
+                    Some(entry) => {
+                        let provides = entry
+                            .capabilities
+                            .map(|caps| caps.provides)
+                            .unwrap_or_default();
+                        last.insert(provider.to_owned(), provides.clone());
+                        ProviderCapabilities::Declared(provides)
+                    }
+                    None => {
+                        last.remove(provider);
+                        ProviderCapabilities::NotInCatalog
+                    }
                 }
-                None => {
-                    last.remove(provider);
-                    ProviderCapabilities::NotInCatalog
-                }
-            },
+            }
             failure => {
                 let kept = last.get(provider).cloned();
                 tracing::warn!(provider, used_kept_list = kept.is_some(), error = ?failure,

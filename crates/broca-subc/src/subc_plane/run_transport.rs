@@ -206,12 +206,9 @@ impl SubcToolPlane {
         dispatch: &ToolManifest,
     ) -> Result<Snapshot, ToolPlaneError> {
         let catalog = self.refresh_catalog_snapshot().await?;
-        let entry = catalog
-            .iter()
-            .find(|entry| entry.module_id == provider)
-            .ok_or_else(|| {
-                ToolPlaneError::Unavailable("provider absent from daemon catalog".into())
-            })?;
+        let entry = crate::provider_catalog::find_module(&catalog, provider).ok_or_else(|| {
+            ToolPlaneError::Unavailable("provider absent from daemon catalog".into())
+        })?;
         let keepalive = crate::provider_catalog::catalog_entry_provides(
             entry,
             cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY,

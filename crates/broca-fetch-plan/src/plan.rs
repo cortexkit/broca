@@ -19,8 +19,10 @@ use sha2::{Digest, Sha256};
 
 use crate::refusal::Refusal;
 
-/// The provider of the session's required persona or worker-role system text.
-/// Its system-text item may never be optional, regardless of the role preset.
+/// The provider of the session's required persona or worker-role system text, under either of
+/// its ids ([`broca_protocol::same_module`]: plans name `prefrontal-core` until its rename and
+/// `prefrontal` after). Its system-text item may never be optional, regardless of the role
+/// preset.
 pub const PERSONA_PROVIDER: &str = "prefrontal-core";
 /// Legacy persona preset spelling. Persona identity is determined by provider, not preset.
 pub const PERSONA_PRESET: &str = "persona";
@@ -436,11 +438,9 @@ pub fn parse_plan_with(
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
-    if let Some((index, _)) = system_text_items
-        .iter()
-        .enumerate()
-        .find(|(_, item)| item.optional && item.provider == PERSONA_PROVIDER)
-    {
+    if let Some((index, _)) = system_text_items.iter().enumerate().find(|(_, item)| {
+        item.optional && broca_protocol::same_module(&item.provider, PERSONA_PROVIDER)
+    }) {
         return Err(Refusal::invalid(format!(
             "plan.system_text_items[{index}].optional"
         )));

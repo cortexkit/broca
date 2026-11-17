@@ -237,6 +237,93 @@ async fn reopening_a_scope_at_a_later_epoch_is_admitted_alike() {
     );
 }
 
+/// Core, renamed `prefrontal`, under its head scope as the daemon re-syncs it after the rename:
+/// the same `ref` and epoch, under the new owner id.
+fn by_renamed_core(request: &mut SubmissionRequest) {
+    let renamed = BindPrincipal::Reserved {
+        module_id: "prefrontal".into(),
+    };
+    super::scoped_by_core(request);
+    request.principal = Some(renamed.clone());
+    stamp_of(request).owner = renamed;
+}
+
+/// A module with a name close to core's, under its own copy of core's head scope.
+fn by_a_near_name(request: &mut SubmissionRequest) {
+    by_renamed_core(request);
+    let near = BindPrincipal::Reserved {
+        module_id: "prefrontal2".into(),
+    };
+    request.principal = Some(near.clone());
+    stamp_of(request).owner = near;
+}
+
+/// A session core made before its rename (`prefrontal-core` became `prefrontal`) admits core
+/// after it, under the re-synced head scope. The re-synced scope is the session's frozen scope
+/// (same `ref` and epoch), so it is no reopen: the run keeps the frozen scope, and its tool
+/// routes reach the re-synced twin when the old one is no longer live. A module whose id is
+/// merely close is still another owner.
+#[tokio::test]
+async fn a_session_made_before_its_owners_rename_admits_the_owner_after_it() {
+    let (module, _) = both(texts(2), false).await;
+    let first = send_unpinned(
+        &module,
+        "r1",
+        tweaked_request("before", super::scoped_by_core),
+    )
+    .await;
+    assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+    let renamed = send_unpinned(&module, "r2", tweaked_request("after", by_renamed_core)).await;
+    assert!(matches!(renamed, SendOutcome::Active { .. }), "{renamed:?}");
+    let near = send_unpinned(&module, "r3", tweaked_request("near", by_a_near_name)).await;
+    assert!(
+        matches!(
+            near,
+            SendOutcome::ScopeRefused(ScopeRefusal::OwnerMismatch(_))
+        ),
+        "{near:?}"
+    );
+    let owners = store_run_scopes(&module)
+        .await
+        .into_iter()
+        .map(|run| run["scope"]["owner"]["module_id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(owners, [json!("prefrontal-core"), json!("prefrontal-core")]);
+}
+
+fn tweaked_request(text: &str, tweak: fn(&mut SubmissionRequest)) -> SubmissionRequest {
+    let mut request = request(text);
+    tweak(&mut request);
+    request
+}
+
+/// [`sends_alike`] without pinning the reply: the test asserts it.
+async fn send_unpinned(module: &Module, run_id: &str, request: SubmissionRequest) -> SendOutcome {
+    let shaped = module.caller.shape(run_id, &SendKey::Minted, request);
+    let answer = module
+        .registry
+        .route_submission_with_order(
+            &module.key,
+            RunId(run_id.into()),
+            shaped,
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("the session opens");
+    module.closed().await;
+    answer
+}
+
 /// A run paused for sign-in holds the session against a reopen: a new send under the later epoch
 /// is busy naming the paused run, and a steer or a retry of the paused run's own send under it is
 /// refused rather than resuming that run, alike. The retry under the frozen epoch resumes it, and

@@ -1724,7 +1724,7 @@ pub(crate) async fn authorization_own_send<B: SessionBackend>(
     let senders = broca_session_loop::plan::senders(&session.operations, parts)
         .map_err(crate::serve::ServeError::Transient)?;
     // Reject unrelated callers before looking up the send's recorded sender.
-    if !senders.iter().any(|entry| matches!(sender, broca_protocol::BindPrincipal::Reserved { module_id } if module_id == &entry.module)) {
+    if !senders.iter().any(|entry| matches!(sender, broca_protocol::BindPrincipal::Reserved { module_id } if broca_protocol::same_module(module_id, &entry.module))) {
         return Ok(false);
     }
     let lookup = SendLookup { session };

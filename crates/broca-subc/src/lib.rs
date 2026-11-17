@@ -61,7 +61,7 @@ pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
 pub use private_content::{ImageResolveError, ResolvedImage};
 pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
-pub use provider_catalog::catalog_entry_provides;
+pub use provider_catalog::{catalog_entry_provides, find_module, live_module_id};
 pub use role_route_diagnostics::scoped_role_route_refusals;
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};

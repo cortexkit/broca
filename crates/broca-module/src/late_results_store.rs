@@ -11,6 +11,7 @@ use std::{
 };
 
 use broca_core::tool_plane::{LateResultRegistration, LateResultsIntake};
+use broca_protocol::canonical_module;
 use cortexkit_role_tool_provider::late_results::{Cursor, IntakeKey};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -288,7 +289,11 @@ impl LateResultsStore {
         let calls = self.registrations()?;
         let mut modules: std::collections::BTreeSet<_> =
             self.feeds()?.into_iter().map(|feed| feed.module).collect();
-        modules.extend(calls.iter().map(|call| call.module.clone()));
+        modules.extend(
+            calls
+                .iter()
+                .map(|call| canonical_module(&call.module).to_owned()),
+        );
         Ok((calls, modules))
     }
 
@@ -328,7 +333,7 @@ impl LateResultsStore {
         let rows = statement
             .query_map(
                 params![
-                    after.map(|key| key.0.as_str()),
+                    after.map(|key| canonical_module(&key.0)),
                     after.map(|key| key.1.as_str()),
                     limit as u64
                 ],
@@ -385,7 +390,7 @@ impl LateResultsStore {
         connection
             .query_row(
                 "SELECT registration, state FROM registrations WHERE module = ?1 AND call_key = ?2",
-                params![module, call_key],
+                params![canonical_module(module), call_key],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
@@ -404,7 +409,7 @@ impl LateResultsStore {
         Ok(self
             .registration_rows()?
             .into_iter()
-            .filter(|row| row.call.module == module)
+            .filter(|row| canonical_module(&row.call.module) == canonical_module(module))
             .collect())
     }
 
@@ -415,7 +420,7 @@ impl LateResultsStore {
         connection
             .execute(
                 "DELETE FROM registrations WHERE module = ?1 AND call_key = ?2",
-                params![module, call_key],
+                params![canonical_module(module), call_key],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -466,6 +471,7 @@ impl LateResultsStore {
     }
 
     pub fn feed(&self, module: &str) -> Result<Option<FeedRow>, String> {
+        let module = canonical_module(module);
         Ok(self.feeds()?.into_iter().find(|row| row.module == module))
     }
 
@@ -478,7 +484,7 @@ impl LateResultsStore {
                 "INSERT INTO feeds (module, ack_owed) VALUES (?1, ?2)
                  ON CONFLICT (module) DO UPDATE SET
                      ack_owed = CASE WHEN ?2 != 0 THEN 1 ELSE feeds.ack_owed END",
-                params![module, ack_owed as i64],
+                params![canonical_module(module), ack_owed as i64],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -493,7 +499,11 @@ impl LateResultsStore {
                  VALUES (?1, ?2, ?3, 0)
                  ON CONFLICT (module) DO UPDATE SET
                      provider_incarnation = ?2, seq = ?3, ack_owed = 0",
-                params![module, through.provider_incarnation, through.seq as i64],
+                params![
+                    canonical_module(module),
+                    through.provider_incarnation,
+                    through.seq as i64
+                ],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -506,7 +516,7 @@ impl LateResultsStore {
             .execute(
                 "INSERT INTO feeds (module, ack_owed) VALUES (?1, ?2)
                  ON CONFLICT (module) DO UPDATE SET ack_owed = ?2",
-                params![module, owed as i64],
+                params![canonical_module(module), owed as i64],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -519,7 +529,7 @@ impl LateResultsStore {
         connection
             .execute(
                 "UPDATE feeds SET provider_incarnation = NULL, seq = NULL WHERE module = ?1",
-                params![module],
+                params![canonical_module(module)],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -532,7 +542,12 @@ impl LateResultsStore {
             .query_row(
                 "SELECT disposition FROM receipts
                  WHERE provider = ?1 AND custodian = ?2 AND call_key = ?3 AND event_id = ?4",
-                params![key.provider, key.custodian, key.call_key, key.event_id],
+                params![
+                    canonical_module(&key.provider),
+                    key.custodian,
+                    key.call_key,
+                    key.event_id
+                ],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -568,7 +583,7 @@ impl LateResultsStore {
                          ELSE excluded.disposition
                      END",
                 params![
-                    key.provider,
+                    canonical_module(&key.provider),
                     key.custodian,
                     key.call_key,
                     key.event_id,
@@ -595,7 +610,12 @@ impl LateResultsStore {
                 .execute(
                     "DELETE FROM receipts
                      WHERE provider = ?1 AND custodian = ?2 AND call_key = ?3 AND event_id = ?4",
-                    params![key.provider, key.custodian, key.call_key, key.event_id],
+                    params![
+                        canonical_module(&key.provider),
+                        key.custodian,
+                        key.call_key,
+                        key.event_id
+                    ],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -630,7 +650,7 @@ impl LateResultsStore {
                 "INSERT INTO registrations (module, call_key, lineage, registration, state) VALUES (?1, ?2, ?3, ?4, 'registered')
                  ON CONFLICT (module, call_key) DO UPDATE SET registration = excluded.registration
                  WHERE registrations.registration = excluded.registration",
-                params![call.module, call.call_key, call.lineage, json],
+                params![canonical_module(&call.module), call.call_key, call.lineage, json],
             ).map_err(|error| error.to_string())?;
             if changed != 1 {
                 return Err(
@@ -649,7 +669,7 @@ impl LateResultsStore {
                 .map_err(|error| error.to_string())?;
             let changed = transaction.execute("INSERT INTO held_withdrawals (module, call_key, registration) VALUES (?1, ?2, ?3)
                 ON CONFLICT (module, call_key) DO UPDATE SET registration = excluded.registration
-                WHERE held_withdrawals.registration = excluded.registration", params![call.module, call.call_key, json]).map_err(|error| error.to_string())?;
+                WHERE held_withdrawals.registration = excluded.registration", params![canonical_module(&call.module), call.call_key, json]).map_err(|error| error.to_string())?;
             if changed != 1 {
                 return Err("withdrawal key already registered to another session or scope".into());
             }
@@ -657,7 +677,7 @@ impl LateResultsStore {
                 .execute(
                     "INSERT INTO feeds (module, ack_owed) VALUES (?1, 0)
                      ON CONFLICT (module) DO NOTHING",
-                    params![call.module],
+                    params![canonical_module(&call.module)],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -716,7 +736,7 @@ impl LateResultsStore {
         detail: &serde_json::Value,
     ) -> Result<(), String> {
         let changed = self.lock()?.execute("UPDATE held_withdrawals SET state=?3, attempts=?4, detail=?5 WHERE module=?1 AND call_key=?2",
-            params![call.module, call.call_key, state, attempts, detail.to_string()]).map_err(|error| error.to_string())?;
+            params![canonical_module(&call.module), call.call_key, state, attempts, detail.to_string()]).map_err(|error| error.to_string())?;
         if changed != 1 {
             return Err("held withdrawal registration was removed".into());
         }
@@ -732,7 +752,7 @@ impl LateResultsStore {
         self.lock()?
             .query_row(
                 "SELECT state, attempts FROM held_withdrawals WHERE module=?1 AND call_key=?2",
-                params![module, call_key],
+                params![canonical_module(module), call_key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -746,7 +766,7 @@ impl LateResultsStore {
     ) -> Result<Option<LateResultRegistration>, String> {
         let json: Option<String> = self.lock()?.query_row(
             "SELECT registration FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state NOT IN ('done','failed')",
-            params![module, call_key], |row| row.get(0),
+            params![canonical_module(module), call_key], |row| row.get(0),
         ).optional().map_err(|error| error.to_string())?;
         json.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
             .transpose()
@@ -776,10 +796,10 @@ impl LateResultsStore {
             transaction
                 .execute(
                     "DELETE FROM registrations WHERE module=?1 AND call_key=?2",
-                    params![module, key],
+                    params![canonical_module(module), key],
                 )
                 .map_err(|error| error.to_string())?;
-            removed += transaction.execute("DELETE FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state='watching' AND attempts=0", params![module, key]).map_err(|error| error.to_string())?;
+            removed += transaction.execute("DELETE FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state='watching' AND attempts=0", params![canonical_module(module), key]).map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(removed)
@@ -797,7 +817,7 @@ impl LateResultsStore {
             .map_err(|error| error.to_string())?;
         let mut removed = 0;
         for (module, key) in calls {
-            removed += transaction.execute("DELETE FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state='watching' AND attempts=0", params![module, key]).map_err(|error| error.to_string())?;
+            removed += transaction.execute("DELETE FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state='watching' AND attempts=0", params![canonical_module(module), key]).map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(removed)
@@ -829,7 +849,7 @@ impl LateResultsStore {
             transaction
                 .execute(
                     "DELETE FROM registrations WHERE module = ?1 AND call_key = ?2",
-                    params![module, call_key],
+                    params![canonical_module(module), call_key],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -940,6 +960,57 @@ mod tests {
         );
         assert!(!root.join(REGISTRATION_MARKER).exists());
         assert!(!root.join(REBUILD_REQUIRED_MARKER).exists());
+    }
+
+    /// Calls registered under a module's old id and under its new one share one feed and one
+    /// set of rows: the puller keyed by either id sees both, and a remove under either id
+    /// reaches a row written under the other.
+    #[test]
+    fn a_renamed_modules_calls_and_feed_meet_under_either_id() {
+        let root = scratch("renamed-module-rows");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let mut before = call("lineage:before");
+        before.module = "prefrontal-core".into();
+        let mut after = call("lineage:after");
+        after.module = "prefrontal".into();
+        store
+            .register_calls(&[before.clone(), after.clone()])
+            .unwrap();
+
+        for id in ["prefrontal-core", "prefrontal"] {
+            let mut keys = store
+                .registrations_for(id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.call.call_key)
+                .collect::<Vec<_>>();
+            keys.sort();
+            assert_eq!(keys, ["lineage:after", "lineage:before"], "{id}");
+        }
+        assert!(store.registrations_for("prefrontal2").unwrap().is_empty());
+        let (_, modules) = store.recovery_snapshot().unwrap();
+        assert_eq!(
+            modules.into_iter().collect::<Vec<_>>(),
+            ["prefrontal-core"],
+            "one feed, so one puller"
+        );
+
+        store
+            .record_ack(
+                "prefrontal",
+                &FeedPosition {
+                    provider_incarnation: "inc".into(),
+                    seq: 4,
+                },
+            )
+            .unwrap();
+        let feed = store.feed("prefrontal-core").unwrap().unwrap();
+        assert_eq!(feed.position.map(|position| position.seq), Some(4));
+
+        store.remove("prefrontal", &before.call_key).unwrap();
+        store.remove("prefrontal-core", &after.call_key).unwrap();
+        assert!(store.registrations_for("prefrontal").unwrap().is_empty());
     }
 
     #[test]

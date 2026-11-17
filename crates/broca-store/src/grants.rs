@@ -734,7 +734,7 @@ impl GrantsStore {
         Ok(conn
             .query_row(
                 "SELECT seq FROM late_cursors WHERE principal=?1",
-                [principal],
+                [broca_protocol::canonical_owner(principal)],
                 |r| r.get(0),
             )
             .optional()?
@@ -750,6 +750,7 @@ impl GrantsStore {
     ) -> Result<Vec<LateDelivery>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn.prepare("SELECT l.seq,h.body FROM late_results l JOIN held_calls h ON h.batch_id=l.batch_id WHERE l.principal=?1 AND l.seq>?2 AND l.expires_at_ms>?3 ORDER BY l.seq LIMIT ?4")?;
+        let principal = broca_protocol::canonical_owner(principal);
         let rows = stmt.query_map(params![principal, integer(since)?, now_ms, limit], |r| {
             Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -767,7 +768,10 @@ impl GrantsStore {
         self.write(|tx| {
             Ok(tx.execute(
                 "DELETE FROM late_results WHERE principal=?1 AND seq<=?2",
-                params![principal, integer(through)?],
+                params![
+                    broca_protocol::canonical_owner(principal),
+                    integer(through)?
+                ],
             )?)
         })
     }
@@ -846,16 +850,19 @@ fn finalize(
         settled_at_ms: now_ms,
     });
     save_call(tx, &row)?;
+    // Keyed by the canonical spelling, so a custodian reads its results whichever of its ids
+    // (across a module rename) the call was admitted under or it reads with.
+    let principal = broca_protocol::canonical_owner(&row.principal);
     tx.execute(
         "INSERT INTO late_results (batch_id,principal,expires_at_ms) VALUES (?1,?2,?3)",
         params![
             row.batch_id,
-            row.principal,
+            principal,
             row.admitted_at_ms.saturating_add(RETENTION_MS)
         ],
     )?;
     let seq = tx.last_insert_rowid();
-    tx.execute("INSERT INTO late_cursors VALUES (?1,?2) ON CONFLICT(principal) DO UPDATE SET seq=excluded.seq", params![row.principal, seq])?;
+    tx.execute("INSERT INTO late_cursors VALUES (?1,?2) ON CONFLICT(principal) DO UPDATE SET seq=excluded.seq", params![principal, seq])?;
     terminal.push((row.batch_id, row.admitted_at_ms));
     Ok(true)
 }

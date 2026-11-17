@@ -37,7 +37,11 @@ pub(crate) async fn upload(
                 plan.as_object()
                     .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
             })
-            .is_some_and(|senders| senders.iter().any(|sender| &sender.module == module_id))
+            .is_some_and(|senders| {
+                senders
+                    .iter()
+                    .any(|sender| broca_protocol::same_module(&sender.module, module_id))
+            })
     });
     if !named {
         owner.map_err(ServeError::ScopeRefused)?;

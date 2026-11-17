@@ -101,8 +101,9 @@ pub use request::{
     ToolReply,
 };
 pub use session::{
+    canonical_module, canonical_owner, other_module_name, same_module, same_owner_string,
     BindIdentity, BindPrincipal, BindScope, ParentState, ScopeKind, ScopeParent, SendScope,
-    SessionScope,
+    SessionScope, RENAMED_MODULES,
 };
 pub use usage::Usage;
 pub mod run_events;

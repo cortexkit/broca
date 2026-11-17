@@ -340,9 +340,7 @@ impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
 impl Fetcher for SubcPlanFetcher {
     async fn call_yield_supported(&self, provider: &str) -> Result<bool, FetchError> {
         let entries = self.catalog_snapshot().await?;
-        Ok(entries
-            .iter()
-            .find(|entry| entry.module_id == provider)
+        Ok(crate::provider_catalog::find_module(&entries, provider)
             .and_then(|entry| entry.capabilities.as_ref())
             .is_some_and(|caps| {
                 caps.provides
@@ -352,9 +350,7 @@ impl Fetcher for SubcPlanFetcher {
     }
     async fn call_keepalive_supported(&self, provider: &str) -> Result<bool, FetchError> {
         let entries = self.catalog_snapshot().await?;
-        Ok(entries
-            .iter()
-            .find(|entry| entry.module_id == provider)
+        Ok(crate::provider_catalog::find_module(&entries, provider)
             .and_then(|entry| entry.capabilities.as_ref())
             .is_some_and(|caps| {
                 caps.provides.iter().any(|capability| {
@@ -372,9 +368,7 @@ impl Fetcher for SubcPlanFetcher {
                 return Err(error);
             }
         };
-        Ok(entries
-            .iter()
-            .find(|entry| entry.module_id == provider)
+        Ok(crate::provider_catalog::find_module(&entries, provider)
             .and_then(|entry| entry.capabilities.as_ref())
             .is_some_and(|caps| {
                 caps.provides.iter().any(|capability| {

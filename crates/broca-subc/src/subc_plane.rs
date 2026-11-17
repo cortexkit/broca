@@ -1454,15 +1454,9 @@ impl SubcToolPlane {
             ToolPlaneError::Unavailable("no default tool module configured".to_string())
         })?;
         let catalog = self.conn.catalog_list().await.map_err(conn_to_plane)?;
-        let entry = catalog
-            .iter()
-            .find(|e| e.module_id == module_id)
-            .ok_or_else(|| {
-                ToolPlaneError::Unavailable(format!(
-                    "module '{}' not found in subc catalog",
-                    module_id
-                ))
-            })?;
+        let entry = crate::provider_catalog::find_module(&catalog, module_id).ok_or_else(|| {
+            ToolPlaneError::Unavailable(format!("module '{}' not found in subc catalog", module_id))
+        })?;
         let tools = entry
             .roles
             .iter()
@@ -1917,7 +1911,8 @@ impl SubcToolPlane {
                             .get(&Self::batch_route_key(ctx))
                             .and_then(|keys| keys.get(&call.tool_call_id))
                             .is_some_and(|(registered_module, registered_key)| {
-                                registered_module == module_id && registered_key == key.call_key
+                                broca_protocol::same_module(registered_module, module_id)
+                                    && registered_key == key.call_key
                             })
                     });
                     // The person's steer had this call handed back (llm-runner `call_yield`): a
@@ -2011,7 +2006,8 @@ impl SubcToolPlane {
                         .get(&Self::batch_route_key(ctx))
                         .and_then(|keys| keys.get(&call.tool_call_id))
                         .is_some_and(|(module, registered_key)| {
-                            module == module_id && registered_key == key.call_key
+                            broca_protocol::same_module(module, module_id)
+                                && registered_key == key.call_key
                         });
                     if registered {
                         self.inline_keys
@@ -2421,9 +2417,7 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .get_or_insert_with(|| Arc::clone(&catalog));
-        let window = catalog
-            .iter()
-            .find(|e| e.module_id == module_id)
+        let window = crate::provider_catalog::find_module(&catalog, module_id)
             .and_then(provider_concurrency)
             .map(|c| window_for(&c))
             .unwrap_or(1);
@@ -4195,7 +4189,9 @@ fn resolve_tool_module(
         .map(str::trim)
         .filter(|module_id| !module_id.is_empty())
     {
-        return ToolRoute::Module(module_id.to_string());
+        // A frozen tool names the id its module had when the run froze it; a renamed module is
+        // reached under the id the catalog lists now.
+        return ToolRoute::Module(crate::provider_catalog::live_module_id(catalog, module_id));
     }
 
     let mut candidates = catalog

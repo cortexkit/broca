@@ -167,11 +167,12 @@ pub fn admit_message_marks_declaring(
         SendScope::Stamped(bind) if ownership.episodes == 0 => Some(&bind.scope),
         _ => None,
     });
+    // Canonical spellings, so a module's two ids across a rename compare as one owner.
     let owner = scope
         .filter(|_| !automated)
-        .map(|scope| scope.owner.as_owner_string());
+        .map(|scope| scope.owner.canonical_owner_string());
     let sender = principal
-        .map(BindPrincipal::as_owner_string)
+        .map(BindPrincipal::canonical_owner_string)
         .unwrap_or_default();
     let marks = cortexkit_role_llm_runner::message_marks::check_with_notice_speaks_for(
         params,
@@ -581,15 +582,16 @@ fn check_frozen_sender(
             ScopeKind::Plain
         }
     }
+    // Canonical spellings, so a module's two ids across a rename compare as one sender.
     let frozen_sender = FrozenSender::new(
-        &sender.as_owner_string(),
+        &sender.canonical_owner_string(),
         kind(frozen),
         frozen.agent_id.as_deref(),
     );
     let result = check_frozen(
         &frozen_sender,
         &principal
-            .map(BindPrincipal::as_owner_string)
+            .map(BindPrincipal::canonical_owner_string)
             .unwrap_or_default(),
         stamped.map(kind).unwrap_or(ScopeKind::Plain),
         stamped.and_then(|scope| scope.agent_id.as_deref()),

@@ -82,7 +82,7 @@ impl BindIdentity {
 /// writes. A rolled-back build that refused a principal kind it did not know would fail to
 /// decode `RunStarted` and lose the whole session. Any JSON value therefore decodes, and one
 /// that is not exactly a shape this build knows is kept verbatim as [`BindPrincipal::Unknown`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum BindPrincipal {
     /// A daemon-spawned module that proved possession of its launch nonce.
     Reserved { module_id: String },
@@ -93,6 +93,80 @@ pub enum BindPrincipal {
     /// A value written by a later build that this build does not know, kept exactly as read.
     /// This build never constructs one of its own.
     Unknown(serde_json::Value),
+}
+
+/// Two principals are the same caller when they are equal, or when both are reserved modules
+/// and their ids name one module across a rename ([`same_module`]): a session a module made
+/// before its rename keeps recognising it after. Everything else compares exactly.
+impl PartialEq for BindPrincipal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                BindPrincipal::Reserved { module_id: a },
+                BindPrincipal::Reserved { module_id: b },
+            ) => same_module(a, b),
+            (BindPrincipal::Direct, BindPrincipal::Direct)
+            | (BindPrincipal::Unverified, BindPrincipal::Unverified) => true,
+            (BindPrincipal::Unknown(a), BindPrincipal::Unknown(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Modules that changed their id in place, as `(old, new)`. A module's sessions, frozen scopes,
+/// plan entries, tools and held calls name the id it had when they were made, in append-only
+/// records nothing rewrites, so broca treats the two ids as one module for as long as those
+/// records exist. `prefrontal-core` became `prefrontal` on 18 Nov 2026.
+pub const RENAMED_MODULES: &[(&str, &str)] = &[("prefrontal-core", "prefrontal")];
+
+/// Whether module ids `a` and `b` name the same module: equal, or the two ids of one rename in
+/// [`RENAMED_MODULES`].
+pub fn same_module(a: &str, b: &str) -> bool {
+    a == b || other_module_name(a) == Some(b)
+}
+
+/// The other id of a renamed module: the new id for its old one and the old for the new.
+/// `None` for a module that was never renamed.
+pub fn other_module_name(id: &str) -> Option<&'static str> {
+    RENAMED_MODULES.iter().find_map(|(old, new)| {
+        if *old == id {
+            Some(*new)
+        } else if *new == id {
+            Some(*old)
+        } else {
+            None
+        }
+    })
+}
+
+/// The one id broca keys a module by: a renamed module's old id for either of its ids, every
+/// other id as given. Stores and maps keyed by module use it, so rows written under either id
+/// meet; the old id is the key because every row written before the rename already uses it.
+pub fn canonical_module(id: &str) -> &str {
+    RENAMED_MODULES
+        .iter()
+        .find(|(_, new)| *new == id)
+        .map_or(id, |(old, _)| old)
+}
+
+/// A principal spelled as an owner string, with a renamed module spelled by its
+/// [`canonical_module`] id: the key for stores that index rows by owner.
+pub fn canonical_owner(owner: &str) -> std::borrow::Cow<'_, str> {
+    match owner.strip_prefix("reserved:") {
+        Some(module) if canonical_module(module) != module => {
+            format!("reserved:{}", canonical_module(module)).into()
+        }
+        _ => owner.into(),
+    }
+}
+
+/// Whether two principals spelled as owner strings ([`BindPrincipal::as_owner_string`]) name
+/// the same caller, by [`same_module`] for reserved modules and exactly otherwise.
+pub fn same_owner_string(a: &str, b: &str) -> bool {
+    match (a.strip_prefix("reserved:"), b.strip_prefix("reserved:")) {
+        (Some(a), Some(b)) => same_module(a, b),
+        _ => a == b,
+    }
 }
 
 impl BindPrincipal {
@@ -108,6 +182,19 @@ impl BindPrincipal {
             BindPrincipal::Direct => "direct".to_owned(),
             BindPrincipal::Unverified => "unverified".to_owned(),
             BindPrincipal::Unknown(value) => value.to_string(),
+        }
+    }
+
+    /// [`Self::as_owner_string`] with a renamed module spelled by its [`canonical_module`] id:
+    /// the spelling to compare or key by, so a principal recorded under a module's old id meets
+    /// the same module presenting its new one. Refusals and forwarded owners keep
+    /// [`Self::as_owner_string`], the principal as presented.
+    pub fn canonical_owner_string(&self) -> String {
+        match self {
+            BindPrincipal::Reserved { module_id } => {
+                format!("reserved:{}", canonical_module(module_id))
+            }
+            other => other.as_owner_string(),
         }
     }
 
@@ -364,5 +451,78 @@ mod tests {
                 .expect("identity is unambiguous");
             assert_eq!(identity, before);
         }
+    }
+
+    fn reserved(module_id: &str) -> super::BindPrincipal {
+        super::BindPrincipal::Reserved {
+            module_id: module_id.into(),
+        }
+    }
+
+    #[test]
+    fn a_renamed_modules_two_ids_name_one_module_and_nothing_else_does() {
+        use super::{canonical_module, canonical_owner, other_module_name, same_module};
+        assert!(same_module("prefrontal-core", "prefrontal"));
+        assert!(same_module("prefrontal", "prefrontal-core"));
+        assert!(same_module("aft", "aft"));
+        assert_eq!(other_module_name("prefrontal-core"), Some("prefrontal"));
+        assert_eq!(other_module_name("prefrontal"), Some("prefrontal-core"));
+        assert_eq!(other_module_name("aft"), None);
+        // Near names are other modules.
+        for other in ["prefrontal-corex", "prefrontal2", "prefrontal-", "core", ""] {
+            assert!(!same_module("prefrontal", other), "{other}");
+            assert!(!same_module("prefrontal-core", other), "{other}");
+        }
+        // The key is the old id, the one every row written before the rename already uses.
+        assert_eq!(canonical_module("prefrontal"), "prefrontal-core");
+        assert_eq!(canonical_module("prefrontal-core"), "prefrontal-core");
+        assert_eq!(canonical_module("aft"), "aft");
+        assert_eq!(
+            canonical_owner("reserved:prefrontal"),
+            "reserved:prefrontal-core"
+        );
+        assert_eq!(canonical_owner("reserved:aft"), "reserved:aft");
+        assert_eq!(canonical_owner("direct"), "direct");
+        // Only a reserved module is renamed: a bare id is not an owner string.
+        assert_eq!(canonical_owner("prefrontal"), "prefrontal");
+    }
+
+    #[test]
+    fn a_principal_and_a_scope_recorded_before_a_rename_match_the_module_after_it() {
+        use super::{same_owner_string, BindPrincipal, SessionScope};
+        assert_eq!(reserved("prefrontal-core"), reserved("prefrontal"));
+        assert_ne!(reserved("prefrontal-core"), reserved("prefrontal2"));
+        assert_ne!(reserved("prefrontal"), BindPrincipal::Direct);
+        assert_eq!(BindPrincipal::Direct, BindPrincipal::Direct);
+        assert_eq!(
+            reserved("prefrontal").canonical_owner_string(),
+            "reserved:prefrontal-core"
+        );
+        // The principal as presented is what refusals name and tool routes forward.
+        assert_eq!(
+            reserved("prefrontal").as_owner_string(),
+            "reserved:prefrontal"
+        );
+        assert!(same_owner_string(
+            "reserved:prefrontal-core",
+            "reserved:prefrontal"
+        ));
+        assert!(!same_owner_string("reserved:prefrontal", "prefrontal"));
+        assert!(!same_owner_string("direct", "reserved:prefrontal"));
+
+        let frozen: SessionScope = serde_json::from_str(
+            r#"{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head-1","scope_epoch":3}"#,
+        )
+        .unwrap();
+        let mut resynced = frozen.clone();
+        resynced.owner = reserved("prefrontal");
+        assert_eq!(frozen, resynced, "the re-synced scope is the frozen one");
+        let mut other_epoch = resynced.clone();
+        other_epoch.scope_epoch = 4;
+        assert_ne!(frozen, other_epoch);
+        // Equality never changes the bytes: each scope keeps the owner it was written with.
+        assert!(serde_json::to_string(&resynced)
+            .unwrap()
+            .contains(r#""module_id":"prefrontal""#));
     }
 }

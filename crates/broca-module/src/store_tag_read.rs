@@ -203,10 +203,11 @@ pub(crate) async fn check_owner(
         Some((None, Some(run_id))) => ScopeKind::Run { run_id },
         _ => ScopeKind::Plain,
     };
+    // Canonical spellings, so a module's two ids across a rename compare as one owner.
     let sender = principal
-        .map(broca_protocol::BindPrincipal::as_owner_string)
+        .map(broca_protocol::BindPrincipal::canonical_owner_string)
         .unwrap_or_default();
-    let owner = owner.map(|owner| owner.as_owner_string());
+    let owner = owner.map(|owner| owner.canonical_owner_string());
     request
         .check_owner(owner.as_deref(), &sender, kind)
         .map_err(|code| {
