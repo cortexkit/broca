@@ -141,9 +141,10 @@ pub fn run_started(
     set(&mut object, "message_marks", start.message_marks.as_ref());
 
     // The config's members and setup parts are read as the serve executor reads them.
-    let (config, manifest_parts) = crate::run::run_config_members(start, part, || {
-        "a carried payload is not an object".to_string()
-    })?;
+    let (config, manifest_parts) =
+        crate::run::run_config_members(start, crate::run::SetupParts::All, part, || {
+            "a carried payload is not an object".to_string()
+        })?;
     for (kind, value) in manifest_parts {
         fill_manifest(manifest.get_or_insert_with(Map::new), kind, value);
     }

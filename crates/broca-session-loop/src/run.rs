@@ -69,6 +69,11 @@ pub(crate) use warming::Warming;
 pub use warming::{warm_count, warm_spend};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
+mod start_config;
+pub use start_config::{
+    run_config_members, run_config_of_run, run_config_of_start, run_frozen_facts, ConfigMembers,
+    FrozenFacts, SetupParts,
+};
 
 /// The cache-marker placement a session's first run freezes (see
 /// `broca_provider::cache_markers::plan_markers` and `admit::marker_order_for_next_run`).
@@ -1679,121 +1684,6 @@ pub fn frozen_marker_order(start: &broca_session_store::record::RunStart) -> Opt
         .and_then(|record| record.get("marker_order_version"))
         .and_then(Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
-}
-
-/// A run's config members, as `RunStarted.config` spells them, and its plan manifest's setup
-/// parts, in order.
-pub type ConfigMembers = (serde_json::Map<String, Value>, Vec<(PartKind, Value)>);
-
-/// A run start's frozen config as today's `RunStarted` record spells it, the members of its
-/// `config` object, and the setup parts of the run's plan manifest, in order. `part` reads a
-/// setup part's value.
-///
-/// The converter's inverse rebuilds today's record from this, and the serve executor rebuilds
-/// the config a new run's admission reads (`run_config_of_start`), so both read a run's start
-/// the same way. The config's parts come first (its tools, then the response format every run
-/// config has, then its global system text and render config), then the manifest's. So a
-/// tools part before the response format is the config's, and one after it is the manifest's.
-pub fn run_config_members<E>(
-    start: &broca_session_store::record::RunStart,
-    mut part: impl FnMut(&broca_session_store::record::PartRef) -> Result<Value, E>,
-    not_object: impl Fn() -> E,
-) -> Result<ConfigMembers, E> {
-    let choices = match start.run_choices.as_ref() {
-        None => serde_json::Map::new(),
-        Some(Value::Object(choices)) => choices.clone(),
-        Some(_) => return Err(not_object()),
-    };
-    let mut config = match choices.get("config") {
-        None => serde_json::Map::new(),
-        Some(Value::Object(config)) => config.clone(),
-        Some(_) => return Err(not_object()),
-    };
-    fn json(value: impl serde::Serialize) -> Value {
-        serde_json::to_value(value).expect("record values serialize")
-    }
-    fn set(
-        config: &mut serde_json::Map<String, Value>,
-        key: &str,
-        value: Option<impl serde::Serialize>,
-    ) {
-        if let Some(value) = value {
-            config.insert(key.into(), json(value));
-        }
-    }
-    config.insert("model".into(), json(&start.model));
-    config.insert("renderer_version".into(), json(start.renderer_version));
-    set(&mut config, "context_limit", start.context_limit);
-    set(&mut config, "service_tier", start.service_tier.as_ref());
-    set(
-        &mut config,
-        "route_decision_id",
-        start.route_decision_id.as_ref(),
-    );
-    set(&mut config, "auth_selection", start.auth_selection.as_ref());
-    let mut manifest = Vec::new();
-    let mut past_config = false;
-    for setup in &start.setup {
-        let value = part(setup)?;
-        match setup.kind {
-            PartKind::Tools if !past_config => {
-                config.insert("tools".into(), value);
-            }
-            PartKind::ResponseFormat => {
-                config.insert("response_format".into(), value);
-                past_config = true;
-            }
-            PartKind::GlobalSystem => {
-                config.insert("global_system".into(), value);
-            }
-            PartKind::RenderConfig => {
-                config.insert("frozen_render_config".into(), value);
-            }
-            kind => manifest.push((kind, value)),
-        }
-    }
-    Ok((config, manifest))
-}
-
-/// The run's frozen config, rebuilt from its start record and setup parts as
-/// [`run_config_members`] reads them.
-pub fn run_config_of_start(
-    start: &broca_session_store::record::RunStart,
-    parts: &dyn Parts,
-) -> Result<broca_wal::RunConfig, LoopError> {
-    let (config, _) = run_config_members(
-        start,
-        |part| crate::parts::value(parts, part).map_err(LoopError::Parts),
-        || LoopError::Parts("a run start's carried config is not an object".into()),
-    )?;
-    serde_json::from_value(Value::Object(config)).map_err(|e| LoopError::Parts(e.to_string()))
-}
-
-/// The run's frozen config as it renders and bills now: its start's, with the render config and
-/// the account its refreezes recorded since applied, as [`frozen_admission`] reads them.
-///
-/// A resume is admitted from this, so a run that moved to another account at a quota wall
-/// resumes on the account it moved to, with that account's render config. A resume never asks
-/// routing again; admitting it from the start's config would instead send it back to the
-/// account that refused it, and its provider would render a config the run no longer froze.
-pub fn run_config_of_run(
-    run: &broca_session_store::fold::operations::Run,
-    parts: &dyn Parts,
-) -> Result<broca_wal::RunConfig, LoopError> {
-    let start = run.start.as_ref().ok_or(LoopError::Unsupported(
-        "a run whose start isn't in the fold",
-    ))?;
-    let mut config = run_config_of_start(start, parts)?;
-    if let Some(refrozen) = &run.refrozen_render {
-        config.frozen_render_config = refrozen["render_config"].clone();
-        if let Some(version) = decode::<u32>(Some(refrozen["renderer_version"].clone()))? {
-            config.renderer_version = version;
-        }
-    }
-    if let Some(selection) = &run.refrozen_auth {
-        config.auth_selection = decode(Some(selection.clone()))?;
-    }
-    Ok(config)
 }
 
 /// The admission a run's start froze: its model, settings, tools and system text, read back from

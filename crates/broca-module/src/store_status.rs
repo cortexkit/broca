@@ -665,7 +665,7 @@ impl<'a> Walk<'a> {
         let mine = start.run_id == self.run_id;
         self.usage_active = mine;
         if mine {
-            let config = broca_session_loop::run::run_config_of_start(start, self.parts)
+            let config = broca_session_loop::run::run_frozen_facts(start, self.parts)
                 .map_err(|error| damaged(format!("the run's start: {error:?}")))?;
             self.steps
                 .run_started(&mut self.usage, &config.frozen_render_config);
@@ -676,8 +676,7 @@ impl<'a> Walk<'a> {
             self.wake_directive = config.turn_directives_v1.as_ref().is_some_and(|names| {
                 names.contains(&cortexkit_role_llm_runner::directives::DirectiveName::Wake)
             });
-            self.cleans_text =
-                broca_core::tags::computed_rules(&config).is_some_and(|rules| rules.clean);
+            self.cleans_text = config.computed_rules().is_some_and(|rules| rules.clean);
             self.frozen_finish_config = config.frozen_render_config;
             self.auth_selection = config.auth_selection;
             self.title.clone_from(&start.title);

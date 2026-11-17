@@ -30,9 +30,9 @@ pub async fn run_rules<B: SessionBackend>(
     else {
         return Ok(None);
     };
-    let config = broca_session_loop::run::run_config_of_start(&start, parts)
+    let facts = broca_session_loop::run::run_frozen_facts(&start, parts)
         .map_err(|error| format!("run {run_id}'s config: {error:?}"))?;
-    Ok(broca_core::tags::computed_rules(&config))
+    Ok(facts.computed_rules())
 }
 
 /// Where part number `tag` sits as the run that numbered it showed it: the message whose

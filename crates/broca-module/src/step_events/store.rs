@@ -161,12 +161,9 @@ impl Observer {
                     .map(str::to_owned),
                 context_limit: start.context_limit,
                 route_decision_id: start.route_decision_id.clone(),
-                frozen_render_config: broca_session_loop::run::run_config_of_start(
-                    start,
-                    &self.parts,
-                )
-                .map(|config| config.frozen_render_config)
-                .unwrap_or_default(),
+                frozen_render_config: broca_session_loop::run::run_frozen_facts(start, &self.parts)
+                    .map(|facts| facts.frozen_render_config)
+                    .unwrap_or_default(),
                 keep_warm: match &start.keep_warm {
                     Some(setting) => serde_json::from_value(setting.clone()).ok(),
                     None => Some(Default::default()),

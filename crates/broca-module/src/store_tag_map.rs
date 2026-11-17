@@ -118,9 +118,9 @@ fn latest_run_renders<B: SessionBackend>(
         )
         .render)
     } else {
-        let config = broca_session_loop::run::run_config_of_start(start, parts)
+        let facts = broca_session_loop::run::run_frozen_facts(start, parts)
             .map_err(|error| format!("the latest run's config: {error:?}"))?;
-        Ok(broca_core::tags::computed_rules(&config).is_some_and(|rules| rules.render))
+        Ok(facts.computed_rules().is_some_and(|rules| rules.render))
     }
 }
 
