@@ -14,4 +14,4 @@
 7193 crates/broca-store/src/lib.rs run-index.db projections of the WAL (the write-ahead log the session store replaced); most go with the WAL code
 7159 crates/broca-wal/src/file_wal.rs the WAL's file store (the write-ahead log the session store replaced); deleted with the WAL code
 6141 crates/broca-catalog/src/runtime.rs catalog resolution; split poller, cache and resolution
-5184 crates/broca-module/src/store_actor.rs the session actor; split setup, sends and reads
+5035 crates/broca-module/src/store_actor.rs the session actor; split setup, sends and reads
