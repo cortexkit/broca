@@ -294,6 +294,55 @@ async fn a_chatgpt_wall_offered_b_after(
     Vec<serde_json::Value>,
     Vec<(String, serde_json::Value)>,
 ) {
+    a_wall_offered(
+        label,
+        WalledRun {
+            model: ("openai", "gpt-6.1"),
+            method: "chatgpt",
+            records_method: true,
+            credential: "chatgpt:openai",
+            account: "chatgpt-a",
+            frozen: broca_provider::families::openai_responses_chatgpt_frozen_config("gpt-6.1"),
+            offered_credential: "chatgpt:openai:second",
+            offered_account: "chatgpt-b",
+        },
+        vault_account,
+        answer_after,
+    )
+    .await
+}
+
+/// A run stopped at its account's weekly wall, and the account routing offers it.
+struct WalledRun {
+    /// The run's model, as provider and model id.
+    model: (&'static str, &'static str),
+    /// The auth method of the run's credential and of the offered one.
+    method: &'static str,
+    /// Whether the run's selection records that method (it does when its credential id is the
+    /// vault's own); a run admitted under a `<method>:<provider>:<label>` key may not.
+    records_method: bool,
+    /// The run's credential and the account it was on.
+    credential: &'static str,
+    account: &'static str,
+    frozen: broca_provider::wire::FrozenRenderConfig,
+    /// What routing offers: a credential the vault lists, for another account.
+    offered_credential: &'static str,
+    offered_account: &'static str,
+}
+
+/// `run` hits its weekly wall and routing offers its other account, which the vault serves for
+/// `vault_account`, taking `answer_after` to answer. What the executor's side of the move
+/// answers the loop, and what it asked routing and the vault.
+async fn a_wall_offered(
+    label: &str,
+    run: WalledRun,
+    vault_account: &'static str,
+    answer_after: Duration,
+) -> (
+    broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>>,
+    Vec<serde_json::Value>,
+    Vec<(String, serde_json::Value)>,
+) {
     let root = fresh_vault_root(label);
     let daemon = CapturingVaultDaemon::start_expiring(
         &root,
@@ -303,10 +352,19 @@ async fn a_chatgpt_wall_offered_b_after(
         },
     )
     .await;
-    let mut executor = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2), listed_credentials([("chatgpt:openai:second", "chatgpt:openai:second")]), supervised_broca_identity()).await;
+    let mut executor = executor_with_vault_addressing(
+        &root,
+        &daemon,
+        Duration::from_secs(2),
+        listed_credentials([(run.offered_credential, run.offered_credential)]),
+        supervised_broca_identity(),
+    )
+    .await;
+    // A Claude subscription run's persona is derived again for the new account from it.
+    executor.claude_code_install_id = Some("install".into());
     let routing = Arc::new(OffersAccount {
-        credential_id: "chatgpt:openai:second",
-        account: "chatgpt-b",
+        credential_id: run.offered_credential,
+        account: run.offered_account,
         answer_after,
         requests: Default::default(),
     });
@@ -317,25 +375,24 @@ async fn a_chatgpt_wall_offered_b_after(
         ),
     ));
     let mut req = drift_request(&root);
-    req.run_id = broca_protocol::RunId("chatgpt-run".into());
+    req.run_id = broca_protocol::RunId("walled-run".into());
     req.model = broca_protocol::request::ModelHandle {
-        provider_module_id: "openai".into(),
-        model_id: "gpt-6.1".into(),
+        provider_module_id: run.model.0.into(),
+        model_id: run.model.1.into(),
     };
     let selection: broca_core::AuthSelection = serde_json::from_value(serde_json::json!({
-        "credential_id": "chatgpt:openai",
-        "account_ref": "chatgpt-a",
-        "resolved_credential_id": "chatgpt:openai",
-        "auth_method": "chatgpt",
+        "credential_id": run.credential,
+        "account_ref": run.account,
+        "resolved_credential_id": run.credential,
+        "auth_method": run.records_method.then_some(run.method),
         "account_decision": {
             "path": "routed",
-            "admission_id": "chatgpt-run",
+            "admission_id": "walled-run",
             "decision_id": "decision-a",
-            "conversation_key": "broca-session:chatgpt",
+            "conversation_key": "broca-session:walled",
         },
     }))
     .unwrap();
-    let frozen = broca_provider::families::openai_responses_chatgpt_frozen_config("gpt-6.1");
     let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
         "model": req.model,
         "tools": [],
@@ -343,20 +400,20 @@ async fn a_chatgpt_wall_offered_b_after(
         "generation": req.generation,
         "response_format": broca_protocol::request::ResponseFormat::default(),
         "context_epoch": 0,
-        "renderer_version": frozen.renderer_version,
-        "frozen_render_config": frozen,
+        "renderer_version": run.frozen.renderer_version,
+        "frozen_render_config": run.frozen,
         "auth_selection": selection,
     }))
     .unwrap();
-    let refused = vec!["chatgpt-a".to_owned()];
+    let refused = vec![run.account.to_owned()];
     let now = epoch_millis().max(0) as u64;
     let wall = broca_session_loop::account_move::Wall {
-        run_id: "chatgpt-run",
+        run_id: "walled-run",
         step_id: 2,
         selection: &selection,
         predecessor: "decision-a",
         credential_id: &selection.credential_id,
-        account: "chatgpt-a",
+        account: run.account,
         limit_window: "seven_day",
         resets_at_ms: Some(now + 3 * 86_400_000),
         retry_after_s: None,
@@ -367,7 +424,7 @@ async fn a_chatgpt_wall_offered_b_after(
         render_config: &config.frozen_render_config,
         run_config: &config,
         reask: false,
-    head_turn: false,
+        head_turn: false,
     };
     let moves = AccountMoves::new(&executor, &req, None, None);
     let answer =
@@ -378,6 +435,78 @@ async fn a_chatgpt_wall_offered_b_after(
     drop(executor);
     daemon.assert_healthy();
     (answer, asked, vault)
+}
+
+/// A Claude subscription run of `model`, whose admission froze the refusal fallback (the Opus
+/// backstop every such run carries), hits its weekly wall and is offered another Claude account.
+async fn a_claude_run_with_a_refusal_fallback_offered_b(
+    label: &str,
+    model: &'static str,
+    records_method: bool,
+) -> broca_session_loop::account_move::Answer<Box<dyn broca_core::provider::Provider>> {
+    let session = broca_protocol::BindIdentity::new("/project", "harness", "s1");
+    let persona = broca_module_serve::claude_code_identity::fresh_persona(
+        "install",
+        Some("00000000-0000-4000-8000-00000000000a"),
+        "oauth:anthropic:first",
+        &session,
+        Some("abc".into()),
+        2,
+    )
+    .unwrap();
+    let claude_code = |model: &str| {
+        let mut frozen = broca_provider::families::anthropic_frozen_config(model);
+        frozen.system_prompt = broca_provider::policy::SystemPromptPolicy::RequiredIdentityLead {
+            identity: "You are Claude Code, Anthropic's official CLI for Claude.".into(),
+        };
+        frozen.claude_code_persona = Some(persona.clone());
+        frozen
+    };
+    let mut frozen = claude_code(model);
+    // Anthropic's own fallback field, which a live Claude subscription request carries too.
+    frozen.server_side_fallback = true;
+    frozen.refusal_fallback = Some(Box::new(broca_provider::wire::RefusalFallbackConfig {
+        model: broca_protocol::request::ModelHandle::new("anthropic", "claude-opus-4-8"),
+        context_limit: None,
+        frozen: claude_code("claude-opus-4-8"),
+    }));
+    let (answer, asked, _) = a_wall_offered(
+        label,
+        WalledRun {
+            model: ("anthropic", model),
+            method: "oauth",
+            records_method,
+            credential: "oauth:anthropic:first",
+            account: "claude-a",
+            frozen,
+            offered_credential: "oauth:anthropic:second",
+            offered_account: "claude-b",
+        },
+        "claude-b",
+        Duration::ZERO,
+    )
+    .await;
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    answer
+}
+
+/// Through the executor: a Claude subscription run with a refusal fallback, with and without
+/// Anthropic's server-side fallback, moves to the offered Claude account rather than refusing
+/// the offer as a credential its recorded fallback can't use.
+#[tokio::test]
+async fn a_claude_run_with_a_refusal_fallback_moves_to_the_offered_account() {
+    for (label, model, records_method) in [
+        ("move-claude-test", "claude-test", true),
+        ("move-claude-opus", "claude-opus-5-5", true),
+        ("move-claude-unrecorded", "claude-opus-5-5", false),
+    ] {
+        let answer = a_claude_run_with_a_refusal_fallback_offered_b(label, model, records_method).await;
+        let broca_session_loop::account_move::Answer::Move(moved) = answer else {
+            panic!("{label}: the offer is taken");
+        };
+        assert_eq!(moved.account, "claude-b", "{label}");
+        assert_eq!(moved.selection.credential_id, "oauth:anthropic:second", "{label}");
+    }
 }
 
 /// Through the executor: an offer whose credential the vault serves for the offered account is
@@ -403,7 +532,7 @@ async fn the_executor_moves_to_an_offer_the_vault_serves_for_the_offered_account
     assert_eq!(asked.len(), 1, "{asked:#?}");
     assert_eq!(asked[0]["method"], "route.account_for");
     assert_eq!(asked[0]["params"]["mode"], "continue");
-    assert_eq!(asked[0]["params"]["admission_id"], "chatgpt-run");
+    assert_eq!(asked[0]["params"]["admission_id"], "walled-run");
     assert_eq!(asked[0]["params"]["previous_decision_id"], "decision-a");
     assert_eq!(asked[0]["params"]["exhausted"]["account"], "chatgpt-a");
     assert!(vault

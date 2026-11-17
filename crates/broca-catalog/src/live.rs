@@ -1636,7 +1636,22 @@ fn validate_recorded_fallback_auth(
     if (frozen.server_side_fallback || frozen.refusal_fallback.is_some())
         && !is_anthropic_oauth_shape(provider_id, auth_method, frozen)
     {
-        return Err("frozen_fallback_auth_mismatch: recorded Anthropic fallback settings require OAuth credentials; resume with OAuth rather than changing the frozen request for an API key".into());
+        // Name each input of the shape check, so a refusal says which one didn't match.
+        let system_prompt = match &frozen.system_prompt {
+            SystemPromptPolicy::RequiredIdentityLead { .. } => "required_identity_lead",
+            SystemPromptPolicy::TopLevelField => "top_level_field",
+            SystemPromptPolicy::SystemMessage => "system_message",
+            SystemPromptPolicy::SystemInstructionField => "system_instruction_field",
+            SystemPromptPolicy::InstructionsField => "instructions_field",
+        };
+        return Err(format!(
+            "frozen_fallback_auth_mismatch: recorded Anthropic fallback settings require OAuth \
+             credentials; resume with OAuth rather than changing the frozen request for an API \
+             key (provider {provider_id}, auth method {}, family {:?}, system prompt \
+             {system_prompt})",
+            auth_method.map_or("none", |method| method.as_token()),
+            frozen.family_id,
+        ));
     }
     Ok(())
 }
