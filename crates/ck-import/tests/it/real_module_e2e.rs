@@ -205,6 +205,14 @@ impl Daemon {
         let config_path = config_home.join("cortexkit/subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).ok()?;
         std::fs::create_dir_all(&runtime_dir).ok()?;
+        // This rig has no vault to hand broca its storage key, so the rig's broca stores
+        // sessions unencrypted (`session_storage.encryption: off`).
+        let broca_config = dir.join("broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            r#"{"session_storage": {"encryption": "off"}}"#,
+        )
+        .ok()?;
         std::fs::write(
             &config_path,
             serde_json::to_vec_pretty(&json!({
@@ -215,7 +223,8 @@ impl Daemon {
                         "args": [],
                         "env": {
                             "BROCA_PROVIDER_BASE_URL": base_url,
-                            "BROCA_TOOL_MODULE": "unused-aft"
+                            "BROCA_TOOL_MODULE": "unused-aft",
+                            "BROCA_CONFIG_PATH": broca_config
                         },
                         "enabled": true
                     }

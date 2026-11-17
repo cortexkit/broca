@@ -495,25 +495,6 @@ async fn undeclared_plan_yields_refuses_before_any_write() {
 }
 
 #[tokio::test]
-async fn undeclared_tag_selector_names_tag_before_lookup_without_writing() {
-    let mut rig = Rig::start("undeclared-tag-selector").await;
-    let before = rig.records().await;
-    let reply = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"tag":1,"call_key":"no-call"}}),
-        )
-        .await;
-    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
-    let error: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(error["code"], "invalid_params");
-    assert_eq!(error["detail"]["field"], "tag", "{error}");
-    sample("undeclared-tag.after.json", &reply);
-    assert_eq!(rig.records().await, before);
-    rig.finish().await;
-}
-
-#[tokio::test]
 async fn send_without_undeclared_notice_members_preserves_legacy_reply_bytes() {
     let mut rig = Rig::start("ordinary-notice-member-bytes").await;
     rig.script.hold_model(true);

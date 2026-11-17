@@ -807,10 +807,23 @@ fn crash_image(from: &Path, to: &Path) {
             std::fs::create_dir_all(&target).unwrap();
         } else {
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            std::fs::copy(&entry, &target).unwrap();
+            match std::fs::copy(&entry, &target) {
+                Ok(_) => {}
+                // Windows refuses to read a file another handle holds an OS lock on. The files
+                // broca keeps locked under its state root (`broca.lock` and the decision-model
+                // store's owner lock) hold no data, only the lock, and a crash frees the lock,
+                // so the image keeps such a file, empty.
+                Err(error) if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {
+                    std::fs::File::create(&target).unwrap();
+                }
+                Err(error) => panic!("copy {}: {error}", entry.display()),
+            }
         }
     }
 }
+
+/// Windows' `ERROR_LOCK_VIOLATION`: part of the file is locked by another handle.
+const ERROR_LOCK_VIOLATION: i32 = 33;
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = vec![dir.to_path_buf()];

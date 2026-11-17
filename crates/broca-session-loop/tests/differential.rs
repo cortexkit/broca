@@ -8580,6 +8580,49 @@ async fn a_tool_input_streamed_in_fragments_reaches_the_display_lane_joined() {
     assert_eq!(display[joined.len()], expected_delta("a1", "after"));
 }
 
+/// A provider that pauses mid-input doesn't hold back what it already streamed: a joined
+/// fragment reaches the display lane when its hold ends, while the stream is still open.
+#[tokio::test]
+async fn a_tool_input_fragment_goes_out_while_its_provider_pauses() {
+    let (out, mut events) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let fragment = DisplayEvent::ToolInputDelta {
+        mid: None,
+        part: None,
+        tool_call_id: ToolCallId("c1".into()),
+        delta: r#"{"path":"#.into(),
+    };
+    let scenario = single(vec![vec![NormalizedEvent::Display(fragment.clone())]]);
+    let run = DISPLAY_OUT.scope(
+        out,
+        HOLD_STREAM.scope(
+            true,
+            TEST_CANCEL.scope(cancel.clone(), async {
+                new_loop(&scenario).await;
+            }),
+        ),
+    );
+    let observe = async {
+        // The stream stays open after the fragment, so only the hold's end can release it.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(OutputEvent::Display(event)) => return event,
+                    Some(_) => continue,
+                    None => panic!("the run ended before the fragment reached the display lane"),
+                }
+            }
+        })
+        .await
+        .expect("the held fragment goes out while its provider pauses");
+        cancel.cancel();
+        while events.recv().await.is_some() {}
+        first
+    };
+    let (_, first) = tokio::join!(run, observe);
+    assert_eq!(first, fragment);
+}
+
 #[tokio::test]
 async fn cancelled_stream_is_reset() {
     let (out, mut events) = mpsc::channel(64);

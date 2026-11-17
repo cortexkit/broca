@@ -4545,26 +4545,23 @@ async fn model_step<W: Writer, P: Provider, T>(
     let outcome = loop {
         // Biased: the cancel is checked before each event, as broca-core's run loop checks it
         // before its step.
+        let deadline = join.deadline();
         let event = tokio::select! {
             biased;
             _ = seams.cancel.cancelled() => break Err(StepFailure::Cancelled),
             event = events.recv() => event,
+            () = display::until(deadline) => {
+                join.flush(seams.out).await;
+                continue;
+            }
         };
         // A held tool-input delta goes out before anything else the step does.
         if !matches!(event, Some(NormalizedEvent::Display(_))) {
-            if let (Some(out), Some(held)) = (seams.out, join.release()) {
-                let _ = out.send(OutputEvent::Display(held)).await;
-            }
+            join.flush(seams.out).await;
         }
         match event {
             Some(NormalizedEvent::Display(display)) => {
-                if matches!(display, broca_protocol::DisplayEvent::DisplayReset) {
-                    *live_display = false;
-                } else if display.delta().is_some()
-                    || matches!(display, broca_protocol::DisplayEvent::DisplayGap { .. })
-                {
-                    *live_display = true;
-                }
+                display::note_live(&display, live_display);
                 if let Some(out) = seams.out {
                     for display in join.take(display, tokio::time::Instant::now()) {
                         let _ = out.send(OutputEvent::Display(display)).await;

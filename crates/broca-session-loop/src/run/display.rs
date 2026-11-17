@@ -62,6 +62,37 @@ impl ToolInputJoin {
     pub(super) fn release(&mut self) -> Option<DisplayEvent> {
         self.held.take().map(|(event, _)| event)
     }
+
+    /// Sends the held delta, if any, on `out`.
+    pub(super) async fn flush(&mut self, out: Option<&mpsc::Sender<OutputEvent>>) {
+        if let (Some(out), Some(held)) = (out, self.release()) {
+            let _ = out.send(OutputEvent::Display(held)).await;
+        }
+    }
+
+    /// When the held delta must go out if no fragment arrives first: a provider that pauses
+    /// mid-input must not leave the fragments it already streamed unshown. `None` holds nothing.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.held.as_ref().map(|(_, since)| *since + HOLD)
+    }
+}
+
+/// Notes in `live` whether `event` leaves streamed words on the display lane: a reset clears them,
+/// and a delta or a gap marker puts words there.
+pub(super) fn note_live(event: &DisplayEvent, live: &mut bool) {
+    if matches!(event, DisplayEvent::DisplayReset) {
+        *live = false;
+    } else if event.delta().is_some() || matches!(event, DisplayEvent::DisplayGap { .. }) {
+        *live = true;
+    }
+}
+
+/// Waits until `deadline`, or forever when there is none.
+pub(super) async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Resets the display lane and streams `message` on it again, each text, reasoning and tool-input

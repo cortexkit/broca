@@ -237,6 +237,8 @@ struct Rig {
     corr: u64,
     runner: HeadRunner,
     admitter: Arc<HeadPlan>,
+    /// How long a request waits for its reply.
+    reply_within: Duration,
 }
 
 impl Drop for Rig {
@@ -339,6 +341,7 @@ impl Rig {
             corr: 1,
             runner,
             admitter,
+            reply_within: Duration::from_secs(20),
         }
     }
 
@@ -390,7 +393,7 @@ impl Rig {
             std::fs::write(folder.join(format!("{case}.request.json")), &frame.body).unwrap();
         }
         write_frame(&mut self.writer, &frame).await.unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reader))
+        let reply = tokio::time::timeout(self.reply_within, read_frame(&mut self.reader))
             .await
             .expect("a reply")
             .unwrap()
@@ -893,6 +896,9 @@ async fn opencode1_extract_import_25k_timing() {
 async fn a_move_list_too_large_for_one_frame_is_served_in_pages_through_serve() {
     let samples = std::env::var_os("BROCA_IMPORT_MOVES_SAMPLES").map(PathBuf::from);
     let mut rig = Rig::start("opencode1-paged-moves", true).await;
+    // The first page imports 100,000 messages, which an unoptimized build on a shared CI runner
+    // takes longer than the rig's usual 20 s to do.
+    rig.reply_within = Duration::from_secs(180);
     rig.bind(1, core(), Some(stamp(core()))).await;
     let count = 100_000;
     let params = opencode1_source_with_text(&rig, "paged-moves", Some(count), 1);
