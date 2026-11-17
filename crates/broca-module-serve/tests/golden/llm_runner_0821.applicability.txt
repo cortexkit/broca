@@ -1,14 +1,14 @@
-N/A cache_policy_plan_decode: missing groups: cache_policy
-N/A keep_warm_auto_warms_idle_session: missing groups: cache_policy
-N/A keep_warm_auto_stops_at_one_rewrite: missing groups: cache_policy
-N/A keep_warm_auto_rearms_after_real_request: missing groups: cache_policy
-N/A keep_warm_off_sends_no_warms: missing groups: cache_policy
-N/A cache_policy_send_decode: missing groups: cache_policy
-N/A cache_policy_plan_refusals: missing groups: cache_policy
-N/A cache_policy_send_refusals: missing groups: cache_policy
-N/A cache_policy_continuation_refused: missing groups: cache_policy
-N/A cache_policy_plan_and_send_refused: missing groups: cache_policy
-N/A cache_policy_step_report: missing groups: cache_policy
+PASS cache_policy_plan_decode
+N/A keep_warm_auto_warms_idle_session: adapter has no idle keep-warm price fixture
+N/A keep_warm_auto_stops_at_one_rewrite: adapter has no idle keep-warm price fixture
+N/A keep_warm_auto_rearms_after_real_request: adapter has no idle keep-warm price fixture
+N/A keep_warm_off_sends_no_warms: adapter has no idle keep-warm price fixture
+PASS cache_policy_send_decode
+PASS cache_policy_plan_refusals
+PASS cache_policy_send_refusals
+PASS cache_policy_continuation_refused
+PASS cache_policy_plan_and_send_refused
+PASS cache_policy_step_report
 N/A restart_survival_model_step: adapter declares host_survives_restart: false
 N/A restart_survival_held_tool_call: adapter declares host_survives_restart: false
 N/A restart_survival_send_handoff: adapter declares host_survives_restart: false

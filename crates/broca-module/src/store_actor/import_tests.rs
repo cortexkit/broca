@@ -1457,9 +1457,13 @@ async fn run_once_with<W: Writer>(
         pause_for_auth_at_start: None,
         account_continue: None,
     };
-    broca_session_loop::run::run(writer, parts, admission, &seams)
-        .await
-        .unwrap();
+    // Boxed: the run loop's future is large, and a test holding it on its stack beside other
+    // large futures overflows a debug build's smaller Windows test-thread stack.
+    Box::pin(broca_session_loop::run::run(
+        writer, parts, admission, &seams,
+    ))
+    .await
+    .unwrap();
     let calls = provider.calls();
     assert_eq!(calls.len(), 1, "one step, one request");
     calls.into_iter().next().unwrap()
@@ -1716,14 +1720,28 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
         async move { stored.records_between(1, last).await.unwrap() }
     };
     let history = records(&session).await;
-    let rebuilt = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r1", 1)
-        .await
-        .unwrap();
+    let rebuilt = Box::pin(super::recorded_warm::request_as_of(
+        &session,
+        &history,
+        &parts,
+        &bind(),
+        "r1",
+        1,
+    ))
+    .await
+    .unwrap();
     assert_eq!(as_read(&rebuilt.opts), as_read(&first));
     // Read from the session as it stands now, the same step takes the later view.
-    let current = super::recorded_warm::request(&session, &history, &parts, &bind(), "r1", Some(1))
-        .await
-        .map(|request| as_read(&request.opts));
+    let current = Box::pin(super::recorded_warm::request(
+        &session,
+        &history,
+        &parts,
+        &bind(),
+        "r1",
+        Some(1),
+    ))
+    .await
+    .map(|request| as_read(&request.opts));
     assert_ne!(current.ok(), Some(as_read(&first)));
 
     // A view that cuts deeper seals the history through `msg_a3` at the next step.
@@ -1756,9 +1774,16 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
         "deeper seal"
     );
     let history = records(&session).await;
-    let rebuilt = super::recorded_warm::request_as_of(&session, &history, &parts, &bind(), "r1", 1)
-        .await
-        .unwrap();
+    let rebuilt = Box::pin(super::recorded_warm::request_as_of(
+        &session,
+        &history,
+        &parts,
+        &bind(),
+        "r1",
+        1,
+    ))
+    .await
+    .unwrap();
     assert_eq!(as_read(&rebuilt.opts), as_read(&first));
     // A step after that seal ran in the log the seal opened, which starts with whole copies of the
     // views its stored views were changes against; its history holds both.

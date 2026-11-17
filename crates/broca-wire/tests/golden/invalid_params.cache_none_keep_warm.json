@@ -1,1 +1,0 @@
-{"code":"invalid_params","message":"cache.mode \"none\" cannot be combined with keep_warm \"auto\"","detail":{"field":"keep_warm"}}

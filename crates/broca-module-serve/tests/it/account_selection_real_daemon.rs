@@ -1915,14 +1915,32 @@ fn spec<'a>(send_id: &'a str, auth: Option<broca_wire::AuthParams>) -> SendSpec<
     }
 }
 
+/// Sends `send_id` and returns its run. Broca loads the vault's credential listing on the first
+/// send that needs it and refuses that send with the retryable `transient` until the listing
+/// arrives; a refused send starts no run, so it is sent again, as a caller would.
 async fn send(
     client: &SessionClient,
     send_id: &str,
     auth: Option<broca_wire::AuthParams>,
 ) -> String {
-    match client.send(spec(send_id, auth)).await.expect("send") {
-        SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. } => run_id,
-        other => panic!("unexpected send outcome {other:?}"),
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match client.send(spec(send_id, auth.clone())).await {
+            Ok(SendOutcome::Active { run_id } | SendOutcome::Finished { run_id, .. }) => {
+                return run_id
+            }
+            Ok(other) => panic!("unexpected send outcome {other:?}"),
+            Err(broca_subc::ConnError::Rejected(refused))
+                if refused.code() == "transient"
+                    && refused
+                        .message()
+                        .contains("credential listing has not loaded")
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("send: {error:?}"),
+        }
     }
 }
 

@@ -1488,6 +1488,12 @@ fn plan_view_session(session: &str) -> bool {
     session.starts_with("cf-plan-view-")
 }
 
+/// A cache-policy case's session. Its creating send carries a plan, so the plan cases can put
+/// their policy in `plan.cache`; the send cases remove the plan and send `cache` beside it.
+fn cache_policy_session(session: &str) -> bool {
+    session.starts_with("cf-cache-policy-")
+}
+
 #[test]
 fn plan_view_heads_start_as_heads_with_or_without_a_plan() {
     let subject = held_call_tests::subject(Arc::new(Shared::default()));
@@ -2585,6 +2591,199 @@ impl RunnerRoute for BrocaRoute {
     }
 }
 
+impl BrocaSubject {
+    /// The fixture's own members for a send, before `send_fields` puts the cache key where the
+    /// contract takes it.
+    fn fixture_send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if let Some(peer) = self
+            .shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .get(session)
+        {
+            let mut fields = routed_accounts::send_fields(session, first, peer);
+            if let Some(key) = self.shared.fork_head_keys.lock().unwrap().get(session) {
+                fields.insert("conversation_key".into(), json!(key));
+            }
+            if first && step_events::fixture_session(session) {
+                // The new-head path records durable attempt identities. The fixture's daemon
+                // uses plain storage because its vault has no deployment key.
+                fields.insert("session_class".into(), json!("head"));
+            }
+            return fields;
+        }
+        if self
+            .shared
+            .head_selection_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = json!({"cache":{"key":format!("tier-fixture-{session}")}});
+            if first {
+                fields["model"] =
+                    json!({"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")});
+                let composition = json!({"providers":[],"step_transform_items":[]});
+                fields["plan"] = json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],
+                    "composition":composition,"composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap()});
+            }
+            return fields.as_object().unwrap().clone();
+        }
+        if self
+            .shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = Map::new();
+            fields.insert(
+                "model".into(),
+                json!({"provider":"xai","model":"conformance-service-tier"}),
+            );
+            // Cache scope carries fixture identity without adding system text beside a plan.
+            fields.insert(
+                "cache".into(),
+                json!({"key":format!("tier-fixture-{session}")}),
+            );
+            return fields;
+        }
+        if session.contains("tool_result_too_large")
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
+        // A plan_view case needs a plan in its params; the case that sends none removes it.
+        if (session_change_kit_session(session) || plan_view_session(session))
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
+        if message_marks_kit_session(session)
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
+        if held_late_results::needs_plan(&self.shared, session)
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
+        if let Some(accepts) = self
+            .shared
+            .attachment_models
+            .lock()
+            .unwrap()
+            .get(session)
+            .copied()
+            .or_else(|| session.contains("attachments").then_some(true))
+        {
+            let mut fields =
+                json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
+            if !self.shared.plan_sessions.lock().unwrap().contains(session) {
+                fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
+                if first {
+                    fields["tools"] = json!([{"name":SCRIPTED_TOOL,"description":"Answers each call with its scripted result.","input_schema":{"type":"object"},"module":TOOL_MODULE}]);
+                }
+            }
+            return fields.as_object().unwrap().clone();
+        }
+        // The pin fixture uses an admitted provider catalog. Caller-declared
+        // legacy tools intentionally have no provider semantics to pin.
+        if session.starts_with("cf-call-identity-pin-")
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
+        if self
+            .shared
+            .output_refs_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            return json!({"model":{"provider":output_refs::PROVIDER,"model":output_refs::MODEL}})
+                .as_object()
+                .unwrap()
+                .clone();
+        }
+        if self.shared.plan_sessions.lock().unwrap().contains(session) {
+            return json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")}})
+                .as_object().unwrap().clone();
+        }
+        // Legacy cases name tools directly; compaction cases use the plan-aware catalogue.
+        let markerless = self
+            .shared
+            .model_id_marker_sessions
+            .lock()
+            .unwrap()
+            .contains(session);
+        // The kit's media fixtures script an answer as several text parts and check how reads
+        // describe each part. Chat-completions text deltas concatenate into one part, so those
+        // sessions use the Messages stream, whose content blocks keep each scripted part.
+        let model = if media_fixture_session(session) {
+            json!({"provider": output_refs::PROVIDER, "model": MEDIA_FIXTURE_MODEL})
+        } else if session.starts_with("cf-temperature-") {
+            json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": "conformance-temperature"})
+        } else if markerless {
+            json!({"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")})
+        } else {
+            json!({"provider": "mock", "model": "mock-model"})
+        };
+        let mut fields = json!({
+            "model": model,
+            "tools": [{
+                "name": SCRIPTED_TOOL,
+                "description": "Answers each call with its scripted result.",
+                "input_schema": {"type": "object"},
+                "module": TOOL_MODULE,
+            }],
+        });
+        if !first {
+            fields.as_object_mut().unwrap().remove("tools");
+        }
+        // Native durability, reader-identity and retention fixtures depend on this original
+        // system marker, including error sessions that never install a model script.
+        if !markerless {
+            fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
+        }
+        fields.as_object().cloned().expect("an object")
+    }
+}
+
+/// Puts a send's `cache` where the contract takes it: a later send carries none (the session
+/// keeps the one its creating send froze), and a send carrying a plan moves it into `plan.cache`.
+/// A `planned` session's cache rides only in its plan: the conformance kit lays the plan send's
+/// fields over params it built from `send_fields`, so those params must not carry a second copy.
+fn place_cache_once(fields: &mut Map<String, Value>, first: bool, planned: bool) {
+    let Some(cache) = fields.remove("cache") else {
+        return;
+    };
+    if !first {
+        return;
+    }
+    match fields.get_mut("plan").and_then(Value::as_object_mut) {
+        Some(plan) => {
+            plan.entry("cache").or_insert(cache);
+        }
+        None if !planned => {
+            fields.insert("cache".into(), cache);
+        }
+        None => {}
+    }
+}
+
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
     async fn step_event_observation(
@@ -2983,6 +3182,9 @@ impl LlmRunnerSubject for BrocaSubject {
             // or observe the numbers a request showed, so the resolving cases report
             // inapplicable by name; the refusal and owner cases run on ordinary routes.
             Capability::TagRead,
+            // role.describe declares cache_policy. Its cases drive ordinary sends with a
+            // session's cache in its creating send or its plan.
+            Capability::CachePolicy,
         ]
         .into_iter()
         .collect();
@@ -3129,171 +3331,22 @@ impl LlmRunnerSubject for BrocaSubject {
         })
     }
 
+    /// The fixture's members for a send, as the contract takes them: a session's cache policy is
+    /// set once, by its creating send or by its plan, so the fixture's cache key (which tells
+    /// the scripted provider the sessions apart) rides on the creating send, inside the plan
+    /// when the send carries one, and later runs keep the key frozen from it.
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
-        if let Some(peer) = self
-            .shared
-            .routed_account_peers
-            .lock()
-            .unwrap()
-            .get(session)
-        {
-            let mut fields = routed_accounts::send_fields(session, first, peer);
-            if let Some(key) = self.shared.fork_head_keys.lock().unwrap().get(session) {
-                fields.insert("conversation_key".into(), json!(key));
-            }
-            if first && step_events::fixture_session(session) {
-                // The new-head path records durable attempt identities. The fixture's daemon
-                // uses plain storage because its vault has no deployment key.
-                fields.insert("session_class".into(), json!("head"));
-            }
-            return fields;
-        }
-        if self
-            .shared
-            .head_selection_sessions
-            .lock()
-            .unwrap()
-            .contains(session)
-        {
-            let mut fields = json!({"cache":{"key":format!("tier-fixture-{session}")}});
-            if first {
-                fields["model"] =
-                    json!({"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")});
-                let composition = json!({"providers":[],"step_transform_items":[]});
-                fields["plan"] = json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],
-                    "composition":composition,"composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap()});
-            }
-            return fields.as_object().unwrap().clone();
-        }
-        if self
-            .shared
-            .service_tier_sessions
-            .lock()
-            .unwrap()
-            .contains(session)
-        {
-            let mut fields = Map::new();
-            fields.insert(
-                "model".into(),
-                json!({"provider":"xai","model":"conformance-service-tier"}),
-            );
-            // Cache scope carries fixture identity without adding system text beside a plan.
-            fields.insert(
-                "cache".into(),
-                json!({"key":format!("tier-fixture-{session}")}),
-            );
-            return fields;
-        }
-        if session.contains("tool_result_too_large")
-            && !self.shared.plan_sessions.lock().unwrap().contains(session)
-        {
+        if first && cache_policy_session(session) {
+            // A cache-policy case sends a refused creating send and then a corrected one under
+            // the same send id, so every creating send carries the plan.
             return self
                 .send_fields_with_plan(session, first, &Map::new())
                 .unwrap();
         }
-        // A plan_view case needs a plan in its params; the case that sends none removes it.
-        if (session_change_kit_session(session) || plan_view_session(session))
-            && !self.shared.plan_sessions.lock().unwrap().contains(session)
-        {
-            return self
-                .send_fields_with_plan(session, first, &Map::new())
-                .unwrap();
-        }
-        if message_marks_kit_session(session)
-            && !self.shared.plan_sessions.lock().unwrap().contains(session)
-        {
-            return self
-                .send_fields_with_plan(session, first, &Map::new())
-                .unwrap();
-        }
-        if held_late_results::needs_plan(&self.shared, session)
-            && !self.shared.plan_sessions.lock().unwrap().contains(session)
-        {
-            return self
-                .send_fields_with_plan(session, first, &Map::new())
-                .unwrap();
-        }
-        if let Some(accepts) = self
-            .shared
-            .attachment_models
-            .lock()
-            .unwrap()
-            .get(session)
-            .copied()
-            .or_else(|| session.contains("attachments").then_some(true))
-        {
-            let mut fields =
-                json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
-            if !self.shared.plan_sessions.lock().unwrap().contains(session) {
-                fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
-                if first {
-                    fields["tools"] = json!([{"name":SCRIPTED_TOOL,"description":"Answers each call with its scripted result.","input_schema":{"type":"object"},"module":TOOL_MODULE}]);
-                }
-            }
-            return fields.as_object().unwrap().clone();
-        }
-        // The pin fixture uses an admitted provider catalog. Caller-declared
-        // legacy tools intentionally have no provider semantics to pin.
-        if session.starts_with("cf-call-identity-pin-")
-            && !self.shared.plan_sessions.lock().unwrap().contains(session)
-        {
-            return self
-                .send_fields_with_plan(session, first, &Map::new())
-                .unwrap();
-        }
-        if self
-            .shared
-            .output_refs_sessions
-            .lock()
-            .unwrap()
-            .contains(session)
-        {
-            return json!({"model":{"provider":output_refs::PROVIDER,"model":output_refs::MODEL}})
-                .as_object()
-                .unwrap()
-                .clone();
-        }
-        if self.shared.plan_sessions.lock().unwrap().contains(session) {
-            return json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")}})
-                .as_object().unwrap().clone();
-        }
-        // Legacy cases name tools directly; compaction cases use the plan-aware catalogue.
-        let markerless = self
-            .shared
-            .model_id_marker_sessions
-            .lock()
-            .unwrap()
-            .contains(session);
-        // The kit's media fixtures script an answer as several text parts and check how reads
-        // describe each part. Chat-completions text deltas concatenate into one part, so those
-        // sessions use the Messages stream, whose content blocks keep each scripted part.
-        let model = if media_fixture_session(session) {
-            json!({"provider": output_refs::PROVIDER, "model": MEDIA_FIXTURE_MODEL})
-        } else if session.starts_with("cf-temperature-") {
-            json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": "conformance-temperature"})
-        } else if markerless {
-            json!({"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")})
-        } else {
-            json!({"provider": "mock", "model": "mock-model"})
-        };
-        let mut fields = json!({
-            "model": model,
-            "tools": [{
-                "name": SCRIPTED_TOOL,
-                "description": "Answers each call with its scripted result.",
-                "input_schema": {"type": "object"},
-                "module": TOOL_MODULE,
-            }],
-        });
-        if !first {
-            fields.as_object_mut().unwrap().remove("tools");
-        }
-        // Native durability, reader-identity and retention fixtures depend on this original
-        // system marker, including error sessions that never install a model script.
-        if !markerless {
-            fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
-        }
-        fields.as_object().cloned().expect("an object")
+        let mut fields = self.fixture_send_fields(session, first);
+        let planned = self.shared.plan_sessions.lock().unwrap().contains(session);
+        place_cache_once(&mut fields, first, planned);
+        fields
     }
 
     fn send_fields_with_plan(
@@ -3331,7 +3384,7 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .insert(session.into());
-        let mut fields = self.send_fields(session, first);
+        let mut fields = self.fixture_send_fields(session, first);
         if first {
             // The kit can promote params already carrying legacy tools into a plan send.
             // Null explicitly clears those legacy defaults; the plan owns this surface.
@@ -3366,6 +3419,7 @@ impl LlmRunnerSubject for BrocaSubject {
             plan.as_object_mut().unwrap().extend(members.clone());
             fields.insert("plan".into(), plan);
         }
+        place_cache_once(&mut fields, first, true);
         Some(fields)
     }
 

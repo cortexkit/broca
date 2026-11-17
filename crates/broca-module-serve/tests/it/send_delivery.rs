@@ -1030,41 +1030,6 @@ async fn a_steer_retry_answers_turn_when_the_next_episode_renders_it() {
     rig.finish().await;
 }
 
-#[tokio::test]
-async fn cache_none_with_automatic_warming_refuses_before_any_write() {
-    let mut rig = Rig::start("cache-none-auto").await;
-    for provider in [
-        "anthropic",
-        "openai",
-        "google",
-        "bedrock",
-        "gateway",
-        "fake",
-    ] {
-        let refused = rig
-            .send_with(
-                "refused",
-                "hello",
-                None,
-                serde_json::json!({
-                    "model": {"provider": provider, "model": "any"},
-                    "cache": {"mode": "none"}, "keep_warm": "auto"
-                }),
-            )
-            .await;
-        assert_golden(&refused, "invalid_params.cache_none_keep_warm.json", "");
-        assert!(
-            rig.records().await.is_empty(),
-            "{provider}: refusal must not write WAL"
-        );
-        assert!(
-            rig.script.prompts.lock().unwrap().is_empty(),
-            "no provider call"
-        );
-    }
-    rig.finish().await;
-}
-
 async fn invalid_retention_writes_nothing(tag: &str, delivery: Option<&str>) {
     let mut rig = Rig::start(tag).await;
     let values = [
