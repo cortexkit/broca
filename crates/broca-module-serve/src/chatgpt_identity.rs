@@ -3,8 +3,6 @@
 use broca_protocol::BindIdentity;
 use broca_provider::chatgpt_wire::{ChatgptWire, ChatgptWireProfile};
 use broca_provider::spec::WireFamilyId;
-use broca_provider::wire::uuid_v4_text;
-use std::sync::OnceLock;
 
 /// Resolve the policy before constructing the provider. The lazy factory must never run on
 /// resume: a different host or process must not replace the episode's original identity.
@@ -33,12 +31,6 @@ pub fn fresh(
     turn_id: &str,
     admitted_at_ms: u64,
 ) -> Result<ChatgptWire, String> {
-    static WINDOW_ID: OnceLock<String> = OnceLock::new();
-    if WINDOW_ID.get().is_none() {
-        let mut bytes = [0; 16];
-        getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
-        let _ = WINDOW_ID.set(uuid_v4_text(bytes));
-    }
     let os = os_info::get();
     let terminal = terminal_user_agent(&|name| std::env::var(name).ok());
     let user_agent = format!(
@@ -54,15 +46,20 @@ pub fn fresh(
     .map(|c| if matches!(c, ' '..='~') { c } else { '_' })
     .collect();
     let bind = serde_json::to_string(session).map_err(|error| error.to_string())?;
+    let thread_id = ChatgptWire::scoped_id("chatgpt-thread", &bind);
     Ok(ChatgptWire {
         profile: ChatgptWireProfile::Codex0163,
         user_agent,
         originator: ChatgptWire::ORIGINATOR.into(),
         session_id: session.session.as_str().to_string(),
-        thread_id: ChatgptWire::scoped_id("chatgpt-thread", &bind),
+        // Codex 0.163 names a context window `{thread_id}:{window_number}` and keeps it when a
+        // conversation resumes in a new process (`Session::current_window_from_state`). The
+        // number moves only when Codex compacts its own history, which broca never does, so a
+        // session keeps window 0 across broca restarts as a Codex conversation keeps its window.
+        window_id: format!("{thread_id}:0"),
+        thread_id,
         // Reuse the owner-only persisted seed, with a separate provider namespace.
         installation_id: ChatgptWire::scoped_id("chatgpt-installation", install_id),
-        window_id: WINDOW_ID.get().unwrap().clone(),
         turn_id: turn_id.to_string(),
         turn_started_at_unix_ms: admitted_at_ms,
     })
@@ -180,7 +177,7 @@ mod tests {
         assert_eq!(first.session_id, "s");
         assert_eq!(first.turn_id, "run-1");
         assert_eq!(first.turn_started_at_unix_ms, 123);
-        assert_eq!(first.window_id.len(), 36);
+        assert_eq!(first.window_id, format!("{}:0", first.thread_id));
         assert_eq!(first.profile, ChatgptWireProfile::Codex0163);
         let changed_host = || Err("host discovery must not run on resume".into());
         let config = serde_json::json!({"chatgpt_wire": first});
