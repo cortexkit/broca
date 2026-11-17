@@ -14,9 +14,11 @@
 //! - the `Pause` and `RunEnd` of the run a send started or was delivered into: `paused`,
 //!   `finished`.
 //!
-//! Only sends a caller keyed (`send_id`) and a module sent (a reserved principal, whose module
-//! id ends the subject) have notices: an unkeyed send can't be re-read, and only a module has a
-//! durable to read them. A seeded run has none, as it has no run events.
+//! Only a send that a module made (a reserved principal: a module the daemon launched, whose
+//! module id ends the subject) and that carries the caller's own key (`send_id`) has notices: an
+//! unkeyed send can't be re-read, and only a module has a durable bus consumer (one that keeps
+//! its place across restarts) to read them. A seeded run (from an import or a fork) has none, as
+//! it has no run events.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -496,8 +498,9 @@ mod tests {
         );
     }
 
-    /// Only a send a module sent and a caller keyed has notices: an unkeyed send can't be
-    /// re-read, and a person's direct route has no durable to read them.
+    /// Only a send that a module made and that carries the caller's `send_id` has notices: an
+    /// unkeyed send can't be re-read, and a person's direct route has no durable bus consumer to
+    /// read them.
     #[test]
     fn unkeyed_sends_and_sends_from_no_module_have_none() {
         let notices = project(vec![

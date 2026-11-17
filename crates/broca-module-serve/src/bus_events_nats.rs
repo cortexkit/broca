@@ -526,6 +526,9 @@ pub struct NatsPublisher {
 #[async_trait]
 impl BusPublisher for NatsPublisher {
     async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
+        if event.inline {
+            return self.publish_inline(event).await;
+        }
         self.stream
             .publish(
                 &event.subject,
@@ -538,6 +541,35 @@ impl BusPublisher for NatsPublisher {
     }
 }
 impl NatsPublisher {
+    /// Publish `event` with its body as the payload and its event key as the NATS message id
+    /// (which JetStream deduplicates on), as `BusClient::publish_event` in the
+    /// `cortexkit-bus-client` crate publishes other modules' events. The stream's own `publish`
+    /// sends an empty payload carrying the body's digest, which suits run events (read back with
+    /// `run.event.get`) but would put no notice in a send state message.
+    async fn publish_inline(&self, event: &Publication) -> Result<PublishReceipt, String> {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            async_nats::header::NATS_MESSAGE_ID,
+            event.event_key.as_str(),
+        );
+        for (name, value) in &event.headers {
+            if name.eq_ignore_ascii_case(async_nats::header::NATS_MESSAGE_ID.as_ref()) {
+                return Err("an inline publication's header collides with its message id".into());
+            }
+            let name = name
+                .parse::<async_nats::header::HeaderName>()
+                .map_err(|_| "invalid NATS header name")?;
+            headers.insert(name, value.as_str());
+        }
+        let ack = async_nats::jetstream::new(self.connection.client())
+            .publish_with_headers(event.subject.clone(), headers, event.body.clone().into())
+            .await
+            .map_err(|_| "ckbus publish failed")?
+            .await
+            .map_err(|_| "ckbus publish failed")?;
+        Ok(PublishReceipt::new(ack.sequence, ack.duplicate))
+    }
+
     /// Connect using `credential`'s inbox prefix. Every handshake, including each reconnect
     /// async-nats makes on its own, asks `holder` for the JWT and nonce signature, so a
     /// reconnect presents the current key and JWT rather than the ones this connection
@@ -1367,6 +1399,7 @@ mod tests {
             headers: Default::default(),
             body: vec![],
             digest: None,
+            inline: false,
         }
     }
 

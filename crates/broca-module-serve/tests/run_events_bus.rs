@@ -270,6 +270,78 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
     assert!(store.pending_bus_event().unwrap().is_none());
 }
 
+/// A send state notice reaches its sender's subscriber with the notice itself as the payload,
+/// and its message id names the change, so publishing it again is a JetStream duplicate. An
+/// empty payload carrying only a digest, as run events are sent, would put no notice in the
+/// message, since a send state notice has no `run.event.get`. Read with a raw async-nats
+/// consumer, not broca's `Stream` cursor (which decodes claim checks), so the check sees the
+/// bytes on the wire.
+#[tokio::test]
+async fn real_bus_send_state_notice_is_its_own_payload() {
+    use broca_protocol::send_states::SendStateNotice;
+    use futures::StreamExt as _;
+    let Some((_bus, conn, names, _)) = fixture().await else {
+        return;
+    };
+    let bus = provision(&conn, &names).await;
+    let temp = scratch();
+    let store = Arc::new(SqliteStore::open(temp.path().join("run-index.db")).unwrap());
+    store.enable_bus_events(names.account()).unwrap();
+    let notice = SendStateNotice {
+        v: 1,
+        session_ref: "0123456789abcdef0123456789abcdef".into(),
+        send_id: "aft:bash:bash-1".into(),
+        seq: 7,
+        state: "pending",
+    };
+    let body = notice.to_bytes().unwrap();
+    assert!(store
+        .record_send_states(&[("aft".into(), notice.clone())], now_ms())
+        .unwrap());
+    let js = async_nats::jetstream::new(conn.client());
+    let consumer = js
+        .get_stream(names.streams().event.clone())
+        .await
+        .unwrap()
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some(AccountNames::module_consumer_name("aft").unwrap()),
+            filter_subject: notice.subject(&names, "aft").unwrap(),
+            ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let event = store.pending_bus_event().unwrap().unwrap();
+    assert_eq!(
+        store.drain_bus_event(&bus, now_ms()).await.unwrap(),
+        DrainResult::Published
+    );
+    let mut messages = consumer.messages().await.unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(5), messages.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.payload.as_ref(), body.as_slice());
+    let decoded: serde_json::Value = serde_json::from_slice(&message.payload).unwrap();
+    assert_eq!(decoded["state"], "pending");
+    let headers = message.headers.as_ref().unwrap();
+    assert_eq!(
+        headers
+            .get(async_nats::header::NATS_MESSAGE_ID)
+            .unwrap()
+            .as_str(),
+        notice.message_id()
+    );
+    message.ack().await.unwrap();
+    let retry = bus.publish(&event).await.unwrap();
+    assert!(
+        retry.duplicate(),
+        "the same notice published again is a duplicate"
+    );
+    assert!(store.pending_bus_event().unwrap().is_none());
+}
+
 #[tokio::test]
 async fn real_bus_outage_queues_then_reconnect_resumes_identical_event() {
     let Some((broker, conn, names, account_public)) = fixture().await else {

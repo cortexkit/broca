@@ -189,8 +189,9 @@ pub struct PeriodStart {
 
 #[derive(Debug, Clone)]
 pub struct Publication {
-    /// The bus message id: the event's claim-check key for a run event, and
-    /// `<session_ref>:advanced:<seq>` for a compaction advance notice.
+    /// The bus message id: the event's claim-check key for a run event,
+    /// `<session_ref>:advanced:<seq>` for a compaction advance notice, and
+    /// `<session_ref>:<send_id>:<seq>` for a send state notice.
     pub event_key: String,
     pub subject: String,
     pub headers: Headers,
@@ -198,6 +199,11 @@ pub struct Publication {
     /// The bus digest when it is not the body's: a compaction advance notice carries no body,
     /// and its digest is the notice digest over its headers.
     pub digest: Option<ContentDigest>,
+    /// Whether the body travels as the message's payload. A send state notice does: it is
+    /// small, and its subscriber reads it straight off the message. The others carry an empty
+    /// payload and a digest: a run event's body is fetched with `run.event.get`, and a compaction
+    /// advance notice has no body (its digest covers its headers).
+    pub inline: bool,
 }
 
 impl Publication {
@@ -763,6 +769,7 @@ impl EventStore<'_> {
             insert_event(conn, &account, session, epoch, event, &bytes, now_ms, true)
         })?;
         Ok(Some(Publication {
+            inline: false,
             event_key,
             subject: event
                 .subject(&account)
@@ -1209,6 +1216,7 @@ impl EventStore<'_> {
                         headers,
                         body: r.get(5)?,
                         digest: None,
+                        inline: true,
                     })
                 },
             )
@@ -1255,7 +1263,7 @@ impl EventStore<'_> {
                 if headers.get("run_id").is_some_and(String::is_empty) {
                     headers.remove("run_id");
                 }
-                Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None })
+                Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None, inline: false })
             },
         ).optional()?;
         match lifecycle {
@@ -1281,6 +1289,7 @@ impl EventStore<'_> {
             .optional()?;
         row.map(|(event_key, subject, headers, digest)| {
             Ok(Publication {
+                inline: false,
                 event_key,
                 subject,
                 headers: serde_json::from_str(&headers)?,
