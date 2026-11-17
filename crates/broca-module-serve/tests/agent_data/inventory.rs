@@ -10,7 +10,7 @@ struct ParkDoor {
 
 #[async_trait::async_trait]
 impl SessionDoor for ParkDoor {
-    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+    async fn durable_offset(&self, _: &str) -> Result<u64, SessionDoorError> {
         unreachable!()
     }
     async fn export(&self, _: &str, _: &[u8]) -> Result<(), SessionDoorError> {
@@ -89,7 +89,7 @@ struct ParkExportDoor {
 
 #[async_trait::async_trait]
 impl SessionDoor for ParkExportDoor {
-    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+    async fn durable_offset(&self, _: &str) -> Result<u64, SessionDoorError> {
         self.covered.fetch_add(1, Ordering::SeqCst);
         Ok(0)
     }
@@ -180,7 +180,7 @@ struct ParkPrepareDoor {
 
 #[async_trait::async_trait]
 impl SessionDoor for ParkPrepareDoor {
-    async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+    async fn durable_offset(&self, _: &str) -> Result<u64, SessionDoorError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.covering.notify_one();
         self.resume.notified().await;

@@ -38,7 +38,7 @@ impl MoveDriver for Driver {
         }
         Ok(plans.into())
     }
-    async fn cover(&self, _ref: &str) -> Result<u64, ErrorBody> {
+    async fn durable_offset(&self, _ref: &str) -> Result<u64, ErrorBody> {
         Ok(0)
     }
     async fn export(&self, _ref: &str, _frozen: &[u8]) -> Result<(), ErrorBody> {

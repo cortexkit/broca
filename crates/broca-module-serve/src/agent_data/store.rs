@@ -32,7 +32,7 @@ impl Driver {
         if let Some(prefix) = plan.store_prefix {
             let covered = self
                 .door
-                .cover(&plan.reference)
+                .durable_offset(&plan.reference)
                 .await
                 .map_err(unavailable)?;
             if moves::stream_prefix(&path, covered).map_err(stream_lost)? != prefix {
@@ -314,10 +314,14 @@ impl Driver {
             let digest = broca_wal::migration::digest(&bytes);
             (bytes.clone(), bytes.len() as u64, digest, None)
         } else if op == Op::Prepare {
-            // Cover carries no digest, so prepare checks only the local frame hashes.
+            // The door's offsets carry no digest, so prepare checks only the local frame hashes.
             // Import checks the whole-prefix digest returned by session.read {cutId}; admit
             // sends only the suffix and cannot remotely compare already-covered bytes.
-            let covered = self.door.cover(reference).await.map_err(unavailable)?;
+            let covered = self
+                .door
+                .durable_offset(reference)
+                .await
+                .map_err(unavailable)?;
             let prefix = moves::stream_prefix(&cached, covered).map_err(stream_lost)?;
             let latest = moves::append_stream(&[], &export);
             let (end, digest) =

@@ -130,7 +130,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl SessionDoor for Door {
-        async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+        async fn durable_offset(&self, _: &str) -> Result<u64, SessionDoorError> {
             unreachable!()
         }
         async fn export(&self, _: &str, _: &[u8]) -> Result<(), SessionDoorError> {

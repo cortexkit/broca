@@ -117,7 +117,7 @@ pub trait MoveDriver: Send + Sync {
         ))
     }
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody>;
-    async fn cover(&self, reference: &str) -> Result<u64, ErrorBody>;
+    async fn durable_offset(&self, reference: &str) -> Result<u64, ErrorBody>;
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody>;
     fn reply(
         &self,
@@ -989,7 +989,7 @@ impl CutArtifacts for FileCutArtifacts {
         for plan in locked.plans.iter().filter(|plan| store::is_store(plan)) {
             self.store_apply(&cut_id, plan, op, request).await?;
             if op == Op::Prepare {
-                offsets.push(self.driver.cover(&plan.reference).await?);
+                offsets.push(self.driver.durable_offset(&plan.reference).await?);
             }
         }
         let wal_plans: Vec<_> = locked
@@ -1013,14 +1013,14 @@ impl CutArtifacts for FileCutArtifacts {
                     )
                     .map_err(unavailable)?
                     .map_err(unavailable)?;
-                    offsets.push(self.driver.cover(&plan.reference).await?);
+                    offsets.push(self.driver.durable_offset(&plan.reference).await?);
                 }
             }
             Op::Export => {
                 for plan in &locked.plans {
                     self.driver.export(&plan.reference, &plan.bytes).await?;
                     if store::is_store(plan) {
-                        self.driver.cover(&plan.reference).await?;
+                        self.driver.durable_offset(&plan.reference).await?;
                     }
                 }
             }

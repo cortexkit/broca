@@ -1,4 +1,4 @@
-//! Fake ENGRAM session.cover/admit/read replies and refusals over authenticated subc frames.
+//! Fake ENGRAM session.offsets/admit/read replies and refusals over authenticated subc frames.
 //! Wire provenance: ENGRAM commit 50d65fc70ccc3e0082eaf1bde882ffaf7b2c2bcd. Unlike the real daemon,
 //! this loopback stub records consumer identity but does not verify a module launch nonce.
 
@@ -209,7 +209,7 @@ async fn send(stream: &mut TcpStream, request: &Frame, ty: FrameType, body: Vec<
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
-fn cover(durable: u64, cloud: u64) -> Answer {
+fn offsets(durable: u64, cloud: u64) -> Answer {
     Answer::Result(json!({"durableOffset": durable, "cloudOffset": cloud}))
 }
 fn read_reply() -> Value {
@@ -217,14 +217,14 @@ fn read_reply() -> Value {
 }
 
 #[tokio::test]
-async fn cover_opens_only_the_attested_internal_service_without_a_stream() {
-    let door = FakeDoor::start(vec![cover(7, 4)]).await;
+async fn offsets_opens_only_the_attested_internal_service_without_a_stream() {
+    let door = FakeDoor::start(vec![offsets(7, 4)]).await;
     let client = door.client(true).await;
-    let result = client.cover(SESSION_REF, deadline()).await.unwrap();
+    let result = client.offsets(SESSION_REF, deadline()).await.unwrap();
     assert_eq!((result.durable_offset, result.cloud_offset), (7, 4));
     assert_eq!(
         door.sent(),
-        vec![json!({"method": "session.cover", "params": {"sessionRef": SESSION_REF}})]
+        vec![json!({"method": "session.offsets", "params": {"sessionRef": SESSION_REF}})]
     );
     let opens = door.opens.lock().unwrap();
     assert_eq!(opens.len(), 1);
@@ -244,7 +244,7 @@ async fn direct_consumers_are_refused_before_opening_or_reading() {
     let door = FakeDoor::start(vec![]).await;
     let client = door.client(false).await;
     assert!(client
-        .cover(SESSION_REF, deadline())
+        .offsets(SESSION_REF, deadline())
         .await
         .unwrap_err()
         .message
@@ -254,14 +254,14 @@ async fn direct_consumers_are_refused_before_opening_or_reading() {
 }
 
 #[tokio::test]
-async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
+async fn admit_chunks_at_the_broca_cap_and_resumes_from_the_durable_end() {
     // Literal lengths make this test independent of the client's cap constant.
     let wal: Vec<u8> = (0..1_048_581).map(|index| (index % 256) as u8).collect();
     let door = FakeDoor::start(vec![
-        cover(2, 1),
-        cover(1_048_578, 5),
-        cover(1_048_581, 5),
-        cover(1_048_581, 5),
+        offsets(2, 1),
+        offsets(1_048_578, 5),
+        offsets(1_048_581, 5),
+        offsets(1_048_581, 5),
     ])
     .await;
     let client = door.client(true).await;
@@ -276,7 +276,7 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
     assert_eq!(
         sent.len(),
         4,
-        "a repeat only covers, never resends durable bytes"
+        "a repeat only reads offsets, never resends durable bytes"
     );
     assert_eq!(sent[1]["params"]["fromOffset"], 2);
     assert_eq!(sent[2]["params"]["fromOffset"], 1_048_578);
@@ -306,10 +306,10 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
 async fn admit_file_streams_one_mib_chunks_and_reuses_the_durable_prefix() {
     let bytes: Vec<u8> = (0..1_048_581).map(|index| (index % 251) as u8).collect();
     let door = FakeDoor::start(vec![
-        cover(2, 1),
-        cover(1_048_578, 5),
-        cover(1_048_581, 5),
-        cover(1_048_581, 5),
+        offsets(2, 1),
+        offsets(1_048_578, 5),
+        offsets(1_048_581, 5),
+        offsets(1_048_581, 5),
     ])
     .await;
     let client = door.client(true).await;
@@ -357,10 +357,10 @@ async fn admit_file_streams_one_mib_chunks_and_reuses_the_durable_prefix() {
 #[tokio::test]
 async fn offset_mismatch_uses_expected_offset_and_a_fresh_cover() {
     let door = FakeDoor::start(vec![
-        cover(0, 0),
+        offsets(0, 0),
         Answer::Refuse(json!({"error": "offset_mismatch", "expectedOffset": 1})),
-        cover(2, 0),
-        cover(3, 0),
+        offsets(2, 0),
+        offsets(3, 0),
     ])
     .await;
     let client = door.client(true).await;
@@ -368,9 +368,9 @@ async fn offset_mismatch_uses_expected_offset_and_a_fresh_cover() {
     assert_eq!(
         door.sent(),
         vec![
-            json!({"method": "session.cover", "params": {"sessionRef": SESSION_REF}}),
+            json!({"method": "session.offsets", "params": {"sessionRef": SESSION_REF}}),
             json!({"method": "session.admit", "params": {"sessionRef": SESSION_REF, "fromOffset": 0, "bytes": "616263"}}),
-            json!({"method": "session.cover", "params": {"sessionRef": SESSION_REF}}),
+            json!({"method": "session.offsets", "params": {"sessionRef": SESSION_REF}}),
             json!({"method": "session.admit", "params": {"sessionRef": SESSION_REF, "fromOffset": 2, "bytes": "63"}}),
         ]
     );
@@ -379,7 +379,7 @@ async fn offset_mismatch_uses_expected_offset_and_a_fresh_cover() {
 #[tokio::test]
 async fn offset_mismatch_without_detail_is_unavailable_and_never_guessed() {
     let door = FakeDoor::start(vec![
-        cover(0, 0),
+        offsets(0, 0),
         Answer::Refuse(json!({"error": "offset_mismatch"})),
     ])
     .await;
@@ -395,9 +395,9 @@ async fn offset_mismatch_without_detail_is_unavailable_and_never_guessed() {
 #[tokio::test]
 async fn offset_mismatch_rejects_a_cover_behind_expected_offset() {
     let door = FakeDoor::start(vec![
-        cover(0, 0),
+        offsets(0, 0),
         Answer::Refuse(json!({"error": "offset_mismatch", "expectedOffset": 2})),
-        cover(1, 0),
+        offsets(1, 0),
     ])
     .await;
     let client = door.client(true).await;
@@ -412,10 +412,10 @@ async fn offset_mismatch_rejects_a_cover_behind_expected_offset() {
 #[tokio::test]
 async fn lease_refusals_retry_with_increasing_backoff() {
     let door = FakeDoor::start(vec![
-        cover(0, 0),
+        offsets(0, 0),
         Answer::Refuse(json!({"error": "lease_unavailable"})),
         Answer::Refuse(json!({"error": "lease_acquiring"})),
-        cover(3, 0),
+        offsets(3, 0),
     ])
     .await;
     let client = door.client(true).await;
@@ -432,13 +432,13 @@ async fn lease_refusals_retry_with_increasing_backoff() {
 async fn retryable_cover_and_read_refusals_are_retried() {
     let door = FakeDoor::start(vec![
         Answer::Refuse(json!({"error": "lease_acquiring"})),
-        cover(3, 1),
+        offsets(3, 1),
         Answer::Refuse(json!({"error": "lease_unavailable"})),
         Answer::Result(read_reply()),
     ])
     .await;
     let client = door.client(true).await;
-    client.cover(SESSION_REF, deadline()).await.unwrap();
+    client.offsets(SESSION_REF, deadline()).await.unwrap();
     let read = client
         .read(SESSION_REF, 0, 3, CUT_ID, deadline())
         .await
@@ -456,7 +456,7 @@ async fn lease_retry_deadline_is_bounded_and_names_the_code() {
     let client = door.client(true).await;
     let error = timeout(
         Duration::from_secs(2),
-        client.cover(SESSION_REF, Instant::now() + Duration::from_millis(40)),
+        client.offsets(SESSION_REF, Instant::now() + Duration::from_millis(40)),
     )
     .await
     .unwrap()
@@ -476,7 +476,8 @@ async fn terminal_door_refusals_are_unavailable_with_the_code_without_retry() {
         "container_handed_off",
         "future_refusal",
     ] {
-        let door = FakeDoor::start(vec![cover(0, 0), Answer::Refuse(json!({"error": code}))]).await;
+        let door =
+            FakeDoor::start(vec![offsets(0, 0), Answer::Refuse(json!({"error": code}))]).await;
         let client = door.client(true).await;
         let error = client
             .admit(SESSION_REF, b"abc", deadline())
@@ -517,12 +518,12 @@ async fn read_limits_use_the_raw_byte_cap_before_opening_the_door() {
 
 #[tokio::test]
 async fn record_too_large_is_never_retried_for_any_door_method() {
-    for method in ["session.cover", "session.admit", "session.read"] {
+    for method in ["session.offsets", "session.admit", "session.read"] {
         let refusal = Answer::Refuse(json!({"error": "record_too_large", "cap": 1048576}));
         let answers = match method {
-            "session.admit" => vec![cover(0, 0), refusal, cover(3, 0)],
+            "session.admit" => vec![offsets(0, 0), refusal, offsets(3, 0)],
             "session.read" => vec![refusal, Answer::Result(read_reply())],
-            _ => vec![refusal, cover(0, 0)],
+            _ => vec![refusal, offsets(0, 0)],
         };
         let door = FakeDoor::start(answers).await;
         let client = door.client(true).await;
@@ -535,7 +536,7 @@ async fn record_too_large_is_never_retried_for_any_door_method() {
                 .read(SESSION_REF, 0, 3, CUT_ID, deadline())
                 .await
                 .unwrap_err(),
-            _ => client.cover(SESSION_REF, deadline()).await.unwrap_err(),
+            _ => client.offsets(SESSION_REF, deadline()).await.unwrap_err(),
         };
         assert_eq!(error.door_code.as_deref(), Some("record_too_large"));
         assert!(error.to_string().contains("record_too_large"));
@@ -632,7 +633,7 @@ async fn cut_not_ready_and_offset_out_of_range_preserve_the_door_code() {
 
 #[tokio::test]
 async fn cover_cannot_claim_bytes_past_the_frozen_wal() {
-    let door = FakeDoor::start(vec![cover(4, 0)]).await;
+    let door = FakeDoor::start(vec![offsets(4, 0)]).await;
     let client = door.client(true).await;
     let error = client
         .admit(SESSION_REF, b"abc", deadline())
@@ -645,13 +646,13 @@ async fn cover_cannot_claim_bytes_past_the_frozen_wal() {
 #[tokio::test]
 async fn malformed_coverage_and_result_envelopes_are_unavailable() {
     for answer in [
-        cover(1, 2),
+        offsets(1, 2),
         Answer::Result(json!({"cloudOffset": 0})),
         Answer::Envelope(json!({"durableOffset": 0, "cloudOffset": 0})),
     ] {
         let door = FakeDoor::start(vec![answer]).await;
         let client = door.client(true).await;
-        client.cover(SESSION_REF, deadline()).await.unwrap_err();
+        client.offsets(SESSION_REF, deadline()).await.unwrap_err();
         assert_eq!(door.sent().len(), 1);
     }
 }

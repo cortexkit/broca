@@ -75,7 +75,7 @@ impl FakeDoor {
 }
 #[async_trait]
 impl SessionDoor for FakeDoor {
-    async fn cover(&self, reference: &str) -> Result<u64, SessionDoorError> {
+    async fn durable_offset(&self, reference: &str) -> Result<u64, SessionDoorError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_cover_once.swap(false, Ordering::SeqCst) {
             return Err(SessionDoorError {

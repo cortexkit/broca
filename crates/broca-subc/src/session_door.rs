@@ -105,16 +105,19 @@ impl SessionDoorClient {
         }
     }
 
-    /// Ask the door to attempt cloud upload and report the locally durable byte end and the byte
-    /// end already confirmed in the cloud. The latter can lag behind local admission.
-    pub async fn cover(
+    /// The locally durable byte end and the byte end already confirmed in the cloud, which can lag
+    /// behind local admission. A ref the door has never seen answers zero for both. Broca only
+    /// resumes an export from the durable end and never waits on the cloud, so it reads
+    /// `session.offsets`, which answers at once, rather than `session.cover`, which first drives
+    /// a cloud upload and can take minutes on a backlog.
+    pub async fn offsets(
         &self,
         session_ref: &str,
         deadline: Instant,
     ) -> Result<DoorCoverage, SessionDoorError> {
         let answer = self
             .call(
-                "session.cover",
+                "session.offsets",
                 json!({"sessionRef": session_ref}),
                 deadline,
             )
@@ -123,7 +126,7 @@ impl SessionDoorClient {
         decode_coverage(answer)
     }
 
-    /// Admit a frozen WAL's complete `[0, endOffset)` bytes, resuming from a fresh cover.
+    /// Admit a frozen WAL's complete `[0, endOffset)` bytes, resuming from the door's durable end.
     /// Already durable bytes are not resent. This never waits for cloud coverage or seals a cut.
     pub async fn admit(
         &self,
@@ -131,7 +134,7 @@ impl SessionDoorClient {
         wal: &[u8],
         deadline: Instant,
     ) -> Result<DoorCoverage, SessionDoorError> {
-        let mut coverage = self.cover(session_ref, deadline).await?;
+        let mut coverage = self.offsets(session_ref, deadline).await?;
         let mut offset = checked_offset(coverage.durable_offset, wal.len())?;
         let mut mismatch_backoff = FIRST_BACKOFF;
         while offset < wal.len() {
@@ -165,7 +168,7 @@ impl SessionDoorClient {
                         .and_then(|detail| detail.get("expectedOffset"))
                         .and_then(Value::as_u64)
                         .ok_or_else(|| refused(&error))?;
-                    coverage = self.cover(session_ref, deadline).await?;
+                    coverage = self.offsets(session_ref, deadline).await?;
                     // Cover can advance after the refusal, but cannot precede its durable end.
                     if coverage.durable_offset < expected {
                         return Err(refused(&error));
@@ -196,7 +199,7 @@ impl SessionDoorClient {
             .metadata()
             .map_err(|error| unavailable(error.to_string()))?
             .len();
-        let mut coverage = self.cover(session_ref, deadline).await?;
+        let mut coverage = self.offsets(session_ref, deadline).await?;
         let mut offset = coverage.durable_offset;
         let mut mismatch_backoff = FIRST_BACKOFF;
         loop {
@@ -219,7 +222,7 @@ impl SessionDoorClient {
                 }
                 Err(error) if error.code == "offset_mismatch" => {
                     let expected = error.detail.as_ref().and_then(|detail| detail.get("expectedOffset")).and_then(Value::as_u64).ok_or_else(|| refused(&error))?;
-                    coverage = self.cover(session_ref, deadline).await?;
+                    coverage = self.offsets(session_ref, deadline).await?;
                     if coverage.durable_offset < expected { return Err(refused(&error)); }
                     if coverage.durable_offset == offset { backoff(deadline, &mut mismatch_backoff, &error).await?; }
                     offset = coverage.durable_offset;

@@ -44,7 +44,9 @@ pub trait SessionDoor: Send + Sync {
         })?;
         self.export(reference, &bytes).await
     }
-    async fn cover(&self, reference: &str) -> Result<u64, SessionDoorError>;
+    /// The door's durable byte end for `reference`: where an export resumes. Zero for a ref the
+    /// door has never seen.
+    async fn durable_offset(&self, reference: &str) -> Result<u64, SessionDoorError>;
     async fn export(&self, reference: &str, bytes: &[u8]) -> Result<(), SessionDoorError>;
     async fn read(
         &self,
@@ -64,8 +66,8 @@ impl SessionDoor for SessionDoorClient {
             .await
             .map(|_| ())
     }
-    async fn cover(&self, reference: &str) -> Result<u64, SessionDoorError> {
-        self.cover(reference, Instant::now() + Duration::from_secs(60))
+    async fn durable_offset(&self, reference: &str) -> Result<u64, SessionDoorError> {
+        self.offsets(reference, Instant::now() + Duration::from_secs(60))
             .await
             .map(|c| c.durable_offset)
     }
@@ -852,8 +854,11 @@ impl MoveDriver for Driver {
             unknown_refs,
         })
     }
-    async fn cover(&self, reference: &str) -> Result<u64, ErrorBody> {
-        self.door.cover(reference).await.map_err(unavailable)
+    async fn durable_offset(&self, reference: &str) -> Result<u64, ErrorBody> {
+        self.door
+            .durable_offset(reference)
+            .await
+            .map_err(unavailable)
     }
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody> {
         if frozen.starts_with(b"broca-store-export/") {
@@ -1004,7 +1009,7 @@ mod operational_port_tests {
     struct NoDoor;
     #[async_trait::async_trait]
     impl SessionDoor for NoDoor {
-        async fn cover(&self, _: &str) -> Result<u64, SessionDoorError> {
+        async fn durable_offset(&self, _: &str) -> Result<u64, SessionDoorError> {
             panic!("inventory must not cover remote data")
         }
         async fn export(&self, _: &str, _: &[u8]) -> Result<(), SessionDoorError> {

@@ -57,7 +57,7 @@ impl subc_client_rs::ModuleHandler for DoorProvider {
             Err(e) => panic!("{e}"),
         };
         let mut answer = match request["method"].as_str().unwrap() {
-            "session.cover" => json!({"durableOffset":stream.len(),"cloudOffset":stream.len()}),
+            "session.offsets" => json!({"durableOffset":stream.len(),"cloudOffset":stream.len()}),
             "session.admit" => {
                 assert_eq!(params["fromOffset"], stream.len() as u64);
                 let chunk = unhex(params["bytes"].as_str().unwrap());
@@ -139,7 +139,7 @@ fn supervised_fake_session_door() {
                 transport: InternalTransport::Bulk,
                 agent_facing: false,
                 operations: vec![
-                    "session.cover".into(),
+                    "session.offsets".into(),
                     "session.admit".into(),
                     "session.read".into(),
                 ],
