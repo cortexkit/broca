@@ -895,6 +895,14 @@ pub trait StreamNormalizer: Send {
         None
     }
 
+    /// How long this grammar's stream may carry only liveness records before the transport
+    /// abandons it, when the family has measured its own bound. `None` (the default) keeps the
+    /// transport's shared limit. Read only for grammars whose [`Self::liveness_marker`] is
+    /// `Some`, since only those run a content deadline apart from the idle one.
+    fn content_deadline(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Last complete SSE event's name or JSON `type`, without response content.
     /// Wrappers must forward this so transport failures retain the wire discriminator.
     fn last_event_type(&self) -> Option<&str> {

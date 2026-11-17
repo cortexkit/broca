@@ -394,6 +394,17 @@ impl WireFamily for OpenAiResponsesChatgpt {
     }
 }
 
+/// How long a ChatGPT backend stream may answer only keepalives (socket pings) before it is
+/// abandoned and the step's attempt sent again.
+///
+/// MEASURED. Across 3,051 completed WebSocket attempts logged 10-17 Nov 2026, the longest gap
+/// between content records was 363 s; 99% stayed under 191 s. Over the same days 8 attempts
+/// went silent for 914 s to 1,800 s while the backend kept answering pings, 7 of them right
+/// after `response.output_item.done`, and none sent content again before it was cut. Under the
+/// shared 1,800 s limit a worker waited up to half an hour on such a stream. 600 s keeps 1.65x
+/// headroom over the longest healthy gap.
+const CHATGPT_CONTENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Delegates to the OpenAI-Responses normalizer unchanged (the codex backend streams the
 /// same Responses SSE events). A thin wrapper so the family owns its own normalizer type.
 struct ChatgptNormalizer {
@@ -441,6 +452,10 @@ impl StreamNormalizer for ChatgptNormalizer {
 
     fn liveness_marker(&self) -> Option<u64> {
         self.inner.liveness_marker()
+    }
+
+    fn content_deadline(&self) -> Option<std::time::Duration> {
+        Some(CHATGPT_CONTENT_DEADLINE)
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {

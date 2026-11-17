@@ -2046,11 +2046,15 @@ async fn close_failure(elapsed: Option<Duration>) {
     assert_eq!(attempt.websocket_close_code, Some(1012));
 }
 
+/// A silent socket ends at the shared idle limit, and one answering only pings ends at the
+/// ChatGPT family's own content limit, which is shorter than the shared one.
 #[tokio::test(start_paused = true)]
-async fn websocket_idle_and_keepalive_only_bounds_match_sse() {
+async fn websocket_idle_and_keepalive_only_bounds() {
+    let chatgpt_content = Duration::from_secs(600);
+    assert!(chatgpt_content < STREAM_CONTENT_TIMEOUT);
     for (keepalive, outcome, duration) in [
         (false, AttemptOutcome::IdleTimeout, STREAM_IDLE_TIMEOUT),
-        (true, AttemptOutcome::ContentTimeout, STREAM_CONTENT_TIMEOUT),
+        (true, AttemptOutcome::ContentTimeout, chatgpt_content),
     ] {
         let stream = futures::stream::unfold((), move |_| async move {
             if keepalive {
@@ -2074,6 +2078,12 @@ async fn websocket_idle_and_keepalive_only_bounds_match_sse() {
                 .unwrap_err();
         assert_eq!(failure.outcome, outcome);
         assert_eq!(start.elapsed(), duration);
+        if keepalive {
+            assert_eq!(
+                failure.error.message,
+                "provider stream idle: waiting for content: only keepalive comments for 600s"
+            );
+        }
     }
 }
 

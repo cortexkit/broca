@@ -46,8 +46,10 @@ run. The 40-minute absolute age starts at establishment, never at checkout. Sess
 close, deletion, move, observed credential rejection and shutdown discard retained
 state. Nothing is persisted; a restart begins with full input. A new
 connection has a 15-second connect/upgrade deadline. Both transports share the same
-normalizer and semantic idle bounds: 300 seconds without a complete record, 1800
+normalizer and semantic idle bounds: 300 seconds without a complete record, 600
 seconds of only keepalives. Ping/pong traffic counts as keepalive, not model progress.
+The 600-second bound is the ChatGPT family's own, chosen from measured content gaps;
+other families keep the shared 1800 seconds.
 
 Without a frozen `chatgpt_wire` profile, every `response.create` contains the **full canonical input**. There is no
 `previous_response_id`, incremental continuation, cut-response resume or socket warmup.

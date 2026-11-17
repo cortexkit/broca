@@ -125,10 +125,14 @@ mod responses_websocket;
 #[path = "transport_cache_evidence.rs"]
 mod cache_runtime;
 
+#[path = "transport/content_deadline.rs"]
+mod content_deadline;
 #[path = "transport/content_gaps.rs"]
 mod content_gaps;
 #[path = "transport/retry_wait.rs"]
 mod retry_wait;
+use content_deadline::content_timeout_error;
+pub(crate) use content_deadline::STREAM_CONTENT_TIMEOUT;
 use content_gaps::{ContentGaps, SseObservationGuard};
 
 pub use responses_websocket::Connections as ChatgptConnections;
@@ -2378,20 +2382,6 @@ const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// headers and gaps between complete decoded records; raw bytes from an incomplete record do not
 /// reset it. This is not a total stream deadline, so a long stream making real progress stays live.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-/// How long a stream may carry ONLY keepalive records (SSE `: keepalive` comments) before it
-/// is abandoned. Applies only to grammars that report a liveness marker; for them the
-/// 300-second deadline above is reset by any complete record, comments included, and this one
-/// is reset only by content.
-///
-/// MEASURED, NOT GUESSED. xai/grok-4.7, replaying a failing request byte for byte, reasons
-/// without streaming its reasoning and sends nothing but `: keepalive` comments every 15 s
-/// while it does. The silent span varied from 138 s to 579 s across samples for about 45k
-/// reasoning tokens, and every sample then completed normally. A 300-second content limit cut
-/// those healthy streams and the retry was cut the same way. A maximum-effort reasoning step
-/// can run several times the longest measured span, so 1800 s leaves roughly 3x headroom over
-/// 579 s while still bounding a peer that keeps the connection alive and never answers.
-const STREAM_CONTENT_TIMEOUT: Duration = Duration::from_secs(1800);
-
 /// Optional floor on how slowly a provider may stream while still counting as healthy, read from
 /// `BROCA_MIN_STREAM_BYTES_PER_SEC` and `BROCA_MIN_STREAM_WINDOW_SECS`.
 ///
@@ -4932,7 +4922,10 @@ where
     let split_deadlines = liveness_marker.is_some();
     let idle = tokio::time::sleep(STREAM_IDLE_TIMEOUT);
     tokio::pin!(idle);
-    let content = tokio::time::sleep(STREAM_CONTENT_TIMEOUT);
+    let content_limit = normalizer
+        .content_deadline()
+        .unwrap_or(STREAM_CONTENT_TIMEOUT);
+    let content = tokio::time::sleep(content_limit);
     tokio::pin!(content);
     let mut completion = Vec::new();
     let mut rate_window = stream_floor_from_env().map(StreamRateWindow::new);
@@ -4959,7 +4952,7 @@ where
                 AttemptOutcome::IdleTimeout,
             )),
             _ = &mut content, if split_deadlines => return Err(AttemptFailure::transport(
-                content_timeout_error(),
+                content_timeout_error(content_limit),
                 AttemptOutcome::ContentTimeout,
             )),
             next = stream.next() => next,
@@ -5060,7 +5053,7 @@ where
             idle.as_mut().reset(now + STREAM_IDLE_TIMEOUT);
         }
         if made_progress && split_deadlines {
-            content.as_mut().reset(now + STREAM_CONTENT_TIMEOUT);
+            content.as_mut().reset(now + content_limit);
         }
         if let Some(window) = rate_window.as_mut() {
             window.observe(&events);
@@ -5196,30 +5189,6 @@ fn stream_timeout_error(activity: &str) -> ProviderError {
         refusal: None,
         class: ErrorClass::Transient,
         message: format!("provider stream idle: {activity} for 300s"),
-        status: None,
-        retry_after_secs: None,
-        provider_code: None,
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-        account_continue: None,
-    }
-}
-
-fn content_timeout_error() -> ProviderError {
-    ProviderError {
-        provider_details: None,
-        cause: None,
-        provider_subcode: None,
-        refusal: None,
-        class: ErrorClass::Transient,
-        message: format!(
-            "provider stream idle: waiting for content: only keepalive comments for {}s",
-            STREAM_CONTENT_TIMEOUT.as_secs()
-        ),
         status: None,
         retry_after_secs: None,
         provider_code: None,
