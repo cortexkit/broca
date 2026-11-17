@@ -608,6 +608,7 @@ pub async fn seal_at_cut<W: Writer, P, T>(
         ));
     }
     let carry = carried_views(&*ctx.session.state.lock().await, writer.operations())?;
+    let first_kept_ordinal = turn_start(writer.conversation(), first_kept_ordinal);
     let window_repetition = spanning_repetition(
         writer.conversation(),
         first_kept_ordinal,
@@ -638,6 +639,7 @@ pub async fn seal_installed_cut<W: Writer>(
     carry: &[Record],
     now_ms: u64,
 ) -> Result<(), LoopError> {
+    let first_kept_ordinal = turn_start(writer.conversation(), first_kept_ordinal);
     let window_repetition = spanning_repetition(
         writer.conversation(),
         first_kept_ordinal,
@@ -788,6 +790,27 @@ pub fn view_record(
         new_signed: sealed.new_signed.clone(),
         applied_by: applied_by.map(str::to_owned),
     }))
+}
+
+/// The ordinal a seal at `ordinal` keeps from. A log starts at an input or an assistant message,
+/// never at a tool turn's results, so a cut whose first kept message is a tool turn's results
+/// keeps from the assistant message whose calls they answer, as the store's seal does
+/// (`seal_at_entry`). The repetition counters taken for the seal then end where the sealed
+/// history ends: after a call's result, never between the two. Taken at the results instead,
+/// they refuse, and every run of the session fails before its first request.
+fn turn_start(
+    conversation: &broca_session_store::fold::conversation::Conversation,
+    ordinal: u64,
+) -> u64 {
+    let mut start = ordinal;
+    while start > conversation.window_start()
+        && conversation
+            .window_message(start)
+            .is_some_and(|message| message.role() == broca_protocol::content::Role::Tool)
+    {
+        start -= 1;
+    }
+    start
 }
 
 /// The repetition counters a cut before ordinal `first_kept` must keep: when the cut splits a

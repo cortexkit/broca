@@ -97,3 +97,100 @@ fn views_restore_with_their_build_metadata_and_applier_across_a_seal() {
         "the copies a seal carries restore the same state"
     );
 }
+
+/// One run's records: its input, then a tool turn per call id (the call, then its result).
+fn run_with_tool_turns(calls: &[&str]) -> Vec<Record> {
+    use broca_protocol::content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
+    use broca_protocol::ids::ToolCallId;
+    use broca_session_store::record::{Assistant, Input, Placement, ToolReply};
+    use std::sync::Arc;
+    let mut records = vec![Record::Input(Input {
+        run_id: "run".into(),
+        placement: Placement::RunInput,
+        message: Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "input".into(),
+            }],
+        )),
+        written_at_ms: Some(1),
+        submission_id: None,
+        notice: None,
+        tags_v1: None,
+        receipt_seq: None,
+        media: Vec::new(),
+        pruned: Vec::new(),
+    })];
+    for (step, call) in calls.iter().enumerate() {
+        records.push(Record::Assistant(Assistant {
+            run_id: "run".into(),
+            step_id: step as u64 + 1,
+            provider_message_id: broca_protocol::MessageId(format!("provider-{call}")),
+            message: Arc::new(Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolCall(ToolCall {
+                    thought_signature: None,
+                    tool_call_id: ToolCallId((*call).into()),
+                    tool_name: "read".into(),
+                    input: serde_json::json!({"path": call}).into(),
+                })],
+            )),
+            usage: None,
+            written_at_ms: Some(2),
+            last_content_at_ms: None,
+            tags_v1: None,
+            budget_finalize: None,
+            pruned: Vec::new(),
+        }));
+        records.push(Record::ToolReply(ToolReply {
+            run_id: "run".into(),
+            batch_id: None,
+            result: ToolResult {
+                tool_call_id: ToolCallId((*call).into()),
+                output: ToolOutput::Text {
+                    text: format!("result of {call}"),
+                },
+                is_error: false,
+            },
+            finished_at_ms: Some(3),
+            tags_v1: None,
+            media: Vec::new(),
+        }));
+    }
+    records
+}
+
+/// A cut whose first kept message is a tool turn's results seals from the assistant message
+/// whose call they answer, as the store's seal does. The repetition counters taken over the
+/// run's history below the seal then never stop between a call and its result: taken at the
+/// results instead, they refused, and every run of the session failed with "a compaction cut
+/// between a tool call and its result".
+#[test]
+fn a_cut_keeping_from_tool_results_seals_from_the_call_that_asked_for_them() {
+    use broca_session_store::fold::conversation::Conversation;
+    let mut conversation = Conversation::new(false);
+    let mut operations = Operations::default();
+    for (seq, record) in run_with_tool_turns(&["one", "two"]).iter().enumerate() {
+        broca_session_store::session::apply(
+            &mut conversation,
+            &mut operations,
+            seq as u64 + 1,
+            record,
+        )
+        .unwrap();
+    }
+    // Input 1, then call 2 and its results 3, then call 4 and its results 5.
+    assert_eq!(conversation.placed, 5);
+    assert!(matches!(
+        super::spanning_repetition(&conversation, 5, None),
+        Err(crate::LoopError::Unsupported(_))
+    ));
+    let start = super::turn_start(&conversation, 5);
+    assert_eq!(start, 4, "results keep from the call that asked for them");
+    assert!(super::spanning_repetition(&conversation, start, None)
+        .unwrap()
+        .is_some());
+    // A cut already at a turn's start stays where it is.
+    assert_eq!(super::turn_start(&conversation, 4), 4);
+    assert_eq!(super::turn_start(&conversation, 2), 2);
+}
