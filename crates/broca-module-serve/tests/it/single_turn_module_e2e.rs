@@ -446,18 +446,73 @@ fn seed_vault_credential(
         out.status.success().then_some(out)
     };
     run(&["bootstrap"])?;
-    // `ck auth put` takes the secret from a file, never from argv: claustrum refuses
-    // `--payload`. The file sits beside the vault, in the rig's scratch folder.
-    let payload = vault_dir.with_extension("payload");
-    std::fs::write(&payload, "sk-rig-only").ok()?;
-    let payload = payload.to_str()?;
-    run(&[
-        "put",
-        "--id",
-        &seed.credential_id,
-        "--payload-file",
-        payload,
-    ])?;
+    // Broca asks routing for every run's account and offers it only the credentials whose
+    // listing names the run's sign-in method and provider, and for a subscription its account.
+    // So the seed stores each credential as its own kind, with its provider and account.
+    let (method, provider) = match seed.credential_id.split(':').collect::<Vec<_>>()[..] {
+        [method, provider, ..] => (method, provider),
+        _ => return None,
+    };
+    match method {
+        "oauth" => {
+            // A subscription sign-in is imported in opencode's `auth.json` shape. The access
+            // token is what the provider sees; the refresh token is never used, because the
+            // expiry is far off.
+            let file = vault_dir.with_extension("auth.json");
+            let auth = serde_json::json!({provider: {
+                "type": "oauth",
+                "access": "sk-rig-only",
+                "refresh": "rig-refresh-unused",
+                "expires": 4_102_444_800_000_u64,
+            }});
+            std::fs::write(&file, auth.to_string()).ok()?;
+            let file = file.to_str()?;
+            run(&[
+                "import",
+                "--source",
+                "opencode",
+                "--id",
+                &seed.credential_id,
+                "--json",
+                file,
+                "--provider",
+                provider,
+                "--account-id",
+                RIG_ACCOUNT,
+            ])?;
+            // An import names no catalog provider, and keeps its account id only as metadata
+            // the vault may not list; set both as an operator would.
+            run(&[
+                "set-providers",
+                "--id",
+                &seed.credential_id,
+                "--set",
+                provider,
+            ])?;
+            run(&[
+                "set-identity",
+                &seed.credential_id,
+                "--account-id",
+                RIG_ACCOUNT,
+            ])?;
+        }
+        _ => {
+            // `ck auth put` takes the secret from a file, never from argv: claustrum refuses
+            // `--payload`. The file sits beside the vault, in the rig's scratch folder.
+            let payload = vault_dir.with_extension("payload");
+            std::fs::write(&payload, "sk-rig-only").ok()?;
+            let payload = payload.to_str()?;
+            run(&[
+                "put",
+                "--id",
+                &seed.credential_id,
+                "--payload-file",
+                payload,
+                "--provider-id",
+                provider,
+            ])?;
+        }
+    }
     // The broca daemon reads every credential by grant (credential.get_scoped) as its
     // supervised principal, never by handle, so the rig grants that principal a read on the
     // seeded credential exactly as an operator does. The handle minted below is only for the
@@ -486,52 +541,34 @@ fn seed_vault_credential(
             run(&["invalidate", "--id", &seed.credential_id])?;
             mint()?
         }
-        VaultSeedOrder::MintThenInvalidate => {
+        VaultSeedOrder::MintThenRevokeHandle => {
             let h = mint()?;
-            run(&["invalidate", "--id", &seed.credential_id])?;
+            run(&["revoke-handle", "--handle", &h])?;
             h
         }
     };
     Some(handle)
 }
 
-fn seed_live_credential(
-    vault_dir: &std::path::Path,
-    key_path: &std::path::Path,
-    ck_auth: &std::path::Path,
-    seed: &VaultSeed,
-) -> Option<String> {
-    debug_assert!(seed.order == VaultSeedOrder::PutThenMint);
-    seed_vault_credential(vault_dir, key_path, ck_auth, seed)
-}
-
-fn seed_dead_credential(
-    vault_dir: &std::path::Path,
-    key_path: &std::path::Path,
-    ck_auth: &std::path::Path,
-    seed: &VaultSeed,
-) -> Option<String> {
-    debug_assert!(seed.order != VaultSeedOrder::PutThenMint);
-    seed_vault_credential(vault_dir, key_path, ck_auth, seed)
-}
-
-/// Whether the vault seed stays live or applies invalidation around handle minting.
-///
-/// `PutThenMint` is the ordinary live credential shape. `MintThenInvalidate` is not a production
-/// shape -- a consumer reporting a dead token is not authority to revoke grants -- and exists so
-/// the pause test's seed guard can be shown to fire
-/// (`seeding_in_the_wrong_order_produces_a_revoked_handle`).
+/// What the seed does after storing the credential.
 #[derive(Clone, Copy, PartialEq)]
 enum VaultSeedOrder {
+    /// Mints a handle: the ordinary live credential.
     PutThenMint,
+    /// Marks the credential for re-authentication, then mints: a dead credential with a live
+    /// handle, production's shape after a provider refused the key.
     InvalidateThenMint,
-    MintThenInvalidate,
+    /// Mints a handle and revokes it: a live credential whose handle is gone.
+    MintThenRevokeHandle,
 }
 
 struct VaultSeed {
     credential_id: String,
     order: VaultSeedOrder,
 }
+
+/// The account a seeded subscription sign-in belongs to.
+const RIG_ACCOUNT: &str = "acct1";
 
 /// Where the rig sends one provider's traffic instead of its catalog endpoint.
 ///
@@ -835,13 +872,13 @@ impl Daemon {
         // BROCA_STATE_ROOT below, not the connection file's own directory. The module names the
         // full path in its refusal, which is the only reason this landed on the second try
         // rather than the tenth.
-        if let Some(seed) = vault_seed.as_ref() {
+        if vault_seed.is_some() {
             let lkg_dir = runtime_dir.join("broca-state").join("catalog");
             setup("create catalog dir", std::fs::create_dir_all(&lkg_dir).ok())?;
             let mut lkg: serde_json::Value =
                 serde_json::from_str(include_str!("../fixtures/fusiform-lkg-minimal.json"))
                     .expect("the checked-in minimal fusiform LKG is valid JSON");
-            if seed.order == VaultSeedOrder::PutThenMint {
+            if matches!(provider_route, Some(ProviderRoute::AtomicChat(_))) {
                 // This synthetic Chat route keeps the original loopback root as its published
                 // endpoint; ProviderRoute::AtomicChat must override it with aimock's own address.
                 // BROCA_PROVIDER_BASE_URL stays unset because that mock override skips credential
@@ -1014,11 +1051,7 @@ impl Daemon {
             )?;
             vault_probe_handle = Some(setup(
                 "seed the vault credential",
-                if seed.order == VaultSeedOrder::PutThenMint {
-                    seed_live_credential(&vault_dir, &key_path, ck_auth_binary, seed)
-                } else {
-                    seed_dead_credential(&vault_dir, &key_path, ck_auth_binary, seed)
-                },
+                seed_vault_credential(&vault_dir, &key_path, ck_auth_binary, seed),
             )?);
 
             config["storage"] =
@@ -1256,6 +1289,11 @@ impl Daemon {
                 .args(["put", "--id", credential_id, "--payload-file"])
                 .arg(&payload)
                 .arg("--replace")
+                // The repaired key keeps naming its provider, so routing is still offered it.
+                .args([
+                    "--provider-id",
+                    credential_id.split(':').nth(1).unwrap_or_default(),
+                ])
                 .output()
         })
         .expect("run ck-auth put --replace");
@@ -2498,25 +2536,23 @@ async fn vault_dependency_is_resolved_after_registering() {
     );
 }
 
-/// A dead credential pauses the run durably, through the real vault, with no provider involved.
+/// A lone dead API key is refused before any run is written.
 ///
-/// Every other case here drives aimock, and the mock path returns `AuthMode::None` before any
-/// credential is consulted -- so nothing in this file reached the vault until now. This one
-/// passes an empty provider base url to take the real credential path, and the pause happens
-/// BEFORE the first provider call, which is what lets it run without a model at all.
-///
-/// The assertion is the DURABLE pause, not the wire line: a pause the client reports but the
-/// WAL does not hold is not resumable, and resumability is the whole reason for pausing rather
-/// than failing.
+/// Broca asks routing for every run's account and offers it only credentials that can serve, so
+/// a key the vault has marked dead is never offered. With no other key, routing has nothing to
+/// choose and the send is refused for good: no run starts, so nothing waits on a sign-in that
+/// may never come. (A run whose credential dies while it runs still pauses for sign-in; see
+/// `a_repaired_credential_resumes_the_paused_run`.) The empty provider base url takes the real
+/// credential path, and the refusal comes before any provider call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dead_credential_pauses_the_run_durably() {
+async fn a_lone_dead_api_key_is_refused_before_any_run() {
     let Some(daemon) = required_vault_daemon(
         Daemon::start_with_dead_vault_credential("vault-dead-cred", "apikey:openai").await,
     ) else {
         return;
     };
 
-    let project_root = daemon.dir.join("vault-pause-project");
+    let project_root = daemon.dir.join("vault-dead-project");
     std::fs::create_dir_all(&project_root).unwrap();
 
     let run = timeout(
@@ -2537,27 +2573,25 @@ async fn a_dead_credential_pauses_the_run_durably() {
         ),
     )
     .await
-    .expect("a paused run must terminate the client, not hang it");
+    .expect("a refused send must terminate the client, not hang it");
 
-    // Distinguish the seed being wrong from the engine being wrong. A revoked handle (the
-    // mint-then-invalidate ordering) fails admission with "credential handle not found", which
-    // is a rig defect wearing an engine defect's clothes.
+    assert_ne!(run.exit_code, 0, "{:?}", run.lines);
     assert!(
-        !run.saw("credential handle not found"),
-        "the seed produced a REVOKED handle, not a dead credential with a live handle -- \
-         check the invalidate/mint ordering in seed_dead_credential: {:?}",
+        run.saw("account_selection_final"),
+        "routing had no account to choose, a final refusal: {:?}",
         run.lines
     );
     assert!(
-        run.saw("RUN_PAUSED"),
-        "a dead credential pauses rather than failing: {:?}",
+        !run.saw("SEND state=active") && !run.saw("RUN_PAUSED"),
+        "no run starts or waits for a sign-in: {:?}",
         run.lines
     );
-
     let records = stored_session(&daemon, "dead-cred").await;
     assert!(
-        paused_for_sign_in(&records),
-        "the pause must be stored, not only reported on the wire: {records:?}"
+        !records
+            .iter()
+            .any(|record| matches!(record, Record::RunStart(_))),
+        "a refused send writes no run: {records:?}"
     );
 }
 
@@ -2714,18 +2748,50 @@ async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_ca
     );
 }
 
-/// A repaired credential RESUMES the paused episode instead of starting a second one.
+/// aimock's replies for the repair arm: the first request is refused as a bad key, and every
+/// later one answers.
+#[cfg(unix)]
+const REFUSE_ONCE_FIXTURES: &str = r#"{
+  "fixtures": [
+    {
+      "match": { "sequenceIndex": 0 },
+      "response": {
+        "error": {
+          "message": "Invalid API key",
+          "type": "invalid_request_error",
+          "code": "invalid_api_key"
+        },
+        "status": 401
+      }
+    },
+    { "match": {}, "response": { "content": "REPAIRED-ANSWER." } }
+  ]
+}"#;
+
+/// A repaired credential RESUMES the run its failure paused, instead of starting a second one.
 ///
-/// The pause test proves admission stops; nothing proved it can start again. The distinction is
-/// invisible on the wire -- both a resume and a fresh run report `state=active` -- so the
-/// assertion is on durable structure: a resumed lineage carries exactly ONE `run_started`,
-/// because `ResumeAfterAuth` continues the paused episode under its original run id rather than
-/// opening a new one. A second `run_started` would mean the repaired credential silently
-/// abandoned the paused work and began again, losing whatever the first episode had committed.
+/// The provider refuses the key mid-run, so the run pauses for sign-in and broca reports the
+/// key to the vault, which marks it for re-authentication. The key is then repaired the way a
+/// re-login writes it, and the same send is sent again. A resume and a fresh run both report
+/// `state=active` on the wire, so the assertions are on the stored records: a model step after
+/// the pause (the run re-entered its loop) and exactly one run start (the same run continued).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_repaired_credential_resumes_the_paused_episode() {
+async fn a_repaired_credential_resumes_the_paused_run() {
+    let aimock = AiMock::start("vault-resume", REFUSE_ONCE_FIXTURES).await;
+    if aimock.is_none() && vault_required() {
+        panic!("single_turn_module_e2e: aimock did not start, but BROCA_REQUIRE_VAULT requires it");
+    }
+    let Some(aimock) = aimock else {
+        return;
+    };
     let Some(daemon) = required_vault_daemon(
-        Daemon::start_with_dead_vault_credential("vault-resume", "apikey:openai").await,
+        Daemon::start_with_live_vault_credential(
+            "vault-resume",
+            "apikey:atomic-chat",
+            &aimock.base_url,
+        )
+        .await,
     ) else {
         return;
     };
@@ -2735,40 +2801,37 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
     let send_args = [
         "send",
         "--prompt",
-        "Pause, then resume once the credential is repaired.",
+        "Pause on the refused key, then resume once it is repaired.",
         "--model",
-        "openai/gpt-4o-mini",
+        "atomic-chat/cache-eviction-probe",
         "--send-id",
         "resume-probe",
     ];
 
-    let first = timeout(
+    timeout(
         Duration::from_secs(60),
         run_client(&daemon, &project_root, "resume", &send_args),
     )
     .await
     .expect("the first send must terminate");
+    // Repair only once the pause is stored and the vault has taken the failure report, so the
+    // resume is known to start from the stored pause.
     assert!(
-        !first.saw("credential handle not found"),
-        "seed produced a revoked handle rather than a dead credential: {:?}",
-        first.lines
+        wait_for_stored(
+            &daemon,
+            "resume",
+            "a stored sign-in pause",
+            paused_for_sign_in
+        )
+        .await,
+        "the refused key must pause the run before the repair"
+    );
+    assert!(
+        daemon.wait_for_vault_needs_reauth().await,
+        "the vault must mark the refused key before the repair"
     );
 
-    // Wait for the pause to be DURABLE before repairing. Repairing while the run is still
-    // admitting would leave the test unable to say which state it resumed from.
-    let paused = wait_for_stored(
-        &daemon,
-        "resume",
-        "a stored sign-in pause",
-        paused_for_sign_in,
-    )
-    .await;
-    assert!(
-        paused,
-        "the first send must pause durably before the repair"
-    );
-
-    daemon.repair_vault_credential("apikey:openai");
+    daemon.repair_vault_credential("apikey:atomic-chat");
 
     let second = timeout(
         Duration::from_secs(60),
@@ -2782,10 +2845,8 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
         second.lines
     );
 
-    // The discriminating observation. A run start alone does NOT vary: a run that never
-    // resumes still has exactly one, because the paused run already wrote it. What separates a
-    // resumed run from a still-paused one is that the resumed run RE-ENTERS the loop, so the
-    // durable tell is a step starting after the pause.
+    // A run that stayed paused has one run start too, since the paused run wrote it. What
+    // separates a resumed run is that it re-enters its loop: a model step after the pause.
     let stepped = wait_for_stored(&daemon, "resume", "a step after the pause", |records| {
         records
             .iter()
@@ -2799,12 +2860,8 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
     .await;
     assert!(
         stepped,
-        "the repaired credential must resume the paused run into a model step; no step start \
-         after the pause means the run stayed paused"
+        "the repaired credential must resume the paused run into a model step"
     );
-
-    // And it must be the SAME run. A second run start would mean the repair abandoned the
-    // paused work and began again, losing whatever the first run had committed.
     let records = stored_session(&daemon, "resume").await;
     let starts = records
         .iter()
@@ -2817,48 +2874,59 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
     );
 }
 
-/// Handles do not matter to the daemon: it reads by grant, so a credential invalidated after a
-/// handle was minted (which revokes that handle) still pauses the run for re-authentication.
+/// aimock's reply for the handle arm: every request answers.
+#[cfg(unix)]
+const ANSWER_FIXTURES: &str =
+    r#"{ "fixtures": [ { "match": {}, "response": { "content": "GRANT-READ-ANSWER." } } ] }"#;
+
+/// Handles do not matter to the daemon: it reads credentials by grant, so a key whose handle was
+/// revoked still serves its runs.
 ///
-/// While broca read by handle, this seed order left it holding a revoked handle, and admission
-/// failed with "credential handle not found" instead of pausing; this test pinned that. Now the
-/// same seed must reach the resumable pause like any other dead credential, which is what shows
-/// the daemon no longer consults a handle at all.
+/// While broca read by handle, a revoked handle failed admission with "credential handle not
+/// found". The run here reaching aimock and finishing shows the daemon consults no handle.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_revoked_handle_does_not_change_a_grant_read_of_a_dead_credential() {
-    let Some(daemon) = Daemon::start_with_vault(
-        "vault-wrong-order",
-        "apikey:openai",
-        VaultSeedOrder::MintThenInvalidate,
-        None,
-    )
-    .await
-    else {
+async fn a_revoked_handle_does_not_change_a_grant_read() {
+    let aimock = AiMock::start("vault-revoked-handle", ANSWER_FIXTURES).await;
+    if aimock.is_none() && vault_required() {
+        panic!("single_turn_module_e2e: aimock did not start, but BROCA_REQUIRE_VAULT requires it");
+    }
+    let Some(aimock) = aimock else {
+        return;
+    };
+    let Some(daemon) = required_vault_daemon(
+        Daemon::start_with_vault(
+            "vault-revoked-handle",
+            "apikey:atomic-chat",
+            VaultSeedOrder::MintThenRevokeHandle,
+            Some(ProviderRoute::AtomicChat(&aimock.base_url)),
+        )
+        .await,
+    ) else {
         return;
     };
 
-    let project_root = daemon.dir.join("vault-order-project");
+    let project_root = daemon.dir.join("vault-handle-project");
     std::fs::create_dir_all(&project_root).unwrap();
-
     let run = timeout(
         Duration::from_secs(60),
         run_client(
             &daemon,
             &project_root,
-            "wrong-order",
+            "revoked-handle",
             &[
                 "run",
                 "--prompt",
-                "The handle for this credential was revoked by the seed; the daemon reads by grant.",
+                "The handle for this key was revoked; the daemon reads by grant.",
                 "--model",
-                "openai/gpt-4o-mini",
+                "atomic-chat/cache-eviction-probe",
                 "--tools",
                 "[]",
             ],
         ),
     )
     .await
-    .expect("admission must terminate the client");
+    .expect("the run must terminate the client");
 
     assert!(
         !run.saw("credential handle not found") && !run.saw("not_found"),
@@ -2866,8 +2934,8 @@ async fn a_revoked_handle_does_not_change_a_grant_read_of_a_dead_credential() {
         run.lines
     );
     assert!(
-        run.saw("RUN_PAUSED"),
-        "a dead credential read by grant reaches the resumable pause: {:?}",
+        run.saw("GRANT-READ-ANSWER."),
+        "the key read by grant serves the run: {:?}",
         run.lines
     );
 }

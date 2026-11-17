@@ -505,9 +505,12 @@ impl Rig {
     }
 
     /// The session's records, each as its debug text: what a refused send must leave as it was.
+    /// The barrier a writer appends when it opens is left out: this rig closes an idle actor
+    /// after 100 ms, which a slow machine can reach between two sends, and a refused send that
+    /// finds the actor closed opens a writer to answer. That barrier is not a write of the send's
+    /// own.
     async fn stored(&self) -> Vec<String> {
-        self.records()
-            .await
+        crate::delivery_rig::without_writer_opens(self.records().await)
             .iter()
             .map(|record| format!("{record:?}"))
             .collect()
