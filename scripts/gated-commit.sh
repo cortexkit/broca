@@ -108,6 +108,11 @@ if [ "$#" -eq 0 ]; then
     # Nothing under crates/ changed, so quickcheck has no subject. Say so rather than
     # inventing one: a gate run against an unrelated crate would pass and mean nothing.
     echo "gated-commit: no crate source changed — committing without a crate gate"
+    # Without a crate change no Rust file grew, but the allowlist may have changed.
+    scripts/check-file-sizes.sh || {
+      echo "gated-commit: the file-size allowlist raises a limit — NOT committing" >&2
+      exit 1
+    }
     git add -A || exit 1
     if [ -n "$message_file" ]; then
       git commit -q -F "$message_file" || exit 1
@@ -193,7 +198,9 @@ else
   attested_tree=""
 fi
 
-# Checked on every path, attested or not: it reads only the tree, so it costs nothing to repeat.
+# Checked whether a matching Linux attestation stood in for the local quickcheck or the
+# quickcheck ran here; it reads only the tree. A commit that changes nothing under crates/ took
+# the early path above, and checked the allowlist there.
 scripts/check-file-sizes.sh || {
   echo "gated-commit: a hand-written file is over its size limit — NOT committing" >&2
   exit 1

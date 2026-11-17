@@ -8,23 +8,37 @@
 # Test code is exempt: files under a tests/ folder and files named tests.rs, *_tests.rs or
 # test_*.rs. Inline `mod tests` blocks still count, because they compile into the library.
 #
-# Exit 0 when every file is within its limit, 1 naming each file that is not, 2 on a malformed
-# allowlist line. Plain bash 3.2 and awk, so it runs as macOS ships them.
+# A limit can only come down: an entry the committed allowlist (HEAD's) lacks, or a limit above
+# its committed one, fails, since either would let a file grow past 5,000 lines. Where HEAD has no
+# allowlist yet, every entry is accepted.
+#
+# Exit 0 when every file is within its limit, 1 naming each file that is not or each raised
+# limit, 2 on a malformed allowlist line. Plain bash 3.2 and awk, so it runs as macOS ships them.
 set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root" || exit 2
 allowlist=scripts/file-size-allowlist.txt
 [ -f "$allowlist" ] || { echo "check-file-sizes: $allowlist is missing" >&2; exit 2; }
 
-counts=$(git ls-files -z -- 'crates/*.rs' | while IFS= read -r -d '' path; do
+# Untracked files count too: the commit gate runs this before it adds them.
+counts=$(git ls-files -z --cached --others --exclude-standard -- 'crates/*.rs' | sort -zu | while IFS= read -r -d '' path; do
   case "$path" in
     (*/tests/*|*/tests.rs|*_tests.rs|*/test_*.rs) continue ;;
   esac
   [ -f "$path" ] && printf '%s %s\n' "$(wc -l < "$path" | tr -d ' ')" "$path"
 done)
 
-printf '%s\n' "$counts" | awk -v allowlist="$allowlist" -v limit=5000 '
+committed=$(mktemp "${TMPDIR:-/tmp}/file-size-committed.XXXXXX") || exit 2
+trap 'rm -f "$committed"' EXIT
+git show "HEAD:$allowlist" > "$committed" 2>/dev/null || : > "$committed"
+
+printf '%s\n' "$counts" | awk -v allowlist="$allowlist" -v committed="$committed" -v limit=5000 '
   BEGIN {
+    while ((getline line < committed) > 0) {
+      if (line ~ /^[[:space:]]*(#|$)/) continue
+      split(line, field, " ")
+      if (field[1] ~ /^[0-9]+$/) { before[field[2]] = field[1] + 0; had = 1 }
+    }
     while ((getline line < allowlist) > 0) {
       if (line ~ /^[[:space:]]*(#|$)/) continue
       n = split(line, field, " ")
@@ -34,6 +48,13 @@ printf '%s\n' "$counts" | awk -v allowlist="$allowlist" -v limit=5000 '
         continue
       }
       allowed[field[2]] = field[1] + 0
+      if (had && !(field[2] in before)) {
+        print "check-file-sizes: " field[2] " is not in the committed allowlist; split the file instead of listing it" > "/dev/stderr"
+        failed = 1
+      } else if (had && field[1] + 0 > before[field[2]]) {
+        print "check-file-sizes: " field[2] " limit raised from " before[field[2]] " to " field[1] "; a limit can only come down" > "/dev/stderr"
+        failed = 1
+      }
     }
   }
   NF == 2 {

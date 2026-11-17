@@ -62,6 +62,38 @@ class CheckFileSizes(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("shrank to 5500", result.stdout)
 
+    def commit(self):
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "-q", "-m", "fixture"],
+            check=True,
+        )
+
+    def test_a_committed_limit_may_come_down_but_not_go_up_or_be_added(self):
+        self.source("crates/a/src/big.rs", 6000)
+        self.allow("6000 crates/a/src/big.rs the reason\n")
+        self.commit()
+        self.allow("5900 crates/a/src/big.rs the reason\n")
+        self.source("crates/a/src/big.rs", 5900)
+        self.assertEqual(self.check().returncode, 0)
+        self.allow("6100 crates/a/src/big.rs the reason\n")
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("limit raised from 6000 to 6100", result.stderr)
+        self.allow("6000 crates/a/src/big.rs the reason\n7000 crates/a/src/new.rs another\n")
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("crates/a/src/new.rs is not in the committed allowlist", result.stderr)
+
+    def test_an_untracked_file_counts(self):
+        path = self.root / "crates/a/src/new.rs"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("//\n" * 5001)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("crates/a/src/new.rs has 5001 lines", result.stderr)
+
     def test_test_files_are_exempt(self):
         for path in [
             "crates/a/tests/it.rs",
