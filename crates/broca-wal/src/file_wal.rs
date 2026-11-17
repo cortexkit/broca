@@ -4475,7 +4475,7 @@ mod tests {
                     assistant_message: broca_protocol::AssistantMessage {
                         message_id: broca_protocol::MessageId("tail".into()),
                         content: vec![broca_protocol::ContentBlock::Text {
-                            text: "x".repeat(8192),
+                            text: "x".repeat(8192).into(),
                         }],
                     }
                     .into(),
@@ -4966,7 +4966,7 @@ mod tests {
             assistant_message: (broca_protocol::content::AssistantMessage {
                 message_id: broca_protocol::MessageId(format!("large-m{n}")),
                 content: vec![broca_protocol::ContentBlock::Text {
-                    text: "x".repeat(text_bytes),
+                    text: "x".repeat(text_bytes).into(),
                 }],
             })
             .into(),

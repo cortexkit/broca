@@ -413,7 +413,7 @@ mod tests {
                     ToolOutput::Parts { parts }
                 }
                 ToolOutput::Text { text } => ToolOutput::Text {
-                    text: text + suffix,
+                    text: text.appended(suffix),
                 },
                 ToolOutput::Error {
                     message,
@@ -434,7 +434,7 @@ mod tests {
                     reason: reason + suffix,
                 },
                 ToolOutput::Json { value } => ToolOutput::Text {
-                    text: format!("{value}{suffix}"),
+                    text: format!("{value}{suffix}").into(),
                 },
             };
             assert_eq!(
@@ -481,7 +481,7 @@ mod tests {
             let ContentBlock::ToolResult(result) = &prompt[index].content[0] else {
                 panic!()
             };
-            assert_eq!(result.output, ToolOutput::Text { text: format!("{{\"a\":1,\"b\":2}}\n\nTool repetition guidance: read returned exactly the same result {count} times. The information is already available above; use it or change the query rather than asking again.") });
+            assert_eq!(result.output, ToolOutput::Text { text: format!("{{\"a\":1,\"b\":2}}\n\nTool repetition guidance: read returned exactly the same result {count} times. The information is already available above; use it or change the query rather than asking again.").into() });
         }
         let mut next_episode = turn("d", json!({}), raw, false);
         let expected = next_episode.clone();

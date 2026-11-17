@@ -185,7 +185,7 @@ fn convert_rollout(path: &Path, session_id: &str) -> ReaderResult<ImportedSessio
                         messages.push(Message::new(
                             Role::User,
                             vec![ContentBlock::Text {
-                                text: summary.to_string(),
+                                text: summary.to_string().into(),
                             }],
                         ));
                     } else {
@@ -498,7 +498,7 @@ fn convert_response_item(
             let call_id = string_field(item, "call_id").unwrap_or("");
             let output = item.get("output").cloned().unwrap_or(Value::Null);
             let output = match output {
-                Value::String(text) => ToolOutput::Text { text },
+                Value::String(text) => ToolOutput::Text { text: text.into() },
                 value => ToolOutput::Json {
                     value: value.into(),
                 },
@@ -558,7 +558,7 @@ fn convert_message(
         .filter_map(|part| match string_field(part, "type") {
             Some("input_text" | "output_text") => {
                 string_field(part, "text").map(|text| ContentBlock::Text {
-                    text: text.to_string(),
+                    text: text.to_string().into(),
                 })
             }
             _ => None,

@@ -51,7 +51,9 @@ fn options(model: &str) -> Result<CallOptions, &'static str> {
     let mut opts = CallOptions::new(vec![
         Message::new(
             Role::System,
-            vec![ContentBlock::Text { text: instructions }],
+            vec![ContentBlock::Text {
+                text: instructions.into(),
+            }],
         ),
         Message::new(
             Role::User,

@@ -407,7 +407,7 @@ mod gated {
             content: vec![
                 ContentBlock::Reasoning {
                     text: thinking.into(),
-                    signature: Some(format!("sig-step-{n}")),
+                    signature: Some(format!("sig-step-{n}").into()),
                 },
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
@@ -430,7 +430,7 @@ mod gated {
             content: vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id: ToolCallId(format!("toolu_step_{n}")),
                 output: ToolOutput::Text {
-                    text: format!("tick {n}"),
+                    text: format!("tick {n}").into(),
                 },
                 is_error: false,
             })],
@@ -763,8 +763,8 @@ mod gated {
             Message::new(role, vec![ContentBlock::Text { text: text.into() }])
         };
         let reasoning = |label: &str| ContentBlock::Reasoning {
-            text: format!("{label} thinking"),
-            signature: Some(format!("sig-{label}")),
+            text: format!("{label} thinking").into(),
+            signature: Some(format!("sig-{label}").into()),
         };
         let call = |label: &str| {
             ContentBlock::ToolCall(ToolCall {
@@ -780,7 +780,7 @@ mod gated {
                 vec![ContentBlock::ToolResult(ToolResult {
                     tool_call_id: ToolCallId(format!("toolu_{label}")),
                     output: ToolOutput::Text {
-                        text: format!("ticked {label}"),
+                        text: format!("ticked {label}").into(),
                     },
                     is_error: false,
                 })],

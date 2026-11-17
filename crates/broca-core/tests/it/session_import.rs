@@ -26,7 +26,7 @@ fn text(role: Role, value: &str) -> Message {
     Message::new(
         role,
         vec![ContentBlock::Text {
-            text: value.to_string(),
+            text: value.to_string().into(),
         }],
     )
 }

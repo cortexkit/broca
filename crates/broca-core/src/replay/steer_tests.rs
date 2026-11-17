@@ -248,7 +248,7 @@ fn shape(prompt: &[Message]) -> Vec<(Role, String)> {
         .iter()
         .map(|message| {
             let label = match message.content.first() {
-                Some(ContentBlock::Text { text }) => text.clone(),
+                Some(ContentBlock::Text { text }) => text.to_string(),
                 Some(ContentBlock::ToolCall(_)) => "call".into(),
                 Some(ContentBlock::ToolResult(_)) => "result".into(),
                 _ => String::new(),

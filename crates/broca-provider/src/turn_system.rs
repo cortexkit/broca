@@ -68,7 +68,7 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             message.role = Role::User;
             let text = text(message);
             message.content = vec![ContentBlock::Text {
-                text: format!("<context-note>{text}</context-note>"),
+                text: format!("<context-note>{text}</context-note>").into(),
             }];
         }
     }

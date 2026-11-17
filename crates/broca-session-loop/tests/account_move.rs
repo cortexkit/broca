@@ -179,7 +179,7 @@ fn attempt(ordinal: u32, account: &str, failed: Option<AttemptAccountLimit>) -> 
 
 fn message(step: u64, tool: bool) -> AssistantMessage {
     let mut content = vec![ContentBlock::Text {
-        text: format!("step {step}"),
+        text: format!("step {step}").into(),
     }];
     if tool {
         content.push(ContentBlock::ToolCall(ToolCall {

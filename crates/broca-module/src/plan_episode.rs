@@ -64,7 +64,7 @@ pub(crate) fn freeze_manifest(
 ) -> Result<(), broca_core::RunError> {
     let is_system = |message: &&Message| message.role == Role::System;
     let frozen_system = vec![ContentBlock::Text {
-        text: manifest.system_text.clone(),
+        text: manifest.system_text.clone().into(),
     }];
     let systems: Vec<_> = request.input.iter().filter(is_system).collect();
     let system_frozen = match systems.as_slice() {

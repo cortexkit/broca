@@ -4487,10 +4487,10 @@ fn map_text_call_tool_result(
             Some(value) => ToolOutput::Json {
                 value: value.clone().into(),
             },
-            None => ToolOutput::Text { text },
+            None => ToolOutput::Text { text: text.into() },
         }
     } else {
-        ToolOutput::Text { text }
+        ToolOutput::Text { text: text.into() }
     };
     ToolResult {
         tool_call_id: id.clone(),

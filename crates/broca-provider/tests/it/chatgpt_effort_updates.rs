@@ -83,7 +83,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
                 turn_system: false,
                 role,
                 content: vec![ContentBlock::Text {
-                    text: format!("episode-{effort}"),
+                    text: format!("episode-{effort}").into(),
                 }],
                 origin: None,
                 ordinal: None,

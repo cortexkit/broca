@@ -186,7 +186,7 @@ impl Writer {
         let input = Message::new(
             Role::User,
             vec![ContentBlock::Text {
-                text: self.text.words(self.shape.input_text_bytes),
+                text: self.text.words(self.shape.input_text_bytes).into(),
             }],
         );
         self.ordinal += 1;
@@ -378,7 +378,7 @@ impl Writer {
             })
             .collect();
         let mut content = vec![ContentBlock::Text {
-            text: self.text.words(self.shape.assistant_text_bytes),
+            text: self.text.words(self.shape.assistant_text_bytes).into(),
         }];
         content.extend(tools.iter().map(|(id, name, input)| {
             ContentBlock::ToolCall(ToolCall {
@@ -433,7 +433,7 @@ impl Writer {
                 result: ToolResult {
                     tool_call_id: id.clone(),
                     output: ToolOutput::Text {
-                        text: self.text.words(self.shape.tool_result_bytes / calls),
+                        text: self.text.words(self.shape.tool_result_bytes / calls).into(),
                     },
                     is_error: false,
                 },
@@ -498,7 +498,11 @@ impl Writer {
         });
         let attempt = self.attempt(run_id, step_id);
         let text = self.text.words(self.shape.assistant_text_bytes * 2);
-        let assistant = self.assistant(run_id, step_id, vec![ContentBlock::Text { text }]);
+        let assistant = self.assistant(
+            run_id,
+            step_id,
+            vec![ContentBlock::Text { text: text.into() }],
+        );
         self.ordinal = ordinal;
         let facts = Record::EntryFacts(self.facts(run_id, true).into());
         self.written.messages += 1;

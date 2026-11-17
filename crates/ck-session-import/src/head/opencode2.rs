@@ -195,7 +195,7 @@ fn text_row(mid: &str, row: &Value, text: Option<String>) -> Result<Option<Draft
         Some(text) => Ok(Some(draft(
             mid,
             row,
-            Message::new(Role::User, vec![ContentBlock::Text { text }]),
+            Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
         )?)),
         None => Ok(None),
     }
@@ -229,17 +229,17 @@ fn user(mid: &str, row: &Value, check: &mut MediaCheck<'_>) -> Result<Option<Dra
     let mut media = Vec::new();
     for skill in array(mid, &row["skills"], "skills")? {
         if let Some(text) = text_of(mid, &skill["text"])? {
-            content.push(ContentBlock::Text { text });
+            content.push(ContentBlock::Text { text: text.into() });
         }
     }
     if let Some(text) = text_of(mid, &row["text"])?.filter(|text| !text.is_empty()) {
-        content.push(ContentBlock::Text { text });
+        content.push(ContentBlock::Text { text: text.into() });
     }
     for file in array(mid, &row["files"], "files")? {
         let mime = file["mime"].as_str().unwrap_or_default();
         match mime {
             "text/plain" | "application/x-directory" => content.push(ContentBlock::Text {
-                text: attachment_text(mid, file)?,
+                text: attachment_text(mid, file)?.into(),
             }),
             _ if mime.starts_with("image/") || mime == "application/pdf" => {
                 let (declared, bytes) = inline_bytes(mid, file)?;
@@ -340,13 +340,13 @@ fn assistant(mid: &str, row: &Value, check: &mut MediaCheck<'_>) -> Result<Vec<D
         match item["type"].as_str() {
             Some("text") => {
                 if let Some(text) = text_of(mid, &item["text"])?.filter(|text| !text.is_empty()) {
-                    content.push(ContentBlock::Text { text });
+                    content.push(ContentBlock::Text { text: text.into() });
                 }
             }
             Some("reasoning") => {
                 if let Some(text) = text_of(mid, &item["text"])?.filter(|text| !text.is_empty()) {
                     content.push(ContentBlock::Reasoning {
-                        text,
+                        text: text.into(),
                         signature: None,
                     });
                 }
@@ -440,7 +440,7 @@ fn tool(
             for content in blocks {
                 if content["type"] == "text" {
                     let text = text_of(mid, &content["text"])?.unwrap_or_default();
-                    parts.push(ToolOutputPart::Text { text });
+                    parts.push(ToolOutputPart::Text { text: text.into() });
                     continue;
                 }
                 let (declared, bytes) = inline_bytes(mid, content)?;
@@ -464,7 +464,8 @@ fn tool(
                             ToolOutputPart::Media { .. } => None,
                         })
                         .collect::<Vec<_>>()
-                        .join("\n"),
+                        .join("\n")
+                        .into(),
                 }
             } else {
                 ToolOutput::Parts { parts }

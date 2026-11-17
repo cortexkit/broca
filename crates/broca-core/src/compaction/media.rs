@@ -117,7 +117,8 @@ pub(crate) fn enforce_by(messages: &mut [Message], captured: impl Fn(&MediaRef) 
                     text: broca_protocol::content::media_not_shown_marker(
                         reference,
                         MediaMarkerReason::Provenance,
-                    ),
+                    )
+                    .into(),
                 };
             }
             ContentBlock::ToolResult(result) => {
@@ -129,7 +130,8 @@ pub(crate) fn enforce_by(messages: &mut [Message], captured: impl Fn(&MediaRef) 
                                     text: broca_protocol::content::media_not_shown_marker(
                                         media,
                                         MediaMarkerReason::Provenance,
-                                    ),
+                                    )
+                                    .into(),
                                 };
                             }
                         }

@@ -67,7 +67,7 @@ fn stateful_caller_message_serializer_uses_borrowed_content() {
         mid: "m0".into(),
         message: Message::assistant_from(
             vec![ContentBlock::TextWithState {
-                text: "x".repeat(1024 * 1024),
+                text: "x".repeat(1024 * 1024).into(),
                 provider_state: TextProviderState {
                     format: TextProviderFormat::OpenAiResponsesChatgpt,
                     data: "opaque".repeat(256 * 1024),

@@ -184,7 +184,8 @@ pub fn enforce_provenance(result: &mut ToolResult, captured: &[MediaRef]) {
                         text: broca_protocol::content::media_not_shown_marker(
                             media,
                             MediaMarkerReason::Provenance,
-                        ),
+                        )
+                        .into(),
                     };
                 }
             }

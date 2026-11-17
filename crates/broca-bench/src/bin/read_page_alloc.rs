@@ -163,7 +163,7 @@ fn snapshot(shape: Shape) -> StorePageSnapshot {
             let mut message = Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
-                    text: "x".repeat(text_len),
+                    text: "x".repeat(text_len).into(),
                 }],
             );
             message.ordinal = Some(ordinal);

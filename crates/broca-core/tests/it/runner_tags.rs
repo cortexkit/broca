@@ -175,7 +175,7 @@ fn payload(block: &ContentBlock) -> String {
     match block {
         ContentBlock::ToolCall(call) => call.input.to_string(),
         ContentBlock::ToolResult(result) => match &result.output {
-            ToolOutput::Text { text } => text.clone(),
+            ToolOutput::Text { text } => text.to_string(),
             other => panic!("the scripted tool answers with text, not {other:?}"),
         },
         other => broca_protocol::tags::part_text(other),

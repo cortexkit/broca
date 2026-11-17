@@ -255,7 +255,7 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 fn plane() -> StubToolPlane {
     StubToolPlane::new().with_tool("read", |_| {
         StubReply::Output(ToolOutput::Text {
-            text: "fn main() {}\n".repeat(400),
+            text: "fn main() {}\n".repeat(400).into(),
         })
     })
 }

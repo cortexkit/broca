@@ -102,8 +102,12 @@ fn every_family_renders_parts_as_ordered_carrier_markers() {
                         ),
                     ])
                 };
-                let expected =
-                    family.render(&frozen, &transcript(ToolOutput::Text { text: expected }));
+                let expected = family.render(
+                    &frozen,
+                    &transcript(ToolOutput::Text {
+                        text: expected.into(),
+                    }),
+                );
                 let actual = family.render(&frozen, &transcript(ToolOutput::Parts { parts }));
                 assert_eq!(actual, expected, "{id:?} is_error={is_error}");
             }

@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 const TOOL: &str = "get_secret_number";
 
 fn text_message(role: Role, text: String) -> Message {
-    Message::new(role, vec![ContentBlock::Text { text }])
+    Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }
 
 /// About 16k tokens of inert, fixed text: long enough to be cached, identical on both steps.

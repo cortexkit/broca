@@ -724,11 +724,13 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
                     } else {
                         instructions(so)
                     };
-                    system.content.push(ContentBlock::Text { text });
+                    system
+                        .content
+                        .push(ContentBlock::Text { text: text.into() });
                 }
                 None => {
                     let block = ContentBlock::Text {
-                        text: instructions(so),
+                        text: instructions(so).into(),
                     };
                     view.prompt
                         .insert(0, Message::new(Role::System, vec![block]));

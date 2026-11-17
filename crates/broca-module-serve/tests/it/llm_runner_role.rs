@@ -1102,14 +1102,16 @@ async fn import_reply_too_large_session(rig: &mut Rig, channel: u16, final_text:
             Message::new(
                 role,
                 vec![ContentBlock::Text {
-                    text: format!("history {ordinal}"),
+                    text: format!("history {ordinal}").into(),
                 }],
             )
         })
         .collect();
     messages.push(Message::new(
         Role::Assistant,
-        vec![ContentBlock::Text { text: final_text }],
+        vec![ContentBlock::Text {
+            text: final_text.into(),
+        }],
     ));
     rig.registry()
         .import(broca_module::serve::SessionImportRequest {
@@ -1538,7 +1540,7 @@ async fn run_result_refuses_a_final_message_that_exceeds_the_frame_limit() {
 
     let mut rig = Rig::start("run-result-frame-limit").await;
     rig.script.push(&[Step::Blocks(vec![ContentBlock::Text {
-        text: "x".repeat(4 * 1024 * 1024),
+        text: "x".repeat(4 * 1024 * 1024).into(),
     }])]);
     let sent = rig.send("large-answer", "answer", None).await;
     let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();

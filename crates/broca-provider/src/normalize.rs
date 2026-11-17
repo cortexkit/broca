@@ -820,13 +820,14 @@ impl AnthropicNormalizer {
                 continue;
             }
             match buf {
-                BlockBuf::Text { text } => content.push(ContentBlock::Text { text }),
-                BlockBuf::Reasoning { text, signature } => {
-                    content.push(ContentBlock::Reasoning { text, signature })
-                }
+                BlockBuf::Text { text } => content.push(ContentBlock::Text { text: text.into() }),
+                BlockBuf::Reasoning { text, signature } => content.push(ContentBlock::Reasoning {
+                    text: text.into(),
+                    signature: signature.map(Into::into),
+                }),
                 BlockBuf::RedactedReasoning { data } => {
                     content.push(ContentBlock::RedactedReasoning {
-                        data,
+                        data: data.into(),
                         provider_format: None,
                     })
                 }

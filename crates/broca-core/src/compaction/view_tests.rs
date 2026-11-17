@@ -35,7 +35,7 @@ fn stamped(mut prompt: Vec<Message>) -> Vec<Message> {
 fn signed(text: &str) -> ContentBlock {
     ContentBlock::Reasoning {
         text: text.into(),
-        signature: Some(format!("sig-{text}")),
+        signature: Some(format!("sig-{text}").into()),
     }
 }
 
@@ -1162,10 +1162,10 @@ fn tagged(prompt: &[Message]) -> Vec<Message> {
         let tag = format!("§{}§ ", message.ordinal.unwrap());
         for block in &mut message.content {
             match block {
-                ContentBlock::Text { text } => text.insert_str(0, &tag),
+                ContentBlock::Text { text } => *text = format!("{tag}{text}").into(),
                 ContentBlock::ToolResult(result) => {
                     if let broca_protocol::ToolOutput::Text { text } = &mut result.output {
-                        text.insert_str(0, &tag);
+                        *text = format!("{tag}{text}").into();
                     }
                 }
                 _ => {}

@@ -1319,10 +1319,10 @@ fn reply_step(id: &str, text: &str) -> Vec<broca_protocol::NormalizedEvent> {
                 message_id: broca_protocol::MessageId(id.into()),
                 content: vec![
                     ContentBlock::Text {
-                        text: format!("Reply to {text}"),
+                        text: format!("Reply to {text}").into(),
                     },
                     ContentBlock::Text {
-                        text: format!("More on {text}"),
+                        text: format!("More on {text}").into(),
                     },
                 ],
             },

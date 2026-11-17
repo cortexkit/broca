@@ -203,7 +203,7 @@ impl HarnessReader for GooseReader {
                         (
                             source_role,
                             ContentBlock::Reasoning {
-                                text: text.to_string(),
+                                text: text.to_string().into(),
                                 signature: None,
                             },
                         )
@@ -449,7 +449,7 @@ fn content_output(content: Value) -> ToolOutput {
         .collect();
     match texts {
         Some(texts) => ToolOutput::Text {
-            text: texts.join("\n"),
+            text: texts.join("\n").into(),
         },
         None => ToolOutput::Json {
             value: content.into(),
@@ -464,7 +464,7 @@ fn output_text(content: &Value) -> String {
             &parts,
             broca_protocol::MediaMarkerReason::NotRequested,
         ),
-        ToolOutput::Text { text } => text,
+        ToolOutput::Text { text } => text.to_string(),
         ToolOutput::Json { value } => value_text(&(value).parse()),
         ToolOutput::Denied { reason } => reason,
         ToolOutput::Error { message, .. } => message,
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::Text {
-                text: "Paris: 12C, clear.".to_string()
+                text: "Paris: 12C, clear.".to_string().into()
             },
             "content text must win over a structured duplicate, or import rewrites what the \
              model was shown"

@@ -2250,7 +2250,7 @@ fn emit_control_to(
         ),
         ControlUnit::ToolResult { result } => {
             let text = match &result.output {
-                broca_protocol::content::ToolOutput::Text { text } => text.clone(),
+                broca_protocol::content::ToolOutput::Text { text } => text.to_string(),
                 broca_protocol::content::ToolOutput::Error {
                     message,
                     module,

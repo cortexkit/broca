@@ -243,7 +243,7 @@ fn user(
             Some("text") if item["ignored"] != true => {
                 let text = text(mid, &item["text"], "user text")?;
                 if !text.is_empty() {
-                    content.push(ContentBlock::Text { text });
+                    content.push(ContentBlock::Text { text: text.into() });
                 }
             }
             Some("file")
@@ -301,14 +301,14 @@ fn assistant(
                     text = " ".into();
                 }
                 if !text.is_empty() {
-                    content.push(ContentBlock::Text { text });
+                    content.push(ContentBlock::Text { text: text.into() });
                 }
             }
             Some("reasoning") => {
                 let text = text(mid, &item["text"], "reasoning text")?;
                 if !text.is_empty() {
                     content.push(ContentBlock::Reasoning {
-                        text,
+                        text: text.into(),
                         signature: None,
                     });
                 }
@@ -332,7 +332,7 @@ fn assistant(
                             text(mid, &state["output"], "tool output")?
                         };
                         let mut parts = vec![ToolOutputPart::Text {
-                            text: output.clone(),
+                            text: output.clone().into(),
                         }];
                         if !compacted {
                             if let Some(attachments) = state["attachments"].as_array() {
@@ -353,7 +353,9 @@ fn assistant(
                             if parts.len() > 1 {
                                 ToolOutput::Parts { parts }
                             } else {
-                                ToolOutput::Text { text: output }
+                                ToolOutput::Text {
+                                    text: output.into(),
+                                }
                             },
                             false,
                         )
@@ -369,7 +371,8 @@ fn assistant(
                                         mid,
                                         &state["metadata"]["output"],
                                         "interrupted output",
-                                    )?,
+                                    )?
+                                    .into(),
                                 },
                                 false,
                             )

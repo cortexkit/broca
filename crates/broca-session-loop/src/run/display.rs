@@ -119,14 +119,14 @@ pub(super) async fn restream(
                     part: None,
                     message_id: message.message_id.clone(),
                     tool_call_id: None,
-                    delta: text.clone(),
+                    delta: text.to_string(),
                 }
             }
             ContentBlock::Reasoning { text, .. } => DisplayEvent::ReasoningDelta {
                 mid: None,
                 part: None,
                 message_id: message.message_id.clone(),
-                delta: text.clone(),
+                delta: text.to_string(),
             },
             ContentBlock::ToolCall(call) => DisplayEvent::ToolInputDelta {
                 mid: None,

@@ -216,7 +216,7 @@ fn matches_call(reply: &PlanViewResponse, call: &broca_protocol::request::CallOp
     assert_eq!(
         call.prompt[0].content,
         [ContentBlock::Text {
-            text: reply.system.text.clone()
+            text: reply.system.text.clone().into()
         }]
     );
     assert_eq!(reply.tools.len(), call.tools.len());
@@ -537,7 +537,9 @@ async fn plan_view_unverifiable_join_keeps_stored_text_without_offsets() {
         assert!(reply.system.items.is_none());
         assert_eq!(
             provider.calls()[0].prompt[0].content,
-            [ContentBlock::Text { text: stored }]
+            [ContentBlock::Text {
+                text: stored.into()
+            }]
         );
         drop(commands);
         served.await.unwrap();

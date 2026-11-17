@@ -1641,16 +1641,19 @@ impl BedrockStreamNormalizer {
                 continue;
             }
             match block {
-                BlockBuf::Reasoning { text, signature } => {
-                    content.push(ContentBlock::Reasoning { text, signature })
-                }
+                BlockBuf::Reasoning { text, signature } => content.push(ContentBlock::Reasoning {
+                    text: text.into(),
+                    signature: signature.map(Into::into),
+                }),
                 BlockBuf::RedactedReasoning { bytes } => {
                     content.push(ContentBlock::RedactedReasoning {
-                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        data: base64::engine::general_purpose::STANDARD
+                            .encode(bytes)
+                            .into(),
                         provider_format: None,
                     })
                 }
-                BlockBuf::Text { text } => content.push(ContentBlock::Text { text }),
+                BlockBuf::Text { text } => content.push(ContentBlock::Text { text: text.into() }),
                 BlockBuf::ToolUse {
                     id,
                     name,
@@ -1993,7 +1996,7 @@ mod tests {
     #[test]
     fn empty_text_tool_result_uses_json_string_and_keeps_success_status() {
         let output = ToolOutput::Text {
-            text: String::new(),
+            text: String::new().into(),
         };
         let body = tool_result_request(output.clone(), false);
         let tool_result = &body["messages"][1]["content"][0]["toolResult"];

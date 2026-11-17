@@ -791,7 +791,7 @@ fn texts(opts: &broca_protocol::request::CallOptions) -> Vec<String> {
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Text { text } => Some(text.to_string()),
             _ => None,
         })
         .collect()

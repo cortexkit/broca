@@ -1256,7 +1256,7 @@ async fn reads_clean_replies_where_their_facts_say_their_run_cleans_them() {
             .filter(|message| message.role == broca_protocol::Role::Assistant)
             .flat_map(|message| &message.content)
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Text { text } => Some(text.to_string()),
                 _ => None,
             })
             .collect();
@@ -1400,7 +1400,7 @@ async fn every_exposure_serves_a_cleaned_reply_and_the_store_keeps_the_written_o
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.clone()),
+                    ContentBlock::Text { text } => Some(text.to_string()),
                     _ => None,
                 })
                 .collect()

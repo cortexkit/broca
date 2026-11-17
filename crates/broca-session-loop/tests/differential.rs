@@ -495,7 +495,7 @@ impl HeldScript {
         self.deposits.lock().unwrap().push(ToolResult {
             tool_call_id: id.clone(),
             output: ToolOutput::Text {
-                text: format!("late result for {}", id.0),
+                text: format!("late result for {}", id.0).into(),
             },
             is_error: false,
         });
@@ -820,7 +820,7 @@ impl ToolPlane for Spy {
             return DispatchResult::Completed(ToolResult {
                 tool_call_id: call.tool_call_id.clone(),
                 output: ToolOutput::Text {
-                    text: "x".repeat(8_000),
+                    text: "x".repeat(8_000).into(),
                 },
                 is_error: false,
             });
@@ -3855,8 +3855,8 @@ async fn runs_whose_tools_change_move_the_signed_floor_alike() {
             id,
             vec![
                 ContentBlock::Reasoning {
-                    text: format!("thinking for {id}"),
-                    signature: Some(format!("sig-{id}")),
+                    text: format!("thinking for {id}").into(),
+                    signature: Some(format!("sig-{id}").into()),
                 },
                 ContentBlock::Text { text: text.into() },
             ],
@@ -10056,7 +10056,7 @@ async fn a_converted_session_with_a_joined_ride_enrolls_and_keeps_its_bytes() {
         let result_text = |message: &Message| -> Option<String> {
             message.content.iter().find_map(|block| match block {
                 ContentBlock::ToolResult(result) => match &result.output {
-                    ToolOutput::Text { text } => Some(text.clone()),
+                    ToolOutput::Text { text } => Some(text.to_string()),
                     _ => None,
                 },
                 _ => None,

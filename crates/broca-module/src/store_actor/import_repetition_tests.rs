@@ -132,7 +132,7 @@ async fn a_direct_imports_tool_results_are_not_repetition_history_for_a_new_run(
         assert_eq!(
             output,
             &ToolOutput::Text {
-                text: String::new()
+                text: String::new().into()
             }
         );
     }

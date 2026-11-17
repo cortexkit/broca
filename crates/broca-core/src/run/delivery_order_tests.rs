@@ -435,7 +435,7 @@ async fn a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild() {
     assert_eq!(
         sent.last().unwrap().content,
         vec![ContentBlock::Text {
-            text: format!("§{tag}§ note")
+            text: format!("§{tag}§ note").into()
         }]
     );
     assert_eq!(
@@ -486,7 +486,7 @@ async fn a_tool_result_delivery_renders_inside_the_results_tagged_part() {
     assert_eq!(
         carried,
         ToolOutput::Text {
-            text: format!("§{carrier_tag}§ done\n\nnote")
+            text: format!("§{carrier_tag}§ done\n\nnote").into()
         }
     );
     assert_eq!(

@@ -532,7 +532,7 @@ fn convert_message_row(
             source_role,
             origin,
             vec![ContentBlock::Text {
-                text: text.to_string(),
+                text: text.to_string().into(),
             }],
             join_previous_assistant,
         );
@@ -597,14 +597,14 @@ fn convert_block(
             .get("text")
             .and_then(Value::as_str)
             .map(|text| ContentBlock::Text {
-                text: text.to_string(),
+                text: text.to_string().into(),
             }),
         "thinking" => {
             block
                 .get("thinking")
                 .and_then(Value::as_str)
                 .map(|text| ContentBlock::Reasoning {
-                    text: text.to_string(),
+                    text: text.to_string().into(),
                     signature: None,
                 })
         }
@@ -632,10 +632,10 @@ fn convert_block(
             let mut content = block.get("content").cloned().unwrap_or(Value::Null);
             *omitted_images += omit_nested_tool_images(&mut content);
             let output = match content {
-                Value::String(text) => ToolOutput::Text { text },
+                Value::String(text) => ToolOutput::Text { text: text.into() },
                 value => match singleton_text_block(&value) {
                     Some(text) => ToolOutput::Text {
-                        text: text.to_string(),
+                        text: text.to_string().into(),
                     },
                     None => ToolOutput::Json {
                         value: value.into(),

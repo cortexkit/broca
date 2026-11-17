@@ -1611,7 +1611,7 @@ mod tests {
             assistant_message: broca_protocol::content::AssistantMessage {
                 message_id: broca_protocol::MessageId("large".into()),
                 content: vec![broca_protocol::ContentBlock::Text {
-                    text: "x".repeat(9000),
+                    text: "x".repeat(9000).into(),
                 }],
             }
             .into(),

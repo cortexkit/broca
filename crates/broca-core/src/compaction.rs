@@ -1145,7 +1145,7 @@ mod carried_encoding_tests {
     }
 
     fn text(role: Role, text: String) -> Message {
-        Message::new(role, vec![ContentBlock::Text { text }])
+        Message::new(role, vec![ContentBlock::Text { text: text.into() }])
     }
 
     /// Judging a replacement against the range it replaces encodes each carried message once and

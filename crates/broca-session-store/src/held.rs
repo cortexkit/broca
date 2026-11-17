@@ -248,6 +248,18 @@ impl HeldBytes for broca_protocol::json::Json {
     }
 }
 
+/// Text held shared: the text and the two reference counts beside it, counted in full by every
+/// holder, as an `Arc` is. Empty text shares one process-wide allocation and counts nothing.
+impl HeldBytes for broca_protocol::text::Text {
+    fn heap_bytes(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else {
+            2 * size_of::<usize>() + self.held_bytes()
+        }
+    }
+}
+
 impl HeldBytes for serde_json::Map<String, serde_json::Value> {
     fn heap_bytes(&self) -> usize {
         let nodes = if self.is_empty() {
@@ -398,6 +410,55 @@ impl HeldBytes for ContentBlock {
                 raw,
             } => from_model.heap_bytes() + to_model.heap_bytes() + raw.heap_bytes(),
         }
+    }
+}
+
+/// The part of `block`'s [`HeldBytes::heap_bytes`] in text and JSON leaves another holder shares
+/// now. A holder that keeps a copy of a message the conversation also holds, as the kept records
+/// and a request in flight do, shares those leaves with it: the conversation counts them, and the
+/// copy counts its heap less this.
+pub fn shared_leaf_bytes(block: &ContentBlock) -> usize {
+    match block {
+        ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => shared_text(text),
+        ContentBlock::Reasoning { text, signature } => {
+            shared_text(text) + signature.as_ref().map_or(0, shared_text)
+        }
+        ContentBlock::RedactedReasoning { data, .. } => shared_text(data),
+        ContentBlock::ToolCall(call) => shared_json(&call.input),
+        ContentBlock::ToolResult(result) => shared_output_bytes(&result.output),
+        ContentBlock::Media(_) | ContentBlock::ProviderFallback { .. } => 0,
+    }
+}
+
+/// [`shared_leaf_bytes`] for a tool result's output.
+pub fn shared_output_bytes(output: &ToolOutput) -> usize {
+    match output {
+        ToolOutput::Text { text } => shared_text(text),
+        ToolOutput::Json { value } => shared_json(value),
+        ToolOutput::Parts { parts } => parts
+            .iter()
+            .map(|part| match part {
+                ToolOutputPart::Text { text } => shared_text(text),
+                ToolOutputPart::Media { .. } => 0,
+            })
+            .sum(),
+        ToolOutput::Denied { .. } | ToolOutput::Error { .. } => 0,
+    }
+}
+
+fn shared_text(text: &broca_protocol::text::Text) -> usize {
+    if text.is_shared() {
+        text.heap_bytes()
+    } else {
+        0
+    }
+}
+
+fn shared_json(json: &broca_protocol::json::Json) -> usize {
+    if json.is_shared() {
+        json.heap_bytes()
+    } else {
+        0
     }
 }
 

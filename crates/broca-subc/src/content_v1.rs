@@ -314,7 +314,7 @@ pub(crate) mod tests {
         let output = ToolOutput::Parts {
             parts: vec![
                 ToolOutputPart::Text {
-                    text: json_object(199),
+                    text: json_object(199).into(),
                 },
                 image,
             ],
@@ -471,7 +471,7 @@ pub(crate) mod tests {
         assert_eq!(
             result.output,
             ToolOutput::Text {
-                text: format!("§1§ {PDF_NOTICE}")
+                text: format!("§1§ {PDF_NOTICE}").into()
             }
         );
         assert!(!broca_protocol::content::is_image_only_notice(PDF_NOTICE));
@@ -596,7 +596,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     result.output,
                     ToolOutput::Text {
-                        text: String::new()
+                        text: String::new().into()
                     }
                 );
             }

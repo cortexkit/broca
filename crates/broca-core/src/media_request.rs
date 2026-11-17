@@ -402,7 +402,7 @@ impl SessionMedia {
                             if let ToolOutput::Parts { parts } = &mut result.output {
                                 for part in parts {
                                     if let ToolOutputPart::Text { text } = part {
-                                        text.clear();
+                                        *text = Default::default();
                                     }
                                 }
                             }
@@ -513,7 +513,7 @@ impl SessionMedia {
                         for media in media {
                             if parts.len() <= media.part {
                                 parts.resize_with(media.part + 1, || ToolOutputPart::Text {
-                                    text: String::new(),
+                                    text: String::new().into(),
                                 });
                             }
                             parts[media.part] = ToolOutputPart::Media {
@@ -601,7 +601,7 @@ impl SessionMedia {
                 message
                     .content
                     .resize_with(block_index + 1, || ContentBlock::Text {
-                        text: String::new(),
+                        text: String::new().into(),
                     });
             }
             message.content[block_index] = ContentBlock::ToolResult(result);
@@ -1091,14 +1091,14 @@ impl SessionMedia {
                         if let ToolOutput::Parts { parts } = &mut result.output {
                             for part in parts {
                                 if let ToolOutputPart::Text { text } = part {
-                                    text.clear();
+                                    *text = Default::default();
                                 }
                             }
                         }
                     }
                     _ => {
                         *block = ContentBlock::Text {
-                            text: String::new(),
+                            text: String::new().into(),
                         }
                     }
                 }

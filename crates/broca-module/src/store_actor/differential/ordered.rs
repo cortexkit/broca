@@ -431,7 +431,7 @@ fn prompts(calls: Vec<broca_protocol::request::CallOptions>) -> Vec<Vec<String>>
                 .iter()
                 .flat_map(|message| &message.content)
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.clone()),
+                    ContentBlock::Text { text } => Some(text.to_string()),
                     ContentBlock::ToolResult(result) => Some(format!(
                         "result of {}: {}",
                         result.tool_call_id.0,

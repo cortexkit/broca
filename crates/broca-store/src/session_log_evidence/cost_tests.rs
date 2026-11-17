@@ -65,7 +65,7 @@ impl CostFixture {
         let message = serde_json::to_string(&Message::new(
             Role::User,
             vec![ContentBlock::Text {
-                text: "x".repeat(512),
+                text: "x".repeat(512).into(),
             }],
         ))
         .unwrap();

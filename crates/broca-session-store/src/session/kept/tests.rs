@@ -593,7 +593,7 @@ fn queued(submission: &str) -> Record {
         input: vec![Message::new(
             Role::User,
             vec![ContentBlock::Text {
-                text: format!("queued {submission}"),
+                text: format!("queued {submission}").into(),
             }],
         )],
         setup: Vec::new(),
@@ -818,7 +818,7 @@ async fn tool_run<B: SessionBackend>(
                     run,
                     answer,
                     vec![ContentBlock::Text {
-                        text: format!("answer {run}"),
+                        text: format!("answer {run}").into(),
                     }],
                 ),
                 facts(*ordinal),

@@ -881,7 +881,7 @@ impl Value for ContentBlock {
                 })?;
                 Ok(ContentBlock::Reasoning {
                     text: finish_req(text, AT)?,
-                    signature,
+                    signature: signature.map(broca_protocol::text::Text::from),
                 })
             }
             5 => {
@@ -892,7 +892,7 @@ impl Value for ContentBlock {
                     _ => skip_unknown(f, AT),
                 })?;
                 Ok(ContentBlock::RedactedReasoning {
-                    data: opaque_written(data, AT)?,
+                    data: opaque_written(data, AT)?.into(),
                     provider_format: format,
                 })
             }

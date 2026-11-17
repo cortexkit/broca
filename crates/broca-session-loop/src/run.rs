@@ -6872,7 +6872,7 @@ async fn post_assistant(
             .iter()
             .filter_map(|part| match part {
                 ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                    Some(text.clone())
+                    Some(text.to_string())
                 }
                 _ => None,
             })

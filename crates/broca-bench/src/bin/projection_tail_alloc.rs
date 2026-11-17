@@ -162,7 +162,7 @@ impl Fixture {
                 input: vec![Message::new(
                     Role::User,
                     vec![ContentBlock::Text {
-                        text: "u".repeat(shape.message_bytes),
+                        text: "u".repeat(shape.message_bytes).into(),
                     }],
                 )]
                 .into(),
@@ -186,7 +186,7 @@ impl Fixture {
                 assistant_message: (AssistantMessage {
                     message_id: MessageId(format!("message-{}", shape.label)),
                     content: vec![ContentBlock::Text {
-                        text: "a".repeat(shape.message_bytes),
+                        text: "a".repeat(shape.message_bytes).into(),
                     }],
                 })
                 .into(),

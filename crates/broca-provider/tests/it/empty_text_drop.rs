@@ -176,7 +176,7 @@ fn bedrock_drops_empty_text_parts() {
         vec![ContentBlock::ToolResult(ToolResult {
             tool_call_id,
             output: ToolOutput::Text {
-                text: String::new(),
+                text: String::new().into(),
             },
             is_error: false,
         })],

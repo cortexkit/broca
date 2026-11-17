@@ -59,7 +59,7 @@ impl Skeleton {
             self.role,
             vec![
                 ContentBlock::Text {
-                    text: String::new()
+                    text: String::new().into()
                 };
                 self.blocks
             ],
@@ -78,7 +78,7 @@ impl Skeleton {
                 if let ContentBlock::ToolResult(result) = &mut message.content[slot.block] {
                     if let ToolOutput::Parts { parts } = &mut result.output {
                         parts.resize_with(part + 1, || ToolOutputPart::Text {
-                            text: String::new(),
+                            text: String::new().into(),
                         });
                         parts[part] = ToolOutputPart::Media {
                             media: slot.reference.clone(),

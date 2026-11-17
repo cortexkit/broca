@@ -528,7 +528,7 @@ async fn codex_continuation_large_canonical_request_has_small_suffix_and_real_st
     let provider = codex_provider(&mock);
     let mut initial = opts();
     initial.prompt[0].content = vec![ContentBlock::Text {
-        text: "deterministic cache prefix. ".repeat(150_000),
+        text: "deterministic cache prefix. ".repeat(150_000).into(),
     }];
     let first = step(&provider, 1, &initial).await;
     let next = follow_up(initial, &first, "Next question");

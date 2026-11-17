@@ -817,7 +817,7 @@ mod tests {
                             parts,
                             broca_protocol::MediaMarkerReason::NotRequested,
                         ),
-                        ToolOutput::Text { text } => text.clone(),
+                        ToolOutput::Text { text } => text.to_string(),
                         ToolOutput::Error { message, .. } => message.clone(),
                         ToolOutput::Json { value } => value.to_string(),
                         ToolOutput::Denied { reason } => reason.clone(),

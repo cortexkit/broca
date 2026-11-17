@@ -88,14 +88,14 @@ fn seed_options() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message::new(
             Role::System,
-            vec![ContentBlock::Text { text: fixed_prefix() }],
+            vec![ContentBlock::Text { text: fixed_prefix().into() }],
         ),
         Message::new(
             Role::User,
             vec![ContentBlock::Text {
                 text: format!(
                     "First reason about which path to read. Complete that reasoning before calling {TOOL}; then write exactly one short visible text sentence and call {TOOL} exactly once with path sample.txt. Do not finish until the tool result arrives."
-                ),
+                ).into(),
             }],
         ),
     ]);
@@ -162,7 +162,7 @@ fn assistant_message_for_request(content: &[ContentBlock], add_tag: bool) -> Mes
         }) {
             match block {
                 ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                    text.insert_str(0, TAG);
+                    *text = format!("{TAG}{text}").into();
                 }
                 _ => unreachable!("the selected block is a text block"),
             }

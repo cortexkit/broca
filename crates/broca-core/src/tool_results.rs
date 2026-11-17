@@ -197,7 +197,7 @@ pub fn transformed_tool_result(
                 ToolOutput::Denied { .. } if text.starts_with("denied: ") => ToolOutput::Denied {
                     reason: text[8..].into(),
                 },
-                _ => ToolOutput::Text { text },
+                _ => ToolOutput::Text { text: text.into() },
             };
         }
     }
@@ -218,7 +218,7 @@ pub fn post_tool_text(result: &ToolResult) -> String {
             parts,
             broca_protocol::MediaMarkerReason::Carrier,
         ),
-        ToolOutput::Text { text } => text.clone(),
+        ToolOutput::Text { text } => text.to_string(),
         ToolOutput::Error {
             message,
             module,

@@ -7965,7 +7965,7 @@ mod tests {
             result: broca_protocol::ToolResult {
                 tool_call_id: broca_protocol::ToolCallId("call-1".into()),
                 output: broca_protocol::ToolOutput::Text {
-                    text: "\u{1}".repeat(1 << 20),
+                    text: "\u{1}".repeat(1 << 20).into(),
                 },
                 is_error: false,
             },

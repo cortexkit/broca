@@ -190,7 +190,7 @@ fn request(dir: &std::path::Path, run: &str, input: &str) -> RunRequest {
 fn plane() -> StubToolPlane {
     StubToolPlane::new().with_tool("edit", |c| {
         StubReply::Output(ToolOutput::Text {
-            text: format!("edited-{}", c.tool_call_id.0),
+            text: format!("edited-{}", c.tool_call_id.0).into(),
         })
     })
 }

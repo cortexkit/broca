@@ -251,10 +251,15 @@ fn seed_prompt() -> Vec<Message> {
         Message::new(
             Role::System,
             vec![ContentBlock::Text {
-                text: fixed_prefix(),
+                text: fixed_prefix().into(),
             }],
         ),
-        Message::new(Role::User, vec![ContentBlock::Text { text: seed_text() }]),
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: seed_text().into(),
+            }],
+        ),
     ]
 }
 

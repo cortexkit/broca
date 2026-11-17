@@ -109,7 +109,7 @@ fn message(role: Role, text: String) -> Message {
     Message {
         turn_system: false,
         role,
-        content: vec![ContentBlock::Text { text }],
+        content: vec![ContentBlock::Text { text: text.into() }],
         origin: None,
         ordinal: None,
         tags: Default::default(),

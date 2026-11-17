@@ -463,7 +463,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
         assistant_message: (AssistantMessage {
             message_id: MessageId(format!("message-{suffix}")),
             content: vec![ContentBlock::Text {
-                text: format!("answer-{suffix}"),
+                text: format!("answer-{suffix}").into(),
             }],
         })
         .into(),
@@ -580,7 +580,7 @@ fn text_reply(message_id: String, text: String) -> Vec<NormalizedEvent> {
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
                 message_id: MessageId(message_id),
-                content: vec![ContentBlock::Text { text }],
+                content: vec![ContentBlock::Text { text: text.into() }],
             },
         }),
         NormalizedEvent::Control(ProviderControl::Finished {
@@ -603,7 +603,7 @@ fn message(role: Role, text: String) -> Message {
         ordinal: None,
         tags: Default::default(),
         role,
-        content: vec![ContentBlock::Text { text }],
+        content: vec![ContentBlock::Text { text: text.into() }],
     }
 }
 

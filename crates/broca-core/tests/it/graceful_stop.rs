@@ -204,7 +204,7 @@ impl ToolPlane for StoppingPlane {
         DispatchResult::Completed(ToolResult {
             tool_call_id: call.tool_call_id.clone(),
             output: ToolOutput::Text {
-                text: format!("edited-{}", call.tool_call_id.0),
+                text: format!("edited-{}", call.tool_call_id.0).into(),
             },
             is_error: false,
         })
@@ -336,7 +336,7 @@ fn tool_results(records: &[WalRecord]) -> Vec<(String, DispatchOutcome, String)>
                 result, outcome, ..
             } => {
                 let text = match &result.output {
-                    ToolOutput::Text { text } => text.clone(),
+                    ToolOutput::Text { text } => text.to_string(),
                     ToolOutput::Error { message, .. } => message.clone(),
                     other => format!("{other:?}"),
                 };

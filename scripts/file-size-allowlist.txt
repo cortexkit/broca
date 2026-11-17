@@ -8,7 +8,7 @@
 8411 crates/broca-core/src/wal_writer.rs the WAL's writer (the write-ahead log the session store replaced); deleted with the WAL code
 7977 crates/broca-core/src/replay.rs replay of the WAL (the write-ahead log the session store replaced); deleted with the WAL code
 7206 crates/broca-session-loop/src/run.rs the run loop; split step, tool batch and boundary areas
-7178 crates/broca-wire/src/lib.rs wire types of every op; split by op family
+7173 crates/broca-wire/src/lib.rs wire types of every op; split by op family
 7161 crates/broca-core/src/admission.rs send admission (plan, auth, cache, budgets); split by area
 7193 crates/broca-store/src/lib.rs run-index.db projections of the WAL (the write-ahead log the session store replaced); most go with the WAL code
 7159 crates/broca-wal/src/file_wal.rs the WAL's file store (the write-ahead log the session store replaced); deleted with the WAL code

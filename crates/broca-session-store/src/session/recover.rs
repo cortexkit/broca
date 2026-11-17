@@ -506,7 +506,7 @@ impl<B: SessionBackend> Session<B> {
                 message: std::sync::Arc::new(Message::new(
                     Role::User,
                     vec![ContentBlock::Text {
-                        text: notice_text(&lost_parts),
+                        text: notice_text(&lost_parts).into(),
                     }],
                 )),
                 written_at_ms: Some(now_ms),

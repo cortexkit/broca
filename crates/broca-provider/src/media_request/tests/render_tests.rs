@@ -22,7 +22,7 @@ fn native_requests_measure_complete_bytes_and_fail_closed_at_the_cap() {
     person.content.insert(
         0,
         ContentBlock::Text {
-            text: "large envelope".repeat(100),
+            text: "large envelope".repeat(100).into(),
         },
     );
     let prompt = vec![person];
@@ -238,7 +238,9 @@ async fn failed_image_capture_keeps_the_numbered_label_before_its_failure_line()
         failure.reason,
     );
     let stored_output = ToolOutput::Parts {
-        parts: vec![ToolOutputPart::Text { text: line.clone() }],
+        parts: vec![ToolOutputPart::Text {
+            text: line.clone().into(),
+        }],
     };
     let stored_bytes = serde_json::to_vec(&stored_output).unwrap();
     let mut tool = Message::new(
@@ -414,7 +416,7 @@ fn prepared_tool_tag_table_preserves_text_targets_and_image_labels_on_every_fami
                         text: "first exposed text".into(),
                     }),
                     "image_empty" => parts.push(ToolOutputPart::Text {
-                        text: String::new(),
+                        text: String::new().into(),
                     }),
                     _ => {}
                 }
@@ -525,7 +527,7 @@ fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
     result.output = ToolOutput::Parts {
         parts: vec![
             ToolOutputPart::Text {
-                text: literal.clone(),
+                text: literal.clone().into(),
             },
             ToolOutputPart::Text {
                 text: "later text".into(),
@@ -590,7 +592,7 @@ fn native_media_provenance_uses_the_same_bytes_and_durable_source_for_every_fami
             let mut message = Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
-                    text: format!("older input {ordinal}"),
+                    text: format!("older input {ordinal}").into(),
                 }],
             );
             message.ordinal = Some(ordinal);

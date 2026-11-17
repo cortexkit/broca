@@ -162,7 +162,7 @@ async fn dropped_tool_media_is_recorded_or_captured_at_dispatch() {
                 );
             } else {
                 let text = match &result.output {
-                    ToolOutput::Text { text } => text.clone(),
+                    ToolOutput::Text { text } => text.to_string(),
                     ToolOutput::Parts { parts } => parts
                         .iter()
                         .map(|part| match part {

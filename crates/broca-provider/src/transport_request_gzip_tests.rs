@@ -186,7 +186,7 @@ fn options(prompt_chars: usize) -> CallOptions {
     CallOptions::new(vec![Message::new(
         Role::User,
         vec![ContentBlock::Text {
-            text: "n".repeat(prompt_chars),
+            text: "n".repeat(prompt_chars).into(),
         }],
     )])
 }

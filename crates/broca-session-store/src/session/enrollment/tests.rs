@@ -615,7 +615,7 @@ fn result_and_rides(conversation: &Conversation, id: &str) -> (String, Vec<Strin
                 .collect()
         })
         .unwrap();
-    (text.clone(), rides)
+    (text.to_string(), rides)
 }
 
 /// A session that joined delivered text into its results keeps the text joined into the results

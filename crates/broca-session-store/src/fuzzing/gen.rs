@@ -126,6 +126,12 @@ fn base64(bytes: &[u8], alphabet: &[u8; 64]) -> String {
     out
 }
 
+impl Gen for broca_protocol::text::Text {
+    fn gen(g: &mut G<'_>) -> Self {
+        String::gen(g).into()
+    }
+}
+
 impl Gen for String {
     fn gen(g: &mut G<'_>) -> Self {
         match g.byte() % 10 {

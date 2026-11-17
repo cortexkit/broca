@@ -184,7 +184,7 @@ fn answer(run: &str, text: &str) -> Record {
         message: std::sync::Arc::new(Message::assistant_from(
             vec![
                 ContentBlock::RedactedReasoning {
-                    data: format!("opaque-{text}"),
+                    data: format!("opaque-{text}").into(),
                     provider_format: None,
                 },
                 ContentBlock::Text { text: text.into() },
@@ -205,7 +205,7 @@ fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Text { text } => Some(text.to_string()),
             _ => None,
         })
         .collect()

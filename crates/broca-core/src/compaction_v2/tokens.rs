@@ -77,11 +77,13 @@ impl Counts {
                         if structured.instructions_paragraph_break {
                             text.insert_str(0, "\n\n");
                         }
-                        message.content.push(ContentBlock::Text { text });
+                        message
+                            .content
+                            .push(ContentBlock::Text { text: text.into() });
                     } else {
                         system.push(broca_protocol::Message::new(
                             broca_protocol::Role::System,
-                            vec![ContentBlock::Text { text }],
+                            vec![ContentBlock::Text { text: text.into() }],
                         ));
                     }
                 }

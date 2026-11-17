@@ -86,8 +86,8 @@ impl Provider for SequenceProvider {
 
 fn thinking(step: &str) -> ContentBlock {
     ContentBlock::Reasoning {
-        text: format!("thinking for {step}"),
-        signature: Some(format!("sig-{step}")),
+        text: format!("thinking for {step}").into(),
+        signature: Some(format!("sig-{step}").into()),
     }
 }
 

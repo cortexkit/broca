@@ -3831,7 +3831,7 @@ fn replay_seeded_with_compaction<'a>(
                     None => expected_text,
                 };
                 prompt.push(tagged(
-                    Message::new(Role::User, vec![ContentBlock::Text { text }]),
+                    Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
                     rec.runner_tags().first(),
                 ));
             }
@@ -6771,7 +6771,7 @@ mod offset_tail_tests {
                 result: Arc::new(ToolResult {
                     tool_call_id: ToolCallId(call.into()),
                     output: ToolOutput::Text {
-                        text: format!("out-{call}"),
+                        text: format!("out-{call}").into(),
                     },
                     is_error: false,
                 }),
@@ -6807,7 +6807,7 @@ mod offset_tail_tests {
             .iter()
             .map(|message| {
                 let label = match message.content.first() {
-                    Some(ContentBlock::Text { text }) => text.clone(),
+                    Some(ContentBlock::Text { text }) => text.to_string(),
                     Some(ContentBlock::ToolCall(_)) => "call".into(),
                     Some(ContentBlock::ToolResult(_)) => "result".into(),
                     _ => String::new(),

@@ -138,7 +138,7 @@ async fn collect_results(events: Vec<OutputEvent>) -> Vec<ToolResultText> {
             OutputEvent::Control(ControlUnit::ToolResult { result }) => Some(ToolResultText {
                 is_error: result.is_error,
                 text: match &result.output {
-                    ToolOutput::Text { text } => text.clone(),
+                    ToolOutput::Text { text } => text.to_string(),
                     ToolOutput::Error { message, .. } => message.clone(),
                     _ => String::new(),
                 },

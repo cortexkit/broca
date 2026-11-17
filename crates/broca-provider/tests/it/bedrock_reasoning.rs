@@ -31,7 +31,7 @@ fn canonical_blocks() -> Vec<ContentBlock> {
             signature: Some("sig-opaque==".into()),
         },
         ContentBlock::Reasoning {
-            text: String::new(),
+            text: String::new().into(),
             signature: Some("empty-sig".into()),
         },
         ContentBlock::RedactedReasoning {

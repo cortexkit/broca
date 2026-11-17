@@ -467,7 +467,7 @@ pub(super) fn tool_output(
     match output {
         ToolOutput::Text { text } => (
             ToolStatus::Completed,
-            text.clone(),
+            text.to_string(),
             OutputFormat::Text,
             vec![],
         ),

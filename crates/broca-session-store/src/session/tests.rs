@@ -352,7 +352,7 @@ fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Text { text } => Some(text.to_string()),
             _ => None,
         })
         .collect()

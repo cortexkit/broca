@@ -3091,7 +3091,7 @@ async fn parallel_results_returned_in_source_order() {
     // echo returns the call id so we can check ordering.
     let plane = StubToolPlane::new().with_tool("echo", |call| {
         StubReply::Output(ToolOutput::Text {
-            text: call.tool_call_id.0.clone(),
+            text: call.tool_call_id.0.clone().into(),
         })
     });
     let (summary, events) = drive(
@@ -3108,7 +3108,7 @@ async fn parallel_results_returned_in_source_order() {
         .iter()
         .filter_map(|c| match c {
             ControlUnit::ToolResult { result } => match &result.output {
-                ToolOutput::Text { text } => Some(text.clone()),
+                ToolOutput::Text { text } => Some(text.to_string()),
                 _ => None,
             },
             _ => None,
@@ -3131,7 +3131,7 @@ async fn sequential_execution_mode_still_source_ordered() {
     ]);
     let plane = StubToolPlane::new().with_tool("echo", |call| {
         StubReply::Output(ToolOutput::Text {
-            text: call.tool_call_id.0.clone(),
+            text: call.tool_call_id.0.clone().into(),
         })
     });
     let (summary, events) = drive(
@@ -3147,7 +3147,7 @@ async fn sequential_execution_mode_still_source_ordered() {
         .iter()
         .filter_map(|c| match c {
             ControlUnit::ToolResult { result } => match &result.output {
-                ToolOutput::Text { text } => Some(text.clone()),
+                ToolOutput::Text { text } => Some(text.to_string()),
                 _ => None,
             },
             _ => None,
@@ -3728,7 +3728,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
             request.input = vec![Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
-                    text: format!("{index}:").repeat(PAYLOAD_BYTES / 2),
+                    text: format!("{index}:").repeat(PAYLOAD_BYTES / 2).into(),
                 }],
             )];
             PendingSubmission {
@@ -4271,7 +4271,7 @@ async fn budgeted_live_prompt_and_replay_preserve_literal_firing_order() {
             .filter(|message| message.role == broca_protocol::Role::User)
             .flat_map(|message| message.content.iter())
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Text { text } => Some(text.to_string()),
                 _ => None,
             })
             .collect()

@@ -82,7 +82,9 @@ pub fn due(
             placement: Placement::BudgetNudge,
             message: std::sync::Arc::new(Message::new(
                 Role::User,
-                vec![ContentBlock::Text { text: firing.text }],
+                vec![ContentBlock::Text {
+                    text: firing.text.into(),
+                }],
             )),
             written_at_ms: None,
             submission_id: None,

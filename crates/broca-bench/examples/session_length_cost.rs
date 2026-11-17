@@ -1017,7 +1017,7 @@ fn text_message(role: Role, text: String) -> Message {
         ordinal: None,
         tags: Default::default(),
         role,
-        content: vec![ContentBlock::Text { text }],
+        content: vec![ContentBlock::Text { text: text.into() }],
     }
 }
 
@@ -1100,7 +1100,7 @@ fn text_step(run: &str) -> Vec<NormalizedEvent> {
             message: AssistantMessage {
                 message_id: MessageId(format!("msg-{run}-t")),
                 content: vec![ContentBlock::Text {
-                    text: format!("the answer for {run} is short"),
+                    text: format!("the answer for {run} is short").into(),
                 }],
             },
         }),

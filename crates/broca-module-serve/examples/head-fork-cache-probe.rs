@@ -256,7 +256,7 @@ fn head_options(corpus: &Corpus, result_bytes: usize) -> CallOptions {
             results.push(ContentBlock::ToolResult(ToolResult {
                 tool_call_id: id,
                 output: ToolOutput::Text {
-                    text: corpus.chunk(bytes, &mut cursor),
+                    text: corpus.chunk(bytes, &mut cursor).into(),
                 },
                 is_error: false,
             }));

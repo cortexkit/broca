@@ -43,7 +43,7 @@ pub(super) async fn restream_message(
                 mid: None,
                 part: None,
                 message_id: message.message_id.clone(),
-                delta: text.clone(),
+                delta: text.to_string(),
             },
             ContentBlock::ToolCall(call) => DisplayEvent::ToolInputDelta {
                 mid: None,

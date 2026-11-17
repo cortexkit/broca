@@ -426,9 +426,9 @@ fn tool_output_with_media<'a>(
                     }
                     Err(reason) => reason,
                 };
-                text.push(broca_protocol::content::media_not_shown_marker(
-                    reference, reason,
-                ));
+                text.push(
+                    broca_protocol::content::media_not_shown_marker(reference, reason).into(),
+                );
             }
         }
     }
@@ -711,7 +711,7 @@ fn tool_output_text(out: &ToolOutput) -> String {
             parts,
             broca_protocol::MediaMarkerReason::Carrier,
         ),
-        ToolOutput::Text { text } => text.clone(),
+        ToolOutput::Text { text } => text.to_string(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
         ToolOutput::Error {
@@ -1209,18 +1209,19 @@ impl OpenAiChatNormalizer {
                     "reasoning": std::mem::take(&mut self.reasoning),
                     "reasoning_details": std::mem::take(&mut self.reasoning_details),
                 }))
-                .expect("reasoning envelope is JSON"),
+                .expect("reasoning envelope is JSON")
+                .into(),
                 provider_format: Some(EncryptedReasoningFormat::OpenRouter),
             });
         } else if !self.reasoning.is_empty() {
             content.push(ContentBlock::Reasoning {
-                text: std::mem::take(&mut self.reasoning),
+                text: std::mem::take(&mut self.reasoning).into(),
                 signature: None,
             });
         }
         if !self.text.is_empty() {
             content.push(ContentBlock::Text {
-                text: std::mem::take(&mut self.text),
+                text: std::mem::take(&mut self.text).into(),
             });
         }
         // Tool arguments are parsed here, from `finish()` at EOF, which is after the chunk that

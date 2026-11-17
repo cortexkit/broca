@@ -191,7 +191,7 @@ impl Provider for TerminalAssistantAllocationProbeProvider {
                 message: broca_protocol::AssistantMessage {
                     message_id: MessageId("terminal-assistant-allocation-probe".into()),
                     content: vec![ContentBlock::Text {
-                        text: "x".repeat(TERMINAL_ASSISTANT_TEXT_BYTES),
+                        text: "x".repeat(TERMINAL_ASSISTANT_TEXT_BYTES).into(),
                     }],
                 },
             },
@@ -555,7 +555,7 @@ impl ToolPlane for ToolResultAllocationProbePlane {
         DispatchResult::Completed(ToolResult {
             tool_call_id: call.tool_call_id.clone(),
             output: ToolOutput::Text {
-                text: "r".repeat(TOOL_RESULT_TEXT_BYTES),
+                text: "r".repeat(TOOL_RESULT_TEXT_BYTES).into(),
             },
             is_error: false,
         })
@@ -801,7 +801,7 @@ async fn admitted_turn_does_not_retain_a_second_input_copy() {
             Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
-                    text: "x".repeat(TEXT_BYTES),
+                    text: "x".repeat(TEXT_BYTES).into(),
                 }],
             )
         })
@@ -1368,7 +1368,7 @@ async fn appended_episode_keeps_one_decoded_copy_of_the_prior_conversation() {
             Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
-                    text: format!("{i:04}{}", "x".repeat(TEXT_BYTES - 4)),
+                    text: format!("{i:04}{}", "x".repeat(TEXT_BYTES - 4)).into(),
                 }],
             )
         })

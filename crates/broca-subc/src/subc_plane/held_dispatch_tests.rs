@@ -788,7 +788,12 @@ async fn tool_result_json_dump_inline_intake_counts_both_formats_once() {
         };
         for _ in 0..2 {
             let result = completed(plane.dispatch_keyed(&ctx, &call, key).await);
-            assert_eq!(result.output, ToolOutput::Text { text: text.clone() });
+            assert_eq!(
+                result.output,
+                ToolOutput::Text {
+                    text: text.clone().into()
+                }
+            );
         }
         assert_eq!(rig.sent.lock().unwrap().len(), 1);
         let snapshot = TOOL_RESULT_JSON_DUMPS.snapshot(0, i64::MAX).unwrap();

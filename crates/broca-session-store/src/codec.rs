@@ -777,6 +777,27 @@ impl Value for String {
     }
 }
 
+/// Written exactly as a `String`: the shared text type only changes how memory holds it.
+impl Value for broca_protocol::text::Text {
+    const WIRE: Wire = Wire::Len;
+    const NAME: &'static str = "string";
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.as_bytes());
+    }
+    fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
+        let bytes = len_payload(raw, Self::NAME)?;
+        std::str::from_utf8(bytes)
+            .map(broca_protocol::text::Text::from)
+            .map_err(|_| DecodeError::new(Self::NAME, DecodeErrorKind::BadUtf8))
+    }
+    fn is_default(&self) -> bool {
+        self.is_empty()
+    }
+    fn missing() -> Option<Self> {
+        Some(broca_protocol::text::Text::default())
+    }
+}
+
 /// Raw bytes. A newtype, because `Vec<u8>` would read as a repeated `u8` field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ByteBuf(pub Vec<u8>);

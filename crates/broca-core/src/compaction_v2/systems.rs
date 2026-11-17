@@ -30,7 +30,7 @@ pub fn from_manifest(manifest: &broca_wal::PlanManifest) -> Vec<Message> {
     vec![Message::new(
         Role::System,
         vec![ContentBlock::Text {
-            text: manifest.system_text.clone(),
+            text: manifest.system_text.clone().into(),
         }],
     )]
 }

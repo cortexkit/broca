@@ -656,7 +656,7 @@ fn wal_view_drops_and_keep_text_edits_preserve_media_age_and_protection() {
     original.content.insert(
         0,
         ContentBlock::Text {
-            text: "large text before the media".repeat(1_000),
+            text: "large text before the media".repeat(1_000).into(),
         },
     );
     let input = vec![original.clone(), fixture.person(), fixture.person()];

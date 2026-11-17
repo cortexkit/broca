@@ -216,7 +216,7 @@ impl Shape {
             .iter()
             .map(|block| match block {
                 Block::Empty => ContentBlock::Text {
-                    text: String::new(),
+                    text: String::new().into(),
                 },
                 Block::Media(id) => ContentBlock::Media(refs.get(*id).clone()),
                 Block::Result(result) => ContentBlock::ToolResult(ToolResult {
@@ -230,7 +230,7 @@ impl Shape {
                                     media: refs.get(*id).clone(),
                                 },
                                 None => ToolOutputPart::Text {
-                                    text: String::new(),
+                                    text: String::new().into(),
                                 },
                             })
                             .collect(),
@@ -287,7 +287,7 @@ mod tests {
             Role::User,
             vec![
                 ContentBlock::Text {
-                    text: String::new(),
+                    text: String::new().into(),
                 },
                 ContentBlock::Media(photo.clone()),
                 ContentBlock::ToolResult(ToolResult {
@@ -295,7 +295,7 @@ mod tests {
                     output: ToolOutput::Parts {
                         parts: vec![
                             ToolOutputPart::Text {
-                                text: String::new(),
+                                text: String::new().into(),
                             },
                             ToolOutputPart::Media {
                                 media: photo.clone(),

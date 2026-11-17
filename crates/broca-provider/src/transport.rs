@@ -6808,7 +6808,7 @@ mod tests {
                 vec![ContentBlock::Text {
                     // A large request catches ownership paths that accidentally special-case
                     // small golden fixtures.
-                    text: "x".repeat(512 * 1024),
+                    text: "x".repeat(512 * 1024).into(),
                 }],
             ),
         ]);

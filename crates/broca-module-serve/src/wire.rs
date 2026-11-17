@@ -183,7 +183,7 @@ impl SendParamsExt for SendParams {
                 (
                     blocks
                         .into_iter()
-                        .map(|text| ContentBlock::Text { text })
+                        .map(|text| ContentBlock::Text { text: text.into() })
                         .collect(),
                     Some(prefix_count),
                 )
@@ -191,7 +191,12 @@ impl SendParamsExt for SendParams {
             None if prompt.is_empty() && !content.is_empty() && template.is_none() => {
                 (Vec::new(), None)
             }
-            None => (vec![ContentBlock::Text { text: prompt }], None),
+            None => (
+                vec![ContentBlock::Text {
+                    text: prompt.into(),
+                }],
+                None,
+            ),
         };
         let _ = append_episode;
         let policy_allowed = tools
@@ -203,7 +208,9 @@ impl SendParamsExt for SendParams {
         if let Some(system) = system {
             input.push(Message::new(
                 Role::System,
-                vec![ContentBlock::Text { text: system }],
+                vec![ContentBlock::Text {
+                    text: system.into(),
+                }],
             ));
         }
         let mut user_message = Message::new(Role::User, prompt_content);

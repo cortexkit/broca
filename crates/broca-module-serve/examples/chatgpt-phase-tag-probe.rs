@@ -133,7 +133,7 @@ fn base_prompt() -> Vec<Message> {
         Message::new(
             Role::System,
             vec![ContentBlock::Text {
-                text: instructions(),
+                text: instructions().into(),
             }],
         ),
         user(&format!(
@@ -239,7 +239,7 @@ fn seed_message(seed: &[ContentBlock], arm: Arm, target: &ModelHandle) -> Messag
             }
             _ => None,
         }) {
-            *text = inject_mark(text);
+            *text = inject_mark(text).into();
         }
     }
     Message::assistant_from(content, target.clone())
@@ -260,9 +260,9 @@ fn render_assistant_tags(prompt: &mut [Message]) {
             if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = block {
                 let cleaned = clean_marks(text);
                 *text = if cleaned.is_empty() {
-                    cleaned
+                    cleaned.into()
                 } else {
-                    format!("{} {cleaned}", tag_mark(number))
+                    format!("{} {cleaned}", tag_mark(number)).into()
                 };
             }
         }
@@ -630,7 +630,7 @@ fn model_slug(model: &str) -> Result<&str, String> {
 fn synthetic_reasoning(id: &str) -> ContentBlock {
     ContentBlock::RedactedReasoning {
         data: json!({"id":id,"type":"reasoning","summary":[],"encrypted_content":"dry-run-ciphertext"})
-            .to_string(),
+            .to_string().into(),
         provider_format: Some(EncryptedReasoningFormat::OpenAiResponsesChatgpt),
     }
 }

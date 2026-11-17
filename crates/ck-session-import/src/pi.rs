@@ -276,7 +276,9 @@ impl HarnessReader for PiReader {
         if let Some(summary) = compaction_summary {
             messages.push(Message::new(
                 Role::User,
-                vec![ContentBlock::Text { text: summary }],
+                vec![ContentBlock::Text {
+                    text: summary.into(),
+                }],
             ));
         }
 
@@ -585,7 +587,7 @@ fn convert_message(
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
             content.push(ContentBlock::Text {
-                text: text.to_string(),
+                text: text.to_string().into(),
             });
         }
     }
@@ -599,14 +601,14 @@ fn convert_message(
             "text" => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
                     content.push(ContentBlock::Text {
-                        text: text.to_string(),
+                        text: text.to_string().into(),
                     });
                 }
             }
             "thinking" => {
                 if let Some(text) = block.get("thinking").and_then(Value::as_str) {
                     content.push(ContentBlock::Reasoning {
-                        text: text.to_string(),
+                        text: text.to_string().into(),
                         signature: None,
                     });
                 }
@@ -685,7 +687,7 @@ fn convert_tool_result(
             block.get("text").and_then(Value::as_str),
         ) {
             (Some("text"), Some(text)) => ToolOutput::Text {
-                text: text.to_string(),
+                text: text.to_string().into(),
             },
             _ => ToolOutput::Json {
                 value: Value::Array(blocks).into(),

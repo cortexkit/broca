@@ -22,15 +22,15 @@ fn thinking(label: &str) -> Message {
         Role::Assistant,
         vec![
             ContentBlock::Reasoning {
-                text: format!("{label} thinking"),
-                signature: Some(format!("{label}-signature")),
+                text: format!("{label} thinking").into(),
+                signature: Some(format!("{label}-signature").into()),
             },
             ContentBlock::RedactedReasoning {
-                data: format!("{label}-redacted"),
+                data: format!("{label}-redacted").into(),
                 provider_format: None,
             },
             ContentBlock::Text {
-                text: format!("{label} text"),
+                text: format!("{label} text").into(),
             },
         ],
     );
@@ -252,7 +252,7 @@ fn compaction_v2_keep_plan_preserves_provider_blocks_cache_markers_and_expected_
         let ContentBlock::Text { text } = &mut expected[position].content[block] else {
             unreachable!()
         };
-        text.insert_str(0, &format!("§{number}§ "));
+        *text = format!("§{number}§ {text}").into();
     }
     let ContentBlock::ToolResult(result) = &mut expected[4].content[0] else {
         unreachable!()
@@ -260,7 +260,7 @@ fn compaction_v2_keep_plan_preserves_provider_blocks_cache_markers_and_expected_
     let ToolOutput::Text { text } = &mut result.output else {
         unreachable!()
     };
-    text.insert_str(0, "§5§ ");
+    *text = format!("§5§ {text}").into();
     let native = CallOptions::new(stored);
     let before = CallOptions::new(expected);
     let after = render::options(&native, prompt);

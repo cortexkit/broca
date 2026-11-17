@@ -25,7 +25,12 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn text(role: Role, value: impl Into<String>) -> Message {
-    Message::new(role, vec![ContentBlock::Text { text: value.into() }])
+    Message::new(
+        role,
+        vec![ContentBlock::Text {
+            text: value.into().into(),
+        }],
+    )
 }
 
 fn request(

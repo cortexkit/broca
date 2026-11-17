@@ -20,17 +20,17 @@ pub(crate) fn append_repetition_guidance(result: &mut ToolResult, guidance: &str
     let suffix = format!("\n\n{LABEL}{guidance}");
 
     match &mut result.output {
-        ToolOutput::Parts { parts } => {
-            parts.push(broca_protocol::ToolOutputPart::Text { text: suffix })
-        }
-        ToolOutput::Text { text } => text.push_str(&suffix),
+        ToolOutput::Parts { parts } => parts.push(broca_protocol::ToolOutputPart::Text {
+            text: suffix.into(),
+        }),
+        ToolOutput::Text { text } => *text = text.appended(&suffix),
         ToolOutput::Denied { reason } => reason.push_str(&suffix),
         ToolOutput::Error { message, .. } => message.push_str(&suffix),
         ToolOutput::Json { value } => {
             // Structured outputs have no metadata slot. Preserve their JSON text before the note;
             // this copy is provider-facing only, while the durable result remains structured.
             let text = format!("{value}{suffix}");
-            result.output = ToolOutput::Text { text };
+            result.output = ToolOutput::Text { text: text.into() };
         }
     }
 }

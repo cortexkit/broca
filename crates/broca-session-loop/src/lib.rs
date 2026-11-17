@@ -67,6 +67,8 @@ pub use run::{resume, run, seal, AccountReports, Admission, Finished, LoopError,
 pub use writer::Writer;
 
 #[cfg(test)]
+mod shared_text_tests;
+#[cfg(test)]
 mod step_budget_tests;
 #[cfg(test)]
 mod step_limit_tests;

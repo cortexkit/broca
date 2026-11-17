@@ -700,7 +700,7 @@ fn a_restored_checkpoint_after_a_kept_view_continues_both_ways() {
     original.content.insert(
         0,
         ContentBlock::Text {
-            text: "large text before the media".repeat(1_000),
+            text: "large text before the media".repeat(1_000).into(),
         },
     );
     let view = CompactionView::new(

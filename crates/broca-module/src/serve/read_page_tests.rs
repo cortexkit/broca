@@ -26,7 +26,7 @@ fn message(ordinal: u64, len: usize) -> SessionReadMessage {
         message: Message::new(
             Role::User,
             vec![ContentBlock::Text {
-                text: "x".repeat(len),
+                text: "x".repeat(len).into(),
             }],
         ),
         run: Some(broca_core::RunAttribution {

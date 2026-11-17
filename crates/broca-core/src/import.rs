@@ -921,7 +921,7 @@ mod tests {
                 ContentBlock::ToolResult(ToolResult {
                     output: ToolOutput::Text { text },
                     ..
-                }) => Some(text.clone()),
+                }) => Some(text.to_string()),
                 _ => None,
             })
             .collect()

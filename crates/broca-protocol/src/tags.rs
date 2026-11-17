@@ -371,13 +371,13 @@ fn render_message_tags(message: &mut Message, rendering: TagRendering) {
     }
 }
 
-fn prefix(text: &mut String, tag: u64) {
+fn prefix(text: &mut crate::text::Text, tag: u64) {
     let mark = tag_mark(tag);
     let mut rendered = String::with_capacity(mark.len() + 1 + text.len());
     rendered.push_str(&mark);
     rendered.push(' ');
     rendered.push_str(text);
-    *text = rendered;
+    *text = rendered.into();
 }
 
 /// The length in bytes of the `§N§` mark `text` begins with, if it begins with one.
@@ -394,9 +394,9 @@ fn leading_mark_len(text: &str) -> Option<usize> {
 
 /// Show `tag` at the start of an assistant text: in place of a mark the text already begins
 /// with, or else prepended with a space.
-fn retag(text: &mut String, tag: u64) {
+fn retag(text: &mut crate::text::Text, tag: u64) {
     match leading_mark_len(text) {
-        Some(len) => text.replace_range(..len, &tag_mark(tag)),
+        Some(len) => *text = format!("{}{}", tag_mark(tag), &text[len..]).into(),
         None => prefix(text, tag),
     }
 }
@@ -444,9 +444,8 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
             {
                 PartKind::ToolResultImageOnly
             }
-            ToolOutput::Text { text: message }
-            | ToolOutput::Error { message, .. }
-            | ToolOutput::Denied { reason: message } => {
+            ToolOutput::Text { text } => text_kind(text, PartKind::ToolResultText),
+            ToolOutput::Error { message, .. } | ToolOutput::Denied { reason: message } => {
                 text_kind(message, PartKind::ToolResultText)
             }
             ToolOutput::Json { .. } => return None,
@@ -610,7 +609,9 @@ pub fn exposed_reply(message: &Message, clean: bool) -> std::borrow::Cow<'_, Mes
     let mut exposed = message.clone();
     for block in &mut exposed.content {
         if let ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } = block {
-            *text = exposed_model_text(true, text).into_owned();
+            if let std::borrow::Cow::Owned(cleaned) = exposed_model_text(true, text) {
+                *text = cleaned.into();
+            }
         }
     }
     std::borrow::Cow::Owned(exposed)
@@ -644,17 +645,24 @@ fn render_computed(
         match (role, block) {
             (Role::Assistant, ContentBlock::Text { text })
             | (Role::Assistant, ContentBlock::TextWithState { text, .. }) => {
-                let exposed = exposed_model_text(computed.clean, text).into_owned();
-                *text = match number {
+                let exposed = exposed_model_text(computed.clean, text);
+                let rendered = match number {
                     Some(number) => {
                         cortexkit_role_llm_runner_v1::tags::render_counted_text(number, &exposed)
+                            .into()
                     }
-                    None => exposed,
+                    None => match exposed {
+                        std::borrow::Cow::Owned(cleaned) => cleaned.into(),
+                        // Unchanged: the text keeps its one shared allocation.
+                        std::borrow::Cow::Borrowed(_) => text.clone(),
+                    },
                 };
+                *text = rendered;
             }
             (Role::User, ContentBlock::Text { text }) => {
                 if let Some(number) = number {
-                    *text = cortexkit_role_llm_runner_v1::tags::render_counted_text(number, text);
+                    *text = cortexkit_role_llm_runner_v1::tags::render_counted_text(number, text)
+                        .into();
                 }
             }
             (Role::User | Role::Tool, ContentBlock::ToolResult(result)) => {
@@ -663,7 +671,7 @@ fn render_computed(
                     ToolOutput::Text { text }
                         if crate::content::is_image_only_placeholder(text) =>
                     {
-                        *text = cortexkit_role_llm_runner_v1::tags::image_label(number);
+                        *text = cortexkit_role_llm_runner_v1::tags::image_label(number).into();
                     }
                     // The label carries the number; the notice lines after it keep telling the
                     // model that the images were not shown.
@@ -671,11 +679,15 @@ fn render_computed(
                         *text = format!(
                             "{}\n{text}",
                             cortexkit_role_llm_runner_v1::tags::image_label(number)
-                        );
+                        )
+                        .into();
                     }
-                    ToolOutput::Text { text: message }
-                    | ToolOutput::Error { message, .. }
-                    | ToolOutput::Denied { reason: message } => {
+                    ToolOutput::Text { text } => {
+                        *text =
+                            cortexkit_role_llm_runner_v1::tags::render_counted_text(number, text)
+                                .into();
+                    }
+                    ToolOutput::Error { message, .. } | ToolOutput::Denied { reason: message } => {
                         *message = cortexkit_role_llm_runner_v1::tags::render_counted_text(
                             number, message,
                         );
@@ -687,7 +699,8 @@ fn render_computed(
                             if let crate::ToolOutputPart::Text { text } = &mut parts[index] {
                                 *text = cortexkit_role_llm_runner_v1::tags::render_counted_text(
                                     number, text,
-                                );
+                                )
+                                .into();
                             }
                         } else {
                             let label = match kind {
@@ -700,7 +713,7 @@ fn render_computed(
                                 _ => None,
                             };
                             if let Some(text) = label {
-                                parts.insert(0, crate::ToolOutputPart::Text { text });
+                                parts.insert(0, crate::ToolOutputPart::Text { text: text.into() });
                             }
                         }
                     }
@@ -736,7 +749,7 @@ pub fn clean_computed_into(messages: &mut [Message]) {
 /// part must preserve its metadata as well as its payload.
 pub fn part_text(block: &ContentBlock) -> String {
     match block {
-        ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => text.clone(),
+        ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => text.to_string(),
         _ => serde_json::to_string(block).expect("a stored content block serializes"),
     }
 }
@@ -783,7 +796,7 @@ mod tests {
             ToolOutput::Parts {
                 parts: vec![
                     crate::ToolOutputPart::Text {
-                        text: format!("§7§ {}", notices[0])
+                        text: format!("§7§ {}", notices[0]).into()
                     },
                     crate::ToolOutputPart::Text {
                         text: notices[1].into()
@@ -1020,7 +1033,8 @@ mod tests {
                     "image",
                     Some("image/png"),
                     Some(8),
-                ),
+                )
+                .into(),
             },
             is_error: false,
         })
@@ -1155,7 +1169,7 @@ mod tests {
             vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id: ToolCallId("n".into()),
                 output: ToolOutput::Text {
-                    text: notices.clone(),
+                    text: notices.clone().into(),
                 },
                 is_error: false,
             })],
@@ -1170,7 +1184,7 @@ mod tests {
         assert_eq!(
             result.output,
             ToolOutput::Text {
-                text: format!("§4§ [image]\n{notices}")
+                text: format!("§4§ [image]\n{notices}").into()
             }
         );
         let once = prompt.clone();

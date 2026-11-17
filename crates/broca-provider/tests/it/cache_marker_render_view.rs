@@ -41,7 +41,7 @@ fn text(value: &str) -> ContentBlock {
 fn reasoning(value: &str) -> ContentBlock {
     ContentBlock::Reasoning {
         text: value.into(),
-        signature: Some(format!("sig-{value}")),
+        signature: Some(format!("sig-{value}").into()),
     }
 }
 

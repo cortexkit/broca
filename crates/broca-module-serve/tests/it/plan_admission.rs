@@ -770,7 +770,7 @@ async fn a_plan_is_fetched_once_frozen_and_rendered_from_the_record() {
     assert_eq!(
         prompts[0][0].content,
         vec![broca_protocol::content::ContentBlock::Text {
-            text: joined.clone()
+            text: joined.clone().into()
         }]
     );
 

@@ -66,7 +66,7 @@ impl ToolPlane for GatedPlane {
         DispatchResult::Completed(ToolResult {
             tool_call_id: call.tool_call_id.clone(),
             output: ToolOutput::Text {
-                text: call.tool_call_id.0.clone(),
+                text: call.tool_call_id.0.clone().into(),
             },
             is_error: false,
         })

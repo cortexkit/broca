@@ -466,7 +466,7 @@ mod tests {
     fn production_sized_text_result_bytes_allocates_nothing() {
         const PRODUCTION_PAYLOAD_BYTES: usize = 100_353;
         let output = ToolOutput::Text {
-            text: "x".repeat(PRODUCTION_PAYLOAD_BYTES),
+            text: "x".repeat(PRODUCTION_PAYLOAD_BYTES).into(),
         };
 
         let source = match &output {
@@ -694,7 +694,7 @@ mod prompt_fold_tests {
         ContentBlock::ToolResult(ToolResult {
             tool_call_id: ToolCallId(id.to_string()),
             output: ToolOutput::Text {
-                text: text.to_string(),
+                text: text.to_string().into(),
             },
             is_error,
         })

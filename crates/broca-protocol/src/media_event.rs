@@ -88,7 +88,7 @@ impl MediaMessage {
             self.role,
             vec![
                 ContentBlock::Text {
-                    text: String::new()
+                    text: String::new().into()
                 };
                 self.blocks
             ],
@@ -113,7 +113,7 @@ impl MediaMessage {
                         if let ToolOutput::Parts { parts } = &mut result.output {
                             if parts.len() <= *part {
                                 parts.resize_with(part + 1, || ToolOutputPart::Text {
-                                    text: String::new(),
+                                    text: String::new().into(),
                                 });
                             }
                             parts[*part] = ToolOutputPart::Media {

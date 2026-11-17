@@ -942,11 +942,11 @@ fn replace_with_text(prompt: &mut [Message], location: MediaLocation, text: Stri
     if let Some(part) = location.part {
         if let ContentBlock::ToolResult(result) = block {
             if let ToolOutput::Parts { parts } = &mut result.output {
-                parts[part] = ToolOutputPart::Text { text };
+                parts[part] = ToolOutputPart::Text { text: text.into() };
             }
         }
     } else {
-        *block = ContentBlock::Text { text };
+        *block = ContentBlock::Text { text: text.into() };
     }
 }
 

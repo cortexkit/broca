@@ -265,7 +265,7 @@ fn user(
                 let text = block_text(block).unwrap_or_default();
                 if !text.is_empty() {
                     out.push(ContentBlock::Text {
-                        text: text.to_owned(),
+                        text: text.to_owned().into(),
                     });
                 }
             }
@@ -308,7 +308,7 @@ fn assistant(mid: &str, row: &Value, content: &Value) -> Result<Option<Draft>, H
                 let text = block_text(block).unwrap_or_default();
                 if !text.is_empty() {
                     out.push(ContentBlock::Text {
-                        text: text.to_owned(),
+                        text: text.to_owned().into(),
                     });
                 }
             }
@@ -316,7 +316,7 @@ fn assistant(mid: &str, row: &Value, content: &Value) -> Result<Option<Draft>, H
                 let text = block["thinking"].as_str().unwrap_or_default();
                 if !text.is_empty() {
                     out.push(ContentBlock::Reasoning {
-                        text: text.to_owned(),
+                        text: text.to_owned().into(),
                         signature: None,
                     });
                 }
@@ -384,7 +384,7 @@ fn tool_result(
     for block in blocks(mid, content)? {
         match block_type(block) {
             "text" => parts.push(ToolOutputPart::Text {
-                text: block_text(block).unwrap_or_default().to_owned(),
+                text: block_text(block).unwrap_or_default().to_owned().into(),
             }),
             "image" => {
                 let (reference, bytes) = image(mid, block, check)?;
@@ -421,7 +421,9 @@ fn tool_result(
                 "a failed tool result carries images, which a failed result can't hold",
             ))
         }
-        (false, true) => ToolOutput::Text { text: text() },
+        (false, true) => ToolOutput::Text {
+            text: text().into(),
+        },
         (false, false) => ToolOutput::Parts { parts },
     };
     let mut draft = draft(

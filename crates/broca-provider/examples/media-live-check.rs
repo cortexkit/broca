@@ -71,7 +71,9 @@ fn fixtures() -> Vec<Fixture> {
 }
 
 fn text(value: impl Into<String>) -> ContentBlock {
-    ContentBlock::Text { text: value.into() }
+    ContentBlock::Text {
+        text: value.into().into(),
+    }
 }
 
 fn tool() -> Tool {

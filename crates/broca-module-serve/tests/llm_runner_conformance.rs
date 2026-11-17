@@ -2873,7 +2873,7 @@ impl LlmRunnerSubject for BrocaSubject {
                     match &reply.result.output {
                         broca_protocol::ToolOutput::Text { text } => Some(text.clone()),
                         broca_protocol::ToolOutput::Json { value } => {
-                            value.parse().as_str().map(str::to_owned)
+                            value.parse().as_str().map(Into::into)
                         }
                         _ => None,
                     }
@@ -2907,7 +2907,7 @@ impl LlmRunnerSubject for BrocaSubject {
             }
         }
         let mid = mid.ok_or_else(|| HarnessError::new("native carrying message missing"))?;
-        Ok((mid, part, key, output))
+        Ok((mid, part, key, output.to_string()))
     }
     async fn routing_runner_declaration(&self) -> Result<Value, HarnessError> {
         Ok(routed_accounts::runner_declaration())
@@ -6207,7 +6207,7 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
     assert_eq!(
         input.content[0],
         broca_protocol::content::ContentBlock::Text {
-            text: format!("{SESSION_MARKER}{session} input-hooked")
+            text: format!("{SESSION_MARKER}{session} input-hooked").into()
         }
     );
     assert!(records

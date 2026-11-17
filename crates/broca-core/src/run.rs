@@ -3158,7 +3158,7 @@ async fn append_budget_firings(
         let mut message = Message::new(
             Role::User,
             vec![ContentBlock::Text {
-                text: firing.text.clone(),
+                text: firing.text.clone().into(),
             }],
         );
         crate::tags::attach(
@@ -7630,7 +7630,7 @@ where
                             .iter()
                             .filter_map(|part| match part {
                                 ContentBlock::Text { text }
-                                | ContentBlock::TextWithState { text, .. } => Some(text.clone()),
+                                | ContentBlock::TextWithState { text, .. } => Some(text.into()),
                                 _ => None,
                             })
                             .collect(),

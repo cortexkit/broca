@@ -94,13 +94,13 @@ fn binding(binding: &MediaBinding) -> usize {
 /// empty text or media. A skeleton has no origin and no tags.
 pub(crate) fn message(message: &Message) -> usize {
     vec(&message.content, |block| match block {
-        ContentBlock::Text { text } => text.capacity(),
+        ContentBlock::Text { text } => text.len(),
         ContentBlock::Media(reference) => media_ref(reference),
         ContentBlock::ToolResult(result) => {
             result.tool_call_id.0.capacity()
                 + match &result.output {
                     ToolOutput::Parts { parts } => vec(parts, |part| match part {
-                        ToolOutputPart::Text { text } => text.capacity(),
+                        ToolOutputPart::Text { text } => text.len(),
                         ToolOutputPart::Media { media } => media_ref(media),
                     }),
                     _ => 0,

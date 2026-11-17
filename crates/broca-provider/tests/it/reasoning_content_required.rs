@@ -174,7 +174,9 @@ fn kimi_echoes_history_before_last_user_and_empty_text_turns_golden() {
 
 fn openrouter_state(reasoning: &str, details: Value) -> ContentBlock {
     ContentBlock::RedactedReasoning {
-        data: json!({"reasoning": reasoning, "reasoning_details": details}).to_string(),
+        data: json!({"reasoning": reasoning, "reasoning_details": details})
+            .to_string()
+            .into(),
         provider_format: Some(EncryptedReasoningFormat::OpenRouter),
     }
 }

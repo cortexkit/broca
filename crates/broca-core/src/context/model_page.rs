@@ -634,7 +634,7 @@ mod tests {
     use broca_protocol::{ContentBlock, Role};
 
     fn text(role: Role, text: String) -> Message {
-        Message::new(role, vec![ContentBlock::Text { text }])
+        Message::new(role, vec![ContentBlock::Text { text: text.into() }])
     }
 
     #[test]

@@ -1502,7 +1502,7 @@ fn legacy_map_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> Tool
     let output = if is_error {
         ToolOutput::error(text)
     } else {
-        ToolOutput::Text { text }
+        ToolOutput::Text { text: text.into() }
     };
     ToolResult {
         tool_call_id: id.clone(),
@@ -1637,7 +1637,7 @@ fn empty_content_array_stays_an_empty_success() {
     assert_eq!(
         result.output,
         ToolOutput::Text {
-            text: String::new()
+            text: String::new().into()
         }
     );
 }

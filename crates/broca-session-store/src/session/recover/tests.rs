@@ -215,9 +215,9 @@ fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Text { text } => Some(text.to_string()),
             ContentBlock::ToolResult(result) => Some(match &result.output {
-                ToolOutput::Text { text } => text.clone(),
+                ToolOutput::Text { text } => text.to_string(),
                 other => format!("{other:?}"),
             }),
             _ => None,

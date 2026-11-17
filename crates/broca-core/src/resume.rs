@@ -337,7 +337,7 @@ mod offset_resume_tests {
             assistant_message: Arc::new(AssistantMessage {
                 message_id: broca_protocol::MessageId(format!("m{id}")),
                 content: vec![ContentBlock::Text {
-                    text: format!("answer {id}"),
+                    text: format!("answer {id}").into(),
                 }],
             }),
             usage: Usage {
@@ -1124,7 +1124,7 @@ mod offset_resume_tests {
                         Message::new(
                             Role::User,
                             vec![ContentBlock::Text {
-                                text: format!("history {i}"),
+                                text: format!("history {i}").into(),
                             }],
                         )
                     })

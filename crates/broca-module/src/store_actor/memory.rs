@@ -79,10 +79,17 @@ fn slots<T>(vector: &Vec<T>) -> usize {
 }
 
 /// A request's options, without its tool list, which the setup parts count. Its episode history
-/// for rendering counts at its inline size.
+/// for rendering counts at its inline size. A request's messages share their text and JSON with
+/// the session's window, which counts them, so the request counts only the leaves it holds alone,
+/// such as text its render rewrote.
 pub(super) fn request_bytes(options: &CallOptions) -> usize {
-    std::mem::size_of::<CallOptions>()
-        + options.prompt.heap_bytes()
+    let shared: usize = options
+        .prompt
+        .iter()
+        .flat_map(|message| &message.content)
+        .map(broca_session_store::held::shared_leaf_bytes)
+        .sum();
+    std::mem::size_of::<CallOptions>() + options.prompt.heap_bytes() - shared
         + serde_heap_bytes(&*options.provider_options)
         + serde_heap_bytes(&options.declared_markers)
         + serde_heap_bytes(&options.step_context)

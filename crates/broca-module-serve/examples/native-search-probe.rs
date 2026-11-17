@@ -609,7 +609,7 @@ async fn run(args: Args) -> Result<(), String> {
                             ordinal: None,
                             tags: Default::default(),
                             role: Role::System,
-                            content: vec![ContentBlock::Text { text }],
+                            content: vec![ContentBlock::Text { text: text.into() }],
                         });
                     }
                     prompt.push(Message {
@@ -620,7 +620,7 @@ async fn run(args: Args) -> Result<(), String> {
                         tags: Default::default(),
                         role: Role::User,
                         content: vec![ContentBlock::Text {
-                            text: args.query.clone(),
+                            text: args.query.clone().into(),
                         }],
                     });
                     let mut opts = if let Some(path) = &args.options_file {

@@ -81,7 +81,7 @@ fn pending_part(
         height: None,
     };
     let part = ToolOutputPart::Text {
-        text: media_not_shown_marker(&metadata, MediaMarkerReason::Undecodable),
+        text: media_not_shown_marker(&metadata, MediaMarkerReason::Undecodable).into(),
     };
     (
         part,
@@ -126,7 +126,8 @@ pub(super) fn classify(
                 ToolOutputPart::Text {
                     text: text
                         .map(str::to_owned)
-                        .unwrap_or_else(|| non_text_tool_content_placeholder(block)),
+                        .unwrap_or_else(|| non_text_tool_content_placeholder(block))
+                        .into(),
                 }
             }
         })
@@ -197,7 +198,8 @@ pub(super) async fn capture(
                 text: media_not_shown_marker(
                     failure.media.as_ref().unwrap_or(&pending.metadata),
                     failure.reason,
-                ),
+                )
+                .into(),
             },
         };
     }

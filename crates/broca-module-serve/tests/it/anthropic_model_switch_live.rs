@@ -198,7 +198,8 @@ fn user_turn(first_n: u64) -> Message {
                  first call uses n = {first_n}. Every result tells you how to compute the next n; \
                  work it out carefully in your thinking before each call. After the result of \
                  the last call, reply with the single word DONE."
-            ),
+            )
+            .into(),
         }],
     )
 }
@@ -274,7 +275,7 @@ async fn run_conversation(token: &str, run_label: &str, rule: CrossModelThinking
     let mut prompt = vec![Message::new(
         Role::System,
         vec![ContentBlock::Text {
-            text: system_prompt(run_label),
+            text: system_prompt(run_label).into(),
         }],
     )];
     let mut rows = Vec::new();
@@ -344,7 +345,8 @@ async fn run_conversation(token: &str, run_label: &str, rule: CrossModelThinking
                             text: format!(
                                 "tick {n}. The next n is the remainder of {dividend} divided by \
                                  {divisor}, plus the sum of the digits of {dividend}."
-                            ),
+                            )
+                            .into(),
                         },
                         is_error: false,
                     })

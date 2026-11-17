@@ -344,7 +344,7 @@ pub async fn run_live<F: WireFamily + 'static>(
         cache_prefix_blocks: None,
         role: Role::User,
         content: vec![ContentBlock::Text {
-            text: spec.prompt.clone(),
+            text: spec.prompt.clone().into(),
         }],
         origin: None,
         ordinal: None,
@@ -528,7 +528,7 @@ impl LiveOutcome {
             .filter_map(|e| match e {
                 OutputEvent::Control(ControlUnit::ToolResult { result }) => {
                     Some(match &result.output {
-                        ToolOutput::Text { text } => text.clone(),
+                        ToolOutput::Text { text } => text.to_string(),
                         ToolOutput::Error { message, .. } => message.clone(),
                         _ => String::new(),
                     })

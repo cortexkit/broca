@@ -580,7 +580,7 @@ pub fn fork_request(
         Message::new(
             role,
             vec![ContentBlock::Text {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
             }],
         )
     };

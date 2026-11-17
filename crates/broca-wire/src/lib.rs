@@ -1302,24 +1302,19 @@ fn serialize_read_message<S: serde::Serializer>(
                     })
             )
     }) {
-        use broca_protocol::{MediaMarkerReason, ToolOutput};
+        use broca_protocol::content::{media_not_shown_marker, media_parts_text};
+        use broca_protocol::{MediaMarkerReason::NotRequested, ToolOutput};
         for block in &mut exposed.to_mut().content {
             match block {
                 ContentBlock::Media(media) => {
                     *block = ContentBlock::Text {
-                        text: broca_protocol::content::media_not_shown_marker(
-                            media,
-                            MediaMarkerReason::NotRequested,
-                        ),
+                        text: media_not_shown_marker(media, NotRequested).into(),
                     }
                 }
                 ContentBlock::ToolResult(result) => {
                     if let ToolOutput::Parts { parts } = &result.output {
                         result.output = ToolOutput::Text {
-                            text: broca_protocol::content::media_parts_text(
-                                parts,
-                                MediaMarkerReason::NotRequested,
-                            ),
+                            text: media_parts_text(parts, NotRequested).into(),
                         };
                     }
                 }
@@ -6442,7 +6437,7 @@ mod caller_message_tests {
         let payload = "x".repeat(300_000);
         let original = read_message(vec![
             ContentBlock::Text {
-                text: payload.clone(),
+                text: payload.clone().into(),
             },
             ContentBlock::Media(media.clone()),
             ContentBlock::ToolCall(ToolCall {
@@ -6457,7 +6452,7 @@ mod caller_message_tests {
                 output: ToolOutput::Parts {
                     parts: vec![
                         ToolOutputPart::Text {
-                            text: payload.clone(),
+                            text: payload.clone().into(),
                         },
                         ToolOutputPart::Media { media },
                     ],
@@ -6469,7 +6464,7 @@ mod caller_message_tests {
                 output: ToolOutput::Parts {
                     parts: vec![
                         ToolOutputPart::Text {
-                            text: payload.clone(),
+                            text: payload.clone().into(),
                         },
                         ToolOutputPart::Text {
                             text: "tail".into(),
@@ -6478,7 +6473,7 @@ mod caller_message_tests {
                 },
             }),
             ContentBlock::Reasoning {
-                text: payload.clone(),
+                text: payload.clone().into(),
                 signature: Some("signature".into()),
             },
         ]);
@@ -6788,7 +6783,7 @@ mod caller_message_tests {
                 text: "small".into(),
             },
             ContentBlock::Text {
-                text: large.clone(),
+                text: large.clone().into(),
             },
         ]);
         let inline = serde_json::to_value(&entry).unwrap();

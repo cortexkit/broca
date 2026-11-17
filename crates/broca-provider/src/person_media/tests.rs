@@ -108,7 +108,7 @@ fn protected_encoded_payload_bound_omits_text_and_envelope_bytes() {
     message.content.insert(
         0,
         ContentBlock::Text {
-            text: "x".repeat(2000),
+            text: "x".repeat(2000).into(),
         },
     );
     profile.request_cap_bytes = 1024;

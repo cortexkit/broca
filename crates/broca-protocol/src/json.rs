@@ -95,6 +95,11 @@ impl Json {
     pub fn held_bytes(&self) -> usize {
         self.0.len()
     }
+
+    /// Whether another holder shares this text's allocation now.
+    pub fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
 }
 
 /// A writer that accepts only the next bytes of the text it holds, so serializing into it checks

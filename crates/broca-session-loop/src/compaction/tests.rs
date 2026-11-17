@@ -148,7 +148,7 @@ fn run_with_tool_turns(calls: &[&str]) -> Vec<Record> {
             result: ToolResult {
                 tool_call_id: ToolCallId((*call).into()),
                 output: ToolOutput::Text {
-                    text: format!("result of {call}"),
+                    text: format!("result of {call}").into(),
                 },
                 is_error: false,
             },

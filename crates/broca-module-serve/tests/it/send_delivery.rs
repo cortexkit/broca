@@ -110,7 +110,7 @@ fn pair(role: &str, text: &str) -> (String, String) {
 /// The last text of a prompt the model was called with.
 fn last_text(prompt: &[broca_protocol::content::Message]) -> String {
     match prompt.last().and_then(|message| message.content.first()) {
-        Some(broca_protocol::content::ContentBlock::Text { text }) => text.clone(),
+        Some(broca_protocol::content::ContentBlock::Text { text }) => text.to_string(),
         other => format!("{other:?}"),
     }
 }

@@ -136,7 +136,8 @@ fn user_turn(count: usize, first_n: u64) -> ContentBlock {
              uses n = {first_n}. Every result tells you how to compute the next n; work it out \
              carefully in your thinking before each call, and double-check the arithmetic. After \
              the result of the {count}th call, reply with the single word DONE."
-        ),
+        )
+        .into(),
     }
 }
 
@@ -252,7 +253,7 @@ async fn run_conversation(token: &str, model: &str, run_label: &str) -> Outcome 
         Message::new(
             Role::System,
             vec![ContentBlock::Text {
-                text: system_prompt(run_label),
+                text: system_prompt(run_label).into(),
             }],
         ),
         Message::new(Role::User, vec![user_turn(PHASE1_STEPS, 1)]),
@@ -338,7 +339,8 @@ async fn run_conversation(token: &str, model: &str, run_label: &str) -> Outcome 
                             text: format!(
                                 "tick {n}. The next n is the remainder of {dividend} divided by \
                                  {divisor}, plus the sum of the digits of {dividend}."
-                            ),
+                            )
+                            .into(),
                         },
                         is_error: false,
                     })

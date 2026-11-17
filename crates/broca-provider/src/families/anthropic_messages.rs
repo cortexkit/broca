@@ -1361,7 +1361,7 @@ fn tool_output_text(out: &ToolOutput) -> String {
             parts,
             broca_protocol::MediaMarkerReason::Carrier,
         ),
-        ToolOutput::Text { text } => text.clone(),
+        ToolOutput::Text { text } => text.to_string(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
         ToolOutput::Error {
@@ -1799,8 +1799,8 @@ mod tests {
             Message::assistant_from(
                 vec![
                     ContentBlock::Reasoning {
-                        text: format!("thinking before tick {n}"),
-                        signature: Some(format!("sig-{n}")),
+                        text: format!("thinking before tick {n}").into(),
+                        signature: Some(format!("sig-{n}").into()),
                     },
                     ContentBlock::ToolCall(broca_protocol::content::ToolCall {
                         thought_signature: None,
@@ -1822,7 +1822,7 @@ mod tests {
                     broca_protocol::content::ToolResult {
                         tool_call_id: call_id,
                         output: ToolOutput::Text {
-                            text: format!("tick {n}"),
+                            text: format!("tick {n}").into(),
                         },
                         is_error: false,
                     },

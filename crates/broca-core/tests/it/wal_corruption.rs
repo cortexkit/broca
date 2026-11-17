@@ -182,7 +182,7 @@ fn request(run: &str, dir: &Path) -> RunRequest {
 fn make_plane() -> StubToolPlane {
     StubToolPlane::new().with_tool("edit", |c| {
         StubReply::Output(ToolOutput::Text {
-            text: format!("edited-{}", c.tool_call_id.0),
+            text: format!("edited-{}", c.tool_call_id.0).into(),
         })
     })
 }

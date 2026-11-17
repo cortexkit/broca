@@ -172,7 +172,7 @@ fn store_texts(
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
-            broca_protocol::ContentBlock::Text { text } => Some(text.clone()),
+            broca_protocol::ContentBlock::Text { text } => Some(text.to_string()),
             _ => None,
         })
         .collect()

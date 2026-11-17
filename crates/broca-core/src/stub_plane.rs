@@ -98,7 +98,9 @@ impl StubToolPlane {
     pub fn with_canned_text(self, tool_name: &str, text: &str) -> Self {
         let text = text.to_owned();
         self.with_tool(tool_name, move |_| {
-            StubReply::Output(ToolOutput::Text { text: text.clone() })
+            StubReply::Output(ToolOutput::Text {
+                text: text.clone().into(),
+            })
         })
     }
 

@@ -13,7 +13,9 @@ fn prompt(turns: usize) -> Vec<Message> {
     let input = serde_json::json!({"command": "cargo test -p crate", "path": "/a/b/c.rs", "lines": [1,2,3], "nested": {"a": "x".repeat(200), "b": [{"c": 1}, {"d": "y".repeat(100)}]}});
     let mut out = vec![Message::new(
         Role::User,
-        vec![ContentBlock::Text { text: text.clone() }],
+        vec![ContentBlock::Text {
+            text: text.clone().into(),
+        }],
     )];
     for n in 0..turns {
         let id = format!("toolu_{n:020}");
@@ -21,11 +23,11 @@ fn prompt(turns: usize) -> Vec<Message> {
             Role::Assistant,
             vec![
                 ContentBlock::Reasoning {
-                    text: text.clone(),
-                    signature: Some("s".repeat(400)),
+                    text: text.clone().into(),
+                    signature: Some("s".repeat(400).into()),
                 },
                 ContentBlock::Text {
-                    text: text[..600].to_string(),
+                    text: text[..600].to_string().into(),
                 },
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: broca_protocol::ToolCallId(id.clone()),
@@ -40,7 +42,7 @@ fn prompt(turns: usize) -> Vec<Message> {
             vec![ContentBlock::ToolResult(ToolResult {
                 tool_call_id: broca_protocol::ToolCallId(id),
                 output: ToolOutput::Text {
-                    text: text.repeat(2),
+                    text: text.repeat(2).into(),
                 },
                 is_error: false,
             })],

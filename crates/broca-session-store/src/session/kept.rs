@@ -381,7 +381,8 @@ impl KeptRecords {
 }
 
 /// The heap of `record` that it shares with the conversation fold: its message or its facts,
-/// when the fold holds the same `Arc` (`in_fold` holds the addresses the fold's `Arc`s point to).
+/// when the fold holds the same `Arc` (`in_fold` holds the addresses the fold's `Arc`s point to),
+/// and a tool reply's output leaves, which the fold's tool message shares when it folds the reply.
 fn shared_with_fold(record: &Record, in_fold: &std::collections::HashSet<usize>) -> usize {
     use crate::held::HeldBytes;
     use std::sync::Arc;
@@ -397,6 +398,7 @@ fn shared_with_fold(record: &Record, in_fold: &std::collections::HashSet<usize>)
         Record::Assistant(assistant) => held(&assistant.message, in_fold),
         Record::EntryFacts(facts) => held(facts, in_fold),
         Record::TurnFacts(turn) => held(turn, in_fold),
+        Record::ToolReply(reply) => crate::held::shared_output_bytes(&reply.result.output),
         _ => 0,
     }
 }

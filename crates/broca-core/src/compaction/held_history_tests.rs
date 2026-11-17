@@ -55,8 +55,10 @@ impl Windows {
                         else {
                             panic!("ordinal 1 starts with signed reasoning");
                         };
-                        signature.pop();
-                        signature.push('f');
+                        let mut tampered = signature.to_string();
+                        tampered.pop();
+                        tampered.push('f');
+                        *signature = tampered.into();
                     }
                     replacement.push(copy);
                 }

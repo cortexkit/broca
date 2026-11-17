@@ -435,7 +435,7 @@ async fn codex_store_two_completed_runs_reuse_the_websocket_lease() {
         request.run_id = RunId(format!("store-{turn}"));
         request.tools.clear();
         request.policy_allowed.clear();
-        request.input[0].content = vec![ContentBlock::Text { text: format!("question {turn}") }];
+        request.input[0].content = vec![ContentBlock::Text { text: format!("question {turn}").into() }];
         let control = broca_core::RunControl::default();
         let admission = broca_session_loop::admit::admission(&mut request, &control, &provider, session.operations(), Some(1)).unwrap();
         let seams = broca_session_loop::Seams {
@@ -475,7 +475,7 @@ async fn codex_cross_run_two_completed_runs_reuse_handshake_and_suffix() {
         request.tools.clear();
         request.policy_allowed.clear();
         request.input[0].content = vec![ContentBlock::Text {
-            text: format!("question {index}"),
+            text: format!("question {index}").into(),
         }];
         let (tx, mut rx) = mpsc::channel(256);
         let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -931,7 +931,7 @@ async fn codex_cross_run_receipt_byte_budget_evicts_oldest_idle_socket() {
     client.chatgpt_connections = ChatgptConnections::with_byte_budget(512 * 1024);
     let mut options = opts();
     options.prompt[0].content = vec![ContentBlock::Text {
-        text: "p".repeat(400_000),
+        text: "p".repeat(400_000).into(),
     }];
     let first = run_provider(&mock, &client, "one");
     first.bind_run_transport(&bind("first"));
@@ -971,7 +971,7 @@ async fn codex_cross_run_single_receipt_over_byte_budget_is_not_retained() {
     client.chatgpt_connections = ChatgptConnections::with_byte_budget(512 * 1024);
     let mut options = opts();
     options.prompt[0].content = vec![ContentBlock::Text {
-        text: "p".repeat(600_000),
+        text: "p".repeat(600_000).into(),
     }];
     let first = run_provider(&mock, &client, "one");
     first.bind_run_transport(&bind("session"));
@@ -1167,7 +1167,7 @@ async fn cache_evidence_live_records_extension_age_resend_and_restart_restore() 
         request.tools.clear();
         request.policy_allowed.clear();
         request.input[0].content = vec![ContentBlock::Text {
-            text: format!("synthetic question {index}"),
+            text: format!("synthetic question {index}").into(),
         }];
         let (tx, mut rx) = mpsc::channel(256);
         let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1325,7 +1325,7 @@ async fn cache_evidence_captures_model_change_through_the_run_loop() {
         request.tools.clear();
         request.policy_allowed.clear();
         request.input[0].content = vec![ContentBlock::Text {
-            text: format!("synthetic model question {index}"),
+            text: format!("synthetic model question {index}").into(),
         }];
         let (tx, mut rx) = mpsc::channel(256);
         let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });

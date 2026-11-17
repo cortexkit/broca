@@ -1924,7 +1924,9 @@ impl OffsetSeed {
             }
             Some(broca_protocol::Message::new(
                 broca_protocol::Role::User,
-                vec![broca_protocol::ContentBlock::Text { text: text.clone() }],
+                vec![broca_protocol::ContentBlock::Text {
+                    text: text.clone().into(),
+                }],
             ))
         } else {
             None

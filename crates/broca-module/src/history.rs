@@ -160,7 +160,7 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                 }
                 ContentBlock::ToolResult(result) => {
                     let (text, files) = match &result.output {
-                        ToolOutput::Text { text } => (text.clone(), vec![]),
+                        ToolOutput::Text { text } => (text.to_string(), vec![]),
                         ToolOutput::Json { value } => (value.to_string(), vec![]),
                         ToolOutput::Denied { reason } => (reason.clone(), vec![]),
                         ToolOutput::Error {

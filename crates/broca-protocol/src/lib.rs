@@ -58,6 +58,7 @@ pub mod session;
 pub mod session_change;
 pub mod structured_output;
 pub mod tags;
+pub mod text;
 pub mod tool_name_alias;
 pub mod usage;
 pub mod wire_node;

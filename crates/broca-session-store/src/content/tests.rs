@@ -26,13 +26,13 @@ fn every_block() -> Vec<ContentBlock> {
     vec![
         ContentBlock::Media(image.clone()),
         ContentBlock::Text {
-            text: String::new(),
+            text: String::new().into(),
         },
         ContentBlock::Text {
             text: "hello".into(),
         },
         ContentBlock::TextWithState {
-            text: String::new(),
+            text: String::new().into(),
             provider_state: TextProviderState {
                 format: TextProviderFormat::Gemini,
                 data: "c2lnbmF0dXJl".into(),
@@ -43,8 +43,8 @@ fn every_block() -> Vec<ContentBlock> {
             signature: Some("RXFVQ0NrZ0lB".into()),
         },
         ContentBlock::Reasoning {
-            text: String::new(),
-            signature: Some(String::new()),
+            text: String::new().into(),
+            signature: Some(String::new().into()),
         },
         ContentBlock::Reasoning {
             text: "x".into(),
@@ -242,7 +242,7 @@ fn the_ciphertext_inside_a_reasoning_item_is_stored_as_bytes_and_reads_back_exac
         assert_eq!((run.alphabet, run.bytes.len()), (alphabet, 600));
 
         let block = ContentBlock::RedactedReasoning {
-            data: item.clone(),
+            data: item.clone().into(),
             provider_format: Some(EncryptedReasoningFormat::OpenAiResponses),
         };
         let encoded = block.encode();
@@ -307,7 +307,7 @@ proptest! {
 
     #[test]
     fn any_opaque_text_reads_back_identically(text in ".{0,64}|[A-Za-z0-9+/]{0,40}={0,2}") {
-        let block = ContentBlock::RedactedReasoning { data: text.clone(), provider_format: None };
+        let block = ContentBlock::RedactedReasoning { data: text.clone().into(), provider_format: None };
         let back = ContentBlock::decode(&block.encode()).unwrap();
         prop_assert_eq!(back, block);
     }

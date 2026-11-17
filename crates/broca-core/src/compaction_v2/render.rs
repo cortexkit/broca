@@ -328,7 +328,7 @@ fn render_planned(
                 };
                 let mut content: Vec<_> = texts
                     .into_iter()
-                    .map(|text| ContentBlock::Text { text })
+                    .map(|text| ContentBlock::Text { text: text.into() })
                     .collect();
                 for inserted in &images {
                     content.push(ContentBlock::Media(image(inserted)?));
@@ -530,9 +530,10 @@ fn render_entry(
                         clean_text,
                         part.tag.expect("numbered text has a tag"),
                         original.role == HostRole::Assistant,
-                    );
+                    )
+                    .into();
                 } else {
-                    *text = clean_text.as_str().to_owned();
+                    *text = clean_text.as_str().to_owned().into();
                 }
             }
             (ContentBlock::ToolCall(call), PartBody::Tool(tool)) => {
@@ -768,7 +769,7 @@ pub(super) fn counted_content(
         }),
         PartBody::Tool(tool) => {
             let mut output = ToolOutput::Text {
-                text: tool.output.as_deref()?.to_owned(),
+                text: tool.output.as_deref()?.to_owned().into(),
             };
             let plan = PlanPart {
                 id: part.id.clone(),
@@ -783,7 +784,7 @@ pub(super) fn counted_content(
             let ToolOutput::Text { text } = output else {
                 return None;
             };
-            Some(text)
+            Some(text.to_string())
         }
         _ => None,
     }
@@ -833,7 +834,7 @@ fn render_result(
             if let ToolOutput::Parts { parts } = output {
                 let prefix = tags::tag_prefix(plan.tag.expect("numbered result has a tag"));
                 if let Some(ToolOutputPart::Text { text }) = parts.first_mut() {
-                    text.insert_str(0, &prefix);
+                    *text = format!("{prefix}{text}").into();
                 } else {
                     parts.insert(
                         0,
@@ -841,7 +842,8 @@ fn render_result(
                             text: format!(
                                 "{prefix}{}",
                                 plan.empty_result_label.as_deref().unwrap_or("")
-                            ),
+                            )
+                            .into(),
                         },
                     );
                 }
@@ -952,11 +954,11 @@ fn append_delivery(
 
 fn set_result_text(output: &mut ToolOutput, text: String, attachment_ids: Option<&[String]>) {
     match output {
-        ToolOutput::Text { text: target } => *target = text,
+        ToolOutput::Text { text: target } => *target = text.into(),
         ToolOutput::Error { .. } | ToolOutput::Denied { .. } => *output = ToolOutput::error(text),
-        ToolOutput::Json { .. } => *output = ToolOutput::Text { text },
+        ToolOutput::Json { .. } => *output = ToolOutput::Text { text: text.into() },
         ToolOutput::Parts { parts } => {
-            let mut kept = vec![ToolOutputPart::Text { text }];
+            let mut kept = vec![ToolOutputPart::Text { text: text.into() }];
             kept.extend(parts.iter().enumerate().filter_map(|(index, part)| {
                 if matches!(part, ToolOutputPart::Media { .. })
                     && attachment_ids.is_none_or(|ids| ids.contains(&index.to_string()))

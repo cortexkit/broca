@@ -2517,7 +2517,7 @@ mod tests {
         CallOptions::new(vec![Message::new(
             Role::System,
             vec![ContentBlock::Text {
-                text: "caller system".to_string(),
+                text: "caller system".to_string().into(),
             }],
         )])
     }
@@ -3460,7 +3460,7 @@ mod tests {
             Message::new(
                 role,
                 vec![ContentBlock::Text {
-                    text: text.to_string(),
+                    text: text.to_string().into(),
                 }],
             )
         };

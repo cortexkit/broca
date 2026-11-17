@@ -931,10 +931,10 @@ fn append_to_newest_result(
         unreachable!("found above");
     };
     match &mut result.output {
-        ToolOutput::Text { text: output } => output.push_str(text),
+        ToolOutput::Text { text: output } => *output = output.appended(text),
         ToolOutput::Error { message, .. } => message.push_str(text),
         ToolOutput::Parts { parts } => parts.push(ToolOutputPart::Text {
-            text: text.to_owned(),
+            text: text.to_owned().into(),
         }),
         ToolOutput::Json { .. } | ToolOutput::Denied { .. } => unreachable!("checked above"),
     }

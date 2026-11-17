@@ -207,7 +207,7 @@ fn broca_request(case: &Value) -> CallOptions {
             .unwrap()
             .iter()
             .map(|block| ContentBlock::Text {
-                text: block["text"].as_str().unwrap().to_string(),
+                text: block["text"].as_str().unwrap().to_string().into(),
             })
             .collect(),
     )];
@@ -221,11 +221,11 @@ fn broca_request(case: &Value) -> CallOptions {
         for block in message["content"].as_array().unwrap() {
             match block["type"].as_str().unwrap() {
                 "text" => blocks.push(ContentBlock::Text {
-                    text: block["text"].as_str().unwrap().to_string(),
+                    text: block["text"].as_str().unwrap().to_string().into(),
                 }),
                 "thinking" => blocks.push(ContentBlock::Reasoning {
-                    text: block["thinking"].as_str().unwrap().to_string(),
-                    signature: block["signature"].as_str().map(str::to_string),
+                    text: block["thinking"].as_str().unwrap().to_string().into(),
+                    signature: block["signature"].as_str().map(Into::into),
                 }),
                 "tool_use" => blocks.push(ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
@@ -236,7 +236,7 @@ fn broca_request(case: &Value) -> CallOptions {
                 "tool_result" => results.push(ContentBlock::ToolResult(ToolResult {
                     tool_call_id: ToolCallId(block["tool_use_id"].as_str().unwrap().to_string()),
                     output: ToolOutput::Text {
-                        text: block["content"].as_str().unwrap().to_string(),
+                        text: block["content"].as_str().unwrap().to_string().into(),
                     },
                     is_error: false,
                 })),

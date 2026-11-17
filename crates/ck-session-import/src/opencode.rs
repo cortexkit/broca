@@ -369,7 +369,7 @@ fn convert_message_parts_with_batching(
             "reasoning" => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     pending.push(ContentBlock::Reasoning {
-                        text: text.to_string(),
+                        text: text.to_string().into(),
                         signature: None,
                     });
                 }
@@ -526,7 +526,7 @@ fn model_origin(metadata: &Value) -> Option<ModelHandle> {
 fn push_text(blocks: &mut Vec<ContentBlock>, part: &Value, key: &str) {
     if let Some(text) = part.get(key).and_then(Value::as_str) {
         blocks.push(ContentBlock::Text {
-            text: text.to_string(),
+            text: text.to_string().into(),
         });
     }
 }
@@ -554,7 +554,7 @@ fn convert_tool(part: &Value) -> (ToolCall, Option<ToolResult>) {
         "completed" => {
             let output = state.get("output").cloned().unwrap_or(Value::Null);
             let output = match output {
-                Value::String(text) => ToolOutput::Text { text },
+                Value::String(text) => ToolOutput::Text { text: text.into() },
                 value => ToolOutput::Json {
                     value: value.into(),
                 },
@@ -751,7 +751,7 @@ mod tests {
             texts
                 .iter()
                 .map(|text| ContentBlock::Text {
-                    text: (*text).to_string(),
+                    text: (*text).to_string().into(),
                 })
                 .collect(),
         )

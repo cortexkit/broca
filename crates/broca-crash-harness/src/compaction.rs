@@ -572,8 +572,8 @@ fn signed_control() -> RunControl {
 
 fn signed(text: &str) -> ContentBlock {
     ContentBlock::Reasoning {
-        text: format!("{text} thinking"),
-        signature: Some(format!("{text}-signature")),
+        text: format!("{text} thinking").into(),
+        signature: Some(format!("{text}-signature").into()),
     }
 }
 

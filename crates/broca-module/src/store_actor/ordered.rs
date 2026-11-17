@@ -304,7 +304,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         request.input = vec![broca_protocol::Message::new(
             broca_protocol::Role::User,
-            vec![broca_protocol::ContentBlock::Text { text }],
+            vec![broca_protocol::ContentBlock::Text { text: text.into() }],
         )];
         Ok(())
     }

@@ -653,7 +653,7 @@ fn convert_tool_result_part<'a>(
                 ToolOutputPart::Media { media: reference } => {
                     let rendered = media_part(reference, true, Some(media));
                     if let Some(marker) = rendered["text"].as_str() {
-                        text.push(marker.to_owned());
+                        text.push(marker.to_owned().into());
                     } else {
                         inline.push(rendered);
                     }
@@ -1267,15 +1267,16 @@ impl GeminiNormalizer {
                     text,
                     provider_state,
                 } => ContentBlock::TextWithState {
-                    text,
+                    text: text.into(),
                     provider_state,
                 },
-                GeminiPartBuf::Text { text, .. } => ContentBlock::Text { text },
-                GeminiPartBuf::Reasoning { text, signature } => {
-                    ContentBlock::Reasoning { text, signature }
-                }
+                GeminiPartBuf::Text { text, .. } => ContentBlock::Text { text: text.into() },
+                GeminiPartBuf::Reasoning { text, signature } => ContentBlock::Reasoning {
+                    text: text.into(),
+                    signature: signature.map(Into::into),
+                },
                 GeminiPartBuf::RedactedReasoning { data } => ContentBlock::RedactedReasoning {
-                    data,
+                    data: data.into(),
                     provider_format: None,
                 },
                 GeminiPartBuf::FunctionCall(buf) => {
@@ -1536,7 +1537,7 @@ mod tests {
                 text: "first".into(),
             },
             ContentBlock::Text {
-                text: String::new(),
+                text: String::new().into(),
             },
             ContentBlock::Text {
                 text: "second".into(),

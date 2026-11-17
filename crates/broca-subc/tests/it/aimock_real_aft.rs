@@ -156,7 +156,7 @@ async fn loop_drives_aimock_through_real_aft() {
             tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: format!("Read the file {rel_name} and report its contents."),
+                text: format!("Read the file {rel_name} and report its contents.").into(),
             }],
         }],
         tools: vec![read_tool],
@@ -292,7 +292,7 @@ fn tool_results(events: &[OutputEvent]) -> Vec<(bool, String)> {
             OutputEvent::Control(ControlUnit::ToolResult { result }) => Some((
                 result.is_error,
                 match &result.output {
-                    ToolOutput::Text { text } => text.clone(),
+                    ToolOutput::Text { text } => text.to_string(),
                     ToolOutput::Error { message, .. } => message.clone(),
                     _ => String::new(),
                 },

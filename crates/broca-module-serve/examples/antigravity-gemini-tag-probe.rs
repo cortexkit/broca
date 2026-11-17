@@ -90,7 +90,7 @@ fn user(text: &str) -> Message {
 
 fn base_prompt() -> Vec<Message> {
     vec![
-        Message::new(Role::System, vec![ContentBlock::Text { text: fixed_prefix() }]),
+        Message::new(Role::System, vec![ContentBlock::Text { text: fixed_prefix().into() }]),
         user(&format!(
             "First think about which path to read. Before calling any tool, write one short visible sentence telling me what you will do. Then call {TOOL} exactly once with path sample.txt. Do not finish until its result arrives. After the result, answer in one short sentence without any further tool call."
         )),
@@ -302,12 +302,12 @@ fn verify_signatures(opts: &CallOptions, body: &Value) -> Result<(), String> {
             }
             ContentBlock::ToolCall(call) => call.thought_signature.clone().map(|sig| ("call", sig)),
             ContentBlock::Reasoning { signature, .. } => {
-                signature.clone().map(|sig| ("thought", sig))
+                signature.as_ref().map(|sig| ("thought", sig.to_string()))
             }
             ContentBlock::RedactedReasoning {
                 data,
                 provider_format: None,
-            } if !data.is_empty() => Some(("thought", data.clone())),
+            } if !data.is_empty() => Some(("thought", data.to_string())),
             _ => None,
         })
         .collect();

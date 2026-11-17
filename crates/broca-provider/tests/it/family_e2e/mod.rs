@@ -259,7 +259,7 @@ impl RunOutcome {
             .filter_map(|e| match e {
                 OutputEvent::Control(ControlUnit::ToolResult { result }) => {
                     Some(match &result.output {
-                        ToolOutput::Text { text } => text.clone(),
+                        ToolOutput::Text { text } => text.to_string(),
                         ToolOutput::Error { message, .. } => message.clone(),
                         _ => String::new(),
                     })
@@ -422,7 +422,7 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
             tags: Default::default(),
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: spec.prompt.clone(),
+                text: spec.prompt.clone().into(),
             }],
         }],
         tools: spec.tools.clone(),

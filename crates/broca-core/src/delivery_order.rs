@@ -144,7 +144,7 @@ pub fn carrier_mode3<'a>(
 /// delivery (see [`carrier`]); any other output is left unchanged.
 pub fn append_to_result(result: &mut ToolResult, text: &str) {
     match &mut result.output {
-        ToolOutput::Text { text: output } => output.push_str(text),
+        ToolOutput::Text { text: output } => *output = output.appended(text),
         ToolOutput::Error { message, .. } => message.push_str(text),
         ToolOutput::Json { .. } | ToolOutput::Denied { .. } => {}
         // The Rendering contract keeps multipart results in source order, including appended text.
@@ -172,13 +172,15 @@ pub(crate) fn append_ride_output(
 ) {
     use cortexkit_role_llm_runner::rides::{self, ContentItem};
     match output {
-        ToolOutput::Text { text } => *text = rides::append(text, rides),
+        ToolOutput::Text { text } => *text = rides::append(text, rides).into(),
         ToolOutput::Error { message, .. } => *message = rides::append(message, rides),
         ToolOutput::Parts { parts } => {
             let mut content: Vec<_> = std::mem::take(parts)
                 .into_iter()
                 .map(|part| match part {
-                    broca_protocol::ToolOutputPart::Text { text } => ContentItem::Text(text),
+                    broca_protocol::ToolOutputPart::Text { text } => {
+                        ContentItem::Text(text.to_string())
+                    }
                     part => ContentItem::Opaque(part),
                 })
                 .collect();
@@ -186,14 +188,16 @@ pub(crate) fn append_ride_output(
             *parts = content
                 .into_iter()
                 .map(|item| match item {
-                    ContentItem::Text(text) => broca_protocol::ToolOutputPart::Text { text },
+                    ContentItem::Text(text) => {
+                        broca_protocol::ToolOutputPart::Text { text: text.into() }
+                    }
                     ContentItem::Opaque(part) => part,
                 })
                 .collect();
         }
         ToolOutput::Json { value } => {
             *output = ToolOutput::Text {
-                text: rides::append(&value.to_string(), rides),
+                text: rides::append(&value.to_string(), rides).into(),
             }
         }
         ToolOutput::Denied { reason } => *output = ToolOutput::error(rides::append(reason, rides)),
@@ -880,7 +884,7 @@ mod ride_v2_tests {
                 append_ride_output(&mut output, &rides);
                 let actual = match output {
                     ToolOutput::Text { text } => text,
-                    ToolOutput::Error { message, .. } => message,
+                    ToolOutput::Error { message, .. } => message.into(),
                     _ => unreachable!(),
                 };
                 assert_eq!(

@@ -43,7 +43,7 @@ fn media_serialization_goldens_round_trip() {
         (mixed.clone(), false),
         (
             vec![ToolOutputPart::Text {
-                text: media_not_shown_marker(&image(), MediaMarkerReason::StoreFailed),
+                text: media_not_shown_marker(&image(), MediaMarkerReason::StoreFailed).into(),
             }],
             false,
         ),

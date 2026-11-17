@@ -480,24 +480,37 @@ pub fn apply_message_ops(
     content: &mut [broca_protocol::ContentBlock],
     ops: &[Operation],
 ) -> Result<(), cortexkit_role_step_transform_provider::answer::AnswerProblem> {
-    let before = content.to_vec();
-    cortexkit_role_step_transform_provider::answer::apply_to_parts(
-        content,
-        |part| match part {
-            broca_protocol::ContentBlock::Text { text }
-            | broca_protocol::ContentBlock::TextWithState { text, .. } => Some(text),
+    use broca_protocol::ContentBlock;
+    // The answer edits text as strings; message text is shared, so each part's text is taken
+    // out as a string, edited there, and put back only where an operation changed it.
+    let mut texts: Vec<Option<String>> = content
+        .iter()
+        .map(|part| match part {
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                Some(text.to_string())
+            }
             _ => None,
-        },
+        })
+        .collect();
+    cortexkit_role_step_transform_provider::answer::apply_to_parts(
+        &mut texts,
+        |text| text.as_mut(),
         ops,
     )?;
-    for (part, original) in content.iter_mut().zip(before) {
-        if *part != original {
-            if let broca_protocol::ContentBlock::TextWithState { text, .. } = part {
-                *part = broca_protocol::ContentBlock::Text {
-                    text: std::mem::take(text),
-                };
-            }
+    for (part, edited) in content.iter_mut().zip(texts) {
+        let Some(edited) = edited else {
+            continue;
+        };
+        let (ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }) = &*part
+        else {
+            continue;
+        };
+        if *text == edited {
+            continue;
         }
+        *part = ContentBlock::Text {
+            text: edited.into(),
+        };
     }
     Ok(())
 }

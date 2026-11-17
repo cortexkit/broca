@@ -385,20 +385,20 @@ pub fn media_not_shown_marker(media: &MediaRef, reason: MediaMarkerReason) -> St
 pub enum ContentBlock {
     Media(MediaRef),
     Text {
-        text: String,
+        text: crate::text::Text,
     },
     /// Assistant text whose provider state belongs to this exact item/part, even if text is empty.
     /// Kept separate from plain Text so existing text constructors and serialized bytes stay stable.
     TextWithState {
-        text: String,
+        text: crate::text::Text,
         provider_state: TextProviderState,
     },
     Reasoning {
-        text: String,
+        text: crate::text::Text,
         /// Provider-signed reasoning signature (e.g. Anthropic signed thinking),
         /// preserved verbatim for cache + replay fidelity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
+        signature: Option<crate::text::Text>,
     },
     /// Opaque provider continuation state, which may include encrypted reasoning. `data` is:
     /// the legacy Anthropic/Gemini form stores the provider blob, while OpenAI Responses stores
@@ -410,7 +410,7 @@ pub enum ContentBlock {
     /// persisted messages omit it and retain legacy behavior. New messages set it explicitly,
     /// and request rendering accepts only its matching format and producing model.
     RedactedReasoning {
-        data: String,
+        data: crate::text::Text,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_format: Option<EncryptedReasoningFormat>,
     },
@@ -505,7 +505,7 @@ pub struct ToolResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutput {
     Text {
-        text: String,
+        text: crate::text::Text,
     },
     Json {
         value: crate::json::Json,
@@ -545,7 +545,7 @@ pub enum ToolOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolOutputPart {
-    Text { text: String },
+    Text { text: crate::text::Text },
     Media { media: MediaRef },
 }
 
@@ -717,7 +717,7 @@ pub fn media_parts_text(parts: &[ToolOutputPart], reason: MediaMarkerReason) -> 
     parts
         .iter()
         .map(|part| match part {
-            ToolOutputPart::Text { text } => text.clone(),
+            ToolOutputPart::Text { text } => text.to_string(),
             ToolOutputPart::Media { media } => media_not_shown_marker(media, reason),
         })
         .collect::<Vec<_>>()
@@ -1213,7 +1213,7 @@ mod tests {
         Message::new(
             role,
             vec![ContentBlock::Text {
-                text: text.to_string(),
+                text: text.to_string().into(),
             }],
         )
     }

@@ -87,7 +87,7 @@ pub(crate) async fn transform_input(
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Text { text } => Some(text.to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>();

@@ -113,14 +113,14 @@ impl Step {
                         part: None,
                         message_id: message_id.clone(),
                         tool_call_id: None,
-                        delta: text.clone(),
+                        delta: text.to_string(),
                     },
                     ContentBlock::Reasoning { text, .. } => {
                         broca_protocol::DisplayEvent::ReasoningDelta {
                             mid: None,
                             part: None,
                             message_id: message_id.clone(),
-                            delta: text.clone(),
+                            delta: text.to_string(),
                         }
                     }
                     ContentBlock::ToolCall(call) => broca_protocol::DisplayEvent::ToolInputDelta {

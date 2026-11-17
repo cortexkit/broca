@@ -176,7 +176,7 @@ fn shaped(frozen: &FrozenRenderConfig, input: &[Value]) -> Value {
                     Role::User
                 },
                 vec![ContentBlock::Text {
-                    text: item["content"].as_str().unwrap().to_owned(),
+                    text: item["content"].as_str().unwrap().to_owned().into(),
                 }],
             )
         })

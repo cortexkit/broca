@@ -548,7 +548,7 @@ mod tests {
                 Role::User,
                 (0..blocks)
                     .map(|i| ContentBlock::Text {
-                        text: format!("{i}"),
+                        text: format!("{i}").into(),
                     })
                     .collect(),
             )]),

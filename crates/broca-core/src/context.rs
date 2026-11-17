@@ -3857,7 +3857,7 @@ mod tests {
                 let mut message = Message::new(
                     Role::User,
                     vec![ContentBlock::Text {
-                        text: format!("row-{ordinal}"),
+                        text: format!("row-{ordinal}").into(),
                     }],
                 );
                 message.ordinal = Some(ordinal);

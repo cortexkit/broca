@@ -887,7 +887,7 @@ fn tool_output_text(out: &ToolOutput) -> String {
             parts,
             broca_protocol::MediaMarkerReason::Carrier,
         ),
-        ToolOutput::Text { text } => text.clone(),
+        ToolOutput::Text { text } => text.to_string(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),
         ToolOutput::Error {
@@ -1685,7 +1685,7 @@ impl OpenAiResponsesNormalizer {
                 index,
                 0,
                 ContentBlock::RedactedReasoning {
-                    data: raw_item,
+                    data: raw_item.into(),
                     provider_format: Some(self.reasoning_format),
                 },
             ));
@@ -1712,7 +1712,7 @@ impl OpenAiResponsesNormalizer {
         for (index, text) in parts {
             if let Some(data) = self.text_states.remove(&index) {
                 ordered.push((index, 1, ContentBlock::TextWithState {
-                    text,
+                    text: text.into(),
                     provider_state: broca_protocol::content::TextProviderState {
                         format: match self.reasoning_format {
                             EncryptedReasoningFormat::OpenAiResponses => broca_protocol::content::TextProviderFormat::OpenAiResponses,
@@ -1723,7 +1723,7 @@ impl OpenAiResponsesNormalizer {
                     },
                 }));
             } else if !text.is_empty() {
-                ordered.push((index, 1, ContentBlock::Text { text }));
+                ordered.push((index, 1, ContentBlock::Text { text: text.into() }));
             }
         }
         if !self.refusal.is_empty() && (!self.arguments_guard.fired() || self.refusal_completed) {
@@ -1731,7 +1731,7 @@ impl OpenAiResponsesNormalizer {
                 self.refusal_output_index.take().unwrap_or(0),
                 2,
                 ContentBlock::Text {
-                    text: std::mem::take(&mut self.refusal),
+                    text: std::mem::take(&mut self.refusal).into(),
                 },
             ));
         }

@@ -171,7 +171,12 @@ fn resolve(step: Step, token: &str, client: ProviderHttpClient) -> Result<Resolv
 }
 
 fn text(role: Role, value: impl Into<String>) -> Message {
-    Message::new(role, vec![ContentBlock::Text { text: value.into() }])
+    Message::new(
+        role,
+        vec![ContentBlock::Text {
+            text: value.into().into(),
+        }],
+    )
 }
 
 fn mason_prompt() -> Vec<Message> {

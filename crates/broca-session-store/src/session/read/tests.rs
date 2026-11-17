@@ -58,7 +58,10 @@ fn input(text: String) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
-        message: std::sync::Arc::new(Message::new(Role::User, vec![ContentBlock::Text { text }])),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -152,7 +155,7 @@ fn round(n: usize) -> Vec<Vec<Record>> {
         vec![reply(&id, format!("{n}:{}", "x".repeat(4096)))],
         vec![
             assistant(vec![ContentBlock::Text {
-                text: format!("answer {n}"),
+                text: format!("answer {n}").into(),
             }]),
             facts(first + 3),
         ],
@@ -375,7 +378,7 @@ fn a_sealed_message_read_fetches_its_block_not_the_segment(cipher: Cipher) {
                 vec![reply(&id, noise(n, 6000))],
                 vec![
                     assistant(vec![ContentBlock::Text {
-                        text: format!("answer {n}"),
+                        text: format!("answer {n}").into(),
                     }]),
                     facts(first + 3),
                 ],
