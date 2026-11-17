@@ -64,6 +64,7 @@ print("fixture cargo fmt")
         self.executable(self.root / "scripts/check-cortexkit-layout.sh", r'''#!/bin/sh
 printf 'layout\n' >> "$LAYOUT_EVENTS"
 ''')
+        self.executable(self.root / "scripts/check-file-sizes.sh", "#!/bin/sh\n")
         # The gate checks only crates that still exist: a deleted crate has no manifest left.
         for crate in ("alpha", "beta"):
             (self.root / "crates" / crate).mkdir(parents=True)

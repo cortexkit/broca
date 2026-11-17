@@ -193,6 +193,11 @@ else
   attested_tree=""
 fi
 
+# Checked on every path, attested or not: it reads only the tree, so it costs nothing to repeat.
+scripts/check-file-sizes.sh || {
+  echo "gated-commit: a hand-written file is over its size limit — NOT committing" >&2
+  exit 1
+}
 git add -A || exit 1
 if [ -n "$attested_tree" ] && [ "$(git write-tree)" != "$attested_tree" ]; then
   echo "gated-commit: attested tree changed before commit — NOT committing" >&2

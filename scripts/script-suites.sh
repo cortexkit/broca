@@ -45,6 +45,8 @@ echo "script-suites: $(python3 --version) at $PY"
 
 suites=(
     scripts/test-exit-guard.py
+    # Hand-written Rust files stay under 5,000 lines; listed ones may not grow.
+    scripts/test-check-file-sizes.py
     scripts/test-check-path-deps.py
     scripts/test-stage-release.py
     scripts/tests/test-release-clients.py
@@ -140,4 +142,6 @@ python3 scripts/check-path-deps.py
 python3 scripts/audit-export-lane.py --self-test
 # Nothing under .cortexkit/ may be tracked except release-notes/, skills/, rules/ and WORKER.md.
 scripts/check-cortexkit-layout.sh
+# No hand-written Rust file grows past 5,000 lines, or past its listed size if already larger.
+scripts/check-file-sizes.sh
 BROCA_EXIT_GUARD_FINISHED=1
