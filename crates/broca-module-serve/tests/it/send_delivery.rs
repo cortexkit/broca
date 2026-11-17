@@ -8,11 +8,11 @@
 //! test decides exactly when a run is inside a model step or inside a tool call.
 
 use crate::delivery_rig;
+use broca_session_store::record::Record;
 
 use delivery_rig::*;
 use std::time::Duration;
 
-use broca_wal::WalRecord;
 use subc_protocol::{Frame, FrameType};
 
 /// The reply bytes of the default mode, pinned. A send while the session is idle is `active`; a
@@ -43,12 +43,12 @@ async fn queue_mode_reply_bytes_are_pinned() {
         let run_2 = submission.strip_prefix("sub-").unwrap().to_owned();
         assert_golden(&pending, "send_reply.pending.json", &run_2);
 
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reuse = rig.send("turn-2", "changed", delivery).await;
         assert_eq!(reuse.header.ty, FrameType::Error, "{tag}");
         assert_golden(&reuse, "send_id_reuse.input.json", "");
         assert_eq!(
-            rig.wal_bytes(),
+            rig.records().await,
             before,
             "{tag}: a refused send writes nothing"
         );
@@ -61,30 +61,30 @@ async fn queue_mode_reply_bytes_are_pinned() {
     }
 }
 
-/// Each episode's end in WAL order: the `RunFinished` reason, or `paused`.
-fn endings(records: &[WalRecord]) -> Vec<String> {
+/// Each run's end in log order: the run end's reason, or `paused`.
+fn endings(records: &[Record]) -> Vec<String> {
     records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::RunFinished { reason, .. } => Some(
-                serde_json::to_value(reason)
+            Record::RunEnd(end) => Some(
+                serde_json::to_value(end.reason)
                     .unwrap()
                     .as_str()
                     .unwrap()
                     .to_owned(),
             ),
-            WalRecord::RunPaused { .. } => Some("paused".to_owned()),
+            Record::Pause(_) => Some("paused".to_owned()),
             _ => None,
         })
         .collect()
 }
 
-/// Each episode's run id in WAL order.
-fn starts(records: &[WalRecord]) -> Vec<String> {
+/// Each run's id in log order.
+fn starts(records: &[Record]) -> Vec<String> {
     records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+            Record::RunStart(start) => Some(start.run_id.clone()),
             _ => None,
         })
         .collect()
@@ -133,11 +133,11 @@ async fn a_steer_during_a_tool_call_joins_the_running_turn_after_the_result() {
 
     let steered = rig.send("steer-1", "write up now", Some("steer")).await;
     assert_golden(&steered, "send_reply.steer_joined.json", &run_1);
-    let records = rig.records();
+    let records = rig.records().await;
     assert!(
         records
             .iter()
-            .any(|record| matches!(record, WalRecord::Steered { .. })),
+            .any(|record| matches!(record, Record::Steer(_))),
         "the steer is durable before its reply"
     );
     let retry = rig.send("steer-1", "write up now", Some("steer")).await;
@@ -169,10 +169,10 @@ async fn a_steer_during_a_tool_call_joins_the_running_turn_after_the_result() {
 
     let after = rig.send("steer-1", "write up now", Some("steer")).await;
     assert_golden(&after, "send_reply.steer_retry_step.json", &run_1);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let other_mode = rig.send("steer-1", "write up now", None).await;
     assert_golden(&other_mode, "send_id_reuse.delivery.json", "");
-    assert_eq!(rig.wal_bytes(), before, "a refused send writes nothing");
+    assert_eq!(rig.records().await, before, "a refused send writes nothing");
     rig.finish().await;
 }
 
@@ -188,12 +188,12 @@ async fn a_steer_with_no_active_run_starts_a_turn() {
     assert_eq!(starts(&records), [run_1]);
     assert!(!records
         .iter()
-        .any(|record| matches!(record, WalRecord::Steered { .. })));
+        .any(|record| matches!(record, Record::Steer(_))));
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reuse = rig.send("turn-1", "hello", Some("interrupt")).await;
     assert_golden(&reuse, "send_id_reuse.delivery.json", "");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -255,14 +255,18 @@ async fn joining_steer_settings_conflict_refuses_before_any_wal_write() {
         ),
     ];
     for (index, (field, extra)) in cases.into_iter().enumerate() {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let refused = rig
             .send_with(&format!("steer-{index}"), "change", Some("steer"), extra)
             .await;
         let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(body["code"], "invalid_params", "{field}: {body}");
         assert_eq!(body["detail"]["field"], field);
-        assert_eq!(rig.wal_bytes(), before, "{field}: refusal writes nothing");
+        assert_eq!(
+            rig.records().await,
+            before,
+            "{field}: refusal writes nothing"
+        );
         if index == 0 {
             assert_golden(&refused, "send_reply.steer_settings_conflict.json", "");
         }
@@ -271,7 +275,7 @@ async fn joining_steer_settings_conflict_refuses_before_any_wal_write() {
     let records = rig.wait_for_finished(1).await;
     assert!(!records
         .iter()
-        .any(|record| matches!(record, WalRecord::Steered { .. })));
+        .any(|record| matches!(record, Record::Steer(_))));
     rig.finish().await;
 }
 
@@ -307,8 +311,9 @@ async fn joining_steer_same_settings_and_omissions_are_accepted() {
     }
     assert_eq!(
         rig.records()
+            .await
             .iter()
-            .filter(|record| matches!(record, WalRecord::Steered { .. }))
+            .filter(|record| matches!(record, Record::Steer(_)))
             .count(),
         4
     );
@@ -337,12 +342,10 @@ async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential
     let run = run_id_of(&rig.send("turn-1", "task", None).await);
     rig.wait_entered().await;
     let frozen = rig
-        .records()
-        .iter()
-        .find_map(|record| match record {
-            WalRecord::RunStarted { config, .. } => config.auth_selection.clone(),
-            _ => None,
-        })
+        .run_configs()
+        .await
+        .into_iter()
+        .find_map(|config| config.auth_selection)
         .expect("the run froze its auth selection");
     assert_eq!(frozen.credential_id, "oauth:anthropic:work");
     assert_eq!(
@@ -358,7 +361,7 @@ async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential
     .into_iter()
     .enumerate()
     {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let refused = rig
             .send_with(
                 &format!("refused-{index}"),
@@ -371,7 +374,7 @@ async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential
         let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(body["code"], "invalid_params", "{pin}: {body}");
         assert_eq!(body["detail"]["field"], "auth", "{pin}: {body}");
-        assert_eq!(rig.wal_bytes(), before, "{pin}: refusal writes nothing");
+        assert_eq!(rig.records().await, before, "{pin}: refusal writes nothing");
         if index == 0 {
             crate::scope_carrier::assert_reply_golden(
                 &refused,
@@ -401,8 +404,9 @@ async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential
     }
     assert_eq!(
         rig.records()
+            .await
             .iter()
-            .filter(|record| matches!(record, WalRecord::Steered { .. }))
+            .filter(|record| matches!(record, Record::Steer(_)))
             .count(),
         2,
         "only the two matching steers were recorded"
@@ -461,13 +465,10 @@ async fn idle_steer_interrupt_and_queue_honour_their_named_settings() {
             pending_run_id(&accepted)
         };
         rig.script.hold_model(false);
-        let records = rig.wait_for_finished(2).await;
-        let config = records
-            .iter()
-            .find_map(|record| match record {
-                WalRecord::RunStarted { run_id, config, .. } if run_id.0 == run => Some(config),
-                _ => None,
-            })
+        rig.wait_for_finished(2).await;
+        let config = rig
+            .run_config_of(&run)
+            .await
             .expect("the new run froze its requested settings");
         assert_eq!(config.model.provider_module_id, "fake");
         assert_eq!(config.model.model_id, "other");
@@ -497,12 +498,12 @@ async fn accepted_steer_settings_retry_replays_after_the_active_run_changes() {
         .send_with("steer-1", "same", Some("steer"), settings.clone())
         .await;
     assert_golden(&first, "send_reply.steer_joined.json", &run);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let retry = rig
         .send_with("steer-1", "same", Some("steer"), settings.clone())
         .await;
     assert_eq!(retry.body, first.body);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
@@ -523,7 +524,7 @@ async fn accepted_steer_settings_retry_replays_after_the_active_run_changes() {
     )
     .await;
     rig.wait_entered().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let retry = rig
         .send_with("steer-1", "same", Some("steer"), settings)
         .await;
@@ -532,7 +533,7 @@ async fn accepted_steer_settings_retry_replays_after_the_active_run_changes() {
         "replay describes the original joined run"
     );
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "replay neither revalidates nor writes"
     );
@@ -550,12 +551,16 @@ async fn a_steer_into_a_paused_run_is_refused_and_writes_nothing() {
     let run_1 = run_id_of(&rig.send("turn-1", "hello", None).await);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let floor = std::fs::read_to_string(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME)).ok();
     let refused = rig.send("steer-1", "more", Some("steer")).await;
     assert_eq!(refused.header.ty, FrameType::Error);
     assert_golden(&refused, "run_paused.json", &run_1);
-    assert_eq!(rig.wal_bytes(), before, "a refused steer writes nothing");
+    assert_eq!(
+        rig.records().await,
+        before,
+        "a refused steer writes nothing"
+    );
     assert_eq!(
         std::fs::read_to_string(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME)).ok(),
         floor
@@ -697,7 +702,7 @@ async fn a_cancel_with_a_steer_pending_starts_no_new_turn() {
     let records = rig.wait_for_finished(1).await;
     rig.wait_idle().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let records_later = rig.records();
+    let records_later = rig.records().await;
     assert_eq!(endings(&records), ["cancelled"]);
     assert_eq!(starts(&records_later), [run_1], "no new turn");
     assert_eq!(rig.script.prompts.lock().unwrap().len(), 1);
@@ -737,16 +742,13 @@ async fn an_interrupt_during_a_model_stream_cancels_then_starts_the_message() {
         .position(|record| {
             matches!(
                 record,
-                WalRecord::Queued {
-                    delivery: Some(broca_protocol::Delivery::Interrupt),
-                    ..
-                }
+                Record::QueuedSend(send) if send.delivery.as_deref() == Some("interrupt")
             )
         })
         .expect("the interrupt's Queued");
     let cancelled_at = records
         .iter()
-        .position(|record| matches!(record, WalRecord::RunFinished { .. }))
+        .position(|record| matches!(record, Record::RunEnd(_)))
         .unwrap();
     assert!(
         queued_at < cancelled_at,
@@ -810,14 +812,14 @@ async fn an_interrupt_ends_a_paused_run_and_starts_the_message() {
     let run_1 = run_id_of(&rig.send("turn-1", "hello", None).await);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let before = rig.records();
+    let before = rig.records().await;
     let intents = before
         .iter()
-        .filter(|record| matches!(record, WalRecord::ToolDispatchIntent { .. }))
+        .filter(|record| matches!(record, Record::ToolIntent(_)))
         .count();
     let results = before
         .iter()
-        .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
+        .filter(|record| matches!(record, Record::ToolOutcome(_)))
         .count();
     assert_eq!(intents, results, "nothing in flight is abandoned");
     let pending = rig
@@ -843,13 +845,13 @@ async fn a_plain_send_into_a_paused_session_is_refused_run_paused() {
         let run_1 = run_id_of(&rig.send("turn-1", "hello", None).await);
         rig.wait_for_finished(1).await;
         rig.wait_idle().await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let refused = rig.send("turn-2", "a brand new message", delivery).await;
         assert_eq!(refused.header.ty, FrameType::Error, "{tag}");
         assert_golden(&refused, "run_paused.json", &run_1);
         rig.wait_idle().await;
         assert_eq!(
-            rig.wal_bytes(),
+            rig.records().await,
             before,
             "{tag}: a refused send writes nothing"
         );
@@ -871,7 +873,7 @@ async fn the_paused_runs_own_retry_still_resumes_it() {
     let retry = rig.send("turn-1", "hello", None).await;
     assert_golden_admitting(&retry, "send_reply.active.json", &run_1);
     rig.wait_idle().await;
-    assert_eq!(starts(&rig.records()), [run_1]);
+    assert_eq!(starts(&rig.records().await), [run_1]);
     rig.finish().await;
 }
 
@@ -888,7 +890,7 @@ async fn conversation_key_refusal_bytes_are_pinned() {
         )
         .await;
     assert_golden(&invalid, "invalid_params.conversation_key.json", "");
-    assert!(rig.wal_bytes().is_empty());
+    assert!(rig.records().await.is_empty());
     let active = rig
         .send_with(
             "turn",
@@ -899,7 +901,7 @@ async fn conversation_key_refusal_bytes_are_pinned() {
         .await;
     assert_eq!(result(&active)["state"], "active");
     rig.wait_entered().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reuse = rig
         .send_with(
             "turn",
@@ -909,7 +911,7 @@ async fn conversation_key_refusal_bytes_are_pinned() {
         )
         .await;
     assert_golden(&reuse, "send_id_reuse.conversation_key.json", "");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
     rig.finish().await;
@@ -1052,7 +1054,7 @@ async fn cache_none_with_automatic_warming_refuses_before_any_write() {
             .await;
         assert_golden(&refused, "invalid_params.cache_none_keep_warm.json", "");
         assert!(
-            rig.wal_bytes().is_empty(),
+            rig.records().await.is_empty(),
             "{provider}: refusal must not write WAL"
         );
         assert!(
@@ -1097,7 +1099,7 @@ async fn invalid_retention_writes_nothing(tag: &str, delivery: Option<&str>) {
             "{delivery:?} {retention}"
         );
         assert!(
-            rig.wal_bytes().is_empty(),
+            rig.records().await.is_empty(),
             "a refused first send writes nothing"
         );
     }
@@ -1113,7 +1115,7 @@ async fn invalid_retention_writes_nothing(tag: &str, delivery: Option<&str>) {
     let accepted = rig.send("accepted", "hi", None).await;
     assert_eq!(accepted.header.ty, FrameType::Response);
     rig.wait_entered().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert!(
         !before.is_empty(),
         "the accepted run must reach its real WAL"
@@ -1142,7 +1144,7 @@ async fn invalid_retention_writes_nothing(tag: &str, delivery: Option<&str>) {
             "{delivery:?} {retention}"
         );
         assert_eq!(
-            rig.wal_bytes(),
+            rig.records().await,
             before,
             "a refused later send writes nothing"
         );
@@ -1189,13 +1191,10 @@ async fn restart_paused_rig(tag: &str) -> (Rig, String) {
     rig.wait_entered().await;
     rig = rig.restart_at_tool_boundary().await;
     assert!(matches!(
-        rig.records().last(),
-        Some(WalRecord::RunPaused {
-            reason: broca_protocol::PauseReason::Restart,
-            ..
-        })
+        rig.records().await.last(),
+        Some(Record::Pause(pause)) if pause.reason == broca_protocol::PauseReason::Restart
     ));
-    assert_eq!(starts(&rig.records()), std::slice::from_ref(&run_id));
+    assert_eq!(starts(&rig.records().await), std::slice::from_ref(&run_id));
     (rig, run_id)
 }
 
@@ -1225,11 +1224,14 @@ async fn restart_paused_steer_reply_bytes_are_pinned_and_render_on_resume() {
         &run_id,
         "d83d96f442423a7f32c1071514b331252b9d4fb167e05253a2ada82e99612de5",
     );
-    let records = rig.records();
+    let records = rig.records().await;
     assert!(records.iter().any(|record| matches!(
         record,
-        WalRecord::Steered { send_id: Some(send_id), delivery: Some(broca_protocol::Delivery::Steer), input, .. }
-            if send_id == "restart-steer" && input.iter().any(|message| last_text(std::slice::from_ref(message)) == "restart steer")
+        Record::Steer(steer)
+            if steer.receipt.as_ref().is_some_and(|receipt| {
+                let receipt = receipt.parse();
+                receipt["send_id"] == "restart-steer" && receipt["delivery"] == "steer"
+            }) && steer.input.iter().any(|message| last_text(std::slice::from_ref(message)) == "restart steer")
     )), "the exact steer is durable before its reply");
     assert_eq!(
         starts(&records),
@@ -1238,15 +1240,10 @@ async fn restart_paused_steer_reply_bytes_are_pinned_and_render_on_resume() {
     );
 
     rig.script.push(&[Step::Text("resumed")]);
-    assert_eq!(
-        rig.registry()
-            .resume_restart_pauses(
-                std::sync::Arc::new(broca_core::FileWalStore::new(rig.dir.join("wal"))),
-                vec![(run_id.clone(), rig.session.clone())],
-            )
-            .await,
-        (1, 0)
-    );
+    // The boot sweep resumes the restart pause once dependency routes are back.
+    rig.registry().enable_restart_resumes();
+    let sweep = rig.registry().recover_store_crash_orphans().await.unwrap();
+    assert_eq!((sweep.recovered, sweep.failed.len()), (1, 0), "{sweep:?}");
     let records = rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     assert_eq!(endings(&records), ["paused", "completed"]);
@@ -1272,7 +1269,7 @@ async fn restart_paused_steer_reply_bytes_are_pinned_and_render_on_resume() {
 #[tokio::test]
 async fn restart_paused_resend_reply_bytes_are_pinned_and_start_no_run() {
     let (mut rig, run_id) = restart_paused_rig("restart-resend-golden").await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let resend = rig
         .send_with(
             "restart-turn",
@@ -1287,27 +1284,43 @@ async fn restart_paused_resend_reply_bytes_are_pinned_and_start_no_run() {
         &run_id,
         "d83d96f442423a7f32c1071514b331252b9d4fb167e05253a2ada82e99612de5",
     );
-    assert_eq!(rig.wal_bytes(), before, "the resend writes nothing");
     assert_eq!(
-        starts(&rig.records()),
+        without_writer_opens(rig.records().await),
+        without_writer_opens(before),
+        "the resend writes nothing"
+    );
+    assert_eq!(
+        starts(&rig.records().await),
         std::slice::from_ref(&run_id),
         "the resend starts no run"
     );
     rig.finish().await;
 }
 
+/// The title a send's record carries: a run start's own, or the one in a queued send's or
+/// steer's receipt.
+fn title(record: &Record) -> Option<String> {
+    let receipt = match record {
+        Record::RunStart(start) => return start.title.clone(),
+        Record::QueuedSend(send) => send.receipt.as_ref(),
+        Record::Steer(steer) => steer.receipt.as_ref(),
+        _ => return None,
+    };
+    receipt.and_then(|receipt| receipt.parse()["title"].as_str().map(str::to_owned))
+}
+
 /// Each record a send wrote, by kind, with its optional title.
-fn titles(records: &[WalRecord]) -> Vec<(&'static str, Option<String>)> {
+fn titles(records: &[Record]) -> Vec<(&'static str, Option<String>)> {
     records
         .iter()
         .filter_map(|record| {
             let kind = match record {
-                WalRecord::RunStarted { .. } => "run_started",
-                WalRecord::Queued { .. } => "queued",
-                WalRecord::Steered { .. } => "steered",
+                Record::RunStart(_) => "run_started",
+                Record::QueuedSend(_) => "queued",
+                Record::Steer(_) => "steered",
                 _ => return None,
             };
-            Some((kind, record.title().map(str::to_owned)))
+            Some((kind, title(record)))
         })
         .collect()
 }
@@ -1340,21 +1353,10 @@ async fn head_title(rig: &mut Rig) -> Option<String> {
         .map(|title| title.as_str().unwrap().to_owned())
 }
 
-/// The title the run index row of `run_id` holds, read from the rig's store file.
-fn indexed_title(rig: &Rig, run_id: &str) -> Option<String> {
-    use broca_core::RunIndex;
-    broca_store::SqliteStore::open(rig.dir.join("store.db"))
-        .unwrap()
-        .lookup_run(run_id)
-        .unwrap()
-        .expect("the run has an index row")
-        .title
-}
-
-/// A titled send, through the real serve path: the title is recorded on the `RunStarted` that
-/// opens its run and in the run's index row, and `run.status` (while the run is live and once
-/// it has completed, with the completed reply compared with its golden fixture) and `session.head` report it. A
-/// later queued send with a new title is recorded on its `Queued` record, `session.head`
+/// A titled send, through the real serve path: the title is recorded on the run start that opens
+/// its run, and `run.status` (while the run is live and once it has completed, with the
+/// completed reply compared with its golden fixture) and `session.head` report it. A later
+/// queued send with a new title is recorded on its queued send's receipt, `session.head`
 /// switches to it at once, and the run that drains it records it too. Both survive a restart
 /// onto a new registry and store. A send without a title leaves every one of these absent.
 #[tokio::test]
@@ -1379,10 +1381,6 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
         head_title(&mut rig).await.as_deref(),
         Some("Fix the login bug")
     );
-    assert_eq!(
-        indexed_title(&rig, &run_1).as_deref(),
-        Some("Fix the login bug")
-    );
 
     let run_2 = pending_run_id(
         &rig.send_with(
@@ -1394,7 +1392,7 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
         .await,
     );
     assert_eq!(
-        titles(&rig.records()),
+        titles(&rig.records().await),
         [
             ("run_started", Some("Fix the login bug".to_owned())),
             ("queued", Some("Write the release notes".to_owned())),
@@ -1428,10 +1426,6 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
         "Write the release notes"
     );
     assert_eq!(
-        indexed_title(&rig, &run_2).as_deref(),
-        Some("Write the release notes")
-    );
-    assert_eq!(
         head_title(&mut rig).await.as_deref(),
         Some("Write the release notes")
     );
@@ -1444,46 +1438,10 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
     assert!(result(&run_status(&mut rig, &run_3).await)
         .get("title")
         .is_none());
-    assert_eq!(indexed_title(&rig, &run_3), None);
     assert_eq!(
         head_title(&mut rig).await.as_deref(),
         Some("Write the release notes")
     );
-    // The store's projection holds it now, past every titled record: the head no longer needs
-    // the WAL tail for it.
-    let projected = || {
-        use broca_core::MaterializedStore;
-        broca_store::SqliteStore::open(rig.dir.join("store.db"))
-            .unwrap()
-            .read_page_with_watermark(&rig.session, None, 1, broca_core::context::ReadView::Raw)
-            .unwrap()
-    };
-    broca_test_support::wait_for(
-        "title projected through WAL head",
-        async {
-            loop {
-                if projected().watermark_seq as usize >= rig.records().len() - 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        },
-        || {
-            format!(
-                "watermark={}, records={}",
-                projected().watermark_seq,
-                rig.records().len()
-            )
-        },
-    )
-    .await;
-    let page = projected();
-    assert!(
-        page.watermark_seq as usize >= rig.records().len() - 1,
-        "projected"
-    );
-    assert_eq!(page.last_title.as_deref(), Some("Write the release notes"));
-
     rig.wait_closed().await;
     rig = rig.restart().await;
     assert_eq!(
@@ -1497,28 +1455,24 @@ async fn a_titled_send_is_recorded_on_its_run_and_reported_by_status_and_head() 
     rig.finish().await;
 }
 
-/// The title the `run_started` record of `run_id` carries, read from the session's WAL.
-fn started_title(records: &[WalRecord], run_id: &str) -> Option<String> {
+/// The title the run start of `run_id` carries, read from the session's log.
+fn started_title(records: &[Record], run_id: &str) -> Option<String> {
     records
         .iter()
         .find_map(|record| match record {
-            WalRecord::RunStarted {
-                run_id: started,
-                title,
-                ..
-            } if started.0 == run_id => Some(title.clone()),
+            Record::RunStart(start) if start.run_id == run_id => Some(start.title.clone()),
             _ => None,
         })
-        .expect("the run has a run_started record")
+        .expect("the run has a run start")
 }
 
-/// An ordered send's title reaches the index row of the run it starts, on both ordered start
-/// paths. An `["idle_start"]` send on a fresh, idle session starts its run while it is being
-/// admitted; the same send made while another run is active waits in the queue and starts its
-/// run once that run ends. Each run's index row holds exactly the title its `run_started`
-/// records. (Direct sends and plain queued sends are covered by the titled-send test above.)
+/// An ordered send's title reaches the start of the run it starts, on both ordered start paths.
+/// An `["idle_start"]` send on a fresh, idle session starts its run while it is being admitted;
+/// the same send made while another run is active waits in the queue and starts its run once
+/// that run ends. (Direct sends and plain queued sends are covered by the titled-send test
+/// above.)
 #[tokio::test]
-async fn an_ordered_sends_title_reaches_the_index_row_of_the_run_it_starts() {
+async fn an_ordered_sends_title_reaches_the_run_it_starts() {
     let mut rig = Rig::start("title-ordered").await;
     let idle_start = |title: &str| serde_json::json!({"delivery": ["idle_start"], "title": title});
     rig.script.hold_model(true);
@@ -1528,13 +1482,8 @@ async fn an_ordered_sends_title_reaches_the_index_row_of_the_run_it_starts() {
     );
     rig.wait_entered().await;
     assert_eq!(
-        started_title(&rig.records(), &immediate).as_deref(),
+        started_title(&rig.records().await, &immediate).as_deref(),
         Some("Ordered on idle")
-    );
-    assert_eq!(
-        indexed_title(&rig, &immediate).as_deref(),
-        Some("Ordered on idle"),
-        "the run an idle_start send starts at once indexes its title"
     );
 
     let drained = pending_run_id(
@@ -1554,16 +1503,6 @@ async fn an_ordered_sends_title_reaches_the_index_row_of_the_run_it_starts() {
         Some("Ordered from the queue")
     );
     rig.wait_idle().await;
-    assert_eq!(
-        indexed_title(&rig, &drained).as_deref(),
-        Some("Ordered from the queue"),
-        "the run a queued idle_start send starts indexes its title"
-    );
-    assert_eq!(
-        indexed_title(&rig, &immediate).as_deref(),
-        Some("Ordered on idle"),
-        "finishing the run keeps its title"
-    );
     rig.finish().await;
 }
 
@@ -1591,14 +1530,14 @@ async fn a_steers_title_is_stored_on_its_steered_record() {
         .await;
     assert_golden(&steered, "send_reply.steer_joined.json", &run_1);
     assert_eq!(
-        titles(&rig.records()),
+        titles(&rig.records().await),
         [
             ("run_started", Some("Task".to_owned())),
             ("steered", Some("Write it up".to_owned())),
         ]
     );
     assert_eq!(head_title(&mut rig).await.as_deref(), Some("Write it up"));
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let retry = rig
         .send_with(
             "steer-1",
@@ -1612,7 +1551,7 @@ async fn a_steers_title_is_stored_on_its_steered_record() {
         body_text(&steered),
         "the recorded answer"
     );
-    assert_eq!(rig.wal_bytes(), before, "a retry writes nothing");
+    assert_eq!(rig.records().await, before, "a retry writes nothing");
     rig.script.hold_tool(false);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
@@ -1655,7 +1594,7 @@ async fn an_invalid_title_is_refused_before_any_wal_write() {
             assert_eq!(body["code"], "invalid_params", "{delivery:?} {title}");
             assert_eq!(body["detail"]["field"], "title", "{delivery:?} {title}");
             assert!(
-                rig.wal_bytes().is_empty(),
+                rig.records().await.is_empty(),
                 "{delivery:?} {title}: nothing written"
             );
         }
@@ -1673,10 +1612,10 @@ async fn an_invalid_title_is_refused_before_any_wal_write() {
     );
     rig.wait_entered().await;
     assert_eq!(
-        titles(&rig.records()),
+        titles(&rig.records().await),
         [("run_started", Some(longest.clone()))]
     );
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     for delivery in [None, Some("steer"), Some("interrupt")] {
         for title in &invalid {
             let refused = rig
@@ -1689,7 +1628,7 @@ async fn an_invalid_title_is_refused_before_any_wal_write() {
                 .await;
             assert_eq!(refused.header.ty, FrameType::Error, "{delivery:?} {title}");
             assert_eq!(
-                rig.wal_bytes(),
+                rig.records().await,
                 before,
                 "{delivery:?} {title}: nothing written"
             );
@@ -1718,7 +1657,7 @@ async fn a_keyed_resend_with_an_edited_title_gets_the_recorded_answer_and_keeps_
         .await;
     let run_1 = run_id_of(&first);
     rig.wait_entered().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let live_retry = rig
         .send_with("turn-1", "hi", None, serde_json::json!({"title": "Edited"}))
         .await;
@@ -1727,7 +1666,7 @@ async fn a_keyed_resend_with_an_edited_title_gets_the_recorded_answer_and_keeps_
         body_text(&first),
         "the recorded answer, not send_id_reuse"
     );
-    assert_eq!(rig.wal_bytes(), before, "a retry writes nothing");
+    assert_eq!(rig.records().await, before, "a retry writes nothing");
 
     let queued = rig
         .send_with(
@@ -1738,7 +1677,7 @@ async fn a_keyed_resend_with_an_edited_title_gets_the_recorded_answer_and_keeps_
         )
         .await;
     let run_2 = pending_run_id(&queued);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let queued_retry = rig
         .send_with(
             "turn-2",
@@ -1748,7 +1687,7 @@ async fn a_keyed_resend_with_an_edited_title_gets_the_recorded_answer_and_keeps_
         )
         .await;
     assert_eq!(body_text(&queued_retry), body_text(&queued));
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     let untitled_retry = rig.send("turn-2", "next", None).await;
     assert_eq!(
         body_text(&untitled_retry),
@@ -1759,7 +1698,7 @@ async fn a_keyed_resend_with_an_edited_title_gets_the_recorded_answer_and_keeps_
     rig.script.hold_model(false);
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let finished = rig
         .send_with(
             "turn-1",
@@ -1769,61 +1708,24 @@ async fn a_keyed_resend_with_an_edited_title_gets_the_recorded_answer_and_keeps_
         )
         .await;
     assert_golden_admitting(&finished, "send_reply.finished.json", &run_1);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(
-        titles(&rig.records()),
+        titles(&rig.records().await),
         [
             ("run_started", Some("First".to_owned())),
             ("queued", Some("Queued first".to_owned())),
             ("run_started", Some("Queued first".to_owned())),
         ]
     );
-    assert_eq!(indexed_title(&rig, &run_1).as_deref(), Some("First"));
-    assert_eq!(indexed_title(&rig, &run_2).as_deref(), Some("Queued first"));
     assert_eq!(
         result(&run_status(&mut rig, &run_1).await)["title"],
         "First"
     );
-    assert_eq!(head_title(&mut rig).await.as_deref(), Some("Queued first"));
-    rig.finish().await;
-}
-
-/// The run index is written only at admission, so a row written before titles existed has no
-/// title. `run.status` then answers from the run's `RunStarted` in the WAL. Simulated by
-/// clearing the column in the store file; `session.head` is rebuilt the same way, from the WAL,
-/// when the store is deleted outright.
-#[tokio::test]
-async fn status_and_head_fall_back_to_the_wal_when_the_store_has_no_title() {
-    let mut rig = Rig::start_with_idle_ttl("title-fallback", Duration::from_millis(100)).await;
-    let run_1 = run_id_of(
-        &rig.send_with(
-            "turn-1",
-            "hi",
-            None,
-            serde_json::json!({"title": "From the WAL"}),
-        )
-        .await,
-    );
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-    let store = rig.dir.join("store.db");
-    rusqlite::Connection::open(&store)
-        .unwrap()
-        .execute("UPDATE run_index SET title = NULL", [])
-        .unwrap();
-    rig = rig.restart().await;
-    assert_eq!(indexed_title(&rig, &run_1), None);
     assert_eq!(
-        result(&run_status(&mut rig, &run_1).await)["title"],
-        "From the WAL"
+        result(&run_status(&mut rig, &run_2).await)["title"],
+        "Queued first"
     );
-    rig.wait_closed().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(rig.dir.join(format!("store.db{suffix}")));
-    }
-    rig = rig.restart().await;
-    assert_eq!(head_title(&mut rig).await.as_deref(), Some("From the WAL"));
+    assert_eq!(head_title(&mut rig).await.as_deref(), Some("Queued first"));
     rig.finish().await;
 }
 
@@ -1843,7 +1745,7 @@ async fn invalid_run_limits_are_refused_by_field_without_writes() {
         .into_iter()
         .enumerate()
         {
-            let before = rig.wal_bytes();
+            let before = rig.records().await;
             let mut extra = serde_json::json!({});
             extra[group] = serde_json::json!({member: value});
             let frame = rig
@@ -1852,7 +1754,7 @@ async fn invalid_run_limits_are_refused_by_field_without_writes() {
             let error: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
             assert_eq!(error["code"], "invalid_params", "{field}: {error}");
             assert_eq!(error["detail"]["field"], field, "{error}");
-            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(rig.records().await, before);
         }
     }
     rig.finish().await;

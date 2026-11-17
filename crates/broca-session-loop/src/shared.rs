@@ -64,6 +64,10 @@ pub enum Request {
         barrier: bool,
         reply: Reply<u64>,
     },
+    /// Asks for the records the run's copy lacks, appending nothing.
+    CaughtUp {
+        reply: Reply<Missed>,
+    },
     SendRecords {
         submission_id: String,
         reply: Reply<(Missed, Vec<Record>)>,
@@ -326,6 +330,11 @@ impl Writer for ActorWriter {
         Ok(first)
     }
 
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        let missed = self.ask(|reply| Request::CaughtUp { reply }).await?;
+        self.catch_up(missed)
+    }
+
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
         let (missed, records) = self
             .ask(|reply| Request::SendRecords {
@@ -538,6 +547,9 @@ impl RunLink {
             Request::Held { reply, .. } => {
                 // Only a hold may be followed by its batch.
                 let _ = reply.send(Err(SessionError::OwnerGone));
+            }
+            Request::CaughtUp { reply } => {
+                let _ = reply.send(Ok(std::mem::take(&mut self.missed)));
             }
             Request::SendRecords {
                 submission_id,
@@ -791,6 +803,35 @@ mod tests {
             writer.conversation().encode(),
             session.conversation().encode()
         );
+    }
+
+    /// Catching up folds what the actor appended since the run's last call and appends nothing,
+    /// so a read of the run's copy between appends (the queue a boundary delivers from) sees
+    /// the session's records.
+    #[tokio::test]
+    async fn catching_up_folds_the_actors_records_without_appending() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let before = session.next_seq();
+        let run = async {
+            assert!(texts(&writer).is_empty());
+            writer.caught_up().await.unwrap();
+            texts(&writer)
+        };
+        let seen = tokio::select! {
+            biased;
+            seen = run => seen,
+            () = actor(&mut session, &mut link, |n| if n == 0 { vec![input("queued")] } else { Vec::new() }) => unreachable!(),
+        };
+        assert_eq!(seen, ["queued"], "the copy missed the actor's record");
+        assert_eq!(
+            session.next_seq(),
+            before + 1,
+            "catching up appended a record"
+        );
+        assert_eq!(writer.next_seq(), session.next_seq());
+        assert_eq!(writer.operations().encode(), session.operations().encode());
     }
 
     /// A seal runs on the session itself and replaces the run's copy, so the window the run sees

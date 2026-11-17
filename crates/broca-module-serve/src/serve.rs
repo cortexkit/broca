@@ -58,10 +58,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MEMORY_REPORT,
-    OP_MOVE_TO_STORE, OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_REQUEST_DUMP,
-    OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET,
-    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_DELETE,
-    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
+    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_REQUEST_DUMP, OP_RESTORE_FROM_BACKUP, OP_RETRACT,
+    OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS,
+    OP_SEND, OP_SEND_STATUS, OP_SESSION_DELETE, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE,
+    OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -892,7 +892,7 @@ impl ServeEnd {
     }
 }
 
-/// Serve one authenticated subc connection with the default catalog and archive configuration.
+/// Serve one authenticated subc connection with the default catalog and configuration.
 pub async fn serve_connection<R, W, H>(
     read_half: R,
     write_half: W,
@@ -942,7 +942,6 @@ where
         health_registry,
         vault_gauge,
         catalog_cache,
-        crate::wal_archive::WalArchiveConfig::default(),
         crate::consumer_routes::ConsumerRoutes::default(),
         None,
         None,
@@ -951,7 +950,7 @@ where
     .await
 }
 
-/// Serve with the same boot configuration that controls the archive timer.
+/// Serve with the process's boot configuration.
 ///
 /// `daemon_capabilities` is the capability list the daemon answered `server.describe` with at
 /// startup; `None` falls back to the list in this connection's HELLO_ACK, which the daemon
@@ -969,7 +968,6 @@ pub async fn serve_connection_configured<R, W, H>(
     health_registry: Arc<LineageRegistry>,
     vault_gauge: Arc<VaultGauge>,
     catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
-    archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: crate::consumer_routes::ConsumerRoutes,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
@@ -988,7 +986,6 @@ where
         health_registry,
         vault_gauge,
         catalog_cache,
-        archive,
         consumer_routes,
         vault_auditor,
         daemon_capabilities,
@@ -1008,7 +1005,6 @@ pub async fn serve_connection_with_agent_data<R, W, H>(
     health_registry: Arc<LineageRegistry>,
     vault_gauge: Arc<VaultGauge>,
     catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
-    archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: crate::consumer_routes::ConsumerRoutes,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
@@ -1028,7 +1024,6 @@ where
         health_registry,
         vault_gauge,
         catalog_cache,
-        archive,
         consumer_routes,
         vault_auditor,
         daemon_capabilities,
@@ -1050,7 +1045,6 @@ pub async fn serve_connection_with_services<R, W, H>(
     health_registry: Arc<LineageRegistry>,
     vault_gauge: Arc<VaultGauge>,
     catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
-    archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: crate::consumer_routes::ConsumerRoutes,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
@@ -1071,7 +1065,6 @@ where
         health_registry,
         vault_gauge,
         catalog_cache,
-        archive,
         consumer_routes,
         vault_auditor,
         daemon_capabilities,
@@ -1093,7 +1086,6 @@ pub async fn serve_connection_with_llm_tools<R, W, H>(
     health_registry: Arc<LineageRegistry>,
     vault_gauge: Arc<VaultGauge>,
     catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
-    archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: crate::consumer_routes::ConsumerRoutes,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
@@ -1130,7 +1122,6 @@ where
             vault_gauge.as_ref(),
             catalog_cache.as_deref(),
             conn_cancel.clone(),
-            archive,
             &consumer_routes,
             vault_auditor,
             daemon_capabilities,
@@ -1186,7 +1177,6 @@ async fn run_frame_loop<R, H>(
     vault_gauge: &VaultGauge,
     catalog_cache: Option<&broca_catalog::CatalogCache>,
     conn_cancel: CancellationToken,
-    archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: &crate::consumer_routes::ConsumerRoutes,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
     daemon_capabilities: Option<Vec<String>>,
@@ -1202,7 +1192,6 @@ where
     send_hello(
         &writer,
         module_id,
-        archive,
         consumer_routes,
         system_one
             .as_ref()
@@ -2181,7 +2170,6 @@ async fn handle_control_request(
             let mut metrics = serde_json::json!({
                     "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
                     "retention_unreadable_sessions": retention_unreadable,
-                    "retention_repairs_pending": health_registry.retention_repairs_pending(),
                     "provider_held": held_runtime,
                     "stall_watchdog": crate::stall::health_gauges(),
                     // The identity of THIS process, so a caller can tell "my work finished while I
@@ -2253,7 +2241,6 @@ async fn handle_control_request(
                     "session_reads": broca_module::registry::session_reads(),
                     "actor_opens": broca_module::registry::actor_opens(),
                     "management_ops": management_operation_counts(),
-            "wal_archive_polls": crate::wal_archive::wal_archive_polls(),
             "bus_events": crate::bus_events::health(),
             "compaction_bus": crate::compaction_bus::health(),
             // The subscriber fan-out's own counters. NOT related to frames_dropped_*
@@ -2304,9 +2291,6 @@ async fn handle_control_request(
             // Which deployment key the new session storage is opened with, and whether it has
             // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
             metrics["store"] = crate::store_key::health();
-            metrics["session_conversion"] =
-                serde_json::to_value(crate::session_conversion::health())
-                    .map_err(|error| ServeIoError(error.to_string()))?;
             metrics["usage_observe"] = crate::usage_observe::published_metrics();
             metrics["account_limit_stale_resets"] =
                 serde_json::json!(broca_core::account_limit_stale_resets());
@@ -2948,10 +2932,6 @@ where
                 &format!("{method} is for the operator only"),
             )
             .await;
-        }
-        if let Some((converting, reason)) = handler.conversion_refusal(&session) {
-            let body = conversion_refusal(converting, &reason);
-            return send_error_body(&writer, ver, channel, epoch, corr, body).await;
         }
         // Establish storage ownership before authorization or dispatch can answer from today's
         // WAL. Without a store runtime the rollback guard refuses every op; with one, only ops
@@ -3942,47 +3922,6 @@ where
                 }
             }
         }
-        OP_MOVE_TO_STORE => {
-            // Only the operator's own connection moves a session: the move changes which
-            // storage serves it, and it can't be undone.
-            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
-                return send_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "operator_required",
-                    "session.move_to_store is for the operator only",
-                )
-                .await;
-            }
-            let class = match move_to_store_class(&req.params) {
-                Ok(class) => class,
-                Err(message) => {
-                    return send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_params",
-                        &message,
-                    )
-                    .await
-                }
-            };
-            match handler.move_to_store(session, class).await {
-                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
-                Err(refusal) => {
-                    let mut body = ErrorBody::new(refusal.code, refusal.message);
-                    if let Some(detail) = refusal.detail {
-                        body = body.with_detail(detail);
-                    }
-                    send_error_body(writer, ver, channel, epoch, corr, body).await
-                }
-            }
-        }
         OP_TAG_MAP => {
             // Checked again here so no path reaches the read without the operator's own
             // connection.
@@ -4847,7 +4786,11 @@ where
                 return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
                     .await;
             }
-            match handler.fork_prepare(session, bind.principal.as_ref()).await {
+            let started = std::time::Instant::now();
+            let result = handler.fork_prepare(session, bind.principal.as_ref()).await;
+            let fork_id = result.as_ref().ok().map(|reply| reply.fork_id.as_str());
+            log_fork_op("prepare", session, fork_id, None, None, &result, started);
+            match result {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_fork_error(writer, ver, channel, epoch, corr, &error).await,
             }
@@ -4870,10 +4813,29 @@ where
                     .await;
                 }
             };
-            match handler
+            let started = std::time::Instant::now();
+            let (fork_id, ask_id) = (request.fork_id.clone(), request.ask_id.clone());
+            let result = handler
                 .fork_ask(session, bind.principal.as_ref(), request)
-                .await
-            {
+                .await;
+            // How the answer finished and its length, never its text.
+            let answered = result.as_ref().ok().map(|reply| {
+                format!(
+                    "finish={:?} answer_chars={}",
+                    reply.finish,
+                    reply.answer.chars().count()
+                )
+            });
+            log_fork_op(
+                "ask",
+                session,
+                Some(&fork_id),
+                Some(&ask_id),
+                answered.as_deref(),
+                &result,
+                started,
+            );
+            match result {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_fork_error(writer, ver, channel, epoch, corr, &error).await,
             }
@@ -4896,10 +4858,13 @@ where
                     .await;
                 }
             };
-            match handler
+            let started = std::time::Instant::now();
+            let fork_id = request.fork_id.clone();
+            let result = handler
                 .fork_end(session, bind.principal.as_ref(), request)
-                .await
-            {
+                .await;
+            log_fork_op("end", session, Some(&fork_id), None, None, &result, started);
+            match result {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_fork_error(writer, ver, channel, epoch, corr, &error).await,
             }
@@ -5243,11 +5208,13 @@ fn delivery_has_mid(delivery: &Delivery) -> bool {
                 broca_protocol::caller::ControlUnit::MessageBoundary { .. }
             ) || matches!(
                 &event.2,
-                LiveEvent::MessageStarted(_)
-                    | LiveEvent::MessageFinished(_)
-                    | LiveEvent::ToolStarted(_)
-                    | LiveEvent::ToolFinished(_)
-                    | LiveEvent::NoticeDelivered(_)
+                Some(
+                    LiveEvent::MessageStarted(_)
+                        | LiveEvent::MessageFinished(_)
+                        | LiveEvent::ToolStarted(_)
+                        | LiveEvent::ToolFinished(_)
+                        | LiveEvent::NoticeDelivered(_)
+                )
             )
         }
         Delivery::Display(event) => match event.as_ref() {
@@ -5286,12 +5253,12 @@ fn public_delivery_mids(
                 translate(mid)?;
             }
             match live {
-                LiveEvent::MessageStarted(event) | LiveEvent::MessageFinished(event) => {
+                Some(LiveEvent::MessageStarted(event) | LiveEvent::MessageFinished(event)) => {
                     translate(&mut event.mid)?
                 }
-                LiveEvent::ToolStarted(event) => translate(&mut event.mid)?,
-                LiveEvent::ToolFinished(event) => translate(&mut event.mid)?,
-                LiveEvent::NoticeDelivered(event) => translate(&mut event.mid)?,
+                Some(LiveEvent::ToolStarted(event)) => translate(&mut event.mid)?,
+                Some(LiveEvent::ToolFinished(event)) => translate(&mut event.mid)?,
+                Some(LiveEvent::NoticeDelivered(event)) => translate(&mut event.mid)?,
                 _ => {}
             }
         }
@@ -5325,7 +5292,7 @@ fn limit_live_arguments(
     limits: Option<&cortexkit_role_llm_runner::display::Limits>,
 ) -> Delivery {
     if let (Delivery::Control(frame), Some(limits)) = (&delivery, limits) {
-        if let cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) = &frame.2 {
+        if let Some(cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event)) = &frame.2 {
             let arguments: serde_json::Value =
                 serde_json::from_str(&event.arguments).expect("projected arguments are JSON");
             let mut limited = cortexkit_role_llm_runner::live::ToolStarted::new(
@@ -5344,7 +5311,9 @@ fn limit_live_arguments(
             return Delivery::Control(Arc::new((
                 frame.0,
                 frame.1.clone(),
-                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(limited),
+                Some(cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(
+                    limited,
+                )),
             )));
         }
     }
@@ -5374,7 +5343,7 @@ fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
                     (*cursor).into(),
                     unit,
                     seq,
-                    live_event,
+                    live_event.as_ref(),
                 ),
             )
         }
@@ -5463,11 +5432,10 @@ async fn send_subscribe_error_body(
 async fn send_hello(
     writer: &EgressSender<Frame>,
     module_id: &str,
-    archive: crate::wal_archive::WalArchiveConfig,
     consumer_routes: &crate::consumer_routes::ConsumerRoutes,
     image_references: bool,
 ) -> Result<(), ServeIoError> {
-    let mut manifest = crate::manifest::manifest_configured(module_id, archive, consumer_routes);
+    let mut manifest = crate::manifest::manifest_configured(module_id, consumer_routes);
     if image_references {
         for role in &mut manifest.provides {
             if let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = role {
@@ -5618,9 +5586,8 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
+        ServeError::UnknownSession => cortexkit_role_llm_runner::errors::UNKNOWN_SESSION.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
-        // Answered on the wire as the contract's `transient` code (see `conversion_refusal`).
-        ServeError::SessionConverting => "transient".into(),
         ServeError::SessionMoved { .. } => "session_moved".into(),
         ServeError::Expired { .. } => broca_module::retention::EXPIRED.into(),
         ServeError::RetentionInvalid(_) | ServeError::InvalidParams { .. } => {
@@ -5697,7 +5664,6 @@ fn refused_send_class(error: &ServeError) -> &'static str {
         | ServeError::ModuleStopping(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
-        | ServeError::SessionConverting
         | ServeError::SessionMoved { .. }
         | ServeError::SessionHeld(_)
         | ServeError::ScopeFreezeBusy { .. }
@@ -5728,23 +5694,6 @@ fn log_refused_send(
 fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
     let body = broca_module::serve::admission_refusal::upload_refusal(error, for_send);
     ErrorBody::new(body.code, body.message).with_detail(body.detail.expect("upload detail"))
-}
-
-/// The class `session.move_to_store`'s params ask the session to move into: none, so it keeps
-/// its WAL's class, or `"durable"`, for a session in `wal/` that belongs in the backed-up root.
-/// Any other value is refused, by message.
-fn move_to_store_class(
-    params: &serde_json::Value,
-) -> Result<Option<broca_wal::StorageClass>, String> {
-    match params.get("class") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(class))
-            if class == broca_wal::StorageClass::Durable.name() =>
-        {
-            Ok(Some(broca_wal::StorageClass::Durable))
-        }
-        Some(other) => Err(format!("class must be \"durable\" when given, not {other}")),
-    }
 }
 
 /// Whether `session.restore_from_backup`'s params ask for every session kept in the new
@@ -5909,21 +5858,6 @@ async fn send_store_outcome<H: ServeHandler + ?Sized>(
     }
 }
 
-/// The refusal of an operation on a session that is converting to the new storage
-/// (`converting`, `reason` saying why: the background pass holds it, or the startup window holds
-/// every session), or that could not be converted (`reason` its refusal class).
-fn conversion_refusal(converting: bool, reason: &str) -> ErrorBody {
-    if converting {
-        // Clears by itself in seconds, so it's answered with the contract's retryable code;
-        // callers decide retries by code alone. The cause names what to wait for.
-        return ErrorBody::new("transient", reason)
-            .with_detail(serde_json::json!({"class": "transient", "cause": "session_converting"}));
-    }
-    ErrorBody::new("session_unconverted", "this session could not be converted").with_detail(
-        serde_json::json!({"class": "permanent", "refusal_class": reason, "retryable": false}),
-    )
-}
-
 async fn send_serve_error(
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -5982,10 +5916,6 @@ async fn send_serve_error(
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())
                 .with_detail(serde_json::json!({"cutId":cut_id}));
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
-        ServeError::SessionConverting => {
-            let body = conversion_refusal(true, &err.to_string());
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::SessionMoved { holder } => {
@@ -6053,6 +5983,7 @@ async fn send_serve_error(
         ServeError::CursorExpired => "cursor_expired",
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND,
+        ServeError::UnknownSession => cortexkit_role_llm_runner::errors::UNKNOWN_SESSION,
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN,
         ServeError::ScopeRefused(_)
         | ServeError::ScopeFreezeBusy { .. }
@@ -6688,6 +6619,28 @@ async fn send_output_ref_refusal(
 }
 
 /// A fork operation's refusal (llm-runner `fork_answer`) under its code and detail.
+/// One line per fork operation, with its outcome: `ok` or the refusal code its caller got. A
+/// fork's caller is the only other party that sees the outcome, so without this line a failed
+/// ask leaves nothing to trace. Never the question or the answer.
+fn log_fork_op<T>(
+    op: &str,
+    session: &broca_module::LineageKey,
+    fork_id: Option<&str>,
+    ask_id: Option<&str>,
+    answered: Option<&str>,
+    result: &Result<T, broca_module::fork_answer::ForkError>,
+    started: std::time::Instant,
+) {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(_) => tracing::info!(target: "fork", op, session = %session.session, fork_id, ask_id,
+            outcome = "ok", answered, elapsed_ms, "fork operation"),
+        Err(error) => tracing::warn!(target: "fork", op, session = %session.session, fork_id,
+            ask_id, outcome = error.code(), message = %error.message(), elapsed_ms,
+            "fork operation refused"),
+    }
+}
+
 async fn send_fork_error(
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -7537,11 +7490,8 @@ mod tests {
             store
                 .record_withdrawal(&call, "failed", 1, &serde_json::json!({"code":code}))
                 .unwrap();
-            let service = broca_module::held_withdrawals::HeldWithdrawals::new(
-                store,
-                Arc::new(broca_core::FileWalStore::new(root.join("wal"))),
-                Arc::new(NoRetry),
-            );
+            let service =
+                broca_module::held_withdrawals::HeldWithdrawals::new(store, Arc::new(NoRetry));
             service.bind_stopping_signal(CancellationToken::new());
             service.recover().await.unwrap();
             let withdrawals = service.health();
@@ -8034,7 +7984,7 @@ mod tests {
         sink.send(Delivery::Control(Arc::new((
             broca_core::Cursor::new(42, 1),
             unit,
-            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+            Some(cortexkit_role_llm_runner::live::LiveEvent::DisplayReset),
         ))))
         .await
         .unwrap();
@@ -8889,45 +8839,103 @@ mod tests {
             .expect("the serve loop's writer channel closed")
     }
 
+    /// The session address inventory, with the first scope-reservation read held until the
+    /// test releases it. A stamped bind reads its session's reservation in its adoption check
+    /// (a session with no run yet belongs to whoever reserved it), so holding that read holds
+    /// the bind's authorization in flight. An unstamped bind never reads it. Later reads
+    /// answer at once.
     struct HeldBindRead {
+        inventory: Arc<broca_store::SqliteStore>,
         entered: tokio::sync::Notify,
-        /// Holds the first history read until the test releases it. A bind may read again
-        /// after that (a store without range proofs is then decoded whole), and those later
-        /// reads return at once.
         release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         finished: tokio::sync::Notify,
-        records: Vec<broca_wal::FramedRecord>,
+        /// What the read answers in place of the inventory's own reservation: `None` reads the
+        /// inventory, `Some(Ok(reservation))` reports that reservation, `Some(Err)` fails.
+        answer: Option<Result<broca_store::session_address::ScopeReservation, String>>,
     }
 
-    impl broca_core::WalStore for HeldBindRead {
-        fn flush_for_read(
+    impl broca_store::SessionAddressResolver for HeldBindRead {
+        fn resolve_session_address(
             &self,
-            _: &BrocaBindIdentity,
-        ) -> Result<Option<u64>, broca_wal::WalError> {
-            // The fixture's immutable records are already durable; only their read timing is held.
-            Ok(None)
+            bind: &broca_protocol::BindIdentity,
+            workdir: Option<&std::path::Path>,
+            reservation: Option<&broca_store::session_address::ScopeReservation>,
+        ) -> Result<broca_protocol::BindIdentity, broca_store::session_address::SessionAddressError>
+        {
+            broca_store::SessionAddressResolver::resolve_session_address(
+                &*self.inventory,
+                bind,
+                workdir,
+                reservation,
+            )
         }
-        fn wal_present(&self, _: &BrocaBindIdentity) -> Option<bool> {
-            Some(true)
-        }
-        fn open(
+
+        fn scope_reservation(
             &self,
-            _: &BrocaBindIdentity,
-        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-            panic!("bind ownership must not open an actor")
-        }
-        fn read_records(
-            &self,
-            _: &BrocaBindIdentity,
-        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            session: &broca_protocol::BindIdentity,
+        ) -> Result<
+            Option<broca_store::session_address::ScopeReservation>,
+            broca_store::session_address::SessionAddressError,
+        > {
             let gate = self.release.lock().unwrap().take();
             if let Some(gate) = gate {
                 self.entered.notify_one();
                 gate.recv().unwrap();
                 self.finished.notify_one();
             }
-            Ok(self.records.clone())
+            match &self.answer {
+                None => broca_store::SessionAddressResolver::scope_reservation(
+                    &*self.inventory,
+                    session,
+                ),
+                Some(Ok(reservation)) => Ok(Some(reservation.clone())),
+                Some(Err(reason)) => {
+                    Err(broca_store::session_address::SessionAddressError::store_error(reason))
+                }
+            }
         }
+
+        fn session_log_state(
+            &self,
+            session: &broca_protocol::BindIdentity,
+            wal: &dyn broca_core::WalStore,
+        ) -> Result<
+            broca_store::session_log_evidence::SessionLogState,
+            broca_store::session_log_evidence::SessionLogError,
+        > {
+            broca_store::SessionAddressResolver::session_log_state(&*self.inventory, session, wal)
+        }
+    }
+
+    /// A registry whose stamped binds' adoption checks wait on the returned [`HeldBindRead`]
+    /// until the returned release is dropped, then read `answer` (see [`HeldBindRead::answer`]).
+    fn held_bind_registry_answering(
+        answer: Option<Result<broca_store::session_address::ScopeReservation, String>>,
+    ) -> (Arc<LineageRegistry>, Arc<HeldBindRead>, ReleaseBindRead) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "serve-held-bind-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("run-index.db");
+        let inventory = Arc::new(broca_store::SqliteStore::open(&db).unwrap());
+        broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(&root))
+            .unwrap();
+        let (release, read_gate) = std::sync::mpsc::channel();
+        let store = Arc::new(HeldBindRead {
+            inventory,
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(Some(read_gate)),
+            finished: tokio::sync::Notify::new(),
+            answer,
+        });
+        let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+        registry.set_session_address_resolver(
+            store.clone() as Arc<dyn broca_store::SessionAddressResolver>
+        );
+        (Arc::new(registry), store, ReleaseBindRead(Some(release)))
     }
 
     struct ReleaseBindRead(Option<std::sync::mpsc::Sender<()>>);
@@ -9101,29 +9109,8 @@ mod tests {
     }
 
     fn held_bind_registry() -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
-        held_bind_registry_with_records(vec![])
-    }
-
-    fn held_bind_registry_with_records(
-        records: Vec<broca_wal::FramedRecord>,
-    ) -> (BindIngress, Arc<HeldBindRead>, ReleaseBindRead) {
-        let (release, read_gate) = std::sync::mpsc::channel();
-        let store = Arc::new(HeldBindRead {
-            entered: tokio::sync::Notify::new(),
-            release: std::sync::Mutex::new(Some(read_gate)),
-            finished: tokio::sync::Notify::new(),
-            records,
-        });
-        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
-            Arc::new(RefusingOpener),
-            store.clone(),
-            None,
-        )));
-        (
-            BindIngress::new(registry),
-            store,
-            ReleaseBindRead(Some(release)),
-        )
+        let (registry, store, release) = held_bind_registry_answering(None);
+        (BindIngress::new(registry), store, release)
     }
 
     #[tokio::test]
@@ -9227,68 +9214,17 @@ mod tests {
 
     #[tokio::test]
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
-        let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
-        let record = broca_wal::WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            ts_ms: None,
-            run_id: broca_protocol::RunId("legacy".into()),
-            session,
-            config: Box::new(broca_wal::RunConfig {
-                account_route: None,
-                global_system: None,
-                route_decision_id: None,
-                served_provider: None,
-                account_limit_pause: false,
-                turn_directives_v1: None,
-                render_tags: false,
-                computed_tags: None,
-                model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-                tools: vec![].into(),
-                tool_choice: Default::default(),
-                generation: Default::default(),
-                response_format: Default::default(),
-                provider_options: serde_json::Value::Null,
-                cache_tiers: serde_json::Value::Null,
-                context_epoch: 0,
-                renderer_version: 1,
-                frozen_render_config: serde_json::json!({"test": true}),
-                auth_selection: None,
-                tools_were_omitted: false,
-                budget: None,
-                context_limit: None,
-                work_class: None,
-                variant: None,
-                service_tier: None,
-                stop_when: vec![],
-                context_management: None,
-            }),
-            input: vec![].into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: None,
-        };
-        let (mut ingress, store, release) =
-            held_bind_registry_with_records(vec![broca_wal::FramedRecord {
-                seq: 1,
-                fence: 1,
-                record,
-            }]);
+        // The session's address was reserved by another scope, so the stamped replacement's
+        // adoption check refuses it.
+        let (registry, store, release) = held_bind_registry_answering(Some(Ok(
+            broca_store::session_address::ScopeReservation {
+                owner: broca_protocol::BindPrincipal::Reserved {
+                    module_id: "someone-else".into(),
+                },
+                scope_ref: "other".into(),
+            },
+        )));
+        let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "published", false).await;
         next_written(&mut ingress.written).await;
         let sink = ingress.subscribe(1, 10).await;
@@ -9303,43 +9239,18 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
-            "scope_adoption_refused"
+            "scope_owner_mismatch"
         );
         ingress.goodbye(2).await;
         assert_eq!(ingress.routes.by_channel[&7].0, 1);
         ingress.assert_delivery(&sink, 1, 10).await;
     }
 
-    /// A WAL store whose every record read fails, so no ownership source can answer.
-    struct UnreadableBindHistory;
-
-    impl broca_core::WalStore for UnreadableBindHistory {
-        fn wal_present(&self, _: &BrocaBindIdentity) -> Option<bool> {
-            Some(true)
-        }
-        fn open(
-            &self,
-            _: &BrocaBindIdentity,
-        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-            panic!("bind ownership must not open an actor")
-        }
-        fn read_records(
-            &self,
-            _: &BrocaBindIdentity,
-        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-            Err(broca_wal::WalError::Io(std::io::Error::other(
-                "injected unreadable history",
-            )))
-        }
-    }
-
     #[tokio::test]
     async fn stamped_bind_with_unreadable_history_is_refused_not_published() {
-        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
-            Arc::new(RefusingOpener),
-            Arc::new(UnreadableBindHistory),
-            None,
-        )));
+        let (registry, _store, release) =
+            held_bind_registry_answering(Some(Err("the inventory is unreadable".into())));
+        drop(release);
         let mut ingress = BindIngress::new(registry);
         ingress.bind(1, "unreadable", true).await;
         ingress.complete_bind().await;
@@ -9558,19 +9469,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_answers_ping_and_goodbye_while_bind_ownership_read_is_held() {
-        let (release, read_gate) = std::sync::mpsc::channel();
-        let release = ReleaseBindRead(Some(release));
-        let store = Arc::new(HeldBindRead {
-            entered: tokio::sync::Notify::new(),
-            release: std::sync::Mutex::new(Some(read_gate)),
-            finished: tokio::sync::Notify::new(),
-            records: vec![],
-        });
-        let registry = Arc::new(test_registry(LineageRegistry::new_with_reader(
-            Arc::new(RefusingOpener),
-            store.clone(),
-            None,
-        )));
+        let (registry, store, release) = held_bind_registry_answering(None);
         let (mut daemon, module) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(module);
         let serve = tokio::spawn(serve_connection(
@@ -9989,7 +9888,6 @@ mod tests {
                 &VaultGauge::not_in_use(),
                 None,
                 CancellationToken::new(),
-                crate::wal_archive::WalArchiveConfig::default(),
                 &crate::consumer_routes::ConsumerRoutes::default(),
                 None,
                 None,
@@ -10544,7 +10442,6 @@ mod tests {
                 &VaultGauge::not_in_use(),
                 None,
                 CancellationToken::new(),
-                crate::wal_archive::WalArchiveConfig::default(),
                 &crate::consumer_routes::ConsumerRoutes::default(),
                 None,
                 None,
@@ -10717,7 +10614,6 @@ mod tests {
                 &VaultGauge::not_in_use(),
                 None,
                 CancellationToken::new(),
-                crate::wal_archive::WalArchiveConfig::default(),
                 &crate::consumer_routes::ConsumerRoutes::default(),
                 None,
                 None,
@@ -10873,7 +10769,6 @@ mod tests {
                 &VaultGauge::not_in_use(),
                 None,
                 CancellationToken::new(),
-                crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
                 None,
                 None,
@@ -10981,7 +10876,6 @@ mod tests {
                 &VaultGauge::not_in_use(),
                 None,
                 CancellationToken::new(),
-                crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
                 None,
                 None,
@@ -11127,7 +11021,6 @@ mod tests {
                 &VaultGauge::not_in_use(),
                 None,
                 CancellationToken::new(),
-                crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
                 None,
                 None,
@@ -11211,10 +11104,10 @@ mod tests {
                 .is_some(),
             "health.check always exposes the stale account-reset counter"
         );
-        assert_eq!(
-            health["metrics"]["retention_repairs_pending"].as_u64(),
-            Some(0),
-            "health.check includes the retention repair backlog, zero included"
+        // The retention repair queue served the WAL's deletions and went with it.
+        assert!(
+            health["metrics"].get("retention_repairs_pending").is_none(),
+            "health.check no longer reports a retention repair backlog"
         );
         assert!(
             health["metrics"]["serve_frames_dropped_unbound_channel"]
@@ -11701,26 +11594,3 @@ mod classifier_route_tests;
 #[cfg(test)]
 #[path = "serve_flow_compat_tests.rs"]
 mod flow_management_compat_tests;
-
-#[cfg(test)]
-mod background_conversion_errors {
-    use super::*;
-
-    #[tokio::test]
-    async fn background_live_registry_refusal_is_retryable_session_converting_on_wire() {
-        let error = ServeError::from(broca_module::registry::OpenError::SessionConverting);
-        assert_eq!(refused_send_code(&error), "transient");
-        assert_eq!(refused_send_class(&error), "transient");
-        let (writer, mut reader) = broca_diagnostics::channel(1, std::sync::Arc::default());
-        send_serve_error(&writer, PROTOCOL_VERSION, 7, 3, 11, &error)
-            .await
-            .unwrap();
-        let frame = reader.recv().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error);
-        let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(body.code, "transient");
-        let detail = body.detail.unwrap();
-        assert_eq!(detail["class"], "transient");
-        assert_eq!(detail["cause"], "session_converting");
-    }
-}

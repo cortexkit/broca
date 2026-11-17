@@ -1,14 +1,14 @@
 use super::*;
 use broca_core::tool_plane::LateResultRegistration;
-use broca_core::FileWalStore;
 use broca_module::late_results_puller::{FeedError, FeedReply, HeldDelivery, LateResultsFeed};
-use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
-use broca_protocol::{BatchId, MessageId, RunId, StepId, ToolCallId};
-use broca_wal::{DispatchOutcome, WalRecord};
+use broca_protocol::ToolCallId;
 use cortexkit_role_tool_provider::late_results::{Cursor, LateEntry};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// A provider's late-results feed with one entry, which records that intake pulled it. No
+/// session store is installed, so the entry is only pulled, never delivered: what the tests
+/// using it observe is when intake starts reading the feed.
 #[derive(Default)]
 struct Feed(AtomicBool);
 
@@ -20,6 +20,7 @@ impl LateResultsFeed for Feed {
         _: Option<&Cursor>,
         _: Option<u32>,
     ) -> Result<FeedReply, FeedError> {
+        self.0.store(true, Ordering::SeqCst);
         Ok(FeedReply {
             entries: vec![LateEntry::new(
                 "result",
@@ -52,7 +53,6 @@ impl HeldDelivery for Feed {
         _: &ToolCallId,
         _: &LateEntry,
     ) -> Result<(), String> {
-        self.0.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -72,130 +72,6 @@ impl WithdrawTransport for NoWithdraw {
     }
 }
 
-fn config() -> broca_wal::RunConfig {
-    broca_wal::RunConfig {
-        account_route: None,
-        global_system: None,
-        route_decision_id: None,
-        served_provider: None,
-        account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: vec![],
-        context_management: None,
-    }
-}
-
-fn records(bind: &BindIdentity) -> Vec<WalRecord> {
-    vec![
-        WalRecord::RunStarted {
-            message_marks: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            compaction_plan_version: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            ts_ms: Some(1),
-            run_id: RunId("run".into()),
-            session: bind.clone(),
-            config: Box::new(config()),
-            input: vec![].into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: None,
-        },
-        WalRecord::ModelStepFinished {
-            raw_finish_reason: None,
-            fallback: Default::default(),
-            written_at_ms: None,
-            tags: None,
-            hooks: None,
-            step_id: StepId(1),
-            assistant_message: Arc::new(AssistantMessage {
-                message_id: MessageId("m".into()),
-                content: vec![ContentBlock::ToolCall(ToolCall {
-                    tool_call_id: ToolCallId("a".into()),
-                    tool_name: "ask".into(),
-                    input: json!({}).into(),
-                    thought_signature: None,
-                })],
-            }),
-            usage: Default::default(),
-            retries_used: 0,
-            finish_reason: None,
-            service_tier_used: None,
-            speed_used: None,
-        },
-        WalRecord::ToolBatchStarted {
-            batch_id: BatchId("b".into()),
-            step_id: StepId(1),
-            planned_calls: vec![ToolCallId("a".into())],
-        },
-    ]
-}
-
-fn intent(id: &str) -> WalRecord {
-    WalRecord::ToolDispatchIntent {
-        dispatched_at_ms: None,
-        batch_id: BatchId("b".into()),
-        tool_call_id: ToolCallId(id.into()),
-        tool_name: Some("ask".into()),
-        args: Arc::new(json!({})),
-        module_id: Some("basal".into()),
-        schema_pin: None,
-        hooks: None,
-        approval_digest: None,
-        call_key: None,
-    }
-}
-
-fn write(wal: &FileWalStore, bind: &BindIdentity, records: &[WalRecord]) {
-    let path = wal.wal_path(bind);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let bytes: Vec<_> = records
-        .iter()
-        .enumerate()
-        .flat_map(|(i, record)| {
-            broca_wal::framing::encode_payload(
-                i as u64 + 1,
-                1,
-                &serde_json::to_vec(record).unwrap(),
-            )
-            .unwrap()
-        })
-        .collect();
-    std::fs::write(path, bytes).unwrap();
-}
-
 fn registration(key: String, bind: &BindIdentity) -> LateResultRegistration {
     LateResultRegistration {
         lineage: key.rsplit_once(':').unwrap().0.into(),
@@ -211,59 +87,15 @@ async fn large_stale_outbox_does_not_delay_held_result_intake() {
     let root = broca_test_support::scratch_root().join("held-runtime-pullers-first");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let wal = Arc::new(FileWalStore::new(root.join("wal")));
     let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
     let mut calls = Vec::new();
+    // A large stale withdrawal outbox: watches retained for calls whose intake already
+    // finished, so the withdrawal sweep has thousands of rows to walk.
     for session in 0..120 {
         let bind = BindIdentity::new("/project", "broca", format!("stale-{session:03}"));
-        let mut log = records(&bind);
-        if let WalRecord::ModelStepFinished {
-            assistant_message, ..
-        } = &mut log[1]
-        {
-            Arc::make_mut(assistant_message).content = (0..174)
-                .map(|call| {
-                    ContentBlock::ToolCall(ToolCall {
-                        tool_call_id: ToolCallId(format!("inline-{call}")),
-                        tool_name: "ask".into(),
-                        input: json!({}).into(),
-                        thought_signature: None,
-                    })
-                })
-                .collect();
-        }
-        if let WalRecord::ToolBatchStarted { planned_calls, .. } = &mut log[2] {
-            *planned_calls = (0..174)
-                .map(|call| ToolCallId(format!("inline-{call}")))
-                .collect();
-        }
         for call in 0..174 {
-            let key = format!("stale-{session}:{}", log.len() + 1);
-            let id = format!("inline-{call}");
-            log.push(intent(&id));
-            log.push(WalRecord::ToolResult {
-                finished_at_ms: None,
-                tags: None,
-                hooks: None,
-                batch_id: BatchId("b".into()),
-                result: Arc::new(broca_protocol::ToolResult {
-                    tool_call_id: ToolCallId(id),
-                    output: broca_protocol::ToolOutput::Text {
-                        text: "inline".into(),
-                    },
-                    is_error: false,
-                }),
-                outcome: DispatchOutcome::Completed,
-                reason: None,
-                withdraw_elicitation: None,
-                provider_held: None,
-            });
-            calls.push(registration(key, &bind));
+            calls.push(registration(format!("stale-{session}:{}", call + 4), &bind));
         }
-        log.push(WalRecord::ToolBatchFinished {
-            batch_id: BatchId("b".into()),
-        });
-        write(&wal, &bind, &log);
     }
     store.register_calls(&calls).unwrap();
     // Old intake pruning did not retire the independently retained withdrawal watches.
@@ -276,37 +108,17 @@ async fn large_stale_outbox_does_not_delay_held_result_intake() {
         )
         .unwrap();
     let held = BindIdentity::new("/project", "broca", "held");
-    let mut log = records(&held);
-    log.push(intent("a"));
-    log.push(WalRecord::ToolCallProviderHeld {
-        batch_id: BatchId("b".into()),
-        tool_call_id: ToolCallId("a".into()),
-        call_key: "held:4".into(),
-        module: "basal".into(),
-        reason: "running".into(),
-        detail_digest: None,
-        held_at_ms: 1,
-        sequential: false,
-    });
-    log.push(WalRecord::RunPaused {
-        account_limit: None,
-        run_id: RunId("run".into()),
-        reason: broca_protocol::PauseReason::ToolHeld,
-        error: None,
-        ts_ms: Some(2),
-    });
-    write(&wal, &held, &log);
     store
         .register_calls(&[registration("held:4".into(), &held)])
         .unwrap();
     let feed = Arc::new(Feed::default());
-    let withdrawals = HeldWithdrawals::new(store.clone(), wal.clone(), Arc::new(NoWithdraw));
-    let intake = LateResultsIntake::new(store.clone(), wal, "broca", feed.clone(), feed.clone());
+    let withdrawals = HeldWithdrawals::new(store.clone(), Arc::new(NoWithdraw));
+    let intake = LateResultsIntake::new(store.clone(), "broca", feed.clone(), feed.clone());
     let runtime = Arc::new(HeldRuntime {
         slots: HeldSlots::new(),
         intake,
         store,
-        wal_root: root,
+        state_root: root,
         needs_rebuild: false,
         withdrawals,
         progress: Arc::new(Mutex::new(RebuildReport::default())),

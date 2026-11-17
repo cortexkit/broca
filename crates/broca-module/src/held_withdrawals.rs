@@ -8,12 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use broca_core::{
-    tool_plane::{LateResultRegistration, ProviderHeldReply},
-    FileWalStore, WalStore,
-};
-use broca_protocol::RunFinishReason;
-use broca_wal::{DispatchOutcome, FramedRecord, WalRecord};
+use broca_core::tool_plane::{LateResultRegistration, ProviderHeldReply};
 use cortexkit_role_tool_provider::withdraw::WithdrawVerdict;
 use serde_json::{json, Value};
 
@@ -37,7 +32,6 @@ pub trait WithdrawTransport: Send + Sync {
 
 pub struct HeldWithdrawals {
     store: Arc<LateResultsStore>,
-    wal: Arc<FileWalStore>,
     transport: Arc<dyn WithdrawTransport>,
     active: Mutex<HashSet<(String, String)>>,
     health: Mutex<Value>,
@@ -53,14 +47,9 @@ struct SweepProgress {
 }
 
 impl HeldWithdrawals {
-    pub fn new(
-        store: Arc<LateResultsStore>,
-        wal: Arc<FileWalStore>,
-        transport: Arc<dyn WithdrawTransport>,
-    ) -> Arc<Self> {
+    pub fn new(store: Arc<LateResultsStore>, transport: Arc<dyn WithdrawTransport>) -> Arc<Self> {
         Arc::new(Self {
             store,
-            wal,
             transport,
             active: Mutex::default(),
             health: Mutex::new(json!({"failed": 0, "pending": 0, "scope_gone": 0})),
@@ -133,7 +122,6 @@ impl HeldWithdrawals {
             sweep.running = true;
         }
         let _sweep = SweepGuard(&self.sweep);
-        self.store.prune_tombstoned()?;
         let mut sessions: HashMap<_, Vec<_>> = HashMap::new();
         for (call, state, attempts) in self.store.withdrawal_rows()? {
             if state != "failed" {
@@ -163,18 +151,48 @@ impl HeldWithdrawals {
                     _ = tokio::time::sleep(RECOVERY_BATCH_INTERVAL) => {}
                 }
             }
-            if self
-                .store_runtime
-                .get()
-                .and_then(std::sync::Weak::upgrade)
+            let runtime = self.store_runtime.get().and_then(std::sync::Weak::upgrade);
+            let held = runtime
+                .as_ref()
                 .map(|runtime| runtime.holds(&bind).map_err(|error| error.to_string()))
                 .transpose()?
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if let (true, Some(runtime)) = (held, runtime) {
                 sessions_read += 1;
                 for (call, _, attempts) in &rows {
-                    match self.drive(call.clone(), *attempts, None).await {
+                    match self.drive(call.clone(), *attempts).await {
                         Ok(sent) => withdrawals_sent += sent,
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                // Every registered call gets a watch, and a call answered without a hold, or
+                // whose run ended, never needs one. Retiring those here keeps the outbox from
+                // growing with every call. A watch a withdrawal above already attempted stays.
+                // A call answered inline gives up its registration too; a held one keeps it for
+                // intake, since its provider may still send the result.
+                let keys: Vec<String> = rows
+                    .iter()
+                    .map(|(call, _, _)| call.call_key.clone())
+                    .collect();
+                if let Some(settled) =
+                    crate::late_results_puller::settled_watches(&runtime, &bind, &keys).await
+                {
+                    let module = |key: &str| {
+                        rows.iter()
+                            .find(|(call, _, _)| call.call_key == key)
+                            .map(|(call, _, _)| (call.module.clone(), key.to_owned()))
+                    };
+                    let (inline, held): (Vec<_>, Vec<_>) =
+                        settled.into_iter().partition(|watch| watch.inline);
+                    let inline: Vec<_> =
+                        inline.iter().filter_map(|w| module(&w.call_key)).collect();
+                    let held: Vec<_> = held.iter().filter_map(|w| module(&w.call_key)).collect();
+                    match self
+                        .store
+                        .remove_inline_calls(&inline)
+                        .and_then(|inline| Ok(inline + self.store.retire_watches(&held)?))
+                    {
+                        Ok(removed) => rows_settled += removed,
                         Err(error) => failure = Some(error),
                     }
                 }
@@ -182,42 +200,12 @@ impl HeldWithdrawals {
                 tokio::task::yield_now().await;
                 continue;
             }
-            // One immutable WAL snapshot serves every row in the session, including cleanup.
-            // Never let the number of old inline calls multiply whole-log decoding at boot.
-            match self.wal.read_records(&bind) {
-                Ok(records) => {
-                    sessions_read += 1;
-                    let facts = broca_core::held_call_facts(&records, None);
-                    let inline: Vec<_> = rows
-                        .iter()
-                        .filter(|(call, state, _)| {
-                            state == "watching"
-                                && crate::late_results_puller::inline_registration_settled(
-                                    &call.call_key,
-                                    &records,
-                                    &facts,
-                                )
-                        })
-                        .map(|(call, _, _)| (call.module.clone(), call.call_key.clone()))
-                        .collect();
-                    match self.store.remove_inline_calls(&inline) {
-                        Ok(settled) => rows_settled += settled,
-                        Err(error) => failure = Some(error),
-                    }
-                    for (call, _, attempts) in &rows {
-                        if stopping.is_cancelled() {
-                            break;
-                        }
-                        if cancelled_hold(&records, &call.call_key) {
-                            match self.drive(call.clone(), *attempts, Some(&records)).await {
-                                Ok(sent) => withdrawals_sent += sent,
-                                Err(error) => failure = Some(error),
-                            }
-                        }
-                    }
-                }
-                Err(error) => failure = Some(error.to_string()),
-            }
+            // The store doesn't hold the session, or isn't installed yet: its cancellations
+            // can't be read, so the rows stay for a later sweep.
+            failure = Some(format!(
+                "held withdrawals wait: no session store holds {}",
+                broca_core::session_addr(&bind)
+            ));
             self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
             tokio::task::yield_now().await;
         }
@@ -231,12 +219,7 @@ impl HeldWithdrawals {
         Ok(())
     }
 
-    async fn drive(
-        &self,
-        call: LateResultRegistration,
-        mut attempts: u32,
-        snapshot: Option<&[FramedRecord]>,
-    ) -> Result<u32, String> {
+    async fn drive(&self, call: LateResultRegistration, mut attempts: u32) -> Result<u32, String> {
         let stopping = self
             .stopping
             .get()
@@ -268,7 +251,7 @@ impl HeldWithdrawals {
         attempts = attempts.max(durable_attempts);
         // Live callers arrive only after sync. Recovery reads the same sealed log: an open
         // hold, a shutdown pause, or an interrupted restart is never a withdrawal intent.
-        let Some(session_identity) = self.cancellation_identity(&call, snapshot).await? else {
+        let Some(session_identity) = self.cancellation_identity(&call).await? else {
             return Ok(0);
         };
         let mut sent = 0;
@@ -339,34 +322,22 @@ impl HeldWithdrawals {
         Ok(sent)
     }
 
+    /// Whether `call` was cancelled while held, and if so whether its withdrawal names the
+    /// session's identity. `None` when it wasn't cancelled, or the store doesn't hold it.
     async fn cancellation_identity(
         &self,
         call: &LateResultRegistration,
-        snapshot: Option<&[FramedRecord]>,
     ) -> Result<Option<bool>, String> {
-        if let Some(runtime) = self.store_runtime.get().and_then(std::sync::Weak::upgrade) {
-            if runtime
-                .holds(&call.bind)
-                .map_err(|error| error.to_string())?
-            {
-                return store::cancellation_identity(&runtime, call).await;
-            }
-        }
-        let records;
-        let records = match snapshot {
-            Some(records) => records,
-            None => {
-                records = self
-                    .wal
-                    .read_records(&call.bind)
-                    .map_err(|error| error.to_string())?;
-                &records
-            }
+        let Some(runtime) = self.store_runtime.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(None);
         };
-        if !cancelled_hold(records, &call.call_key) {
+        if !runtime
+            .holds(&call.bind)
+            .map_err(|error| error.to_string())?
+        {
             return Ok(None);
         }
-        withdrawal_uses_session_identity(records, call).map(Some)
+        store::cancellation_identity(&runtime, call).await
     }
 }
 
@@ -397,7 +368,7 @@ impl Drop for Active<'_> {
 impl HeldWithdrawal for HeldWithdrawals {
     async fn withdraw(&self, reply: &ProviderHeldReply) -> Result<(), String> {
         if let Some(call) = self.store.withdrawal_call(&reply.module, &reply.call_key)? {
-            let result = self.drive(call, 0, None).await.map(|_| ());
+            let result = self.drive(call, 0).await.map(|_| ());
             if let Err(error) = &result {
                 self.health.lock().expect("withdrawal health")["error"] = json!(error);
             }
@@ -405,88 +376,4 @@ impl HeldWithdrawal for HeldWithdrawals {
         }
         Ok(())
     }
-}
-
-/// Read the plan active when the original call was dispatched, not a later session refresh.
-pub(crate) fn withdrawal_uses_session_identity(
-    records: &[FramedRecord],
-    call: &LateResultRegistration,
-) -> Result<bool, String> {
-    let mut manifest = None;
-    for record in records {
-        match &record.record {
-            WalRecord::RunStarted {
-                manifest: frozen, ..
-            } => manifest = frozen.as_deref(),
-            WalRecord::ToolDispatchIntent { call_key, .. }
-                if broca_core::tool_call_key(
-                    Some(&call.lineage),
-                    record.seq,
-                    call_key.as_deref(),
-                )
-                .as_deref()
-                    == Some(call.call_key.as_str()) =>
-            {
-                return match manifest {
-                    Some(manifest) => broca_core::ToolManifest::from_tools(Vec::new())
-                        .with_plan_manifest(manifest)
-                        .map(|manifest| manifest.uses_session_identity(&call.module))
-                        .map_err(|error| format!("withdrawal plan is unreadable: {error}")),
-                    None => Ok(false),
-                };
-            }
-            _ => {}
-        }
-    }
-    Err("withdrawal dispatch intent is missing".into())
-}
-
-fn cancelled_hold(records: &[FramedRecord], key: &str) -> bool {
-    let mut held = None;
-    for frame in records {
-        match &frame.record {
-            WalRecord::RunStarted { .. } => held = None,
-            WalRecord::ToolCallProviderHeld {
-                call_key,
-                batch_id,
-                tool_call_id,
-                ..
-            } if call_key == key => held = Some((batch_id, tool_call_id, true)),
-            WalRecord::ToolResult {
-                batch_id,
-                result,
-                outcome,
-                reason,
-                ..
-            } => {
-                if let Some((batch, call, eligible)) = &mut held {
-                    if *batch == batch_id && *call == &result.tool_call_id {
-                        // Only the typed synthetic cancellation terminal preserves the
-                        // withdrawal intent. A provider-delivered terminal settles this call,
-                        // even if a sibling later causes the whole run to be cancelled.
-                        *eligible = *outcome == DispatchOutcome::Interrupted
-                            && reason.as_deref() == Some("provider_held_cancelled");
-                    }
-                }
-            }
-            WalRecord::ToolNoDispatch {
-                batch_id,
-                tool_call_id,
-                ..
-            } => {
-                if let Some((batch, call, eligible)) = &mut held {
-                    if *batch == batch_id && *call == tool_call_id {
-                        *eligible = false;
-                    }
-                }
-            }
-            WalRecord::RunFinished {
-                reason: RunFinishReason::Cancelled,
-                ..
-            } if held.is_some_and(|(_, _, eligible)| eligible) => return true,
-            WalRecord::RunFinished { .. } => held = None,
-            _ => {}
-        }
-    }
-    false
 }

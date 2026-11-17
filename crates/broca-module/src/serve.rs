@@ -72,19 +72,6 @@ impl SessionReadRequest {
     }
 }
 
-/// The ordinal a `mid` names: broca spells a message's id `m<ordinal>`. `None` for any other
-/// spelling, which names no message.
-fn ordinal_of_mid(mid: &str) -> Option<u64> {
-    let digits = mid.strip_prefix('m')?;
-    let digits = digits
-        .split_once('.')
-        .map_or(digits, |(_, position)| position);
-    let canonical = !digits.is_empty()
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
-        && (digits == "0" || !digits.starts_with('0'));
-    canonical.then(|| digits.parse().ok()).flatten()
-}
-
 fn json_bytes(value: &impl Serialize) -> u64 {
     broca_protocol::serialized_json_bytes(value)
 }
@@ -378,35 +365,6 @@ pub(crate) struct ChangeRead {
 }
 
 impl ChangeRead {
-    /// What the WAL `records` say, for a request naming `generation` and `send_id`.
-    pub(crate) fn of_wal(
-        records: &[broca_wal::FramedRecord],
-        generation: Option<u64>,
-        send_id: Option<&str>,
-    ) -> Self {
-        let first_run = first_run_started(records).and_then(|start| match start {
-            broca_wal::WalRecord::RunStarted {
-                scope, principal, ..
-            } => Some((scope.clone(), principal.clone())),
-            _ => None,
-        });
-        let opener = records
-            .iter()
-            .rev()
-            .find_map(|record| match &record.record {
-                broca_wal::WalRecord::RunStarted {
-                    scope: Some(scope), ..
-                } => scope_plan_opener(scope),
-                _ => None,
-            });
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(records);
-        Self {
-            first_run,
-            opener,
-            facts: crate::plan_change::ChangeFacts::of(&change, generation, send_id),
-        }
-    }
-
     /// The caller's refusal when it isn't the session's owner, or when the session has no run
     /// yet and so no baseline to change.
     fn check_owner(
@@ -816,109 +774,11 @@ pub fn session_read_response(
         },
         tools,
         tools_run_id,
-        deferred_calls: page
-            .deferred_calls
-            .as_ref()
-            .map(crate::approval::call_views),
-        late_approvals: page
-            .deferred_calls
-            .as_ref()
-            .map(|_| crate::approval::late_views(&page.late_approvals)),
+        // Deferred approvals were retired: no session records a deferred or late-approved call.
+        deferred_calls: None,
+        late_approvals: None,
         open_batch: None,
     }
-}
-
-/// The durable terminal of run `run_id`'s episode, if the WAL holds one: its reason and error.
-fn durable_terminal(
-    records: &[broca_wal::FramedRecord],
-    run_id: &broca_protocol::RunId,
-) -> Option<(
-    broca_protocol::caller::RunFinishReason,
-    Option<broca_protocol::ProviderError>,
-)> {
-    let start = records.iter().position(|framed| {
-        matches!(&framed.record, broca_wal::WalRecord::RunStarted { run_id: id, .. } if id == run_id)
-    })?;
-    records[start + 1..]
-        .iter()
-        .take_while(|framed| !matches!(framed.record, broca_wal::WalRecord::RunStarted { .. }))
-        .find_map(|framed| match &framed.record {
-            broca_wal::WalRecord::RunFinished { reason, error, .. } => {
-                Some((*reason, error.clone()))
-            }
-            _ => None,
-        })
-}
-
-/// The session's first `RunStarted`: its start record, which froze what the session runs with.
-fn first_run_started(records: &[broca_wal::FramedRecord]) -> Option<&broca_wal::WalRecord> {
-    records
-        .iter()
-        .map(|framed| &framed.record)
-        .find(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
-}
-
-/// The baseline the session's first `RunStarted` (`start`) froze: built from its plan manifest
-/// when the session was admitted with a fetch plan, else only the tool names in its config.
-fn baseline_of(start: &broca_wal::WalRecord) -> broca_wire::BaselineWire {
-    match start {
-        broca_wal::WalRecord::RunStarted {
-            manifest: Some(manifest),
-            ..
-        } => planned_baseline(manifest),
-        broca_wal::WalRecord::RunStarted { config, .. } => broca_wire::BaselineWire::plan_less(
-            config.tools.iter().map(|tool| tool.name.clone()).collect(),
-        ),
-        _ => broca_wire::BaselineWire::plan_less(Vec::new()),
-    }
-}
-
-/// `send.status` read from a session's whole WAL, `frames`: what became of the send `send_id`
-/// whose run id the serve layer derived as `own_run`, asked by `principal`. `lineage` is the
-/// WAL's lineage id, which names the carrying call of a notice delivered before notices
-/// recorded their call key.
-pub(crate) fn send_status_of_records(
-    frames: Vec<broca_wal::FramedRecord>,
-    lineage: Option<broca_wal::WalLineageId>,
-    own_run: broca_protocol::RunId,
-    send_id: &str,
-    principal: Option<&broca_protocol::BindPrincipal>,
-) -> Result<broca_wire::SendReplyWire, ServeError> {
-    let senders = broca_core::AdmissionCheckpointV1::from_frames(&frames)
-        .map_err(|error| ServeError::Open(error.to_string(), None))?
-        .ownership
-        .unwrap_or_default()
-        .effective_senders();
-    let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
-    let (own_run, lookup_sender) =
-        if let Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }) = principal {
-            crate::send_fate::resolve_retry_run_id(&records, &own_run, send_id, sender, &senders)
-                .map(|(id, sender)| (id, Some(sender)))
-                .map_err(|_| ServeError::UnknownSend)?
-        } else {
-            (own_run, principal.cloned())
-        };
-    if crate::send_fate::recorded_send_sender(&records, &own_run)
-        .is_some_and(|sender| Some(sender) != lookup_sender.as_ref())
-    {
-        return Err(ServeError::UnknownSend);
-    }
-    let legacy_steers = crate::send_fate::legacy_steers_allowed(&records, &own_run);
-    let outcome = crate::send_fate::recorded_send_outcome(
-        &records,
-        &own_run,
-        send_id,
-        legacy_steers,
-        lineage,
-    )
-    .ok_or(ServeError::UnknownSend)?;
-    send_status_reply(outcome, &own_run, || {
-        records
-            .iter()
-            .find(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
-            .filter(|record| matches!(record, broca_wal::WalRecord::RunStarted { run_id, .. } if run_id == &own_run))
-            .map(baseline_of)
-    })
 }
 
 /// The `send.status` reply for a send's recorded `outcome`. `baseline` is the baseline the
@@ -1030,25 +890,6 @@ pub(crate) fn planned_baseline(manifest: &broca_wal::PlanManifest) -> broca_wire
     )
 }
 
-/// Why the caller is not the owner the start record `start` names, if it is not: the frozen
-/// scope's owner when the session is scoped, else the principal of the session's first send. A
-/// session whose start record names neither has no recorded owner to hold a caller to.
-fn baseline_owner_mismatch(
-    start: &broca_wal::WalRecord,
-    principal: Option<&broca_protocol::BindPrincipal>,
-    scope: &broca_protocol::SendScope,
-) -> Option<broca_core::OwnerMismatch> {
-    let broca_wal::WalRecord::RunStarted {
-        scope: frozen,
-        principal: first,
-        ..
-    } = start
-    else {
-        return None;
-    };
-    owner_mismatch(frozen.as_ref(), first.as_ref(), principal, scope)
-}
-
 /// Why the caller is not the owner a session's first run recorded, if it is not: the owner of
 /// the scope it froze, `frozen`, when the session is scoped, else the principal of its first
 /// send, `first`. A session whose first run recorded neither has no owner to hold a caller to.
@@ -1092,81 +933,6 @@ pub fn scope_plan_opener(scope: &broca_protocol::SessionScope) -> Option<String>
     })
 }
 
-/// Whether `run.result` cleans the final reply of the run `run_id` of tag notation, when the run
-/// started on the current compaction contract: its frozen config and manifest decide it. `None`
-/// for any other run, whose reply's own tag flags decide.
-pub(crate) fn clean_reply_of(
-    records: &[broca_wal::FramedRecord],
-    run_id: &broca_protocol::RunId,
-) -> Option<bool> {
-    records.iter().find_map(|frame| match &frame.record {
-        broca_wal::WalRecord::RunStarted {
-            run_id: id,
-            config,
-            manifest,
-            compaction_plan_version: Some(_),
-            ..
-        } if id == run_id => Some(broca_core::compaction_v2::metadata::clean_replies_for_run(
-            config,
-            manifest.as_deref(),
-        )),
-        _ => None,
-    })
-}
-
-/// The final assistant message of the completed run `run_id`: the last assistant message of the
-/// transcript as it stood when that run's episode ended. Its text parts are joined in order with
-/// nothing inserted, and its reasoning parts are left out.
-pub(crate) fn final_message_of(
-    records: &[broca_wal::FramedRecord],
-    run_id: &broca_protocol::RunId,
-    clean_reply: Option<bool>,
-) -> Result<broca_wire::FinalMessage, ServeError> {
-    // Missing records and replay failures do not expose a retryable I/O cause.
-    let started = |framed: &broca_wal::FramedRecord| matches!(&framed.record, broca_wal::WalRecord::RunStarted { run_id: id, .. } if id == run_id);
-    let Some(start) = records.iter().position(started) else {
-        return Err(ServeError::Open(
-            format!("run '{}' has no readable RunStarted", run_id.0),
-            None,
-        ));
-    };
-    let end = records[start + 1..]
-        .iter()
-        .position(|framed| matches!(framed.record, broca_wal::WalRecord::RunStarted { .. }))
-        .map_or(records.len(), |offset| start + 1 + offset);
-    let transcript = broca_core::replay_transcript(&records[..end])
-        .map_err(|error| ServeError::Open(format!("replay failed: {error}"), None))?;
-    final_message_from_prompt(&transcript, run_id, clean_reply)
-}
-
-fn final_message_from_prompt(
-    transcript: &[broca_protocol::Message],
-    run_id: &broca_protocol::RunId,
-    clean_reply: Option<bool>,
-) -> Result<broca_wire::FinalMessage, ServeError> {
-    let (ordinal, message) = transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, message)| message.role == broca_protocol::content::Role::Assistant)
-        .ok_or_else(|| {
-            ServeError::Open(
-                format!("completed run '{}' has no assistant message", run_id.0),
-                None,
-            )
-        })?;
-    let ordinal = message.ordinal.unwrap_or(ordinal as u64);
-    // The reconstructed message's tag flags also drive provider requests. Caller text follows
-    // the run's frozen exposure policy, including compaction views that show numbers without
-    // legacy tags.
-    let clean = clean_reply.unwrap_or_else(|| broca_protocol::tags::cleans_model_text(message));
-    Ok(broca_wire::FinalMessage {
-        ordinal: ordinal + 1,
-        mid: format!("m{ordinal}"),
-        text: joined_text(message, clean),
-    })
-}
-
 /// A run's final message's text, as `run.result` serves it: its text parts joined in order with
 /// nothing inserted, its reasoning parts left out. `clean` says whether the run that wrote it
 /// cleans the model's text of tag notation on every exposure.
@@ -1182,56 +948,6 @@ pub(crate) fn joined_text(message: &broca_protocol::Message, clean: bool) -> Str
             _ => None,
         })
         .collect()
-}
-
-pub(crate) fn recorded_interrupt_reason(
-    records: &[broca_wal::FramedRecord],
-    run_id: &broca_protocol::RunId,
-) -> Option<String> {
-    let mut current = None;
-    let mut reason = None;
-    for frame in records {
-        match &frame.record {
-            broca_wal::WalRecord::RunStarted { run_id, .. } => current = Some(run_id),
-            broca_wal::WalRecord::RunFinished {
-                reason: broca_protocol::RunFinishReason::Interrupted,
-                interrupt_reason,
-                ..
-            } if current == Some(run_id) => reason = interrupt_reason.clone(),
-            _ => {}
-        }
-    }
-    reason
-}
-
-pub(crate) fn wake_directive_requested(
-    records: &[broca_wal::FramedRecord],
-    run_id: &broca_protocol::RunId,
-) -> bool {
-    records
-        .iter()
-        .rev()
-        .find_map(|frame| match &frame.record {
-            broca_wal::WalRecord::RunStarted {
-                run_id: id, config, ..
-            } if id == run_id => Some(config.turn_directives_v1.as_ref().is_some_and(|names| {
-                names.contains(&cortexkit_role_llm_runner::directives::DirectiveName::Wake)
-            })),
-            _ => None,
-        })
-        .unwrap_or(false)
-}
-
-pub(crate) fn completed_directives(
-    records: &[broca_wal::FramedRecord],
-    run_id: &broca_protocol::RunId,
-    text: &str,
-) -> Option<Vec<cortexkit_role_llm_runner::directives::Directive>> {
-    // Parse the stored final message, never a provider request decorated with runner tags.
-    if !wake_directive_requested(records, run_id) {
-        return None;
-    }
-    wake_directives(text)
 }
 
 /// The directives a completed run that asked for the `wake` directive reports: the one its final
@@ -1328,67 +1044,6 @@ pub(crate) struct RunToolCallsPageContext<'a> {
     pub(crate) seed: Option<&'a RunToolCallsCursor>,
 }
 
-struct RunToolCallBuilder {
-    call: cortexkit_role_llm_runner::tool_calls::RunToolCall,
-    has_intent: bool,
-    terminal: bool,
-}
-
-fn committed_tool_step_ordinals(
-    records: &[broca_wal::FramedRecord],
-) -> std::collections::HashMap<u64, u64> {
-    let wal_records: Vec<_> = records.iter().map(|framed| framed.record.clone()).collect();
-    let Ok(replayed) = broca_core::replay::replay(&wal_records) else {
-        return std::collections::HashMap::new();
-    };
-    replayed
-        .committed_tool_turns
-        .into_iter()
-        .filter_map(|(ordinal, record_index)| {
-            records
-                .get(record_index)
-                .map(|framed| (framed.seq, ordinal as u64))
-        })
-        .collect()
-}
-
-fn run_tool_call_records(
-    range: &broca_wal::WalRangeRead,
-) -> Result<&[broca_wal::FramedRecord], ServeError> {
-    match range.records() {
-        broca_wal::WalRangeRecords::Complete(records) => Ok(records),
-        broca_wal::WalRangeRecords::Absent => Ok(&[]),
-        broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {
-            Err(ServeError::Open(
-                "run.tool_calls could not establish a complete WAL range".into(),
-                Some(broca_protocol::ErrorClass::Transient),
-            ))
-        }
-    }
-}
-
-fn run_tool_call_bounds(records: &[broca_wal::FramedRecord], run_id: &str) -> Option<(u64, u64)> {
-    let start = records.iter().position(|framed| {
-        matches!(&framed.record, broca_wal::WalRecord::RunStarted { run_id: started, .. } if started.0 == run_id)
-    })?;
-    let start_seq = records[start].seq;
-    let mut end_seq = records.last().map_or(start_seq, |framed| framed.seq);
-    for framed in &records[start + 1..] {
-        match &framed.record {
-            broca_wal::WalRecord::RunFinished { .. } => {
-                end_seq = framed.seq;
-                break;
-            }
-            broca_wal::WalRecord::RunStarted { .. } => {
-                end_seq = framed.seq.saturating_sub(1);
-                break;
-            }
-            _ => {}
-        }
-    }
-    Some((start_seq, end_seq))
-}
-
 pub(crate) fn run_tool_call_outcome(
     outcome: broca_wal::record::DispatchOutcome,
     has_intent: bool,
@@ -1407,252 +1062,6 @@ pub(crate) fn run_tool_call_outcome(
         DispatchOutcome::Completed if is_error => outcomes::FAILED,
         DispatchOutcome::Completed => outcomes::SUCCEEDED,
     }
-}
-
-/// Walk WAL records in transcript order so call ordinals match the assistant message that asked
-/// for them. Tool results are used only to count their stored bytes; their content is never copied
-/// into the run-call response.
-fn indexed_run_tool_calls(
-    records: &[broca_wal::FramedRecord],
-    target_run_id: &str,
-    lineage_id: Option<&str>,
-    seed: Option<&RunToolCallsCursor>,
-    step_ordinals: &std::collections::HashMap<u64, u64>,
-) -> Result<Vec<IndexedRunToolCall>, ServeError> {
-    use broca_wal::WalRecord;
-    use cortexkit_role_llm_runner::tool_calls::outcomes;
-
-    let mut entries = Vec::new();
-    let mut current_run = seed.map(|_| target_run_id.to_owned());
-    let mut prompt_len = seed.map_or(0, |cursor| cursor.ordinal);
-    let mut pending_steers = 0u64;
-    let mut active_calls: Vec<RunToolCallBuilder> = Vec::new();
-    let mut active_step_seq = 0u64;
-    let mut active_step_ordinal = 0u64;
-    let mut active_batch_id: Option<String> = None;
-
-    let finish_calls = |calls: &mut Vec<RunToolCallBuilder>,
-                        step_seq: u64,
-                        batch_end_seq: u64,
-                        ordinal: u64,
-                        entries: &mut Vec<IndexedRunToolCall>| {
-        for (call_index, builder) in calls.iter_mut().enumerate() {
-            if !builder.terminal && builder.has_intent {
-                builder.call.outcome = outcomes::INDETERMINATE.into();
-            }
-            if !builder.call.outcome.is_empty() {
-                entries.push(IndexedRunToolCall {
-                    call: builder.call.clone(),
-                    step_seq,
-                    call_index,
-                    batch_end_seq,
-                    ordinal,
-                    after_batch: Vec::new(),
-                });
-            }
-        }
-    };
-
-    for framed in records {
-        match &framed.record {
-            WalRecord::RunStarted { run_id, input, .. } => {
-                current_run = Some(run_id.0.clone());
-                prompt_len = prompt_len.saturating_add(input.len() as u64);
-                pending_steers = 0;
-                active_calls.clear();
-                active_batch_id = None;
-            }
-            WalRecord::StepStarted { .. } => {
-                prompt_len = prompt_len.saturating_add(pending_steers);
-                pending_steers = 0;
-            }
-            WalRecord::ModelStepFinished {
-                assistant_message, ..
-            } => {
-                active_calls.clear();
-                active_batch_id = None;
-                active_step_seq = framed.seq;
-                active_step_ordinal = step_ordinals
-                    .get(&framed.seq)
-                    .copied()
-                    .unwrap_or(prompt_len);
-                let calls: Vec<_> = assistant_message.tool_calls().collect();
-                if current_run.as_deref() == Some(target_run_id) {
-                    active_calls.extend(calls.iter().enumerate().map(|(position, call)| {
-                        RunToolCallBuilder {
-                            call: cortexkit_role_llm_runner::tool_calls::RunToolCall::new(
-                                call.tool_call_id.0.clone(),
-                                call.tool_name.clone(),
-                                call.input.clone().parse(),
-                                "",
-                                active_step_ordinal + 1,
-                            )
-                            .with_position(position as u32),
-                            has_intent: false,
-                            terminal: false,
-                        }
-                    }));
-                }
-                if calls.is_empty() {
-                    prompt_len = prompt_len.saturating_add(1);
-                }
-            }
-            WalRecord::ToolBatchStarted { batch_id, .. } => {
-                active_batch_id = Some(batch_id.0.clone());
-            }
-            WalRecord::ToolCallDeferred {
-                batch_id, call_id, ..
-            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
-                if let (Some(lineage_id), Some(call)) = (
-                    lineage_id,
-                    active_calls.iter_mut().find(|call| {
-                        call.call.tool_call_id == call_id.0
-                            && call.call.call_key.is_none()
-                            && !call.has_intent
-                            && !call.terminal
-                    }),
-                ) {
-                    call.call.call_key =
-                        broca_core::tool_call_key(Some(lineage_id), framed.seq, None);
-                }
-            }
-            WalRecord::ToolDispatchIntent {
-                batch_id,
-                tool_call_id,
-                args,
-                module_id,
-                call_key,
-                ..
-            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
-                if let Some(call) = active_calls.iter_mut().find(|call| {
-                    call.call.tool_call_id == tool_call_id.0 && !call.has_intent && !call.terminal
-                }) {
-                    call.has_intent = true;
-                    call.call.args = (**args).clone();
-                    call.call.dispatched_to = module_id.clone();
-                    call.call.call_key =
-                        broca_core::tool_call_key(lineage_id, framed.seq, call_key.as_deref());
-                }
-            }
-            WalRecord::ToolNoDispatch {
-                batch_id,
-                tool_call_id,
-                ..
-            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
-                let at = active_calls
-                    .iter()
-                    .position(|call| {
-                        call.call.tool_call_id == tool_call_id.0
-                            && !call.terminal
-                            && !call.has_intent
-                            && call.call.call_key.is_none()
-                    })
-                    .or_else(|| {
-                        active_calls.iter().position(|call| {
-                            call.call.tool_call_id == tool_call_id.0 && !call.terminal
-                        })
-                    });
-                if let Some(call) = at.and_then(|at| active_calls.get_mut(at)) {
-                    if call.call.call_key.is_none() {
-                        call.call.call_key =
-                            broca_core::tool_call_key(lineage_id, framed.seq, None);
-                    }
-                    call.call.outcome = outcomes::REFUSED.into();
-                    call.terminal = true;
-                }
-            }
-            WalRecord::ToolResult {
-                batch_id,
-                result,
-                outcome,
-                reason,
-                ..
-            } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
-                let at = active_calls.iter().position(|call| {
-                    call.call.tool_call_id == result.tool_call_id.0 && !call.terminal
-                });
-                if let Some(call) = at.and_then(|at| active_calls.get_mut(at)) {
-                    if call.call.call_key.is_none() {
-                        call.call.call_key =
-                            broca_core::tool_call_key(lineage_id, framed.seq, None);
-                    }
-                    call.call.outcome = run_tool_call_outcome(
-                        *outcome,
-                        call.has_intent,
-                        reason.as_deref(),
-                        result.is_error,
-                    )
-                    .into();
-                    call.call.result_bytes = Some(
-                        serde_json::to_vec(result.as_ref())
-                            .map_err(|error| {
-                                ServeError::Open(
-                                    format!("could not encode stored tool result size: {error}"),
-                                    None,
-                                )
-                            })?
-                            .len() as u64,
-                    );
-                    call.terminal = true;
-                }
-            }
-            WalRecord::ToolBatchFinished { batch_id }
-                if active_batch_id.as_deref() == Some(batch_id.0.as_str()) =>
-            {
-                if current_run.as_deref() == Some(target_run_id) {
-                    for builder in &mut active_calls {
-                        builder.call.result_ordinal = Some(active_step_ordinal + 2);
-                    }
-                    finish_calls(
-                        &mut active_calls,
-                        active_step_seq,
-                        framed.seq,
-                        active_step_ordinal,
-                        &mut entries,
-                    );
-                }
-                // Each batch adds two prompt messages—one assistant and one tool-role message,
-                // regardless of how many calls the batch contains.
-                prompt_len = prompt_len.saturating_add(2);
-                active_calls.clear();
-                active_batch_id = None;
-            }
-            WalRecord::Steered { input, .. } => {
-                pending_steers = pending_steers.saturating_add(input.len() as u64);
-            }
-            WalRecord::SendDelivered {
-                input: Some(input), ..
-            } => {
-                pending_steers = pending_steers.saturating_add(input.len() as u64);
-            }
-            WalRecord::BudgetFired { run_id, .. }
-                if current_run.as_deref() == Some(run_id.0.as_str()) =>
-            {
-                prompt_len = prompt_len.saturating_add(1);
-            }
-            WalRecord::RunFinished { .. } => {
-                if current_run.as_deref() == Some(target_run_id) {
-                    break;
-                } else {
-                    prompt_len = prompt_len.saturating_add(pending_steers);
-                    pending_steers = 0;
-                    current_run = None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if current_run.as_deref() == Some(target_run_id) && !active_calls.is_empty() {
-        finish_calls(
-            &mut active_calls,
-            active_step_seq,
-            records.last().map_or(active_step_seq, |record| record.seq),
-            active_step_ordinal,
-            &mut entries,
-        );
-    }
-    Ok(entries)
 }
 
 pub(crate) fn invalid_tool_call_cursor(message: &str) -> ServeError {
@@ -2269,7 +1678,6 @@ pub enum ServeError {
     SessionMoving {
         cut_id: String,
     },
-    SessionConverting,
     SessionMoved {
         holder: String,
     },
@@ -2396,6 +1804,8 @@ pub enum ServeError {
     UnknownMid(String),
     /// `run.result` names no run of the session.
     UnknownRun(String),
+    /// The session doesn't exist, and the request doesn't create it.
+    UnknownSession,
     /// The routing module refused to choose a provider account for the send; nothing was
     /// written.
     AccountSelectionRefused(broca_core::AccountSelectionRefusal),
@@ -2410,26 +1820,6 @@ pub enum ServeError {
     },
 }
 
-impl ServeError {
-    fn from_history_read(
-        error: OpenError,
-        _requested: Option<&str>,
-        after: Option<(Option<u64>, &str)>,
-    ) -> Self {
-        if let OpenError::SessionLogMissing {
-            read: Some(read), ..
-        } = &error
-        {
-            if let (Some(prompt_len), Some((after, mid))) = (read.prompt_len, after) {
-                if !after.is_some_and(|ordinal| ordinal < prompt_len) {
-                    return Self::UnknownMid(mid.into());
-                }
-            }
-        }
-        Self::from(error)
-    }
-}
-
 impl From<OpenError> for ServeError {
     fn from(e: OpenError) -> Self {
         match e {
@@ -2437,7 +1827,6 @@ impl From<OpenError> for ServeError {
                 session, harness, ..
             } => Self::SessionLogMissing { session, harness },
             OpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
-            OpenError::SessionConverting => Self::SessionConverting,
             OpenError::SessionMoved { holder } => Self::SessionMoved { holder },
             OpenError::Expired { expired_at_ms } => ServeError::Expired { expired_at_ms },
             OpenError::RetentionInvalid(detail) => ServeError::RetentionInvalid(detail),
@@ -2465,6 +1854,7 @@ impl From<OpenError> for ServeError {
             OpenError::NotServedOnNewStorage { feature } => {
                 ServeError::NotServedOnNewStorage { feature }
             }
+            OpenError::UnknownSession => ServeError::UnknownSession,
         }
     }
 }
@@ -2479,7 +1869,6 @@ impl std::fmt::Display for ServeError {
             Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
-            ServeError::SessionConverting => write!(f, "session is converting in the background"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
             ServeError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
@@ -2554,6 +1943,7 @@ impl std::fmt::Display for ServeError {
             ServeError::CursorExpired => f.write_str("the subscribe cursor is not held in this session log"),
             ServeError::UnknownMid(mid) => write!(f, "the lineage has no message '{mid}'"),
             ServeError::UnknownRun(run_id) => write!(f, "the session has no run '{run_id}'"),
+            ServeError::UnknownSession => f.write_str("session does not exist"),
             ServeError::AccountSelectionRefused(refusal) => write!(
                 f,
                 "routing refused to choose a provider account ({})",
@@ -2791,11 +2181,6 @@ pub trait ServeHandler: Send + Sync {
         Ok(false)
     }
 
-    /// A temporary cutover refusal, checked before authorization can read a source WAL.
-    fn conversion_refusal(&self, _session: &LineageKey) -> Option<(bool, String)> {
-        None
-    }
-
     /// The applied plan, read without opening an actor. `None` means the session is kept on
     /// the old storage, which does not serve this operation.
     async fn plan_view(
@@ -2852,20 +2237,6 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// `session.move_to_store`: moves the session from today's storage into the new storage
-    /// (see `registry::store_move`), into the root of `class` when the operator asked for one. A
-    /// handler without the new storage refuses by name.
-    async fn move_to_store(
-        &self,
-        _session: &LineageKey,
-        _class: Option<broca_wal::StorageClass>,
-    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
-        Err(crate::registry::store_move::MoveRefusal::new(
-            "store_unavailable",
-            "this module keeps no sessions in the new storage",
-        ))
-    }
-
     /// Where a file-source import may read from. `None` without the new storage.
     fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
         None
@@ -2906,17 +2277,6 @@ pub trait ServeHandler: Send + Sync {
         &self,
         _session: &LineageKey,
     ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
-        Ok(None)
-    }
-
-    /// Every durable record of the session's current lineage, oldest first, read under the
-    /// expiry check of run `run_id`. `None` from a handler that keeps no log reader. On-demand
-    /// history uses it for send metadata; output references use it to find a past compaction view.
-    async fn session_log(
-        &self,
-        _session: &LineageKey,
-        _run_id: &str,
-    ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
         Ok(None)
     }
 
@@ -3383,98 +2743,38 @@ impl crate::LineageRegistry {
                 )))),
             };
         }
-        let (records, _) = self
-            .read_durable_wal(session)
-            .await
-            .map_err(|error| SessionChangeError::Transient(wal_error(error.to_string())))?;
-        Ok(ChangeRead::of_wal(&records, generation, send_id))
-    }
-
-    /// Fill each message's `tool_calls` with what the WAL recorded about its calls' dispatch.
-    /// The facts of a turn in this read's WAL tail come with the page; an older turn's come from
-    /// the session's cache (see [`crate::LineageRegistry::tool_turn_dispatches`]).
-    async fn attribute_tool_calls(
-        &self,
-        session: &LineageKey,
-        response: &mut SessionReadResponse,
-        tail: &std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
-        prompt_len: u64,
-    ) -> Result<(), ServeError> {
-        let calls_of = |message: &broca_protocol::Message| -> Vec<String> {
-            message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    broca_protocol::content::ContentBlock::ToolCall(call) => {
-                        Some(call.tool_call_id.0.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let ordinals: Vec<u64> = response
-            .messages
-            .iter()
-            .filter_map(|message| {
-                if message
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.delivery.as_ref())
-                    .is_some_and(|delivery| {
-                        delivery.mode == broca_protocol::DeliveryMode::ToolResult
-                    })
-                {
-                    message.ordinal.checked_sub(2)
-                } else if !calls_of(&message.message).is_empty() {
-                    message.ordinal.checked_sub(1)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if ordinals.is_empty() {
-            return Ok(());
-        }
-        let Some(lineage_id) = response.lineage_id.clone() else {
-            // No lineage, so no call has a key; every call is reported with no dispatch fact.
-            for message in &mut response.messages {
-                message.tool_calls = calls_of(&message.message)
-                    .into_iter()
-                    .map(broca_wire::SessionReadToolCall::new)
-                    .collect();
-            }
-            return Ok(());
-        };
-        let dispatches = self
-            .tool_turn_dispatches(session, &lineage_id, tail, &ordinals, prompt_len)
-            .await?;
-        apply_tool_call_dispatches(response, &dispatches, &lineage_id);
-        Ok(())
+        // A session that doesn't exist has no run to change.
+        Ok(ChangeRead::default())
     }
 }
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn cached_session_owner(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        crate::LineageRegistry::cached_session_owner(self, session, principal)
+    }
+
     fn plan_readers_supported(
         &self,
         session: &LineageKey,
-        class: Option<&str>,
+        _class: Option<&str>,
     ) -> Result<bool, ServeError> {
         if self.store_holding(session)?.is_some() {
             return Ok(true);
         }
-        let starts_in_store = self.wal_written(session) != Some(true)
-            && (class == Some(crate::registry::HEAD_SESSION_CLASS)
-                || self.starts_new_sessions_in_store(class));
-        // A session that starts in the new storage but can't be created there yet (its key
-        // still loading after a start) is refused as retryable, as the opener and the send's own
-        // admission refuse it, never answered "not supported", which refuses the plan for good.
-        if starts_in_store && !self.store_can_create() {
+        // A session that can't be created yet (its key still loading after a start) is refused
+        // as retryable, as the opener and the send's own admission refuse it, never answered "not
+        // supported", which refuses the plan for good.
+        if !self.store_can_create() {
             if let Some(pending) = self.store_creation_pending() {
                 return Err(pending.into());
             }
         }
-        Ok(starts_in_store && self.store_can_create())
+        Ok(self.store_can_create())
     }
     async fn authorize_session_read(
         &self,
@@ -3543,13 +2843,6 @@ impl ServeHandler for crate::LineageRegistry {
     > {
         crate::LineageRegistry::check_plan_selection(self, plan).await
     }
-    fn cached_session_owner(
-        &self,
-        session: &LineageKey,
-        principal: Option<&broca_protocol::BindPrincipal>,
-    ) -> Option<bool> {
-        crate::LineageRegistry::cached_session_owner(self, session, principal)
-    }
     async fn run_event_get(
         &self,
         session: &LineageKey,
@@ -3602,9 +2895,11 @@ impl ServeHandler for crate::LineageRegistry {
                 })),
             };
         }
-        self.route_tag_location(session, tag)
-            .await
-            .map_err(ServeError::from)
+        // A session the store doesn't hold holds no part.
+        Ok(Some(broca_core::TagLocation {
+            found: None,
+            indexed_through: u64::MAX,
+        }))
     }
 
     async fn output_ref_history_version(
@@ -3668,28 +2963,6 @@ impl ServeHandler for crate::LineageRegistry {
             .await
             .and_then(|ownership| ownership.first_episode)
             .and_then(|first| first.manifest))
-    }
-
-    async fn session_log(
-        &self,
-        session: &LineageKey,
-        run_id: &str,
-    ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
-        let range = self
-            .read_run_tool_calls_range(session, run_id, 0, None, None)
-            .await?;
-        match range.records() {
-            broca_wal::WalRangeRecords::Complete(records) => Ok(Some(
-                records.iter().map(|framed| framed.record.clone()).collect(),
-            )),
-            broca_wal::WalRangeRecords::Absent => Ok(Some(Vec::new())),
-            broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {
-                Err(ServeError::Open(
-                    "the session log could not be read completely".into(),
-                    Some(broca_protocol::ErrorClass::Transient),
-                ))
-            }
-        }
     }
 
     async fn authorize_session(
@@ -3795,16 +3068,27 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
         use crate::actor::SendOutcome;
-        // A session with no WAL yet has no episode, and an owner's scoped bind may have reserved
-        // its address. Refuse anyone else's first send here, before staging media or opening the
-        // session's actor, which writes the WAL's first frame. The actor makes the same decision
-        // for a session whose WAL already exists. A session kept in the session store
-        // (`broca-session-store`, which keeps no WAL) never has a WAL however many runs it has,
-        // so a missing WAL says nothing about it: its store actor applies the reservation while
+        // broca keeps no input-token budget and doesn't declare `input_token_cap`, so a send
+        // naming one is refused before anything is staged or opened, rather than admitted and
+        // then failed when its run starts.
+        if req
+            .request
+            .budget
+            .as_ref()
+            .is_some_and(|budget| budget.max_input_tokens.is_some())
+        {
+            return Err(ServeError::InvalidParams {
+                field: "budget.max_input_tokens".into(),
+                message: "broca keeps no input-token budget (input_token_cap is not declared)"
+                    .into(),
+            });
+        }
+        // A session the store doesn't hold yet has no run, and an owner's scoped bind may have
+        // reserved its address. Refuse anyone else's first send here, before staging media or
+        // creating the session. Once the store holds it, its actor applies the reservation while
         // it has no run (`StoreActor::send_scope`).
         if req.request.scope != broca_protocol::SendScope::Internal
             && self.store_holding(&req.session)?.is_none()
-            && self.wal_written(&req.session) == Some(false)
         {
             // A reservation that cannot be read refuses the send as transient, never as "not
             // reserved", which would let anyone start the session.
@@ -4076,24 +3360,7 @@ impl ServeHandler for crate::LineageRegistry {
                 .send_status(own_run, send_id, principal)
                 .await;
         }
-        // As `read`: a head published meanwhile serves the answer once more, from there.
-        let today = async {
-            self.check_expired(session, Some(&own_run.0)).await?;
-            let (frames, lineage) = self.read_durable_wal(session).await?;
-            send_status_of_records(frames, lineage, own_run.clone(), send_id, principal)
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_status::StoreRead::new(&store, session, self)
-                        .send_status(own_run, send_id, principal)
-                        .await
-                }
-                None => Err(error),
-            },
-            served => served,
-        }
+        Err(ServeError::UnknownSend)
     }
 
     async fn plan_state(&self, session: &LineageKey) -> PlanState {
@@ -4182,11 +3449,6 @@ impl ServeHandler for crate::LineageRegistry {
                 ));
             }
         };
-        if ownership.episodes == 0 {
-            // Only a successful empty ownership read needs the extra fence;
-            // existing unreadable-history refusals keep their code and cause.
-            self.check_session_log(session).await?;
-        }
         // A stamp of another scope meets the refusal its first send would get, so the route is
         // never acknowledged for a session whose address another scope's bind reserved.
         let stamped = broca_protocol::SendScope::Stamped(scope.clone());
@@ -4211,27 +3473,7 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     fn kept_in_new_storage(&self, session: &LineageKey) -> Result<bool, ServeError> {
-        if self.store_holding(session)?.is_some() {
-            return Ok(true);
-        }
-        match self.store_owner_refusal(session)? {
-            // A move journal without a published head still follows today's authorization
-            // path, where the owner's standing is checked before the migration fence.
-            Some(OpenError::SessionMoving { .. }) | None => Ok(false),
-            Some(refusal) => Err(refusal.into()),
-        }
-    }
-
-    fn conversion_refusal(&self, session: &LineageKey) -> Option<(bool, String)> {
-        crate::LineageRegistry::conversion_refusal(self, session)
-    }
-
-    async fn move_to_store(
-        &self,
-        session: &LineageKey,
-        class: Option<broca_wal::StorageClass>,
-    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
-        crate::LineageRegistry::move_to_store(self, session, class).await
+        Ok(self.store_holding(session)?.is_some())
     }
 
     async fn restore_from_backup(
@@ -4252,13 +3494,7 @@ impl ServeHandler for crate::LineageRegistry {
                 .await
                 .map(Some);
         }
-        if self.wal_written(session) == Some(false) {
-            self.check_session_log(session)
-                .await
-                .map_err(ServeError::from)?;
-            return Err(crate::store_plan_view::Error::NoPlan);
-        }
-        Ok(None)
+        Err(crate::store_plan_view::Error::NoPlan)
     }
 
     async fn tag_map(
@@ -4271,14 +3507,7 @@ impl ServeHandler for crate::LineageRegistry {
                 .await
                 .map(Some);
         }
-        // No storage holds a session with no WAL and no head in the new storage: it reads as
-        // `session.read` reads it, an empty transcript, which numbers nothing, unless its
-        // history is known to be missing. Any other session is kept on today's storage.
-        if self.wal_written(session) == Some(false) {
-            self.check_session_log(session).await?;
-            return Ok(Some(broca_wire::tag_map::TagMapResponse::unnumbered()));
-        }
-        Ok(None)
+        Ok(Some(broca_wire::tag_map::TagMapResponse::unnumbered()))
     }
 
     async fn request_dump(
@@ -4298,14 +3527,10 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<Option<broca_wire::session_delete::DeleteResponse>, ServeError> {
         use crate::retention::store::OperatorDeletion;
         let Some(store) = self.store_holding(session)? else {
-            // No head in the new storage: a session today's storage keeps is refused by name,
-            // and an address holding no session at all has nothing to delete.
-            return match self.wal_written(session) {
-                Some(false) => Ok(Some(broca_wire::session_delete::DeleteResponse {
-                    deleted: false,
-                })),
-                _ => Ok(None),
-            };
+            // An address holding no session has nothing to delete.
+            return Ok(Some(broca_wire::session_delete::DeleteResponse {
+                deleted: false,
+            }));
         };
         let retention = self.handle().retention_service().ok_or_else(|| {
             ServeError::Transient("retention is not running in this module yet".into())
@@ -4472,256 +3697,15 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
-        if let Some(store) = self.store_holding(&req.session)? {
-            return crate::store_read::serve_read(self, &store, req).await;
-        }
-        // A read that found no head reads today's storage. A move may publish the session's
-        // head meanwhile, and today's storage then refuses the session as kept in the new
-        // storage: the read is then served once more, from there.
-        let again = req.clone();
-        let today: Result<SessionReadResponse, ServeError> = async move {
-            let before_history = self.history_read_version(&req.session).await?;
-            let late_only = req.late_after.is_some();
-            // A mid not of the form `m<ordinal>` names no message. The read still runs (from past
-            // the last ordinal, so it returns no message), because a read naming a stale lineage
-            // must be refused `lineage_changed` before its mid is checked, whatever the mid.
-            let after = req.after_mid.as_deref().map(ordinal_of_mid);
-            let from_ordinal = match after {
-                Some(Some(ordinal)) => Some(ordinal.saturating_add(1)),
-                Some(None) => Some(u64::MAX),
-                None => req.from_ordinal.map(|at| at.saturating_sub(1)),
-            };
-            let read = self
-                .route_read_page(
-                    &req.session,
-                    if late_only { Some(0) } else { from_ordinal },
-                    if late_only { Some(0) } else { req.limit },
-                    req.include_tools && !late_only,
-                )
-                .await;
-            let crate::registry::RouteReadPage {
-                at_seq,
-                mut page,
-                tools,
-                dispatches,
-                open_batch,
-                head_facts,
-                native_tool_outputs,
-                ..
-            } = read.map_err(|error| {
-                if late_only && matches!(error, crate::registry::OpenError::Expired { .. }) {
-                    let refusal =
-                        broca_wire::InvalidLateCursor::new(req.late_after.as_deref().unwrap());
-                    ServeError::InvalidParams {
-                        field: refusal.detail.field,
-                        message: refusal.message,
-                    }
-                } else {
-                    ServeError::from_history_read(
-                        error,
-                        req.lineage_id.as_deref(),
-                        after.zip(req.after_mid.as_deref()),
-                    )
-                }
-            })?;
-            let snapshot = self
-                .served_snapshot(
-                    &req.session,
-                    page.lineage_id.map(|id| id.to_string()),
-                    at_seq > 0,
-                    before_history,
-                )
-                .await?;
-            if req
-                .history_version
-                .is_some_and(|requested| requested != snapshot.history_version)
-            {
-                return Err(ServeError::HistoryChanged);
+        crate::registry::count_session_read();
+        match self.store_holding(&req.session)? {
+            Some(store) => crate::store_read::serve_read(self, &store, req).await,
+            None => {
+                // Retention deletes an expired session and leaves only its expiry marker, so
+                // the address must still read as expired, not as never written.
+                self.check_expired(&req.session, None).await?;
+                crate::store_read::serve_unwritten(&req)
             }
-            let mode3 = self
-                .mode3_for_page(
-                    &req.session,
-                    page.lineage_id.map(|id| id.to_string()),
-                    &head_facts,
-                )
-                .await?;
-            if let (Some(after), Some(mid)) = (after, &req.after_mid) {
-                if broca_core::position_of_mid(
-                    mid,
-                    mode3,
-                    page.lineage_id.map(|id| id.to_string()).as_deref(),
-                )
-                .is_none()
-                    || !after.is_some_and(|ordinal| ordinal < page.prompt_len)
-                {
-                    return Err(ServeError::UnknownMid(mid.clone()));
-                }
-            }
-            let cap = req
-                .max_bytes
-                .unwrap_or(broca_wire::READ_DEFAULT_MAX_BYTES)
-                .min(broca_wire::READ_MAXIMUM_MAX_BYTES);
-            let unreported = matches!(
-                open_batch,
-                Some(broca_wire::OpenBatchView::NotReported { .. })
-            );
-            if late_only && unreported {
-                return Err(ServeError::Open(
-                    "late approval metadata is not reported because the WAL tail is incomplete"
-                        .into(),
-                    Some(broca_protocol::ErrorClass::Transient),
-                ));
-            }
-            let default_page = req.from_ordinal.unwrap_or(1) <= 1 && req.after_mid.is_none();
-            let had_late = !page.late_approvals.is_empty();
-            let (late, next_late_after) = if !unreported && (late_only || default_page) {
-                let (entries, next) = crate::approval::late_page(
-                    &page.late_approvals,
-                    req.late_after.as_deref(),
-                    cap,
-                )
-                .map_err(|error| ServeError::InvalidParams {
-                    field: error.detail.field,
-                    message: error.message,
-                })?;
-                (Some(entries), next)
-            } else {
-                (None, None)
-            };
-            page.late_approvals.clear();
-            if late_only {
-                page.messages.clear();
-                page.next_from_ordinal = None;
-            }
-            let prompt_len = page.prompt_len;
-            let times = if req.include_display_facts {
-                DisplayTimes::of(&page)
-            } else {
-                DisplayTimes::default()
-            };
-            let mut response = session_read_response(page, tools);
-            response.history_version = snapshot.history_version;
-            response.incarnation = snapshot.incarnation;
-            let facts = if let Some(lineage) = response.lineage_id.as_deref().filter(|_| {
-                req.include_display_facts
-                    || (native_tool_outputs.is_none()
-                        && response
-                            .messages
-                            .iter()
-                            .any(|entry| entry.message.role == broca_protocol::Role::Tool))
-            }) {
-                self.display_facts_for_page(
-                    &req.session,
-                    lineage,
-                    at_seq,
-                    response
-                        .messages
-                        .iter()
-                        .filter(|entry| {
-                            req.include_display_facts
-                                || entry.message.role == broca_protocol::Role::Tool
-                        })
-                        .map(|entry| entry.ordinal - 1)
-                        .collect(),
-                )
-                .await?
-            } else {
-                Default::default()
-            };
-            // The display-facts cache holds each tool result's output exactly as the tool returned
-            // it, before any notice was joined to it for the model. Only this response's copies take
-            // those outputs: the stored rows keep the joined text, because a resumed run renders it.
-            for entry in &mut response.messages {
-                if let Some(outputs) = native_tool_outputs
-                    .as_ref()
-                    .and_then(|outputs| outputs.get(&(entry.ordinal - 1)))
-                    .or_else(|| {
-                        facts
-                            .get(&(entry.ordinal - 1))
-                            .map(|facts| &facts.native_tool_outputs)
-                    })
-                {
-                    for (part, block) in entry.message.content.iter_mut().enumerate() {
-                        if let broca_protocol::ContentBlock::ToolResult(result) = block {
-                            if let Some(output) = outputs.get(&(part as u32)) {
-                                result.output = output.clone();
-                            }
-                        }
-                    }
-                }
-            }
-            if req.include_display_facts && response.lineage_id.is_some() {
-                apply_display_facts(&mut response, &times, &facts, None);
-            }
-            if req.include_rich_ui {
-                let mut stamps = std::collections::BTreeMap::new();
-                for run_id in rich_ui_runs(&response) {
-                    let stamp = self
-                        .session_log(&req.session, &run_id)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .find_map(|record| match record {
-                            broca_wal::WalRecord::RunStarted {
-                                run_id: started,
-                                manifest,
-                                ..
-                            } if started.0 == run_id => {
-                                manifest.and_then(|manifest| manifest.rich_ui)
-                            }
-                            _ => None,
-                        });
-                    stamps.insert(run_id, stamp);
-                }
-                apply_rich_ui(&mut response, &stamps);
-            }
-            if had_late || late_only {
-                response.late_approvals = late;
-            }
-            response.next_late_after = next_late_after;
-            if open_batch.is_none() || unreported {
-                response.deferred_calls = None;
-                response.late_approvals = None;
-            }
-            // Preserve legacy session.read JSON when the session has no approval records.
-            // Omitting approval metadata means it is not reported, rather than asserting empty lists.
-            response.open_batch = if unreported {
-                open_batch
-            } else {
-                response.deferred_calls.as_ref().and(open_batch)
-            };
-            if late_only {
-                response.deferred_calls = None;
-                response.open_batch = None;
-            }
-            self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
-                .await?;
-            apply_media_mode(&mut response, req.media, &req.session.session)?;
-            for entry in &mut response.messages {
-                entry.mid = broca_core::message_mid(
-                    mode3,
-                    response.lineage_id.as_deref(),
-                    entry.ordinal - 1,
-                )
-                .map_err(|error| {
-                    ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
-                })?;
-            }
-            cap_page_bytes(
-                &mut response,
-                cap,
-                from_ordinal.is_none(),
-                &req.session.session,
-            )?;
-            Ok(response)
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(&again.session, &error)? {
-                Some(store) => crate::store_read::serve_read(self, &store, again).await,
-                None => Err(error),
-            },
-            served => served,
         }
     }
 
@@ -4745,24 +3729,11 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn message_identity(
         &self,
-        session: &LineageKey,
+        _session: &LineageKey,
     ) -> Result<(bool, Option<String>), ServeError> {
-        // The new storage keeps each message's public id as it was minted or converted, so its
-        // stream's ids need no translation; reading today's log for them would be refused.
-        if self.store_holding(session)?.is_some() {
-            return Ok((false, None));
-        }
-        if let Some(identity) = self.message_identity_from_log(session).await? {
-            return Ok(identity);
-        }
-        let crate::registry::RouteReadPage {
-            page, head_facts, ..
-        } = self.route_read_page(session, None, Some(1), false).await?;
-        let lineage = page.lineage_id.map(|id| id.to_string());
-        let mode3 = self
-            .mode3_for_page(session, lineage.clone(), &head_facts)
-            .await?;
-        Ok((mode3, lineage))
+        // The store keeps each message's public id as it was minted or converted, so its
+        // stream's ids need no translation.
+        Ok((false, None))
     }
 
     async fn head_for(
@@ -4771,186 +3742,16 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<broca_wire::HeadResponse, ServeError> {
-        if let Some(store) = self.store_holding(session)? {
-            return crate::store_head::serve_head(self, &store, session, principal, scope).await;
-        }
-        // As `read`: a head published while this read used today's storage serves it once
-        // more, from the new storage.
-        let today: Result<broca_wire::HeadResponse, ServeError> = async {
-            let before_history = self.history_read_version(session).await?;
-            // The newest page of one message: the store's last row and the WAL past its watermark,
-            // so the cost follows what is not yet materialized, never the session's length.
-            let crate::registry::RouteReadPage {
-                page,
-                at_seq,
-                head_facts,
-                head_facts_complete,
-                newest_record_ms,
-                retention_activity_ms,
-                last_title,
-                ..
-            } = self.route_read_page(session, None, Some(1), false).await?;
-            let snapshot = self
-                .served_snapshot(
-                    session,
-                    page.lineage_id.map(|id| id.to_string()),
-                    at_seq > 0,
-                    before_history,
-                )
-                .await?;
-            if snapshot.incarnation == "unwritten" {
-                return Ok(broca_wire::HeadResponse {
-                    history_version: snapshot.history_version,
-                    incarnation: snapshot.incarnation,
-                    ..Default::default()
-                });
+        match self.store_holding(session)? {
+            Some(store) => {
+                crate::store_head::serve_head(self, &store, session, principal, scope).await
             }
-            if !head_facts_complete {
-                return Err(crate::registry::OpenError::Open(
-                    "session.head cannot attest metadata from an incomplete WAL suffix".into(),
-                )
-                .into());
+            // A session no send created: its head names nothing, as an unwritten one's does.
+            // One retention deleted still answers expired.
+            None => {
+                self.check_expired(session, None).await?;
+                Ok(broca_wire::HeadResponse::default())
             }
-            // Retained sessions report expiry activity; maintenance must not move that clock.
-            // Otherwise use the live WAL file's own write time, a stat; else
-            // (its WAL was folded into an archive) the newest timestamped record of the read's
-            // tail. Only a folded session whose tail holds no timestamped record pays for a pass
-            // over its whole WAL (`head_time`, which a move records this time by).
-            let updated_at = match crate::head_time::known_updated_at(
-                retention_activity_ms,
-                self.live_wal_written_ms(session),
-                newest_record_ms,
-            ) {
-                Some(at) => at,
-                None => {
-                    crate::head_time::newest_record_ms(&self.read_durable_wal(session).await?.0)
-                        .unwrap_or(0)
-                }
-            };
-            let selected_model = head_facts.selected_model();
-            let service_tier = head_facts.selection.as_ref().and_then(|selection| {
-                selection
-                    .service_tier
-                    .filter(|tier| !tier.is_standard())
-                    .map(|tier| tier.as_str().into())
-            });
-            let media_facts = if let Some(lineage_id) = page.lineage_id {
-                Some(
-                    self.media_facts_for_head(
-                        session,
-                        crate::registry::media_head::Request {
-                            lineage: lineage_id,
-                            at_seq,
-                            run_id: page.lineage_state.last_run_id.as_ref(),
-                            state: page.lineage_state.state.as_str(),
-                            model: selected_model.as_ref(),
-                        },
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
-                if let Some(facts) = &media_facts {
-                    facts.interrupt_reason.clone()
-                } else if let Some(run_id) = &page.lineage_state.last_run_id {
-                    recorded_interrupt_reason(&self.read_durable_wal(session).await?.0, run_id)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let sender = head_facts.sender(principal, scope, broca_wire::DELIVERY_MODES);
-            let last_run_error = if page.lineage_state.state.as_str() == "error" {
-                if let Some(run_id) = page.lineage_state.last_run_id.clone() {
-                    // Query the named run through the same terminal-record reconciliation as
-                    // run.status, rather than classifying provider diagnostics a second time.
-                    match self.run_status(session, run_id).await? {
-                        RunStatusResponse::Error {
-                            error: Some(error), ..
-                        } => {
-                            let mut summary = cortexkit_role_llm_runner::read::LastRunError::new(
-                                error.class_wire(),
-                            );
-                            summary.retry_after_secs = error
-                                .retry_after_secs
-                                .and_then(cortexkit_role_llm_runner::read::RetryAfterSecs::new);
-                            summary.resets_at_ms = error.resets_at_ms;
-                            summary.provider_code = error.provider_code.clone();
-                            Some(summary)
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let mode3 = self
-                .mode3_for_page(
-                    session,
-                    page.lineage_id.map(|id| id.to_string()),
-                    &head_facts,
-                )
-                .await?;
-            let input = media_facts.map_or_else(broca_wire::head_input, |facts| facts.input);
-            let head = page.head.map(CursorWire::from);
-            Ok(broca_wire::HeadResponse {
-                mode3,
-                last_run_rich_ui: head_facts.last_run_rich_ui,
-                last_run_error,
-                model: selected_model,
-                service_tier,
-                usage: head_facts.usage.filter(|usage| usage.consistent()),
-                sender,
-                incarnation: snapshot.incarnation,
-                lineage_id: page.lineage_id.map(|id| id.to_string()),
-                last_ordinal: (page.prompt_len > 0).then_some(page.prompt_len),
-                first_ordinal: (page.prompt_len > 0).then_some(1),
-                history_version: snapshot.history_version,
-                head,
-                last_run_state: page.lineage_state.last_run_id.map(|run_id| {
-                    broca_wire::LastRunState {
-                        awaits: None,
-                        run_id: run_id.0,
-                        state: page.lineage_state.state.as_str().to_owned(),
-                        reason: interrupted_reason.or_else(|| {
-                            page.lineage_state
-                                .reason
-                                .filter(|reason| reason.as_str() != "interrupted")
-                                .map(|reason| reason.as_str().to_owned())
-                        }),
-                        // Today's storage holds no heads, only workers, so its head leaves the
-                        // optional resume time out; `run.status` serves it for every run.
-                        resume_not_before_ms: None,
-                    }
-                }),
-                updated_at: Some(updated_at),
-                cache: self
-                    .cache_clock_reading(session)
-                    .map(|reading| broca_wire::HeadCacheWire {
-                        last_sent_at_ms: reading.last_sent_at_ms,
-                        ttl_ms: reading.ttl_ms,
-                        expires_at_ms: reading.expires_at_ms(),
-                        prefix_tokens: reading.prefix_tokens,
-                        expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
-                    }),
-                title: last_title,
-                input: Some(input),
-            })
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_head::serve_head(self, &store, session, principal, scope).await
-                }
-                None => Err(error),
-            },
-            served => served,
         }
     }
 
@@ -4982,130 +3783,8 @@ impl ServeHandler for crate::LineageRegistry {
                 .run_result(&run_id)
                 .await;
         }
-        // As `read`: a head published meanwhile serves the answer once more, from there.
-        let again = run_id.clone();
-        let today: Result<broca_wire::RunResultResponse, ServeError> = async move {
-            let (state, mut records, preserve_pause) = self
-                .route_run_state_with_reader_policy(session, run_id.clone())
-                .await?;
-            let auth_selection = state.as_ref().and_then(frozen_auth_selection);
-            let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
-            let mut context_ceiling = state
-                .as_ref()
-                .and_then(|state| state.context_ceiling.clone());
-            let mut structured_output = state
-                .as_ref()
-                .and_then(|state| state.structured_output.clone());
-            let mut usage = state
-                .as_ref()
-                .map(|state| state.run_usage.clone())
-                .unwrap_or_default();
-            let mut finish = state.as_ref().and_then(|state| state.finish.clone());
-            let status = run_status_response_with_reader_policy(state, preserve_pause);
-            let Some((mut state, mut reason, mut error)) = result_state(status) else {
-                return Err(ServeError::UnknownRun(run_id.0));
-            };
-            if state == "active" {
-                // The live actor still calls a run active for a moment after its terminal is
-                // durable, while `session.read` and `session.head` already read that terminal from
-                // the WAL. The durable terminal wins, so a caller that saw the run end on a page is
-                // never told it is still running.
-                let read = match records.take() {
-                    Some(records) => records,
-                    None => self.read_durable_wal(session).await?.0,
-                };
-                if let Some((reason, terminal_error)) = durable_terminal(&read, &run_id) {
-                    let reconciled = broca_core::reconcile_run_state(
-                        read.iter().map(|frame| &frame.record),
-                        &run_id.0,
-                    );
-                    detail = reconciled
-                        .as_ref()
-                        .and_then(|state| state.budget_detail.clone());
-                    usage = reconciled
-                        .as_ref()
-                        .map(|state| state.run_usage.clone())
-                        .unwrap_or_default();
-                    context_ceiling = reconciled
-                        .as_ref()
-                        .and_then(|state| state.context_ceiling.clone());
-                    finish = reconciled.as_ref().and_then(|state| state.finish.clone());
-                    structured_output = reconciled.and_then(|state| state.structured_output);
-                    state = serde_json::to_value(reason)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or(state);
-                    error = terminal_error.map(Into::into);
-                }
-                records = Some(read);
-            }
-            if state == "interrupted" {
-                let read = match records.take() {
-                    Some(records) => records,
-                    None => self.read_durable_wal(session).await?.0,
-                };
-                reason = recorded_interrupt_reason(&read, &run_id);
-                records = Some(read);
-            }
-            let mut directives = None;
-            let final_message = if state == "completed" {
-                let records = match records {
-                    Some(records) => records,
-                    None => self.read_durable_wal(session).await?.0,
-                };
-                let clean_reply = clean_reply_of(&records, &run_id);
-                let mut message = final_message_of(&records, &run_id, clean_reply)?;
-                // A complete legacy snapshot already proves its original m<position> vocabulary.
-                // Re-reading head would read the log again even though this snapshot already proves it.
-                let complete_legacy = records.first().is_some_and(|frame| frame.seq == 1)
-                    && !broca_core::is_mode3_log(records.iter().map(|frame| &frame.record));
-                if !complete_legacy {
-                    let head = self.head(session).await?;
-                    let (mode3, lineage) = (head.mode3, head.lineage_id);
-                    message.mid =
-                        broca_core::message_mid(mode3, lineage.as_deref(), message.ordinal - 1)
-                            .map_err(|error| {
-                                ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
-                            })?;
-                }
-                directives = completed_directives(&records, &run_id, &message.text);
-                Some(message)
-            } else {
-                None
-            };
-            let response = broca_wire::RunResultResponse {
-                awaits: None,
-                finish: if matches!(state.as_str(), "active" | "paused") {
-                    None
-                } else {
-                    finish
-                },
-                auth_selection,
-                directives,
-                usage,
-                detail,
-                context_ceiling,
-                run_id: run_id.0,
-                state,
-                reason,
-                error,
-                final_message,
-                structured_output,
-            };
-            checked_run_result(response, &session.session)
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_status::StoreRead::new(&store, session, self)
-                        .run_result(&again)
-                        .await
-                }
-                None => Err(error),
-            },
-            served => served,
-        }
+        self.check_expired(session, Some(&run_id.0)).await?;
+        Err(ServeError::UnknownRun(run_id.0))
     }
 
     async fn run_tool_calls(
@@ -5124,106 +3803,8 @@ impl ServeHandler for crate::LineageRegistry {
                 .run_tool_calls(request)
                 .await;
         }
-        // As `read`: a head published meanwhile serves the answer once more, from there.
-        let again = request.clone();
-        let today: Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> =
-            async move {
-                let run_id = request.run_id.clone();
-                let limit = tool_calls_limit(&request);
-                let (
-                    range,
-                    run_start_seq,
-                    run_end_seq,
-                    lineage_id,
-                    seed,
-                    range_start_seq,
-                    fallback,
-                ) = match request.after.as_deref() {
-                    None => {
-                        let range = self
-                            .read_run_tool_calls_range(session, &run_id, 0, None, None)
-                            .await?;
-                        let records = run_tool_call_records(&range)?;
-                        let Some((start, end)) = run_tool_call_bounds(records, &run_id) else {
-                            return Err(ServeError::UnknownRun(run_id));
-                        };
-                        let lineage_id =
-                            range.lineage_id.as_ref().map(|lineage| lineage.to_string());
-                        (range, start, end, lineage_id, None, 0, None)
-                    }
-                    Some(token) => {
-                        let cursor = checked_tool_calls_cursor(token, &run_id)?;
-                        let lineage_id = cursor.lineage_id.clone();
-                        let range = self
-                            .read_run_tool_calls_range(
-                                session,
-                                &run_id,
-                                cursor.step_seq - 1,
-                                cursor.anchor_before.map(Into::into),
-                                Some(cursor.batch_end_seq),
-                            )
-                            .await?;
-                        let observed_lineage =
-                            range.lineage_id.as_ref().map(|lineage| lineage.to_string());
-                        if observed_lineage
-                            .as_ref()
-                            .is_some_and(|observed| lineage_id.as_ref() != Some(observed))
-                        {
-                            return Err(invalid_tool_call_cursor(
-                                "run.tool_calls.after belongs to a different WAL lineage",
-                            ));
-                        }
-                        (
-                            range,
-                            cursor.run_start_seq,
-                            cursor.run_end_seq,
-                            lineage_id,
-                            Some(cursor.clone()),
-                            cursor.step_seq,
-                            cursor.anchor_before,
-                        )
-                    }
-                };
-                let records = run_tool_call_records(&range)?;
-                let step_ordinals = if seed.is_none() {
-                    committed_tool_step_ordinals(records)
-                } else {
-                    std::collections::HashMap::new()
-                };
-                let entries = indexed_run_tool_calls(
-                    records,
-                    &run_id,
-                    lineage_id.as_deref(),
-                    seed.as_ref(),
-                    &step_ordinals,
-                )?;
-                run_tool_calls_answer(
-                    entries,
-                    limit,
-                    &RunToolCallsPageContext {
-                        run_id: &run_id,
-                        lineage_id: lineage_id.as_deref(),
-                        run_start_seq,
-                        run_end_seq,
-                        range: Some(&range),
-                        range_start_seq,
-                        fallback,
-                        seed: seed.as_ref(),
-                    },
-                )
-            }
-            .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_status::StoreRead::new(&store, session, self)
-                        .run_tool_calls(again)
-                        .await
-                }
-                None => Err(error),
-            },
-            served => served,
-        }
+        self.check_expired(session, Some(&request.run_id)).await?;
+        Err(ServeError::UnknownRun(request.run_id))
     }
 
     async fn baseline(
@@ -5237,73 +3818,7 @@ impl ServeHandler for crate::LineageRegistry {
                 .baseline(principal, scope)
                 .await;
         }
-        // As `read`: a head published meanwhile serves the answer once more, from there.
-        let today = async {
-            let (records, _) = self.read_durable_wal(session).await?;
-            let Some(start) = first_run_started(&records) else {
-                // Missing history must not be reported as a never-written baseline.
-                self.check_session_log(session).await?;
-                return Ok(broca_wire::BaselineReply::not_yet());
-            };
-            if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-                return Err(ServeError::ScopeRefused(
-                    broca_core::ScopeRefusal::OwnerMismatch(Box::new(mismatch)),
-                ));
-            }
-            let mut baseline = baseline_of(start);
-            if let broca_wal::WalRecord::RunStarted { config, .. } = start {
-                baseline.cache = self
-                    .cache_declaration(config)
-                    .map(|declaration| declaration.to_wire());
-            }
-            // Every ready baseline on a runner declaring `session_change` states the rungs it
-            // supports per surface, and the generations it accepted, applied and holds pending.
-            let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-            if let Some(manifest) = &change.prefix_manifest {
-                let cache = baseline.cache.take();
-                baseline = planned_baseline(manifest);
-                baseline.cache = cache;
-            }
-            baseline.accepted_generation = change.accepted_generation;
-            baseline.applied_generation = change.applied_generation;
-            baseline.pending = change.pending.as_ref().map(|pending| {
-                cortexkit_role_llm_runner::baseline::PendingChange {
-                    generation: pending.generation,
-                    policy: pending.policy.clone(),
-                }
-            });
-            baseline.effective =
-                change
-                    .effective
-                    .as_ref()
-                    .map(|effective| broca_wire::EffectiveBaselineWire {
-                        generation: effective.generation,
-                        applied_by: effective.applied_by.clone(),
-                        manifest_digest: effective.manifest_digest.clone(),
-                        composition_digest: effective.composition_digest.clone(),
-                        absent_items: effective
-                            .absent_items
-                            .iter()
-                            .map(|item| {
-                                serde_json::to_value(item).expect("a baseline item is JSON")
-                            })
-                            .collect(),
-                    });
-            baseline.rungs = Some(supported_rungs());
-            Ok(broca_wire::BaselineReply::ready(baseline))
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_status::StoreRead::new(&store, session, self)
-                        .baseline(principal, scope)
-                        .await
-                }
-                None => Err(error),
-            },
-            served => served,
-        }
+        Ok(broca_wire::BaselineReply::not_yet())
     }
 
     fn admission_baseline(
@@ -5342,31 +3857,7 @@ impl ServeHandler for crate::LineageRegistry {
                 _ => None,
             };
         }
-        let (records, _) = self.read_durable_wal(session).await.ok()?;
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        if change.accepted_generation == 0 {
-            return None;
-        }
-        let accepted = change
-            .accepted
-            .get(&change.accepted_generation)
-            .map(|(identity, _)| identity.clone());
-        let effective = if change.applied_generation > 0 {
-            change
-                .accepted
-                .get(&change.applied_generation)
-                .map(|(identity, _)| identity.clone())
-        } else {
-            first_run_started(&records).and_then(|start| match start {
-                broca_wal::WalRecord::RunStarted {
-                    manifest: Some(manifest),
-                    ..
-                } => Some(manifest.plan_identity.clone()),
-                broca_wal::WalRecord::RunStarted { .. } => None,
-                _ => None,
-            })
-        };
-        Some((effective, accepted))
+        None
     }
 
     async fn session_refresh(
@@ -5654,16 +4145,7 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     fn session_written(&self, session: &LineageKey) -> Result<bool, ServeError> {
-        // A session kept in the new storage exists from its head, with no WAL to probe.
-        if self.store_holding(session)?.is_some() {
-            return Ok(true);
-        }
-        self.wal_written(session).ok_or_else(|| {
-            ServeError::Open(
-                "cannot determine whether the session has a WAL; retry the send".into(),
-                Some(broca_protocol::ErrorClass::Transient),
-            )
-        })
+        Ok(self.store_holding(session)?.is_some())
     }
 
     async fn cancel(
@@ -5749,56 +4231,8 @@ impl ServeHandler for crate::LineageRegistry {
                 .run_status(&run_id)
                 .await;
         }
-        // As `read`: a head published meanwhile serves the answer once more, from there.
-        let again = run_id.clone();
-        let today: Result<RunStatusResponse, ServeError> = async move {
-            let (state, _, preserve_pause) = self
-                .route_run_state_with_reader_policy(session, run_id.clone())
-                .await?;
-            let mut response = run_status_response_with_reader_policy(state, preserve_pause);
-            // Lifecycle resolution above remains authoritative when its transcript reader or
-            // final text is unavailable. Enrich the answer only with readable durable metadata.
-            let metadata = if matches!(
-                response,
-                RunStatusResponse::Interrupted { .. } | RunStatusResponse::Completed { .. }
-            ) {
-                self.read_durable_wal(session).await.ok().map(|read| read.0)
-            } else {
-                None
-            };
-            match (&mut response, metadata.as_deref()) {
-                (RunStatusResponse::Interrupted { reason, .. }, Some(records)) => {
-                    *reason = recorded_interrupt_reason(records, &run_id);
-                }
-                (RunStatusResponse::Completed { directives, .. }, Some(records))
-                    if wake_directive_requested(records, &run_id) =>
-                {
-                    *directives = final_message_of(records, &run_id, None)
-                        .ok()
-                        .and_then(|message| completed_directives(records, &run_id, &message.text));
-                }
-                _ => {}
-            }
-            if let RunStatusResponse::Active {
-                awaiting_approval, ..
-            } = &mut response
-            {
-                *awaiting_approval = self.cached_awaiting_approval(session, &run_id);
-            }
-            checked_run_status(response, &run_id.0)
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_status::StoreRead::new(&store, session, self)
-                        .run_status(&again)
-                        .await
-                }
-                None => Err(error),
-            },
-            served => served,
-        }
+        self.check_expired(session, Some(&run_id.0)).await?;
+        Ok(RunStatusResponse::Unknown)
     }
 
     async fn run_admission(
@@ -5811,55 +4245,8 @@ impl ServeHandler for crate::LineageRegistry {
                 .run_admission(&run_id)
                 .await;
         }
-        let today = async {
-            if matches!(
-                self.run_status(session, run_id.clone()).await?,
-                RunStatusResponse::Unknown
-            ) {
-                return Ok(None);
-            }
-            let (records, _) = self.read_durable_wal(session).await?;
-            for frame in records {
-                if let broca_wal::WalRecord::RunStarted {
-                    run_id: own,
-                    session_class,
-                    ts_ms,
-                    manifest,
-                    principal,
-                    scope,
-                    ..
-                } = frame.record
-                {
-                    if own == run_id {
-                        return crate::run_admission::response(
-                            &own.0,
-                            session_class,
-                            ts_ms.ok_or_else(|| {
-                                ServeError::Open("the run's start has no timestamp".into(), None)
-                            })?,
-                            broca_wire::RunAdmissionStorage::Wal,
-                            manifest.as_deref(),
-                            principal.as_ref(),
-                            scope.as_ref(),
-                        )
-                        .map(Some);
-                    }
-                }
-            }
-            Ok(None)
-        }
-        .await;
-        match today {
-            Err(error) => match self.store_after_refusal(session, &error)? {
-                Some(store) => {
-                    crate::store_status::StoreRead::new(&store, session, self)
-                        .run_admission(&run_id)
-                        .await
-                }
-                None => Err(error),
-            },
-            served => served,
-        }
+        self.check_expired(session, Some(&run_id.0)).await?;
+        Ok(None)
     }
 
     async fn run_status_reply(
@@ -5867,42 +4254,13 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<broca_wire::RunStatusReply, ServeError> {
-        use broca_core::delivery_order::QueuedSendFate;
-        use broca_wire::{QueuedSendState, RunStatusReply};
         if let Some(store) = self.store_holding(session)? {
             return crate::store_status::StoreRead::new(&store, session, self)
                 .run_status_reply(&run_id)
                 .await;
         }
-        let status = self.run_status(session, run_id.clone()).await?;
-        if !matches!(status, RunStatusResponse::Unknown) {
-            return Ok(status.into());
-        }
-        // No run carries this id. It may still be the id a queued send was minted from, which
-        // callers poll until the send is a run; the WAL says what became of the send.
-        let reply = match self.route_queued_send_fate(session, &run_id).await? {
-            None => status.into(),
-            Some(QueuedSendFate::Pending) => RunStatusReply::Send(QueuedSendState::Pending),
-            Some(QueuedSendFate::Ended(reason)) => RunStatusReply::Send(match reason {
-                broca_wal::record::SendEndReason::Superseded { .. } => QueuedSendState::Superseded,
-                broca_wal::record::SendEndReason::Expired => QueuedSendState::Expired,
-            }),
-            Some(QueuedSendFate::Retracted) => RunStatusReply::Send(QueuedSendState::Retracted),
-            // Delivered into a run that was already going: the send is part of that run now,
-            // so its status is that run's, with the receipt naming the run.
-            Some(QueuedSendFate::Delivered { run_id: into, .. }) => RunStatusReply::Run {
-                status: Box::new(self.run_status(session, into.clone()).await?),
-                delivered: Some(
-                    cortexkit_role_llm_runner::send::Delivered::new(
-                        cortexkit_role_llm_runner::send::delivered_as::STEP,
-                    )
-                    .with_ref(into.0),
-                ),
-            },
-            // The send started its own run after the first lookup: answer that run.
-            Some(QueuedSendFate::Started) => self.run_status(session, run_id).await?.into(),
-        };
-        Ok(reply)
+        self.check_expired(session, Some(&run_id.0)).await?;
+        Ok(RunStatusResponse::Unknown.into())
     }
 }
 
@@ -6111,10 +4469,6 @@ mod paused_auth_tests {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "serve/run_tool_calls_tests.rs"]
-mod run_tool_calls_tests;
 
 #[cfg(test)]
 mod context_ceiling_tests {

@@ -1,0 +1,260 @@
+//! The answers a moved session must give the same on both machines: its pages, compaction
+//! entries and head, and the bytes of the next request it would send. The receiver computes
+//! them from the bytes it staged and compares them with the digests the sender computed from
+//! its own copy, so a move that would change what the session answers is refused before
+//! anything is activated.
+
+use std::collections::BTreeMap;
+
+use broca_module::serve::SessionReadRequest;
+use broca_protocol::BindIdentity;
+use broca_session_loop::parts::MemoryParts;
+use broca_session_store::backend::SessionAddr;
+use broca_session_store::keys::DeploymentKey;
+use broca_session_store::record::{Input, PartKind, Placement, Record, StepStart};
+use broca_session_store::session::moves::Export;
+use broca_session_store::session::Session;
+use broca_session_store::setup::SetupStore;
+use serde_json::Value;
+
+/// Digest keys. Both machines name each answer the same, so these strings are part of the move
+/// protocol between builds: changing one makes every move refuse until both sides carry it.
+pub const READ: &str = "read";
+pub const ENTRIES: &str = "entries";
+pub const HEAD: &str = "head";
+pub const NEXT_REQUEST: &str = "next_request";
+
+/// The run id the next-request check writes into the in-memory copy, so the checked request is
+/// never confused with one the session sent.
+const NEXT_RUN: &str = "store-move-next-request";
+
+/// The read modes: whether each asks for display facts, tools and Rich UI.
+const READ_MODES: [(&str, bool, bool, bool); 5] = [
+    ("default", false, false, false),
+    ("display_facts", true, false, false),
+    ("tools", false, true, false),
+    ("rich_ui", false, false, true),
+    ("all", true, true, true),
+];
+
+/// How many messages a compared page asks for. Small, so a session's pages are many and their
+/// boundaries are compared too.
+const PAGE: u64 = 7;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    broca_session_store::codec::hex(&sha2::Sha256::digest(bytes))
+}
+
+/// The setup parts `record` names.
+fn named_parts(record: &Record) -> &[broca_session_store::record::PartRef] {
+    match record {
+        Record::RunStart(start) => &start.setup,
+        Record::SetupStub(stub) => &stub.parts,
+        Record::SessionRefresh(refresh) => &refresh.setup,
+        _ => &[],
+    }
+}
+
+/// The digests of what `export` answers, read by the same store readers and renderer that serve
+/// the session. The scratch writer lives only in memory, so checking the next send never changes
+/// a file.
+pub async fn store_snapshot(
+    export: &Export,
+    deployment: &DeploymentKey,
+) -> Result<BTreeMap<String, String>, String> {
+    let triple = &export.header.triple;
+    let bind = BindIdentity {
+        project_root: triple.project_root.clone().into(),
+        harness: triple.harness.clone(),
+        session: triple.session.clone(),
+    };
+    let addr = SessionAddr(broca_core::session_addr(&bind));
+    let memory = export
+        .memory(&addr, deployment)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let view = Session::view(&memory, addr.clone(), triple, deployment)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let records = view.records_from(0).await.map_err(|e| format!("{e:?}"))?;
+    let key = deployment
+        .setup_key_for(export.header.cipher)
+        .ok_or("deployment key missing")?;
+    let setup = SetupStore::new(&memory, &key);
+    let mut parts = MemoryParts {
+        parts: BTreeMap::new(),
+    };
+    for (_, record) in &records {
+        for part in named_parts(record) {
+            parts.parts.insert(
+                part.digest,
+                setup
+                    .get(part)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?
+                    .to_vec(),
+            );
+        }
+    }
+    let mut digests = BTreeMap::new();
+    let mut pages = Vec::new();
+    for (_, display_facts, tools, rich_ui) in READ_MODES {
+        let mut from = 1;
+        loop {
+            let mut request = SessionReadRequest::new(bind.clone(), Some(from), Some(PAGE));
+            request.include_display_facts = display_facts;
+            request.include_tools = tools;
+            request.include_rich_ui = rich_ui;
+            let page = broca_module::store_read::serve_view(&view, &parts, &request)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            pages.push(serde_json::to_value(&page).map_err(|e| e.to_string())?);
+            match page.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => break,
+            }
+        }
+    }
+    digests.insert(
+        READ.into(),
+        sha256_hex(&serde_json::to_vec(&pages).unwrap()),
+    );
+    let entries = broca_module::store_entries::all_entries(&view)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    digests.insert(
+        ENTRIES.into(),
+        sha256_hex(&serde_json::to_vec(&entries).unwrap()),
+    );
+    let built = broca_module::store_head::build(&view, &parts, true)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    digests.insert(
+        HEAD.into(),
+        sha256_hex(&serde_json::to_vec(&built.reply).unwrap()),
+    );
+    let start = records.iter().rev().find_map(|(_, record)| match record {
+        Record::RunStart(start) => Some((**start).clone()),
+        _ => None,
+    });
+    drop(view);
+    let request = if let Some(mut start) = start {
+        let at = records
+            .iter()
+            .filter_map(|(_, record)| record.activity_ms())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let config = start
+            .setup
+            .iter()
+            .find(|part| part.kind == PartKind::RenderConfig)
+            .and_then(|part| parts.parts.get(&part.digest));
+        if let Some(config) = config {
+            let render_tags = start
+                .run_choices
+                .as_ref()
+                .and_then(|choices| choices.get("config"))
+                .and_then(|config| config.get("render_tags"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let frozen =
+                serde_json::from_slice(config).map_err(|e| format!("render config: {e}"))?;
+            let render_config: Value =
+                serde_json::from_slice(config).map_err(|e| format!("render config: {e}"))?;
+            // The next message gets its `EntryFacts` record (its id, time and part numbers) as
+            // the run loop writes one: on a session on the compaction contract a message's
+            // compaction entry, and so the request, can't be built without it. `tags` are the
+            // numbering rules those facts follow.
+            let manifest = broca_session_store::fold::operations::ManifestRef::of_start(&start)
+                .map(|reference| broca_session_loop::run::stored_manifest(&reference, &parts))
+                .transpose()
+                .map_err(|e| format!("the latest run's manifest: {e:?}"))?;
+            let tags = broca_session_loop::entries::Tags::for_session(
+                start.compaction_plan_version.is_some(),
+                manifest.as_deref(),
+                &render_config,
+            );
+            let mut writer = Session::load(&memory, addr.clone(), triple, deployment)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            start.run_id = NEXT_RUN.into();
+            start.submission_id = None;
+            start.send_id = None;
+            start.request_identity_digest = None;
+            start.ts_ms = Some(at);
+            start.written_at_ms = Some(at);
+            let next = vec![
+                Record::RunStart(Box::new(start)),
+                Record::Input(Input {
+                    run_id: NEXT_RUN.into(),
+                    placement: Placement::RunInput,
+                    message: std::sync::Arc::new(broca_protocol::content::Message::new(
+                        broca_protocol::content::Role::User,
+                        vec![broca_protocol::content::ContentBlock::Text {
+                            text: "The next message after the move.".into(),
+                        }],
+                    )),
+                    written_at_ms: Some(at),
+                    submission_id: None,
+                    notice: None,
+                    tags_v1: None,
+                    receipt_seq: None,
+                    pruned: vec![],
+                    media: vec![],
+                }),
+                Record::StepStart(StepStart {
+                    run_id: NEXT_RUN.into(),
+                    step_id: 1,
+                    mid: None,
+                }),
+            ];
+            use broca_session_loop::Writer as _;
+            let prefix = writer.message_id_prefix();
+            let calls = Default::default();
+            let next = broca_session_loop::entries::with_facts(
+                next,
+                &broca_session_loop::entries::Placing {
+                    conversation: writer.conversation(),
+                    first_seq: writer.next_seq(),
+                    prefix: &prefix,
+                    session: &writer.session_id(),
+                    tags,
+                    view: None,
+                    operations: writer.operations(),
+                    calls: &calls,
+                    rich_ui: None,
+                    runner: None,
+                },
+            )?;
+            writer
+                .append(&next, true)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            let reader = export
+                .memory(&addr, deployment)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            broca_module::store_media::offline_render(
+                &writer,
+                reader,
+                &parts,
+                &bind,
+                1,
+                &frozen,
+                render_tags,
+                None,
+            )
+            .await?
+        } else {
+            return Err(
+                "the latest run has no frozen render config for the next-request move check".into(),
+            );
+        }
+    } else {
+        Vec::new()
+    };
+    digests.insert(NEXT_REQUEST.into(), sha256_hex(&request));
+    Ok(digests)
+}

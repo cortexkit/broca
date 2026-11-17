@@ -36,7 +36,7 @@ fn steps() -> Vec<Vec<broca_protocol::NormalizedEvent>> {
 /// A side whose session exists: core's first text send ran, and, when `gated`, is still in its
 /// first model step. The session is in mode `cipher`.
 async fn started(gated: bool, cipher: Cipher) -> Side {
-    let side = side_gated(true, steps(), gated, cipher).await;
+    let side = side_gated(steps(), gated, cipher).await;
     let mut first = request("first");
     scoped_by_core(&mut first);
     let sent = side.send("r1", first).await;
@@ -119,7 +119,7 @@ fn media_objects(store: &Side) -> usize {
 /// byte range.
 async fn survives_a_restart(store: &Side, image: &[u8]) {
     assert!(store.registry.stop_and_seal().await);
-    let restarted = registry_at(&store.dir, true, Vec::new(), store.cipher).await;
+    let restarted = registry_at(&store.dir, Vec::new(), store.cipher).await;
     let whole = ServeHandler::media_read(
         &restarted,
         &store.key,
@@ -158,7 +158,7 @@ async fn photo_send(
 /// so a creating send naming one is refused, and the new storage keeps the session the send
 /// opened, empty.
 async fn a_photo_send_creating_its_session_answers_alike(cipher: Cipher) {
-    let store = side_gated(true, steps(), false, cipher).await;
+    let store = side_gated(steps(), false, cipher).await;
     let mut send = photo("look", &["no-such-upload"]);
     scoped_by_core(&mut send);
     let new = store.send("r1", send).await;

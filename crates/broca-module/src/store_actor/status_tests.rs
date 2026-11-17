@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId, SubmissionId};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -25,6 +25,8 @@ use crate::serve::ServeHandler;
 
 #[path = "cache_write_split_tests.rs"]
 mod cache_write_split;
+#[path = "directives_tests.rs"]
+mod directives;
 
 /// One module over a scratch folder, whose sessions start in the new storage when `store`.
 struct Side {
@@ -61,11 +63,9 @@ fn scratch() -> std::path::PathBuf {
 /// when one is given. With `store`, a session that exists nowhere starts in the new storage.
 async fn side_at(
     dir: std::path::PathBuf,
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<Notify>>,
 ) -> Side {
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, gate));
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
@@ -75,24 +75,14 @@ async fn side_at(
     )
     .await
     .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal,
-        None,
-    );
-    let registry = if store {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(Arc::new(runtime)),
+    ));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Side {
         dir,
@@ -103,8 +93,8 @@ async fn side_at(
     }
 }
 
-async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Side {
-    side_at(scratch(), store, steps, gate).await
+async fn side(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Side {
+    side_at(scratch(), steps, gate).await
 }
 
 /// The new storage's side over the script, and its gate when `gated`.
@@ -113,7 +103,7 @@ async fn pair(
     gated: bool,
 ) -> (Side, Option<Arc<Notify>>) {
     let store_gate = gated.then(|| Arc::new(Notify::new()));
-    (side(true, steps(), store_gate.clone()).await, store_gate)
+    (side(steps(), store_gate.clone()).await, store_gate)
 }
 
 impl Side {
@@ -200,7 +190,7 @@ fn reply<T: serde::Serialize>(reply: Result<T, crate::serve::ServeError>) -> Val
 }
 
 async fn admission_case(store: bool, scoped: bool) {
-    let side = side(store, vec![text_step("answer", "done")], None).await;
+    let side = side(vec![text_step("answer", "done")], None).await;
     let manifest: broca_wal::PlanManifest = serde_json::from_value(json!({
         "plan": "{}", "plan_identity": "admission-plan", "composition_digest": "composition",
         "tools": [], "system_text": "private system text", "system_digest": "system",
@@ -327,8 +317,8 @@ async fn run_admission_store_serves_recorded_scope() {
 
 #[tokio::test]
 async fn run_admission_unknown_is_absent_on_both_storages() {
-    for store in [true] {
-        let side = side(store, vec![text_step("answer", "done")], None).await;
+    {
+        let side = side(vec![text_step("answer", "done")], None).await;
         side.send("known", "hello").await;
         side.closed().await;
         assert!(side
@@ -359,7 +349,7 @@ fn masked(mut value: Value) -> Value {
                 // A message's id is minted per run; an active run's live step is pinned on its
                 // own.
                 object.remove("mid");
-                // Waits are new-storage-only; dedicated actor tests compare every wait surface.
+                // Dedicated actor tests check every wait surface.
                 object.remove("awaits");
                 if object.get("state") == Some(&json!("active")) {
                     object.remove("step");
@@ -707,7 +697,7 @@ async fn keyed_sends_report_their_status_alike() {
 /// Sends `r1`, whose first model call never answers, and `r2` queued behind it, in a module
 /// over `dir`, then drops the module's runtime mid-run, as a killed process leaves the session:
 /// no actor writes anything more.
-async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
+async fn crash_with_a_queued_send(dir: std::path::PathBuf) {
     tokio::task::spawn_blocking(move || {
         // No task may run once block_on returns. A multi-thread runtime can cancel a run
         // task while its actor is still polling, letting the actor record the cancellation
@@ -717,7 +707,7 @@ async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
             .build()
             .unwrap();
         let side = runtime.block_on(async {
-            let mut side = side_at(dir, store, Vec::new(), Some(Arc::new(Notify::new()))).await;
+            let mut side = side_at(dir, Vec::new(), Some(Arc::new(Notify::new()))).await;
             side.owns_dir = false;
             assert!(matches!(
                 side.send("r1", "first").await,
@@ -745,10 +735,10 @@ async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
     let store_dir = scratch();
-    crash_with_a_queued_send(store_dir.clone(), true).await;
+    crash_with_a_queued_send(store_dir.clone()).await;
     let steps = || vec![text_step("a2", "again")];
     let store_gate = Arc::new(Notify::new());
-    let store = side_at(store_dir, true, steps(), Some(Arc::clone(&store_gate))).await;
+    let store = side_at(store_dir, steps(), Some(Arc::clone(&store_gate))).await;
     assert!(store.in_store());
     // Before anything opens the store session.
     let before = [

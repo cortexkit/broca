@@ -301,6 +301,12 @@ impl StoredLineage {
         self.call(key).is_none_or(|call| call.held.is_some())
     }
 
+    /// Whether the call finished without its provider holding it.
+    pub(super) fn answered_inline(&self, key: &str) -> bool {
+        self.call(key)
+            .is_some_and(|call| call.terminal && call.held.is_none())
+    }
+
     pub(super) fn retirement_reason(&self, key: &str) -> Option<&'static str> {
         let call = self.call(key)?;
         if call.run_ended {

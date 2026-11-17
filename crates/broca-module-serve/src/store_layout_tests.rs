@@ -20,15 +20,7 @@ use super::{class_single_folder_tree, Layout};
 struct NeverRuns;
 
 #[async_trait::async_trait]
-impl broca_module::executor::RunExecutor for NeverRuns {
-    async fn execute(
-        &self,
-        _: broca_module::executor::RunJob,
-        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        panic!("opening a session runs nothing")
-    }
-}
+impl broca_module::executor::RunExecutor for NeverRuns {}
 
 const MOVE_ID: &str = "store-move:00000000-0000-4000-8000-000000000000";
 const SETUP_PART: &[u8] = br#"{"system":"a setup part"}"#;

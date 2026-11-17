@@ -5,8 +5,6 @@
 //! frame loop (route.bind → ack, session.*/run.* route requests → the coordinator).
 #![forbid(unsafe_code)]
 
-use broca_diagnostics::{spawn_blocking, JobKind};
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,13 +94,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
-        LaunchArgs::ConvertClone { root, backup } => {
-            let report = broca_module_serve::session_conversion::rehearse(&root, &backup)
-                .await
-                .map_err(ServeIoError)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            return Ok(());
-        }
         LaunchArgs::Daemon(path) => path,
     };
     // BROCA RESOLVES ITS OWN MODULE ID AND THE LOGGER USES THAT ANSWER. Reading the variable
@@ -144,9 +135,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!(target: "lifecycle", "refusing to start: launch nonce: {error}");
         return Err(ServeIoError(format!("launch nonce: {error}")).into());
     }
-    // The startup crash-orphan pass treats a WAL last written before this instant as a crashed
-    // process's leftover; anything written later belongs to a live writer.
-    let process_started = std::time::SystemTime::now();
     // Before any broca.jsonc loader: each of them reads a missing file as "no overrides".
     broca_module_serve::config_home::require_explicit_file(
         broca_module_serve::cache_routing::CONFIG_PATH_ENV,
@@ -154,7 +142,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
+    broca_module_serve::config::warn_obsolete_keys().map_err(ServeIoError)?;
     let service_tier =
         broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
     let classifier_routing = broca_module_serve::config::ClassifierRoutingConfig::load_default()
@@ -167,8 +155,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(ServeIoError)?
             .full_flush,
     );
-    let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
-        .map_err(ServeIoError)?;
     let bus_event_config =
         broca_module_serve::bus_events::Config::load_default_path().map_err(ServeIoError)?;
     let compaction_signals = broca_module_serve::config::CompactionSignalsConfig::load_default()
@@ -340,20 +326,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     })?;
     create_state_directories(&state_root)?;
-    let conversion_config =
-        broca_module_serve::session_conversion::Config::load_default().map_err(ServeIoError)?;
-    let conversion = broca_module_serve::session_conversion::Engine::configured(
-        &state_root,
-        conversion_config.clone(),
-    )
-    .map_err(ServeIoError)?;
-    if let Some(conversion) = &conversion {
-        conversion.publish_health();
-    }
-    // A move of a session into the new storage that a crash interrupted is undone or
-    // finished from its journal before anything sweeps the state root or opens a session.
-    let mut unsettled_moves =
-        broca_module_serve::store_move::recover_at_startup(&state_root).refused;
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.
     if let Err(error) = write_engram_catalog(&state_root) {
@@ -363,22 +335,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "could not publish the backup catalog; continuing to serve: {error}"
         );
     }
-    // A cutover owns the archive containers until their members have moved. Do not launch a
-    // competing archive-packing job while either conversion switch is enabled.
-    let _archive_timer =
-        (!conversion_config.enabled()).then(|| archive_config.spawn(state_root.clone()));
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
-    let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
-    let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
-        .with_backup_classes(backup_classes.0);
-    if bus_event_config.enabled {
-        wal_store = wal_store.with_durable_observer(bus_hints.observer());
-    }
-    let wal_store = Arc::new(wal_store);
-    broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
-        .await
-        .map_err(ServeIoError)?;
-    let crash_orphan_wal = wal_store.clone();
+    // The session classes whose new sessions start in the backed-up root.
+    let backup_class_names = backup_classes.0.clone();
+    let wal_store = Arc::new(
+        FileWalStore::with_config(state_root.join("wal"), wal_config)
+            .with_backup_classes(backup_classes.0),
+    );
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
     // provider's late results under broca's own principal and hands them to the run's batch.
@@ -396,7 +359,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let held_runtime = broca_module_serve::held_runtime::HeldRuntime::build(
         &state_root,
-        wal_store.clone(),
         feed_conn
             .consumer_module_id()
             .map(str::to_owned)
@@ -407,19 +369,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
     held_runtime.publish_for_health();
-    // No legacy projection is open yet at this startup point.
-    let forget_projection: broca_module_serve::store_move::ForgetProjection =
-        Arc::new(|_: &broca_protocol::BindIdentity| Ok(()));
-    // A finished move's journal stays until the session's materialized rows and late-results
-    // registrations are gone, which needs the stores just opened, and no actor yet.
-    unsettled_moves.extend(
-        broca_module_serve::store_move::finish_at_startup(
-            &state_root,
-            Some(&forget_projection),
-            Some(&held_runtime.store),
-        )
-        .refused,
-    );
     let plane =
         plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
     let plane = Arc::new(plane);
@@ -501,12 +450,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| ServeIoError(format!("fetch-plan consumer connect: {e}")))?,
     );
     let tool_route_health_plane = Arc::clone(&plane);
-    let executor_impl = executor::LiveLoopExecutor::new(
-        wal_store.clone(),
-        run_index.as_ref().unwrap().clone(),
-        plane,
-        provider_base_url,
-    );
+    let executor_impl =
+        executor::LiveLoopExecutor::new(wal_store.clone(), plane, provider_base_url);
     let mut executor_impl = executor_impl
     .with_provider_held_lifecycle(held_runtime.slots.clone())
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
@@ -545,63 +490,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(target: "billing", "{warning}");
     }
     charge_basis_table.publish_for_health();
-    // The terminal run index is the durable outbox for a crash after its commit but before live
-    // export emission. Catch up off the runtime so HELLO remains non-blocking;
-    // repeated work races safely with the live path because export facts are immutable by fact_id.
-    let catch_up_index = run_index.clone();
-    let catch_up_wal = wal_store.clone();
-    let catch_up_resolver = charge_basis_table.clone();
-    let _export_catch_up = {
-        let ready = scope_describer.clone();
-        tokio::spawn(async move {
-            ready.wait_registered().await;
-            spawn_blocking(JobKind::Recovery, move || {
-            let Some(catch_up_index) = catch_up_index else {
-                return;
-            };
-            let started = std::time::Instant::now();
-            match broca_core::catch_up_usage_exports(
-                catch_up_index.as_ref(),
-                catch_up_wal.as_ref(),
-                catch_up_resolver.as_ref(),
-            ) {
-                // SAY IT FINISHED, AND HOW LONG IT TOOK, even when there was nothing to do. This
-                // arm used to log nothing, so "finished in 50 ms" and "still running 20 s after
-                // boot" were the same observation from outside. This pass shares the store's
-                // single connection with admission's snapshot read, so it was the first suspect
-                // for the first send after a respawn that was never admitted. Measured at
-                // 2-5.5 s, it had always finished before that send; the stall was the archive
-                // membership build, prewarmed below.
-                Ok(0) => tracing::info!(
-                    target: "export",
-                    "usage-export startup catch-up finished in {} ms; nothing missed",
-                    started.elapsed().as_millis()
-                ),
-                Ok(count) => tracing::warn!(
-                    target: "export",
-                    "caught up {count} missed usage-export run(s) in {} ms",
-                    started.elapsed().as_millis()
-                ),
-                Err(error) => {
-                    tracing::warn!(target: "export", "usage-export startup catch-up failed: {error}")
-                }
-            }
-        }).await
-        })
-    };
-    // Build the archive membership cache now, off the send path. Otherwise the first NEW
-    // session after a restart builds it inside admission: 10,821 ms cold on production
-    // (2026-09-25 18:46Z), past the client's 10 s send deadline, so that send was never
-    // admitted. See FileWalStore::prewarm_archive_membership. The build logs its own time.
-    let prewarm_wal = wal_store.clone();
-    let _archive_prewarm = spawn_blocking(JobKind::Recovery, move || {
-        if let Err(error) = prewarm_wal.prewarm_archive_membership() {
-            tracing::warn!(
-                target: "archive",
-                "archive membership prewarm failed; the first new session will build it instead: {error}"
-            );
-        }
-    });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
     let mut classifier_router = None;
     // Where the new session storage's deployment key is read from: the vault, by grant. `None`
@@ -790,22 +678,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     executor_impl = executor_impl.with_context_management(context_management);
     executor_impl = executor_impl.with_compaction_signals(compaction_signals.enabled);
     let vault_auditor = executor_impl.vault_auditor();
-    let wal_reader: Arc<dyn broca_core::WalStore> = wal_store.clone();
     let store_reader = run_index
         .clone()
         .map(|store| store as Arc<dyn broca_core::MaterializedStore>);
     let retention = Arc::new(
-        {
-            let legacy = run_index.as_ref().unwrap();
-            broca_module::retention::RetentionService::new(
-                wal_store.clone(),
-                legacy.clone(),
-                lease_store.clone(),
-                legacy.clone(),
-                charge_basis_table.clone(),
-            )
-        }
-        .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
+        broca_module::retention::RetentionService::new(&state_root, lease_store.clone())
+            .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
     );
     executor_impl = executor_impl.with_compaction_plane(Arc::new(
         broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
@@ -857,7 +735,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let move_wal = wal_store.clone();
-    let store_move_wal = wal_store.clone();
     let store_move_leases: Arc<dyn broca_core::LeaseStore> = lease_store.clone();
     // Both live hints and durable run events share this process's credential and broker link.
     let bus_connector = Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
@@ -866,32 +743,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let step_events = Arc::new(broca_module_serve::step_events::StepEvents::start_on_bus(
         bus_connector.clone(),
     ));
-    let mut opener_builder = broca_module::DefaultOpener::new(lease_store, wal_store, executor)
+    let mut opener_builder = broca_module::DefaultOpener::new(lease_store, executor)
+        .with_backup_classes(backup_class_names)
         .with_charge_basis_resolver(charge_basis_table.clone())
         .with_store_slot(Arc::clone(&store_slot))
         .with_step_events(step_events.clone());
-    if let Some(legacy) = &run_index {
-        opener_builder = opener_builder
-            .with_run_index(legacy.clone())
-            .with_materialized_store(legacy.clone())
-            .with_export_index(legacy.clone());
-    }
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
-    let registry =
-        LineageRegistry::new_with_sources(Arc::new(opener_builder), Some(wal_reader), store_reader)
-            // Every new session starts in the new storage, whatever its class.
-            .with_store_new_sessions();
+    let registry = LineageRegistry::new_with_run_index(Arc::new(opener_builder), store_reader);
     registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
-    // A session whose move startup couldn't settle isn't served from today's storage.
-    unsettled_moves.sort();
-    unsettled_moves.dedup();
-    registry.refuse_unsettled_moves(unsettled_moves);
     let registry = Arc::new(registry);
-    if let Some(conversion) = &conversion {
-        conversion.install_guard(registry.as_ref());
-    }
     // `session.restore_from_backup` repairs sessions kept in the new storage after their files
     // came back from a backup, holding each one it writes as a move does.
     registry.set_store_restorer(Arc::new(
@@ -916,36 +778,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .run(registry.stopping_signal()),
     );
-    // `session.move_to_store` moves a session into the new storage, creating it in the mode
-    // `session_storage.encryption` chose: a plain session once the runtime is open, an
-    // encrypted one once the deployment key has loaded (`key_unavailable` until then).
-    {
-        let mut mover = broca_module_serve::store_move::StoreMove::new(
-            registry.as_ref().clone(),
-            &state_root,
-            Arc::clone(&store_slot),
-            store_move_wal,
-            store_move_leases,
-            broca_module_serve::store_move::served_by_serve_layer(),
-        )
-        .with_forget_projection(forget_projection)
-        .with_late_results(held_runtime.store.clone(), held_runtime.slots.clone());
-        // The move checks the run index's settled rows before replacing a session's storage.
-        if let Some(legacy) = &run_index {
-            let legacy = legacy.clone();
-            mover = mover.with_run_rows(Arc::new(move |session: &broca_protocol::BindIdentity| {
-                Ok((
-                    legacy.session_runs(session)?,
-                    legacy.session_exports_settled(session)?,
-                ))
-            }));
-        }
-        let mover = Arc::new(mover);
-        if let Some(conversion) = &conversion {
-            conversion.set_mover(Arc::clone(&mover));
-        }
-        registry.set_store_mover(mover);
-    }
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
@@ -1110,34 +942,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
     tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
         "agent-data boot recovery complete");
-    let phase_started = std::time::Instant::now();
-    let _history_rewrites = registry
-        .finish_history_rewrites_at_boot()
-        .await
-        .map_err(|error| ServeIoError(format!("finish fenced history recovery: {error}")))?;
-    tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
-        "fenced history boot recovery complete");
-    let phase_started = std::time::Instant::now();
-    registry
-        .boot_retention_deletions()
-        .await
-        .map_err(|error| ServeIoError(format!("retention boot recovery: {error}")))?;
-    tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
-        "retention deletion boot recovery complete");
     let retention_sweep = Some({
         let registry = registry.clone();
         let ready = scope_describer.clone();
         tokio::spawn(async move {
             ready.wait_registered().await;
-            if let Err(error) = registry.rebuild_retention_deletion_inventory().await {
-                tracing::warn!(target: "retention", %error, "retention deletion inventory repair deferred");
-            }
-            let phase_started = std::time::Instant::now();
-            if let Err(error) = registry.enroll_retention().await {
-                tracing::warn!(target: "retention", %error, "retention enrollment recovery deferred");
-            }
-            tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
-                "retention enrollment boot recovery complete");
             if registry.run_retention_sweeper().await.is_err() {
                 tracing::warn!(target: "retention", "retention sweep stopped; durable recovery required");
             }
@@ -1152,10 +961,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let _bus_events = broca_module_serve::bus_events::Service {
         config: bus_event_config,
         store: event_store,
-        wal: crash_orphan_wal.clone(),
         registry: registry.as_ref().clone(),
         connector: Some(bus_connector),
-        hints: bus_hints,
         store_events: store_run_events,
         stop: bus_stop,
     }
@@ -1187,44 +994,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
         })
     };
-    let recovery: Arc<dyn broca_core::RecoveryDiscovery> = run_index.as_ref().unwrap().clone();
-    let crash_orphans = mark_crash_orphans(
-        &registry,
-        recovery.clone(),
-        Arc::clone(&crash_orphan_wal),
-        process_started,
-    )
-    .await;
-    let crash_orphan_seal = {
-        let registry = Arc::clone(&registry);
-        #[cfg(feature = "test-clock")]
-        let seal_gate = state_root.join(CRASH_ORPHAN_SEAL_GATE);
-        tokio::spawn(async move {
-            #[cfg(feature = "test-clock")]
-            hold_crash_orphan_seal(&seal_gate).await;
-            let started = std::time::Instant::now();
-            let sweep = registry.seal_marked_crash_orphans(crash_orphans).await;
-            // One line per pass, at WARN like the shutdown seal's, and on every boot: a
-            // silent pass would read the same as a pass that never ran.
-            tracing::warn!(
-                target: "lifecycle",
-                "crash-orphan seal complete in {} ms; {} run(s) sealed interrupted, {} index \
-                 row(s) repaired from the WAL ({} active index row(s); {} session(s) marked, {} archived, {} written since \
-                 boot, {} unreadable, {} held by another process, {} failed to open)",
-                started.elapsed().as_millis(),
-                sweep.sealed,
-                sweep.index_repaired,
-                sweep.candidate_runs,
-                sweep.marked,
-                sweep.not_live,
-                sweep.written_since_boot,
-                sweep.unreadable,
-                sweep.lease_held,
-                sweep.open_failed,
-            );
-        })
-    };
-
     // Late results reach a run through its session's actor, so delivery waits for the registry.
     held_resumer.bind(registry.clone());
     // Boot recovery for provider-held calls runs off the startup path, once the dependency
@@ -1238,29 +1007,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             describer.wait_registered().await;
             runtime.recover(registry).await;
-        })
-    };
-    let _restart_resume = {
-        let registry = registry.clone();
-        let index = run_index.as_ref().unwrap().clone();
-        let wal = crash_orphan_wal.clone();
-        let describer = scope_describer.clone();
-        tokio::spawn(async move {
-            describer.wait_registered().await;
-            let candidates =
-                spawn_blocking(JobKind::Recovery, move || index.restart_resume_candidates()).await;
-            match candidates {
-                Ok(Ok(candidates)) => {
-                    registry.resume_restart_pauses(wal, candidates).await;
-                    // Admitting the resumed runs decoded every one of their conversations at
-                    // once. Release what that wave freed at the next idle tick; the runs' own
-                    // terminals note their memory again as each one finishes.
-                    broca_memory_relief::note_freed();
-                }
-                error => {
-                    tracing::warn!(target: "lifecycle", "restart resume: cannot list candidate runs: {error:?}")
-                }
-            }
         })
     };
     // Return freed heap pages to the system after a peak. The hook wakes once per
@@ -1285,94 +1031,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
-    // Finished runs are not restart candidates, but their actors may still need to
-    // retract unanswered approval questions. The query excludes sessions whose content
-    // retention has expired: the retention service retracts those using its ledger of
-    // question identifiers, without reopening the deleted conversation.
-    let _withdrawal_debt = {
-        let registry = registry.clone();
-        let index = recovery.clone();
-        let describer = scope_describer.clone();
-        tokio::spawn(async move {
-            let stopping = registry.stopping_signal();
-            tokio::select! {
-                biased;
-                _ = stopping.cancelled() => return,
-                _ = describer.wait_registered() => {}
-            }
-            let candidates = tokio::select! {
-                biased;
-                _ = stopping.cancelled() => return,
-                rows = spawn_blocking(JobKind::Recovery, move || index.withdrawal_candidates()) => rows,
-            };
-            let candidates = match candidates {
-                Ok(Ok(rows)) => rows,
-                error => {
-                    tracing::warn!(target: "lifecycle", "withdrawal debt: cannot list candidate runs: {error:?}");
-                    return;
-                }
-            };
-            let mut seen = std::collections::HashSet::new();
-            for row in candidates {
-                if !seen.insert(row.session.clone()) {
-                    continue;
-                }
-                tokio::select! {
-                    biased;
-                    _ = stopping.cancelled() => return,
-                    opened = registry.actor_for(&row.session) => {
-                        if let Err(error) = opened {
-                            tracing::warn!(target: "lifecycle", "withdrawal debt: cannot open session '{}': {error}", row.session.session);
-                        }
-                    }
-                }
-            }
-        })
-    };
-    let _conversion = conversion.map(|engine| {
-        let registry = Arc::clone(&registry);
-        let slot = Arc::clone(&store_slot);
-        tokio::spawn(async move {
-            let result = broca_module_serve::session_conversion::after_startup_recovery(
-                async {
-                    crash_orphan_seal
-                        .await
-                        .map_err(|error| format!("startup recovery did not complete: {error}"))
-                },
-                async {
-                    let stopping = registry.stopping_signal();
-                    let runtime = loop {
-                        if let Some(runtime) = slot.creating_runtime() {
-                            break runtime;
-                        }
-                        tokio::select! {
-                            _ = stopping.cancelled() => return Ok(()),
-                            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-                        }
-                    };
-                    engine
-                        .run_live(
-                            runtime.deployment(),
-                            Some(&runtime),
-                            Some(registry.as_ref()),
-                        )
-                        .await?;
-                    engine
-                        .run_background(
-                            runtime.deployment(),
-                            &runtime,
-                            registry.as_ref(),
-                            Duration::from_millis(250),
-                        )
-                        .await
-                },
-            )
-            .await;
-            if let Err(error) = result {
-                engine.record_error(error);
-            }
-        })
-    });
     let stream = connect(&conn_path).await?;
     let (read_half, write_half) = tokio::io::split(stream);
     let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
@@ -1383,7 +1041,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         registry.clone(),
         vault_gauge,
         Some(catalog_cache),
-        archive_config,
         consumer_routes,
         vault_auditor,
         daemon_capabilities,
@@ -1534,70 +1191,6 @@ mod runtime_shutdown_tests {
     }
 }
 
-/// First half of the startup crash-orphan pass, run BEFORE serving begins.
-///
-/// A process that dies without its shutdown seal (SIGKILL, panic, power loss) leaves each
-/// in-flight run with a `RunStarted`, no terminal, and an `active` index row. This marks the
-/// sessions that may hold one; the registry's actors then seal them `Interrupted` through the
-/// shutdown seal's own code when they open. Marking before the first request is what lets the
-/// sealing half run in the background while serving: a caller's send that reaches a marked
-/// session first takes the mark in its own open and seals before its send is handled.
-///
-/// Candidates come from the run index's active rows, not from replaying every live WAL, so the
-/// cost is one stat per candidate session. A failure here costs only the pass: the orphans stay
-/// as they are and ordinary recovery handles them when the session is next opened.
-async fn mark_crash_orphans(
-    registry: &LineageRegistry,
-    run_index: Arc<dyn broca_core::RecoveryDiscovery>,
-    wal_store: Arc<FileWalStore>,
-    process_started: std::time::SystemTime,
-) -> broca_module::registry::CrashOrphanSweep {
-    let candidates = spawn_blocking(JobKind::Recovery, move || {
-        run_index
-            .active_runs()
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|(id, key)| (broca_protocol::RunId(id), key))
-                    .collect::<Vec<_>>()
-            })
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())
-    .and_then(|result| result.map_err(|error| error.to_string()));
-    let candidates = match candidates {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(
-                target: "lifecycle",
-                "crash-orphan pass could not list active runs; skipping it this boot: {error}"
-            );
-            Vec::new()
-        }
-    };
-    let registry = registry.clone();
-    spawn_blocking(JobKind::Recovery, move || {
-        registry.mark_crash_orphans(wal_store.as_ref(), candidates, process_started)
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// A debug-only control for real-daemon tests, in the state root: while this file exists, the
-/// boot's crash-orphan seal pass waits before it opens any session. Sessions are marked before
-/// serving begins, so a test that creates the file before killing broca can observe, without
-/// racing, a restarted process whose orphans are marked but not yet sealed. Only a `test-clock`
-/// build reads it.
-#[cfg(feature = "test-clock")]
-const CRASH_ORPHAN_SEAL_GATE: &str = "test-crash-orphan-seal-gate";
-
-#[cfg(feature = "test-clock")]
-async fn hold_crash_orphan_seal(gate: &std::path::Path) {
-    while gate.exists() {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-}
-
 /// The SIGTERM trigger for the seal. Not a backstop: until subc gives modules their own process
 /// groups, it is how every DAEMON CUT reaches broca, because launchd SIGTERMs the daemon's whole
 /// group (measured: 3 of 3 cuts on 2026-09-23 logged this arm). A module restart reaches the
@@ -1745,7 +1338,6 @@ enum LaunchArgs {
     Daemon(PathBuf),
     Version,
     WalKnownFeatures,
-    ConvertClone { root: PathBuf, backup: PathBuf },
 }
 
 fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchArgs, String> {
@@ -1753,8 +1345,6 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
     let mut conn_path = None;
     let mut version = false;
     let mut wal_known_features = false;
-    let mut clone_root = None;
-    let mut clone_backup = None;
     while let Some(arg) = args.next() {
         if arg == "--subc" {
             if conn_path.is_some() {
@@ -1765,19 +1355,6 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
                 return Err(format!("missing value for --subc; got {value:?}"));
             }
             conn_path = Some(PathBuf::from(value));
-        } else if arg == "--convert-clone" || arg == "--converted-sources" {
-            let value = args.next().ok_or("missing conversion path")?;
-            if value.is_empty() || value.to_string_lossy().starts_with('-') {
-                return Err("missing conversion path".into());
-            }
-            let target = if arg == "--convert-clone" {
-                &mut clone_root
-            } else {
-                &mut clone_backup
-            };
-            if target.replace(PathBuf::from(value)).is_some() {
-                return Err("duplicate conversion path".into());
-            }
         } else if arg == "--version" || arg == "-V" {
             version = true;
         } else if arg == "--wal-known-features" {
@@ -1785,15 +1362,6 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
         } else {
             return Err(format!("unknown argument {arg:?}"));
         }
-    }
-    if clone_root.is_some() || clone_backup.is_some() {
-        if conn_path.is_some() || version || wal_known_features {
-            return Err("clone conversion cannot start a daemon or run a probe".into());
-        }
-        return Ok(LaunchArgs::ConvertClone {
-            root: clone_root.ok_or("missing --convert-clone")?,
-            backup: clone_backup.ok_or("missing --converted-sources")?,
-        });
     }
     if version {
         return Ok(LaunchArgs::Version);
@@ -1813,15 +1381,11 @@ mod executor {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use async_trait::async_trait;
     use broca_catalog::live::{AuthMode, CachePolicy};
-    use broca_core::{
-        run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, FileWalStore, OutputEvent,
-        RunError, RunSummary, WalStore,
-    };
-    use broca_module::executor::{RunExecutor, RunJob, RunKind};
+    use broca_core::{AllowAll, FileWalStore, OutputEvent, RunError, RunSummary, WalStore};
+    use broca_module::executor::{RunExecutor, RunKind};
     use broca_protocol::caller::{PauseReason, RunFinishReason};
     use broca_protocol::error::{ErrorClass, ProviderError};
     use broca_protocol::{AuthRequest, BindIdentity};
@@ -1832,11 +1396,6 @@ mod executor {
     use broca_provider::{build_provider_http_client, ProviderHttpClient};
     use broca_subc::{SubcToolPlane, VaultError, VaultGet, VaultToken};
     use tokio::sync::mpsc;
-
-    /// How long to wait for the tool route to bind before the timed loop (gives the tool
-    /// provider time for its one-time setup on the first route open for a session — e.g. AFT
-    /// cold-starts its code index, which on a large project can take seconds).
-    const BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
     use broca_catalog::live::WireFamilyId;
     use broca_module_serve::account_routing::{AccountChoice, RoutingClient};
@@ -1951,6 +1510,9 @@ mod executor {
     #[derive(Clone)]
     pub struct InRunRefresh {
         pub refresher: SharedSecretRefresher,
+        /// The refresher moves it; the run-end report names the version the run's last attempt
+        /// sent instead. Exposed so tests can see it move.
+        #[cfg_attr(not(test), allow(dead_code))]
         pub served_version: Arc<AtomicU64>,
         /// When the token the run is using NOW expires (`None` for a token that never does,
         /// such as an API key). Moves together with `served_version`, so the pre-send check
@@ -2595,26 +2157,6 @@ mod executor {
         Ok(())
     }
 
-    /// The credential the run actually USED, paired with the record_version of the token it
-    /// was served — the identity a post-run wire-auth-failure report needs. `None` when the
-    /// run never got a vault token: the mock path, a selection without a served token, a pre-loop
-    /// `needs_reauth` pause (the vault already knows; no provider call was made), or a
-    /// version-less resolution (nothing served, nothing to CAS against). Requiring BOTH pieces
-    /// structurally prevents a report that could invalidate a version the run never saw.
-    fn used_credential_for_report(
-        pause: &Option<ProviderError>,
-        selection: Option<broca_core::AuthSelection>,
-        record_version: Option<u64>,
-    ) -> Option<(broca_core::AuthSelection, u64)> {
-        if pause.is_some() {
-            return None;
-        }
-        match (selection, record_version) {
-            (Some(s), Some(version)) => Some((s, version)),
-            _ => None,
-        }
-    }
-
     fn should_check_wire_auth(outcome: &Result<RunSummary, RunError>) -> bool {
         matches!(
             outcome,
@@ -2658,20 +2200,6 @@ mod executor {
         terminal_error.await.as_ref().and_then(wire_auth_status)
     }
 
-    async fn terminal_provider_error(
-        wal_store: Arc<dyn WalStore>,
-        session: BindIdentity,
-    ) -> Option<ProviderError> {
-        let records =
-            broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::WalRead, move || {
-                wal_store.read_records(&session)
-            })
-            .await
-            .ok()?
-            .ok()?;
-        latest_terminal_error(&records).cloned()
-    }
-
     /// Share the durable terminal's error between routing and vault reporting. API-key auth
     /// pauses block the rejected key without ending the paused run or releasing its admission.
     /// `terminal_error` reads the error from the session's storage and is awaited only when the
@@ -2711,20 +2239,6 @@ mod executor {
         Some(error)
     }
 
-    /// Return the newest pause/finish record's error without crossing that terminal boundary.
-    /// An error-free terminal deliberately produces `None`, even when an older terminal failed.
-    fn latest_terminal_error(records: &[broca_wal::FramedRecord]) -> Option<&ProviderError> {
-        records
-            .iter()
-            .rev()
-            .find_map(|frame| match &frame.record {
-                broca_wal::WalRecord::RunPaused { error, .. }
-                | broca_wal::WalRecord::RunFinished { error, .. } => Some(error.as_ref()),
-                _ => None,
-            })
-            .flatten()
-    }
-
     /// The reportable wire-auth status of a terminal error: an Auth-class `401` or `403` only.
     /// A Permanent 403 is an authorization denial, not a dead credential, and must not be
     /// reported to the vault. Pure, so the class and status filter is unit-tested without WAL
@@ -2750,21 +2264,6 @@ mod executor {
         /// sign-in or for a restart. Its resume writes the account and the config that names it
         /// before it calls the provider. Any other resume continues on the account it recorded.
         records_account_change: bool,
-    }
-
-    fn prior_run_view_from_checkpoint(
-        checkpoint: &broca_core::AdmissionCheckpointV1,
-    ) -> Option<PriorRunView> {
-        checkpoint
-            .last_episode
-            .as_ref()
-            .map(|episode| PriorRunView {
-                run_id: episode.run_id.clone(),
-                config: episode.config.clone(),
-                idle: episode.disposition == broca_core::EpisodeDisposition::Finished,
-                moved: false,
-                records_account_change: false,
-            })
     }
 
     /// What a run's admission takes from its job, for a session on today's WAL or in the new
@@ -2799,21 +2298,17 @@ mod executor {
         persona: PersonaHistory,
     }
 
-    /// The session history a fresh Claude Code persona falls back on.
-    enum PersonaHistory {
-        /// Today's WAL, read through the durable head.
-        Wal,
-        /// What a session in the new storage already holds in its folds.
-        Store {
-            /// The session's first user message, when it is still in the open window.
-            /// `None` with `first_user_sealed` means it's in sealed history, which a run
-            /// can't read; the suffix is then left unpinned, as when a WAL can't be read.
-            first_user: Option<broca_protocol::content::Message>,
-            first_user_sealed: bool,
-            /// The human prompts the session's runs started with (the conversation fold's
-            /// `human_prompts`), counted the way `human_prompt_ordinal` counts a WAL's.
-            human_prompts: u64,
-        },
+    /// The session history a fresh Claude Code persona falls back on: what the session already
+    /// holds in its folds.
+    struct PersonaHistory {
+        /// The session's first user message, when it is still in the open window. `None` with
+        /// `first_user_sealed` means it's in sealed history, which a run can't read; the suffix
+        /// is then left unpinned.
+        first_user: Option<broca_protocol::content::Message>,
+        first_user_sealed: bool,
+        /// The human prompts the session's runs started with (the conversation fold's
+        /// `human_prompts`).
+        human_prompts: u64,
     }
 
     /// What [`LiveLoopExecutor::admit_episode`] decided.
@@ -2824,7 +2319,6 @@ mod executor {
         account_choice: AccountChoice,
         /// Routing refused the caller's decision; the run pauses on it without a model call.
         routing_decision_error: Option<ProviderError>,
-        mode: broca_core::StartMode,
         resolved: broca_catalog::live::ProviderResolution,
         /// The catalog provider whose rows the run borrowed, when its model's provider is one
         /// the catalog doesn't carry (`RunConfig::served_provider`).
@@ -2853,8 +2347,8 @@ mod executor {
             .and_then(serde_json::Value::as_u64)
     }
 
-    /// [`LiveLoopExecutor::session_prompt_ordinal`] for a session in the new storage, whose
-    /// conversation fold counts its human prompts, so nothing is read.
+    /// The prompt ordinal a fresh persona freezes for a session whose conversation fold counts
+    /// its human prompts: the latest run's recorded ordinal, else that count.
     fn prompt_ordinal_from(
         req: &broca_core::RunRequest,
         last_frozen: Option<&serde_json::Value>,
@@ -2866,10 +2360,10 @@ mod executor {
         )
     }
 
-    /// [`LiveLoopExecutor::session_cc_version_suffix`] for a session in the new storage: the
-    /// latest run's suffix, else one computed from the session's first user message. When that
-    /// message is in sealed history, which a run can't read, the suffix is left unpinned and
-    /// the renderer computes it from each request, as when a WAL can't be read.
+    /// The `cc_version` suffix pinned for a new run's session: the latest run's suffix, else one
+    /// computed from the session's first user message. When that message is in sealed history,
+    /// which a run can't read, the suffix is left unpinned and the renderer computes it from
+    /// each request.
     fn store_cc_version_suffix(
         req: &broca_core::RunRequest,
         last_frozen: Option<&serde_json::Value>,
@@ -3084,7 +2578,7 @@ mod executor {
         };
         Ok(StoreHistory {
             prior_run,
-            persona: PersonaHistory::Store {
+            persona: PersonaHistory {
                 first_user,
                 first_user_sealed,
                 human_prompts: conversation.human_prompts,
@@ -3517,7 +3011,7 @@ mod executor {
                 }),
                 last_config: Some(&config),
                 head_seq: 0,
-                persona: PersonaHistory::Store {
+                persona: PersonaHistory {
                     first_user: None,
                     first_user_sealed: false,
                     human_prompts: 0,
@@ -3890,85 +3384,41 @@ mod executor {
             .await
     }
 
-    #[derive(Clone, Copy)]
-    enum ReportedTokenVersion {
-        Admitted(u64),
-        Sent(u64),
-    }
-
     /// The rejection a run that ended on a wire auth error still owes the vault, if any: ONE
-    /// REPORT PER REJECTION, naming the version the provider actually rejected.
-    ///
-    /// An execution supplying `Sent` measures it from recorded attempts, so neither
-    /// an unused admission token nor a newer token fetched after a rejection can be reported.
-    /// The legacy `Admitted` path retains its existing refresher-based accounting:
-    /// - Without an in-step refresher (`in_run` is `None`) nothing has reported anything, and
-    ///   the run only ever held its admitted version: report that, with the terminal status.
-    /// - When the provider rejected a token the step had already refreshed, the refresher
-    ///   recorded that rejection without reporting it: report exactly that status and version.
-    ///   That is the second token's own report; the first token's was sent in-step.
-    /// - Otherwise, when the refresher already reported in-step, the rejection that ended the
-    ///   run is the one it reported (the vault had no newer token, or the refreshed token was
-    ///   never sent), so nothing is owed. The served version may have moved past the rejected
-    ///   one by then, which is why it is not compared.
-    /// - A refresher that never ran leaves the run on the version it holds now.
+    /// REPORT PER REJECTION, naming the version the provider actually rejected. `sent` is the
+    /// version the run's last attempt sent, measured from its recorded attempts, so neither an
+    /// unused admission token nor a newer token fetched after a rejection can be reported.
+    /// - When the in-step refresher recorded a rejection of `sent` without reporting it, report
+    ///   exactly that status and version.
+    /// - When the refresher already reported `sent`, nothing is owed.
+    /// - Otherwise report `sent`, with the terminal status.
     fn run_end_report_target(
         in_run: Option<&InRunRefresh>,
-        version: ReportedTokenVersion,
+        sent: u64,
         terminal_status: u16,
     ) -> Option<UnreportedRejection> {
-        let admitted_version = match version {
-            ReportedTokenVersion::Sent(sent) => {
-                if let Some(in_run) = in_run {
-                    if let Some(unreported) = *in_run
-                        .unreported_rejection
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                    {
-                        if unreported.record_version == sent {
-                            return Some(unreported);
-                        }
-                    }
-                    if *in_run
-                        .reported_version
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        == Some(sent)
-                    {
-                        return None;
-                    }
+        if let Some(in_run) = in_run {
+            if let Some(unreported) = *in_run
+                .unreported_rejection
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+            {
+                if unreported.record_version == sent {
+                    return Some(unreported);
                 }
-                return Some(UnreportedRejection {
-                    status: terminal_status,
-                    record_version: sent,
-                });
             }
-            ReportedTokenVersion::Admitted(admitted) => admitted,
-        };
-        let Some(in_run) = in_run else {
-            return Some(UnreportedRejection {
-                status: terminal_status,
-                record_version: admitted_version,
-            });
-        };
-        if let Some(unreported) = *in_run
-            .unreported_rejection
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-        {
-            return Some(unreported);
-        }
-        if in_run
-            .reported_version
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_some()
-        {
-            return None;
+            if *in_run
+                .reported_version
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                == Some(sent)
+            {
+                return None;
+            }
         }
         Some(UnreportedRejection {
             status: terminal_status,
-            record_version: in_run.served_version.load(Ordering::SeqCst),
+            record_version: sent,
         })
     }
 
@@ -3978,7 +3428,7 @@ mod executor {
     async fn report_rejection_after_run(
         vault: &VaultAuth,
         selection: &broca_core::AuthSelection,
-        version: ReportedTokenVersion,
+        version: u64,
         in_run: Option<&InRunRefresh>,
         terminal_status: u16,
     ) {
@@ -4125,9 +3575,6 @@ mod executor {
     /// threads the admission ack so the coordinator admits a run only once it's durable.
     pub struct LiveLoopExecutor<W = FileWalStore> {
         wal_store: Arc<W>,
-        offset_resume: Option<Arc<ResumeReaderFactory>>,
-        /// The legacy session store used by resume.
-        session_store: Option<Arc<broca_store::SqliteStore>>,
         /// The SHARED tool plane (one consumer connection, per-session routes). Shared so
         /// every session's tool dispatch rides one outbound subc connection.
         plane: Arc<SubcToolPlane>,
@@ -4173,21 +3620,6 @@ mod executor {
         tool_name_aliases: broca_module_serve::config::ToolNameAliasesConfig,
         /// Boot-loaded wait bound shared by routing admission and new account-limit pauses.
         max_same_account_wait: broca_core::SameAccountWait,
-        /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
-        /// its WAL could not be read), so the WAL is read for it at most once per session.
-        cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
-        /// WAL bytes read to pin `cc_version` suffixes, for tests that prove a read happens at
-        /// most once.
-        cc_suffix_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
-        /// Verified human-prompt counts and their WAL end offsets. If another provider admits
-        /// intervening episodes without recording a persona count, resume counting at that
-        /// offset instead of decoding the session's history again.
-        cc_prompt_memo: Arc<
-            std::sync::Mutex<
-                std::collections::HashMap<String, broca_wal::file_wal::HumanPromptCount>,
-            >,
-        >,
-        cc_prompt_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     /// The executor also needs the file store's bounded prompt reader and installation path.
@@ -4196,12 +3628,6 @@ mod executor {
     pub trait ExecutorWalStore: WalStore {
         fn file_store(&self) -> &FileWalStore;
     }
-
-    type ResumeReaderFactory = dyn Fn(
-            &broca_protocol::BindIdentity,
-        ) -> Result<Arc<dyn broca_core::resume::OffsetResumeReader>, String>
-        + Send
-        + Sync;
 
     impl ExecutorWalStore for FileWalStore {
         fn file_store(&self) -> &FileWalStore {
@@ -4212,48 +3638,11 @@ mod executor {
     impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         pub fn new(
             wal_store: Arc<W>,
-            session_store: Arc<broca_store::SqliteStore>,
             plane: Arc<SubcToolPlane>,
             provider_base_url: Option<String>,
-        ) -> Self {
-            Self::new_with_offset_resume_readers(
-                wal_store,
-                session_store,
-                plane,
-                provider_base_url,
-                None,
-            )
-        }
-
-        /// Construct a session-local resume composition for the selected state format.
-        /// The factory runs after the writer syncs; its reader must serve that durable head.
-        pub fn new_with_offset_resume_readers(
-            wal_store: Arc<W>,
-            session_store: Arc<broca_store::SqliteStore>,
-            plane: Arc<SubcToolPlane>,
-            provider_base_url: Option<String>,
-            offset_resume: Option<Arc<ResumeReaderFactory>>,
-        ) -> Self {
-            Self::build(
-                wal_store,
-                Some(session_store),
-                plane,
-                provider_base_url,
-                offset_resume,
-            )
-        }
-
-        fn build(
-            wal_store: Arc<W>,
-            session_store: Option<Arc<broca_store::SqliteStore>>,
-            plane: Arc<SubcToolPlane>,
-            provider_base_url: Option<String>,
-            offset_resume: Option<Arc<ResumeReaderFactory>>,
         ) -> Self {
             Self {
                 wal_store,
-                offset_resume,
-                session_store,
                 plane,
                 hooks: None,
                 compaction_plane: None,
@@ -4273,122 +3662,7 @@ mod executor {
                 anthropic_fallbacks: Default::default(),
                 tool_name_aliases: Default::default(),
                 max_same_account_wait: Default::default(),
-                cc_suffix_memo: Default::default(),
-                cc_suffix_wal_bytes: Default::default(),
-                cc_prompt_memo: Default::default(),
-                cc_prompt_wal_bytes: Default::default(),
             }
-        }
-
-        /// The `cc_version` suffix pinned for a new episode's session: the one the session's
-        /// latest episode froze, or else one computed from the session's first durable user
-        /// message, read from the WAL only as far as the record that carries it (never a
-        /// compaction view). The result is remembered per session for this process, so a session
-        /// whose latest episode recorded no suffix (it used another provider) does not read the
-        /// WAL again. `None` when the WAL cannot be read: logged once per session at WARN, and
-        /// the renderer then computes the suffix from each request as before.
-        async fn session_cc_version_suffix(
-            &self,
-            req: &broca_core::RunRequest,
-            last_episode_frozen_config: Option<&serde_json::Value>,
-            durable_head: u64,
-        ) -> Option<String> {
-            use broca_module_serve::claude_code_identity::{
-                first_durable_cc_version_suffix, inherited_cc_version_suffix,
-            };
-            if let Some(inherited) = inherited_cc_version_suffix(last_episode_frozen_config) {
-                return Some(inherited);
-            }
-            let key = broca_core::session_addr(&req.session);
-            if let Some(remembered) = self.cc_suffix_memo.lock().unwrap().get(&key) {
-                return remembered.clone();
-            }
-            // An empty WAL holds no earlier message, so the new input's is the first.
-            let durable = if durable_head == 0 {
-                None
-            } else {
-                let wal_store = Arc::clone(&self.wal_store);
-                let session = req.session.clone();
-                let read = broca_diagnostics::spawn_blocking(
-                    broca_diagnostics::JobKind::WalRead,
-                    move || wal_store.first_user_message(&session),
-                )
-                .await;
-                match read {
-                    Ok(Ok((message, bytes))) => {
-                        self.cc_suffix_wal_bytes
-                            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-                        message
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::warn!(
-                            session = %req.session.session,
-                            "the session's first user message could not be read; its Claude Code cc_version suffix is not pinned"
-                        );
-                        self.remember_cc_suffix(key, None);
-                        return None;
-                    }
-                }
-            };
-            let suffix = first_durable_cc_version_suffix(durable.as_slice(), &req.input);
-            self.remember_cc_suffix(key, suffix.clone());
-            suffix
-        }
-
-        /// Reuse the human-prompt count recorded by the preceding episode without touching the
-        /// WAL. Legacy or imported sessions need one initial count of episode inputs. Remember
-        /// that count's verified file offset for later provider switches, so fallback reads
-        /// inspect only appended frames without deserializing model/tool records.
-        async fn session_prompt_ordinal(
-            &self,
-            req: &broca_core::RunRequest,
-            last_episode_frozen_config: Option<&serde_json::Value>,
-            durable_head: u64,
-        ) -> Result<u64, RunError> {
-            let add_input = |count: u64| prompt_ordinal_after(req, count);
-            if let Some(ordinal) = recorded_prompt_ordinal(last_episode_frozen_config) {
-                return add_input(ordinal);
-            }
-            let key = broca_core::session_addr(&req.session);
-            let base = self.cc_prompt_memo.lock().unwrap().get(&key).copied();
-            if let Some(base) = base.filter(|base| base.through_seq == durable_head) {
-                return add_input(base.count);
-            }
-            let wal_store = Arc::clone(&self.wal_store);
-            let session = req.session.clone();
-            let counted =
-                broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::WalRead, move || {
-                    wal_store
-                        .file_store()
-                        .human_prompt_count(&session, durable_head, base.as_ref())
-                })
-                .await
-                .map_err(|error| {
-                    RunError::Config(format!("Claude Code prompt history read failed: {error}"))
-                })?
-                .map_err(|error| {
-                    RunError::Config(format!("Claude Code prompt history read failed: {error}"))
-                })?;
-            self.cc_prompt_wal_bytes
-                .fetch_add(counted.bytes_read, std::sync::atomic::Ordering::Relaxed);
-            let mut memo = self.cc_prompt_memo.lock().unwrap();
-            if memo.len() >= 16_384 {
-                memo.clear();
-            }
-            memo.insert(key, counted);
-            add_input(counted.count)
-        }
-
-        /// Remember a session's pinned suffix (or that its WAL could not be read) for this
-        /// process. The map is cleared when it grows past a bound, which costs at most one more
-        /// bounded read per session.
-        fn remember_cc_suffix(&self, key: String, suffix: Option<String>) {
-            const MAX_REMEMBERED_SESSIONS: usize = 16_384;
-            let mut memo = self.cc_suffix_memo.lock().unwrap();
-            if memo.len() >= MAX_REMEMBERED_SESSIONS {
-                memo.clear();
-            }
-            memo.insert(key, suffix);
         }
 
         /// Install the id the Claude Code persona's device id derives from.
@@ -4748,8 +4022,6 @@ mod executor {
             // credential has been repaired. Once auth succeeds, mark the core attempt as
             // auth-resolved so an AuthRequired replay continues; core ignores that signal for
             // fresh runs and every other replay resolution.
-            let mode =
-                broca_module_serve::start_mode_after_auth(job.kind, resolution.pause.is_none());
             // DRIVE the wire family from the resolved auth method: a method that selects a
             // distinct grammar (Antigravity → google-codeassist, ChatGPT → chatgpt-responses)
             // overrides the catalog provider's family. `family_for_method` is the single
@@ -4795,35 +4067,21 @@ mod executor {
                     let last_frozen = history
                         .last_config
                         .map(|config| &config.frozen_render_config);
-                    let cc_version_suffix = match &history.persona {
-                        PersonaHistory::Wal => {
-                            self.session_cc_version_suffix(job.req, last_frozen, history.head_seq)
-                                .await
-                        }
-                        PersonaHistory::Store {
-                            first_user,
-                            first_user_sealed,
-                            ..
-                        } => store_cc_version_suffix(
-                            job.req,
-                            last_frozen,
-                            first_user.as_ref(),
-                            *first_user_sealed,
-                        ),
-                    };
+                    let cc_version_suffix = store_cc_version_suffix(
+                        job.req,
+                        last_frozen,
+                        history.persona.first_user.as_ref(),
+                        history.persona.first_user_sealed,
+                    );
                     // Like every other failure before the loop, this one is reported through
                     // the admission ack. Returning without it would drop the ack unsent, and
                     // the actor would then see only "run ended before admission" instead of
                     // this permanent Config cause.
-                    let prompt_ordinal = match match &history.persona {
-                        PersonaHistory::Wal => {
-                            self.session_prompt_ordinal(job.req, last_frozen, history.head_seq)
-                                .await
-                        }
-                        PersonaHistory::Store { human_prompts, .. } => {
-                            prompt_ordinal_from(job.req, last_frozen, *human_prompts)
-                        }
-                    } {
+                    let prompt_ordinal = match prompt_ordinal_from(
+                        job.req,
+                        last_frozen,
+                        history.persona.human_prompts,
+                    ) {
                         Ok(ordinal) => ordinal,
                         Err(error) => {
                             return Err(error);
@@ -5112,7 +4370,6 @@ mod executor {
                 resolution,
                 account_choice,
                 routing_decision_error,
-                mode,
                 resolved,
                 served_provider,
             })
@@ -5218,7 +4475,7 @@ mod executor {
             summary: &Result<RunSummary, RunError>,
             account_reporter: Option<&broca_module_serve::account_routing::RunReporter>,
             report_selection: Option<broca_core::AuthSelection>,
-            used_credential: Option<(broca_core::AuthSelection, ReportedTokenVersion)>,
+            used_credential: Option<(broca_core::AuthSelection, u64)>,
             in_run_refresh: Option<&InRunRefresh>,
             terminal_error: impl Fn() -> F,
             lineage: Option<broca_wal::WalLineageId>,
@@ -5472,7 +4729,6 @@ mod executor {
                 resolution,
                 account_choice,
                 routing_decision_error,
-                mode: _,
                 resolved,
                 served_provider,
             } = admitted;
@@ -5628,12 +4884,7 @@ mod executor {
                 .as_ref()
                 .map(|moved| moved.selection.clone())
                 .or(report_selection);
-            let used_credential = sent
-                .lock()
-                .unwrap()
-                .last
-                .clone()
-                .map(|(selection, version)| (selection, ReportedTokenVersion::Sent(version)));
+            let used_credential = sent.lock().unwrap().last.clone();
             let in_run_refresh = match moved.as_ref().filter(|moved| {
                 used_credential
                     .as_ref()
@@ -6525,9 +5776,6 @@ mod executor {
                 .map(|_| ())
                 .map_err(|error| format!("account_route: {error}"))
         }
-        fn source_warm_enabled(&self) -> bool {
-            self.anthropic_fallbacks.refusal_resend.is_enabled()
-        }
         fn cached_account_email(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
             let vault = self.vault.as_ref()?;
             let id = vault.addressing.vault_id_for_selection(selection).ok()??;
@@ -6622,26 +5870,6 @@ mod executor {
 
         fn compaction_views(&self) -> Option<Arc<dyn broca_core::CompactionViews>> {
             Some(self.compaction_views.clone())
-        }
-
-        async fn apply_idle_compaction(
-            &self,
-            session: &broca_protocol::BindIdentity,
-            writer: &broca_core::WalHandle,
-            records: Vec<broca_wal::WalRecord>,
-            ready: &broca_core::compaction_provider::notice::ViewReady,
-        ) -> Result<bool, String> {
-            broca_module_serve::compaction_bus::apply_idle(
-                session,
-                writer,
-                &records,
-                ready,
-                &self
-                    .compaction_plane()
-                    .ok_or("compaction provider unavailable")?,
-                self.compaction_views(),
-            )
-            .await
         }
 
         fn warm_after_send_ms(&self, config: &broca_wal::RunConfig) -> Option<u64> {
@@ -6766,350 +5994,6 @@ mod executor {
             .await
         }
 
-        async fn execute(
-            &self,
-            mut job: RunJob,
-            out: mpsc::Sender<OutputEvent>,
-        ) -> Result<RunSummary, RunError> {
-            // DECIDE auth + RESOLVE the provider BEFORE the loop (so a resolution failure is
-            // a typed error via the admission ack, never a ghost run that wrote RunStarted
-            // then died). Admission, auth and cache selection, and the loop's reconstruction
-            // all read one view of the session: its admission checkpoint plus the WAL records
-            // after it. The run's own `RunStarted` may already be inside the checkpoint.
-            let prepared = if let Some(readers) = &self.offset_resume {
-                let loaded = async {
-                    job.writer
-                        .sync()
-                        .await
-                        .map_err(|e| RunError::Wal(e.to_string()))?;
-                    let reader = readers(&job.req.session).map_err(RunError::Wal)?;
-                    broca_core::run::prepare_offset_resume(
-                        &job.writer,
-                        self.wal_store.as_ref(),
-                        &job.req.session,
-                        reader.as_ref(),
-                    )
-                    .await
-                }
-                .await;
-                match loaded {
-                    Ok(prepared) => Some(prepared),
-                    Err(error) => {
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-            let selected_snapshot = prepared.as_ref().map(|p| p.snapshot().clone());
-            let prior_snapshot = selected_snapshot.as_ref().unwrap_or(&job.prior_snapshot);
-            let prior_run = if matches!(job.kind, RunKind::AppendEpisode) {
-                None
-            } else {
-                prior_run_view_from_checkpoint(&prior_snapshot.checkpoint_at_head)
-            };
-            let history = EpisodeHistory {
-                prior_run,
-                last_config: prior_snapshot
-                    .checkpoint_at_head
-                    .last_episode
-                    .as_ref()
-                    .map(|episode| &episode.config),
-                head_seq: prior_snapshot.head_seq,
-                persona: PersonaHistory::Wal,
-            };
-            let admitted = self
-                .admit_episode(
-                    EpisodeJob {
-                        req: &job.req,
-                        kind: job.kind,
-                        auth: &job.auth,
-                        conversation_key: &job.conversation_key,
-                        queued_service_tier: &mut job.queued_service_tier,
-                        media_profile: &job.media_profile,
-                        clock: job.control.clock.as_ref(),
-                        continue_offer: None,
-                        routing_serves_continuation: false,
-                    },
-                    &history,
-                )
-                .await;
-            let EpisodeAdmission {
-                fresh_episode,
-                episode_context_management,
-                resolution,
-                account_choice,
-                routing_decision_error,
-                mode,
-                resolved,
-                served_provider,
-            } = match admitted {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(error.clone()));
-                    }
-                    return Err(error);
-                }
-            };
-            let prior_run = history.prior_run;
-
-            if job.has_media_input() {
-                let checked = job.admit_media(
-                    resolved.provider.as_ref(),
-                    self.wal_store.uploads().as_ref(),
-                );
-                if let Err(error) = checked {
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(error.clone()));
-                    }
-                    return Err(error);
-                }
-            }
-
-            let uploads = self.wal_store.uploads();
-            if let Some(uploads) = uploads.filter(|_| {
-                resolved.provider.supports_media_renderer()
-                    && (job.has_media_input()
-                        || prior_snapshot.checkpoint_at_head.has_captured_media()
-                        || !job.req.tools.is_empty())
-            }) {
-                let store = match uploads.session_media_store(&job.req.session) {
-                    Ok(store) => store,
-                    Err(error) => {
-                        let error = RunError::Wal(format!("open session media store: {error}"));
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                };
-                let wal = Arc::clone(&self.wal_store);
-                let session = job.req.session.clone();
-                let head = job.writer.durable_head();
-                let initialized = broca_core::media_request::initialize_media_checkpoint(
-                    &job.writer,
-                    Arc::clone(&self.wal_store),
-                    &session,
-                    prior_snapshot,
-                )
-                .await;
-                let broca_core::media_request::InitializedMedia {
-                    checkpoint,
-                    anchor: initial_anchor,
-                } = match initialized {
-                    Ok(initialized) => initialized,
-                    Err(error) => {
-                        let error = RunError::Wal(error);
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                };
-                let anchor = std::sync::Mutex::new(initial_anchor);
-                let frozen: broca_provider::wire::FrozenRenderConfig =
-                    serde_json::from_value(resolved.provider.render_config_blob())
-                        .expect("resolved provider has a frozen config");
-                let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                    store,
-                    checkpoint,
-                    prior_snapshot
-                        .checkpoint_at_head
-                        .last_episode
-                        .as_ref()
-                        .and_then(|episode| episode.config.budget.clone()),
-                    frozen.media,
-                    Box::new(move |after| {
-                        let through = head.load(Ordering::Acquire);
-                        if after == through {
-                            return Ok(Vec::new());
-                        }
-                        let mut anchor = anchor.lock().unwrap();
-                        let range = if after == 0 {
-                            wal.read_records_range(&session, after, Some(through), None)
-                                .map_err(|error| format!("read session media captures: {error}"))?
-                        } else {
-                            let anchor = anchor
-                                .as_ref()
-                                .ok_or("media capture tail has no byte anchor")?;
-                            wal.read_records_range_from_valid_anchor(
-                                &session,
-                                after,
-                                Some(through),
-                                anchor,
-                            )
-                            .map_err(|error| format!("read session media captures: {error}"))?
-                            .ok_or("media capture tail byte anchor is stale")?
-                        };
-                        *anchor = range.next_anchor;
-                        match range.into_records() {
-                            broca_wal::WalRangeRecords::Complete(records)
-                            | broca_wal::WalRangeRecords::Unknown(records)
-                                if records.last().is_some_and(|frame| frame.seq == through) =>
-                            {
-                                Ok(records)
-                            }
-                            _ => Err("session media capture WAL range is incomplete".into()),
-                        }
-                    }),
-                );
-                let media = match media {
-                    Ok(media) => Arc::new(media),
-                    Err(error) => {
-                        let error = RunError::Wal(error);
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                };
-                resolved.provider.set_media_request_renderer(Arc::new(
-                    move |frozen, opts, tags, commit, provenance| {
-                        media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                    },
-                ));
-            }
-
-            // Warm the tool route CONCURRENTLY with the loop (gives the tool provider time
-            // for its one-time setup on the first route open for a session). This must NOT
-            // block admission: the admission ack — and with it the client's session.send
-            // reply — fires at the RunStarted barrier inside the loop, so an await here
-            // holds every fresh-session send hostage to the tool module's configure time
-            // (observed live: AFT configure crossing the client's 10s send deadline under
-            // load made ~15% of harness sends report "outcome unknown" while their runs
-            // actually ran). The loop's first tool dispatch cannot happen before the first
-            // model response returns, which gives the warm seconds of headroom; a dispatch
-            // racing a still-cold route just opens it itself (the route cache handles the
-            // race). A bind failure stays a tool-plane availability issue surfacing as a
-            // normal NotSent at dispatch. Skipped when pausing for re-auth, and skipped
-            // entirely for a TOOL-LESS run: a send with no tools can never dispatch, so
-            // attaching the tool module would only add latency — and if the tool module
-            // rejects this session's bind identity, it would stall a run that never needed
-            // the module at all.
-            if resolution.pause.is_none() && !job.req.tools.is_empty() {
-                let plane = Arc::clone(&self.plane);
-                let warm_bind_identity = job.req.session.clone();
-                // Warm under the scope this run was admitted under (fresh or resumed), so the
-                // route the run's first dispatch reuses carries that scope; a scoped session's
-                // tool route is never opened unscoped.
-                let warm_scope = job.req.scope.clone();
-                // Bind detached warming to this actor generation before spawning. If teardown
-                // wins before the task's first poll, this exact token is already cancelled.
-                let lifecycle = plane.capture_session_lifecycle_token(&warm_bind_identity);
-                tokio::spawn(async move {
-                    let _ = plane
-                        .warm_bind_for_lifecycle(
-                            &warm_bind_identity,
-                            warm_scope.as_ref(),
-                            BIND_TIMEOUT,
-                            lifecycle,
-                        )
-                        .await;
-                });
-            }
-
-            let materialized_store = self
-                .session_store
-                .clone()
-                .and_then(|store| job.materialized_store(store));
-            let frozen_context_limit = context_limit_for_episode(
-                fresh_episode,
-                job.req.context_limit,
-                resolved.context_limit,
-                prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.context_limit),
-            );
-
-            let report_selection = resolution.selection.clone();
-            let (control, account_reporter) = self.episode_control(
-                job.control,
-                &job.req.run_id,
-                job.writer.durable_head(),
-                routing_decision_error,
-                &resolution,
-                &account_choice,
-                frozen_context_limit,
-                served_provider,
-                None,
-            );
-            // What a new episode freezes onto RunStarted; core ignores it on a resume.
-            job.req.context_management = Some(episode_context_management);
-
-            // For the post-loop wire-auth-failure report: the credential id this run actually
-            // USED (only when we proceeded with a vault token — `pause` is None means we got a
-            // token and called the provider). A pre-loop `needs_reauth` pause is excluded (the
-            // vault already knows; no provider call was made, so there's no wire rejection to
-            // report). `None` on the mock path (which has no vault record version) or
-            // a pre-loop pause.
-            let used_credential = used_credential_for_report(
-                &resolution.pause,
-                resolution.selection,
-                resolution.record_version,
-            );
-            // Read after the run: an in-step refresh may have moved the run to a newer token,
-            // and the run-end report must name the version the provider actually rejected.
-            let in_run_refresh = resolution.in_run_refresh.clone();
-            let session = job.req.session.clone();
-
-            resolved
-                .provider
-                .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
-            let summary = if let Some(prepared) = prepared {
-                broca_core::run::run_loop_on_writer_with_prepared_resume(
-                    job.req,
-                    &job.writer,
-                    mode,
-                    &resolved.provider,
-                    self.plane.as_ref(),
-                    &AllowAll,
-                    self.wal_store.as_ref(),
-                    control,
-                    &out,
-                    job.on_admitted,
-                    prepared,
-                )
-                .await
-            } else {
-                run_loop_on_writer_admitted_with_prior_snapshot(
-                    job.req,
-                    &job.writer,
-                    mode,
-                    &resolved.provider,
-                    self.plane.as_ref(),
-                    &AllowAll,
-                    self.wal_store.as_ref(),
-                    materialized_store,
-                    control,
-                    &out,
-                    job.on_admitted,
-                    Some(prior_snapshot),
-                )
-                .await
-            };
-
-            self.report_run_end(
-                &summary,
-                account_reporter.as_deref(),
-                report_selection,
-                used_credential.map(|(selection, version)| {
-                    (selection, ReportedTokenVersion::Admitted(version))
-                }),
-                in_run_refresh.as_ref(),
-                || terminal_provider_error(self.wal_store.clone(), session.clone()),
-                job.writer.lineage_id(),
-                &job.writer.durable_head(),
-                &session,
-            )
-            .await;
-
-            summary
-        }
-
         /// Runs a session kept in the new session storage: the same admission decisions as
         /// `execute`, read from the session's folds instead of the WAL, then the new run loop
         /// (`broca_session_loop`) writing through the store actor.
@@ -7192,6 +6076,7 @@ mod executor {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::time::Duration;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("store_run_tests.rs");
@@ -7200,15 +6085,12 @@ mod executor {
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");
-        include!("step_event_writer_tests.rs");
         include!("auth_hint_writer_tests.rs");
         include!("vault_request_tests.rs");
         include!("store_key_tests.rs");
         include!("role_plane_tests.rs");
-        include!("admission_wal_read_budget_tests.rs");
 
         include!("credential_source_guard_tests.rs");
-        include!("frozen_auth_method_resume_tests.rs");
         include!("account_move_tests.rs");
         mod signed_out {
             use super::*;
@@ -7879,57 +6761,6 @@ mod executor {
             }
         }
 
-        /// The version served at get is the version echoed at report — and a report is
-        /// only possible when the run actually held a served token. Pre-loop pauses and
-        /// version-less resolutions produce no report identity at all.
-        #[test]
-        fn report_identity_pairs_served_version_and_requires_a_served_token() {
-            let selection = || {
-                Some(broca_core::AuthSelection {
-                    billing_vault_facts: None,
-                    auth_method: None,
-                    credential_id: "oauth:anthropic".into(),
-                    account_ref: None,
-                    resolved_credential_id: None,
-                    vault_request: None,
-                    account_decision: None,
-                })
-            };
-            // Served token at version 7 → report identity carries exactly that version.
-            assert_eq!(
-                used_credential_for_report(&None, selection(), Some(7))
-                    .map(|(selection, version)| (selection.credential_id, version)),
-                Some(("oauth:anthropic".to_string(), 7))
-            );
-            // A pre-loop pause means no provider call — no report identity.
-            let pause = Some(ProviderError {
-                provider_details: None,
-                cause: None,
-                provider_subcode: None,
-                refusal: None,
-                class: ErrorClass::Auth,
-                message: "needs reauth".into(),
-                status: None,
-                retry_after_secs: None,
-                provider_code: None,
-                resets_at_ms: None,
-                resets_at_source: None,
-                limit_window: None,
-                account_ref: None,
-                credential_id: None,
-                affordable_max_tokens: None,
-                account_continue: None,
-            });
-            assert_eq!(
-                used_credential_for_report(&pause, selection(), Some(7)),
-                None
-            );
-            // A selection without a vault-served version is metadata only; it cannot
-            // produce a report call to the credentials module.
-            assert_eq!(used_credential_for_report(&None, selection(), None), None);
-            assert_eq!(used_credential_for_report(&None, None, Some(7)), None);
-        }
-
         #[test]
         fn vault_success_proceeds_with_secret() {
             let token = VaultToken {
@@ -8395,110 +7226,6 @@ mod executor {
             }
         }
 
-        fn framed(seq: u64, record: broca_wal::WalRecord) -> broca_wal::FramedRecord {
-            broca_wal::FramedRecord {
-                seq,
-                fence: 1,
-                record,
-            }
-        }
-
-        fn auth_pause(seq: u64, status: u16) -> broca_wal::FramedRecord {
-            framed(
-                seq,
-                broca_wal::WalRecord::RunPaused {
-                    account_limit: None,
-                    ts_ms: None,
-                    run_id: broca_protocol::RunId("run-1".into()),
-                    reason: broca_protocol::PauseReason::AuthRequired,
-                    error: Some(err_with_status(Some(status))),
-                },
-            )
-        }
-
-        fn run_finished(seq: u64, error: Option<ProviderError>) -> broca_wal::FramedRecord {
-            framed(
-                seq,
-                broca_wal::WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    ts_ms: None,
-                    reason: if error.is_some() {
-                        broca_protocol::caller::RunFinishReason::Error
-                    } else {
-                        broca_protocol::caller::RunFinishReason::Completed
-                    },
-                    usage: broca_protocol::Usage::default(),
-                    error,
-                    retries_used: 0,
-                },
-            )
-        }
-
-        fn run_started(seq: u64, run_id: &str) -> broca_wal::FramedRecord {
-            framed(
-                seq,
-                broca_wal::WalRecord::RunStarted {
-                    message_marks: None,
-                    compaction_plan_version: None,
-                    sent_by: None,
-                    written_at_ms: None,
-                    tags: None,
-                    session_class: None,
-                    retention: None,
-                    hooks: None,
-                    title: None,
-                    on_restart: None,
-                    keep_warm: None,
-                    marker_order_version: None,
-                    manifest: None,
-                    scope: None,
-                    send_id: None,
-                    request_identity_digest: None,
-                    project_id: None,
-                    principal: None,
-                    run_id: broca_protocol::RunId(run_id.into()),
-                    session: BindIdentity::new("/tmp/project", "harness", "session"),
-                    ts_ms: None,
-                    config: Box::new(broca_wal::RunConfig {
-                        account_route: None,
-                        global_system: None,
-                        route_decision_id: None,
-                        served_provider: None,
-                        account_limit_pause: false,
-                        turn_directives_v1: None,
-                        render_tags: false,
-                        computed_tags: None,
-                        model: broca_protocol::request::ModelHandle::new("openai", "gpt-test"),
-                        tools: Vec::new().into(),
-                        tool_choice: Default::default(),
-                        generation: Default::default(),
-                        response_format: Default::default(),
-                        provider_options: serde_json::Value::Null,
-                        cache_tiers: serde_json::Value::Null,
-                        context_epoch: 0,
-                        renderer_version: 1,
-                        frozen_render_config: serde_json::Value::Null,
-                        auth_selection: None,
-                        tools_were_omitted: false,
-                        budget: None,
-                        context_limit: None,
-                        work_class: None,
-                        variant: None,
-                        service_tier: None,
-                        stop_when: Vec::new(),
-                        context_management: None,
-                    }),
-                    input: Vec::new().into(),
-                    origin: broca_wal::RunOrigin::Fresh,
-                    submission_id: None,
-                },
-            )
-        }
-
-        fn latest_wire_auth_status(records: &[broca_wal::FramedRecord]) -> Option<u16> {
-            latest_terminal_error(records).and_then(wire_auth_status)
-        }
-
         /// A provider's refusal of a requested service tier on a 403, classified exactly as the
         /// transport classifies it, is permanent with the stable tier code and is NOT reported to
         /// the vault as a dead credential. A genuine auth 403 on the same tier-carrying request,
@@ -8531,11 +7258,6 @@ mod executor {
             );
             assert_eq!(dead_key.class, ErrorClass::Auth);
             assert_eq!(wire_auth_status(&dead_key), Some(403));
-
-            // Stored as the run's terminal error, the refusal still yields no status to report.
-            let mut records = vec![run_started(1, "tier-run")];
-            records.push(run_finished(2, Some(refusal)));
-            assert_eq!(latest_wire_auth_status(&records), None);
         }
 
         /// An exhausted account is a rate limit on a healthy credential. Reporting it would force
@@ -8562,15 +7284,12 @@ mod executor {
                 account_continue: None,
             };
             assert_eq!(wire_auth_status(&exhausted), None);
-            let mut records = vec![run_started(1, "limit-run")];
-            records.push(run_finished(2, Some(exhausted)));
-            assert_eq!(latest_wire_auth_status(&records), None);
         }
 
         /// An Anthropic API key that has run out of prepaid credit is a billing problem, not an
         /// invalid key, so it must never be reported to the vault as an auth failure. The refusal
         /// goes through the transport's real `classify_http_error`, and no auth status is derived
-        /// from it, neither from the error itself nor from it stored as the run's terminal. The
+        /// from it. The
         /// body is Anthropic's public shape, assumed rather than captured (see
         /// `anthropic_credit_balance_too_low` in the transport).
         #[test]
@@ -8583,45 +7302,6 @@ mod executor {
             );
             assert!(refusal.is_billing_exhausted());
             assert_eq!(wire_auth_status(&refusal), None);
-            let mut records = vec![run_started(1, "credit-run")];
-            records.push(run_finished(2, Some(refusal)));
-            assert_eq!(latest_wire_auth_status(&records), None);
-        }
-
-        #[test]
-        fn wal_selection_resolves_the_metered_api_charge_basis() {
-            let mut started = run_started(1, "unversioned-run");
-            if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started.record {
-                config.model = broca_protocol::request::ModelHandle::new("deepseek", "chat");
-                config.auth_selection = Some(broca_core::AuthSelection {
-                    billing_vault_facts: None,
-                    auth_method: None,
-                    credential_id: "apikey:deepseek".into(),
-                    account_ref: None,
-                    resolved_credential_id: None,
-                    vault_request: None,
-                    account_decision: None,
-                });
-            }
-            let records = vec![started, run_finished(2, None)];
-            let segments = broca_core::compute_segments(
-                &records,
-                "serve-test",
-                &broca_module_serve::ChargeBasisTable::shipped_defaults(),
-            );
-            assert_eq!(segments.len(), 1);
-            assert_eq!(
-                segments[0].auth_selection.as_deref(),
-                Some("apikey:deepseek")
-            );
-            assert_eq!(
-                segments[0].charge_basis,
-                broca_core::ChargeBasis::MeteredApi
-            );
-            assert_eq!(
-                segments[0].charge_basis_mapping_version,
-                broca_module_serve::CHARGE_BASIS_MAPPING_VERSION
-            );
         }
 
         fn run_outcome(
@@ -8700,122 +7380,6 @@ mod executor {
             }
         }
 
-        struct CountingWalStore {
-            inner: FileWalStore,
-            records: Vec<broca_wal::FramedRecord>,
-            full_reads: std::sync::atomic::AtomicUsize,
-        }
-
-        impl CountingWalStore {
-            fn new(records: Vec<broca_wal::FramedRecord>) -> Self {
-                Self {
-                    inner: FileWalStore::new(
-                        broca_test_support::scratch_root()
-                            .join(format!("broca-auth-gate-test-{}", std::process::id())),
-                    ),
-                    records,
-                    full_reads: std::sync::atomic::AtomicUsize::new(0),
-                }
-            }
-
-            fn full_reads(&self) -> usize {
-                self.full_reads.load(std::sync::atomic::Ordering::SeqCst)
-            }
-        }
-
-        impl WalStore for CountingWalStore {
-            fn open(
-                &self,
-                session: &BindIdentity,
-            ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-                self.inner.open(session)
-            }
-
-            fn read_records(
-                &self,
-                _session: &BindIdentity,
-            ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-                self.full_reads
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(self.records.clone())
-            }
-        }
-
-        #[tokio::test]
-        async fn successful_vault_outcome_skips_post_run_wal_read() {
-            let session = BindIdentity::new("/tmp/project", "harness", "session");
-            let store = Arc::new(CountingWalStore::new(vec![run_finished(1, None)]));
-            let outcome = run_outcome(RunFinishReason::Completed, None);
-
-            assert_eq!(
-                post_run_wire_auth_status(
-                    &outcome,
-                    terminal_wire_auth_status(terminal_provider_error(
-                        store.clone(),
-                        session.clone()
-                    )),
-                    None,
-                )
-                .await,
-                None
-            );
-            assert_eq!(store.full_reads(), 0);
-
-            // Control case: bypassing the outcome gate performs the full WAL read even though
-            // the newest terminal is a successful finish and therefore yields no auth status.
-            assert_eq!(
-                terminal_wire_auth_status(terminal_provider_error(store.clone(), session)).await,
-                None
-            );
-            assert_eq!(store.full_reads(), 1);
-        }
-
-        #[tokio::test]
-        async fn auth_pause_still_reads_and_reports_wire_status() {
-            let session = BindIdentity::new("/tmp/project", "harness", "session");
-            let store = Arc::new(CountingWalStore::new(vec![auth_pause(1, 401)]));
-            let outcome = run_outcome(
-                RunFinishReason::Interrupted,
-                Some(PauseReason::AuthRequired),
-            );
-
-            assert_eq!(
-                post_run_wire_auth_status(
-                    &outcome,
-                    terminal_wire_auth_status(terminal_provider_error(store.clone(), session)),
-                    None,
-                )
-                .await,
-                Some(401)
-            );
-            assert_eq!(store.full_reads(), 1);
-        }
-
-        #[tokio::test]
-        async fn routed_terminal_error_is_reused_for_vault_auth_report() {
-            for error in [Some(err_with_status(Some(401))), None] {
-                let session = BindIdentity::new("/tmp/project", "harness", "session");
-                let store = Arc::new(CountingWalStore::new(vec![run_finished(1, error.clone())]));
-                let outcome = run_outcome(RunFinishReason::Error, None);
-                let cached = terminal_provider_error(store.clone(), session.clone()).await;
-                assert_eq!(store.full_reads(), 1);
-                assert_eq!(
-                    post_run_wire_auth_status(
-                        &outcome,
-                        terminal_wire_auth_status(terminal_provider_error(store.clone(), session)),
-                        Some(&cached),
-                    )
-                    .await,
-                    error.as_ref().and_then(wire_auth_status)
-                );
-                assert_eq!(
-                    store.full_reads(),
-                    1,
-                    "routing and vault share the terminal read"
-                );
-            }
-        }
-
         struct TerminalRouting {
             reports: std::sync::Mutex<Vec<serde_json::Value>>,
             supported: bool,
@@ -8873,29 +7437,29 @@ mod executor {
             attempt_status: Option<u16>,
         ) -> Vec<serde_json::Value> {
             use broca_module_serve::account_routing::{RoutingClient, RunReporter};
-            use broca_wal::Wal;
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let mut wal =
-                broca_wal::FileWal::open(broca_test_support::scratch_root().join(format!(
-                    "terminal-backoff-{}-{}.wal",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed)
-                )))
-                .unwrap();
-            wal.append(4, &run_finished(4, Some(error.clone())).record, true)
-                .unwrap();
-            let lineage = wal.lineage_id().unwrap();
+            // A run on the new storage reports its attempts by record position alone.
+            let lineage: Option<broca_wal::WalLineageId> = None;
             let routing = Arc::new(TerminalRouting {
                 reports: Default::default(),
                 supported: true,
             });
-            let reporter = RunReporter::start(
+            let decision: broca_wal::AccountDecision = serde_json::from_value(serde_json::json!({
+                "path": path,
+                "admission_id": "adm-transient",
+            }))
+            .unwrap();
+            // A new-storage run names its reports by its session and record position. Only an
+            // account routing chose is reported to routing at all.
+            let Some(reporter) = RunReporter::start_for_decision(
                 Arc::new(RoutingClient::new(routing.clone(), Default::default())),
-                "adm-transient".into(),
+                &decision,
                 "run-transient".into(),
                 None,
                 Arc::new(std::sync::atomic::AtomicU64::new(4)),
-            );
+                Some("session-transient".into()),
+            ) else {
+                return Vec::new();
+            };
             for (seq, receipt) in [(2, 1_000), (3, 42_000)] {
                 let status = if seq == 2 { Some(503) } else { attempt_status };
                 let mut attempt: broca_protocol::ModelAttempt =
@@ -8913,7 +7477,7 @@ mod executor {
                 attempt.account_observation.failure_received_at_ms = Some(receipt);
                 broca_core::AccountReporter::attempt_recorded(
                     reporter.as_ref(),
-                    Some(lineage),
+                    lineage,
                     seq,
                     &attempt,
                 );
@@ -8928,12 +7492,12 @@ mod executor {
                 Some(&selection),
                 &outcome,
                 async { Some(error) },
-                (Some(lineage), 4),
+                (lineage, 4),
             )
             .await;
             if let Ok(summary) = outcome {
                 if summary.paused.is_none() {
-                    reporter.finish(Some(lineage), 4, summary.reason);
+                    reporter.finish(lineage, 4, summary.reason);
                 }
             }
             drop(reporter);
@@ -9120,147 +7684,11 @@ mod executor {
                         error,
                     )
                     .await;
-                    assert_eq!(reports.len(), 3, "{method}: {path}");
-                    assert!(reports
-                        .iter()
-                        .all(|body| body["kind"] != "transient_backoff"));
+                    // An account routing didn't choose is never reported to routing, so it
+                    // can't be held back from it either.
+                    assert_eq!(reports, Vec::<serde_json::Value>::new(), "{method}: {path}");
                 }
             }
-        }
-
-        #[tokio::test]
-        async fn routed_apikey_auth_pause_reports_refused_without_finishing() {
-            use broca_module_serve::account_routing::{RoutingClient, RunReporter};
-            use broca_wal::Wal;
-            let mut wal = broca_wal::FileWal::open(broca_test_support::scratch_root().join(
-                format!("credential-refused-lineage-{}.wal", std::process::id()),
-            ))
-            .unwrap();
-            wal.append(1, &auth_pause(1, 401).record, true).unwrap();
-            let lineage = wal.lineage_id().unwrap();
-            for (method, path, admission, supported, expected) in [
-                ("apikey", "routed", Some("adm-key"), true, true),
-                ("apikey", "routed", Some("adm-key"), false, false),
-                ("oauth", "routed", Some("adm-key"), true, false),
-                ("chatgpt", "routed", Some("adm-key"), true, false),
-                ("apikey", "legacy_static", Some("adm-key"), true, false),
-                ("apikey", "routed", None, true, false),
-            ] {
-                // Replaying one pause keeps its id; a later pause in the same lineage gets a new id.
-                for seq in [7, 7, 11] {
-                    let routing = Arc::new(TerminalRouting {
-                        reports: Default::default(),
-                        supported,
-                    });
-                    let reporter = RunReporter::start(
-                        Arc::new(RoutingClient::new(routing.clone(), Default::default())),
-                        "adm-key".into(),
-                        "run-1".into(),
-                        None,
-                        Arc::new(std::sync::atomic::AtomicU64::new(seq)),
-                    );
-                    let selection: broca_core::AuthSelection =
-                        serde_json::from_value(serde_json::json!({
-                            "auth_method":method,"credential_id":"vault-key",
-                            "account_decision":{"path":path,"admission_id":admission}
-                        }))
-                        .unwrap();
-                    let store = Arc::new(CountingWalStore::new(vec![auth_pause(seq, 401)]));
-                    let outcome = run_outcome(
-                        RunFinishReason::Interrupted,
-                        Some(PauseReason::AuthRequired),
-                    );
-                    let session = BindIdentity::new("/tmp/project", "harness", "session");
-                    let cached = report_routed_terminal_error(
-                        &reporter,
-                        Some(&selection),
-                        &outcome,
-                        terminal_provider_error(store.clone(), session.clone()),
-                        (Some(lineage), seq),
-                    )
-                    .await;
-                    assert_eq!(
-                        store.full_reads(),
-                        usize::from(method == "apikey" && path == "routed" && admission.is_some())
-                    );
-                    if cached.is_some() {
-                        assert_eq!(
-                            post_run_wire_auth_status(
-                                &outcome,
-                                terminal_wire_auth_status(terminal_provider_error(
-                                    store.clone(),
-                                    session
-                                )),
-                                cached.as_ref()
-                            )
-                            .await,
-                            Some(401)
-                        );
-                        assert_eq!(store.full_reads(), 1);
-                    }
-                    drop(reporter);
-                    broca_test_support::wait_until("auth pause reports drained", || async {
-                        if Arc::strong_count(&routing) == 1 {
-                            Ok(())
-                        } else {
-                            Err("report task still owns routing".into())
-                        }
-                    })
-                    .await;
-                    let reports = routing.reports.lock().unwrap();
-                    assert_eq!(
-                        reports.len(),
-                        usize::from(expected),
-                        "{method}: {path}: {supported}"
-                    );
-                    if expected {
-                        assert_eq!(
-                            reports[0],
-                            serde_json::json!({
-                                "event_id":format!("{lineage}:{seq}:credential_refused"),
-                                "kind":"credential_refused","caller":{"runner":"broca"},
-                                "admission_id":"adm-key","credential_id":"vault-key"
-                            })
-                        );
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn successful_reauth_does_not_reuse_the_prior_pause_error() {
-            let records = vec![auth_pause(1, 401), run_finished(2, None)];
-
-            assert_eq!(latest_wire_auth_status(&records), None);
-        }
-
-        #[test]
-        fn newest_auth_pause_remains_reportable() {
-            let records = vec![auth_pause(1, 401)];
-
-            assert_eq!(latest_wire_auth_status(&records), Some(401));
-        }
-
-        #[test]
-        fn newest_non_auth_failure_hides_an_older_auth_pause() {
-            let records = vec![
-                auth_pause(1, 401),
-                run_finished(2, Some(err_with_status(Some(500)))),
-            ];
-
-            assert_eq!(latest_wire_auth_status(&records), None);
-        }
-
-        #[test]
-        fn clean_later_episode_hides_a_historical_auth_pause() {
-            let records = vec![
-                auth_pause(1, 401),
-                run_finished(2, None),
-                run_started(3, "run-2"),
-                run_finished(4, None),
-            ];
-
-            assert_eq!(latest_wire_auth_status(&records), None);
         }
 
         #[test]
@@ -9318,9 +7746,8 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         })
         .map_err(|e| ServeIoError(format!("create lease directory: {e}")))?;
 
-    // Storage and conversion folders are created here, not on their first write, because the
-    // backup descriptor names them, and engram refuses a
-    // capture whose declared path is missing.
+    // Storage folders are created here, not on their first write, because the backup
+    // descriptor names them, and engram refuses a capture whose declared path is missing.
     for name in [
         "wal-durable",
         "wal-archive-durable",
@@ -9328,7 +7755,6 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         broca_wal::SESSION_STORAGE_DIR,
         broca_wal::SESSION_STORAGE_EPHEMERAL_DIR,
         broca_wal::SESSION_STORAGE_MOVES_DIR,
-        "conversion-staging",
     ] {
         let path = state_root.join(name);
         match broca_owner_only::create_dir(&path) {
@@ -9347,9 +7773,6 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         .map_err(|error| ServeIoError(format!("create recovery candidate directories: {error}")))?;
     broca_core::media_store::create_media_directories(state_root)
         .map_err(|error| ServeIoError(error.to_string()))?;
-    // Cutover-only device-local recovery state must exist even with conversion disabled:
-    // a missing declared database would block every module's backup capture.
-    broca_module_serve::conversion_ledger::Ledger::open(state_root).map_err(ServeIoError)?;
     Ok(())
 }
 
@@ -9428,22 +7851,6 @@ mod windows_acl_tests {
 mod state_directory_tests {
     use super::{create_state_directories, write_engram_catalog, EMBEDDED_ENGRAM_CATALOG};
     use std::path::PathBuf;
-
-    #[test]
-    fn cutover_recovery_artifacts_exist_before_catalog_even_when_switches_are_off() {
-        let root = fresh_root("cutover-artifacts");
-        assert!(!broca_module_serve::session_conversion::Config::default().enabled());
-        create_state_directories(&root).unwrap();
-        assert!(root.join("conversion-staging").is_dir());
-        assert!(root
-            .join(broca_module_serve::conversion_ledger::FILE)
-            .is_file());
-        let ledger = broca_module_serve::conversion_ledger::Ledger::open(&root).unwrap();
-        assert_eq!(ledger.progress().unwrap().sources, 0);
-        write_engram_catalog(&root).unwrap();
-        broca_owner_only::validate(root.join("conversion-staging")).unwrap();
-        broca_owner_only::validate(root.join(broca_module_serve::conversion_ledger::FILE)).unwrap();
-    }
 
     // broca's owner-only scratch root, not the system temp directory: on Windows the owner-only
     // checks refuse state under a shared temp folder.

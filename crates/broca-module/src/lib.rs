@@ -18,7 +18,6 @@ static ALLOCATOR: broca_test_support::alloc::CountingAlloc =
 pub mod actor;
 pub mod cache;
 pub mod claude_code_identity;
-mod compaction_watch;
 pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
@@ -42,7 +41,6 @@ mod plan_episode;
 pub mod reader_admission;
 pub mod registry;
 pub mod retention;
-pub mod retention_withdrawals;
 mod run_admission;
 mod send_fate;
 mod sender_admission;
@@ -79,10 +77,8 @@ mod uploads;
 pub mod wal_render;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
-pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};
+pub use executor::{RunExecutor, RunKind, SealedRun, WarmBase, WarmError, WarmJob};
 pub use fanout::{Delivery, FromCursor};
-#[cfg(feature = "test-clock")]
-pub use keep_warm::{automatic_warmer_for_test, warm_setup_for_allocation_test};
 pub use opener::DefaultOpener;
 pub use registry::{LineageKey, LineageRegistry};
 pub use serve::{
@@ -91,14 +87,7 @@ pub use serve::{
     SessionReadRequest, SessionReadResponse, StatusResponse, SubscribeFrom,
 };
 
-mod approval;
-mod approval_state;
 pub mod cut_state;
-mod durable_read;
 mod keep_warm;
 pub mod move_files;
 pub mod move_install;
-mod source_warm;
-
-#[cfg(test)]
-mod history_version_tests;

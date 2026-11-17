@@ -10,7 +10,6 @@ description = "broca as a subc module: the session-lineage coordinator (one acto
 [dependencies]
 base64 = "0.22"
 broca-diagnostics = { path = "../broca-diagnostics" }
-broca-memory-relief = { path = "../broca-memory-relief" }
 broca-protocol = { path = "../broca-protocol" }
 broca-wire = { path = "../broca-wire" }
 broca-core = { path = "../broca-core" }
@@ -58,7 +57,6 @@ futures = { workspace = true, features = ["executor"] }
 [dev-dependencies]
 # The synthetic session the memory budget tests load.
 broca-session-store = { path = "../broca-session-store", features = ["synthetic"] }
-broca-session-convert = { path = "../broca-session-convert" }
 broca-crash-harness = { path = "../broca-crash-harness" }
 tokio-tungstenite.workspace = true
 cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }

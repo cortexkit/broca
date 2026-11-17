@@ -88,62 +88,6 @@ struct Args {
     cmd: Cmd,
 }
 
-#[derive(clap::Args, Debug)]
-struct CacheDumpArgs {
-    /// Bind session names to export. Repeat to select several sessions.
-    #[arg(
-        id = "session",
-        long = "session",
-        required_unless_present = "since",
-        conflicts_with = "since"
-    )]
-    sessions: Vec<String>,
-    /// Export only calls whose selected attempt ended at or after RFC3339 or epoch milliseconds.
-    /// Earlier WAL history is replayed to reconstruct exact request bodies.
-    #[arg(long, required_unless_present = "session")]
-    since: Option<String>,
-    #[arg(long)]
-    out: PathBuf,
-    /// Override the state root; otherwise use the normal read-only state-root resolver.
-    #[arg(long)]
-    state_root: Option<PathBuf>,
-    /// Address these sessions directly without consulting run-index.db.
-    #[arg(long, requires_all = ["session", "harness"], conflicts_with = "since")]
-    project_root: Option<PathBuf>,
-    #[arg(long, requires_all = ["session", "project_root"], conflicts_with = "since")]
-    harness: Option<String>,
-}
-
-#[derive(Parser)]
-struct OfflineArgs {
-    /// Parse the daemon flag only to give the same refusal in either argument order.
-    #[arg(long, global = true, hide = true)]
-    subc: Option<PathBuf>,
-    #[command(subcommand)]
-    command: OfflineCommand,
-}
-#[derive(Subcommand)]
-enum OfflineCommand {
-    CacheDump(CacheDumpArgs),
-    CacheDiagnose(TrajectoryArgs),
-    Trajectory(TrajectoryArgs),
-}
-
-#[derive(clap::Args, Debug)]
-struct TrajectoryArgs {
-    id: String,
-    #[arg(long)]
-    out: Option<PathBuf>,
-    #[arg(long)]
-    transcript: bool,
-    #[arg(long)]
-    state_root: Option<PathBuf>,
-    #[arg(long, requires = "harness")]
-    project_root: Option<PathBuf>,
-    #[arg(long, requires = "project_root")]
-    harness: Option<String>,
-}
-
 fn state_root(root: Option<&PathBuf>) -> Result<PathBuf, String> {
     root.cloned().map(Ok).unwrap_or_else(|| {
         broca_module_serve::state_root::resolve_state_root()
@@ -152,75 +96,10 @@ fn state_root(root: Option<&PathBuf>) -> Result<PathBuf, String> {
     })
 }
 
-fn offline_daemon_refusal(name: &str) -> String {
-    format!(
-        "{name} must be invoked without daemon arguments; put the subcommand first and omit --subc"
-    )
-}
-
 fn subc_path(args: &Args) -> Result<&std::path::Path, String> {
     args.subc
         .as_deref()
         .ok_or_else(|| "--subc is required for daemon commands".into())
-}
-
-fn trajectory(args: TrajectoryArgs) -> Result<i32, String> {
-    let root = state_root(args.state_root.as_ref())?;
-    let bind = match (args.project_root, args.harness) {
-        (Some(project), Some(harness)) => {
-            broca_protocol::BindIdentity::new(project, harness, &args.id)
-        }
-        (None, None) => broca_module_serve::session_lookup::lookup(&root, &args.id)?,
-        _ => return Err("--project-root and --harness must be provided together".into()),
-    };
-    let rows = broca_module_serve::trajectory::read(&root, &bind, args.transcript)?;
-    let mut output: Box<dyn Write> = match args.out {
-        Some(path) => {
-            let mut options = broca_owner_only::OpenOptions::new();
-            options.write(true).create_new(true);
-            Box::new(options.open(path).map_err(|_| {
-                "cannot create private trajectory output (existing files are never overwritten)"
-            })?)
-        }
-        None => Box::new(std::io::stdout().lock()),
-    };
-    for row in rows {
-        serde_json::to_writer(&mut output, &row).map_err(|_| "cannot write trajectory")?;
-        writeln!(output).map_err(|_| "cannot write trajectory")?;
-    }
-    output.flush().map_err(|_| "cannot flush trajectory")?;
-    Ok(0)
-}
-
-fn cache_diagnose(args: TrajectoryArgs) -> Result<i32, String> {
-    if args.transcript {
-        return Err("cache-diagnose does not export transcripts".into());
-    }
-    let root = state_root(args.state_root.as_ref())?;
-    let bind = match (args.project_root, args.harness) {
-        (Some(project), Some(harness)) => {
-            broca_protocol::BindIdentity::new(project, harness, &args.id)
-        }
-        (None, None) => broca_module_serve::session_lookup::lookup(&root, &args.id)?,
-        _ => return Err("--project-root and --harness must be provided together".into()),
-    };
-    let rows = broca_module_serve::cache_diagnose::read(&root, &bind)?;
-    let mut output: Box<dyn Write> = match args.out {
-        Some(path) => {
-            let mut options = broca_owner_only::OpenOptions::new();
-            options.write(true).create_new(true);
-            Box::new(options.open(path).map_err(|_| {
-                "cannot create private cache diagnosis output (existing files are never overwritten)"
-            })?)
-        }
-        None => Box::new(std::io::stdout().lock()),
-    };
-    for row in rows {
-        serde_json::to_writer(&mut output, &row).map_err(|_| "cannot write cache diagnosis")?;
-        writeln!(output).map_err(|_| "cannot write cache diagnosis")?;
-    }
-    output.flush().map_err(|_| "cannot flush cache diagnosis")?;
-    Ok(0)
 }
 
 fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
@@ -270,44 +149,6 @@ fn local_storage_root(root: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-fn cache_dump(args: CacheDumpArgs) -> Result<i32, String> {
-    let root = match args.state_root {
-        Some(root) => root,
-        None => {
-            broca_module_serve::state_root::resolve_state_root()
-                .map_err(|_| "cannot resolve state root")?
-                .path
-        }
-    };
-    let since = args
-        .since
-        .as_deref()
-        .map(broca_module_serve::cache_dump::parse_since)
-        .transpose()?;
-    let direct = match (args.project_root, args.harness) {
-        (Some(project_root), Some(harness)) => Some(broca_module_serve::cache_dump::DirectBind {
-            project_root,
-            harness,
-        }),
-        (None, None) => None,
-        _ => return Err("--project-root and --harness must be provided together".into()),
-    };
-    let summary = broca_module_serve::cache_dump::export_with_bind(
-        &root,
-        &args.sessions,
-        since,
-        &args.out,
-        direct.as_ref(),
-    )?;
-    println!(
-        "{}",
-        serde_json::to_string(&summary).map_err(|_| "encode summary")?
-    );
-    Ok(i32::from(
-        summary.calls_examined == 0 || !summary.sessions_not_found.is_empty(),
-    ))
-}
-
 #[derive(Clone, Debug, ValueEnum)]
 enum CliCacheRole {
     Primary,
@@ -347,12 +188,6 @@ enum Cmd {
     /// send or unexported spend. Operator only. Stdout is the reply (`{"result":{"deleted":…}}`)
     /// or the refusal as the daemon sent it, which exits 1.
     Delete,
-    /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
-    CacheDump(CacheDumpArgs),
-    /// Diagnose recorded prompt-cache prefixes without a daemon connection.
-    CacheDiagnose(TrajectoryArgs),
-    /// Export run, model and tool events from a live or archived session WAL (no daemon).
-    Trajectory(TrajectoryArgs),
     /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
     ComposePlan {
         /// JSON with tool_items and empty system_text_items/step_transform_items; omit
@@ -499,16 +334,6 @@ enum Cmd {
         /// attaches the command to the daemon.
         #[arg(long)]
         all: bool,
-    },
-    /// `session.move_to_store`: move this live, idle session from today's storage into the new
-    /// storage. Operator only, and it can't be undone. Prints the daemon's reply, or its
-    /// refusal (`not_movable` names what the session still needs) and exits 1.
-    MoveToStore {
-        /// Move the session into the new storage's durable (backed-up) root, though its WAL is
-        /// in `wal/`: for a long-lived session created without the label that makes a session
-        /// durable. Without it the session keeps its WAL's class.
-        #[arg(long, value_parser = ["durable"])]
-        class: Option<String>,
     },
     /// `session.tag_map`: which message and part each part number of this session belongs to,
     /// the number the model is shown in front of the part. Operator only, for a session
@@ -781,32 +606,6 @@ fn content_import_id(messages: &[broca_protocol::Message]) -> Result<String, Str
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|a| a == "cache-dump" || a == "cache-diagnose" || a == "trajectory")
-    {
-        let args = OfflineArgs::parse();
-        let result = if args.subc.is_some() {
-            Err(offline_daemon_refusal(match &args.command {
-                OfflineCommand::CacheDump(_) => "cache-dump",
-                OfflineCommand::CacheDiagnose(_) => "cache-diagnose",
-                OfflineCommand::Trajectory(_) => "trajectory",
-            }))
-        } else {
-            match args.command {
-                OfflineCommand::CacheDump(args) => cache_dump(args),
-                OfflineCommand::CacheDiagnose(args) => cache_diagnose(args),
-                OfflineCommand::Trajectory(args) => trajectory(args),
-            }
-        };
-        std::process::exit(match result {
-            Ok(code) => code,
-            Err(error) => {
-                eprintln!("{error}");
-                1
-            }
-        });
-    }
     let args = Args::parse();
     let json = args.json_events;
     std::process::exit(match run(args).await {
@@ -856,12 +655,6 @@ fn parse_subscribe_cursor(raw: &str) -> Result<broca_wire::CursorWire, String> {
 }
 
 async fn run(args: Args) -> Result<i32, String> {
-    match &args.cmd {
-        Cmd::CacheDump(_) => return Err(offline_daemon_refusal("cache-dump")),
-        Cmd::CacheDiagnose(_) => return Err(offline_daemon_refusal("cache-diagnose")),
-        Cmd::Trajectory(_) => return Err(offline_daemon_refusal("trajectory")),
-        _ => {}
-    }
     subc_path(&args)?;
     validate_max_output_tokens(&args.cmd)?;
     let plan = match &args.cmd {
@@ -946,9 +739,6 @@ async fn run(args: Args) -> Result<i32, String> {
     match args.cmd {
         Cmd::ComposePlan { .. } => {
             unreachable!("compose-plan is dispatched before the management-surface bind")
-        }
-        Cmd::CacheDump(_) | Cmd::CacheDiagnose(_) | Cmd::Trajectory(_) => {
-            unreachable!("offline commands are refused before the management-surface bind")
         }
         Cmd::Run {
             admission,
@@ -1117,29 +907,6 @@ async fn run(args: Args) -> Result<i32, String> {
                 }
             };
             restore_report(json, &body, &mut |line| println!("{line}"))
-        }
-        Cmd::MoveToStore { class } => {
-            let started = std::time::Instant::now();
-            let params = match class {
-                Some(class) => serde_json::json!({ "class": class }),
-                None => serde_json::json!({}),
-            };
-            let reply = client
-                .management_raw("session.move_to_store", &params)
-                .await
-                .map_err(|error| format!("move-to-store transport: {error}"))?;
-            let elapsed_ms = started.elapsed().as_millis();
-            let (body, exit) = match reply {
-                Ok(body) => (body, 0),
-                Err(body) => (body, 1),
-            };
-            write_raw_reply_to(
-                &body,
-                Some(elapsed_ms),
-                &mut std::io::stdout().lock(),
-                &mut std::io::stderr().lock(),
-            )?;
-            Ok(exit)
         }
         Cmd::TagMap { out, limit } => {
             let mut pages = Vec::new();
@@ -2976,39 +2743,6 @@ mod tests {
         assert_eq!(super::local_storage_root(missing), missing);
     }
 
-    #[test]
-    fn cache_diagnose_accepts_task_ids_and_explicit_offline_binding() {
-        use clap::Parser;
-        let args = super::OfflineArgs::try_parse_from([
-            "broca-session",
-            "cache-diagnose",
-            "task-id",
-            "--state-root",
-            "copied-state",
-            "--project-root",
-            "/project",
-            "--harness",
-            "test",
-            "--out",
-            "diagnosis.jsonl",
-        ])
-        .unwrap();
-        let super::OfflineCommand::CacheDiagnose(args) = args.command else {
-            panic!("wrong offline command")
-        };
-        assert_eq!(args.id, "task-id");
-        assert_eq!(args.harness.as_deref(), Some("test"));
-        assert_eq!(args.out, Some(std::path::PathBuf::from("diagnosis.jsonl")));
-        assert!(super::OfflineArgs::try_parse_from([
-            "broca-session",
-            "cache-diagnose",
-            "id",
-            "--harness",
-            "test"
-        ])
-        .is_err());
-    }
-
     use std::sync::Arc;
 
     use super::{
@@ -3074,125 +2808,6 @@ mod tests {
         super::write_raw_reply_to(body, Some(2001), &mut stdout, &mut stderr).unwrap();
         assert_eq!(stdout, body);
         assert_eq!(String::from_utf8(stderr).unwrap(), "RAW bytes=3 sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nRAW elapsed_ms=2001\n");
-    }
-
-    #[test]
-    fn cache_dump_reads_all_compaction_records_live_and_archived() {
-        use broca_core::wal_writer::session_addr;
-        use broca_protocol::BindIdentity;
-        use broca_wal::{framing, WalRecord};
-        use serde_json::json;
-        use sha2::{Digest, Sha256};
-
-        let root = broca_test_support::scratch_root().join("cache-dump-compaction-reader");
-        std::fs::create_dir_all(root.join("wal")).unwrap();
-        let bind = BindIdentity::new(root.join("project"), "reader-test", "compaction");
-        let address = session_addr(&bind);
-        let decode = |value| serde_json::from_value::<WalRecord>(value).unwrap();
-        let started = decode(json!({
-            "type": "run_started", "run_id": "reader-run", "session": bind,
-            "config": {
-                "model": {"provider_module_id": "p", "model_id": "m"},
-                "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
-                "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 1,
-                "frozen_render_config": broca_provider::families::anthropic_frozen_config("m")
-            },
-            "input": [{"role": "user", "content": [{"type": "text", "text": "reader fixture"}]}]
-        }));
-        let step = decode(json!({"type": "step_started", "step_id": 1}));
-        // The records below replace the input with the user text "summary".
-        // Define that request here instead of calling render_step: if render_step
-        // ignored compaction, generating the fixture with it would hide the error.
-        let body = broca_protocol::canonical_json_bytes(&json!({
-            "max_tokens":2048, "model":"m", "stream":true,
-            "messages":[{"role":"user", "content":[{"type":"text", "text":"summary"}]}],
-            "system":[{"type":"text", "text":"You are Claude Code, Anthropic's official CLI for Claude."}],
-            "thinking":{"type":"enabled", "budget_tokens":1024}
-        }));
-        let mut records = vec![started];
-        let compaction: Vec<WalRecord> =
-            include_str!("../../../broca-wal/tests/fixtures/compaction_records.jsonl")
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-        assert_eq!(compaction.len(), 7);
-        assert_eq!(
-            compaction
-                .iter()
-                .map(|record| serde_json::to_value(record).unwrap()["type"].clone())
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            4,
-        );
-        records.extend(compaction);
-        records.push(step);
-        records.push(decode(json!({
-            "type": "model_attempt_finished", "step_id": 1, "attempt": 0,
-            "request_body_len": body.len(), "request_body_sha256": format!("{:x}", Sha256::digest(&body)),
-            "response_body_len": 1, "response_body_sha256": "unused", "outcome": "complete", "ts_ms": 1000
-        })));
-        records.push(decode(json!({
-            "type": "model_step_finished", "step_id": 1,
-            "assistant_message": {"message_id": "reader-message", "content": [{"type": "text", "text": "done"}]},
-            "usage": {"input_tokens": 11, "output_tokens": 5}
-        })));
-        let bytes: Vec<u8> = records
-            .iter()
-            .enumerate()
-            .flat_map(|(index, record)| framing::encode(index as u64 + 1, 7, record).unwrap())
-            .collect();
-        let live = root.join("wal").join(format!("{address}.wal"));
-        std::fs::write(&live, &bytes).unwrap();
-        for archived in [false, true] {
-            if archived {
-                std::fs::create_dir(root.join("wal-archive")).unwrap();
-                let mut writer =
-                    broca_wal::archive::ArchiveWriter::create(root.join("wal-archive/fold-1.ark"))
-                        .unwrap()
-                        .without_feature_floor();
-                writer.append(&address, &bytes).unwrap();
-                writer.seal().unwrap();
-                std::fs::remove_file(&live).unwrap();
-            }
-            let decoded = broca_core::FileWalStore::new(root.join("wal"))
-                .read_address_records(&address)
-                .unwrap();
-            assert_eq!(
-                decoded
-                    .into_iter()
-                    .map(|frame| frame.record)
-                    .collect::<Vec<_>>(),
-                records,
-            );
-            let out = root.join(if archived { "archived" } else { "live" });
-            assert_eq!(
-                super::cache_dump(super::CacheDumpArgs {
-                    sessions: vec![bind.session.clone()],
-                    since: None,
-                    out: out.clone(),
-                    state_root: Some(root.clone()),
-                    project_root: Some(bind.project_root.clone()),
-                    harness: Some(bind.harness.clone()),
-                }),
-                Ok(0),
-            );
-            let body_path = out.join(
-                broca_provider::request_dump::request_dump_filename(None, "reader-run", 1)
-                    .replace(".json", ".body.json"),
-            );
-            assert_eq!(std::fs::read(body_path).unwrap(), body);
-            assert!(std::fs::read_dir(&out).unwrap().any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".response.json")));
-            assert_eq!(
-                live.exists(),
-                !archived,
-                "cache-dump must not extract or repair its source"
-            );
-        }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A rendered control unit must carry every field the cursor is about to advance past.

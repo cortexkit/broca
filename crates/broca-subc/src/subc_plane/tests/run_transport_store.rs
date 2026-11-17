@@ -1,8 +1,8 @@
 use super::*;
-use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
+use broca_core::{AllowAll, FileLeaseStore, OutputEvent};
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
 use broca_module::executor::{
-    RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+    RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
 };
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
@@ -63,13 +63,6 @@ struct Executor {
 
 #[async_trait]
 impl RunExecutor for Executor {
-    async fn execute(
-        &self,
-        _: RunJob,
-        _: tokio::sync::mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("this fixture only opens new storage")
-    }
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -289,7 +282,6 @@ async fn session(tag: &str, steps: Vec<Vec<NormalizedEvent>>, tagged: bool) -> S
     });
     let dir = broca_test_support::scratch_root()
         .join(format!("run-transport-{tag}-{}", std::process::id()));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let runtime = broca_module::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -300,12 +292,10 @@ async fn session(tag: &str, steps: Vec<Vec<NormalizedEvent>>, tagged: bool) -> S
     .unwrap();
     let opener = DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         executor.clone(),
     )
     .with_store_runtime(Arc::new(runtime));
-    let registry =
-        LineageRegistry::new_with_reader(Arc::new(opener), wal, None).with_store_new_sessions();
+    let registry = LineageRegistry::new(Arc::new(opener));
     let bind = BindIdentity::new(dir.join("project"), "runner", "transport");
     executor.plane.invalidate_route(&bind);
     Session {

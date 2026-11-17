@@ -374,7 +374,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
     refused_plan["system_text_items"][0]["params"]["model"] =
         json!({"provider": "fake", "id": "fake"});
     seen["aft"].lock().unwrap().refuse_catalog = true;
-    let before_refusal = rig.wal_bytes();
+    let before_refusal = rig.records().await;
     let refused = rig
         .request(
             7,
@@ -403,7 +403,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
             "retryable": false,
         })
     );
-    assert_eq!(rig.wal_bytes(), before_refusal);
+    assert_eq!(rig.records().await, before_refusal);
     let golden = golden_path("send_refused.fetch_unavailable_provider_detail.json");
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(&golden, &refused.body).unwrap();
@@ -443,12 +443,10 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
         ])
     );
     let frozen = rig
-        .records()
-        .iter()
-        .find_map(|r| match r {
-            broca_wal::WalRecord::RunStarted { manifest, .. } => manifest.clone(),
-            _ => None,
-        })
+        .admissions()
+        .await
+        .into_iter()
+        .find_map(|admission| admission.manifest)
         .unwrap();
     assert!(frozen
         .system_text

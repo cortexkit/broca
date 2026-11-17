@@ -644,7 +644,6 @@ async fn executor_with_vault_addressing(
         .unwrap();
     LiveLoopExecutor::new(
         Arc::new(FileWalStore::new(root.join("wal"))),
-        Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()),
         Arc::new(SubcToolPlane::new(tool_conn, "unused")),
         None,
     )
@@ -1628,11 +1627,10 @@ async fn a_failed_pre_send_re_read_keeps_the_held_token_and_a_401_still_recovers
     assert_eq!(recovered.evidence.reason.as_deref(), Some("rejected"));
 }
 
-/// ONE REPORT PER REJECTION, for the version actually rejected. The in-step report is the
-/// refresh trigger, so the run-end report never repeats it, even after a refresh moved the run
-/// to a newer version that was never rejected. A rejection of the refreshed token that the
-/// step could not recover from is reported once, with its own status and version. A run that
-/// never tried to recover reports the version it held.
+/// ONE REPORT PER REJECTION, for the version the run's last attempt sent. The in-step report is
+/// the refresh trigger, so the run-end report never repeats it. A rejection of the refreshed
+/// token that the step could not recover from is reported once, with its own status and
+/// version. A run with no in-step refresher reports the version it sent.
 #[test]
 fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
     struct NeverRefreshes;
@@ -1662,23 +1660,26 @@ fn the_run_end_report_names_only_a_rejection_nothing_has_reported() {
         status,
         record_version,
     };
-    // In-step refresh reported v1 and moved the run to v2, which was never rejected.
-    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), ReportedTokenVersion::Admitted(1), 401), None);
-    // In-step refresh reported v1 and the vault had nothing newer.
-    assert_eq!(run_end_report_target(Some(&in_run(1, Some(1), None)), ReportedTokenVersion::Admitted(1), 401), None);
-    // The refreshed v2 was rejected too: report v2 alone, with its own status.
+    // In-step refresh already reported v1, the version the run last sent.
+    assert_eq!(run_end_report_target(Some(&in_run(2, Some(1), None)), 1, 401), None);
+    // The refreshed v2 was sent and rejected too: report v2 alone, with its own status.
     assert_eq!(
-        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(401, 2)))), ReportedTokenVersion::Admitted(1), 401),
+        run_end_report_target(Some(&in_run(2, Some(1), Some(rejection(403, 2)))), 2, 401),
+        Some(rejection(403, 2))
+    );
+    // The refresher reported v1, but the run last sent v2 and nothing reported that: report
+    // v2 with the run's terminal status.
+    assert_eq!(
+        run_end_report_target(Some(&in_run(2, Some(1), None)), 2, 401),
         Some(rejection(401, 2))
     );
-    // A refresher that never ran: report the version the run holds now (3), with the status the
-    // run's terminal error carries.
+    // A refresher that never ran: report the version the run sent.
     assert_eq!(
-        run_end_report_target(Some(&in_run(3, None, None)), ReportedTokenVersion::Admitted(1), 401),
+        run_end_report_target(Some(&in_run(3, None, None)), 3, 401),
         Some(rejection(401, 3))
     );
-    // A run with no in-step refresher reports the version admission served it (7).
-    assert_eq!(run_end_report_target(None, ReportedTokenVersion::Admitted(7), 401), Some(rejection(401, 7)));
+    // A run with no in-step refresher reports the version it sent (7).
+    assert_eq!(run_end_report_target(None, 7, 401), Some(rejection(401, 7)));
 }
 
 struct ChatgptRouting {
@@ -1868,15 +1869,16 @@ fn chatgpt_test_token(version: u64, other_account: bool) -> String {
 }
 
 struct ChatgptRefreshRun {
-    summary: broca_core::RunSummary,
+    summary: broca_session_loop::run::Finished,
     requests: Vec<(String, serde_json::Value)>,
     sent: Vec<(String, Vec<u8>)>,
     attempts: Vec<Option<broca_protocol::CredentialRefresh>>,
     pause_code: Option<String>,
 }
 
-/// Drive real vault admission, catalog auth shaping, transport and run-loop pause mapping.
-/// Only the vault daemon and the ChatGPT HTTP backend are scripted locally.
+/// Drive one run through the production executor on a session in the new storage: real vault
+/// admission, catalog auth shaping, transport, the run loop's pause mapping and the run-end
+/// report. Only the vault daemon and the ChatGPT HTTP backend are scripted locally.
 async fn chatgpt_refresh_run(
     label: &str,
     reports: ReportScript,
@@ -1887,16 +1889,12 @@ async fn chatgpt_refresh_run(
 }
 
 /// [`chatgpt_refresh_run`] whose upstream answers the first `rejections` requests with a 401.
-/// After the run it does what the executor does at run end: when the terminal is a wire auth
-/// rejection, it evicts and reports whatever rejection the in-step refresh did not report.
 async fn chatgpt_refresh_run_rejecting(
     label: &str,
     reports: ReportScript,
     mut expiry: ExpiryScript,
     rejections: usize,
 ) -> ChatgptRefreshRun {
-    use broca_core::{run_loop, AllowAll, FileLeaseStore, StubToolPlane};
-    use broca_protocol::content::{ContentBlock, Message, Role};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let root = fresh_vault_root(label);
@@ -1910,11 +1908,6 @@ async fn chatgpt_refresh_run_rejecting(
         expiry,
     )
     .await;
-    let executor = executor_with_capturing_vault(&root, &daemon).await;
-    let auth = executor
-        .decide_auth("openai", None, true, Some(AuthMethod::Chatgpt), None)
-        .await
-        .unwrap_or_else(|error| panic!("ChatGPT admission: {error}"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1938,10 +1931,19 @@ async fn chatgpt_refresh_run_rejecting(
                             name.eq_ignore_ascii_case("content-length")
                                 .then(|| value.trim().parse::<usize>().unwrap())
                         })
-                        .unwrap();
+                        .unwrap_or(0);
                     break (headers, end + 4, len);
                 }
             };
+            // The transport tries a WebSocket first; refusing the upgrade makes it send over
+            // HTTPS, so this fixture counts and answers model requests only.
+            if headers.starts_with("GET ") {
+                socket
+                    .write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
             while bytes.len() < body_start + body_len {
                 let n = socket.read(&mut buf).await.unwrap();
                 assert!(n > 0, "complete HTTP request body");
@@ -1968,135 +1970,70 @@ async fn chatgpt_refresh_run_rejecting(
         }
     });
     install_test_catalog();
-    let options = broca_catalog::live::ResolveOptions {
-        family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
-        auth_method: Some(AuthMethod::Chatgpt),
-        account_id: auth.account_id.as_deref(),
-        frozen_account_ref: Some("acct-chatgpt"),
-        session_id: Some("chatgpt-refresh-session"),
-        prompt_cache_key: Some("chatgpt-refresh-cache"),
-        secret_refresher: auth
-            .in_run_refresh
-            .as_ref()
-            .map(|refresh| refresh.refresher.clone()),
-        ..Default::default()
-    };
-    let resolved = resolve_provider_for_episode(
-        "openai/gpt-5",
-        Some(&url),
-        Some(128),
-        &auth,
-        &options,
-        build_provider_http_client(),
+    let mut executor = executor_with_capturing_vault(&root, &daemon).await;
+    executor.provider_overrides = broca_module_serve::provider_overrides::ProviderOverrides::parse(
+        &serde_json::json!({"providers": {"openai": {"base_url": url}}}).to_string(),
+    )
+    .unwrap();
+    let mut req = drift_request(&root);
+    req.run_id = broca_protocol::RunId(label.into());
+    req.model = broca_protocol::request::ModelHandle::new("openai", "gpt-5");
+    req.generation.max_output_tokens = Some(128);
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text { text: "hi".into() }],
+    )];
+    req.stop_when = vec![broca_protocol::request::StopCondition::StepCount { n: 1 }];
+    let mut session = store_session().await;
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let end = serve_store_run_with_control(
+        &executor,
+        &mut session,
+        &parts,
+        req,
+        broca_module::executor::StoreRunMode::Fresh,
         Default::default(),
+        Some(broca_protocol::AuthRequest {
+            method: "chatgpt".into(),
+            account: None,
+            pool: None,
+            credential_id: None,
+        }),
     )
-    .unwrap_or_else(|error| panic!("ChatGPT resolution: {error}"));
-    // This refresh fixture parses HTTP POST bodies; pin HTTPS so it tests token recovery,
-    // not socket negotiation, while retaining its original send-count assertions.
-    broca_core::Provider::set_chatgpt_https_policy(&resolved.provider, Arc::new(|| true));
-    let session = BindIdentity::new(&root, "chatgpt-refresh", label);
-    let req = broca_core::RunRequest { route_decision_id: None, account_route: None,
-    input_written_at_ms: None, directives: None, session_class: None, retention: None,
-    title: None,
-    on_restart: None,
-    keep_warm: None,
-    send_id: None,
-    request_identity_digest: None,
-    scope: None,
-    project_id: None,
-    principal: None,
-    run_id: broca_protocol::RunId(label.into()),
-    session: session.clone(),
-    model: broca_protocol::request::ModelHandle {
-        provider_module_id: "openai".into(),
-        model_id: "gpt-5".into(),
-    },
-    input: vec![Message {
-        turn_system: false,
-        cache_prefix_blocks: None,
-        origin: None,
-        ordinal: None,
-        tags: Default::default(),
-        role: Role::User,
-        content: vec![ContentBlock::Text { text: "hi".into() }],
-    }],
-    tools: vec![],
-    policy_allowed: Default::default(),
-    tool_choice: Default::default(),
-    generation: Default::default(),
-    cache: None,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    variant: None,
-    service_tier: None,
-    stop_when: vec![broca_protocol::request::StopCondition::StepCount { n: 1 }],
-    submission_id: None,
-    context_management: None,
-    inherit_frozen_cache: false, structured_output: None,
-    head_turn: false,
-    };
-    let wal = FileWalStore::new(root.join("refresh-wal"));
-    let lease = FileLeaseStore::new(root.join("refresh-lease"));
-    let (tx, mut rx) = mpsc::channel(256);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let summary = tokio::time::timeout(
-        Duration::from_secs(30),
-        run_loop(
-            req,
-            &resolved.provider,
-            &StubToolPlane::new(),
-            &lease,
-            &AllowAll,
-            &wal,
-            &tx,
-        ),
-    )
-    .await
-    .expect("local ChatGPT run terminates")
-    .expect("run succeeds or pauses");
-    drop(tx);
-    drain.await.unwrap();
+    .await;
+    let summary = end
+        .result
+        .unwrap_or_else(|error| panic!("the ChatGPT run ends: {error:?}"));
     server.abort();
-    let records = wal.read_records(&session).unwrap();
-    if let (Some(status), Some((credential_key, admitted_version))) = (
-        latest_terminal_error(&records).and_then(wire_auth_status),
-        used_credential_for_report(&auth.pause, auth.selection.clone(), auth.record_version),
-    ) {
-        report_rejection_after_run(
-            executor.vault.as_ref().unwrap(),
-            &credential_key,
-            ReportedTokenVersion::Admitted(admitted_version),
-            auth.in_run_refresh.as_ref(),
-            status,
-        )
-        .await;
-    }
-    let attempts = wal
-        .read_records(&session)
+    let records: Vec<_> = session
+        .records_from(0)
+        .await
         .unwrap()
         .into_iter()
-        .filter_map(|frame| {
-            if let broca_wal::WalRecord::ModelAttemptFinished {
-                credential_refresh, ..
-            } = frame.record
-            {
-                Some(credential_refresh)
-            } else {
-                None
-            }
+        .map(|(_, record)| record)
+        .collect();
+    let attempts = records
+        .iter()
+        .filter_map(|record| match record {
+            broca_session_store::record::Record::Attempt(attempt) => Some(
+                attempt
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.parse()["credential_refresh"].clone().into())
+                    .and_then(|refresh: serde_json::Value| serde_json::from_value(refresh).ok()),
+            ),
+            _ => None,
         })
         .collect();
-    let pause_code = wal
-        .read_records(&session)
-        .unwrap()
-        .into_iter()
-        .find_map(|frame| match frame.record {
-            broca_wal::WalRecord::RunPaused {
-                error: Some(error), ..
-            } => error.provider_code,
-            _ => None,
-        });
+    let pause_code = records.iter().find_map(|record| match record {
+        broca_session_store::record::Record::Pause(pause) => pause
+            .error
+            .as_ref()
+            .and_then(|error| error.parse()["provider_code"].as_str().map(str::to_owned)),
+        _ => None,
+    });
     daemon.assert_healthy();
     let result = ChatgptRefreshRun {
         summary,
@@ -2130,11 +2067,10 @@ fn assert_chatgpt_refreshed_headers(headers: &str) {
         "chatgpt-account-id",
         "acct-chatgpt"
     ));
-    assert!(chatgpt_header_is(
-        headers,
-        "session-id",
-        "chatgpt-refresh-cache"
-    ));
+    // The session's prompt-cache key, which broca derives from the session.
+    assert!(headers.lines().any(|line| line
+        .split_once(':')
+        .is_some_and(|(key, value)| key.eq_ignore_ascii_case("session-id") && !value.trim().is_empty())));
     assert!(chatgpt_header_is(headers, "originator", "codex_cli_rs"));
     assert!(headers.lines().any(|line| line
         .to_ascii_lowercase()

@@ -27,7 +27,6 @@ members = [
     "crates/broca-heap-profile",
     "crates/broca-memory-relief",
     "crates/broca-session-store",
-    "crates/broca-session-convert",
     "crates/broca-session-loop",
 ]
 # The session store's fuzz targets build on nightly with cargo-fuzz, in a workspace of their

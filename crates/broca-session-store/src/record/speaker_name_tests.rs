@@ -205,6 +205,8 @@ fn marked_fold_entries() -> (
             sender: Some("core".into()),
             request_identity_digest: None,
             message_marks: Some(marks),
+            waits_for_run: None,
+            expires_at_ms: None,
         },
     )
 }

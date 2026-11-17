@@ -9,13 +9,6 @@ impl Drop for AdmissionTaskGuard {
 }
 #[async_trait]
 impl RunExecutor for HeldAdmission {
-    async fn execute(&self, _job: RunJob, _out: mpsc::Sender<OutputEvent>) -> Result<RunSummary, RunError> {
-        assert!(!self.live.swap(true, Ordering::SeqCst), "admission attempts must not overlap");
-        let _guard = AdmissionTaskGuard(self.live.clone());
-        self.started.add_permits(1);
-        self.release.notified().await;
-        Err(RunError::Config("dependency refused admission".into()))
-    }
 }
 
 fn seed_admission_episode(wal: &FlakyReadWalStore, key: &BindIdentity, now: u64, restart: bool) {
@@ -63,9 +56,7 @@ async fn expiry_read_failure_joins_nonrestart_admission_before_next_attempt() {
     seed_admission_episode(&wal, &key, retention.clock.now_ms(), false);
     let executor = Arc::new(HeldAdmission { live: Arc::new(AtomicBool::new(false)),
         started: Semaphore::new(0), release: tokio::sync::Notify::new() });
-    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
-        leases, wal.clone(), executor.clone(),
-    ).with_idle_ttl(Duration::from_secs(60))));
+    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(leases, executor.clone()).with_idle_ttl(Duration::from_secs(60))));
     registry.set_retention_service(retention.clone());
     registry.actor_for(&key).await.unwrap();
     registry.route_status(&key).await.unwrap();
@@ -120,9 +111,7 @@ async fn status_after_expiry_deletion_reports_expired() {
         assert!(retention.delete_expired(&key, retention.clock.now_ms()).unwrap().is_some());
     }
     assert_eq!(wal.inner.wal_present(&key), Some(false));
-    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
-        leases, wal, Arc::new(RetentionDone),
-    )));
+    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(leases, Arc::new(RetentionDone))));
     registry.set_retention_service(retention);
     let status = registry.route_status(&key).await;
     assert!(matches!(status, Err(crate::registry::OpenError::Expired { .. })), "{status:?}");
@@ -142,9 +131,7 @@ async fn restart_waiter_fixture(name: &str) -> (
     seed_admission_episode(&wal, &key, 100, true);
     let executor = Arc::new(HeldAdmission { live: Arc::new(AtomicBool::new(false)),
         started: Semaphore::new(0), release: tokio::sync::Notify::new() });
-    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
-        Arc::new(FileLeaseStore::new(dir.join("leases"))), wal.clone(), executor.clone(),
-    ).with_idle_ttl(Duration::from_secs(60))));
+    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), executor.clone()).with_idle_ttl(Duration::from_secs(60))));
     let resume = tokio::spawn({
         let registry = registry.clone(); let wal = wal.clone(); let key = key.clone();
         async move { registry.resume_restart_pauses(wal, vec![("prior".into(), key)]).await }
@@ -194,13 +181,6 @@ async fn queued_restart_waiter_receives_explicit_error_on_failed_seal() {
 struct MissingCompactionLimitAdmission;
 #[async_trait]
 impl RunExecutor for MissingCompactionLimitAdmission {
-    async fn execute(&self, mut job: RunJob, _out: mpsc::Sender<OutputEvent>) -> Result<RunSummary, RunError> {
-        // The run loop refuses through the admission channel before it writes anything.
-        if let Some(reply) = job.on_admitted.take() {
-            let _ = reply.send(Err(RunError::CompactionContextLimitMissing));
-        }
-        Err(RunError::CompactionContextLimitMissing)
-    }
 }
 
 #[tokio::test]
@@ -210,8 +190,8 @@ async fn compaction_v2_missing_limit_admission_keeps_the_invalid_params_field_an
     std::fs::create_dir_all(&dir).unwrap();
     let key = BindIdentity::new(dir.join("project"), "runner", "session");
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let opener = Arc::new(crate::opener::DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), wal.clone(), Arc::new(MissingCompactionLimitAdmission)));
-    let registry = LineageRegistry::new_with_reader(opener, wal.clone(), None);
+    let opener = Arc::new(crate::opener::DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), Arc::new(MissingCompactionLimitAdmission)));
+    let registry = LineageRegistry::new(opener);
     let result = registry.route_send(&key, text_req(&key, "limit"), RunKind::FreshOrResume).await.unwrap();
     assert!(matches!(result, SendOutcome::DeliveryRefused { code:"invalid_params", field:"context_limit", .. }), "{result:?}");
     assert!(wal.read_records(&key).unwrap().is_empty());

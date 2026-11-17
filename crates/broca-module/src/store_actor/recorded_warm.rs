@@ -463,6 +463,10 @@ impl<W: Writer> Writer for Before<'_, W> {
     async fn append(&mut self, _: &[Record], _: bool) -> Result<u64, SessionError> {
         Err(SessionError::OwnerGone)
     }
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        // The session as it stood before a seq: nothing appends to it.
+        Ok(())
+    }
     async fn send_records(&mut self, _: &str) -> Result<Vec<Record>, SessionError> {
         Err(SessionError::OwnerGone)
     }

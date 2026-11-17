@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use broca_core::provider::StubProvider;
 use broca_core::stub_plane::StubToolPlane;
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::OutputEvent;
 use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
 use broca_protocol::request::StopCondition;
 use broca_protocol::{
@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use super::StoreActor;
 use crate::actor::{CancelOutcome, LineageCmd, LineageStatus, SendKey, SendOutcome};
 use crate::executor::{
-    RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+    RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
 };
 
 pub(super) fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
@@ -416,13 +416,6 @@ impl RunExecutor for LoopExecutor {
         requested: f64,
     ) -> Option<Option<f64>> {
         super::differential::temperature::current_temperature(model, frozen, requested)
-    }
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
     }
 
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {

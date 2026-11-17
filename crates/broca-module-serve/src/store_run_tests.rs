@@ -44,7 +44,8 @@ async fn serve_store_run(
     req: broca_core::RunRequest,
     mode: broca_module::executor::StoreRunMode,
 ) -> broca_module::executor::StoreRunEnd {
-    serve_store_run_with_control(executor, session, parts, req, mode, Default::default()).await
+    serve_store_run_with_control(executor, session, parts, req, mode, Default::default(), None)
+        .await
 }
 
 async fn serve_store_run_with_control(
@@ -56,16 +57,24 @@ async fn serve_store_run_with_control(
     req: broca_core::RunRequest,
     mode: broca_module::executor::StoreRunMode,
     control: broca_core::run::RunControl,
+    auth: Option<broca_protocol::AuthRequest>,
 ) -> broca_module::executor::StoreRunEnd {
+    // The session's image index, handed to the run as its actor hands it over once built.
+    let backend: &'static broca_session_store::backend::MemoryBackend = session.backend();
+    let mut index = broca_module::store_media::SessionIndex::new(&*session, Some(backend));
+    index.open(session, parts).await;
+    assert!(index.ready(), "a session's image index is current once opened");
+    let (media_sent, media) = tokio::sync::oneshot::channel();
+    let _ = media_sent.send(index.for_run());
     let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(session, None);
     let job = broca_module::executor::StoreRunJob {
         req,
-        auth: None,
+        auth,
         control,
         writer,
         parts: Box::new(parts.clone()),
         mode,
-        media: None,
+        media: Some(media),
         queued_service_tier: None,
         keep_warm: None,
     };
@@ -111,6 +120,7 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::Append { .. } => "append",
         Request::Hold { .. } => "hold",
         Request::Held { .. } => "held",
+        Request::CaughtUp { .. } => "caught up",
         Request::SendRecords { .. } => "send records",
         Request::OpenLogRecords { .. } => "open log records",
         Request::AcceptedSend { .. } => "accepted send",

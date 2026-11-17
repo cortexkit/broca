@@ -84,13 +84,7 @@ async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool)
         let (calls, mut inbox) = mpsc::unbounded_channel();
         let events =
             with_bus.then(|| Arc::new(StepEvents::start_on_bus(Arc::new(Capture { calls, fail }))));
-        let module = module_step_events(
-            new_storage,
-            script(interrupted),
-            Some(cipher),
-            events.clone(),
-        )
-        .await;
+        let module = module_step_events(script(interrupted), Some(cipher), events.clone()).await;
         let outcome = module.send("step-run", "hello", None).await;
         assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
         broca_test_support::wait_until("the scripted run is idle", || async {
@@ -186,43 +180,6 @@ async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool)
                 .map(|b| format!("{b:02x}"))
                 .collect();
             assert_eq!(event.log_incarnation, incarnation);
-        } else {
-            assert_eq!(event.message_id, None);
-            assert!(serde_json::from_slice::<Value>(&body)
-                .unwrap()
-                .get("message_id")
-                .is_none());
-            let records = module.wal.read_records(&module.key).unwrap();
-            assert!(records.iter().any(|frame| matches!(
-                &frame.record,
-                broca_wal::WalRecord::RunFinished {
-                    reason: broca_protocol::RunFinishReason::Completed,
-                    ..
-                }
-            )));
-            let attempts: Vec<_> = records
-                .iter()
-                .filter_map(|frame| match &frame.record {
-                    broca_wal::WalRecord::ModelAttemptFinished {
-                        attempt_id: Some(id),
-                        ..
-                    } => Some((frame.seq, id)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(attempts.len(), 1);
-            assert_eq!(event.seq, attempts[0].0);
-            assert_eq!(event.attempt_id.as_deref(), Some(attempts[0].1.as_str()));
-            let writer = records
-                .iter()
-                .find_map(|frame| match &frame.record {
-                    broca_wal::WalRecord::WriterOpened { writer_id, .. } => Some(writer_id),
-                    _ => None,
-                })
-                .unwrap();
-            let writer: String = writer.iter().map(|b| format!("{b:02x}")).collect();
-            let lineage = module.wal.open(&module.key).unwrap().lineage_id().unwrap();
-            assert_eq!(event.log_incarnation, format!("{lineage}.{writer}"));
         }
         tokio::task::yield_now().await;
         assert!(inbox.try_recv().is_err(), "an attempt published twice");
@@ -262,8 +219,7 @@ async fn handoff_evidence(new_storage: bool) {
         calls,
         fail: false,
     })));
-    let module =
-        module_step_events(new_storage, script(false), Some(Cipher::None), Some(events)).await;
+    let module = module_step_events(script(false), Some(Cipher::None), Some(events)).await;
     let session_ref = broca_core::agent_session_ref(&module.key);
     let capture = broca_test_support::LogCapture::observe(move |event| {
         event.target == "step-events.evidence"
@@ -333,7 +289,7 @@ async fn a_model_attempt_without_send_time_emits_no_step_event(cipher: Cipher) {
         unreachable!()
     };
     attempt.sent_at_ms = None;
-    let module = module_step_events(true, script, Some(cipher), Some(events.clone())).await;
+    let module = module_step_events(script, Some(cipher), Some(events.clone())).await;
     assert!(matches!(
         module.send("no-send-time", "hello", None).await,
         SendOutcome::Active { .. }
@@ -359,7 +315,6 @@ async fn cached_anthropic_auto_step_events_match(cipher: Cipher) {
             fail: false,
         })));
         let module = module_options_with_render(
-            new_storage,
             script(false),
             Some(cipher),
             Some(events),

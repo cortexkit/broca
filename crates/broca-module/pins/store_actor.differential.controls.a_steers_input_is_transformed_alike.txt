@@ -13,7 +13,7 @@ Active {
     delivered: None,
 }
 == control stream
-sha256:80adbf13a8a9b37d32cf5b2e8bd64503203e769dffe2d8d79aaba9b0646a9bda (2889 bytes)
+sha256:9bd6717c5295078d410c29aedd2d4f904c7e3fc9fdd49ca240322e3233042518 (2823 bytes)
 == the conversation
 [
     "you are a worker",

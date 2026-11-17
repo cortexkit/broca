@@ -1,16 +1,17 @@
 //! Existing sessions retain their inventory root; only new scoped sessions take the stamp's
-//! workdir. Both paths preserve the same WAL, lease, run-index and reference derivations.
+//! workdir. Either way the session is stored, and its inventory ref resolves, under the
+//! address the bind triple derives.
 
 use crate::delivery_rig;
+use broca_session_store::record::Record;
 
 use delivery_rig::*;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use broca_core::{LeaseStore, RunIndex, SessionRefIndex};
+use broca_core::SessionRefIndex;
 use broca_protocol::BindIdentity;
-use broca_wal::WalRecord;
 use serde_json::{json, Value};
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
@@ -135,52 +136,45 @@ fn counter(counters: &Value, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("health.check reports {name}: {counters}"))
 }
 
-/// Everything a session is addressed by, checked against its bind triple. `elsewhere` is a
-/// stamped folder that differs from the bind root: no state may appear under a key built
-/// from it.
-fn assert_keyed_by_bind(
+/// The session `session` names is stored in the new storage under its bind triple's address,
+/// holds exactly the runs `run_ids`, and is what the inventory's ref resolves to. With
+/// `elsewhere`, nothing is stored or referenced under the same name in that folder.
+async fn assert_keyed_by_bind(
     rig: &Rig,
     session: &BindIdentity,
     run_ids: &[String],
     elsewhere: Option<&Path>,
 ) {
-    let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
-    let wal_path = wal.wal_path(session);
-    assert_eq!(
-        wal_path.file_stem().and_then(|stem| stem.to_str()),
-        Some(broca_core::session_addr(session).as_str()),
-        "the WAL is named by the bind triple's address"
+    let runtime = rig.registry().store_runtime().unwrap();
+    assert!(
+        broca_wal::session_storage_class(
+            rig.registry().store_runtime().unwrap().state_root(),
+            &broca_core::session_addr(session)
+        )
+        .unwrap()
+        .is_some(),
+        "the session is stored under the bind triple's address"
     );
-    let records: Vec<WalRecord> =
-        broca_wal::replay_file(&wal_path, broca_wal::DEFAULT_MAX_READ_BYTES)
-            .unwrap()
-            .into_iter()
-            .map(|frame| frame.record)
-            .collect();
-    let started: Vec<&BindIdentity> = records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::RunStarted { session, .. } => Some(session),
+    // Opening the session checks the triple its head records against `session`.
+    let view = runtime
+        .current_view(session)
+        .await
+        .unwrap()
+        .expect("the session opens under its bind triple");
+    let started: Vec<String> = view
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            Record::RunStart(start) => Some(start.run_id),
             _ => None,
         })
         .collect();
-    assert_eq!(started.len(), run_ids.len(), "{records:?}");
-    assert!(
-        started.iter().all(|recorded| *recorded == session),
-        "every episode records the bind triple: {started:?}"
+    assert_eq!(
+        started, run_ids,
+        "every run is stored in the bind triple's session"
     );
-
-    for run_id in run_ids {
-        let row = rig
-            .store
-            .lookup_run(run_id)
-            .unwrap()
-            .expect("the run is indexed");
-        assert_eq!(
-            &row.session, session,
-            "the run index keys {run_id} by the bind triple"
-        );
-    }
 
     let reference = broca_core::agent_session_ref(session);
     let refs = rig
@@ -193,27 +187,18 @@ fn assert_keyed_by_bind(
         "the session ref resolves to the bind triple's address"
     );
 
-    // The idle session's actor still holds its writer lease, under the bind triple's key.
-    let leases = broca_core::FileLeaseStore::new(rig.dir.join("leases"));
-    assert!(
-        matches!(
-            leases.acquire(&broca_core::lease_key_for(session)),
-            Err(broca_core::LeaseError::Held { .. })
-        ),
-        "the session's writer holds the lease keyed by the bind triple"
-    );
-
     let Some(elsewhere) = elsewhere else {
         return;
     };
     let moved = BindIdentity::new(elsewhere, session.harness.clone(), session.session.clone());
     assert!(
-        !wal.wal_path(&moved).exists(),
-        "nothing is written under the stamped folder's key"
-    );
-    assert!(
-        leases.acquire(&broca_core::lease_key_for(&moved)).is_ok(),
-        "nothing holds a lease under the stamped folder's key"
+        broca_wal::session_storage_class(
+            rig.registry().store_runtime().unwrap().state_root(),
+            &broca_core::session_addr(&moved)
+        )
+        .unwrap()
+        .is_none(),
+        "nothing is stored under the stamped folder's key"
     );
     assert!(
         rig.store
@@ -226,6 +211,23 @@ fn assert_keyed_by_bind(
             .all(|(address, _)| *address != broca_core::session_addr(&moved)),
         "no ref maps to the stamped folder's address"
     );
+}
+
+/// The usage facts the rig's index holds for `run_id`.
+fn facts_of(rig: &Rig, run_id: &str) -> Vec<Value> {
+    let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+    let mut statement = connection
+        .prepare("SELECT segment_json FROM export_facts")
+        .unwrap();
+    let rows: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.iter()
+        .map(|row| serde_json::from_str::<Value>(row).unwrap())
+        .filter(|fact| fact["run_id"] == run_id)
+        .collect()
 }
 
 #[tokio::test]
@@ -244,8 +246,6 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
 
     let moved = bind_stamped(&mut rig, 9, "stamped-moved", &root).await;
     let moved_first = send_and_settle(&mut rig, 9, "turn-1").await;
-    let legacy_bytes =
-        std::fs::read(broca_core::FileWalStore::new(rig.dir.join("wal")).wal_path(&moved)).unwrap();
     bind_at(
         &mut rig,
         9,
@@ -293,42 +293,36 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
         "the matching session is counted as matching: {before} -> {after}"
     );
 
-    assert_keyed_by_bind(&rig, &same, &[same_run], None);
-    assert_keyed_by_bind(&rig, &moved, &[moved_first, moved_second], Some(&elsewhere));
-    assert_keyed_by_bind(&rig, &new_key, &[new_run], Some(&root));
+    assert_keyed_by_bind(&rig, &same, &[same_run], None).await;
+    assert_keyed_by_bind(&rig, &moved, &[moved_first, moved_second], Some(&elsewhere)).await;
+    assert_keyed_by_bind(&rig, &new_key, std::slice::from_ref(&new_run), Some(&root)).await;
     assert_keyed_by_bind(
         &rig,
         &old_seat,
         &[seat_first, seat_second],
         Some(&elsewhere),
-    );
-    assert_keyed_by_bind(&rig, &new_unscoped, &[unscoped_run], Some(&root));
-    for (label, session) in [("SCOPED", &new_key), ("UNSCOPED", &new_unscoped)] {
-        let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
-        let records = broca_core::WalStore::read_records(&wal, session).unwrap();
-        let facts = broca_core::compute_segments(
-            &records,
-            "project-attribution-example",
-            &|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1),
-        );
-        assert_eq!(facts.len(), 1);
-        let value = serde_json::to_value(&facts[0]).unwrap();
+    )
+    .await;
+    assert_keyed_by_bind(
+        &rig,
+        &new_unscoped,
+        std::slice::from_ref(&unscoped_run),
+        Some(&root),
+    )
+    .await;
+    for (label, run_id) in [("SCOPED", &new_run), ("UNSCOPED", &unscoped_run)] {
+        let facts = facts_of(&rig, run_id);
+        assert_eq!(facts.len(), 1, "{label}: {facts:?}");
         if label == "UNSCOPED" {
-            assert!(value["session"].get("project_root").is_none());
+            assert!(facts[0]["session"].get("project_root").is_none());
         } else {
             assert_eq!(
-                value["session"]["project_root"],
+                facts[0]["session"]["project_root"],
                 json!(new_key.project_root)
             );
         }
-        println!(
-            "FACT_SAMPLE_{label}={}",
-            serde_json::to_string(&facts[0]).unwrap()
-        );
+        println!("FACT_SAMPLE_{label}={}", facts[0]);
     }
-    let resumed_bytes =
-        std::fs::read(broca_core::FileWalStore::new(rig.dir.join("wal")).wal_path(&moved)).unwrap();
-    assert_eq!(&resumed_bytes[..legacy_bytes.len()], legacy_bytes);
     for (index, old_root) in [&root, &elsewhere].into_iter().enumerate() {
         for scoped in [false, true] {
             let name = format!("legacy-{index}-{scoped}");
@@ -338,8 +332,6 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
                 .unwrap();
             bind_at(&mut rig, 13, &name, old_root, None, 1).await;
             let first = send_and_settle(&mut rig, 13, "first").await;
-            let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
-            let prefix = std::fs::read(wal.wal_path(&legacy)).unwrap();
             bind_at(
                 &mut rig,
                 13,
@@ -355,17 +347,15 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
                 &legacy,
                 &[first, second],
                 Some(Path::new("broca-unscoped-v1")),
-            );
-            assert!(std::fs::read(wal.wal_path(&legacy))
-                .unwrap()
-                .starts_with(&prefix));
+            )
+            .await;
         }
     }
     rig.finish().await;
 }
 
 #[tokio::test]
-async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation() {
+async fn ambiguous_and_incomplete_addresses_refuse_before_any_session_is_stored() {
     let mut rig = Rig::start_with_scopes("address-refusal").await;
     let counters_before = health_metrics(&mut rig).await["session_address_refusals"].clone();
     let first = BindIdentity::new(
@@ -437,11 +427,16 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation(
         );
         assert!(error["message"].as_str().unwrap().contains(name));
         assert_eq!(count(), before);
-        let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
-        let leases = broca_core::FileLeaseStore::new(rig.dir.join("leases"));
         for identity in [&first, &second] {
-            assert!(!wal.wal_path(identity).exists());
-            assert!(leases.acquire(&broca_core::lease_key_for(identity)).is_ok());
+            assert!(
+                broca_wal::session_storage_class(
+                    rig.registry().store_runtime().unwrap().state_root(),
+                    &broca_core::session_addr(identity)
+                )
+                .unwrap()
+                .is_none(),
+                "a refused bind stores nothing"
+            );
         }
     }
     rig.finish().await;
@@ -513,9 +508,12 @@ async fn inventory_wait_refusals_keep_the_precise_transient_code_and_reason() {
             &rig.session.harness,
             "new-after-repair",
         );
-        assert!(!broca_core::FileWalStore::new(rig.dir.join("wal"))
-            .wal_path(&identity)
-            .exists());
+        assert!(broca_wal::session_storage_class(
+            rig.registry().store_runtime().unwrap().state_root(),
+            &broca_core::session_addr(&identity)
+        )
+        .unwrap()
+        .is_none());
         rig.finish().await;
     }
 }

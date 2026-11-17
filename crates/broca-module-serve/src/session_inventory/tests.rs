@@ -37,8 +37,7 @@ impl Fixture {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
-        let registry =
-            LineageRegistry::new_with_sources(Arc::new(NeverOpen), None, Some(index.clone()));
+        let registry = LineageRegistry::new(Arc::new(NeverOpen));
         registry.set_session_address_inventory(index.clone());
         let inventory = SessionInventory::new(root.clone(), index.clone());
         registry.set_session_inventory_readiness(Arc::new(inventory.clone()));

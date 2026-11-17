@@ -1,5 +1,4 @@
-//! A send's service tier level on a session kept in the new storage, admitted by today's rule
-//! (`LineageActor`'s send admission) before anything is written: a level the runner doesn't know,
+//! A send's service tier level, admitted before anything is written: a level the runner doesn't know,
 //! or one the send's model can't be sent at, is refused; a running or paused run keeps the level
 //! it froze; and with no level of its own, a session's first run takes the one its plan's model
 //! selection names. The send then carries the level it was admitted at: into the run it starts,

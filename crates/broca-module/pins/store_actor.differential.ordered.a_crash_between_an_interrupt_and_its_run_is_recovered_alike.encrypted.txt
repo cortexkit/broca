@@ -12,7 +12,7 @@ Pending {
     ),
 }
 == control stream
-sha256:6f714fb8d4e5c52e75be3745ebd7133d1c054029b4b2bae1a13bdeb4a40d5d07 (5327 bytes)
+sha256:8b8aef655af5294ce1b855f58a3f7354a1bc16d0530d0168df0964bc1e184c31 (5195 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:86424feaa5232f068e05a4ed05aa2b4a1fc6a0da462f3f81c38e9d25f486e8b0 (6076 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))

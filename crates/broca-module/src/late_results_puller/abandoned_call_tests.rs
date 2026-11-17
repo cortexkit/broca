@@ -15,7 +15,7 @@ mod abandoned_call {
     }
 
     #[tokio::test]
-    async fn late_settlement_of_abandoned_calls_changes_neither_wal_nor_run_wakes() {
+    async fn late_settlement_of_abandoned_calls_changes_neither_the_session_nor_run_wakes() {
         for ended in [false, true] {
             let bind = session(if ended {
                 "abandoned-ended"
@@ -33,33 +33,15 @@ mod abandoned_call {
                 vec![registration(key, "tools", &bind)],
             )
             .await;
-            let wal = Arc::new(FileWalStore::new(rig.root.join("wal")));
-            let mut records = held_records(key, "tools", &bind);
-            records.truncate(4);
-            records.push(WalRecord::ToolResult {
-                finished_at_ms: None,
-                tags: None,
-                hooks: None,
-                batch_id: BatchId("b".into()),
-                result: Arc::new(broca_core::outcome_unknown_result(&ToolCallId("a".into()))),
-                outcome: DispatchOutcome::Unknown,
-                reason: None,
-                withdraw_elicitation: None,
-                provider_held: None,
-            });
+            // The call was dispatched and its answer is unknown: it was never held.
+            let mut records = held_records(key, "tools");
+            records.truncate(3);
+            records.push(outcome("run", "b", "a", CallOutcome::Unknown));
             if ended {
-                records.push(WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    reason: broca_protocol::RunFinishReason::Interrupted,
-                    ts_ms: Some(44),
-                    usage: Default::default(),
-                    error: None,
-                    retries_used: 0,
-                });
+                records.push(run_end("run", RunFinishReason::Interrupted));
             }
-            write_wal(&wal, &bind, &records);
-            let path = wal.wal_path(&bind);
-            let before = std::fs::read(&path).unwrap();
+            rig.seed(&bind, &records).await;
+            let before = rig.records(&bind).await;
             let slots = HeldSlots::new();
             let wake = Arc::new(WakeProbe::default());
             let mappings = Arc::new(AtomicUsize::new(0));
@@ -73,7 +55,8 @@ mod abandoned_call {
                 }),
             ));
             rig.intake =
-                LateResultsIntake::new(rig.store.clone(), wal, "broca", delivery, rig.feed.clone());
+                LateResultsIntake::new(rig.store.clone(), "broca", delivery, rig.feed.clone());
+            rig.intake.set_session_store(Arc::clone(&rig.runtime));
             let _puller = rig.puller("tools");
             let mut first =
                 entry(kinds::NOT_STARTED, key, "scope-ended-1").with_reason("scope_ended");
@@ -107,27 +90,8 @@ mod abandoned_call {
             assert_eq!(mappings.load(Ordering::SeqCst), 0);
             assert_eq!(wake.0.load(Ordering::SeqCst), 0);
             assert!(slots.is_empty());
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-            let reopened = broca_wal::replay_file(&path, 1024 * 1024).unwrap();
-            let terminals: Vec<_> = reopened
-                .iter()
-                .filter_map(|r| match &r.record {
-                    WalRecord::ToolResult {
-                        result, outcome, ..
-                    } => Some((result, outcome)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(*terminals[0].1, DispatchOutcome::Unknown);
-            assert_eq!(terminals[0].0.tool_call_id, ToolCallId("a".into()));
-            assert_eq!(
-                reopened
-                    .iter()
-                    .filter(|r| matches!(r.record, WalRecord::ToolDispatchIntent { .. }))
-                    .count(),
-                1
-            );
+            // Nothing was written: the call keeps its one intent and its unknown terminal.
+            assert_eq!(rig.records(&bind).await, before);
         }
     }
 }

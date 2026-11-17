@@ -3,6 +3,7 @@
 
 use super::*;
 use broca_core::{ExportError, ExportIndex};
+use broca_wal::FramedRecord;
 
 cipher_tests!(idle_open_recovery_never_reinserts_older_runs);
 
@@ -120,7 +121,7 @@ async fn idle_open_recovery_never_reinserts_older_runs(cipher: Cipher) {
         &side,
         cipher,
         executor.clone(),
-        &finished_head(),
+        converted("finished-head"),
         Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
     )
     .await;

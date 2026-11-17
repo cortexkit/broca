@@ -12,11 +12,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
-    run_loop_on_writer_admitted_with_prior_snapshot, BatchCtx, DispatchResult, FileLeaseStore,
-    FileWalStore, OutputEvent, Provider, RunError, RunSummary, StartMode, ToolManifest, ToolPlane,
-    ToolPlaneError,
+    BatchCtx, DispatchResult, FileLeaseStore, OutputEvent, Provider, RunError, ToolManifest,
+    ToolPlane, ToolPlaneError,
 };
-use broca_module::executor::{RunExecutor, RunJob, RunKind};
+use broca_module::executor::RunExecutor;
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
 use broca_protocol::{
@@ -25,7 +24,7 @@ use broca_protocol::{
     request::CallOptions,
     BindIdentity, FinishReason, MessageId, StepId, ToolCallId, Usage,
 };
-use broca_wal::WalRecord;
+use broca_session_store::record::Record;
 use subc_protocol::session::ModuleControlRequest;
 use subc_protocol::{
     BindIdentity as SubcBindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, Priority,
@@ -36,8 +35,6 @@ use tokio::sync::{mpsc, Notify};
 
 #[path = "../../../broca-wire/tests/support/run_usage.rs"]
 mod usage_compat;
-use broca_core::WalStore;
-use std::sync::atomic::Ordering;
 pub use usage_compat::legacy_bytes;
 
 /// One scripted model step.
@@ -165,7 +162,6 @@ pub struct Script {
     pub tool_plane: Mutex<Option<Arc<dyn broca_core::ToolPlane>>>,
     /// A synthetic tool's catalog schema and semantics pin; absent for legacy direct tools.
     pub schema_pin: Mutex<Option<broca_wal::DispatchSchemaPin>>,
-    pub attempt_time: Mutex<Option<u64>>,
     pub hold_stream: Mutex<bool>,
     pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
@@ -196,9 +192,6 @@ pub struct Script {
     pub failures: Mutex<Vec<String>>,
     pub provider_output: Mutex<Vec<String>>,
     module_log: Mutex<Option<broca_test_support::LogCapture>>,
-    /// Seal tests hold work past the ordinary boundary-stop grace so the actor, rather than
-    /// the loop's graceful stop, must collect and persist the hook fallback slots.
-    pub ignore_graceful_stop: Mutex<bool>,
     /// When set, the next run pauses for re-authentication right after admission.
     pub pause_next_run: Mutex<bool>,
     /// Optional compaction driver; availability remains off until set_compaction_plane installs it.
@@ -349,7 +342,7 @@ impl Provider for ScriptedProvider {
         }
         let (tx, rx) = mpsc::channel(8);
         let script = self.0.clone();
-        let mut events = self
+        let events = self
             .0
             .normalized_steps
             .lock()
@@ -364,12 +357,6 @@ impl Provider for ScriptedProvider {
                     .unwrap_or(Step::Text("done"))
                     .events()
             });
-        if let Some(at) = *self.0.attempt_time.lock().unwrap() {
-            events.insert(0, NormalizedEvent::Control(ProviderControl::AttemptFinished {
-                attempt: serde_json::from_value(serde_json::json!({"attempt":0,"outcome":"complete","ts_ms":at,
-                    "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b"})).unwrap(),
-            }));
-        }
         tokio::spawn(async move {
             for event in events {
                 if matches!(
@@ -514,7 +501,6 @@ impl broca_core::ApprovalPolicy for ScriptedApproval {
 
 /// The real core loop over the scripted provider and tool plane.
 struct CoreExec {
-    wal_store: Arc<FileWalStore>,
     store: Arc<broca_store::SqliteStore>,
     script: Arc<Script>,
     hook_plane: Arc<Mutex<Option<Arc<dyn broca_core::HookPlane>>>>,
@@ -554,119 +540,29 @@ impl RunExecutor for CoreExec {
         }
     }
 
-    async fn apply_idle_compaction(
-        &self,
-        session: &broca_protocol::BindIdentity,
-        writer: &broca_core::WalHandle,
-        records: Vec<broca_wal::WalRecord>,
-        ready: &broca_core::compaction_provider::notice::ViewReady,
-    ) -> Result<bool, String> {
-        broca_module_serve::compaction_bus::apply_idle(
-            session,
-            writer,
-            &records,
-            ready,
-            &self
-                .compaction_plane()
-                .ok_or("compaction provider unavailable")?,
-            None,
-        )
-        .await
-    }
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         self.hook_plane.lock().unwrap().clone()
     }
 
-    async fn execute(
+    /// A session kept in the new storage (one a move took there) runs through the new loop over
+    /// the same scripted provider, tools and approvals today's runs use.
+    async fn execute_on_store(
         &self,
-        job: RunJob,
+        job: broca_module::executor::StoreRunJob,
         out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        let mode = match job.kind {
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-            RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-            RunKind::FreshOrResume => StartMode::FreshOrResume,
-        };
-        let materialized_store =
-            job.materialized_store(self.store.clone() as Arc<dyn broca_core::SessionStore>);
-        let provider = ScriptedProvider(self.script.clone(), None, std::sync::RwLock::new(None));
-        if job.has_media_input() {
-            if let Err(error) = job.admit_media(&provider, self.wal_store.uploads().as_ref()) {
-                if let Some(ack) = job.on_admitted {
-                    let _ = ack.send(Err(error.clone()));
-                }
-                return Err(error);
-            }
-        }
-        if provider.supports_media_renderer() {
-            let store = self
-                .wal_store
-                .uploads()
-                .unwrap()
-                .session_media_store(&job.req.session)
-                .unwrap();
-            let wal = self.wal_store.clone();
-            let session = job.req.session.clone();
-            let head = job.writer.durable_head();
-            let checkpoint = match broca_core::media_request::initialize_media_checkpoint(
-                &job.writer,
-                self.wal_store.clone(),
-                &job.req.session,
-                &job.prior_snapshot,
-            )
-            .await
-            {
-                Ok(initialized) => initialized.checkpoint,
-                Err(error) => {
-                    let error = RunError::Wal(error);
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(error.clone()));
-                    }
-                    return Err(error);
-                }
-            };
-            let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-                store,
-                checkpoint,
-                job.prior_snapshot
-                    .checkpoint_at_head
-                    .last_episode
-                    .as_ref()
-                    .and_then(|episode| episode.config.budget.clone()),
-                self.script
-                    .media_frozen
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|frozen| frozen.media.clone()),
-                Box::new(move |after| {
-                    wal.read_records_range(
-                        &session,
-                        after,
-                        Some(head.load(Ordering::Acquire)),
-                        None,
-                    )
-                    .map_err(|error| error.to_string())
-                    .and_then(|range| match range.into_records() {
-                        broca_wal::WalRangeRecords::Complete(records)
-                        | broca_wal::WalRangeRecords::Unknown(records) => Ok(records),
-                        _ => Err("incomplete media fixture WAL".into()),
-                    })
-                }),
-            )
-            .unwrap();
-            provider.set_media_request_renderer(Arc::new(
-                move |frozen, opts, tags, commit, provenance| {
-                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
-                },
-            ));
-        }
-        let mut control = job.control;
+    ) -> broca_module::executor::StoreRunEnd {
+        use broca_module::executor::{StoreRunError, StoreRunMode};
+        use broca_session_loop::writer::Writer as _;
+        let broca_module::executor::StoreRunJob {
+            mut req,
+            mut control,
+            mut writer,
+            mut parts,
+            mode,
+            media,
+            ..
+        } = job;
         control.hook_plane = self.hook_plane();
-        control.compaction_plane = self.script.compaction_plane.lock().unwrap().clone();
-        if *self.script.ignore_graceful_stop.lock().unwrap() {
-            control.stop_requested = None;
-        }
         if let Some(selection) = self.script.auth_selection.lock().unwrap().clone() {
             control.auth_selection = Some(selection);
         }
@@ -692,83 +588,53 @@ impl RunExecutor for CoreExec {
                 account_continue: None,
             });
         }
-        // A resume keeps the decision its episode froze; a fresh episode decides from its send,
-        // as the module's provider resolution does.
-        let structured_output = job
-            .prior_snapshot
-            .checkpoint_at_head
-            .last_episode
-            .as_ref()
-            .filter(|episode| episode.run_id == job.req.run_id)
-            .map(|episode| {
-                broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
-                    Some(&episode.config.frozen_render_config),
+        // A fresh run decides structured output from its send, as the module's provider
+        // resolution does; any other run keeps the decision its start froze in its render config.
+        let structured_output = if matches!(mode, StoreRunMode::Fresh) {
+            req.structured_output.as_ref().map(|request| {
+                broca_provider::structured_output::decide(
+                    broca_provider::spec::WireFamilyId::OpenAiChat,
+                    "xai",
+                    None,
+                    *self.script.structured_output_support.lock().unwrap(),
+                    request,
                 )
+                .unwrap()
             })
-            .unwrap_or_else(|| {
-                job.req.structured_output.as_ref().map(|request| {
-                    broca_provider::structured_output::decide(
-                        broca_provider::spec::WireFamilyId::OpenAiChat,
-                        "xai",
-                        None,
-                        *self.script.structured_output_support.lock().unwrap(),
-                        request,
-                    )
-                    .unwrap()
-                })
-            });
-        let module_log = self.script.module_log.lock().unwrap().clone();
-        let provider = ScriptedProvider(provider.0, structured_output, provider.2);
-        let tools = ScriptedTools(self.script.clone());
-        let approval = ScriptedApproval(self.script.clone());
-        let run = run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &provider,
-            &tools,
-            &approval,
-            self.wal_store.as_ref(),
-            materialized_store,
-            control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        );
-        let result = if let Some(log) = module_log {
-            log.scope_future(run).await
         } else {
-            run.await
+            writer
+                .operations()
+                .run
+                .as_ref()
+                .and_then(|run| broca_session_loop::run::run_config_of_run(run, parts.as_ref()).ok())
+                .and_then(|config| {
+                    broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
+                        Some(&config.frozen_render_config),
+                    )
+                })
         };
-        result.inspect_err(|error| {
-            self.script.failures.lock().unwrap().push(error.to_string());
-        })
-    }
-
-    /// A session kept in the new storage (one a move took there) runs through the new loop over
-    /// the same scripted provider, tools and approvals today's runs use.
-    async fn execute_on_store(
-        &self,
-        job: broca_module::executor::StoreRunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> broca_module::executor::StoreRunEnd {
-        use broca_module::executor::{StoreRunError, StoreRunMode};
-        use broca_session_loop::writer::Writer as _;
-        let broca_module::executor::StoreRunJob {
-            mut req,
-            mut control,
-            mut writer,
-            mut parts,
-            mode,
-            media,
-            ..
-        } = job;
-        control.hook_plane = self.hook_plane();
-        let provider = ScriptedProvider(self.script.clone(), None, std::sync::RwLock::new(None));
+        let provider = ScriptedProvider(
+            self.script.clone(),
+            structured_output,
+            std::sync::RwLock::new(None),
+        );
         let tools = ScriptedTools(self.script.clone());
         let approval = ScriptedApproval(self.script.clone());
         let result = async {
-            let now = || 1;
+            // The run's clock as the module's own runs read it: the session's retention clock,
+            // else the wall clock. A restart pause is resumed only while it is recent, by the
+            // same clock.
+            let clock = control.clock.clone();
+            let now = || {
+                clock.as_ref().map_or_else(
+                    || {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_millis() as u64)
+                    },
+                    |clock| clock.now_ms(),
+                )
+            };
             // As the module's executor installs it for a store run that may carry media, when
             // the scripted model takes media: a renderer reading the session's own media
             // objects through its actor's image index, which each model call waits for until the
@@ -809,7 +675,8 @@ impl RunExecutor for CoreExec {
                 bind: req.session.clone(),
                 out: Some(&out),
                 cancel: control.cancel.clone().unwrap_or_default(),
-                stop: Default::default(),
+                // As the module's own runs do: a graceful stop ends the run at its next boundary.
+                stop: control.stop_requested.clone().unwrap_or_default(),
                 held: None,
                 approval: &approval,
                 hook_plane: control.hook_plane.clone(),
@@ -821,7 +688,7 @@ impl RunExecutor for CoreExec {
                 keep_warm: None,
                 account_reports: None,
                 max_same_account_wait: Default::default(),
-                auth_selection: None,
+                auth_selection: control.auth_selection.clone(),
                 step_progress: control.step_progress.clone(),
                 model_call_ready,
                 pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
@@ -868,16 +735,12 @@ pub struct Rig {
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
     pub session: BindIdentity,
-    pub wal_path: PathBuf,
     pub script: Arc<Script>,
     hook_plane: Arc<Mutex<Option<Arc<dyn broca_core::HookPlane>>>>,
     registry: Arc<LineageRegistry>,
     daemon_scopes: bool,
     corr: u64,
     next_subscription_read_delay: Option<Duration>,
-    /// Whether the module keeps the new session storage beside today's and can move the
-    /// rig's session there (`session.move_to_store`), as a production module does.
-    movable: bool,
     /// Frames [`Rig::request`] read that weren't its reply, such as a still-open
     /// subscription's, in the order they arrived.
     pub skipped: Vec<Frame>,
@@ -885,19 +748,49 @@ pub struct Rig {
 
 pub struct FailureDiagnostics {
     script: Arc<Script>,
-    wal_path: PathBuf,
+    store: Option<Arc<broca_module::store_open::StoreRuntime>>,
+    session: BindIdentity,
 }
 
 impl FailureDiagnostics {
     pub fn snapshot(&self) -> String {
         format!(
-            "--- broca in-process module log ---\n{:?}\nexecutor failures: {:?}\n--- scripted model provider output ---\n{:?}\nhold_model={}\n--- broca WAL ---\n{:?}",
+            "--- broca in-process module log ---\n{:?}\nexecutor failures: {:?}\n--- scripted model provider output ---\n{:?}\nhold_model={}\n--- broca stored records ---\n{}",
             self.script.module_log.lock().unwrap().as_ref().map(|log| log.events()),
             self.script.failures.lock().unwrap(),
             self.script.provider_output.lock().unwrap(),
             self.script.hold_model.lock().unwrap(),
-            broca_wal::replay_file(&self.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES),
+            self.stored_records(),
         )
+    }
+
+    /// The session's open log, read on a thread of its own: the snapshot is taken while the
+    /// failing test unwinds on the runtime that drives the rig, so that runtime can't serve the
+    /// read. A read that can't finish in time is reported, never waited out.
+    fn stored_records(&self) -> String {
+        let Some(store) = self.store.clone() else {
+            return "the rig keeps no session store".into();
+        };
+        let session = self.session.clone();
+        let (sent, read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let records = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    match store.current_view(&session).await {
+                        Ok(Some(view)) => format!("{:?}", view.open_log_records().await),
+                        Ok(None) => "the session has no stored records".into(),
+                        Err(error) => format!("the session can't be read: {error:?}"),
+                    }
+                }),
+                Err(error) => format!("no runtime to read the session on: {error}"),
+            };
+            let _ = sent.send(records);
+        });
+        read.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| "the session's records did not read within 10 s".into())
     }
 }
 
@@ -915,38 +808,13 @@ impl Rig {
         *self.script.module_log.lock().unwrap() = Some(broca_test_support::LogCapture::new());
         FailureDiagnostics {
             script: self.script.clone(),
-            wal_path: self.wal_path.clone(),
+            store: self.registry.store_runtime(),
+            session: self.session.clone(),
         }
     }
 
     pub async fn start(tag: &str) -> Self {
         Self::start_with_idle_ttl(tag, broca_module::actor::IDLE_TTL).await
-    }
-
-    pub async fn start_with_ride_writer(tag: &str) -> Self {
-        let dir = broca_test_support::scratch_root()
-            .join(format!("broca-send-delivery-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("proj")).unwrap();
-        Self::open_existing_as_with_ride_writer(
-            dir,
-            broca_module::actor::IDLE_TTL,
-            false,
-            "runner",
-            true,
-        )
-        .await
-    }
-
-    /// Open a stable test root so two independently built releases can replay the same WAL.
-    pub async fn open_fixture(dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&dir).unwrap();
-        Self::open_existing(dir, Duration::from_millis(100), false).await
-    }
-
-    pub fn seed_fixture_wal(&self, bytes: &[u8]) {
-        std::fs::create_dir_all(self.wal_path.parent().unwrap()).unwrap();
-        std::fs::write(&self.wal_path, bytes).unwrap();
     }
 
     pub async fn start_with_scopes(tag: &str) -> Self {
@@ -990,47 +858,6 @@ impl Rig {
         daemon_scopes: bool,
         harness: &str,
     ) -> Self {
-        Self::open_with(dir, idle_ttl, daemon_scopes, harness, false, false).await
-    }
-
-    /// A rig whose module keeps the new session storage beside today's, with a mover for the
-    /// rig's session as a production module installs one: its sessions start on today's
-    /// storage, and `session.move_to_store` on an operator's route moves one.
-    pub async fn start_movable(tag: &str) -> Self {
-        let dir = broca_test_support::scratch_root()
-            .join(format!("broca-send-delivery-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("proj")).unwrap();
-        Self::open_with(
-            dir,
-            Duration::from_millis(100),
-            false,
-            "runner",
-            false,
-            true,
-        )
-        .await
-    }
-
-    async fn open_existing_as_with_ride_writer(
-        dir: PathBuf,
-        idle_ttl: Duration,
-        daemon_scopes: bool,
-        harness: &str,
-        ride_writer: bool,
-    ) -> Self {
-        Self::open_with(dir, idle_ttl, daemon_scopes, harness, ride_writer, false).await
-    }
-
-    async fn open_with(
-        dir: PathBuf,
-        idle_ttl: Duration,
-        daemon_scopes: bool,
-        harness: &str,
-        ride_writer: bool,
-        movable: bool,
-    ) -> Self {
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &dir.join("store.db"),
@@ -1040,89 +867,39 @@ impl Rig {
         let script = Arc::new(Script::default());
         let hook_plane = Arc::new(Mutex::new(None));
         let exec = Arc::new(CoreExec {
-            wal_store: wal.clone(),
             store: store.clone(),
             script: script.clone(),
             hook_plane: hook_plane.clone(),
         });
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
             exec.clone(),
         )
-        .with_idle_ttl(idle_ttl)
-        .with_run_index(store.clone())
-        .with_materialized_store(store.clone());
-        // What drops a moved session's materialized rows, as the module's startup and its mover
-        // drop them.
-        let forget: broca_module_serve::store_move::ForgetProjection = {
-            let store = store.clone();
-            Arc::new(move |session: &BindIdentity| store.drop_session_projection(session))
-        };
-        let runtime = if movable {
-            // As the module's startup does, before anything serves: a move a crash interrupted
-            // is finished or undone.
-            let recovered =
-                broca_module_serve::store_move::finish_at_startup(&dir, Some(&forget), None);
-            assert!(recovered.refused.is_empty(), "{:?}", recovered.refused);
-            Some(Arc::new(
-                broca_module::store_open::StoreRuntime::open(
-                    &dir,
-                    broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-                    exec.clone() as Arc<dyn RunExecutor>,
-                    idle_ttl,
-                )
-                .await
-                .unwrap(),
-            ))
-        } else {
-            None
-        };
-        // A move refuses a session that owes a usage export, so a movable rig writes exports the
-        // way the module does: one fact per finished run, into the run index's export table.
-        let opener = match &runtime {
-            Some(runtime) => opener
-                .with_store_runtime(runtime.clone())
-                .with_export_index(store.clone())
-                .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
-                    (broca_core::ChargeBasis::Unknown, 1)
-                })),
-            None => opener,
-        };
-        #[cfg(feature = "test-clock")]
-        let opener = if ride_writer {
-            opener.with_ride_writer_for_test()
-        } else {
-            opener
-        };
-        #[cfg(not(feature = "test-clock"))]
-        assert!(!ride_writer, "live envelope fixtures require test-clock");
-        let opener = Arc::new(opener);
-        let registry = Arc::new(LineageRegistry::new_with_reader(
-            opener,
-            wal.clone(),
-            Some(store.clone()),
-        ));
-        registry.set_session_address_inventory(store.clone());
-        if let Some(runtime) = runtime {
-            let runs = store.clone();
-            let mover = broca_module_serve::store_move::StoreMove::new(
-                registry.as_ref().clone(),
+        .with_idle_ttl(idle_ttl);
+        let runtime = Arc::new(
+            broca_module::store_open::StoreRuntime::open(
                 &dir,
-                Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
-                wal.clone(),
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                broca_module_serve::store_move::served_by_serve_layer(),
+                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                exec.clone() as Arc<dyn RunExecutor>,
+                idle_ttl,
             )
-            .with_forget_projection(forget)
-            .with_run_rows(Arc::new(move |session: &BindIdentity| {
-                Ok((
-                    runs.session_runs(session)?,
-                    runs.session_exports_settled(session)?,
-                ))
+            .await
+            .unwrap()
+            .with_billing(broca_module::store_billing::StoreBilling {
+                index: store.clone() as Arc<dyn broca_core::ExportIndex>,
+                resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+            }),
+        );
+        // Every session is kept in the new storage. It writes usage exports the way the module
+        // does: one fact per finished run, into the run index's export table.
+        let opener = opener
+            .with_store_runtime(runtime.clone())
+            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
+                (broca_core::ChargeBasis::Unknown, 1)
             }));
-            registry.set_store_mover(Arc::new(mover));
-        }
+        let opener = Arc::new(opener);
+        let registry = Arc::new(LineageRegistry::new(opener));
+        registry.set_session_address_inventory(store.clone());
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (server_read, server_write) = tokio::io::split(server);
@@ -1168,7 +945,6 @@ impl Rig {
             &session,
         )
         .unwrap();
-        let wal_path = wal.wal_path(&session);
         let mut rig = Self {
             store,
             dir,
@@ -1176,14 +952,12 @@ impl Rig {
             writer,
             serve,
             session,
-            wal_path,
             script,
             hook_plane,
             registry,
             daemon_scopes,
             corr: 1,
             next_subscription_read_delay: None,
-            movable,
             skipped: Vec::new(),
         };
         rig.bind(7).await;
@@ -1625,11 +1399,11 @@ impl Rig {
         // New keys inherit the frozen surface; retries of the creating key repeat its
         // original declaration so the request identity stays identical after a restart too.
         // Explicit overrides below still exercise forbidden later declarations.
-        let records = self.records();
+        let records = self.records().await;
         if records
             .iter()
             .find_map(|record| match record {
-                WalRecord::RunStarted { send_id, .. } => Some(send_id.as_deref()),
+                Record::RunStart(start) => Some(start.send_id.as_deref()),
                 _ => None,
             })
             .is_some_and(|first| first != Some(send_id))
@@ -1653,7 +1427,6 @@ impl Rig {
 
     /// Wait until the session's actor reports no run in flight. A paused session is idle.
     pub async fn wait_idle(&mut self) {
-        let wal_path = self.wal_path.clone();
         broca_test_support::wait_for(
             "session actor becomes idle",
             async {
@@ -1667,12 +1440,7 @@ impl Rig {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             },
-            || {
-                format!(
-                    "WAL bytes={:?}",
-                    std::fs::metadata(&wal_path).map(|m| m.len())
-                )
-            },
+            || "run.status never read idle".to_owned(),
         )
         .await
     }
@@ -1717,82 +1485,215 @@ impl Rig {
             .collect()
     }
 
-    pub fn records(&self) -> Vec<WalRecord> {
-        broca_wal::replay_file(&self.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES)
-            .unwrap_or_default()
+    /// The session's records in the new storage, in log order: what its runs and sends wrote.
+    /// Empty while the session doesn't exist.
+    /// Whether the rig's session has a log in the store.
+    pub async fn session_stored(&self) -> bool {
+        self.registry
+            .store_runtime()
+            .expect("the rig keeps its sessions in the new storage")
+            .current_view(&self.session)
+            .await
+            .is_ok_and(|view| view.is_some())
+    }
+
+    pub async fn records(&self) -> Vec<Record> {
+        let runtime = self
+            .registry
+            .store_runtime()
+            .expect("the rig keeps its sessions in the new storage");
+        match runtime.current_view(&self.session).await {
+            Ok(Some(view)) => view
+                .open_log_records()
+                .await
+                .expect("the session's log reads")
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The frozen config of each run the session started, in the order the runs started, read
+    /// back from each run's start record and the setup parts it names.
+    pub async fn run_configs(&self) -> Vec<broca_wal::RunConfig> {
+        self.run_configs_by_id()
+            .await
             .into_iter()
-            .map(|frame| frame.record)
+            .map(|(_, config)| config)
             .collect()
     }
 
-    pub fn wal_bytes(&self) -> Vec<u8> {
-        std::fs::read(&self.wal_path).unwrap_or_default()
+    /// The frozen config of the run `run_id` started with.
+    pub async fn run_config_of(&self, run_id: &str) -> Option<broca_wal::RunConfig> {
+        self.run_configs_by_id()
+            .await
+            .into_iter()
+            .find_map(|(id, config)| (id == run_id).then_some(config))
     }
 
-    /// Wait until the latest episode's step start is on disk. The provider can reach its hold
-    /// before the run's `StepStarted` is written, so without this a WAL snapshot taken at the
+    /// Each run's id and frozen config, in the order the runs started.
+    async fn run_configs_by_id(&self) -> Vec<(String, broca_wal::RunConfig)> {
+        let runtime = self
+            .registry
+            .store_runtime()
+            .expect("the rig keeps its sessions in the new storage");
+        let class = runtime
+            .class_of(&self.session)
+            .unwrap()
+            .expect("the session exists");
+        let parts = runtime.parts_for(class, runtime.new_sessions());
+        self.records()
+            .await
+            .iter()
+            .filter_map(|record| match record {
+                Record::RunStart(start) => Some((
+                    start.run_id.clone(),
+                    broca_session_loop::run::run_config_of_start(start, parts)
+                        .expect("a run's start reads back its config"),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What each run the session started was admitted with (its model, input, tools, frozen
+    /// plan manifest and the rest), in the order the runs started, read back from each run's
+    /// start record and the setup parts it names.
+    pub async fn admissions(&self) -> Vec<broca_session_loop::run::Admission> {
+        let runtime = self
+            .registry
+            .store_runtime()
+            .expect("the rig keeps its sessions in the new storage");
+        let class = runtime
+            .class_of(&self.session)
+            .unwrap()
+            .expect("the session exists");
+        let parts = runtime.parts_for(class, runtime.new_sessions());
+        self.records()
+            .await
+            .iter()
+            .filter_map(|record| match record {
+                Record::RunStart(start) => Some(
+                    broca_session_loop::run::admission_of_start(start, parts)
+                        .expect("a run's start reads back its admission"),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The request of each send the session queued, in the order they were queued, read back
+    /// from each queued send's record and the setup parts it names.
+    pub async fn queued_requests(&self) -> Vec<broca_protocol::request::SubmissionRequest> {
+        let runtime = self
+            .registry
+            .store_runtime()
+            .expect("the rig keeps its sessions in the new storage");
+        let class = runtime
+            .class_of(&self.session)
+            .unwrap()
+            .expect("the session exists");
+        let parts = runtime.parts_for(class, runtime.new_sessions());
+        self.records()
+            .await
+            .iter()
+            .filter_map(|record| match record {
+                Record::QueuedSend(send) => Some(
+                    broca_session_loop::queue::request_of(send, parts)
+                        .expect("a queued send reads back its request"),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The names of the session's records, for a failure message.
+    async fn record_names(&self) -> String {
+        broca_test_support::record_kinds(self.records().await.iter().map(Record::name))
+    }
+
+    /// Wait until the latest run's step start is written. The provider can reach its hold before
+    /// the run's `StepStart` is written, so without this a snapshot of the records taken at the
     /// hold can still grow by that record.
     async fn wait_latest_step_started(&self) {
-        broca_test_support::wait_for(
-            "latest episode durable StepStarted",
-            async {
-                loop {
-                    let records = self.records();
-                    let last_start = records
+        let started = async {
+            loop {
+                let records = self.records().await;
+                let last_start = records
+                    .iter()
+                    .rposition(|record| matches!(record, Record::RunStart(_)));
+                if last_start.is_some_and(|start| {
+                    records[start..]
                         .iter()
-                        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }));
-                    if last_start.is_some_and(|start| {
-                        records[start..]
-                            .iter()
-                            .any(|record| matches!(record, WalRecord::StepStarted { .. }))
-                    }) {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                        .any(|record| matches!(record, Record::StepStart(_)))
+                }) {
+                    return;
                 }
-            },
-            || broca_test_support::record_kinds(self.records()),
-        )
-        .await
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(60), started)
+            .await
+            .is_err()
+        {
+            panic!(
+                "timed out waiting for the latest run's StepStart: {}",
+                self.record_names().await
+            );
+        }
     }
 
-    /// Wait until the WAL holds at least `n` episode terminals.
-    pub async fn wait_for_finished(&self, n: usize) -> Vec<WalRecord> {
-        broca_test_support::wait_for(
-            "durable episode terminals",
-            async {
-                loop {
-                    let records = self.records();
-                    let finished = records
-                        .iter()
-                        .filter(|record| {
-                            matches!(
-                                record,
-                                WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
-                            )
-                        })
-                        .count();
-                    if finished >= n {
-                        return records;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+    /// Wait until the session holds at least `n` run ends and pauses, and return its records.
+    pub async fn wait_for_finished(&self, n: usize) -> Vec<Record> {
+        let finished = async {
+            loop {
+                let records = self.records().await;
+                let finished = records
+                    .iter()
+                    .filter(|record| matches!(record, Record::RunEnd(_) | Record::Pause(_)))
+                    .count();
+                // A run's spend facts are written after its end, and the record that settles
+                // them follows: a test that snapshots the log once runs end must see it there.
+                if finished >= n && !self.billing_owed().await {
+                    return records;
                 }
-            },
-            || broca_test_support::record_kinds(self.records()),
-        )
-        .await
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(60), finished).await {
+            Ok(records) => records,
+            Err(_) => panic!(
+                "timed out waiting for {n} run ends or pauses: {}",
+                self.record_names().await
+            ),
+        }
     }
 
-    /// Wait until the provider or the tool plane is holding a call, and the latest episode's step
-    /// start is on disk. Tests snapshot the WAL here to prove a later call writes nothing.
+    /// Whether an ended run's spend facts are still to be settled in the session's log.
+    async fn billing_owed(&self) -> bool {
+        let runtime = self
+            .registry
+            .store_runtime()
+            .expect("the rig keeps its sessions in the new storage");
+        match runtime.current_view(&self.session).await {
+            Ok(Some(view)) => !view.operations.billing_owed.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Wait until the provider or the tool plane is holding a call, and the latest run's step
+    /// start is written. Tests snapshot the records here to prove a later call writes nothing.
     pub async fn wait_entered(&self) {
-        broca_test_support::event_timeout(
-            "provider or tool reaches held call",
-            self.script.entered.notified(),
-            || broca_test_support::record_kinds(self.records()),
-        )
-        .await
-        .expect("the run reached the held call");
+        if tokio::time::timeout(Duration::from_secs(60), self.script.entered.notified())
+            .await
+            .is_err()
+        {
+            panic!(
+                "the run never reached the held call: {}",
+                self.record_names().await
+            );
+        }
         self.wait_latest_step_started().await;
     }
 
@@ -1834,16 +1735,6 @@ impl Rig {
 
     /// Recreate the serve connection, registry and store from the same durable session.
     pub async fn restart(self) -> Self {
-        self.restart_with_wal(None).await
-    }
-
-    /// Restore a WAL backup and rebuild its derived index while no writer is running.
-    pub async fn restart_restoring_wal(self, bytes: &[u8]) -> Self {
-        assert!(self.registry.stop_and_seal().await);
-        self.restart_with_wal(Some(bytes)).await
-    }
-
-    async fn restart_with_wal(self, restored: Option<&[u8]>) -> Self {
         let Self {
             dir,
             reader,
@@ -1852,9 +1743,7 @@ impl Rig {
             registry,
             daemon_scopes,
             session,
-            wal_path,
             store,
-            movable,
             ..
         } = self;
         drop(writer);
@@ -1862,23 +1751,11 @@ impl Rig {
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
         drop(registry);
         drop(store);
-        if let Some(bytes) = restored {
-            std::fs::write(wal_path, bytes).unwrap();
-            for file in ["store.db", "store.db-wal", "store.db-shm"] {
-                match std::fs::remove_file(dir.join(file)) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => panic!("removing derived index: {error}"),
-                }
-            }
-        }
-        Self::open_with(
+        Self::open_existing_as(
             dir,
             Duration::from_millis(100),
             daemon_scopes,
             &session.harness,
-            false,
-            movable,
         )
         .await
     }
@@ -1900,6 +1777,16 @@ impl Rig {
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// `records` without the barrier the session's writer appends each time it opens. A send that
+/// is refused or replayed writes nothing of its own, but the writer it opened to answer, after a
+/// restart or an idle close, still appends that barrier first.
+pub fn without_writer_opens(records: Vec<Record>) -> Vec<Record> {
+    records
+        .into_iter()
+        .filter(|record| !matches!(record, Record::WriterOpened(_)))
+        .collect()
 }
 
 pub fn golden_path(file: &str) -> PathBuf {
@@ -2116,11 +2003,69 @@ pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) ->
         }
         from = start + 1;
     }
-    if incarnation.len() >= 8 {
-        text = text.replace(&format!("m{}.", &incarnation[..8]), "m@LINEAGE_PREFIX@.");
-    }
+    let text = normalize_store_ids(&text);
     text.replace(run_id, "@RUN_ID@")
         .replace(incarnation, "@LINEAGE_ID@")
+}
+
+/// `text` with the ids the new storage mints per session replaced by placeholders: message ids
+/// (`g<writer generation's first 16 hex digits>.<seq>`, spelled `g@GENERATION@.<seq>`) and the
+/// session id call keys begin with (`<32 hex digits>:<seq>`, spelled `@SESSION_ID@:<seq>`).
+/// Only a quoted string that is exactly such an id is replaced, so content stays intact.
+pub fn normalize_store_ids(text: &str) -> String {
+    fn hex_run(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            .count()
+    }
+    /// Whether `rest` is `<prefix_len bytes><separator><digits>"`.
+    fn whole(rest: &[u8], prefix_len: usize, separator: u8) -> bool {
+        let digits = rest.get(prefix_len + 1..).map_or(0, |tail| {
+            tail.iter().take_while(|byte| byte.is_ascii_digit()).count()
+        });
+        rest.get(prefix_len) == Some(&separator)
+            && digits > 0
+            && rest.get(prefix_len + 1 + digits) == Some(&b'"')
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'"' {
+            let rest = &bytes[at + 1..];
+            let mid =
+                rest.first() == Some(&b'g') && hex_run(&rest[1..]) == 16 && whole(rest, 17, b'.');
+            if mid {
+                out.push_str(&text[copied..=at]);
+                out.push_str("g@GENERATION@");
+                at += 1 + 17;
+                copied = at;
+                continue;
+            }
+            if hex_run(rest) == 32 && whole(rest, 32, b':') {
+                out.push_str(&text[copied..=at]);
+                out.push_str("@SESSION_ID@");
+                at += 1 + 32;
+                copied = at;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+#[test]
+fn store_id_normalization_replaces_only_whole_minted_ids() {
+    assert_eq!(
+        normalize_store_ids(
+            r#"{"mid":"g0123456789abcdef.17","call_key":"0123456789abcdef0123456789abcdef:11","text":"g0123456789abcdef.17 stays","short":"g0123.1"}"#
+        ),
+        r#"{"mid":"g@GENERATION@.17","call_key":"@SESSION_ID@:11","text":"g0123456789abcdef.17 stays","short":"g0123.1"}"#
+    );
 }
 
 #[test]
@@ -2174,7 +2119,7 @@ mod subscription_tests {
         for marker in [
             "BROCA_MODULE_LOG_MARKER",
             "SCRIPTED_PROVIDER_OUTPUT_MARKER",
-            "RunFinished",
+            "RunEnd",
         ] {
             assert!(stderr.contains(marker), "missing {marker}: {stderr}");
         }

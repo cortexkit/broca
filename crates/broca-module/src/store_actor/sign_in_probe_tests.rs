@@ -17,14 +17,6 @@ struct CountAdmissions {
 
 #[async_trait::async_trait]
 impl RunExecutor for CountAdmissions {
-    async fn execute(
-        &self,
-        job: crate::executor::RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        self.inner.execute(job, out).await
-    }
-
     async fn execute_on_store(
         &self,
         mut job: StoreRunJob,
@@ -84,10 +76,9 @@ async fn paused_on(label: &str, routed: bool) -> ProbeFixture {
 
     let root =
         broca_test_support::scratch_root().join(format!("sign-in-{label}-{}", std::process::id()));
-    let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
     let leases = Arc::new(broca_core::FileLeaseStore::new(root.join("leases")));
-    let opener = crate::opener::DefaultOpener::new(leases, wal.clone(), runner.clone());
-    let registry = crate::registry::LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
+    let opener = crate::opener::DefaultOpener::new(leases, runner.clone());
+    let registry = crate::registry::LineageRegistry::new(Arc::new(opener));
     let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
         .await
         .unwrap();

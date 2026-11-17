@@ -64,7 +64,8 @@ pub(crate) fn owes_recovery(
 
 /// What the session owes that keeps it a recovery candidate, named for the boot sweep's
 /// counts, or `None` when it owes nothing ([`owes_recovery`] is `false`). The first thing owed
-/// is named: queued sends, then unwritten billing, then the unfinished run by how it stands.
+/// is named: queued sends opening would start or expire ([`opening_drains`]), then unwritten
+/// billing, then the unfinished run by how it stands.
 pub(crate) fn recovery_owed(
     operations: &broca_session_store::fold::operations::Operations,
     billing: bool,
@@ -72,7 +73,11 @@ pub(crate) fn recovery_owed(
 ) -> Option<&'static str> {
     use broca_protocol::PauseReason;
     use broca_session_store::fold::operations::Resolution;
-    if !operations.queue.is_empty() {
+    if operations
+        .queue
+        .iter()
+        .any(|pending| opening_drains(pending, None))
+    {
         return Some("queued_sends");
     }
     if billing && !operations.billing_owed.is_empty() {
@@ -91,6 +96,20 @@ pub(crate) fn recovery_owed(
         Resolution::Paused(_) => "run_paused_other",
         Resolution::Resume => "run_resume",
     })
+}
+
+/// Whether opening the session would do something for the queued send `pending`, at `now` when
+/// given: start its run, or end it as expired. An ordered send that can't start a run waits for
+/// a running run, so opening an idle session does nothing for it until it expires. Without
+/// `now`, any expiry counts, since it comes due later.
+pub(crate) fn opening_drains(
+    pending: &broca_session_store::fold::operations::Pending,
+    now: Option<u64>,
+) -> bool {
+    !pending.waits_for_run.unwrap_or(false)
+        || pending
+            .expires_at_ms
+            .is_some_and(|at| now.is_none_or(|now| at <= now))
 }
 
 /// Whether `run` is paused for sign-in with nothing opening could do for it: no cancel to

@@ -70,9 +70,7 @@ SteerSettingsConflict {
     }
   },
   {
-    "event": {
-      "type": "display_reset"
-    },
+    "event": null,
     "unit": {
       "finish_reason": "stop",
       "step_id": 1,

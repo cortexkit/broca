@@ -25,7 +25,7 @@ Active {
     delivered: None,
 }
 == control stream
-sha256:58a503afcf98a839964fffba2246a91ac52d9aed6fec61bde9411bf0d5a3d60d (6036 bytes)
+sha256:76914f49d1882d3fd68bff1e6d45ace76d01c527213b32602c17056f97d1b2f6 (5904 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:86548a0c14b3554cc6c17cbaa067fe1b2b05a7deaec5b5f371657156712de762 (7465 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))

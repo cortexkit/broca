@@ -1,8 +1,7 @@
 //! What a module answers about a session that exists nowhere: every read a caller may make before
-//! the session's first send, and that none of them creates the session in either storage. Each
+//! the session's first send, and that none of them creates the session. Each
 //! answer is pinned (see `broca_test_support::pins`).
 
-use broca_core::WalStore as _;
 use broca_protocol::{RunId, SendScope};
 
 use super::{module, Module};
@@ -99,26 +98,19 @@ async fn commands(module: &Module) {
                 .await
         )
     );
-    broca_test_support::pin!(
-        "run state",
-        format!("{:?}", registry.route_run_state(key, run()).await)
-    );
     let (sink, _deliveries) = tokio::sync::mpsc::channel(64);
     broca_test_support::pin!(
         "live subscribe",
         format!("{:?}", registry.route_subscribe_live(key, sink).await)
     );
-    broca_test_support::pin!(
-        "tag location",
-        format!("{:?}", registry.route_tag_location(key, 1).await)
-    );
 }
 
 /// Every command but a send, routed to a session no send created, answers as a session that
-/// doesn't exist, and leaves it so.
+/// doesn't exist, except a subscribe, which waits for the session's first send; none of them
+/// creates it.
 #[tokio::test]
 async fn commands_to_a_session_that_exists_nowhere_create_nothing() {
-    let module = module(true, Vec::new()).await;
+    let module = module(Vec::new()).await;
     commands(&module).await;
     module.closed().await;
     assert_eq!(
@@ -131,17 +123,13 @@ async fn commands_to_a_session_that_exists_nowhere_create_nothing() {
         "the new storage holds nothing"
     );
     assert!(!module.head().exists(), "no head in the new storage");
-    broca_test_support::pin!(
-        "a log on today's storage",
-        module.wal.wal_present(&module.key)
-    );
 }
 
 /// Every read of a session no send created answers as a session that doesn't exist, and leaves
-/// it so: no log in either storage, and no actor holding it.
+/// it so: no head in the storage, and no actor holding it.
 #[tokio::test]
 async fn reads_of_a_session_that_exists_nowhere_create_nothing() {
-    let module = module(true, Vec::new()).await;
+    let module = module(Vec::new()).await;
     answers(&module).await;
     module.closed().await;
     assert_eq!(
@@ -154,10 +142,6 @@ async fn reads_of_a_session_that_exists_nowhere_create_nothing() {
         "the new storage holds nothing"
     );
     assert!(!module.head().exists(), "no head in the new storage");
-    broca_test_support::pin!(
-        "a log on today's storage",
-        module.wal.wal_present(&module.key)
-    );
     // Read again: the answers don't depend on an earlier read.
     answers(&module).await;
 }

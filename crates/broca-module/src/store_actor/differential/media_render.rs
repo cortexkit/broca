@@ -12,9 +12,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use async_trait::async_trait;
 use broca_core::provider::{MediaRequestRenderer, Provider};
 use broca_core::{
-    run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, BatchCtx, DispatchResult,
-    FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, StartMode, StubToolPlane,
-    ToolManifest, ToolPlane, ToolPlaneError, WalStore,
+    AllowAll, BatchCtx, DispatchResult, FileLeaseStore, OutputEvent, RunError, StubToolPlane,
+    ToolManifest, ToolPlane, ToolPlaneError,
 };
 use broca_protocol::content::{AssistantMessage, ContentBlock, ToolOutput, ToolOutputPart};
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
@@ -24,7 +23,7 @@ use tokio::sync::mpsc;
 
 use super::media::{base64, bytes_of, image_profile, image_render_config, photo, Side, PNG, WIDE};
 use crate::actor::SendOutcome;
-use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
+use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
 use crate::registry::LineageRegistry;
 use broca_session_store::keys::Cipher;
 
@@ -247,75 +246,9 @@ impl ToolPlane for PhotoPlane {
 /// Runs both sides' runs, each installing its media renderer as the module's executor does.
 struct RenderExecutor {
     script: Arc<super::super::tests::Gated>,
-    wal: Arc<FileWalStore>,
     sent: Sent,
     /// The compaction provider the side's runs are offered, when its sessions are planned.
     compactor: Option<Arc<super::controls::Compactor>>,
-}
-
-impl RenderExecutor {
-    /// Today's renderer, installed as the module's executor installs it for a run that may
-    /// carry media: seeded from the session's WAL at admission, reading each later record.
-    async fn install_today(&self, job: &RunJob, provider: &Rendering) -> Result<(), RunError> {
-        let Some(uploads) = self.wal.uploads().filter(|_| {
-            job.has_media_input()
-                || job.prior_snapshot.checkpoint_at_head.has_captured_media()
-                || !job.req.tools.is_empty()
-        }) else {
-            return Ok(());
-        };
-        let store = uploads
-            .session_media_store(&job.req.session)
-            .map_err(|error| RunError::Wal(error.to_string()))?;
-        let initialized = broca_core::media_request::initialize_media_checkpoint(
-            &job.writer,
-            Arc::clone(&self.wal),
-            &job.req.session,
-            &job.prior_snapshot,
-        )
-        .await
-        .map_err(RunError::Wal)?;
-        let wal = Arc::clone(&self.wal);
-        let session = job.req.session.clone();
-        let head = job.writer.durable_head();
-        let frozen: broca_provider::wire::FrozenRenderConfig =
-            serde_json::from_value(image_render_config()).unwrap();
-        let media = broca_provider::media_request::LiveMedia::from_checkpoint(
-            store,
-            initialized.checkpoint,
-            job.prior_snapshot
-                .checkpoint_at_head
-                .last_episode
-                .as_ref()
-                .and_then(|episode| episode.config.budget.clone()),
-            frozen.media,
-            Box::new(move |after| {
-                let through = head.load(Ordering::Acquire);
-                if after == through {
-                    return Ok(Vec::new());
-                }
-                let range = wal
-                    .read_records_range(&session, after, Some(through), None)
-                    .map_err(|error| error.to_string())?;
-                match range.into_records() {
-                    broca_wal::WalRangeRecords::Complete(records)
-                    | broca_wal::WalRangeRecords::Unknown(records)
-                        if records.last().is_some_and(|frame| frame.seq == through) =>
-                    {
-                        Ok(records)
-                    }
-                    _ => Err("incomplete media WAL range".into()),
-                }
-            }),
-        )
-        .map_err(RunError::Wal)?;
-        provider.set_media_request_renderer(Arc::new(
-            move |frozen, opts, tags, commit, provenance| {
-                media.render_with_provenance(frozen, opts, tags, commit, provenance)
-            },
-        ));
-        Ok(())
-    }
 }
 
 /// The new storage's renderer, installed as the module's executor installs it for a store run
@@ -348,45 +281,6 @@ impl RunExecutor for RenderExecutor {
         self.compactor
             .clone()
             .map(|compactor| compactor as Arc<dyn broca_core::CompactionPlane>)
-    }
-
-    async fn execute(
-        &self,
-        mut job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        // As the store side's executor does: the caller's context limit is the admitted one.
-        job.control.admitted_context_limit =
-            job.control.admitted_context_limit.or(job.req.context_limit);
-        let provider = Rendering::new(&self.script, &self.sent);
-        let checked = job
-            .admit_media(&provider, self.wal.uploads().as_ref())
-            .and(self.install_today(&job, &provider).await);
-        if let Err(error) = checked {
-            if let Some(ack) = job.on_admitted {
-                let _ = ack.send(Err(error.clone()));
-            }
-            return Err(error);
-        }
-        let mode = match job.kind {
-            RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-        };
-        Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &provider,
-            &PhotoPlane::new(),
-            &AllowAll,
-            self.wal.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        ))
-        .await
     }
 
     async fn execute_on_store(
@@ -479,8 +373,8 @@ impl RunExecutor for RenderExecutor {
     }
 }
 
-/// A module over the state root `dir` whose runs render their requests into `sent`: sessions
-/// start in the new storage when `store`.
+/// A module over the state root `dir` whose runs render their requests into `sent`. Sessions
+/// start in the new storage; `store` must say so.
 async fn registry(
     dir: &std::path::Path,
     store: bool,
@@ -490,8 +384,8 @@ async fn registry(
     compactor: Option<Arc<super::controls::Compactor>>,
     cipher: Cipher,
 ) -> LineageRegistry {
+    assert!(store, "sessions start in the new storage");
     broca_core::media_store::create_media_directories(dir).unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(RenderExecutor {
         script: Arc::new(super::super::tests::Gated {
             inner: broca_core::provider::StubProvider::new(steps),
@@ -500,7 +394,6 @@ async fn registry(
             notes_sends: false,
             hold: None,
         }),
-        wal: Arc::clone(&wal),
         sent: Arc::clone(sent),
         compactor: compactor.clone(),
     });
@@ -515,40 +408,26 @@ async fn registry(
     let runtime = Arc::new(runtime);
     if let Some(compactor) = compactor {
         let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
-        if store {
-            let runtime = Arc::downgrade(&runtime);
-            compactor.reads(Arc::new(move || {
-                let runtime = runtime.upgrade().expect("the session runtime is open");
-                let key = key.clone();
-                Box::pin(async move {
-                    let view = runtime.current_view(&key).await.unwrap().unwrap();
-                    crate::store_entries::all_entries(view.as_ref())
-                        .await
-                        .unwrap()
-                })
-            }));
-        } else {
-            compactor.reads_today(Arc::clone(&wal), key);
-        }
+        let runtime = Arc::downgrade(&runtime);
+        compactor.reads(Arc::new(move || {
+            let runtime = runtime.upgrade().expect("the session runtime is open");
+            let key = key.clone();
+            Box::pin(async move {
+                let view = runtime.current_view(&key).await.unwrap().unwrap();
+                crate::store_entries::all_entries(view.as_ref())
+                    .await
+                    .unwrap()
+            })
+        }));
     }
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(super::IDLE)
-            .with_store_runtime(runtime),
-        ),
-        wal,
-        None,
-    );
-    if store {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    }
+    LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(super::IDLE)
+        .with_store_runtime(runtime),
+    ))
 }
 
 /// One side: a module and what its model was asked to send.

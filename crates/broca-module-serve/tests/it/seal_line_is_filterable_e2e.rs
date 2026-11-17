@@ -92,6 +92,13 @@ impl Rig {
         std::fs::create_dir_all(config_path.parent().unwrap()).expect("create subc config dir");
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
 
+        let broca_config = config_home.join("cortexkit").join("broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&super::stored_log::plain_storage()).unwrap(),
+        )
+        .expect("write broca config");
+        let broca_config = broca_config.display().to_string();
         let config = serde_json::json!({
             "version": 1,
             "modules": {
@@ -106,7 +113,11 @@ impl Rig {
                     // module to reach `serve`. The admission test below does start runs; its
                     // ack fires at the durable RunStarted barrier, before any provider call, so
                     // the unreachable URL fails those runs only after admission has been measured.
-                    "env": {"BROCA_PROVIDER_BASE_URL": "http://127.0.0.1:1/unused"},
+                    // No deployment-key vault here either: sessions are stored plain.
+                    "env": {
+                        "BROCA_PROVIDER_BASE_URL": "http://127.0.0.1:1/unused",
+                        "BROCA_CONFIG_PATH": broca_config,
+                    },
                     "enabled": true
                 }
             }

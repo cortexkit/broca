@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use broca_core::provider::{MediaRequestRenderer, Provider, StubProvider};
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::{OutputEvent, RunError};
 use broca_protocol::request::CallOptions;
 use broca_protocol::{NormalizedEvent, ProviderControl, ProviderError, RunId, SubmissionRequest};
 use broca_session_loop::parts::{MemoryParts, SharedParts};
@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use super::controls::{compacting_plan, limited, Compactor};
 use super::media::image_render_config;
 use crate::actor::{CancelOutcome, LineageCmd, SendKey, SendOutcome, SendPlan};
-use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
+use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
 use crate::store_actor::tests::{
     bind, deployment, idle, request, send_with, text_step, triple, Commands, ADDR,
 };
@@ -188,14 +188,6 @@ impl ReadyExecutor {
 
 #[async_trait]
 impl RunExecutor for ReadyExecutor {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         Some(Arc::clone(&self.compactor) as Arc<dyn broca_core::CompactionPlane>)
     }

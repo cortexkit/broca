@@ -31,10 +31,16 @@
 mod common;
 #[path = "../delivery_rig/mod.rs"]
 mod delivery_rig;
+#[path = "../common/first_offer_routing.rs"]
+mod first_offer_routing;
 #[path = "../common/routing_fixture.rs"]
 mod routing_fixture;
 #[path = "../step_transform_rig/mod.rs"]
 mod step_transform_rig;
+#[path = "../common/store_exec.rs"]
+mod store_exec;
+#[path = "../common/stored_log.rs"]
+mod stored_log;
 
 mod account_selection_real_daemon;
 mod anthropic_default_cache_render;
@@ -42,7 +48,6 @@ mod anthropic_model_switch_live;
 mod anthropic_thinking_binding_live;
 mod anthropic_thinking_echo_live;
 #[cfg(unix)]
-mod approval_gate;
 mod cache_shared_prefix_render;
 mod captured_replay_e2e;
 mod chatgpt_websocket_live;
@@ -66,21 +71,16 @@ mod preset_real_daemon;
 mod prompt_blocks_render;
 mod provider_override_boot;
 mod provisional_run_status;
-mod renderer_version_resume_real_daemon;
-mod reply_deadline_real_daemon;
 mod resolution_refusal_class;
-mod retention_consent_wire;
 mod scope_carrier;
 mod scope_workdir;
 mod seal_line_is_filterable_e2e;
 mod send_delivery;
-mod send_tool_reply_real_daemon;
 mod session_client;
 mod single_turn_module_e2e;
 mod state_root_isolation;
 mod state_root_lock;
 mod step_transforms;
-mod store_move_serve;
 mod store_ops_serve;
 mod structured_output;
 mod wal_known_features;

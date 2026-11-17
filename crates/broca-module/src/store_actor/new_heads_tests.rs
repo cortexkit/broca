@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broca_core::scope_admission::OwnerMismatch;
-use broca_core::{FileLeaseStore, FileWalStore, ScopeRefusal, WalStore as _};
+use broca_core::{FileLeaseStore, ScopeRefusal};
 use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, RunId, SendScope};
 use broca_store::session_address::ScopeReservation;
 use broca_wal::StorageClass;
@@ -27,7 +27,6 @@ pub(super) const IDLE: Duration = Duration::from_millis(100);
 pub(super) struct Module {
     dir: PathBuf,
     pub(super) registry: LineageRegistry,
-    wal: Arc<FileWalStore>,
     inventory: Inventory,
     pub(super) key: BindIdentity,
 }
@@ -52,11 +51,9 @@ pub(super) async fn module(
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, None));
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         Arc::clone(&executor),
     )
     .with_idle_ttl(IDLE);
@@ -71,7 +68,7 @@ pub(super) async fn module(
         .unwrap();
         opener = opener.with_store_runtime(Arc::new(runtime));
     }
-    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+    let registry = LineageRegistry::new(Arc::new(opener));
     let inventory = Inventory::open(&dir, &dir);
     registry.set_session_address_inventory(Arc::clone(&inventory.store));
     let key = BindIdentity::new(
@@ -85,7 +82,6 @@ pub(super) async fn module(
     Module {
         dir,
         registry,
-        wal,
         inventory,
         key,
     }
@@ -229,7 +225,6 @@ async fn a_head_starts_in_the_durable_root_of_the_new_storage_and_reopens_from_i
     assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
     module.closed().await;
     assert_eq!(module.store_class(), Some(StorageClass::Durable));
-    assert_eq!(module.wal.wal_present(&module.key), Some(false));
     assert!(module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
     let mut later = request("second");
     later.tools = None;
@@ -239,7 +234,6 @@ async fn a_head_starts_in_the_durable_root_of_the_new_storage_and_reopens_from_i
     assert!(matches!(second, SendOutcome::Active { .. }), "{second:?}");
     module.closed().await;
     assert_eq!(module.store_class(), Some(StorageClass::Durable));
-    assert_eq!(module.wal.wal_present(&module.key), Some(false));
 }
 
 /// [`send`] of a head's creating send, asking to be delivered as `delivery`, with the run kind
@@ -315,7 +309,6 @@ async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answ
         broca_test_support::pin!(label, new);
         store.closed().await;
         assert_eq!(store.store_class(), Some(StorageClass::Durable), "{label}");
-        assert_eq!(store.wal.wal_present(&store.key), Some(false), "{label}");
     }
 }
 
@@ -372,7 +365,6 @@ async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation
     }
     broca_test_support::pin!("the later send's answer", answers[0]);
     assert_eq!(store.store_class(), Some(StorageClass::Durable));
-    assert_eq!(store.wal.wal_present(&store.key), Some(false));
 }
 
 /// The refusal a reserved session gives a send from any scope but the one that reserved it.
@@ -425,7 +417,6 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
             "{label}: the refused send left {:?}",
             store.store_leftovers()
         );
-        assert_eq!(store.wal.wal_present(&store.key), Some(false), "{label}");
     }
     for module in [&store] {
         let sent = sent_by("owner", core(), stamped(core(), "head-1", 5));

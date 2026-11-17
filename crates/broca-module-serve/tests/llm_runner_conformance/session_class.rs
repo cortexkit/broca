@@ -1,5 +1,6 @@
 //! Production admission, restart placement, and the released reader's refusal boundary.
 use super::*;
+use broca_session_store::record::Record;
 use cortexkit_role_llm_runner_conformance::ScriptedTurn;
 
 pub(super) fn rigs_present() -> bool {
@@ -62,6 +63,22 @@ fn golden(name: &str, value: Value) {
     assert_eq!(bytes, std::fs::read(path).unwrap(), "{name}");
 }
 
+/// `session` is stored in the root of class `placed`, and in no other.
+fn assert_placed(
+    subject: &BrocaSubject,
+    live: &Live,
+    session: &str,
+    placed: broca_wal::StorageClass,
+) {
+    let address = broca_core::session_addr(&subject.bind_identity(session));
+    assert_eq!(
+        broca_wal::session_storage_class(&live.state_root, &address).unwrap(),
+        Some(placed),
+        "{session} is stored as {}",
+        placed.name()
+    );
+}
+
 async fn assert_stored_head(
     subject: &BrocaSubject,
     live: &Live,
@@ -113,21 +130,19 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     }
     let scratch = scratch("session-class");
     let mut subject = BrocaSubject::new(&scratch).await;
-    // This rig has no deployment-key vault. Class placement does not depend on encryption,
-    // so use plain storage to keep sidekick sessions available across restarts without a key.
-    subject.plain_session_storage = true;
     let root = scratch.join("rig");
     let mut live = subject.start(&root).await.unwrap();
-    for (session, class, retention, tree) in [
-        ("durable-head", Some("head"), None, "session-store-durable"),
-        ("ordinary", None, None, "wal"),
+    use broca_wal::StorageClass;
+    for (session, class, retention, placed) in [
+        ("durable-head", Some("head"), None, StorageClass::Durable),
+        ("ordinary", None, None, StorageClass::Ordinary),
         (
             "retained-head",
             Some("head"),
             Some(3600),
-            "session-store-ephemeral",
+            StorageClass::Ephemeral,
         ),
-        ("worker", Some("worker"), None, "wal"),
+        ("worker", Some("worker"), None, StorageClass::Ordinary),
     ] {
         subject
             .install_script(
@@ -170,17 +185,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
             golden("send_reply.session_class.json", normalized);
         }
         finish(&route, &sent["run_id"]).await;
-        let addr = broca_core::session_addr(&subject.bind_identity(session));
-        for candidate in ["wal", "wal-durable", "wal-ephemeral"] {
-            assert_eq!(
-                live.state_root
-                    .join(candidate)
-                    .join(format!("{addr}.wal"))
-                    .exists(),
-                candidate == tree,
-                "{session} in {candidate}"
-            );
-        }
+        assert_placed(&subject, &live, session, placed);
         if class == Some("head") {
             let storage_class = if retention.is_some() {
                 broca_wal::StorageClass::Ephemeral
@@ -189,7 +194,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
             };
             assert_stored_head(&subject, &live, session, storage_class, 1).await;
         } else {
-            assert!(subject.records(&live, session).iter().any(|record| matches!(record, broca_wal::WalRecord::RunStarted { session_class, .. } if session_class.as_deref() == class)));
+            assert!(subject.records(&live, session).await.iter().any(|record| matches!(record, Record::RunStart(start) if start.session_class.as_deref() == class)));
         }
         let read = response(route.request("session.read", json!({})).await.unwrap());
         assert!(!read["messages"].as_array().unwrap().is_empty());
@@ -221,9 +226,11 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     drop(live);
     subject.backup_classes = Some(vec!["worker".into()]);
     let mut live = subject.start(&root).await.unwrap();
-    for (session, class, tree) in [
-        ("durable-head", None, "session-store-durable"),
-        ("worker", Some("worker"), "wal"),
+    // A session keeps the class it was created in: `worker` now names a backed-up class, and the
+    // worker session stays where it is.
+    for (session, class, placed) in [
+        ("durable-head", None, StorageClass::Durable),
+        ("worker", Some("worker"), StorageClass::Ordinary),
     ] {
         let route = subject
             .session_route(&live, session, &subject.owner_stamp())
@@ -250,17 +257,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
                 .unwrap(),
         );
         finish(&route, &sent["run_id"]).await;
-        let addr = broca_core::session_addr(&subject.bind_identity(session));
-        for candidate in ["wal", "wal-durable", "wal-ephemeral"] {
-            assert_eq!(
-                live.state_root
-                    .join(candidate)
-                    .join(format!("{addr}.wal"))
-                    .exists(),
-                candidate == tree,
-                "{session} in {candidate} after restart"
-            );
-        }
+        assert_placed(&subject, &live, session, placed);
         if session == "durable-head" {
             assert_stored_head(
                 &subject,
@@ -296,11 +293,10 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
         }
         let classes: Vec<_> = subject
             .records(&live, session)
+            .await
             .iter()
             .filter_map(|record| match record {
-                broca_wal::WalRecord::RunStarted { session_class, .. } => {
-                    Some(session_class.clone())
-                }
+                Record::RunStart(start) => Some(start.session_class.clone()),
                 _ => None,
             })
             .collect();

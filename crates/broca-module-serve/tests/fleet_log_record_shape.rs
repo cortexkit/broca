@@ -13,9 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// The site under test: loading an archive config whose retention is under the safe floor
-/// warns, on `broca.archive`, before returning the config.
-const BELOW_FLOOR_CONFIG: &str = r#"{"wal_archive_idle_retention_days": 7}"#;
+/// The site under test: a `broca.jsonc` that still sets an obsolete key warns, on
+/// `broca.config`, while broca starts.
+const OBSOLETE_KEY_CONFIG: &str = r#"{"wal_archive_idle_retention_days": 7}"#;
 
 fn rig_dir() -> PathBuf {
     let dir = broca_test_support::scratch_root()
@@ -27,7 +27,7 @@ fn rig_dir() -> PathBuf {
 
 fn write_config(dir: &Path) -> PathBuf {
     let path = dir.join("broca.jsonc");
-    std::fs::write(&path, BELOW_FLOOR_CONFIG).expect("write the archive config");
+    std::fs::write(&path, OBSOLETE_KEY_CONFIG).expect("write the config");
     path
 }
 
@@ -44,15 +44,17 @@ fn a_production_warning_carries_the_module_id_and_the_component_it_declared() {
     let handle = cortexkit_log::init(config).expect("no other subscriber in this test process");
 
     let path = write_config(&dir);
-    broca_module_serve::wal_archive::WalArchiveConfig::load(&path)
-        .expect("a retention below the floor is a warning, not a refusal");
+    // The only test in this binary, so no other thread reads the variable.
+    std::env::set_var("BROCA_CONFIG_PATH", &path);
+    broca_module_serve::config::warn_obsolete_keys()
+        .expect("an obsolete key is a warning, not a refusal");
 
     let rendered = std::fs::read_to_string(handle.path()).expect("read the log segment");
     let line = rendered
         .lines()
-        .find(|line| line.contains("is below 14 days"))
+        .find(|line| line.contains("is obsolete and ignored"))
         .unwrap_or_else(|| {
-            panic!("the archive retention warning never reached the segment:\n{rendered}")
+            panic!("the obsolete-key warning never reached the segment:\n{rendered}")
         });
 
     let record = cortexkit_log::parse_line(line).unwrap_or_else(|error| {
@@ -65,8 +67,8 @@ fn a_production_warning_carries_the_module_id_and_the_component_it_declared() {
          {line}"
     );
     assert_eq!(
-        record.logger, "broca.archive",
-        "the site declared the archive component and the rendered logger must show it, or \
+        record.logger, "broca.config",
+        "the site declared the config component and the rendered logger must show it, or \
          nothing can be filtered by component: {line}"
     );
     assert_eq!(
@@ -78,7 +80,7 @@ fn a_production_warning_carries_the_module_id_and_the_component_it_declared() {
     assert!(
         record
             .body
-            .starts_with("wal_archive_idle_retention_days=7 is below 14 days"),
+            .starts_with("broca.jsonc key 'wal_archive_idle_retention_days' is obsolete"),
         "the message begins with its own words: the attribution now lives in the logger name, \
          and a surviving `broca:` prefix would repeat it: {line}"
     );

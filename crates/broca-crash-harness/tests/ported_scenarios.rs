@@ -68,21 +68,6 @@ async fn ported_crash_cut_scenarios_hold_every_invariant_at_every_boundary() {
                 .records()
                 .iter()
                 .any(|record| matches!(record, WalRecord::ToolCallProviderHeld { .. }))),
-            "session_changes" => {
-                let records = handle.reference.log.records();
-                for kind in [
-                    "session_refresh_accepted",
-                    "session_refresh_policy_changed",
-                    "session_prefix_flushed",
-                ] {
-                    assert!(
-                        records
-                            .iter()
-                            .any(|record| serde_json::to_value(record).unwrap()["type"] == kind),
-                        "missing {kind}"
-                    );
-                }
-            }
             "cache_warmed" => assert!(handle
                 .reference
                 .log

@@ -469,17 +469,35 @@ mod compaction_signals_config_tests {
     }
 }
 
-/// Read the retired media key only to tell operators it no longer affects admission.
-pub fn warn_obsolete_media_default() -> Result<(), String> {
+/// Top-level `broca.jsonc` keys that no longer do anything, each with what an operator should
+/// know about it. Read only to tell the operator, never parsed: a leftover setting must not
+/// stop broca from starting, and must not sit in the file looking as if it were in force.
+const OBSOLETE_KEYS: &[(&str, &str)] = &[
+    (
+        "media",
+        "media input follows the frozen model's capabilities",
+    ),
+    (
+        "wal_archive_idle_retention_days",
+        "sessions keep no logs to archive; the new storage seals history itself",
+    ),
+    (
+        "session_conversion",
+        "every session is in the new storage, so nothing is left to convert",
+    ),
+];
+
+/// Warn, once per key, about each obsolete key the operator's `broca.jsonc` still sets.
+pub fn warn_obsolete_keys() -> Result<(), String> {
     if let crate::config_home::ConfigHome::Resolved { path, .. } =
         crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
     {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                if has_obsolete_media(&text)
-                    .map_err(|error| format!("{}: {error}", path.display()))?
+                for (key, why) in
+                    obsolete_keys(&text).map_err(|error| format!("{}: {error}", path.display()))?
                 {
-                    tracing::warn!(target: "config", "broca.jsonc key 'media' is obsolete and ignored; media input follows the frozen model's capabilities");
+                    tracing::warn!(target: "config", "broca.jsonc key '{key}' is obsolete and ignored; {why}");
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -489,32 +507,47 @@ pub fn warn_obsolete_media_default() -> Result<(), String> {
     Ok(())
 }
 
-fn has_obsolete_media(text: &str) -> Result<bool, String> {
+/// The obsolete keys `text` sets, with what to say about each.
+fn obsolete_keys(text: &str) -> Result<Vec<(&'static str, &'static str)>, String> {
     let text = crate::cache_routing::strip_trailing_commas(
         &crate::cache_routing::strip_jsonc_comments(text),
     );
     let file: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(&text).map_err(|error| format!("parse broca config: {error}"))?;
-    Ok(file.contains_key("media"))
+    Ok(OBSOLETE_KEYS
+        .iter()
+        .filter(|(key, _)| file.contains_key(*key))
+        .copied()
+        .collect())
 }
 
 #[cfg(test)]
-mod obsolete_media_tests {
-    use super::has_obsolete_media;
+mod obsolete_key_tests {
+    use super::obsolete_keys;
 
     #[test]
-    fn obsolete_media_is_accepted_without_parsing_its_value() {
-        assert!(!has_obsolete_media("{}").unwrap());
-        for text in [
-            r#"{"media":{"enabled":false}}"#,
-            r#"{"media":{"enabled":true,},}"#,
-            r#"{"media":{"enabeld":true}}"#,
-            r#"{"media":{"enabled":"yes"}}"#,
-            r#"{"media":null}"#,
-            r#"{"media":[]}"#,
+    fn obsolete_keys_are_accepted_without_parsing_their_values() {
+        assert!(obsolete_keys("{}").unwrap().is_empty());
+        for (text, key) in [
+            (r#"{"media":{"enabled":false}}"#, "media"),
+            (r#"{"media":{"enabled":true,},}"#, "media"),
+            (r#"{"media":{"enabeld":true}}"#, "media"),
+            (r#"{"media":{"enabled":"yes"}}"#, "media"),
+            (r#"{"media":null}"#, "media"),
+            (r#"{"media":[]}"#, "media"),
+            (
+                r#"{"wal_archive_idle_retention_days":30}"#,
+                "wal_archive_idle_retention_days",
+            ),
+            (
+                r#"{"wal_archive_idle_retention_days":"thirty"}"#,
+                "wal_archive_idle_retention_days",
+            ),
         ] {
-            assert!(has_obsolete_media(text).unwrap());
-            // Other boot loaders must not reject the retired top-level key either.
+            let found = obsolete_keys(text).unwrap();
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(found[0].0, key, "{text}");
+            // Other boot loaders must not reject a retired top-level key either.
             crate::account_routing::AccountSelectionConfig::parse(text).unwrap();
         }
     }

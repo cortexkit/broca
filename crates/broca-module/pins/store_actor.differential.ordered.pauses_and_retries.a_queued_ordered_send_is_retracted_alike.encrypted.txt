@@ -20,7 +20,7 @@ Retracted {
     ),
 }
 == control stream
-sha256:3d084b5190a1a16776f29763c15b5b24b31ab3d7980ef220befbfe38c8e8987b (3912 bytes)
+sha256:0fcd818850ae0ce070344619c1cec0799765d08f7bdf077cf53f3a549ffdd009 (3813 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:6d55dd82d7c4451a79e2fd637c5e70cb4ade7585af504faeb48c8068b746063d (5120 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))

@@ -101,7 +101,7 @@ pub(super) async fn prove(
                         event.0.into(),
                         &event.1,
                         seq,
-                        &event.2,
+                        event.2.as_ref(),
                     )
                     .unwrap();
                     assert!(broca_wire::decode_subscribe_event(&bytes).is_ok());
@@ -142,14 +142,6 @@ struct Retrying {
 
 #[async_trait::async_trait]
 impl crate::executor::RunExecutor for Retrying {
-    async fn execute(
-        &self,
-        _: crate::executor::RunJob,
-        _: mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        unreachable!("the fixture uses a real store actor")
-    }
-
     async fn execute_on_store(
         &self,
         job: crate::executor::StoreRunJob,

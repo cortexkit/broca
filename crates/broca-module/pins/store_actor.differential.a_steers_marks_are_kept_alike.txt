@@ -27,7 +27,7 @@ Active {
     delivered: None,
 }
 == control stream
-sha256:0b196c27c0b256e35c958f607c3e2e5d80074d4d04cdff8b46b76562e754743e (5132 bytes)
+sha256:16855ed702f3f00ffbb4cad66e05f4ed0dc413c0d038be9a96cc5b3be5baac54 (5000 bytes)
 == the conversation
 [
     "first",

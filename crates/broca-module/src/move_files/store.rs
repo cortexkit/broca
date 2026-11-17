@@ -349,9 +349,6 @@ impl FileCutArtifacts {
                     )
                     .map_err(failure)?;
                 migration::unlink(&sidecar.with_extension("moved")).map_err(unavailable)?;
-                self.registry
-                    .handle()
-                    .invalidate_history_caches(&plan.session);
                 self.driver
                     .drop_projection(&plan.session)
                     .map_err(unavailable)?;

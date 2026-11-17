@@ -21,7 +21,7 @@ Finished {
     delivered: None,
 }
 == control stream
-sha256:a8b037d0e94e022edfaa44e6f89a5a98d0634205b15bd6f27a98e07640accab9 (3088 bytes)
+sha256:6f1f562ff3cd0f096ded287156fc2f92a591d8644a85488f95d8a7b33de1c911 (3022 bytes)
 == the conversation
 [
     "first",

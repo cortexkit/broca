@@ -25,7 +25,7 @@ fn text(role: Role, text: &str) -> Message {
 #[tokio::test]
 async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_today() {
     let script = vec![super::super::tests::text_step("continued", "next answer")];
-    let store = module(true, script).await;
+    let store = module(script).await;
     let messages = vec![text(Role::System, "discarded"), text(Role::User, "question"),
         serde_json::from_value(serde_json::json!({"role":"assistant","content":[{
             "type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{}
@@ -56,7 +56,6 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
     opted_reads(&store, "inline import").await;
     store.closed().await;
     assert!(store.head().exists());
-    assert_eq!(store.wal.wal_present(&store.key), Some(false));
     let mut continued = Vec::new();
     for module in [&store] {
         let mut request = request("continue");
@@ -99,7 +98,7 @@ async fn inline_import_normalization_retry_reuse_and_nonempty_refusal_match_toda
 
 #[tokio::test]
 async fn inline_import_invalid_and_empty_payloads_match_today_and_leave_a_fillable_session() {
-    let store = module(true, vec![]).await;
+    let store = module(vec![]).await;
     for messages in [
         vec![],
         vec![text(Role::System, "only system")],
@@ -131,7 +130,7 @@ async fn conversation_key_sends_and_subsequent_sends_are_admitted_alike() {
         super::super::tests::text_step("a1", "answer"),
         super::super::tests::text_step("a2", "next"),
     ];
-    let store = module(true, script).await;
+    let store = module(script).await;
     for (run, key) in [("r1", Some("shared-conversation")), ("r2", None)] {
         let new = store.send(run, "input", key).await;
         broca_test_support::pin!("alike", new);
@@ -328,7 +327,7 @@ fn comparable_refs(mut page: serde_json::Value) -> serde_json::Value {
 
 #[tokio::test]
 async fn output_reference_list_and_byte_reads_match_today() {
-    let store = module(true, reference_script()).await;
+    let store = module(reference_script()).await;
     referencing(&store).await;
     let new = reference_set(&store).await;
     let new_page = listed(&store, &new.descriptor.set_id).await;
@@ -358,7 +357,7 @@ async fn output_reference_list_and_byte_reads_match_today() {
         broca_session_store::codec::hex(&session.head().incarnation.0)
     );
     // Another session's reference, to the same output of the same script.
-    let other = module(true, reference_script()).await;
+    let other = module(reference_script()).await;
     referencing(&other).await;
     let other_set = reference_set(&other).await;
     let other_page = listed(&other, &other_set.descriptor.set_id).await;
@@ -385,7 +384,7 @@ async fn output_reference_list_and_byte_reads_match_today() {
 #[tokio::test]
 async fn a_set_id_names_the_stored_history_version_and_resolves_across_the_raise() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let store = module(true, reference_script()).await;
+    let store = module(reference_script()).await;
     referencing(&store).await;
     let set = reference_set(&store).await;
     let stored = store.load().await.head().history_version;

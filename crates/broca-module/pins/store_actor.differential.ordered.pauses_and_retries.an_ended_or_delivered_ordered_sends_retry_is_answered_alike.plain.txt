@@ -82,7 +82,7 @@ Finished {
     ),
 }
 == control stream
-sha256:fc5f52217e48c244349e9babaa5b0b8a265bcee757b2a8193ba20d744527e2b9 (4527 bytes)
+sha256:36220dad58d8525ce42c67f7cae5393991073b661de2924a34b10307c4bfb21d (4428 bytes)
 == display facts, tools, rich ui (true, false, false), page (None, None)
 sha256:f484b09944c1437987fdab9a2795816c2461364ea0958260ef553f3e3690d86d (6391 bytes)
 == display facts, tools, rich ui (true, false, false), page (Some(1), Some(1))

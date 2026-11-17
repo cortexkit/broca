@@ -141,7 +141,7 @@ Object {
     },
 ]
 == control stream
-sha256:ea1b3fc9fbed8305163c9802cda0cf7e512b2ab358648fb15ab9368108502a2a (3454 bytes)
+sha256:7ab1c715e66d3699c85d26956835e456a54e6ba0ca9299e27c86d3a84d7dfeef (3322 bytes)
 == alike
 Object {
     "auth_selection": String("oauth:stub:synthetic"),
@@ -280,4 +280,4 @@ Object {
     },
 ]
 == control stream
-sha256:c42af6ac25f0565e9a1b87fee71ff8ecf720b65bdbe2e51b3da0500754a9018c (4520 bytes)
+sha256:576e6e5ab1ccdfa0527d3294bd9f52dbdcf032a3c61beefc39c5dcc30ebdc642 (4355 bytes)

@@ -1,6 +1,6 @@
-//! Input-token-cap conformance through broca's real serving path and WAL-backed runner.
+//! broca keeps no input-token budget and leaves `input_token_cap` undeclared: a send naming
+//! `budget.max_input_tokens` is refused through the real serving path before any session exists.
 use crate::delivery_rig::*;
-use broca_protocol::{ContentBlock, ToolCall, ToolCallId, Usage};
 use serde_json::json;
 
 fn refusal(frame: &subc_protocol::Frame) -> serde_json::Value {
@@ -13,48 +13,10 @@ fn refusal(frame: &subc_protocol::Frame) -> serde_json::Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
-fn measured(input: Option<u64>, call: bool) -> Step {
-    Step::Usage {
-        content: if call {
-            vec![ContentBlock::ToolCall(ToolCall {
-                tool_call_id: ToolCallId("budget-call".into()),
-                tool_name: "work".into(),
-                input: json!({}).into(),
-                thought_signature: None,
-            })]
-        } else {
-            vec![ContentBlock::Text {
-                text: "answer".into(),
-            }]
-        },
-        usage: Usage {
-            input_tokens: input,
-            cached_input_tokens: Some(2),
-            cache_write_tokens: Some(3),
-            output_tokens: Some(99),
-            ..Default::default()
-        },
-    }
-}
-
-fn raw_result(frame: &subc_protocol::Frame) -> String {
-    #[derive(serde::Deserialize)]
-    struct Reply<'a> {
-        #[serde(borrow)]
-        result: &'a serde_json::value::RawValue,
-    }
-    serde_json::from_slice::<Reply<'_>>(&frame.body)
-        .unwrap()
-        .result
-        .get()
-        .to_owned()
-}
-
 #[tokio::test]
-async fn budget_exhausted_status_golden_and_result_through_serve() {
-    let mut rig = Rig::start("input-cap-golden").await;
-    rig.script.push(&[measured(Some(5), true)]);
-    let send = rig
+async fn a_send_naming_an_input_cap_is_refused_before_its_session_exists() {
+    let mut rig = Rig::start("input-cap-refused").await;
+    let reply = rig
         .send_with(
             "cap",
             "hello",
@@ -62,73 +24,15 @@ async fn budget_exhausted_status_golden_and_result_through_serve() {
             json!({"budget":{"max_input_tokens":10}}),
         )
         .await;
-    let run = result(&send)["run_id"].as_str().unwrap().to_owned();
-    let records = rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    assert!(rig.script.dispatched.lock().unwrap().is_empty());
-    assert!(records.iter().any(|record| matches!(record, broca_wal::WalRecord::ToolResult { reason: Some(reason), .. } if reason == "budget_exhausted")));
-    let status = rig
-        .request(7, json!({"method":"run.status","params":{"run_id":run}}))
-        .await;
-    let served = raw_result(&status);
-    let path = golden_path("run_status.budget_exhausted.json");
-    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
-        std::fs::write(&path, format!("{served}\n")).unwrap();
-        println!("run_status.budget_exhausted.json: {served}");
-    }
-    let golden = std::fs::read_to_string(path).unwrap();
+    let error = refusal(&reply);
+    assert_eq!(error["code"], "invalid_params", "{error}");
     assert_eq!(
-        legacy_bytes(served.as_bytes(), golden.trim_end().as_bytes()),
-        golden.trim_end().as_bytes()
+        error["detail"]["field"], "budget.max_input_tokens",
+        "{error}"
     );
-    assert_eq!(
-        result(&status)["detail"],
-        json!({"limit":10,"spent":10,"cause":"limit_reached"})
-    );
-    let answer = rig
-        .request(7, json!({"method":"run.result","params":{"run_id":run}}))
-        .await;
-    assert_eq!(result(&answer)["state"], "budget_exhausted");
-    let typed: cortexkit_role_llm_runner::run::RunResult =
-        serde_json::from_value(result(&answer)).unwrap();
-    assert!(typed.run_state().is_budget_exhausted());
-    assert_eq!(result(&answer)["detail"], result(&status)["detail"]);
-    assert!(result(&answer).get("final_message").is_none());
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn unreported_usage_detail_keeps_only_measured_steps_before_unknown() {
-    let mut rig = Rig::start("input-cap-unreported").await;
-    rig.script
-        .push(&[measured(Some(5), false), measured(None, true)]);
-    rig.send_with(
-        "first",
-        "hello",
-        None,
-        json!({"budget":{"max_input_tokens":50}}),
-    )
-    .await;
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    let send = rig.send("second", "more", None).await;
-    let run = result(&send)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(2).await;
-    rig.wait_idle().await;
-    let status = rig
-        .request(7, json!({"method":"run.status","params":{"run_id":run}}))
-        .await;
-    // The first episode reported 5 fresh + 2 cached + 3 cache-write tokens. The second
-    // omitted fresh input, so spent stays 10 rather than estimating that step from its cache split.
-    let legacy = r#"{"state":"budget_exhausted","detail":{"limit":50,"spent":10,"cause":"usage_unreported"},"final_step_finish_reason":"tool_calls","undelivered_steers":[],"usage":{"cached_input_tokens":2,"cache_write_tokens":3,"output_tokens":99},"retries_used":0}"#;
-    assert_eq!(
-        legacy_bytes(raw_result(&status).as_bytes(), legacy.as_bytes()),
-        legacy.as_bytes()
-    );
-    assert_eq!(result(&status)["usage"]["unreported_steps"], 0);
-    assert_eq!(
-        result(&status)["detail"],
-        json!({"limit":50,"spent":10,"cause":"usage_unreported"})
+    assert!(
+        rig.records().await.is_empty(),
+        "a refused send creates no session"
     );
     assert!(rig.script.dispatched.lock().unwrap().is_empty());
     rig.finish().await;
@@ -152,184 +56,6 @@ async fn closed_budget_and_nudges_refuse_unknown_members_by_name() {
         assert_eq!(error["code"], "invalid_params");
         assert_eq!(error["detail"]["field"], field);
         assert!(error.to_string().contains(field), "{error}");
-    }
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn cap_adopts_lowers_refuses_raise_and_omission_keeps_it_through_serve() {
-    let mut rig = Rig::start("input-cap-freeze").await;
-    rig.script.push(&[
-        measured(Some(0), false),
-        measured(Some(0), false),
-        measured(Some(0), false),
-    ]);
-    rig.send("uncapped", "hello", None).await;
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.send_with(
-        "adopt",
-        "more",
-        None,
-        json!({"budget":{"max_input_tokens":50}}),
-    )
-    .await;
-    rig.wait_for_finished(2).await;
-    rig.wait_idle().await;
-    let raise = rig
-        .send_with(
-            "raise",
-            "more",
-            None,
-            json!({"budget":{"max_input_tokens":51}}),
-        )
-        .await;
-    assert_eq!(refusal(&raise)["code"], "invalid_params");
-    assert!(refusal(&raise)
-        .to_string()
-        .contains("budget.max_input_tokens"));
-    rig.send_with(
-        "lower",
-        "more",
-        None,
-        json!({"budget":{"max_input_tokens":15}}),
-    )
-    .await;
-    rig.wait_for_finished(3).await;
-    rig.wait_idle().await;
-    let send = rig.send("omitted", "more", None).await;
-    let run = result(&send)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(4).await;
-    rig.wait_idle().await;
-    assert_eq!(
-        rig.script.prompts.lock().unwrap().len(),
-        3,
-        "no step at exactly fifteen"
-    );
-    let status = rig
-        .request(7, json!({"method":"run.status","params":{"run_id":run}}))
-        .await;
-    assert_eq!(
-        result(&status)["detail"],
-        json!({"limit":15,"spent":15,"cause":"limit_reached"})
-    );
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn queued_lower_cap_stops_the_active_crossing_step_before_tools() {
-    let mut rig = Rig::start("input-cap-live-lower").await;
-    *rig.script.hold_model.lock().unwrap() = true;
-    rig.script.push(&[measured(Some(5), true)]);
-    rig.send_with(
-        "first",
-        "hello",
-        None,
-        json!({"budget":{"max_input_tokens":50}}),
-    )
-    .await;
-    let queued = rig
-        .send_with(
-            "lower",
-            "later",
-            None,
-            json!({"budget":{"max_input_tokens":10}}),
-        )
-        .await;
-    assert_eq!(result(&queued)["state"], "pending");
-    let raised = rig
-        .send_with(
-            "raise",
-            "later",
-            None,
-            json!({"budget":{"max_input_tokens":11}}),
-        )
-        .await;
-    assert_eq!(refusal(&raised)["code"], "invalid_params");
-    *rig.script.hold_model.lock().unwrap() = false;
-    rig.script.model_gate.notify_waiters();
-    rig.wait_for_finished(2).await;
-    rig.wait_idle().await;
-    assert!(rig.script.dispatched.lock().unwrap().is_empty());
-    assert_eq!(rig.script.prompts.lock().unwrap().len(), 1);
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn active_status_and_result_count_only_completed_steps() {
-    let mut rig =
-        Rig::start_with_idle_ttl("active-run-usage", std::time::Duration::from_millis(100)).await;
-    rig.script.hold_model(true);
-    rig.script.hold_tool(true);
-    rig.script
-        .push(&[measured(Some(5), true), measured(Some(7), false)]);
-    let send = rig.send("usage", "hello", None).await;
-    let run = result(&send)["run_id"].as_str().unwrap().to_owned();
-    for method in ["run.status", "run.result"] {
-        let reply = rig
-            .request(7, json!({"method":method,"params":{"run_id":run}}))
-            .await;
-        assert_eq!(
-            result(&reply)["usage"],
-            json!({"steps":0,"unreported_steps":0,"by_model":[]})
-        );
-    }
-    rig.script.hold_model(false);
-    // Wait for the effect the assertions read: the actor counts a step once the writer reports
-    // it durable, a moment after the record reaches the file, so polling the WAL alone races.
-    broca_test_support::wait_for(
-        "status counts the first durable step",
-        async {
-            loop {
-                let reply = rig
-                    .request(7, json!({"method":"run.status","params":{"run_id":run}}))
-                    .await;
-                if result(&reply)["usage"]["steps"] == 1 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        },
-        || "run.status never counted the durable first step".into(),
-    )
-    .await;
-    for method in ["run.status", "run.result"] {
-        let reply = rig
-            .request(7, json!({"method":method,"params":{"run_id":run}}))
-            .await;
-        assert_eq!(result(&reply)["state"], "active");
-        assert_eq!(result(&reply)["usage"]["steps"], 1);
-        assert_eq!(result(&reply)["usage"]["unreported_steps"], 0);
-        assert_eq!(result(&reply)["usage"]["input_tokens"], 5);
-    }
-    rig.script.hold_tool(false);
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    let status = rig
-        .request(7, json!({"method":"run.status","params":{"run_id":run}}))
-        .await;
-    let answer = rig
-        .request(7, json!({"method":"run.result","params":{"run_id":run}}))
-        .await;
-    assert_eq!(result(&status)["usage"], result(&answer)["usage"]);
-    assert_eq!(result(&status)["usage"]["steps"], 2);
-    assert_eq!(result(&status)["usage"]["input_tokens"], 12);
-    let final_usage = result(&status)["usage"].clone();
-    rig.wait_closed().await;
-    for method in ["run.status", "run.result"] {
-        let reply = rig
-            .request(7, json!({"method":method,"params":{"run_id":run}}))
-            .await;
-        assert_eq!(
-            result(&reply)["usage"],
-            final_usage,
-            "closed {method} must retain the live terminal's usage"
-        );
-        assert_eq!(
-            rig.registry().slot_counts().open,
-            0,
-            "a usage read must not reopen the closed actor"
-        );
     }
     rig.finish().await;
 }

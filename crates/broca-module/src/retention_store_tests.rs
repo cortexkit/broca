@@ -1,26 +1,25 @@
-// Tests of retention for sessions kept in the new storage: the rule both storages decide by, and
-// the sweep deleting an expired session there, with everything it owns, under its lease.
+// Tests of session retention: the rule a session's records decide its deadline by, and the sweep
+// deleting an expired session with everything it owns, under its lease.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
-use broca_protocol::{BindIdentity, PauseReason, RunFinishReason, RunId};
+use broca_core::FileLeaseStore;
+use broca_protocol::{BindIdentity, PauseReason, RunFinishReason};
 use broca_session_loop::queue::{Receipt, SteerReceipt};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{Moved, Pause, QueuedSend, Record, RunEnd, RunStart};
 use broca_session_store::session::Session;
-use broca_store::SqliteStore;
-use broca_wal::{FramedRecord, StorageClass, WalRecord};
+use broca_wal::StorageClass;
 
 use super::store_policy;
-use crate::executor::{RunExecutor, RunJob};
+use crate::executor::RunExecutor;
 use crate::opener::DefaultOpener;
 use crate::registry::{LineageOpener as _, StoreCreation};
-use crate::retention::{policy, RetentionService};
+use crate::retention::RetentionService;
 use crate::store_open::StoreRuntime;
 use crate::LineageRegistry;
 
@@ -28,15 +27,7 @@ use crate::LineageRegistry;
 struct NoRuns;
 
 #[async_trait::async_trait]
-impl RunExecutor for NoRuns {
-    async fn execute(
-        &self,
-        _: RunJob,
-        _: tokio::sync::mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("these tests run no model step")
-    }
-}
+impl RunExecutor for NoRuns {}
 
 /// Retention seconds of the sessions these tests seed: a session whose last run ended at
 /// `ENDED_MS` expires at `DEADLINE_MS`.
@@ -65,10 +56,9 @@ fn triple(key: &BindIdentity) -> SessionTriple {
 /// that sweeps.
 struct Rig {
     root: PathBuf,
-    wal: Arc<FileWalStore>,
     service: Arc<RetentionService>,
     runtime: Arc<StoreRuntime>,
-    opener: Arc<DefaultOpener<FileLeaseStore, FileWalStore>>,
+    opener: Arc<DefaultOpener<FileLeaseStore>>,
     registry: LineageRegistry,
 }
 
@@ -78,34 +68,20 @@ impl Rig {
             .join(format!("retention-store-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let wal = Arc::new(FileWalStore::new(root.join("wal")));
-        let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
         let leases = Arc::new(FileLeaseStore::new(root.join("leases")));
-        let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
-        let service = Arc::new(
-            RetentionService::new(
-                wal.clone(),
-                index.clone(),
-                leases.clone(),
-                index.clone(),
-                resolver,
-            )
-            .unwrap(),
-        );
+        let service = Arc::new(RetentionService::new(&root, leases.clone()).unwrap());
         let runtime = Arc::new(
             StoreRuntime::open(&root, deployment(), Arc::new(NoRuns), idle_ttl)
                 .await
                 .unwrap(),
         );
         let opener = Arc::new(
-            DefaultOpener::new(leases, wal.clone(), Arc::new(NoRuns))
-                .with_store_runtime(runtime.clone()),
+            DefaultOpener::new(leases, Arc::new(NoRuns)).with_store_runtime(runtime.clone()),
         );
-        let registry = LineageRegistry::new_with_reader(opener.clone(), wal.clone(), None);
+        let registry = LineageRegistry::new(opener.clone());
         registry.set_retention_service(service.clone());
         Self {
             root,
-            wal,
             service,
             runtime,
             opener,
@@ -256,98 +232,6 @@ fn store_paused(run: &str, ts: u64) -> Record {
     })
 }
 
-fn wal_record(fixture: &str) -> WalRecord {
-    serde_json::from_str(fixture).unwrap()
-}
-
-fn wal_start(key: &BindIdentity, run: &str, retention: Option<u64>, ts: u64) -> WalRecord {
-    let mut record = wal_record(include_str!(
-        "../../broca-wal/tests/golden/pre_step_transforms/run_started.json"
-    ));
-    let WalRecord::RunStarted {
-        session,
-        run_id,
-        retention: value,
-        ts_ms,
-        ..
-    } = &mut record
-    else {
-        unreachable!("the fixture is a run start")
-    };
-    *session = key.clone();
-    *run_id = RunId(run.into());
-    *value = retention;
-    *ts_ms = Some(ts);
-    record
-}
-
-fn wal_end(ts: u64) -> WalRecord {
-    WalRecord::RunFinished {
-        interrupt_reason: None,
-        ts_ms: Some(ts),
-        reason: RunFinishReason::Completed,
-        usage: Default::default(),
-        error: None,
-        retries_used: 0,
-    }
-}
-
-fn wal_queued(retention: Option<u64>, ts: u64) -> WalRecord {
-    let mut record = wal_record(include_str!(
-        "../../broca-wal/tests/golden/pre_step_transforms/queued.json"
-    ));
-    let WalRecord::Queued {
-        retention: value,
-        ts_ms,
-        ..
-    } = &mut record
-    else {
-        unreachable!("the fixture is a queued send")
-    };
-    *value = retention;
-    *ts_ms = Some(ts);
-    record
-}
-
-fn wal_steered(retention: Option<u64>, ts: u64) -> WalRecord {
-    let mut record = wal_record(include_str!(
-        "../../broca-wal/tests/golden/pre_step_transforms/steered.json"
-    ));
-    let WalRecord::Steered {
-        retention: value,
-        ts_ms,
-        ..
-    } = &mut record
-    else {
-        unreachable!("the fixture is a steer")
-    };
-    *value = retention;
-    *ts_ms = Some(ts);
-    record
-}
-
-fn wal_paused(run: &str, ts: u64) -> WalRecord {
-    WalRecord::RunPaused {
-        run_id: RunId(run.into()),
-        ts_ms: Some(ts),
-        reason: PauseReason::ToolHeld,
-        error: None,
-        account_limit: None,
-    }
-}
-
-fn framed(records: Vec<WalRecord>) -> Vec<FramedRecord> {
-    records
-        .into_iter()
-        .enumerate()
-        .map(|(n, record)| FramedRecord {
-            seq: n as u64 + 1,
-            fence: 1,
-            record,
-        })
-        .collect()
-}
-
 fn seqs(records: Vec<Record>) -> Vec<(u64, Record)> {
     records
         .into_iter()
@@ -356,25 +240,15 @@ fn seqs(records: Vec<Record>) -> Vec<(u64, Record)> {
         .collect()
 }
 
-/// One history, written by either storage, gives one retention policy: today's records and the
-/// new storage's say the same run starts, sends, steers, ends and pauses, with the same retention
-/// and times, and both storages decide through one rule.
+/// A session's retention policy, last activity and deadline, as its run starts, queued sends,
+/// steers, ends and pauses decide them.
 #[test]
-fn both_storages_decide_one_history_by_one_rule() {
-    let key = BindIdentity::new("/project", "runner", "s");
-    let start = |run: &str, retention: Option<u64>, ts: u64| {
-        (
-            wal_start(&key, run, retention, ts),
-            store_start(run, retention, ts),
-        )
-    };
-    let end = |run: &str, ts: u64| (wal_end(ts), store_end(run, ts));
-    let queued =
-        |retention: Option<u64>, ts: u64| (wal_queued(retention, ts), store_queued(retention, ts));
-    let steered = |retention: Option<u64>, ts: u64| {
-        (wal_steered(retention, ts), store_steered(retention, ts))
-    };
-    let paused = |run: &str, ts: u64| (wal_paused(run, ts), store_paused(run, ts));
+fn the_retention_rule_reads_a_session_history() {
+    let start = store_start;
+    let end = store_end;
+    let queued = store_queued;
+    let steered = store_steered;
+    let paused = store_paused;
     let cases = vec![
         (
             "a finished run",
@@ -426,61 +300,18 @@ fn both_storages_decide_one_history_by_one_rule() {
         ),
         ("no run yet", vec![queued(Some(60), 1_000)], None),
     ];
-    for (name, steps, expected) in cases {
-        let (wal, store): (Vec<_>, Vec<_>) = steps.into_iter().unzip();
-        assert_eq!(policy(&framed(wal)), expected, "{name}: today's storage");
-        assert_eq!(
-            store_policy(&seqs(store)),
-            expected,
-            "{name}: the new storage"
-        );
+    for (name, records, expected) in cases {
+        assert_eq!(store_policy(&seqs(records)), expected, "{name}");
     }
 }
 
-/// An expired session in the new storage's ephemeral root, moved there from today's storage, is
-/// deleted by the sweep with everything it owns: its head and kept head versions, its logs and
-/// objects, and what its move left on today's storage (the retired WAL, its identity sidecar,
-/// today's media manifest of the session, and the `moved` marker). Its address then reads as
-/// absent in both storages, and a later send there starts a new session.
+/// An expired session in the ephemeral root is deleted by the sweep with everything it owns: its
+/// head and kept head versions, its logs and objects, and a move's leftover stream. Its address
+/// then reads as absent, and a later send there starts a new session.
 #[tokio::test]
 async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_owns() {
     let rig = Rig::new("expired", Duration::from_secs(600)).await;
-    let key = rig.key("moved");
-    // What the move left on today's storage: the WAL it retired, with its identity sidecar, the
-    // session's media manifest, and the marker naming the move.
-    let lineage = {
-        let _lease = rig.service.lease(&key).unwrap();
-        let mut wal = rig.wal.open_with_retention(&key, Some(SECONDS)).unwrap();
-        wal.append(1, &wal_start(&key, "r1", Some(SECONDS), STARTED_MS), true)
-            .unwrap();
-        wal.append(1, &wal_end(ENDED_MS), true).unwrap();
-        rig.service.remember_session(&key).unwrap();
-        wal.lineage_id().unwrap().to_string()
-    };
-    let bytes = b"%PDF-1.7\nretention fixture\n%%EOF";
-    let reference = broca_core::media_validation::validate_media(bytes, "application/pdf").unwrap();
-    broca_core::media_store::MediaStore::open(
-        &rig.root,
-        broca_core::media_store::MediaStoreClass::Ephemeral,
-    )
-    .unwrap()
-    .session(&key)
-    .unwrap()
-    .register_and_append(&reference, bytes, || Ok(()))
-    .unwrap();
-    let retired = rig.wal.ephemeral_wal_path(&key);
-    let marker = rig.wal.wal_path(&key).with_extension("moved");
-    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    broca_wal::migration::atomic_json(
-        &rig.root,
-        &marker,
-        &broca_wal::migration::Moved {
-            cut_id: "store-move:1".into(),
-            holder: "session-store".into(),
-            lineage_id: lineage,
-        },
-    )
-    .unwrap();
+    let key = rig.key("expired");
     rig.seed(
         &key,
         &[
@@ -495,13 +326,7 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
         true,
     )
     .await;
-    let mut owned = rig.folders(&key);
-    owned.extend([
-        retired.clone(),
-        retired.with_extension("session"),
-        marker,
-        rig.root.join("media-ephemeral/refs").join(addr(&key).0),
-    ]);
+    let owned = rig.folders(&key);
     for path in &owned {
         assert!(path.exists(), "{} before the sweep", path.display());
     }
@@ -525,12 +350,7 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     for path in &owned {
         assert!(!path.exists(), "{} is left", path.display());
     }
-    assert_eq!(
-        broca_wal::store_ownership(&rig.root, &addr(&key).0).unwrap(),
-        broca_wal::StoreOwnership::Today
-    );
     assert!(rig.runtime.current_view(&key).await.unwrap().is_none());
-    rig.wal.check_move(&key, true).unwrap();
 
     // A later send at the address starts a new session, with none of the deleted one's history.
     let handle = rig.registry.handle();

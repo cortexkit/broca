@@ -51,7 +51,7 @@ async fn noted_session(more: Vec<Vec<NormalizedEvent>>) -> Side {
         text_step("a3", "It says file contents."),
     ];
     steps.extend(more);
-    let side = side(true, steps, false, true).await;
+    let side = side(steps, false, true).await;
     let first = side
         .send_request(
             "r1",
@@ -489,7 +489,7 @@ async fn numbers_before_a_cut_stay_and_a_revert_frees_none_for_reuse() {
 /// number nothing, with no rows.
 #[tokio::test]
 async fn a_session_that_numbers_nothing_says_so() {
-    let side = side(true, vec![text_step("a1", "hello")], false, false).await;
+    let side = side(vec![text_step("a1", "hello")], false, false).await;
     let unwritten = map_page(&side, None, None).await;
     assert_eq!(unwritten, TagMapResponse::unnumbered());
     assert!(matches!(

@@ -1,6 +1,5 @@
-//! The rules that start an episode under a session's fetch plan. They live apart from the session
-//! actor (`crate::actor::LineageActor`), which applies them on every path that starts an episode,
-//! so any other actor that starts episodes under a plan freezes it the same way.
+//! The rules that start an episode under a session's fetch plan, applied by the session actor on
+//! every path that starts an episode.
 
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::request::SubmissionRequest;

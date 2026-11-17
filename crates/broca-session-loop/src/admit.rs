@@ -76,6 +76,7 @@ pub fn admission<P: Provider>(
         auth_selection: control.auth_selection.clone(),
         account_limit_pause: control.account_limit_pause,
         route_decision_id: req.route_decision_id.clone(),
+        account_route: req.account_route.clone(),
         served_provider: control.served_provider.clone(),
         service_tier: req.service_tier,
         variant: req.variant.clone(),

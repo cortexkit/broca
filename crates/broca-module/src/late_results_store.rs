@@ -75,23 +75,6 @@ pub(crate) fn retention_block_reason(
     Ok(registered.then_some("provider_held_registered"))
 }
 
-pub(crate) fn remove_retained_lineage(root: &Path, lineage: &str) -> Result<(), String> {
-    let path = root.join("late-results.db");
-    if !path.try_exists().map_err(|e| e.to_string())? {
-        return Ok(());
-    }
-    let connection =
-        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .map_err(|error| error.to_string())?;
-    LateResultsStore {
-        connection: Mutex::new(connection),
-        path,
-        held_history: std::sync::atomic::AtomicBool::new(false),
-        tombstones_pruned: std::sync::atomic::AtomicU8::new(PRUNED_WITH_WITHDRAWALS),
-    }
-    .remove_lineage(lineage)
-}
-
 /// The feed cursor as this store keeps it: the provider's incarnation plus the sequence the
 /// provider said that incarnation's entries had reached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,18 +150,10 @@ pub struct RegistrationRow {
     pub state: RegistrationState,
 }
 
-const PRUNED_NONE: u8 = 0;
-const PRUNED_REGISTRATIONS: u8 = 1;
-const PRUNED_WITH_WITHDRAWALS: u8 = 2;
-
 pub struct LateResultsStore {
     connection: Mutex<Connection>,
     path: PathBuf,
     held_history: std::sync::atomic::AtomicBool,
-    /// How far this process has already removed the rows of lineages retention tombstoned
-    /// before it started (see [`Self::prune_tombstoned`]): `PRUNED_NONE`, `PRUNED_REGISTRATIONS`
-    /// or `PRUNED_WITH_WITHDRAWALS`.
-    tombstones_pruned: std::sync::atomic::AtomicU8,
 }
 
 impl LateResultsStore {
@@ -186,7 +161,9 @@ impl LateResultsStore {
     /// A crash before the directory sync may leave the fence present, which safely repeats
     /// the rebuild; it must never publish a partial scan as complete.
     pub fn finish_rebuild(&self) -> Result<(), String> {
-        self.finish_rebuild_with_sync(crate::retention::sync_dir)
+        self.finish_rebuild_with_sync(|root| {
+            broca_session_store::durable::sync_dir(root).map_err(|error| error.to_string())
+        })
     }
 
     fn finish_rebuild_with_sync(
@@ -277,12 +254,11 @@ impl LateResultsStore {
             connection: Mutex::new(connection),
             path,
             held_history: std::sync::atomic::AtomicBool::new(false),
-            tombstones_pruned: std::sync::atomic::AtomicU8::new(PRUNED_NONE),
         };
         // Older projections may have registrations but no withdrawal outbox yet. Backfill
         // only those rows; ordinary roots with no registration history remain write-free.
         let calls: Vec<_> = store
-            .prune_tombstoned()?
+            .unpruned_registration_rows()?
             .into_iter()
             .map(|row| row.call)
             .collect();
@@ -331,7 +307,6 @@ impl LateResultsStore {
 
     /// Every registration with its state.
     pub fn registration_rows(&self) -> Result<Vec<RegistrationRow>, String> {
-        self.prune_tombstoned()?;
         self.unpruned_registration_rows()
     }
 
@@ -406,7 +381,6 @@ impl LateResultsStore {
         module: &str,
         call_key: &str,
     ) -> Result<Option<RegistrationRow>, String> {
-        self.prune_tombstoned()?;
         let connection = self.lock()?;
         connection
             .query_row(
@@ -810,6 +784,24 @@ impl LateResultsStore {
         Ok(removed)
     }
 
+    /// Retires the withdrawal watches of calls that can never owe a withdrawal. Only a watch
+    /// no withdrawal has been attempted for goes; registrations are left to intake.
+    pub fn retire_watches(&self, calls: &[(String, String)]) -> Result<usize, String> {
+        if calls.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut removed = 0;
+        for (module, key) in calls {
+            removed += transaction.execute("DELETE FROM held_withdrawals WHERE module=?1 AND call_key=?2 AND state='watching' AND attempts=0", params![module, key]).map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(removed)
+    }
+
     pub fn withdrawal_details(&self, scope_gone: bool) -> Result<Vec<serde_json::Value>, String> {
         let connection = self.lock()?;
         let mut query = connection.prepare(&format!("SELECT detail FROM held_withdrawals WHERE state='failed' AND ({WITHDRAWAL_SCOPE_GONE}) = ?1 ORDER BY module, call_key LIMIT 10")).map_err(|error| error.to_string())?;
@@ -871,63 +863,6 @@ impl LateResultsStore {
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
     }
-
-    /// A tombstone is durable before WAL removal. Reuse the surviving registration snapshot
-    /// for backfill, and inspect the outbox only after an existing registration/feed read
-    /// has proved history. An ordinary root performs no additional schema lookup.
-    ///
-    /// The walk, one file read per registration and withdrawal, runs once per process: it
-    /// catches a deletion that a crash interrupted after its tombstone was written and before
-    /// the deletion completed. A deletion this
-    /// process makes removes the lineage's rows itself as it completes
-    /// (`remove_retained_lineage`), so later calls only read the rows.
-    ///
-    /// Withdrawals are walked only once a read has proved held history, so a walk made before
-    /// that runs again, once, when the history appears.
-    pub(crate) fn prune_tombstoned(&self) -> Result<Vec<RegistrationRow>, String> {
-        let needed = if self.has_held_history() {
-            PRUNED_WITH_WITHDRAWALS
-        } else {
-            PRUNED_REGISTRATIONS
-        };
-        if self
-            .tombstones_pruned
-            .load(std::sync::atomic::Ordering::Acquire)
-            >= needed
-        {
-            return self.unpruned_registration_rows();
-        }
-        let rows = self.prune_tombstones_now()?;
-        self.tombstones_pruned
-            .fetch_max(needed, std::sync::atomic::Ordering::AcqRel);
-        Ok(rows)
-    }
-
-    fn prune_tombstones_now(&self) -> Result<Vec<RegistrationRow>, String> {
-        let root = self.path.parent().ok_or("intake store has no state root")?;
-        let wal = broca_core::FileWalStore::new(root.join("wal"));
-        let mut rows = self.unpruned_registration_rows()?;
-        let mut calls: Vec<_> = rows.iter().map(|row| row.call.clone()).collect();
-        if self.has_held_history() {
-            calls.extend(self.withdrawal_rows()?.into_iter().map(|(call, _, _)| call));
-        }
-        for call in calls {
-            let path = wal.tombstone_path(&call.bind, &call.lineage);
-            let bytes = match std::fs::read(path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.to_string()),
-            };
-            let stone: crate::retention::Tombstone =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if stone.lineage_id != call.lineage {
-                return Err("intake retention tombstone identity mismatch".into());
-            }
-            self.remove_lineage(&call.lineage)?;
-            rows.retain(|row| row.call.lineage != call.lineage);
-        }
-        Ok(rows)
-    }
 }
 
 #[async_trait::async_trait]
@@ -987,11 +922,8 @@ mod tests {
         let store = std::sync::Arc::new(LateResultsStore::open(&path).unwrap());
         let (calls, modules) = store.recovery_snapshot().unwrap();
         assert!(calls.is_empty() && modules.is_empty());
-        let service = crate::held_withdrawals::HeldWithdrawals::new(
-            store,
-            std::sync::Arc::new(broca_core::FileWalStore::new(root.join("wal"))),
-            std::sync::Arc::new(NoWithdrawal),
-        );
+        let service =
+            crate::held_withdrawals::HeldWithdrawals::new(store, std::sync::Arc::new(NoWithdrawal));
         service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
         service.recover().await.unwrap();
         // Fixture setup is excluded. Count SQLite connection opens and each SELECT's
@@ -1000,7 +932,7 @@ mod tests {
             boot_io::counts(),
             boot_io::Counts {
                 opens: 1,
-                reads: 4,
+                reads: 3,
                 writes: 0,
                 schema_batches: 1
             }
@@ -1009,8 +941,8 @@ mod tests {
         assert!(!root.join(REBUILD_REQUIRED_MARKER).exists());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn retained_feed_discovers_pruned_outbox_history_and_tombstones() {
+    #[test]
+    fn a_retained_feed_keeps_held_history_after_its_registrations_are_pruned() {
         let root = scratch("pruned-outbox-history");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("late-results.db");
@@ -1031,41 +963,6 @@ mod tests {
             "feed rows retain history when intake registrations are pruned"
         );
         assert_eq!(store.withdrawal_rows().unwrap().len(), 1);
-        let wal = std::sync::Arc::new(broca_core::FileWalStore::new(root.join("wal")));
-        let tombstone = wal.tombstone_path(&deleted.bind, &deleted.lineage);
-        std::fs::create_dir_all(tombstone.parent().unwrap()).unwrap();
-        std::fs::write(
-            tombstone,
-            serde_json::to_vec(&crate::retention::Tombstone {
-                recovery_artifacts: Vec::new(),
-                lineage_id: deleted.lineage,
-                expired_at_ms: 1,
-                seq: 1,
-                completed_at_ms: None,
-                next_tag: None,
-                next_notice_seq: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        // A tombstone retention never completed is found by the next process: the walk runs
-        // once per process, and this process's own deletions remove their rows as they complete.
-        drop(store);
-        let store = std::sync::Arc::new(LateResultsStore::open(&path).unwrap());
-        // As at startup, the runtime's snapshot finds the held history before recovery runs.
-        store.recovery_snapshot().unwrap();
-        assert!(store.has_held_history());
-        let service = crate::held_withdrawals::HeldWithdrawals::new(
-            store.clone(),
-            wal,
-            std::sync::Arc::new(NoWithdrawal),
-        );
-        service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
-        service.recover().await.unwrap();
-        assert!(
-            store.withdrawal_rows().unwrap().is_empty(),
-            "expired calls are pruned before recovery reads any WAL or sends a withdrawal"
-        );
     }
 
     #[test]
@@ -1372,49 +1269,6 @@ mod tests {
                 ack_owed: true,
             })
         );
-    }
-
-    #[test]
-    fn boot_prunes_tombstoned_registrations_without_a_wal_or_actor() {
-        let path = scratch("late-results-tombstone/late-results.db");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let store = LateResultsStore::open(&path).unwrap();
-        let deleted = call("lineage:1");
-        store
-            .register_calls(std::slice::from_ref(&deleted))
-            .unwrap();
-        store.ensure_feed("provider", true).unwrap();
-        let key = intake_key("ev-1");
-        store
-            .record_receipt(&key, "result", Disposition::NoOp)
-            .unwrap();
-        drop(store);
-        let wal = broca_core::FileWalStore::new(path.parent().unwrap().join("wal"));
-        let tombstone = wal.tombstone_path(&deleted.bind, &deleted.lineage);
-        std::fs::create_dir_all(tombstone.parent().unwrap()).unwrap();
-        std::fs::write(
-            tombstone,
-            serde_json::to_vec(&crate::retention::Tombstone {
-                recovery_artifacts: Vec::new(),
-                lineage_id: deleted.lineage,
-                expired_at_ms: 1,
-                seq: 1,
-                completed_at_ms: None,
-                next_tag: None,
-                next_notice_seq: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let reopened = LateResultsStore::open(&path).unwrap();
-        assert!(reopened.unpruned_registration_rows().unwrap().is_empty());
-        assert!(reopened.registrations().unwrap().is_empty());
-        assert_eq!(
-            reopened.registration("provider", "lineage:1").unwrap(),
-            None
-        );
-        assert_eq!(reopened.receipt(&key).unwrap(), None);
-        assert!(reopened.feed("provider").unwrap().unwrap().ack_owed);
     }
 }
 

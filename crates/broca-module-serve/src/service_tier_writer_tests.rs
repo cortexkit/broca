@@ -6,99 +6,55 @@ struct TierServeRig {
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     serve: tokio::task::JoinHandle<()>,
     registry: Arc<broca_module::LineageRegistry>,
-    wal: Arc<FileWalStore>,
+    runtime: Arc<broca_module::store_open::StoreRuntime>,
     session: BindIdentity,
     corr: u64,
     subc: Option<tokio::task::JoinHandle<()>>,
-    /// Whether the rig's module creates new sessions in the new session storage, which keeps no
-    /// WAL.
-    on_store: bool,
 }
 
 impl TierServeRig {
     async fn start(root: &std::path::Path, url: &str) -> Self {
-        Self::start_with_plane(root, url, None).await
-    }
-
-    async fn start_with_plane(
-        root: &std::path::Path,
-        url: &str,
-        plane: Option<Arc<TierCompaction>>,
-    ) -> Self {
         let (live, subc) = stand_in_executor(root).await;
-        Self::start_with_executor(root, Some(url), plane, live, Some(subc)).await
+        Self::start_in(root, Some(url), live, Some(subc)).await
     }
 
-    async fn start_with_executor(
-        root: &std::path::Path,
-        url: Option<&str>,
-        plane: Option<Arc<TierCompaction>>,
-        live: LiveLoopExecutor,
-        subc: Option<tokio::task::JoinHandle<()>>,
-    ) -> Self {
-        Self::start_in(root, url, plane, live, subc, false).await
-    }
-
-    /// [`Self::start`], with the rig's module creating new sessions in the new session storage.
-    async fn start_on_store(root: &std::path::Path, url: &str) -> Self {
-        let (live, subc) = stand_in_executor(root).await;
-        Self::start_in(root, Some(url), None, live, Some(subc), true).await
+    /// A rig whose runs `live` executes, as it is configured.
+    async fn start_with_executor(root: &std::path::Path, live: LiveLoopExecutor) -> Self {
+        Self::start_in(root, None, live, None).await
     }
 
     async fn start_in(
         root: &std::path::Path,
         url: Option<&str>,
-        plane: Option<Arc<TierCompaction>>,
         mut live: LiveLoopExecutor,
         subc: Option<tokio::task::JoinHandle<()>>,
-        on_store: bool,
     ) -> Self {
         use broca_module::{DefaultOpener, LineageRegistry};
         use subc_protocol::{
             Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION,
         };
         live.provider_base_url = url.map(str::to_owned);
-        let wal = live.wal_store.clone();
-        let store = live.session_store.clone().expect("legacy fixture materializer");
+        let store = Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &root.join("store.db"),
             &broca_core::ReadOnlyWalReader::new(root),
         )
         .unwrap();
-        let executor: Arc<dyn RunExecutor> = match plane {
-            Some(plane) => Arc::new(TierFixtureExecutor { live, plane }),
-            None => Arc::new(live),
-        };
-        let opener = DefaultOpener::new(
-            Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
-            wal.clone(),
-            Arc::clone(&executor),
-        )
-        .with_run_index(store.clone())
-        .with_materialized_store(store.clone());
-        let opener = if on_store {
-            let runtime = broca_module::store_open::StoreRuntime::open(
+        let executor: Arc<dyn RunExecutor> = Arc::new(live);
+        let opener = DefaultOpener::new(Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))), Arc::clone(&executor));
+        let runtime = Arc::new(
+            broca_module::store_open::StoreRuntime::open(
                 root,
                 broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
                 executor,
                 std::time::Duration::from_millis(100),
             )
             .await
-            .unwrap();
-            opener.with_store_runtime(Arc::new(runtime))
-        } else {
-            opener
-        };
-        let registry = LineageRegistry::new_with_reader(
-            Arc::new(opener),
-            wal.clone(),
-            Some(store.clone()),
+            .unwrap(),
         );
-        let registry = Arc::new(if on_store {
-            registry.with_store_new_sessions()
-        } else {
-            registry
-        });
+        let opener = opener.with_store_runtime(Arc::clone(&runtime));
+        let registry = LineageRegistry::new(Arc::new(opener));
+        let registry = Arc::new(registry);
         registry.set_session_address_inventory(store);
         let (client, server) = tokio::io::duplex(1024 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -151,11 +107,10 @@ impl TierServeRig {
             writer,
             serve,
             registry,
-            wal,
+            runtime,
             session,
             corr: 0,
             subc,
-            on_store,
         };
         let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
             route_channel: 7,
@@ -219,31 +174,6 @@ impl TierServeRig {
     }
 
     async fn ended(&mut self, run: &str) -> (subc_protocol::Frame, subc_protocol::Frame) {
-        use broca_core::WalStore as _;
-        // A session in the new storage keeps no WAL; its run's end is read from `run.status`
-        // below alone.
-        let wal = (!self.on_store).then_some(&self.wal);
-        broca_test_support::wait_until("tier run durable terminal", || {
-            let Some(wal) = wal else {
-                return std::future::ready(Ok(()));
-            };
-            let frames = wal.read_records(&self.session).unwrap();
-            let mut active = false;
-            let mut ended = false;
-            for frame in &frames {
-                match &frame.record {
-                    broca_wal::WalRecord::RunStarted { run_id, .. } => active = run_id.0 == run,
-                    broca_wal::WalRecord::RunFinished { .. } if active => ended = true,
-                    _ => {}
-                }
-            }
-            std::future::ready(if ended {
-                Ok(())
-            } else {
-                Err("no terminal".to_owned())
-            })
-        })
-        .await;
         let registry = self.registry.clone();
         let session = self.session.clone();
         let run_id = RunId(run.to_owned());
@@ -274,6 +204,20 @@ impl TierServeRig {
         (status, result)
     }
 
+    /// The session's records in the new storage, in log order; empty while it doesn't exist.
+    async fn records(&self) -> Vec<broca_session_store::record::Record> {
+        match self.runtime.current_view(&self.session).await {
+            Ok(Some(view)) => view
+                .open_log_records()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     async fn close(self) {
         assert!(self.registry.stop_and_seal().await);
         drop(self.writer);
@@ -283,91 +227,6 @@ impl TierServeRig {
             subc.abort();
             let _ = subc.await;
         }
-    }
-}
-
-#[derive(Default)]
-struct TierCompaction {
-    rides: Mutex<Vec<broca_core::compaction_provider::ride::RideRequest>>,
-    request_ride_counts: Mutex<Vec<usize>>,
-}
-
-#[async_trait::async_trait]
-impl broca_core::CompactionPlane for TierCompaction {
-    async fn setup(
-        &self,
-        _: &str,
-        _: &BindIdentity,
-        _: Option<&broca_protocol::SessionScope>,
-        request: broca_core::compaction_provider::setup::SetupRequest,
-    ) -> Result<
-        broca_core::compaction_provider::setup::SetupAnswer,
-        broca_core::compaction::CompactionUnavailable,
-    > {
-        Ok(serde_json::from_value(serde_json::json!({"answer":"ready","request_id":request.request_id,
-            "initial":{"compaction_id":"tier-head","version":1,"range":{"from":0,"to":0},"replacement":[]}})).unwrap())
-    }
-
-    async fn ride(
-        &self,
-        _: &str,
-        _: &BindIdentity,
-        _: Option<&broca_protocol::SessionScope>,
-        request: broca_core::compaction_provider::ride::RideRequest,
-    ) -> Result<
-        broca_core::compaction_provider::ride::RideAnswer,
-        broca_core::compaction::CompactionUnavailable,
-    > {
-        self.rides.lock().unwrap().push(request);
-        Ok(broca_core::compaction_provider::ride::RideAnswer::nothing())
-    }
-}
-
-struct TierFixtureExecutor {
-    live: LiveLoopExecutor,
-    plane: Arc<TierCompaction>,
-}
-
-#[async_trait::async_trait]
-impl RunExecutor for TierFixtureExecutor {
-    fn head_selection_wire(&self, model: &cortexkit_role_llm_runner::head_selection::PlanModel) -> Option<String> {
-        self.live.head_selection_wire(model)
-    }
-    async fn check_plan_selection(&self, plan: &serde_json::Value) -> Result<Option<cortexkit_role_llm_runner::head_selection::PlanModel>, cortexkit_role_llm_runner::head_selection::PlanModelProblem> {
-        self.live.check_plan_selection(plan).await
-    }
-    fn check_service_tier(
-        &self,
-        request: &broca_protocol::SubmissionRequest,
-    ) -> Result<(), String> {
-        self.live.check_service_tier(request)
-    }
-    fn check_account_route(
-        &self,
-        request: &broca_protocol::request::SubmissionRequest,
-    ) -> Result<(), String> {
-        self.live.check_account_route(request)
-    }
-
-    fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
-        Some(self.plane.clone())
-    }
-
-    async fn execute(
-        &self,
-        mut job: RunJob,
-        out: mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<RunSummary, broca_core::RunError> {
-        // Supply the already-fetched tool-free compaction plan at the executor seam. Model I/O,
-        // tier changes, rides, notices and replies still use the shipping actor/core/serve path.
-        job.control.manifest = Some(Arc::new(broca_wal::PlanManifest {
-            rich_ui: None,
-            plan: broca_wal::OpaqueJson::from_json_text(serde_json::json!({"compaction_item":{"provider":"tier-compaction","preset":"head","params":{}},"composition":{}}).to_string()).unwrap(),
-            plan_identity: "tier-plan".into(), composition_digest: "tier-composition".into(),
-            tools: Arc::new(vec![]), system_text: String::new(), system_digest: String::new(),
-            join_version: 1, role_versions: Default::default(), fetches: vec![], declarations: vec![],
-        }));
-        self.live.execute(job, out).await
     }
 }
 
@@ -528,23 +387,13 @@ async fn head_selection_refreshed_model_is_used_by_next_run() {
     assert_eq!(tier_reply(&head)["result"]["model"]["model"], "test-ultrafast");
     assert_eq!(tier_reply(&head)["result"]["service_tier"], "fast");
     tier_sample("session.head-refreshed.json", &head.body);
-    {
-        use broca_core::WalStore as _;
-        let accepted = rig.wal.read_records(&rig.session).unwrap().into_iter().find_map(|frame| {
-            matches!(frame.record, broca_wal::WalRecord::SessionRefreshAccepted { .. }).then_some(frame.record)
-        }).unwrap();
-        let bytes = serde_json::to_vec(&accepted).unwrap();
-        let decoded: broca_wal::WalRecord = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded, accepted);
-        let mut without_selection = accepted.clone();
-        if let broca_wal::WalRecord::SessionRefreshAccepted { manifest, .. } = &mut without_selection {
-            let mut plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
-            plan.as_object_mut().unwrap().remove("model");
-            manifest.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
-        }
-        assert_eq!(accepted.required_features(), without_selection.required_features());
-        tier_sample("session_refresh_accepted.json", &bytes);
-    }
+    assert!(
+        rig.records().await.iter().any(|record| matches!(
+            record,
+            broca_session_store::record::Record::SessionRefresh(refresh) if refresh.generation == 1
+        )),
+        "the refresh is recorded"
+    );
     let absent = rig.call("session.refresh", serde_json::json!({"plan":selection_plan(None),
         "generation":2,"policy":"on_prefix_rebuild"})).await;
     assert_eq!(absent.header.ty, subc_protocol::FrameType::Response, "{absent:?}");
@@ -605,7 +454,7 @@ async fn head_selection_refresh_does_not_change_running_tier() {
     install_queued_ultrafast_catalog();
     let root = fresh_vault_root("selection-running-tier");
     let release = Arc::new(tokio::sync::Notify::new());
-    let http = tier_http_fixture(vec![None, None], false, Some(release.clone()), None).await;
+    let http = tier_http_fixture(vec![None, None], false, Some(release.clone())).await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
     rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
     let sent = rig.call("session.send", serde_json::json!({"send_id":"first","prompt":"hello",
@@ -640,12 +489,11 @@ async fn head_selection_refresh_does_not_change_running_tier() {
 }
 
 async fn selection_refusal(model: serde_json::Value, detail: serde_json::Value) {
-    use broca_core::WalStore as _;
     let root = fresh_vault_root("selection-refusal");
     let http = resume_http_fixture().await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
     selection_first(&mut rig, selection_plan(None)).await;
-    let before = rig.wal.read_records(&rig.session).unwrap();
+    let before = rig.records().await;
     let head = rig.call("session.head", serde_json::json!({})).await;
     let response = rig.call("session.refresh", serde_json::json!({"plan":selection_plan(Some(model)),
         "generation":1,"policy":"immediately"})).await;
@@ -653,7 +501,7 @@ async fn selection_refusal(model: serde_json::Value, detail: serde_json::Value) 
     let error = tier_reply(&response);
     assert_eq!(error["code"], "invalid_params");
     assert_eq!(error["detail"], detail);
-    assert_eq!(rig.wal.read_records(&rig.session).unwrap(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(rig.call("session.head", serde_json::json!({})).await.body, head.body);
     assert_eq!(http.requests.lock().unwrap().len(), 1);
     rig.close().await;
@@ -695,10 +543,6 @@ async fn head_selection_missing_sign_in_is_unsupported_model_without_write() {
     live.vault = None;
     let result = live.check_plan_selection(&selection_plan(Some(fast_selection()))).await;
     assert_eq!(result, Err(cortexkit_role_llm_runner::head_selection::PlanModelProblem::UnsupportedModel));
-    let session = BindIdentity::new(&root, "tier-test", "session");
-    assert_eq!(broca_core::WalStore::live_wal_bytes(live.wal_store.as_ref(), &session).unwrap(), None);
-    assert!(matches!(broca_core::WalStore::read_records(live.wal_store.as_ref(), &session),
-        Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
     subc.abort();
     // The executor owns the SQLite store; Windows cannot delete its open database files.
     drop(live);
@@ -719,9 +563,8 @@ async fn head_selection_refuses_unsupported_tier_without_write() {
 }
 
 #[tokio::test]
-async fn head_selection_creating_refusals_do_not_create_a_wal() {
-    use broca_core::WalStore as _;
-    if !run_catalog_drift_child("head_selection_creating_refusals_do_not_create_a_wal") {
+async fn head_selection_creating_refusals_do_not_create_a_session() {
+    if !run_catalog_drift_child("head_selection_creating_refusals_do_not_create_a_session") {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
@@ -735,74 +578,23 @@ async fn head_selection_creating_refusals_do_not_create_a_wal() {
         let http = resume_http_fixture().await;
         let mut rig = TierServeRig::start(&root, &http.url).await;
         rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
-        let before = rig.wal.live_wal_bytes(&rig.session).unwrap();
         let response = rig.call("session.send", serde_json::json!({"send_id":"refused","prompt":"hello",
             "model":{"provider":"openai","model":"test-ultrafast"},"plan":selection_plan(Some(model))})).await;
         assert_eq!(response.header.ty, subc_protocol::FrameType::Error, "{response:?}");
         assert_eq!(tier_reply(&response)["detail"], detail);
-        assert_eq!(rig.wal.live_wal_bytes(&rig.session).unwrap(), before);
-        assert!(matches!(rig.wal.read_records(&rig.session),
-            Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+        assert!(
+            rig.runtime.current_view(&rig.session).await.unwrap().is_none(),
+            "a refused creating send creates no session"
+        );
         assert!(http.requests.lock().unwrap().is_empty());
         rig.close().await;
         std::fs::remove_dir_all(root).unwrap();
     }
 }
 
-/// The queue record a tiered send leaves behind when it waits for a run already in flight: the
-/// same durable bytes the served path writes, taken from the WAL rather than composed by hand.
-async fn served_queue_record(tier: &str, send_id: &str) -> broca_wal::WalRecord {
-    use broca_core::WalStore as _;
-    let root = fresh_vault_root(&format!("tier-served-{tier}"));
-    let release = Arc::new(tokio::sync::Notify::new());
-    let http = tier_http_fixture(vec![None], false, Some(release.clone()), None).await;
-    let mut rig = TierServeRig::start(&root, &http.url).await;
-    let run = tier_run(&rig.send("held", Some(tier)).await);
-    broca_test_support::wait_until("held request reaches HTTP", || {
-        std::future::ready(if http.requests.lock().unwrap().len() == 1 {
-            Ok(())
-        } else {
-            Err("not received".to_owned())
-        })
-    })
-    .await;
-    let queued = rig.send(send_id, None).await;
-    assert_eq!(tier_reply(&queued)["result"]["state"], "pending");
-    broca_test_support::wait_until("served queue record is durable", || {
-        let frames = rig.wal.read_records(&rig.session).unwrap();
-        std::future::ready(
-            if frames
-                .iter()
-                .any(|frame| matches!(&frame.record, broca_wal::WalRecord::Queued { .. }))
-            {
-                Ok(())
-            } else {
-                Err("queued record is not readable yet".to_owned())
-            },
-        )
-    })
-    .await;
-    let record = rig
-        .wal
-        .read_records(&rig.session)
-        .unwrap()
-        .into_iter()
-        .find_map(|frame| match frame.record {
-            record @ broca_wal::WalRecord::Queued { .. } => Some(record),
-            _ => None,
-        })
-        .unwrap();
-    release.notify_one();
-    rig.ended(&run).await;
-    rig.close().await;
-    std::fs::remove_dir_all(root).unwrap();
-    record
-}
-
 async fn tier_http_fixture(reports: Vec<Option<&'static str>>,
     two_steps: bool,
     hold: Option<Arc<tokio::sync::Notify>>,
-    plane: Option<Arc<TierCompaction>>,
 ) -> ResumeHttpFixture {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -840,19 +632,6 @@ async fn tier_http_fixture(reports: Vec<Option<&'static str>>,
                 headers,
                 body: bytes[split..split + length].to_vec(),
             });
-            if let Some(plane) = &plane {
-                let count = plane
-                    .rides
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|ride| {
-                        ride.cause
-                            == broca_core::compaction_provider::ride::RideCause::ServiceTierChange
-                    })
-                    .count();
-                plane.request_ride_counts.lock().unwrap().push(count);
-            }
             if index == 0 {
                 if let Some(hold) = &hold {
                     hold.notified().await;
@@ -905,7 +684,7 @@ async fn service_tier_usage_reports_standard_absence_and_conflict_after_reopen()
         ),
     ] {
         let root = fresh_vault_root(&format!("tier-usage-{name}"));
-        let http = tier_http_fixture(reports.clone(), reports.len() == 2, None, None).await;
+        let http = tier_http_fixture(reports.clone(), reports.len() == 2, None).await;
         let mut rig = TierServeRig::start(&root, &http.url).await;
         let run = tier_run(&rig.send(name, Some("fast")).await);
         let (status, result) = rig.ended(&run).await;
@@ -941,17 +720,19 @@ async fn service_tier_usage_reports_standard_absence_and_conflict_after_reopen()
     }
 }
 
+/// A run's tier is fixed for its life: a steer naming another tier is refused, and a send
+/// queued behind the run with no tier of its own records the run's tier and is sent at it once
+/// it drains. Repeating the queued send answers it again with the same bytes.
 #[tokio::test]
-async fn service_tier_fixed_run_and_writer_queue_survive_a_restart_cut() {
-    use broca_core::WalStore as _;
-    if !run_catalog_drift_child("service_tier_fixed_run_and_writer_queue_survive_a_restart_cut") {
+async fn service_tier_fixed_run_and_its_queued_send_keep_the_runs_tier() {
+    if !run_catalog_drift_child("service_tier_fixed_run_and_its_queued_send_keep_the_runs_tier") {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
     install_queued_ultrafast_catalog();
     let root = fresh_vault_root("tier-fixed-queue");
     let release = Arc::new(tokio::sync::Notify::new());
-    let http = tier_http_fixture(vec![None, None, None], false, Some(release.clone()), None).await;
+    let http = tier_http_fixture(vec![None, None], false, Some(release.clone())).await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
     let run = tier_run(&rig.send("held-ultra", Some("ultrafast")).await);
     broca_test_support::wait_until("ultrafast request reaches HTTP", || {
@@ -969,198 +750,47 @@ async fn service_tier_fixed_run_and_writer_queue_survive_a_restart_cut() {
     );
     let queued = rig.send("queued-ultra", None).await;
     assert_eq!(tier_reply(&queued)["result"]["state"], "pending");
-    // The retry below must find this queue record in the WAL, not in whatever the actor still
-    // holds in memory, so wait for the record itself to be readable.
-    broca_test_support::wait_until("queued record is durable", || {
-        let frames = rig.wal.read_records(&rig.session).unwrap();
-        std::future::ready(
-            if frames
-                .iter()
-                .any(|frame| matches!(&frame.record, broca_wal::WalRecord::Queued { .. }))
-            {
-                Ok(())
-            } else {
-                Err("queued record is not readable yet".to_owned())
-            },
-        )
-    })
-    .await;
     let repeated = rig.send("queued-ultra", None).await;
     assert_eq!(
         queued.body, repeated.body,
         "inheriting a tier must not alter caller retry identity"
     );
-    let queued_record = rig
-        .wal
-        .read_records(&rig.session)
-        .unwrap()
+    let queued_request = rig
+        .records()
+        .await
         .into_iter()
-        .find_map(|frame| match frame.record {
-            record @ broca_wal::WalRecord::Queued { .. } => Some(record),
+        .find_map(|record| match record {
+            broca_session_store::record::Record::QueuedSend(queued) => {
+                queued.request.as_ref().map(|request| request.parse())
+            }
             _ => None,
         })
-        .unwrap();
-    let broca_wal::WalRecord::Queued { request, .. } = &queued_record else {
-        unreachable!()
-    };
-    assert_eq!(request.service_tier_level.as_deref(), Some("ultrafast"));
-    assert!(queued_record
-        .required_features()
-        .contains(&"service-tier-queue/v1"));
+        .expect("the queued send is recorded");
+    assert_eq!(queued_request["service_tier_level"], "ultrafast", "{queued_request}");
     release.notify_one();
     rig.ended(&run).await;
-    broca_test_support::wait_until("queued ultrafast finishes", || {
-        let frames = rig.wal.read_records(&rig.session).unwrap();
-        std::future::ready(
-            if frames
-                .iter()
-                .filter(|f| matches!(&f.record, broca_wal::WalRecord::RunFinished { .. }))
-                .count()
-                == 2
-            {
-                Ok(())
-            } else {
-                Err("queued run has not ended".to_owned())
-            },
-        )
+    broca_test_support::wait_until("the queued send's run is sent", || {
+        std::future::ready(if http.requests.lock().unwrap().len() == 2 {
+            Ok(())
+        } else {
+            Err("not received".to_owned())
+        })
     })
     .await;
-    rig.close().await;
-
-    // Reopen the exact durable queue record from the enqueue cut, with no actor cache. The cut
-    // session is created through the rig's own bind, as a real client creates one: the session
-    // gets the address the bind resolves and its inventory row. A WAL written under a
-    // folder-derived address with no inventory row is a state production never produces, so it
-    // would test the addressing rather than the queue drain.
-    let cut_root = fresh_vault_root("tier-queue-cut");
-    let cut = TierServeRig::start(&cut_root, &http.url).await;
-    let mut writer = cut.wal.open(&cut.session).unwrap();
-    writer.append(1, &queued_record, true).unwrap();
-    drop(writer);
-    let cut_session = cut.session.clone();
-    cut.close().await;
-    let reopened = TierServeRig::start(&cut_root, &http.url).await;
-    assert_eq!(
-        reopened.session, cut_session,
-        "the reopened rig binds the session the cut wrote"
+    let drained = tier_reply(
+        &rig.call("session.send_status", serde_json::json!({"send_id":"queued-ultra"}))
+            .await,
     );
-    reopened
-        .registry
-        .actor_for(&reopened.session)
-        .await
-        .unwrap();
-    broca_test_support::wait_until("reopened tier queue finishes", || {
-        let frames = reopened.wal.read_records(&reopened.session).unwrap();
-        std::future::ready(
-            if frames
-                .iter()
-                .any(|f| matches!(&f.record, broca_wal::WalRecord::RunFinished { .. }))
-            {
-                Ok(frames)
-            } else {
-                Err("reopened run has not ended".to_owned())
-            },
-        )
-    })
-    .await
-    .into_iter()
-    .find_map(|frame| match frame.record {
-        broca_wal::WalRecord::RunStarted { config, .. } => {
-            assert_eq!(config.frozen_render_config["service_tier"], "ultrafast");
-            Some(())
-        }
-        _ => None,
-    })
-    .expect("queue consumed into RunStarted");
-    assert_eq!(http.requests.lock().unwrap().len(), 3);
+    let drained_run = drained["result"]["run_id"].as_str().unwrap().to_owned();
+    let (_, result) = rig.ended(&drained_run).await;
+    assert_eq!(tier_reply(&result)["result"]["state"], "completed", "{result:?}");
     for request in http.requests.lock().unwrap().iter() {
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["service_tier"], "ultrafast");
     }
-    reopened.close().await;
-    std::fs::remove_dir_all(root).unwrap();
-    std::fs::remove_dir_all(cut_root).unwrap();
-}
-
-/// A session written before subc-protocol 0.34 keeps the address it was given then. Its bind
-/// carried a folder, so that address is derived from the folder and its session-ref row records
-/// it. After the upgrade the bind carries no folder at all, so nothing about the bind can name
-/// that address; the row is the only thing that can, and it must.
-#[tokio::test]
-async fn queued_tier_send_drains_after_upgrading_a_legacy_folder_addressed_session() {
-    use broca_core::{SessionRefIndex as _, WalStore as _};
-    if !run_catalog_drift_child(
-        "queued_tier_send_drains_after_upgrading_a_legacy_folder_addressed_session",
-    ) {
-        return;
-    }
-    broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
-
-    // The pre-0.34 session: a folder-derived address, its WAL, and the session-ref row that
-    // recorded the pair then.
-    let root = fresh_vault_root("tier-legacy-addressed");
-    let legacy = BindIdentity::new(&root, "tier-test", "session");
-    let wal = FileWalStore::new(root.join("wal"));
-    let queued = served_queue_record("ultrafast", "legacy-queued").await;
-    let broca_wal::WalRecord::Queued { .. } = &queued else {
-        unreachable!("a served send records its queue entry")
-    };
-    let mut writer = wal.open(&legacy).unwrap();
-    writer.append(1, &queued, true).unwrap();
-    drop(writer);
-    broca_store::SqliteStore::open(root.join("store.db"))
-        .unwrap()
-        .record_session(&broca_core::session_addr(&legacy), &legacy)
-        .unwrap();
-
-    // The upgrade: a rig on this line binds the same harness and session name with no folder.
-    let http = tier_http_fixture(vec![None], false, None, None).await;
-    let reopened = TierServeRig::start(&root, &http.url).await;
-    assert_eq!(
-        reopened.session, legacy,
-        "the recorded pair resolves to the address the legacy session was written under"
-    );
-    assert_eq!(
-        broca_core::wal_writer::session_addr(&reopened.session),
-        broca_core::wal_writer::session_addr(&legacy)
-    );
-    reopened
-        .registry
-        .actor_for(&reopened.session)
-        .await
-        .unwrap();
-    broca_test_support::wait_until("legacy queued send drains after the upgrade", || {
-        let frames = reopened.wal.read_records(&reopened.session).unwrap();
-        std::future::ready(
-            if frames
-                .iter()
-                .any(|frame| matches!(&frame.record, broca_wal::WalRecord::RunFinished { .. }))
-            {
-                Ok(frames)
-            } else {
-                Err("legacy queued send has not drained".to_owned())
-            },
-        )
-    })
-    .await
-    .into_iter()
-    .find_map(|frame| match frame.record {
-        broca_wal::WalRecord::RunStarted { config, .. } => {
-            assert_eq!(config.frozen_render_config["service_tier"], "ultrafast");
-            Some(())
-        }
-        _ => None,
-    })
-    .expect("the legacy queue entry was consumed into a RunStarted");
-    assert_eq!(http.requests.lock().unwrap().len(), 1);
-    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap()[0].body)
-        .unwrap();
-    assert_eq!(body["service_tier"], "ultrafast");
-    reopened.close().await;
+    rig.close().await;
     std::fs::remove_dir_all(root).unwrap();
 }
-
 
 #[test]
 fn service_tier_switch_off_pins_master_log_discovery_usage_and_request_bytes() {
@@ -1324,49 +954,6 @@ fn service_tier_billed_refusal_reports_and_anthropic_speed_vote_truthfully() {
 }
 
 #[tokio::test]
-async fn service_tier_enabled_resume_uses_frozen_bytes_with_no_catalog() {
-    if !run_catalog_drift_child("service_tier_enabled_resume_uses_frozen_bytes_with_no_catalog") {
-        return;
-    }
-    broca_protocol::configure_service_tier(true).unwrap();
-    broca_catalog::install_global_catalog_cache(Arc::new(broca_catalog::CatalogCache::empty()));
-    let server = resume_http_fixture().await;
-    let root = fresh_vault_root("writer-frozen-tier-resume");
-    let (summary, _, records) = execute_recorded_fixture(&root, &server, |config| {
-        config.frozen_render_config["service_tier"] = "ultrafast".into();
-    })
-    .await;
-    assert_eq!(summary.reason, RunFinishReason::Completed);
-    assert_eq!(server.requests.lock().unwrap().len(), 1);
-    let body: serde_json::Value =
-        serde_json::from_slice(&server.requests.lock().unwrap()[0].body).unwrap();
-    assert_eq!(body["service_tier"], "ultrafast");
-    assert!(!records
-        .iter()
-        .any(|frame| matches!(frame.record, broca_wal::WalRecord::RunConfigRefrozen { .. })));
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
-async fn service_tier_compaction_first_fast_request_has_no_change_to_ride() {
-    if !run_catalog_drift_child("service_tier_compaction_first_fast_request_has_no_change_to_ride")
-    {
-        return;
-    }
-    broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
-    let root = fresh_vault_root("tier-first-fast");
-    let plane = Arc::new(TierCompaction::default());
-    let http = tier_http_fixture(vec![None], false, None, Some(plane.clone())).await;
-    let mut rig = TierServeRig::start_with_plane(&root, &http.url, Some(plane.clone())).await;
-    let run = tier_run(&rig.send("first-fast", Some("fast")).await);
-    rig.ended(&run).await;
-    assert_eq!(*plane.request_ride_counts.lock().unwrap(), vec![0]);
-    rig.close().await;
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
 async fn service_tier_writer_admits_maps_refuses_and_describes_through_serve() {
     if !run_catalog_drift_child(
         "service_tier_writer_admits_maps_refuses_and_describes_through_serve",
@@ -1485,16 +1072,11 @@ async fn service_tier_writer_admits_maps_refuses_and_describes_through_serve() {
 /// What a rig's session made of three service tier sends: a creating send whose plan's model
 /// selection names `fast`, a later send naming `fast` itself, and a later send naming `fast` for
 /// a model with no price at that tier. For each send, its answer, its run's end, and the model
-/// and tier the provider was sent, with the run ids left out, since each side mints its own.
-async fn tier_story(store: bool) -> Vec<serde_json::Value> {
-    use broca_core::WalStore as _;
-    let root = fresh_vault_root(if store { "tier-store" } else { "tier-today" });
+/// and tier the provider was sent, with the run ids left out.
+async fn tier_story() -> Vec<serde_json::Value> {
+    let root = fresh_vault_root("tier-store");
     let http = resume_http_fixture().await;
-    let mut rig = if store {
-        TierServeRig::start_on_store(&root, &http.url).await
-    } else {
-        TierServeRig::start(&root, &http.url).await
-    };
+    let mut rig = TierServeRig::start(&root, &http.url).await;
     rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
     let mut story = Vec::new();
     let sends = [
@@ -1525,40 +1107,31 @@ async fn tier_story(store: bool) -> Vec<serde_json::Value> {
             "sent": {"model": body["model"], "service_tier": body["service_tier"]},
         }));
     }
-    if store {
-        assert_eq!(
-            rig.wal.wal_present(&rig.session),
-            Some(false),
-            "the session is kept in the new storage"
-        );
-    }
     rig.close().await;
     std::fs::remove_dir_all(root).unwrap();
     story
 }
 
-/// A session kept in the new storage admits and sends service tiers as today's storage does: a
-/// creating send whose plan's model selection names `fast`, and a later send naming `fast`, are
-/// both sent at the provider's priority tier, and a level the send's model has no price for is
-/// refused with today's answer, before anything is sent.
+/// A session admits and sends service tiers: a creating send whose plan's model selection
+/// names `fast`, and a later send naming `fast`, are both sent at the provider's priority tier,
+/// and a level the send's model has no price for is refused before anything is sent.
 #[tokio::test]
-async fn a_store_session_admits_and_sends_service_tiers_as_today() {
-    if !run_catalog_drift_child("a_store_session_admits_and_sends_service_tiers_as_today") {
+async fn a_session_admits_and_sends_service_tiers() {
+    if !run_catalog_drift_child("a_session_admits_and_sends_service_tiers") {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
     install_queued_ultrafast_catalog();
-    let today = tier_story(false).await;
+    let story = tier_story().await;
     assert_eq!(
-        today[0]["sent"],
+        story[0]["sent"],
         serde_json::json!({"model": "test-ultrafast", "service_tier": "priority"}),
-        "{today:?}"
+        "{story:?}"
     );
-    assert_eq!(today[1]["sent"], today[0]["sent"], "{today:?}");
+    assert_eq!(story[1]["sent"], story[0]["sent"], "{story:?}");
     assert_eq!(
-        today[2]["detail"],
+        story[2]["detail"],
         serde_json::json!({"field":"service_tier","reason":"unsupported_tier"}),
-        "{today:?}"
+        "{story:?}"
     );
-    assert_eq!(tier_story(true).await, today);
 }

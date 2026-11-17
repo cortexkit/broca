@@ -55,7 +55,7 @@ fn run_awaits_contract_cases_decode_through_broca_bodies_and_frames() {
             index as u32,
             &unit,
             index as u64,
-            &LiveEvent::DisplayReset,
+            Some(&LiveEvent::DisplayReset),
         )
         .unwrap();
         let frame: Value = serde_json::from_slice(&bytes).unwrap();
@@ -80,7 +80,8 @@ fn run_awaits_contract_cases_decode_through_broca_bodies_and_frames() {
             })
             .unwrap();
             let bytes =
-                encode_live_subscribe_control(7, 0, &unit, 1, &LiveEvent::DisplayReset).unwrap();
+                encode_live_subscribe_control(7, 0, &unit, 1, Some(&LiveEvent::DisplayReset))
+                    .unwrap();
             assert_eq!(
                 serde_json::from_slice::<Value>(&bytes).unwrap()["unit"]["awaits"],
                 status["awaits"]

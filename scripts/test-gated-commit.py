@@ -64,6 +64,10 @@ print("fixture cargo fmt")
         self.executable(self.root / "scripts/check-cortexkit-layout.sh", r'''#!/bin/sh
 printf 'layout\n' >> "$LAYOUT_EVENTS"
 ''')
+        # The gate checks only crates that still exist: a deleted crate has no manifest left.
+        for crate in ("alpha", "beta"):
+            (self.root / "crates" / crate).mkdir(parents=True)
+            (self.root / "crates" / crate / "Cargo.toml").write_text("")
 
     @staticmethod
     def executable(path, text):
@@ -86,6 +90,11 @@ printf 'layout\n' >> "$LAYOUT_EVENTS"
         events = [json.loads(line)[0] for line in self.events.read_text().splitlines()]
         self.assertNotIn("commit", events)
         self.assertNotIn("add", events)
+
+    def test_a_deleted_crate_is_not_named_but_its_lock_change_is_gated(self):
+        # cargo refuses a package that is no longer a workspace member, so naming the deleted
+        # crate would fail the whole gate; the lock file change still selects broca-subc.
+        self.assert_gated([" D crates/gone/src/lib.rs", " M Cargo.lock"], ["broca-subc"])
 
     def test_space_in_crate_path_does_not_skip_gate(self):
         self.assert_gated([" M crates/alpha/source with spaces.rs"], ["alpha"])

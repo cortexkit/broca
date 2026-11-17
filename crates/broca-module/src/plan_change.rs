@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use broca_fetch_plan::session_change::{self, PendingState, SessionChangeState};
+use broca_fetch_plan::session_change::{self, PendingState};
 use broca_wal::PlanManifest;
 
 use crate::serve::SessionChangeError;
@@ -70,34 +70,6 @@ impl ChangeFacts {
         match &self.pending {
             Some(pending) => Some(pending.manifest.as_ref()),
             None => self.current_manifest.as_deref(),
-        }
-    }
-}
-
-impl ChangeFacts {
-    /// The facts today's fold `state` holds, for a request naming `generation` and `send_id`.
-    pub fn of(state: &SessionChangeState, generation: Option<u64>, send_id: Option<&str>) -> Self {
-        let accepted = generation.and_then(|generation| {
-            let (plan_identity, policy) = state.accepted.get(&generation)?;
-            let (run_in_progress, applies_from_next_run) = state.accepted_replies[&generation];
-            Some(Accepted {
-                plan_identity: plan_identity.clone(),
-                policy: policy.clone(),
-                run_in_progress,
-                applies_from_next_run,
-            })
-        });
-        Self {
-            accepted_generation: state.accepted_generation,
-            pending: state.pending.clone(),
-            current_manifest: state.current_manifest.clone(),
-            flushed: state.flush_pending,
-            accepted,
-            applied_by: generation.and_then(|generation| state.applied.get(&generation).cloned()),
-            policy_send: send_id.and_then(|send_id| state.policy_send_ids.get(send_id).cloned()),
-            flush_send: send_id.and_then(|send_id| state.flush_send_ids.get(send_id).copied()),
-            // Today's storage can't gain a compaction provider.
-            enrollment: None,
         }
     }
 }

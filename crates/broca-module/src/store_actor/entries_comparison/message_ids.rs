@@ -43,8 +43,6 @@ async fn event_side(steps: Vec<Vec<NormalizedEvent>>) -> (Side, Inbox) {
     let events = Arc::new(StepEvents::start_on_bus(Arc::new(Capture(tx))));
     let side = side_with_events(
         Build {
-            runtime: true,
-            new_sessions: true,
             gated: false,
             compaction: true,
             hooks: false,
@@ -380,7 +378,6 @@ async fn message_ids_cancelled_step_omits_the_member() {
     let dir = broca_test_support::scratch_root()
         .join(format!("synthetic-step-cancel-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let provider = broca_core::provider::StubProvider::new(Vec::new());
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
         store: Cancels,
@@ -397,7 +394,6 @@ async fn message_ids_cancelled_step_omits_the_member() {
     .unwrap();
     let opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         executor,
     )
     .with_store_runtime(Arc::new(runtime))
@@ -409,8 +405,7 @@ async fn message_ids_cancelled_step_omits_the_member() {
             "synthetic-cancel",
         ),
         dir,
-        registry: LineageRegistry::new_with_reader(Arc::new(opener), wal, None)
-            .with_store_new_sessions(),
+        registry: LineageRegistry::new(Arc::new(opener)),
         gate: None,
         provider,
         caller: Default::default(),

@@ -24,7 +24,7 @@ use broca_core::tool_plane::{
     ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
 };
 use broca_core::{provider::Provider, RunControl, RunRequest, StubReply, StubToolPlane};
-use broca_protocol::caller::PauseReason;
+use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{
     AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolOutputPart, ToolResult,
 };
@@ -780,6 +780,19 @@ impl ToolPlane for Spy {
                 }
             }
             return self.held.wait(ctx, call, &reply).await;
+        }
+        // A call that went out and never answered: the caller cancels the run (`stall`), or the
+        // runner stops (`stall_stop`), while it runs, so whether it took effect is never known.
+        if let "stall" | "stall_stop" = call.tool_name.as_str() {
+            let token = if call.tool_name == "stall" {
+                guard.cancel_token()
+            } else {
+                guard.stop_token()
+            };
+            token.expect("the loop guards every dispatch").cancel();
+            return DispatchResult::SentButOutcomeUnknown {
+                reason: "cut short while it ran".into(),
+            };
         }
         if call.tool_name == "photo" {
             return photo(ctx, call).await;
@@ -2336,6 +2349,10 @@ impl Writer for Recording<'_, '_> {
     }
     fn session_id(&self) -> String {
         Writer::session_id(&*self.session)
+    }
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        // As the actor answers a catch-up: with the records it appended meanwhile.
+        self.flush().await
     }
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
         self.flush().await?;
@@ -4701,6 +4718,54 @@ async fn a_cancel_before_a_later_call_returns_its_stream_drops_the_call() {
     compare_steered(calling("read", 0), vec![(2, Action::CancelNow)]).await;
 }
 
+/// How the run whose call `name` never answered ended: its reason and interrupt reason.
+async fn end_after_a_call_in_doubt(name: &str) -> (RunFinishReason, Option<String>) {
+    let scenario = Scenario {
+        input: vec![user("run it")],
+        tools: vec![tool(name, ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", name, json!({"x": 1}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "never asked for"),
+        ],
+    };
+    let actions = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
+    actions
+        .source
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunEnd(end) => Some((end.reason, end.interrupt_reason.clone())),
+            _ => None,
+        })
+        .expect("the run ended")
+}
+
+/// A caller who cancels while a call runs gets a cancelled run, even though the call's outcome
+/// is never known; interrupted would name a stop nobody asked for.
+#[tokio::test]
+async fn a_cancel_while_a_call_runs_ends_the_run_cancelled() {
+    assert_eq!(
+        end_after_a_call_in_doubt("stall").await,
+        (RunFinishReason::Cancelled, None)
+    );
+}
+
+/// The runner's stop while a call runs ends the run interrupted by the shutdown, as a stop at a
+/// step boundary does.
+#[tokio::test]
+async fn a_stop_while_a_call_runs_ends_the_run_interrupted_by_the_shutdown() {
+    assert_eq!(
+        end_after_a_call_in_doubt("stall_stop").await,
+        (RunFinishReason::Interrupted, Some("runner_shutdown".into()))
+    );
+}
+
 #[tokio::test]
 async fn a_boundary_cancel_during_a_tool_step_ends_after_its_batch() {
     compare_steered(
@@ -5957,7 +6022,8 @@ async fn store_dispatch_without_a_plan_stays_presetless() {
 
 /// The hook provider both loops call, keyed by the tool a call names: the mutate hook rewrites
 /// a `mutated` call's input to `{"path":"mutated"}`, the validate hook denies a `vetoed` call,
-/// the provider is unavailable for a `hook_down` call, and every other call passes.
+/// the provider is unavailable for a `hook_down` call, the mutate hook cancels the run and never
+/// answers for a `cut_in_hook` call, and every other call passes.
 ///
 /// Its post-assistant hook cancels the run (through `cancel`, the loop's immediate cancel) when
 /// the answer's text says "cancel me": a caller's cancel landing after the model's answer is
@@ -6020,6 +6086,13 @@ impl broca_core::hooks::HookPlane for HarnessHooks {
         };
         match (tool.as_str(), phase) {
             ("hook_down", _) => Err(broca_core::hooks::HookUnavailable),
+            // The caller cancels while the mutate hook still runs, so the hook is cut short.
+            ("cut_in_hook", Phase::Mutate) => {
+                if let Some(cancel) = &self.cancel {
+                    cancel.cancel();
+                }
+                std::future::pending().await
+            }
             ("mutated", Phase::Mutate) => Ok(HookAnswer::Mutate {
                 input: json!({"path": "mutated"}),
                 note: Some("rewritten by the harness hook".into()),
@@ -6286,6 +6359,63 @@ fn cancel_before_batch_scenario() -> Scenario {
             text_step("a2", "never reached"),
         ],
     }
+}
+
+/// A caller's cancel that cuts a pre-tool hook short: no call of the batch is sent, each gets its
+/// not-run result, the plane hears the batch ended, and the run ends cancelled.
+#[tokio::test]
+async fn a_cancel_that_cuts_a_pre_tool_hook_short_closes_the_batch_unsent() {
+    let tools = vec![
+        tool("cut_in_hook", ExecutionMode::Parallel),
+        tool("read", ExecutionMode::Parallel),
+    ];
+    let scenario = Scenario {
+        input: vec![user("run it")],
+        manifest: Some(hooked_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "cut_in_hook", json!({"x": 1})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "never asked for"),
+        ],
+    };
+    let outcome = TEST_CANCEL
+        .scope(CancellationToken::new(), new_loop(&scenario))
+        .await;
+    assert!(
+        !outcome.calls.iter().any(|call| call.contains("dispatch")),
+        "nothing is sent: {:?}",
+        outcome.calls
+    );
+    assert_eq!(
+        outcome.calls.last().map(String::as_str),
+        Some("\"batch_finished\""),
+        "the plane hears the batch ended: {:?}",
+        outcome.calls
+    );
+    let named = |name: &str| -> Vec<&Value> {
+        outcome
+            .records
+            .iter()
+            .filter_map(|record| record.get(name))
+            .collect()
+    };
+    assert_eq!(
+        named("ToolOutcome").len(),
+        2,
+        "each call has its outcome: {:?}",
+        outcome.records
+    );
+    let end = named("RunEnd");
+    assert_eq!(end.len(), 1, "{:?}", outcome.records);
+    assert_eq!(end[0]["reason"], "cancelled", "{}", end[0]);
 }
 
 #[tokio::test]

@@ -7,10 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{
-    run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, FileLeaseStore, FileWalStore,
-    OutputEvent, RunError, RunSummary, StartMode, WalStore,
-};
+use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, WalStore};
 use broca_protocol::content::ContentBlock;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId, SubmissionRequest};
 use broca_session_store::backend::MemoryBackend;
@@ -19,7 +16,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::tests::{auth_failure, executor, request, texts, Gated};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, RunKind};
+use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
 
 /// Turns async test functions that take a `Cipher` into tests run once in each mode, as the
@@ -1064,7 +1061,6 @@ async fn an_agents_named_notice_is_kept_alike() {
 struct Module {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
-    wal: Arc<FileWalStore>,
     key: BindIdentity,
     /// The caller whose sends reach the module's session.
     caller: super::tests::Caller,
@@ -1078,32 +1074,29 @@ impl Drop for Module {
 
 pub(super) const IDLE: Duration = Duration::from_millis(100);
 
-async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
-    module_step_events(on, steps, None, None).await
+async fn module(steps: Vec<Vec<NormalizedEvent>>) -> Module {
+    module_step_events(steps, None, None).await
 }
 
 async fn module_step_events(
-    on: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     cipher: Option<broca_session_store::keys::Cipher>,
     step_events: Option<Arc<crate::step_events::StepEvents>>,
 ) -> Module {
-    module_options(on, steps, cipher, step_events, IDLE, None).await
+    module_options(steps, cipher, step_events, IDLE, None).await
 }
 
 async fn module_options(
-    on: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     cipher: Option<broca_session_store::keys::Cipher>,
     step_events: Option<Arc<crate::step_events::StepEvents>>,
     idle_ttl: Duration,
     gate: Option<Arc<Notify>>,
 ) -> Module {
-    module_options_with_render(on, steps, cipher, step_events, idle_ttl, gate, None).await
+    module_options_with_render(steps, cipher, step_events, idle_ttl, gate, None).await
 }
 
 async fn module_options_with_render(
-    on: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     cipher: Option<broca_session_store::keys::Cipher>,
     step_events: Option<Arc<crate::step_events::StepEvents>>,
@@ -1120,10 +1113,6 @@ async fn module_options_with_render(
     ));
     let _ = std::fs::remove_dir_all(&dir);
     // The WAL store's folder sits in the state root `dir`, beside the new storage.
-    let wal = Arc::new(match cipher {
-        Some(_) => FileWalStore::with_config(dir.join("wal"), broca_wal::WalConfig::OVERHAUL),
-        None => FileWalStore::new(dir.join("wal")),
-    });
     let mut store_loop = executor(steps.clone(), gate.clone());
     store_loop.provider.render_config = render_config;
     let executor: Arc<dyn RunExecutor> = Arc::new(store_loop);
@@ -1138,7 +1127,6 @@ async fn module_options_with_render(
     .unwrap();
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         executor,
     )
     .with_idle_ttl(idle_ttl)
@@ -1146,17 +1134,11 @@ async fn module_options_with_render(
     if let Some(events) = step_events {
         opener = opener.with_step_events(events);
     }
-    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
-    let registry = if on {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
+    let registry = LineageRegistry::new(Arc::new(opener));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Module {
         dir,
         registry,
-        wal,
         key,
         caller: Default::default(),
     }
@@ -1296,13 +1278,10 @@ impl Module {
 /// the first run.
 #[tokio::test]
 async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
-    let module = module(
-        true,
-        vec![
-            super::tests::text_step("a1", "hello"),
-            super::tests::text_step("a2", "again"),
-        ],
-    )
+    let module = module(vec![
+        super::tests::text_step("a1", "hello"),
+        super::tests::text_step("a2", "again"),
+    ])
     .await;
     assert!(matches!(
         module.send("r1", "first", None).await,
@@ -1313,7 +1292,6 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
         module.head().exists(),
         "the session's head is in the new storage"
     );
-    assert_eq!(module.wal.wal_present(&module.key), Some(false));
     assert!(
         module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE),
         "{}",
@@ -1324,7 +1302,6 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
         SendOutcome::Active { .. }
     ));
     module.closed().await;
-    assert_eq!(module.wal.wal_present(&module.key), Some(false));
     assert_eq!(
         module.store_texts().await,
         ["first", "hello", "second", "again"]
@@ -1384,13 +1361,10 @@ async fn read_json(
 /// a page after a message's id, each pinned. The session's own message ids continue a read.
 #[tokio::test]
 async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
-    let store = module(
-        true,
-        vec![
-            super::tests::text_step("a1", "hello"),
-            super::tests::text_step("a2", "again"),
-        ],
-    )
+    let store = module(vec![
+        super::tests::text_step("a1", "hello"),
+        super::tests::text_step("a2", "again"),
+    ])
     .await;
     assert!(matches!(
         store.send("r1", "first", None).await,
@@ -1514,7 +1488,7 @@ async fn an_ordered_send_queued_behind_a_run_keeps_its_submission_id_on_both_sto
         let gate = Arc::new(Notify::new());
         let mut steps = hello();
         steps.extend(hello());
-        let module = module_options(true, steps, None, None, IDLE, Some(gate.clone())).await;
+        let module = module_options(steps, None, None, IDLE, Some(gate.clone())).await;
         let mut first = request("the running run");
         from_core(&mut first);
         let outcome = module.send_request("running", first, None).await;
@@ -1598,7 +1572,7 @@ async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
 
     let mut observed = Vec::new();
     {
-        let module = module(true, hello()).await;
+        let module = module(hello()).await;
         let mut direct = request("unkeyed direct input");
         from_core(&mut direct);
         let outcome = module.send_request("unkeyed-direct", direct, None).await;

@@ -139,8 +139,7 @@ async fn a_parked_held_run_cancels_alike(cipher: Cipher) {
             };
             db.register_calls(std::slice::from_ref(&call)).unwrap();
             let transport = Arc::new(Withdrawals::default());
-            let withdrawals =
-                HeldWithdrawals::new(db.clone(), side.executor.wal.clone(), transport.clone());
+            let withdrawals = HeldWithdrawals::new(db.clone(), transport.clone());
             withdrawals.bind_stopping_signal(CancellationToken::new());
             withdrawals.with_store_runtime(side.registry.store_runtime().unwrap());
             if at == RunCancelAt::Now {

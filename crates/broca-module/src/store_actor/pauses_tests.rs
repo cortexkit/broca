@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::{OutputEvent, RunError};
 use broca_protocol::{Delivery, PauseReason, RunId, SubmissionId};
 use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_loop::queue;
@@ -21,7 +21,7 @@ use super::tests::{
 };
 use super::StoreActor;
 use crate::actor::{SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob};
+use crate::executor::{RunExecutor, StoreRunEnd, StoreRunError, StoreRunJob};
 
 /// Runs each store job through `inner`. Notifying `stop` drops the loop and returns an
 /// executor error without writing its end, so the actor must record the failure.
@@ -40,14 +40,6 @@ fn cut_off(why: &str) -> StoreRunEnd {
 
 #[async_trait]
 impl RunExecutor for Cutting {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     async fn execute_on_store(
         &self,
         job: StoreRunJob,

@@ -58,7 +58,7 @@ pub struct StoreUnit {
     pub seq: u64,
     pub sub_index: u32,
     pub unit: ControlUnit,
-    pub event: LiveEvent,
+    pub event: Option<LiveEvent>,
     /// Whether a subscriber is sent it. Only a notice whose record names no send is hidden; a
     /// resume checks a cursor against every unit, hidden ones included.
     pub visible: bool,
@@ -72,10 +72,10 @@ struct Units<'a> {
 
 impl Units<'_> {
     fn push(&mut self, unit: ControlUnit, event: LiveEvent) {
-        self.push_visible(unit, event, true);
+        self.push_visible(unit, Some(event), true);
     }
 
-    fn push_visible(&mut self, unit: ControlUnit, event: LiveEvent, visible: bool) {
+    fn push_visible(&mut self, unit: ControlUnit, event: Option<LiveEvent>, visible: bool) {
         let sub_index = self.out.len() as u32;
         self.out.push(StoreUnit {
             seq: self.seq,
@@ -86,9 +86,13 @@ impl Units<'_> {
         });
     }
 
-    /// A unit with no lifecycle event of its own, which today's stream pairs with a reset.
+    /// A unit with no lifecycle event of its own (one tool call of a stored assistant message, a
+    /// step's end, a status). It is sent without an event: under the runner contract a
+    /// `display_reset` tells a reader to drop the live words it shows, and the words this unit
+    /// follows are already stored. Words the run really abandons get their reset on the display
+    /// lane, from the run loop.
     fn plain(&mut self, unit: ControlUnit) {
-        self.push(unit, LiveEvent::DisplayReset);
+        self.push_visible(unit, None, true);
     }
 
     fn boundary(&mut self, mid: &str, event: LiveEvent) {
@@ -805,16 +809,19 @@ impl StoreControl {
             (Some(owner), Some(call)) if first_start => {
                 let mut event = tool_started_event_at(owner.clone(), call, None, None, observed_at);
                 identity.stamp(&mut event);
-                event
+                Some(event)
             }
-            (Some(owner), Some(_)) => finished(owner),
-            _ => LiveEvent::DisplayReset,
+            (Some(owner), Some(_)) => Some(finished(owner)),
+            // A result whose call isn't one the stored assistant message made has no lifecycle
+            // to report.
+            _ => None,
         };
-        units.push(
+        units.push_visible(
             ControlUnit::ToolResult {
                 result: result.clone(),
             },
             event,
+            true,
         );
         if first_start {
             if let Some(owner) = &owner {

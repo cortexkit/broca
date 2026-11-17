@@ -33,7 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use broca_protocol::caller::PauseReason;
 use broca_protocol::BindIdentity;
+use broca_session_store::record::Record;
 use broca_subc::SubcConnection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -557,6 +559,8 @@ struct Daemon {
     connection_file: PathBuf,
     // Only direct credential.get wire probes use a handle; the supervised module uses its grant.
     vault_probe_handle: Option<String>,
+    /// The routing stand-in every run's account decision goes to.
+    routing: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Daemon {
@@ -570,6 +574,7 @@ impl Drop for Daemon {
                 )
             );
         }
+        self.routing.abort();
         broca_test_support::kill_and_reap_tree(self.child.get_mut());
         if !std::thread::panicking() {
             broca_test_support::remove_rig_dir(&self.dir);
@@ -919,6 +924,10 @@ impl Daemon {
         for (key, value) in broca_env {
             config["modules"]["broca"]["env"][*key] = json!(value);
         }
+        // No deployment-key vault here: sessions are stored plain. A provider route adds its
+        // URL overrides to the same file.
+        let mut broca_config = super::stored_log::plain_storage();
+        broca_config["account_selection"] = super::first_offer_routing::broca_config();
         if let Some(route) = provider_route {
             let providers = match route {
                 // Anthropic points at the same capture host; its family appends
@@ -933,18 +942,19 @@ impl Daemon {
                     "atomic-chat": {"base_url": format!("{aimock_base_url}/v1")}
                 }),
             };
-            let override_path = dir.join("provider-overrides.jsonc");
-            setup(
-                "write provider URL override",
-                std::fs::write(
-                    &override_path,
-                    serde_json::to_vec(&json!({ "providers": providers })).unwrap(),
-                )
-                .ok(),
-            )?;
-            config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
-                json!(override_path.to_string_lossy());
+            broca_config["providers"] = providers;
         }
+        let broca_config_path = dir.join("broca.jsonc");
+        setup(
+            "write broca config",
+            std::fs::write(
+                &broca_config_path,
+                serde_json::to_vec(&broca_config).unwrap(),
+            )
+            .ok(),
+        )?;
+        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
+            json!(broca_config_path.to_string_lossy());
         if aft_modules.is_empty() {
             for (key, value) in aft_env {
                 config["modules"]["aft"]["env"][*key] = json!(value);
@@ -1110,11 +1120,14 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
+        // broca asks routing for every run's account, so the stand-in is up before any send.
+        let routing = super::first_offer_routing::serve(&connection_file).await;
         let mut daemon = Daemon {
             child: RefCell::new(child),
             dir,
             connection_file,
             vault_probe_handle,
+            routing,
         };
         // Wait until the broca MODULE is actually LIVE (registered + bindable), not just
         // until subc is up. A supervised module spawns + HELLO-registers ASYNCHRONOUSLY after
@@ -1297,13 +1310,9 @@ impl Daemon {
         unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
     }
 
-    /// The module's WAL directory, under the BROCA_STATE_ROOT the rig gives the module.
-    fn module_wal_dir(&self) -> PathBuf {
-        self.connection_file
-            .parent()
-            .unwrap()
-            .join("broca-state")
-            .join("wal")
+    /// The state root the rig gives the module (its BROCA_STATE_ROOT).
+    fn broca_state_root(&self) -> PathBuf {
+        self.connection_file.parent().unwrap().join("broca-state")
     }
 }
 
@@ -1479,23 +1488,45 @@ impl ConcurrencyProbe {
 /// Poll a module's WAL directory until every marker appears in one file, or time out.
 ///
 /// The durable record is the barrier rather than a wire line: a client can report a state the
-/// WAL has not yet committed, and a test that proceeds on the report races the fsync it
+/// session has not yet stored, and a test that proceeds on the report races the write it
 /// actually depends on.
-async fn wait_for_wal_marker(wal_dir: &Path, markers: &[&str]) -> bool {
-    broca_test_support::wait_until("durable WAL markers", || async {
-        let hit = std::fs::read_dir(wal_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
-            .any(|bytes| {
-                let text = String::from_utf8_lossy(&bytes);
-                markers.iter().all(|m| text.contains(m))
-            });
-        hit.then_some(true)
-            .ok_or_else(|| format!("wal_dir={}, missing markers={markers:?}", wal_dir.display()))
+async fn wait_for_stored(
+    daemon: &Daemon,
+    session: &str,
+    what: &str,
+    holds: impl Fn(&[Record]) -> bool,
+) -> bool {
+    let state_root = daemon.broca_state_root();
+    let identity = client_identity(session);
+    broca_test_support::wait_until(what, || async {
+        let records = super::stored_log::stored_records(&state_root, &identity).await;
+        holds(&records)
+            .then_some(true)
+            .ok_or_else(|| format!("{session}'s stored records: {records:?}"))
     })
     .await
+}
+
+/// The identity `run_client` binds `session` under: the client's own `broca` harness, which the
+/// daemon keys under the unscoped root, since the client's route carries no scope.
+fn client_identity(session: &str) -> BindIdentity {
+    BindIdentity::new(
+        broca_protocol::session::UNSCOPED_SESSION_ROOT,
+        "broca",
+        session,
+    )
+}
+
+/// `session`'s stored records, as `run_client` bound it. Empty while it stored nothing.
+async fn stored_session(daemon: &Daemon, session: &str) -> Vec<Record> {
+    super::stored_log::stored_records(&daemon.broca_state_root(), &client_identity(session)).await
+}
+
+/// Whether `records` hold a pause for re-authentication.
+fn paused_for_sign_in(records: &[Record]) -> bool {
+    records.iter().any(|record| {
+        matches!(record, Record::Pause(pause) if matches!(pause.reason, PauseReason::AuthRequired))
+    })
 }
 
 async fn run_client(
@@ -1781,25 +1812,20 @@ async fn single_client_single_turn_through_the_real_module() {
         result_summary.lines
     );
 
-    // ANTI-FALSE-GREEN 2: the run actually PERSISTED — the module wrote a durable WAL for the
-    // session. A run that merely produced wire events but didn't persist (or never ran) would
-    // leave no WAL.
-    let wal_dir = daemon.module_wal_dir();
+    // ANTI-FALSE-GREEN 2: the run actually PERSISTED: the module stored the session's run to its
+    // end. A run that merely produced wire events but didn't persist (or never ran) would leave
+    // no stored end.
+    let records = stored_session(&daemon, session).await;
     assert!(
-        wal_dir.exists(),
-        "the module's WAL dir should exist after a run ({wal_dir:?})"
-    );
-    let wal_files: Vec<_> = std::fs::read_dir(&wal_dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).collect())
-        .unwrap_or_default();
-    assert!(
-        !wal_files.is_empty(),
-        "the module should have written a durable WAL file for the session ({wal_dir:?})"
+        records
+            .iter()
+            .any(|record| matches!(record, Record::RunEnd(_))),
+        "the module stored the session's run to its end: {records:?}"
     );
     #[cfg(unix)]
     {
-        let state_root = wal_dir.parent().unwrap();
-        let public = broca_test_support::public_tree_entries(state_root).unwrap();
+        let state_root = daemon.broca_state_root();
+        let public = broca_test_support::public_tree_entries(&state_root).unwrap();
         assert!(
             public.is_empty(),
             "state-root entries with group/world permissions: {public:?}"
@@ -1891,65 +1917,45 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
         "the Meta request names the session as its prompt cache scope: {request_body}"
     );
 
-    let mut records = std::fs::read_dir(daemon.module_wal_dir())
-        .expect("module WAL directory exists")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
-        .find_map(|path| {
-            let frames = broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES).ok()?;
-            frames
-                .iter()
-                .any(|frame| {
-                    matches!(
-                        &frame.record,
-                        broca_wal::WalRecord::RunStarted { session: bind, .. }
-                            if bind.session == session
-                    )
-                })
-                .then_some(frames)
-        })
-        .expect("the completed Meta run has a readable WAL");
-    let (run_id, credential_id, frozen_cache_key) = records
-        .iter()
-        .find_map(|frame| match &frame.record {
-            broca_wal::WalRecord::RunStarted {
-                run_id,
-                session: bind,
-                config,
-                ..
-            } if bind.session == session => Some((
-                run_id.clone(),
-                config
-                    .auth_selection
-                    .as_ref()
-                    .map(|selection| selection.credential_id.clone()),
-                config.frozen_render_config.get("prompt_cache_key").cloned(),
-            )),
-            _ => None,
-        })
-        .expect("RunStarted records the Meta credential selection");
-    assert_eq!(credential_id.as_deref(), Some("oauth:meta:test"));
+    let admission =
+        super::stored_log::stored_admissions(&daemon.broca_state_root(), &client_identity(session))
+            .await
+            .into_iter()
+            .next()
+            .expect("the completed Meta run is stored");
     assert_eq!(
-        frozen_cache_key,
-        Some(serde_json::json!(session)),
-        "RunStarted freezes the key, so a resume renders the same scope"
+        admission
+            .auth_selection
+            .as_ref()
+            .map(|selection| selection.credential_id.as_str()),
+        Some("oauth:meta:test"),
+        "the run's start records the Meta credential selection"
+    );
+    assert_eq!(
+        admission.render_config.get("prompt_cache_key"),
+        Some(&serde_json::json!(session)),
+        "the run's start freezes the key, so a resume renders the same scope"
     );
 
-    let facts = broca_core::compute_segments_for_run(
-        &records,
-        &run_id,
-        "meta-muse-e2e",
-        &broca_module_serve::ChargeBasisTable::shipped_defaults(),
-    );
+    // The run's spend fact is written when the run ends, which the client may report first.
+    let state_root = daemon.broca_state_root();
+    let facts = broca_test_support::wait_until("the Meta run's spend fact", || async {
+        let facts: Vec<serde_json::Value> = super::stored_log::stored_spend_facts(&state_root)
+            .into_iter()
+            .filter(|fact| fact["run_id"] == admission.run_id.as_str())
+            .collect();
+        (!facts.is_empty())
+            .then_some(facts)
+            .ok_or_else(|| "no spend fact yet".to_owned())
+    })
+    .await;
     assert_eq!(facts.len(), 1, "one completed turn yields one billing fact");
-    assert_eq!(facts[0].provider, "meta");
-    assert_eq!(facts[0].auth_selection.as_deref(), Some("oauth:meta:test"));
+    assert_eq!(facts[0]["provider"], "meta");
+    assert_eq!(facts[0]["auth_selection"], "oauth:meta:test");
     assert_eq!(
-        facts[0].charge_basis,
-        broca_core::ChargeBasis::SubscriptionIncluded
+        facts[0]["charge_basis"],
+        serde_json::to_value(broca_core::ChargeBasis::SubscriptionIncluded).unwrap()
     );
-    records.clear();
 }
 
 /// An Anthropic OAuth run admitted through the real module speaks as Claude Code: the request the
@@ -2232,67 +2238,24 @@ async fn concurrent_mixed_family_sessions_through_the_real_module_are_isolated()
         }
     }
 
-    // The module hashes the full bind identity into one WAL path per session. Read each WAL back
-    // through the same store API used by the module and ensure durability did not merge payloads.
-    let wal_dir = daemon.module_wal_dir();
-    assert!(
-        wal_dir.exists(),
-        "the module WAL directory exists ({wal_dir:?})"
-    );
-    // Read whatever WALs the module actually wrote, rather than deriving each expected path by
-    // re-hashing the bind identity here. The module canonicalizes the project root before
-    // hashing it, and reproducing that faithfully means matching platform-specific path forms --
-    // so a mismatch shows up as "this session has no WAL", which reads like lost durability
-    // rather than like a test recomputing a name. Enumerating the directory asserts the
-    // property directly: one WAL per session, each holding exactly one session's sentinels.
-    let wal_files: Vec<PathBuf> = std::fs::read_dir(&wal_dir)
-        .expect("read the module WAL directory")
-        .filter_map(|entry| {
-            let path = entry.expect("read WAL directory entry").path();
-            path.extension()
-                .is_some_and(|ext| ext == "wal")
-                .then_some(path)
-        })
-        .collect();
-    assert_eq!(
-        wal_files.len(),
-        slots.len(),
-        "five sessions produced five WALs, found {wal_files:?}"
-    );
-
-    let contents: Vec<String> = wal_files
-        .iter()
-        .map(|path| {
-            let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-            String::from_utf8_lossy(&bytes).into_owned()
-        })
-        .collect();
-
+    // Each session's stored records hold its own sentinels and no other session's: durability
+    // did not merge payloads. Each is read back under its own identity, so a session that stored
+    // nothing reads empty and fails here.
     for slot in slots.iter() {
-        let holders = contents
-            .iter()
-            .filter(|text| text.contains(&slot.tool_result))
-            .count();
-        assert_eq!(
-            holders, 1,
-            "{}'s tool-result sentinel appears in exactly one WAL, found {holders}",
+        let text = format!("{:?}", stored_session(&daemon, &slot.session).await);
+        assert!(
+            text.contains(&slot.tool_result),
+            "{}'s stored records hold its own tool-result sentinel",
             slot.session
         );
-    }
-
-    // The isolation property itself: no single WAL may carry sentinels belonging to two
-    // different sessions, whichever file each session turned out to own.
-    for (index, text) in contents.iter().enumerate() {
-        let owners: Vec<&str> = slots
-            .iter()
-            .filter(|slot| text.contains(&slot.tool_result) || text.contains(&slot.final_text))
-            .map(|slot| slot.session.as_str())
-            .collect();
-        assert_eq!(
-            owners.len(),
-            1,
-            "WAL {index} carries sentinels from {owners:?}, expected exactly one session"
-        );
+        for other in slots.iter().filter(|other| other.session != slot.session) {
+            assert!(
+                !text.contains(&other.tool_result) && !text.contains(&other.final_text),
+                "{}'s stored records carry {}'s sentinels",
+                slot.session,
+                other.session
+            );
+        }
     }
 }
 
@@ -2591,17 +2554,10 @@ async fn a_dead_credential_pauses_the_run_durably() {
         run.lines
     );
 
-    let wal_dir = daemon.module_wal_dir();
-    let paused_on_disk = std::fs::read_dir(&wal_dir)
-        .expect("module wal dir")
-        .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
-        .any(|bytes| {
-            let text = String::from_utf8_lossy(&bytes);
-            text.contains("run_paused") && text.contains("auth_required")
-        });
+    let records = stored_session(&daemon, "dead-cred").await;
     assert!(
-        paused_on_disk,
-        "the pause must be durable in the WAL, not only reported on the wire"
+        paused_for_sign_in(&records),
+        "the pause must be stored, not only reported on the wire: {records:?}"
     );
 }
 
@@ -2800,8 +2756,13 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
 
     // Wait for the pause to be DURABLE before repairing. Repairing while the run is still
     // admitting would leave the test unable to say which state it resumed from.
-    let wal_dir = daemon.module_wal_dir();
-    let paused = wait_for_wal_marker(&wal_dir, &["run_paused", "auth_required"]).await;
+    let paused = wait_for_stored(
+        &daemon,
+        "resume",
+        "a stored sign-in pause",
+        paused_for_sign_in,
+    )
+    .await;
     assert!(
         paused,
         "the first send must pause durably before the repair"
@@ -2821,32 +2782,38 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
         second.lines
     );
 
-    // The discriminating observation. `run_started` alone does NOT vary: a run that never
-    // resumes still has exactly one, because the paused episode already wrote it. What
-    // separates a resumed episode from a still-paused one is that the resumed run RE-ENTERS
-    // the loop -- so the durable tell is a step opening after the pause.
-    let stepped = wait_for_wal_marker(&wal_dir, &["step_started"]).await;
+    // The discriminating observation. A run start alone does NOT vary: a run that never
+    // resumes still has exactly one, because the paused run already wrote it. What separates a
+    // resumed run from a still-paused one is that the resumed run RE-ENTERS the loop, so the
+    // durable tell is a step starting after the pause.
+    let stepped = wait_for_stored(&daemon, "resume", "a step after the pause", |records| {
+        records
+            .iter()
+            .position(|record| paused_for_sign_in(std::slice::from_ref(record)))
+            .is_some_and(|pause| {
+                records[pause..]
+                    .iter()
+                    .any(|record| matches!(record, Record::StepStart(_)))
+            })
+    })
+    .await;
     assert!(
         stepped,
-        "the repaired credential must resume the paused episode into a model step; no \
-         step_started means the run stayed paused"
+        "the repaired credential must resume the paused run into a model step; no step start \
+         after the pause means the run stayed paused"
     );
 
-    // And it must be the SAME episode. A second run_started would mean the repair abandoned
-    // the paused work and began again, losing whatever the first episode had committed.
-    let starts: usize = std::fs::read_dir(&wal_dir)
-        .expect("module wal dir")
-        .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .matches("\"run_started\"")
-                .count()
-        })
-        .sum();
+    // And it must be the SAME run. A second run start would mean the repair abandoned the
+    // paused work and began again, losing whatever the first run had committed.
+    let records = stored_session(&daemon, "resume").await;
+    let starts = records
+        .iter()
+        .filter(|record| matches!(record, Record::RunStart(_)))
+        .count();
     assert_eq!(
         starts, 1,
-        "a resumed lineage carries one run_started; {starts} means the repair started a new \
-         episode instead of continuing the paused one"
+        "a resumed session carries one run start; {starts} means the repair started a new run \
+         instead of continuing the paused one"
     );
 }
 
@@ -2905,17 +2872,14 @@ async fn a_revoked_handle_does_not_change_a_grant_read_of_a_dead_credential() {
     );
 }
 
-/// The WAL text of the one session named `session`, or empty when it wrote nothing.
-fn session_wal_text(wal_dir: &Path, session: &str) -> String {
-    let needle = format!("\"session\":\"{session}\"");
-    std::fs::read_dir(wal_dir)
-        .ok()
+/// The context management each run of `session` froze at its start, in the order the runs
+/// started, as its JSON. Empty when the session stored no run.
+async fn frozen_context_management(daemon: &Daemon, session: &str) -> Vec<serde_json::Value> {
+    super::stored_log::stored_admissions(&daemon.broca_state_root(), &client_identity(session))
+        .await
         .into_iter()
-        .flatten()
-        .filter_map(|entry| std::fs::read(entry.ok()?.path()).ok())
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .find(|text| text.contains(&needle))
-        .unwrap_or_default()
+        .map(|admission| serde_json::to_value(admission.context_management).unwrap())
+        .collect()
 }
 
 /// Poll `run.status` until the session reports idle. A client exits on RUN_FINISHED, a moment
@@ -3035,21 +2999,22 @@ async fn context_management_is_chosen_per_session_and_frozen_at_first_admission(
         transform.lines
     );
 
-    // Durable proof: the none session froze "none" on BOTH admitted episodes (the inherited
-    // one included) and the refused send wrote nothing; the refused sessions wrote no episode.
-    let wal_dir = daemon.module_wal_dir();
-    let none_wal = session_wal_text(&wal_dir, "cm-none");
-    assert_eq!(none_wal.matches("\"type\":\"run_started\"").count(), 2);
+    // Durable proof: the none session froze "none" on BOTH admitted runs (the inherited one
+    // included) and the refused send stored nothing; the refused sessions stored no run.
     assert_eq!(
-        none_wal.matches("\"context_management\":\"none\"").count(),
-        2,
-        "each admitted episode freezes the session's value"
+        frozen_context_management(&daemon, "cm-none").await,
+        vec![json!("none"), json!("none")],
+        "each admitted run freezes the session's value"
     );
-    assert!(session_wal_text(&wal_dir, "cm-default").contains(r#""context_management":"none""#));
+    assert_eq!(
+        frozen_context_management(&daemon, "cm-default").await,
+        vec![json!("none")]
+    );
     for refused in ["cm-compaction", "cm-transform"] {
-        assert!(
-            !session_wal_text(&wal_dir, refused).contains("\"type\":\"run_started\""),
-            "{refused} was refused before RunStarted"
+        assert_eq!(
+            frozen_context_management(&daemon, refused).await,
+            Vec::<serde_json::Value>::new(),
+            "{refused} was refused before its run started"
         );
     }
 }

@@ -20,18 +20,6 @@ use std::time::Duration;
 
 use super::{CutLockMode, LineageKey, LineageRegistry, MoveSessionGuard};
 
-/// What runs `session.move_to_store` for the registry's sessions.
-#[async_trait::async_trait]
-pub trait StoreMover: Send + Sync {
-    /// Moves the session `key` into the new storage: into the root of the class its WAL's
-    /// folder has, or of `class` when the operator asked for one.
-    async fn move_to_store(
-        &self,
-        key: &LineageKey,
-        class: Option<broca_wal::StorageClass>,
-    ) -> Result<serde_json::Value, MoveRefusal>;
-}
-
 /// A move refused or aborted: its error code, message and detail, as the client receives them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MoveRefusal {
@@ -66,44 +54,7 @@ pub(crate) struct MoveFences {
     read_ended: Arc<tokio::sync::Notify>,
 }
 
-/// One lease-free read counted against its session while it runs.
-pub(crate) struct InFlightRead {
-    address: String,
-    reads: Arc<Mutex<HashMap<String, usize>>>,
-    read_ended: Arc<tokio::sync::Notify>,
-}
-
-impl Drop for InFlightRead {
-    fn drop(&mut self) {
-        let mut reads = self.reads.lock().unwrap();
-        if let Some(count) = reads.get_mut(&self.address) {
-            *count -= 1;
-            if *count == 0 {
-                reads.remove(&self.address);
-            }
-        }
-        drop(reads);
-        self.read_ended.notify_waiters();
-    }
-}
-
 impl MoveFences {
-    /// Counts a lease-free read of `key` until the returned guard drops.
-    pub(crate) fn read(&self, key: &LineageKey) -> InFlightRead {
-        let address = broca_core::session_addr(key);
-        *self
-            .reads
-            .lock()
-            .unwrap()
-            .entry(address.clone())
-            .or_default() += 1;
-        InFlightRead {
-            address,
-            reads: Arc::clone(&self.reads),
-            read_ended: Arc::clone(&self.read_ended),
-        }
-    }
-
     /// How today's storage refuses `key` while a move in this process holds it, or startup
     /// couldn't settle its move: as moving, which a caller may retry.
     pub(crate) fn refusal(&self, key: &LineageKey) -> Option<super::OpenError> {
@@ -193,39 +144,6 @@ impl StoreMoveFence {
 }
 
 impl LineageRegistry {
-    /// Refuses the sessions at `addresses` (startup's unsettled moves) until the process
-    /// restarts: their journals stay for an operator to look at.
-    pub fn refuse_unsettled_moves(&self, addresses: impl IntoIterator<Item = String>) {
-        self.inner
-            .store_moves
-            .unsettled
-            .lock()
-            .unwrap()
-            .extend(addresses);
-    }
-
-    /// Installs what runs `session.move_to_store`. Only the first installation counts.
-    pub fn set_store_mover(&self, mover: Arc<dyn StoreMover>) {
-        let _ = self.inner.store_mover.set(mover);
-    }
-
-    /// Runs `session.move_to_store` for `key`, into the root of `class` when the operator asked
-    /// for one, or refuses `store_unavailable` when this module keeps no sessions in the new
-    /// storage.
-    pub async fn move_to_store(
-        &self,
-        key: &LineageKey,
-        class: Option<broca_wal::StorageClass>,
-    ) -> Result<serde_json::Value, MoveRefusal> {
-        match self.inner.store_mover.get() {
-            Some(mover) => mover.move_to_store(key, class).await,
-            None => Err(MoveRefusal::new(
-                "store_unavailable",
-                "this module keeps no sessions in the new storage",
-            )),
-        }
-    }
-
     /// Fences `key` for a move; see the module's description. `leases` is the store the
     /// session's lease is taken from when no actor hands one over.
     pub async fn fence_store_move(
@@ -284,31 +202,5 @@ impl LineageRegistry {
             return Err(FenceRefusal::Busy("reads_in_flight".into()));
         }
         Ok(fence)
-    }
-
-    /// Forgets what the registry keeps of `key`'s copy in today's storage, once the new storage
-    /// owns the session: its read proofs, run-state and dispatch facts, sender, ownership and
-    /// notice caches, and its idle transport.
-    pub fn forget_moved_session(&self, key: &LineageKey) {
-        self.handle().stop_idle_warm(key, "moved");
-        self.inner.opener.retire_session_transport(key);
-        self.inner.read_only_lineages.lock().unwrap().remove(key);
-        self.invalidate_history_caches_for_move(key);
-        self.inner.cache.remove(key);
-    }
-
-    fn invalidate_history_caches_for_move(&self, key: &LineageKey) {
-        self.inner.read_proofs.lock().unwrap().remove(key);
-        self.inner.dispatch_cache.lock().unwrap().remove(key);
-        self.inner.frozen_senders.lock().unwrap().remove(key);
-        self.inner.mode3_logs.lock().unwrap().remove(key);
-        self.inner.attribution_notices.lock().unwrap().remove(key);
-        self.inner
-            .unbound_cursor_notices
-            .lock()
-            .unwrap()
-            .remove(key);
-        self.inner.live_ownership.lock().unwrap().remove(key);
-        self.inner.owner_snapshots.lock().unwrap().remove(key);
     }
 }

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason, ToolCall};
 use broca_protocol::{
     BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, ToolCallId, Usage,
@@ -68,18 +68,28 @@ fn tool_gate() -> ToolGate {
 /// starts in the new storage, in mode `cipher`.
 async fn side_at(
     dir: std::path::PathBuf,
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     tools: Option<ToolGate>,
     cipher: Cipher,
 ) -> Side {
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    side_answering(dir, steps, tools, cipher, "file contents").await
+}
+
+/// [`side_at`], whose `read` tool answers `tool_text`.
+async fn side_answering(
+    dir: std::path::PathBuf,
+    steps: Vec<Vec<NormalizedEvent>>,
+    tools: Option<ToolGate>,
+    cipher: Cipher,
+    tool_text: &str,
+) -> Side {
     let planes = Planes {
         tool_gate: tools,
         ..Planes::default()
     };
     let mut store_loop = executor(steps.clone(), None);
     store_loop.planes = planes.clone();
+    store_loop.tool_text = tool_text.into();
     let executor: Arc<dyn RunExecutor> = Arc::new(store_loop);
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
@@ -89,24 +99,14 @@ async fn side_at(
     )
     .await
     .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal,
-        None,
-    );
-    let registry = if store {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(Arc::new(runtime)),
+    ));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Side {
         dir,
@@ -125,19 +125,14 @@ async fn pair(
 ) -> (Side, Option<ToolGate>) {
     let store_gate = gated.then(tool_gate);
     (
-        side_at(scratch(), true, steps(), store_gate.clone(), cipher).await,
+        side_at(scratch(), steps(), store_gate.clone(), cipher).await,
         store_gate,
     )
 }
 
 /// A side on the new storage, over the script.
-async fn side(
-    store: bool,
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<ToolGate>,
-    cipher: Cipher,
-) -> Side {
-    side_at(scratch(), store, steps, gate, cipher).await
+async fn side(steps: Vec<Vec<NormalizedEvent>>, gate: Option<ToolGate>, cipher: Cipher) -> Side {
+    side_at(scratch(), steps, gate, cipher).await
 }
 
 impl Side {
@@ -251,15 +246,24 @@ fn reply(page: Result<ToolCallsPage, ServeError>) -> Value {
 
 /// A step that calls the `read` tool once for each of `ids`, in order.
 fn reads(id: &str, ids: &[&str]) -> Vec<NormalizedEvent> {
-    let calls = ids
+    let calls: Vec<_> = ids
         .iter()
         .enumerate()
-        .map(|(n, call)| {
+        .map(|(n, call)| (*call, json!({ "n": n })))
+        .collect();
+    reads_with(id, &calls)
+}
+
+/// A step that calls the `read` tool once for each `(id, input)` of `calls`, in order.
+fn reads_with(id: &str, calls: &[(&str, Value)]) -> Vec<NormalizedEvent> {
+    let calls = calls
+        .iter()
+        .map(|(call, input)| {
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
                 tool_call_id: ToolCallId((*call).into()),
                 tool_name: "read".into(),
-                input: json!({ "n": n }).into(),
+                input: input.clone().into(),
             })
         })
         .collect();
@@ -333,7 +337,7 @@ async fn finished_runs_list_their_calls_alike() {
         );
         assert_eq!(store.pages("r1", Some(1)).await.len(), 3);
         // A session's cursors name its own log: another session's cursor is refused.
-        let other = side(true, steps(), None, cipher).await;
+        let other = side(steps(), None, cipher).await;
         for (run, text) in [("r1", "first"), ("r2", "second")] {
             other.send(run, text).await;
             other.idle().await;
@@ -427,7 +431,7 @@ async fn a_batch_in_flight_lists_alike() {
 
 /// Runs a session on `dir` until its run's call is dispatched and waiting for its tool, then
 /// drops every task where it waits, as a crash does: nothing records the call's result.
-async fn crash_mid_dispatch(dir: std::path::PathBuf, store: bool, cipher: Cipher) {
+async fn crash_mid_dispatch(dir: std::path::PathBuf, cipher: Cipher) {
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -435,7 +439,7 @@ async fn crash_mid_dispatch(dir: std::path::PathBuf, store: bool, cipher: Cipher
             .unwrap();
         let side = runtime.block_on(async {
             let steps = vec![read_step("a1"), text_step("a2", "done")];
-            let mut side = side_at(dir, store, steps, Some(tool_gate()), cipher).await;
+            let mut side = side_at(dir, steps, Some(tool_gate()), cipher).await;
             side.owns_dir = false;
             assert!(matches!(
                 side.send("r1", "first").await,
@@ -467,8 +471,8 @@ async fn crash_mid_dispatch(dir: std::path::PathBuf, store: bool, cipher: Cipher
 async fn a_call_a_crash_cut_off_lists_as_indeterminate_alike() {
     for cipher in Cipher::ALL {
         let store_dir = scratch();
-        crash_mid_dispatch(store_dir.clone(), true, cipher).await;
-        let store = side_at(store_dir, true, Vec::new(), None, cipher).await;
+        crash_mid_dispatch(store_dir.clone(), cipher).await;
+        let store = side_at(store_dir, Vec::new(), None, cipher).await;
         assert!(store.stored_in(cipher), "{}", cipher.label());
         let before = store.pages("r1", None).await;
         assert!(store.registry.slot_state(&store.key).is_some());
@@ -491,4 +495,102 @@ async fn a_call_a_crash_cut_off_lists_as_indeterminate_alike() {
             "the open recorded the call's unknown-outcome result"
         );
     }
+}
+
+/// A page stops at the byte target before a call that would cross it, and a call larger than the
+/// target is served alone and whole: arguments are never cut to fit.
+#[tokio::test]
+async fn pages_keep_their_byte_target_and_serve_an_oversized_call_whole() {
+    let large = "a".repeat(1_700_000);
+    let oversized = "b".repeat(3_200_000);
+    let steps = vec![
+        reads_with(
+            "a1",
+            &[
+                ("c1", json!({ "content": large })),
+                ("c2", json!({ "content": large })),
+            ],
+        ),
+        reads_with("a2", &[("big", json!({ "content": oversized }))]),
+        text_step("a3", "done"),
+    ];
+    let store = side(steps, None, Cipher::None).await;
+    assert!(matches!(
+        store.send("r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    store.idle().await;
+    let mut after = None;
+    let mut listed = Vec::new();
+    loop {
+        let page = store.calls("r1", after, None).await.unwrap();
+        let ids: Vec<_> = page
+            .calls
+            .iter()
+            .map(|call| call.tool_call_id.clone())
+            .collect();
+        for call in &page.calls {
+            listed.push((
+                call.tool_call_id.clone(),
+                call.args["content"].as_str().unwrap().len(),
+            ));
+        }
+        assert_eq!(ids.len(), 1, "each call fills a page on its own: {ids:?}");
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        listed,
+        [
+            ("c1".to_owned(), 1_700_000),
+            ("c2".to_owned(), 1_700_000),
+            ("big".to_owned(), 3_200_000),
+        ]
+    );
+}
+
+/// A cursor whose members were changed after the module issued it is refused, naming `after`,
+/// even when it still names a real call of the run.
+#[tokio::test]
+async fn a_cursor_changed_after_issue_is_refused() {
+    let steps = vec![reads("a1", &["c1", "c2", "c3"]), text_step("a2", "done")];
+    let store = side(steps, None, Cipher::None).await;
+    store.send("r1", "first").await;
+    store.idle().await;
+    let first = store.calls("r1", None, Some(1)).await.unwrap();
+    let issued = first.next.unwrap();
+    let mut cursor: Value = serde_json::from_str(&issued).expect("a cursor is a JSON object");
+    let changed = cursor
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .find_map(|value| value.as_u64().map(|number| (value, number)))
+        .map(|(value, number)| *value = json!(number + 1));
+    assert!(
+        changed.is_some(),
+        "the cursor has a number to change: {issued}"
+    );
+    match store
+        .calls("r1", Some(serde_json::to_string(&cursor).unwrap()), Some(1))
+        .await
+    {
+        Err(ServeError::InvalidParams { field, .. }) => assert_eq!(field, "after"),
+        other => panic!("a changed cursor was served: {other:?}"),
+    }
+}
+
+/// A page names each call's result by its size only: the result's content never appears.
+#[tokio::test]
+async fn a_page_never_holds_a_results_content() {
+    const SECRET: &str = "TOOL-RESULT-CONTENT-MUST-NOT-LEAK-7f52e3";
+    let steps = vec![reads("a1", &["c1"]), text_step("a2", "done")];
+    let store = side_answering(scratch(), steps, None, Cipher::None, SECRET).await;
+    store.send("r1", "first").await;
+    store.idle().await;
+    let page = store.calls("r1", None, None).await.unwrap();
+    let body = serde_json::to_string(&page).unwrap();
+    assert!(!body.contains(SECRET), "{body}");
+    assert!(page.calls[0].result_bytes.unwrap() >= SECRET.len() as u64);
 }

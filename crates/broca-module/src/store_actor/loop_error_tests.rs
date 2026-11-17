@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use broca_core::provider::{Provider, StubProvider};
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
+use broca_core::{FileLeaseStore, OutputEvent, RunError};
 use broca_protocol::request::CallOptions;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId};
 use broca_session_loop::LoopError;
@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, Notify};
 use super::tests::{request, text_step, Caller};
 use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{
-    RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+    RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
 };
 use crate::registry::LineageRegistry;
 use crate::serve::ServeHandler as _;
@@ -66,14 +66,6 @@ struct FailingExecutor {
 
 #[async_trait]
 impl RunExecutor for FailingExecutor {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -213,7 +205,6 @@ impl Side {
         executor: Arc<FailingExecutor>,
     ) -> Self {
         let executor: Arc<dyn RunExecutor> = executor;
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let runtime = crate::store_open::StoreRuntime::open(
             &dir,
             broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -222,20 +213,14 @@ impl Side {
         )
         .await
         .unwrap();
-        let registry = LineageRegistry::new_with_reader(
-            Arc::new(
-                crate::opener::DefaultOpener::new(
-                    Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                    wal.clone(),
-                    executor,
-                )
-                .with_idle_ttl(IDLE)
-                .with_store_runtime(Arc::new(runtime)),
-            ),
-            wal,
-            None,
-        )
-        .with_store_new_sessions();
+        let registry = LineageRegistry::new(Arc::new(
+            crate::opener::DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                executor,
+            )
+            .with_idle_ttl(IDLE)
+            .with_store_runtime(Arc::new(runtime)),
+        ));
         Self {
             dir,
             registry,

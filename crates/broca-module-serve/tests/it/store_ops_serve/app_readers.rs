@@ -6,17 +6,22 @@ const STRANGER: &str = "synthetic-stranger";
 
 pub(super) struct RunGate {
     held: std::sync::atomic::AtomicBool,
-    entered: tokio::sync::Semaphore,
-    release: tokio::sync::Semaphore,
+    pub(super) entered: tokio::sync::Semaphore,
+    pub(super) release: tokio::sync::Semaphore,
 }
 
 impl RunGate {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             held: true.into(),
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
         })
+    }
+
+    /// Holds the next model request too: the gate holds only the first one it sees.
+    pub(super) fn hold_next(&self) {
+        self.held.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -93,7 +98,7 @@ const READS: [&str; 7] = [
     "session.subscribe",
 ];
 
-fn principal(module: &str) -> Principal {
+pub(super) fn principal(module: &str) -> Principal {
     Principal::Reserved {
         module_id: module.into(),
     }
@@ -572,7 +577,7 @@ async fn app_readers_switch_on_at_acceptance_without_changing_model_request_byte
     }
 }
 
-async fn send_wire(
+pub(super) async fn send_wire(
     rig: &mut Rig,
     channel: u16,
     id: &str,
@@ -600,7 +605,7 @@ async fn refresh_wire(rig: &mut Rig, plan: &Value, generation: u64) -> Frame {
     .await
 }
 
-fn response(frame: &Frame) -> Value {
+pub(super) fn response(frame: &Frame) -> Value {
     assert_eq!(
         frame.header.ty,
         FrameType::Response,
@@ -700,7 +705,7 @@ async fn app_readers_send_status_uses_current_senders_and_never_grants_writes() 
 }
 
 #[tokio::test]
-async fn app_readers_malformed_admission_and_legacy_storage_write_nothing() {
+async fn app_readers_malformed_admission_writes_nothing() {
     let mut rig = Rig::start("app-readers-shape", vec![text_step("a", "answer")]).await;
     rig.registry.set_plan_admitter(Arc::new(EmptyAdmitter));
     rig.bind_session(1, core()).await;
@@ -738,123 +743,6 @@ async fn app_readers_malformed_admission_and_legacy_storage_write_nothing() {
         assert_eq!(
             rig.registry.plan_view(&rig.key).await.unwrap().unwrap(),
             before
-        );
-    }
-    let mut legacy = crate::delivery_rig::Rig::start("app-readers-legacy").await;
-    legacy.bind_as(7, Some(core())).await;
-    legacy.registry().set_plan_admitter(Arc::new(EmptyAdmitter));
-    legacy
-        .script
-        .push(&[crate::delivery_rig::Step::Text("synthetic legacy answer")]);
-    response(
-        &legacy
-            .send("legacy-first", "synthetic legacy prompt", None)
-            .await,
-    );
-    legacy.wait_idle().await;
-    let bytes = legacy.wal_bytes();
-    assert!(
-        !bytes.is_empty(),
-        "the session is already kept on today's storage"
-    );
-    for op in ["session.send", "session.refresh"] {
-        let params = if op == "session.send" {
-            json!({"send_id":"legacy","prompt":"synthetic","model":{"provider":"fake","model":"fake"},"plan":valid})
-        } else {
-            json!({"plan":valid,"generation":1,"policy":"immediately"})
-        };
-        let refused = legacy
-            .request(7, json!({"method":op,"params":params}))
-            .await;
-        let body: Value = serde_json::from_slice(&refused.body).unwrap();
-        assert_eq!(body["code"], "invalid_params", "{body}");
-        assert_eq!(body["detail"]["field"], "plan.readers");
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("today's storage"));
-        assert_eq!(legacy.wal_bytes(), bytes, "{op} wrote legacy storage");
-    }
-}
-
-#[tokio::test]
-async fn app_readers_never_fall_back_to_legacy_storage_on_creation() {
-    let rig = Rig::start("app-readers-no-fallback", vec![]).await;
-    for missing_runtime in [false, true] {
-        let (registry, wal) = if missing_runtime {
-            let wal = Arc::new(FileWalStore::new(rig.dir.join("no-runtime-wal")));
-            let executor = Arc::new(StoreLoop {
-                provider: broca_core::provider::StubProvider::new(vec![]),
-                gate: None,
-                requests: Default::default(),
-                compaction: Arc::new(ReadyProvider::default()),
-                marks: None,
-                attempts: false,
-            });
-            let opener = DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(rig.dir.join("no-runtime-leases"))),
-                wal.clone(),
-                executor,
-            );
-            (
-                Arc::new(
-                    LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None)
-                        .with_store_new_sessions(),
-                ),
-                wal,
-            )
-        } else {
-            (rig.registry.clone(), rig.wal.clone())
-        };
-        let mut req = request("synthetic prompt");
-        if !missing_runtime {
-            req.input[0]
-                .content
-                .push(ContentBlock::Media(broca_protocol::MediaRef {
-                    kind: broca_protocol::MediaKind::Image,
-                    mime: "image/png".into(),
-                    byte_size: 68,
-                    sha256: "a".repeat(64),
-                    width: Some(1),
-                    height: Some(1),
-                }));
-        }
-        let outcome = registry
-            .route_submission_with_order(
-                &rig.key,
-                RunId("fallback".into()),
-                req,
-                RunKind::FreshOrResume,
-                SendKey::Minted,
-                false,
-                broca_protocol::Delivery::Queue,
-                Some(frozen(&readers_plan(Some(json!([])), false))),
-                None,
-                None,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                outcome,
-                SendOutcome::DeliveryRefused {
-                    code: "invalid_params",
-                    field: "plan.readers",
-                    ..
-                }
-            ),
-            "{outcome:?}"
-        );
-        assert!(registry.slot_state(&rig.key).is_none());
-        assert_eq!(wal.wal_present(&rig.key), Some(false));
-        assert!(
-            broca_wal::session_storage_class(&rig.dir, &broca_core::session_addr(&rig.key))
-                .unwrap()
-                .is_none()
         );
     }
 }

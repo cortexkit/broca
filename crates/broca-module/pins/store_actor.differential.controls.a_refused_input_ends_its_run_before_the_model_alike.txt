@@ -58,9 +58,7 @@ Active {
     }
   },
   {
-    "event": {
-      "type": "display_reset"
-    },
+    "event": null,
     "unit": {
       "error": {
         "class": "permanent",

@@ -3305,7 +3305,9 @@ enum LiveSubscribeEventRef<'a> {
         #[serde(serialize_with = "serialize_control_unit")]
         unit: &'a broca_protocol::caller::ControlUnit,
         seq: u64,
-        event: &'a cortexkit_role_llm_runner::live::LiveEvent,
+        /// Absent on a unit with no lifecycle event of its own.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        event: Option<&'a cortexkit_role_llm_runner::live::LiveEvent>,
     },
     Display {
         event: &'a DisplayEvent,
@@ -3328,7 +3330,7 @@ pub fn encode_live_subscribe_control(
     sub_index: u32,
     unit: &broca_protocol::caller::ControlUnit,
     seq: u64,
-    event: &cortexkit_role_llm_runner::live::LiveEvent,
+    event: Option<&cortexkit_role_llm_runner::live::LiveEvent>,
 ) -> serde_json::Result<Vec<u8>> {
     encode_live_subscribe_control_with_cursor(CursorWire::new(wal_seq, sub_index), unit, seq, event)
 }
@@ -3338,7 +3340,7 @@ pub fn encode_live_subscribe_control_with_cursor(
     cursor: CursorWire,
     unit: &broca_protocol::caller::ControlUnit,
     seq: u64,
-    event: &cortexkit_role_llm_runner::live::LiveEvent,
+    event: Option<&cortexkit_role_llm_runner::live::LiveEvent>,
 ) -> serde_json::Result<Vec<u8>> {
     if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
         let mut status =
@@ -3403,7 +3405,8 @@ mod held_status_event_tests {
             },
         ] {
             let before =
-                encode_live_subscribe_control(7, 0, &unit, 12, &LiveEvent::DisplayReset).unwrap();
+                encode_live_subscribe_control(7, 0, &unit, 12, Some(&LiveEvent::DisplayReset))
+                    .unwrap();
             let mut cursor = CursorWire::new(7, 0);
             cursor.incarnation = Some("lineage".into());
             cursor.digest = Some("0123456789abcdef".into());
@@ -3411,7 +3414,7 @@ mod held_status_event_tests {
                 cursor,
                 &unit,
                 12,
-                &LiveEvent::DisplayReset,
+                Some(&LiveEvent::DisplayReset),
             )
             .unwrap();
             let mut stripped = String::from_utf8(after).unwrap();
@@ -3447,7 +3450,8 @@ mod held_status_event_tests {
                 status: Box::new(RunStatus::new("active").with_held_calls(calls.clone())),
             };
             let bytes =
-                encode_live_subscribe_control(7, 0, &unit, 12, &LiveEvent::DisplayReset).unwrap();
+                encode_live_subscribe_control(7, 0, &unit, 12, Some(&LiveEvent::DisplayReset))
+                    .unwrap();
             let frame: cortexkit_role_llm_runner::subscribe::SubscribeEvent =
                 serde_json::from_slice(&bytes).unwrap();
             assert_eq!(frame.kind, "control");
@@ -7287,7 +7291,7 @@ mod live_subscribe_tests {
         let unit = ControlUnit::MessageBoundary { mid: "m3".into() };
         let old = encode_subscribe_control(4, 2, &unit).unwrap();
         let event = LiveEvent::MessageFinished(MessageEvent::new("m3"));
-        let live = encode_live_subscribe_control(4, 2, &unit, 12, &event).unwrap();
+        let live = encode_live_subscribe_control(4, 2, &unit, 12, Some(&event)).unwrap();
         let mut expected = old;
         assert_eq!(expected.pop(), Some(b'}'));
         expected.extend_from_slice(br#","seq":12,"event":{"type":"message_finished","mid":"m3"}}"#);
@@ -7388,7 +7392,7 @@ mod subscribe_caller_text_tests {
                 serde_json::to_string(&event).unwrap()
             );
             assert_eq!(
-                encode_live_subscribe_control(11, 2, &unit, 7, &event).unwrap(),
+                encode_live_subscribe_control(11, 2, &unit, 7, Some(&event)).unwrap(),
                 expected_live.as_bytes()
             );
             assert_eq!(serde_json::to_vec(&unit).unwrap(), stored);

@@ -13,7 +13,7 @@ impl Scratch {
         let _ = std::fs::remove_dir_all(&root);
         let config_dir = root.join("config/cortexkit/broca");
         std::fs::create_dir_all(&config_dir).unwrap();
-        // Loading this config emits a warning, exposing accidental config/logger startup.
+        // An obsolete key: loading this config warns, exposing accidental config/logger startup.
         std::fs::write(
             config_dir.join("broca.jsonc"),
             r#"{"wal_archive_idle_retention_days": 7}"#,

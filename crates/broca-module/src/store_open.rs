@@ -714,7 +714,22 @@ impl StoreRuntime {
             // A session on the current compaction contract keeps text delivered with a tool
             // result apart from the result, as every new session is. It is created in the mode
             // `session_storage.encryption` chose.
-            Session::create(backend, addr, triple, self.deployment(), false).await
+            // A session created where an expired one was deleted continues past the deleted
+            // one's history version, so a reader holding that version sees a new history.
+            let history_version = floors
+                .iter()
+                .map(broca_session_store::expired::Marker::next_history_version)
+                .max()
+                .unwrap_or(0);
+            Session::create_with_history_version(
+                backend,
+                addr,
+                triple,
+                self.deployment(),
+                false,
+                history_version,
+            )
+            .await
         } else {
             Session::load(backend, addr, &triple, self.deployment()).await
         }
@@ -754,9 +769,7 @@ impl StoreRuntime {
             actor = actor.with_step_events(events);
         }
         if let Some(service) = registry.retention_service() {
-            if !service.defer_overhaul() {
-                actor = actor.with_retention_clock(service.clock.clone());
-            }
+            actor = actor.with_retention_clock(service.clock.clone());
         }
         if create.is_some() {
             actor = actor.created_here();
@@ -797,13 +810,10 @@ impl StoreRuntime {
             }
         });
         Ok(ActorHandle {
-            media_head: None,
             gen,
             tx,
             // The new storage keeps no WAL, so there is no WAL offset to share.
-            durable_head: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             run_in_flight,
-            approvals: Arc::new(crate::approval_state::ApprovalState::default()),
             first_episode,
         })
     }

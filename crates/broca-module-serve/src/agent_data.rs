@@ -292,6 +292,7 @@ struct Driver {
     door: Arc<dyn SessionDoor>,
 }
 
+mod snapshot;
 mod store;
 mod stream;
 struct Incoming {
@@ -562,7 +563,7 @@ impl MoveDriver for Driver {
         )
         .await
         .map_err(broca_module::move_files::store::failure)?;
-        let checks = broca_session_convert::verify::store_snapshot(&actual, runtime.deployment())
+        let checks = snapshot::store_snapshot(&actual, runtime.deployment())
             .await
             .map_err(unavailable)?;
         if export.checks != checks {
@@ -1075,8 +1076,7 @@ mod operational_port_tests {
             root.join("wal"),
             broca_wal::WalConfig::LEGACY,
         ));
-        let registry =
-            LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
+        let registry = LineageRegistry::new(Arc::new(NeverOpen));
         let service = AgentDataService::with_ports(
             root.clone(),
             registry.clone(),
@@ -1134,8 +1134,7 @@ mod operational_port_tests {
                 ));
                 std::fs::create_dir_all(root.join("wal")).unwrap();
                 let wal = Arc::new(FileWalStore::new(root.join("wal")));
-                let registry =
-                    LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
+                let registry = LineageRegistry::new(Arc::new(NeverOpen));
                 let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = {
                     let db = Arc::new(
                         broca_store::SqliteStore::open(root.join("run-index.db")).unwrap(),

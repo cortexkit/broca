@@ -154,7 +154,7 @@ impl Driver {
             .validate(&addr, runtime.deployment())
             .await
             .map_err(failure)?;
-        let checks = broca_session_convert::verify::store_snapshot(&export, runtime.deployment())
+        let checks = super::snapshot::store_snapshot(&export, runtime.deployment())
             .await
             .map_err(unavailable)?;
         if checks != export.checks {
@@ -303,10 +303,9 @@ impl Driver {
         .map_err(|e| unavailable(format!("{e:?}")))?;
         let busy = store_busy(&view);
         if busy.is_none() {
-            export.checks =
-                broca_session_convert::verify::store_snapshot(&export, runtime.deployment())
-                    .await
-                    .map_err(unavailable)?;
+            export.checks = super::snapshot::store_snapshot(&export, runtime.deployment())
+                .await
+                .map_err(unavailable)?;
         }
         let (head, _) = export.head(&addr, runtime.deployment()).map_err(failure)?;
         let cached = self.root.join("session-store-moves/streams").join(&addr.0);

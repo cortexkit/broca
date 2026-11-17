@@ -1,4 +1,5 @@
 use super::*;
+use broca_session_store::record::Record;
 use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
 
 fn response(reply: Reply) -> Value {
@@ -109,8 +110,9 @@ async fn boundary_cancel_during_tool_then_send_is_provider_valid_and_byte_stable
     assert!(
         subject
             .records(&live, session)
+            .await
             .iter()
-            .any(|record| matches!(record, broca_wal::WalRecord::RunCancelRequested { .. })),
+            .any(|record| matches!(record, Record::CancelRequest(_))),
         "ack must follow the durable marker"
     );
     subject.release_tool_call(&call.arguments).await.unwrap();
@@ -142,64 +144,25 @@ async fn boundary_cancel_during_tool_then_send_is_provider_valid_and_byte_stable
     .expect("the second send must start its run once the first is released");
     terminal(&route, &second["run_id"], "completed").await;
     assert_eq!(subject.tool_invocations(&call.arguments).await, 1);
-    let records = subject.records(&live, session);
-    let start = records
+    // The second run's request carries the held call answered by exactly its result.
+    let actual = subject.shared.raw_bodies.lock().unwrap()[session][1].clone();
+    let body: Value = serde_json::from_slice(&actual).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let calls: Vec<_> = messages
         .iter()
-        .rposition(|record| matches!(record, broca_wal::WalRecord::StepStarted { .. }))
-        .unwrap();
-    let config = records[..start]
-        .iter()
-        .rev()
-        .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config.as_ref()),
-            _ => None,
-        })
-        .unwrap();
-    let (_, opts, expected) = broca_module_serve::wal_render::render_step(
-        &records[..=start],
-        config,
-        second["run_id"].as_str().unwrap(),
-        1,
-    )
-    .unwrap();
-    let calls: Vec<_> = opts
-        .prompt
-        .iter()
-        .flat_map(|message| message.content.iter())
-        .filter_map(|block| match block {
-            broca_protocol::ContentBlock::ToolCall(call) => Some(call.tool_call_id.clone()),
-            _ => None,
-        })
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .map(|call| call["id"].clone())
         .collect();
-    let results: Vec<_> = opts
-        .prompt
+    let results: Vec<_> = messages
         .iter()
-        .flat_map(|message| message.content.iter())
-        .filter_map(|block| match block {
-            broca_protocol::ContentBlock::ToolResult(result) => Some(result.tool_call_id.clone()),
-            _ => None,
-        })
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["tool_call_id"].clone())
         .collect();
     assert_eq!(
         calls, results,
-        "every tool use must have exactly its tool result"
+        "every tool use must have exactly its tool result: {body}"
     );
-    assert_eq!(calls.len(), 1);
-    let actual = subject.shared.raw_bodies.lock().unwrap()[session][1].clone();
-    assert_eq!(
-        actual, expected,
-        "the actual provider request must match WAL replay byte for byte"
-    );
-    let body: Value = serde_json::from_slice(&actual).unwrap();
-    assert_eq!(
-        body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["role"] == "tool")
-            .count(),
-        1
-    );
+    assert_eq!(calls.len(), 1, "{body}");
     drop(route);
     drop(live);
 }

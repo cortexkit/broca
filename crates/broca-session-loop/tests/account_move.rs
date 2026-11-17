@@ -576,6 +576,10 @@ impl Writer for Logging<'_, '_> {
         Ok(seq)
     }
 
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        Writer::caught_up(&mut *self.session).await
+    }
+
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
         Writer::send_records(&mut *self.session, submission_id).await
     }

@@ -167,7 +167,6 @@ type FrozenRequest = (
 
 struct Executor {
     provider: Limited,
-    wal: Arc<FileWalStore>,
     refuse: AtomicBool,
     signed_out: AtomicBool,
     requests: std::sync::Mutex<Vec<FrozenRequest>>,
@@ -175,51 +174,6 @@ struct Executor {
 
 #[async_trait]
 impl RunExecutor for Executor {
-    async fn execute(
-        &self,
-        mut job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        self.requests.lock().unwrap().push((
-            job.req.run_id.clone(),
-            job.req.keep_warm,
-            job.req.on_restart,
-        ));
-        if self.refuse.swap(false, Ordering::SeqCst) {
-            let error = RunError::Config("provider unavailable for resume".into());
-            if let Some(reply) = job.on_admitted.take() {
-                let _ = reply.send(Err(error.clone()));
-            }
-            return Err(error);
-        }
-        job.control.account_limit_pause = true;
-        job.control.clock = Some(self.provider.clock.clone());
-        job.control.auth_selection = Some(selection());
-        job.control.pause_for_auth_at_start = self.sign_in_error();
-        let mode = match job.kind {
-            RunKind::FreshOrResume if !self.signed_out.load(Ordering::SeqCst) => {
-                StartMode::ResumeAfterAuth
-            }
-            RunKind::FreshOrResume => StartMode::FreshOrResume,
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-            RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-        };
-        run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &self.provider,
-            &StubToolPlane::new(),
-            &AllowAll,
-            self.wal.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        )
-        .await
-    }
     async fn execute_on_store(
         &self,
         job: crate::executor::StoreRunJob,
@@ -318,19 +272,9 @@ impl Side {
         first_call: usize,
     ) -> Self {
         std::fs::create_dir_all(&dir).unwrap();
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let leases = Arc::new(FileLeaseStore::new(dir.join("leases")));
-        let index = Arc::new(broca_store::SqliteStore::open(dir.join("index.db")).unwrap());
-        let service = Arc::new(
-            crate::retention::RetentionService::new(
-                wal.clone(),
-                index.clone(),
-                leases.clone(),
-                index,
-                Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
-            )
-            .unwrap(),
-        );
+        let service =
+            Arc::new(crate::retention::RetentionService::new(&dir, leases.clone()).unwrap());
         let executor = Arc::new(Executor {
             provider: Limited {
                 reset_at: std::sync::atomic::AtomicU64::new(RESET),
@@ -343,7 +287,6 @@ impl Side {
                 release_success: Arc::default(),
                 sent: Default::default(),
             },
-            wal: wal.clone(),
             refuse: AtomicBool::new(false),
             signed_out: AtomicBool::new(false),
             requests: Default::default(),
@@ -356,17 +299,12 @@ impl Side {
         )
         .await
         .unwrap();
-        let opener = crate::opener::DefaultOpener::new(leases, wal.clone(), executor.clone())
+        let opener = crate::opener::DefaultOpener::new(leases, executor.clone())
             .with_idle_ttl(IDLE)
             .with_store_runtime(Arc::new(runtime));
-        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
-        let registry = if store {
-            registry.with_store_new_sessions()
-        } else {
-            registry
-        };
+        let registry = LineageRegistry::new(Arc::new(opener));
         registry.set_retention_service(service);
-        registry.resume_restart_pauses(wal, Vec::new()).await;
+        registry.enable_restart_resumes();
         registry.recover_store_crash_orphans().await.unwrap();
         Self {
             dir,
@@ -539,48 +477,6 @@ impl Side {
                     _ => {}
                 }
             }
-        } else {
-            let mut current = RunId(String::new());
-            for frame in self.executor.wal.read_records(&self.key).unwrap() {
-                match frame.record {
-                    broca_wal::WalRecord::RunStarted {
-                        run_id,
-                        keep_warm,
-                        on_restart,
-                        ..
-                    } => {
-                        current = run_id.clone();
-                        result.push(json!(["start", run_id, keep_warm, on_restart]));
-                    }
-                    broca_wal::WalRecord::RunPaused {
-                        run_id,
-                        reason,
-                        error,
-                        account_limit,
-                        ..
-                    } => result.push(json!([
-                        "pause",
-                        run_id,
-                        reason,
-                        error,
-                        normalized_pause(
-                            account_limit.map(|pause| serde_json::to_value(pause).unwrap())
-                        )
-                    ])),
-                    broca_wal::WalRecord::ResumeStarted { episode, .. } => {
-                        result.push(json!(["resume", episode]))
-                    }
-                    broca_wal::WalRecord::RunFinished { reason, error, .. } => {
-                        result.push(json!([
-                            "end",
-                            current,
-                            reason,
-                            error.and_then(|error| error.provider_code)
-                        ]))
-                    }
-                    _ => {}
-                }
-            }
         }
         result
     }
@@ -657,7 +553,6 @@ async fn account_limit_timer_requires_the_durable_source_evidence() {
     assert!(actor.account_limit_timer.is_some());
     let not_ready = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(side.dir.join("leases"))),
-        side.executor.wal.clone(),
         side.executor.clone(),
     )));
     assert!(!not_ready.handle().restart_resume_ready());

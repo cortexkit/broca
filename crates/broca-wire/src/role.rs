@@ -421,7 +421,6 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::PLAN_VIEW,
         // Reader policies are served on the new storage; today's storage refuses plan.readers.
         cortexkit_role_llm_runner::capabilities::APP_READERS,
-        cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,
         cortexkit_role_llm_runner::capabilities::MAX_STEPS,
@@ -1414,7 +1413,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "15cc14478fa2bb911ea3cbba9c75d43286a2029cdf087b930adbb1dc01dc048d",
+            "712c0504cee97d3e9a2112f7e76ea7313e3fdd0530571fc4c7658e91581c10ae",
         );
     }
 
@@ -1611,7 +1610,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "eb85e1bb56c29e0839825701a95d493b1034f68eaad587168c6c033a34936b2f";
+        "709adf6d8ce6975b54eab2f2910e06b6b3b269853ea7f9b2458edfd4b0b4db0f";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

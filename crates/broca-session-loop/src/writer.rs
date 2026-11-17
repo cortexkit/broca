@@ -39,6 +39,11 @@ pub trait Writer {
         Err(SessionError::Media(MediaError::NoStore))
     }
 
+    /// Brings [`Writer::operations`] and [`Writer::conversation`] up to date with records
+    /// another appender added since this writer's last call, appending nothing. A writer that
+    /// is the session itself is always up to date.
+    async fn caught_up(&mut self) -> Result<(), SessionError>;
+
     /// Every ledger record that names the queued send `submission_id`, oldest first, from the
     /// open log or sealed history: what the loop reads to deliver the send at a boundary.
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError>;
@@ -198,6 +203,10 @@ pub trait Writer {
 }
 
 impl<B: SessionBackend> Writer for Session<B> {
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     async fn accepted_send(
         &self,
         account: &str,

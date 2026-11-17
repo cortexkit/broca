@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::compaction_v2::protocol::read::{Detail, ReadPage, ReadRequest, Select};
-use broca_core::{
-    AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, StubToolPlane,
-};
+use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, StubToolPlane};
 use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
 use broca_protocol::{
     BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, SubmissionRequest, Usage,
@@ -24,7 +22,7 @@ use tokio::sync::{mpsc, Notify};
 use super::tests::{auth_failure, request, text_step, Gated};
 use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{
-    RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+    RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
 };
 use crate::registry::LineageRegistry;
 
@@ -98,14 +96,6 @@ impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
         self.compaction
             .clone()
             .map(|plane| plane as Arc<dyn broca_core::CompactionPlane>)
-    }
-
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
     }
 
     async fn execute_on_store(
@@ -203,30 +193,23 @@ const IDLE: Duration = Duration::from_millis(100);
 /// A module whose sessions start in the new storage when `store`, over the scripted provider
 /// `steps`. With `gated`, every model step waits for the gate. With
 /// `compaction`, the module has a ready compaction provider.
-async fn side(
-    store: bool,
-    steps: Vec<Vec<NormalizedEvent>>,
-    gated: bool,
-    compaction: bool,
-) -> Side {
-    side_idling(store, steps, gated, compaction, IDLE).await
+async fn side(steps: Vec<Vec<NormalizedEvent>>, gated: bool, compaction: bool) -> Side {
+    side_idling(steps, gated, compaction, IDLE).await
 }
 
 /// [`side`], whose sessions close after `idle` without a command.
 async fn side_idling(
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     compaction: bool,
     idle: Duration,
 ) -> Side {
     let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]);
-    side_in(store, steps, gated, compaction, idle, deployment).await
+    side_in(steps, gated, compaction, idle, deployment).await
 }
 
 /// [`side_idling`], whose new storage creates sessions under `deployment`.
 async fn side_in(
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     compaction: bool,
@@ -234,8 +217,6 @@ async fn side_in(
     deployment: broca_session_store::keys::DeploymentKey,
 ) -> Side {
     let build = Build {
-        runtime: true,
-        new_sessions: store,
         gated,
         compaction,
         hooks: false,
@@ -246,10 +227,6 @@ async fn side_in(
 
 /// How a side's module is built.
 struct Build {
-    /// Whether the module's opener serves the new storage.
-    runtime: bool,
-    /// Whether the registry starts every session it can in the new storage, not only heads.
-    new_sessions: bool,
     /// Whether every model step waits for the side's gate.
     gated: bool,
     /// Whether the executor offers a ready compaction provider.
@@ -293,8 +270,6 @@ async fn side_with_events(
     step_events: Option<Arc<crate::step_events::StepEvents>>,
 ) -> Side {
     let Build {
-        runtime,
-        new_sessions,
         gated,
         compaction,
         hooks,
@@ -308,7 +283,6 @@ async fn side_with_events(
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let gate = gated.then(|| Arc::new(Notify::new()));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let provider = broca_core::provider::StubProvider::new(steps.clone());
     let scripted = || Gated {
         render_config: None,
@@ -324,25 +298,17 @@ async fn side_with_events(
     });
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         Arc::clone(&executor),
     )
     .with_idle_ttl(idle);
     if let Some(events) = step_events {
         opener = opener.with_step_events(events);
     }
-    if runtime {
-        let runtime = crate::store_open::StoreRuntime::open(&dir, deployment, executor, idle)
-            .await
-            .unwrap();
-        opener = opener.with_store_runtime(Arc::new(runtime));
-    }
-    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
-    let registry = if new_sessions {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
+    let runtime = crate::store_open::StoreRuntime::open(&dir, deployment, executor, idle)
+        .await
+        .unwrap();
+    opener = opener.with_store_runtime(Arc::new(runtime));
+    let registry = LineageRegistry::new(Arc::new(opener));
     let key = BindIdentity::new(dir.join("project"), "store-entries", "s1");
     Side {
         dir,
@@ -685,7 +651,7 @@ async fn compare_compaction_refusals(store: &Side, label: &str) {
 
 /// A module whose sessions start in the new storage, over the scripted provider steps.
 async fn both(steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> Side {
-    side(true, steps, gated, false).await
+    side(steps, gated, false).await
 }
 
 /// A step that calls the `read` tool, whose canned result the next step reads.
@@ -922,7 +888,7 @@ async fn contract_sessions_in(
         text_step("a3", "§5§ §6§ It says file contents."),
     ];
     steps.extend(more);
-    let store = side_in(true, steps, false, true, idle, deployment()).await;
+    let store = side_in(steps, false, true, idle, deployment()).await;
     for side in [&store] {
         assert!(matches!(
             side.send_request(
@@ -1612,7 +1578,7 @@ async fn every_exposure_serves_a_cleaned_reply_and_the_store_keeps_the_written_o
 #[tokio::test]
 async fn a_reply_its_run_doesnt_clean_is_served_as_stored() {
     use crate::serve::{ServeHandler, SessionReadRequest};
-    let store = side(true, vec![text_step("a1", WRITTEN[0])], false, false).await;
+    let store = side(vec![text_step("a1", WRITTEN[0])], false, false).await;
     assert!(matches!(
         store.send_request("r1", untooled("first"), None).await,
         SendOutcome::Active { .. }
@@ -1863,7 +1829,7 @@ async fn dump_head_import_entries() {
         };
         let thalamus_reply: Value =
             serde_json::from_slice(&std::fs::read(folder.join("reply.json")).unwrap()).unwrap();
-        let side = side(true, Vec::new(), false, false).await;
+        let side = side(Vec::new(), false, false).await;
         // The export and its side file, in a folder the import may read and then delete.
         let source = side.dir.join("import-source");
         std::fs::create_dir_all(&source).unwrap();
@@ -2379,12 +2345,10 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         text_step("a2", "Continuing."),
         text_step("a3", "after the view"),
     ];
-    let side = |runtime: bool| {
+    let side = || {
         let steps = steps.clone();
         async move {
             let build = Build {
-                runtime,
-                new_sessions: false,
                 gated: false,
                 compaction: true,
                 hooks: true,
@@ -2400,7 +2364,7 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
             side
         }
     };
-    let store = side(true).await;
+    let store = side().await;
     let mut replies = Vec::new();
     for (side, first) in [(&store, &first)] {
         let reply = send_keyed(
@@ -2830,15 +2794,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         text_step("a4", "seen"),
     ];
     let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
-    let store = side_in(
-        true,
-        steps,
-        false,
-        true,
-        Duration::from_secs(60),
-        deployment(),
-    )
-    .await;
+    let store = side_in(steps, false, true, Duration::from_secs(60), deployment()).await;
     for side in [&store] {
         let first = side
             .send_request(

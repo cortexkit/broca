@@ -7,6 +7,7 @@
 use broca_module::ServeHandler;
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::RunId;
+use broca_session_store::record::Record;
 
 use crate::delivery_rig;
 use delivery_rig::*;
@@ -115,7 +116,7 @@ async fn message_senders_preserve_attested_owner_on_fresh_and_steered_rows() {
     {
         assert!(entry["row"].get("sender").is_none());
     }
-    capture_sender_samples(&rig, &page, "owner-steer");
+    capture_sender_samples(&page, "owner-steer");
     let read = call(&mut rig, "session.read", serde_json::json!({})).await;
     assert!(!String::from_utf8(read.body).unwrap().contains("\"sender\""));
     rig.finish().await;
@@ -170,7 +171,9 @@ fn assert_display_sender(page: &serde_json::Value, text: &str, sender: &str) {
     assert_eq!(rows[0]["row"]["sender"], sender, "{text}: {page}");
 }
 
-fn capture_sender_samples(rig: &Rig, page: &serde_json::Value, name: &str) {
+/// Writes the read page `page` as a reader sample named `name` under `BROCA_SENDER_SAMPLES`,
+/// with its checksum.
+fn capture_sender_samples(page: &serde_json::Value, name: &str) {
     let Some(root) = std::env::var_os("BROCA_SENDER_SAMPLES") else {
         return;
     };
@@ -179,50 +182,7 @@ fn capture_sender_samples(rig: &Rig, page: &serde_json::Value, name: &str) {
     std::fs::create_dir_all(&root).unwrap();
     let bytes = serde_json::to_vec(page).unwrap();
     std::fs::write(root.join("history.json"), &bytes).unwrap();
-    let mut sums = format!("{:x}  history.json\n", Sha256::digest(&bytes));
-    let mut written = std::collections::BTreeSet::new();
-    for record in rig.records().into_iter().rev() {
-        if name == "matrix"
-            && !matches!(&record,
-            broca_wal::WalRecord::RunStarted { sent_by: Some(broca_protocol::BindPrincipal::Reserved { module_id }), .. }
-            | broca_wal::WalRecord::Queued { sent_by: Some(broca_protocol::BindPrincipal::Reserved { module_id }), .. }
-            if module_id == "named")
-        {
-            continue;
-        }
-        let kind = match &record {
-            broca_wal::WalRecord::RunStarted {
-                sent_by: Some(_), ..
-            } => "run-started",
-            broca_wal::WalRecord::Queued {
-                sent_by: Some(_), ..
-            } => "queued",
-            broca_wal::WalRecord::Steered {
-                sent_by: Some(_), ..
-            } => "steered",
-            _ => continue,
-        };
-        if !written.insert(kind) {
-            continue;
-        }
-        let json = serde_json::to_vec(&record).unwrap();
-        let frame = broca_wal::framing::encode_v4(
-            broca_wal::framing::v4::Metadata {
-                seq: 7,
-                fence: 3,
-                appended_ms: 123,
-                writer_id: [5; 16],
-            },
-            &[],
-            &record,
-        )
-        .unwrap();
-        for (extension, bytes) in [("json", json), ("v4", frame)] {
-            let filename = format!("{kind}.{extension}");
-            std::fs::write(root.join(&filename), &bytes).unwrap();
-            sums.push_str(&format!("{:x}  {filename}\n", Sha256::digest(&bytes)));
-        }
-    }
+    let sums = format!("{:x}  history.json\n", Sha256::digest(&bytes));
     std::fs::write(root.join("SHA256SUMS"), sums).unwrap();
 }
 
@@ -353,21 +313,18 @@ async fn message_senders_cover_named_start_join_interrupt_template_and_queue_res
     ] {
         assert_display_sender(&page, text, "named");
     }
-    for record in rig.records() {
-        if let broca_wal::WalRecord::RunStarted {
-            input,
-            sent_by,
-            principal,
-            ..
-        } = record
-        {
-            if input.iter().any(|message| message.content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "queued after restart"))) {
-                assert_eq!(sent_by, Some(broca_protocol::BindPrincipal::Reserved { module_id: "named".into() }));
-                assert_eq!(principal, Some(broca_protocol::BindPrincipal::Reserved { module_id: "owner".into() }));
-            }
+    // The page names each message's sender; every run, the one the queued send started after
+    // the restart included, runs under the owner's principal.
+    let owner = serde_json::to_value(broca_protocol::BindPrincipal::Reserved {
+        module_id: "owner".into(),
+    })
+    .unwrap();
+    for record in rig.records().await {
+        if let Record::RunStart(start) = record {
+            assert_eq!(start.principal.as_ref(), Some(&owner), "{}", start.run_id);
         }
     }
-    capture_sender_samples(&rig, &page, "matrix");
+    capture_sender_samples(&page, "matrix");
     rig.finish().await;
 }
 
@@ -424,29 +381,10 @@ async fn finish_reason_reports_provider_limits_without_a_caller_cap_on_every_fam
             use sha2::{Digest, Sha256};
             let path = std::path::PathBuf::from(path).join(format!("{family:?}"));
             std::fs::create_dir_all(&path).unwrap();
-            let step = rig
-                .records()
-                .into_iter()
-                .find(|record| matches!(record, broca_wal::WalRecord::ModelStepFinished { .. }))
-                .unwrap();
-            let json = serde_json::to_vec(&step).unwrap();
-            let frame = broca_wal::framing::encode_v4(
-                broca_wal::framing::v4::Metadata {
-                    seq: 7,
-                    fence: 3,
-                    appended_ms: 123,
-                    writer_id: [5; 16],
-                },
-                &[],
-                &step,
-            )
-            .unwrap();
             let mut sums = String::new();
             for (name, bytes) in [
                 ("run-result.json", output_frame.body.as_slice()),
                 ("run-status.json", status_frame.body.as_slice()),
-                ("model-step.json", json.as_slice()),
-                ("model-step.v4", frame.as_slice()),
             ] {
                 std::fs::write(path.join(name), bytes).unwrap();
                 sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
@@ -616,26 +554,22 @@ async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
         }
     }
     assert_eq!(plain, stripped);
-    let records = rig.records();
+    let records = rig.records().await;
     let started = records
         .iter()
         .find_map(|record| match record {
-            broca_wal::WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                dispatched_at_ms,
-                ..
-            } if tool_call_id.0 == "facts-call" => *dispatched_at_ms,
+            Record::ToolIntent(intent) if intent.tool_call_id.0 == "facts-call" => {
+                intent.dispatched_at_ms
+            }
             _ => None,
         })
         .unwrap();
     let finished = records
         .iter()
         .find_map(|record| match record {
-            broca_wal::WalRecord::ToolResult {
-                result,
-                finished_at_ms,
-                ..
-            } if result.tool_call_id.0 == "facts-call" => *finished_at_ms,
+            Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == "facts-call" => {
+                outcome.finished_at_ms
+            }
             _ => None,
         })
         .unwrap();
@@ -708,8 +642,14 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         assert_eq!(body.matches(&timed).count(), 1);
         body = body.replace(&timed, &format!("\"ordinal\":{ordinal}"));
     }
+    // The call key is `<session id>:<seq of the call's dispatch intent>`.
+    let intent_seq = page["messages"][1]["tool_calls"][0]["call_key"]
+        .as_str()
+        .and_then(|key| key.rsplit_once(':'))
+        .map(|(_, seq)| seq.to_owned())
+        .expect("the call has a key");
     let attribution = format!(
-        r#","tool_calls":[{{"tool_call_id":"call-1","call_key":"@LINEAGE_ID@:5","dispatched_to":"{WORK_MODULE}","indeterminate":false}}]"#
+        r#","tool_calls":[{{"tool_call_id":"call-1","call_key":"@SESSION_ID@:{intent_seq}","dispatched_to":"{WORK_MODULE}","indeterminate":false}}]"#
     );
     assert_eq!(body.matches(&attribution).count(), 1, "{body}");
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
@@ -760,8 +700,15 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
             ))
         })
         .collect();
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(
+            golden_path("session_subscribe.tool_turn.legacy.jsonl"),
+            format!("{}\n", legacy.join("\n")),
+        )
+        .unwrap();
+    }
     assert_eq!(
-        legacy.join("\n").replace("m@LINEAGE_PREFIX@.", "m"),
+        legacy.join("\n"),
         pinned("session_subscribe.tool_turn.legacy.jsonl")
     );
     for (index, body) in events.iter().enumerate() {
@@ -778,7 +725,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         events.join("\n"),
         tool_turn_sample_with_recorded_times(
             &pinned("session_subscribe.tool_turn.jsonl"),
-            &rig.records(),
+            &rig.records().await,
         )
     );
     rig.finish().await;
@@ -833,20 +780,15 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
     rig.script.hold_tool(true);
     rig.script.hold_model(false);
     rig.wait_entered().await;
-    let records = rig.records();
-    let config = records
-        .iter()
-        .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-            _ => None,
-        })
-        .unwrap();
+    let records = rig.records().await;
+    let config_all = rig.run_configs().await;
+    let config = config_all.first().unwrap();
     assert!(config.render_tags);
     assert!(config.computed_tags.is_some());
     assert!(records.iter().any(|record| matches!(record,
-        broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call-1")));
+        Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == "call-1")));
     assert!(!records.iter().any(|record| matches!(record,
-        broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call-open")));
+        Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == "call-open")));
 
     let read = rig
         .request(
@@ -947,8 +889,8 @@ async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
     .await;
     // The tool provider now holds call-held: its dispatch intent is durable, its result is not.
     rig.wait_entered().await;
-    assert!(!rig.records().iter().any(|record| matches!(record,
-        broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call-held")));
+    assert!(!rig.records().await.iter().any(|record| matches!(record,
+        Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == "call-held")));
 
     let held = rig
         .request(
@@ -985,7 +927,7 @@ async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
 
 /// Keep the captured frame template, substituting only this run's two WAL observations.
 /// The expected clocks come from durable records, never from the stream being checked.
-fn tool_turn_sample_with_recorded_times(sample: &str, records: &[broca_wal::WalRecord]) -> String {
+fn tool_turn_sample_with_recorded_times(sample: &str, records: &[Record]) -> String {
     sample
         .lines()
         .map(|line| {
@@ -999,16 +941,12 @@ fn tool_turn_sample_with_recorded_times(sample: &str, records: &[broca_wal::WalR
             let recorded = records
                 .iter()
                 .find_map(|record| match record {
-                    broca_wal::WalRecord::ToolDispatchIntent {
-                        tool_call_id,
-                        dispatched_at_ms,
-                        ..
-                    } if start && tool_call_id.0 == call => Some(*dispatched_at_ms),
-                    broca_wal::WalRecord::ToolResult {
-                        result,
-                        finished_at_ms,
-                        ..
-                    } if !start && result.tool_call_id.0 == call => Some(*finished_at_ms),
+                    Record::ToolIntent(intent) if start && intent.tool_call_id.0 == call => {
+                        Some(intent.dispatched_at_ms)
+                    }
+                    Record::ToolOutcome(outcome) if !start && outcome.tool_call_id.0 == call => {
+                        Some(outcome.finished_at_ms)
+                    }
                     _ => None,
                 })
                 .flatten()
@@ -1052,15 +990,15 @@ async fn refused_writing_nothing(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = call(rig, method, params.clone()).await;
     let body = refusal(&reply);
     assert_eq!(
-        rig.wal_bytes().len(),
+        rig.records().await.len(),
         before.len(),
         "{method} {params} was refused {body} but the WAL grew"
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     body
 }
 
@@ -1212,7 +1150,6 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         "run_usage",
         "run_cancel",
         "retract",
-        "input_token_cap",
         "dispatch_attribution",
         "streaming",
         "live_events",
@@ -1224,7 +1161,13 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
     ] {
         assert!(describe.declares(group), "{group}");
     }
-    for group in ["model_view", "compaction", "call-modes/v1"] {
+    // broca keeps no input-token budget, so it leaves the cap undeclared.
+    for group in [
+        "model_view",
+        "compaction",
+        "call-modes/v1",
+        "input_token_cap",
+    ] {
         assert!(!describe.declares(group), "{group}");
     }
     assert_eq!(raw["session_capabilities_from"], "admission");
@@ -1261,158 +1204,10 @@ async fn a_never_written_session_has_an_unwritten_page_and_head() {
     .unwrap();
     assert_eq!(head, HeadMeta::empty(0, "unwritten"));
     assert!(
-        rig.wal_bytes().is_empty(),
+        rig.records().await.is_empty(),
         "a read of an unwritten session wrote"
     );
     rig.finish().await;
-}
-
-/// A session kept in the new session storage is refused by name on every operation this build
-/// serves for a session: it reports the storage it needs, and never answers from an absent log
-/// or creates one, which would fork the session in two.
-#[tokio::test]
-async fn a_session_on_the_new_storage_is_refused_by_name_and_never_gets_a_log() {
-    let mut rig = Rig::start("newer-storage").await;
-    let head = broca_wal::session_storage_head(
-        &rig.dir,
-        broca_wal::StorageClass::Ordinary,
-        &broca_core::session_addr(&rig.session),
-    );
-    std::fs::create_dir_all(head.parent().unwrap()).unwrap();
-    std::fs::write(&head, b"head").unwrap();
-    for (method, params) in [
-        (
-            "session.send",
-            serde_json::json!({"prompt": "hi", "send_id": "s1", "model": {"provider": "fake", "model": "fake"}}),
-        ),
-        ("session.read", serde_json::json!({})),
-        ("session.head", serde_json::json!({})),
-        ("send.status", serde_json::json!({"send_id": "s1"})),
-        ("session.send_status", serde_json::json!({"send_id": "s1"})),
-        ("run.status", serde_json::json!({"run_id": "run-1"})),
-        ("run.result", serde_json::json!({"run_id": "run-1"})),
-    ] {
-        let body = refusal(&call(&mut rig, method, params).await);
-        assert_eq!(body["code"], "wal_newer_writer", "{method}: {body}");
-        assert_eq!(
-            body["detail"],
-            serde_json::json!({"kind": "newer_writer", "missing": ["session-storage/v1"]}),
-            "{method}: {body}"
-        );
-    }
-    assert!(
-        !rig.wal_path.exists(),
-        "a refused operation created a log beside the new storage's session"
-    );
-    rig.finish().await;
-}
-
-/// Session reads and controls must establish storage ownership even when they can otherwise
-/// answer from an empty log or refuse before opening one. Keep probing after a wrong answer so
-/// the failure names every operation that bypassed the rollback guard.
-#[tokio::test]
-async fn every_read_and_control_refuses_new_storage_without_a_runtime() {
-    let mut rig = Rig::start("newer-storage-operations").await;
-    let head = broca_wal::session_storage_head(
-        &rig.dir,
-        broca_wal::StorageClass::Ordinary,
-        &broca_core::session_addr(&rig.session),
-    );
-    std::fs::create_dir_all(head.parent().unwrap()).unwrap();
-    std::fs::write(&head, b"head").unwrap();
-    let mut gaps = Vec::new();
-    for (method, params) in [
-        ("session.read", serde_json::json!({})),
-        ("session.head", serde_json::json!({})),
-        ("send.status", serde_json::json!({"send_id": "s1"})),
-        ("session.send_status", serde_json::json!({"send_id": "s1"})),
-        ("run.status", serde_json::json!({"run_id": "run-1"})),
-        ("run.result", serde_json::json!({"run_id": "run-1"})),
-        ("session.subscribe", serde_json::json!({})),
-        ("session.history", serde_json::json!({})),
-        ("session.baseline", serde_json::json!({})),
-        ("run.tool_calls", serde_json::json!({"run_id": "run-1"})),
-        ("run.status", serde_json::json!({})),
-        (
-            "run.event.get",
-            serde_json::json!({"event_key": "0".repeat(64)}),
-        ),
-        (
-            "session.output_refs",
-            serde_json::json!({"set_id": "set-1"}),
-        ),
-        (
-            "session.output_ref_read",
-            serde_json::json!({"ref_id": "set-1/r0", "offset": 0, "length": 1}),
-        ),
-        (
-            "session.media_read",
-            serde_json::json!({"sha256": "0".repeat(64), "offset": 0, "length": 1}),
-        ),
-        (
-            "session.upload_begin",
-            serde_json::json!({"mime": "image/png", "bytes": 1, "sha256": "0".repeat(64)}),
-        ),
-        (
-            "session.upload_append",
-            serde_json::json!({"upload_id": "upload-1", "offset": 0, "data": "AA=="}),
-        ),
-        (
-            "session.upload_commit",
-            serde_json::json!({"upload_id": "upload-1"}),
-        ),
-        (
-            "session.upload_status",
-            serde_json::json!({"upload_id": "upload-1"}),
-        ),
-        ("run.cancel", serde_json::json!({"run_id": "run-1"})),
-        (
-            "session.retract",
-            serde_json::json!({"submission_id": "sub-1"}),
-        ),
-        (
-            "session.refresh",
-            serde_json::json!({"plan": [], "policy": "immediately", "generation": 1}),
-        ),
-        (
-            "session.refresh_policy",
-            serde_json::json!({"generation": 1, "policy": "immediately", "send_id": "policy-1"}),
-        ),
-        (
-            "session.flush_prefix",
-            serde_json::json!({"send_id": "flush-1"}),
-        ),
-        ("session.warm", serde_json::json!({})),
-        ("session.move_to_store", serde_json::json!({})),
-        ("session.restore_from_backup", serde_json::json!({})),
-        (
-            "session.import",
-            serde_json::json!({"import_id": "import-1", "origin": {"kind": "import", "source_ref": "fixture:guard"},
-                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
-        ),
-        (
-            "session.import",
-            serde_json::json!({"import_id": "import-file-1", "origin": {"kind": "import", "source_ref": "fixture:guard"},
-                "source": {"harness": "opencode2", "path": "absent.json", "session": "session-1", "sha256": "0".repeat(64)}}),
-        ),
-        ("session.install_view", serde_json::json!({"view": {}})),
-    ] {
-        let frame = call(&mut rig, method, params).await;
-        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-        if frame.header.ty != FrameType::Error
-            || body["code"] != "wal_newer_writer"
-            || body["detail"]
-                != serde_json::json!({"kind": "newer_writer", "missing": ["session-storage/v1"]})
-        {
-            gaps.push(format!("{method}: {body}"));
-        }
-        assert!(
-            !rig.wal_path.exists(),
-            "{method} created a log beside the new storage's session"
-        );
-    }
-    rig.finish().await;
-    assert!(gaps.is_empty(), "rollback guard bypasses: {gaps:#?}");
 }
 
 /// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
@@ -1569,7 +1364,7 @@ async fn pages_are_capped_by_bytes() {
 
 /// Two sibling calls of one step get distinct keys, a model id recurring in a later step gets a
 /// distinct key again, and every call names the module it was dispatched to. A key is the
-/// lineage and WAL sequence of the call's own dispatch intent.
+/// key its dispatch intent recorded, under the session's lineage.
 #[tokio::test]
 async fn every_call_has_its_own_key_and_module() {
     let mut rig = Rig::start("keys").await;
@@ -1582,7 +1377,6 @@ async fn every_call_has_its_own_key_and_module() {
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
     let page = read(&mut rig, serde_json::json!({})).await;
-    let lineage = page.incarnation.clone();
     let entries: Vec<_> = page
         .messages
         .iter()
@@ -1599,18 +1393,22 @@ async fn every_call_has_its_own_key_and_module() {
         3,
         "{keys:?}"
     );
-    let intents: Vec<u64> =
-        broca_wal::replay_file(&rig.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES)
-            .unwrap()
-            .into_iter()
-            .filter(|f| matches!(f.record, broca_wal::WalRecord::ToolDispatchIntent { .. }))
-            .map(|f| f.seq)
-            .collect();
-    let expected: Vec<String> = intents
+    // Each key is the one the call's own dispatch intent recorded, under the session's id.
+    let expected: Vec<String> = rig
+        .records()
+        .await
         .iter()
-        .map(|seq| format!("{lineage}:{seq}"))
+        .filter_map(|record| match record {
+            Record::ToolIntent(intent) => intent.call_key.clone(),
+            _ => None,
+        })
         .collect();
     assert_eq!(keys, expected);
+    let sessions: std::collections::BTreeSet<_> = keys
+        .iter()
+        .map(|key| key.split_once(':').expect("<session id>:<seq>").0)
+        .collect();
+    assert_eq!(sessions.len(), 1, "{keys:?}");
     for entry in &entries {
         assert_eq!(entry.dispatched_to.as_deref(), Some(WORK_MODULE));
         assert!(!entry.indeterminate);
@@ -1621,82 +1419,6 @@ async fn every_call_has_its_own_key_and_module() {
         later.messages[0].tool_calls[0].call_key.as_ref(),
         Some(&keys[2])
     );
-    rig.finish().await;
-}
-
-/// A call recorded before broca recorded the dispatch module keeps its key and reads with no
-/// `dispatched_to`: the module is never guessed.
-#[tokio::test]
-async fn an_intent_without_a_module_reads_with_no_dispatched_to() {
-    let mut rig = Rig::start("legacy-intent").await;
-    // Write one finished episode the way a build that predates the dispatch module wrote it,
-    // before any send, so no lineage actor holds the session.
-    let record = |value: serde_json::Value| -> broca_wal::WalRecord {
-        serde_json::from_value(value).unwrap()
-    };
-    let records = [
-        record(serde_json::json!({
-            "type": "run_started", "run_id": "run-1",
-            "session": serde_json::to_value(&rig.session).unwrap(),
-            "config": {"model": {"provider_module_id": "fake", "model_id": "fake"}, "tools": [],
-                "tool_choice": {"type": "auto"}, "generation": {},
-                "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 1},
-            "input": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
-            "origin": {"kind": "fresh"}
-        })),
-        record(serde_json::json!({"type": "step_started", "step_id": 1})),
-        record(serde_json::json!({
-            "type": "model_step_finished", "step_id": 1,
-            "assistant_message": {"message_id": "m1", "content": [{"type": "tool_call",
-                "tool_call_id": "call-1", "tool_name": "work", "input": {}}]},
-            "usage": {}, "finish_reason": "tool_calls"
-        })),
-        record(serde_json::json!({
-            "type": "tool_batch_started", "batch_id": "b1", "step_id": 1,
-            "planned_calls": ["call-1"]
-        })),
-        record(serde_json::json!({
-            "type": "tool_dispatch_intent", "batch_id": "b1", "tool_call_id": "call-1",
-            "tool_name": "work", "args": {}
-        })),
-        record(serde_json::json!({
-            "type": "tool_result", "batch_id": "b1", "outcome": "completed",
-            "result": {"tool_call_id": "call-1", "output": {"kind": "text", "text": "ok"},
-                "is_error": false}
-        })),
-        record(serde_json::json!({"type": "tool_batch_finished", "batch_id": "b1"})),
-        record(serde_json::json!({"type": "turn_finished", "step_id": 1})),
-        record(serde_json::json!({"type": "step_started", "step_id": 2})),
-        record(serde_json::json!({
-            "type": "model_step_finished", "step_id": 2,
-            "assistant_message": {"message_id": "m2", "content": [{"type": "text",
-                "text": "answer"}]},
-            "usage": {}
-        })),
-        record(serde_json::json!({"type": "run_finished", "reason": "completed", "usage": {}})),
-    ];
-    {
-        use broca_wal::Wal;
-        std::fs::create_dir_all(rig.wal_path.parent().unwrap()).unwrap();
-        let mut wal = broca_wal::FileWal::open(&rig.wal_path).unwrap();
-        for record in &records {
-            assert!(record.required_features().is_empty());
-            wal.append(1, record, true).unwrap();
-        }
-    }
-    let intent_seq = broca_wal::replay_file(&rig.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES)
-        .unwrap()
-        .into_iter()
-        .find(|f| matches!(f.record, broca_wal::WalRecord::ToolDispatchIntent { .. }))
-        .unwrap()
-        .seq;
-    let page = read(&mut rig, serde_json::json!({})).await;
-    let lineage = page.incarnation.clone();
-    let entry = &page.messages[1].tool_calls[0];
-    assert_eq!(entry.tool_call_id, "call-1");
-    assert_eq!(entry.call_key, Some(format!("{lineage}:{intent_seq}")));
-    assert_eq!(entry.dispatched_to, None);
-    assert!(!entry.indeterminate);
     rig.finish().await;
 }
 
@@ -1837,282 +1559,11 @@ async fn run_result_refuses_a_final_message_that_exceeds_the_frame_limit() {
     rig.finish().await;
 }
 
-/// Durable role reads still answer after a closed session is folded, without restoring its WAL.
-#[tokio::test]
-async fn run_result_answers_the_final_text_from_an_archived_session() {
-    use broca_core::wal_fold::{fold, FoldOptions, FoldSettings};
-    use broca_protocol::content::ContentBlock;
-    use broca_wal::archive::ArchiveReader;
-
-    let mut rig = Rig::start_with_idle_ttl("run-result-archived", Duration::from_millis(100)).await;
-    let text = |t: &str| ContentBlock::Text { text: t.into() };
-    rig.script.push(&[Step::Blocks(vec![
-        text("{\"answer\":\""),
-        ContentBlock::Reasoning {
-            text: "thinking".into(),
-            signature: None,
-        },
-        text("yes"),
-        text("\",\"n\":1}"),
-    ])]);
-    let sent = rig.send("turn-0", "go", None).await;
-    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-
-    let options = FoldOptions {
-        write: true,
-        ..Default::default()
-    };
-    let report = fold(
-        &rig.dir,
-        FoldSettings {
-            options: &options,
-            cold_ms: 0,
-        },
-    )
-    .unwrap();
-    assert!(
-        !rig.wal_path.exists(),
-        "fold must remove the live WAL: {report:?}"
-    );
-    assert_eq!(report.removed, 1, "{report:?}");
-    let archive = rig
-        .dir
-        .join("wal-archive")
-        .join(report.journal.unwrap())
-        .with_extension("ark");
-    let member = ArchiveReader::open(archive, broca_wal::DEFAULT_MAX_READ_BYTES)
-        .unwrap()
-        .read_member(&broca_core::wal_writer::session_addr(&rig.session))
-        .unwrap();
-    assert!(
-        member.is_some(),
-        "the sealed container must hold this session"
-    );
-
-    let answer: RunResult = serde_json::from_value(result(
-        &call(
-            &mut rig,
-            "run.result",
-            serde_json::json!({"run_id": run_id}),
-        )
-        .await,
-    ))
-    .unwrap();
-    assert_eq!(answer.state, "completed");
-    assert!(answer.final_message_consistent());
-    let final_message = answer.final_message.unwrap();
-    assert_eq!(final_message.text, "{\"answer\":\"yes\",\"n\":1}");
-    assert!(
-        !rig.wal_path.exists(),
-        "run.result must not restore the live WAL"
-    );
-
-    let page = read(&mut rig, serde_json::json!({})).await;
-    let last = page.messages.last().unwrap();
-    assert_eq!(last.ordinal, final_message.ordinal);
-    assert_eq!(last.mid, final_message.mid);
-    let message = serde_json::to_value(&last.message).unwrap();
-    assert_eq!(message["role"], "assistant");
-    let read_text: String = message["content"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|part| part["type"] == "text")
-        .map(|part| part["text"].as_str().unwrap())
-        .collect();
-    assert_eq!(read_text, final_message.text);
-    assert!(
-        !rig.wal_path.exists(),
-        "session.read must not restore the live WAL"
-    );
-
-    let status = result(
-        &call(
-            &mut rig,
-            "run.status",
-            serde_json::json!({"run_id": run_id}),
-        )
-        .await,
-    );
-    assert_eq!(status["state"], "completed");
-    assert!(
-        !rig.wal_path.exists(),
-        "run.status must not restore the live WAL"
-    );
-    rig.finish().await;
-}
-
-/// A status-only read must not reopen a folded session's actor or WAL.
-#[tokio::test]
-async fn run_status_answers_from_an_archived_session_without_restoring_it() {
-    let mut rig = Rig::start_with_idle_ttl("run-status-archived", Duration::from_millis(100)).await;
-    rig.script.push(&[Step::Text("answer")]);
-    let sent = rig.send("turn-0", "go", None).await;
-    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-    fold_session(&rig);
-    let status = result(
-        &call(
-            &mut rig,
-            "run.status",
-            serde_json::json!({"run_id": run_id}),
-        )
-        .await,
-    );
-    assert_eq!(status["state"], "completed");
-    assert!(
-        !rig.wal_path.exists(),
-        "run.status alone must not restore the live WAL"
-    );
-    rig.finish().await;
-}
-
-fn fold_session(rig: &Rig) {
-    use broca_core::wal_fold::{fold, FoldOptions, FoldSettings};
-    let options = FoldOptions {
-        write: true,
-        ..Default::default()
-    };
-    let report = fold(
-        &rig.dir,
-        FoldSettings {
-            options: &options,
-            cold_ms: 0,
-        },
-    )
-    .unwrap();
-    assert!(
-        !rig.wal_path.exists(),
-        "fold must remove the live WAL: {report:?}"
-    );
-    assert_eq!(report.removed, 1, "{report:?}");
-}
-
-/// An unavailable WAL cannot hide a terminal that the durable run index already knows.
-#[tokio::test]
-async fn run_status_falls_back_to_the_terminal_index_when_the_wal_is_absent() {
-    let mut rig = Rig::start_with_idle_ttl("run-status-absent", Duration::from_millis(100)).await;
-    rig.script.push(&[Step::Text("answer")]);
-    let sent = rig.send("turn-0", "go", None).await;
-    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-    std::fs::remove_file(&rig.wal_path).unwrap();
-    assert!(!rig.wal_path.exists());
-    let status = result(
-        &call(
-            &mut rig,
-            "run.status",
-            serde_json::json!({"run_id": run_id}),
-        )
-        .await,
-    );
-    assert_eq!(status["state"], "completed");
-    assert!(status.get("undelivered_steers").is_none());
-    assert!(status.get("directives").is_none());
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn cancelled_run_result_keeps_the_terminal_index_answer_without_a_wal() {
-    let mut rig =
-        Rig::start_with_idle_ttl("cancelled-result-absent", Duration::from_millis(100)).await;
-    rig.script.hold_model(true);
-    rig.script.push(&[Step::Text("not delivered")]);
-    let sent = rig.send("turn-0", "go", None).await;
-    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_entered().await;
-    rig.cancel(&run_id).await;
-    rig.script.hold_model(false);
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-    std::fs::remove_file(&rig.wal_path).unwrap();
-    let answer = result(&call(&mut rig, "run.result", serde_json::json!({"run_id":run_id})).await);
-    assert_eq!(answer["state"], "cancelled");
-    assert!(answer["final_message"].is_null());
-    assert!(!rig.wal_path.exists());
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn completed_run_result_without_a_wal_keeps_its_unreadable_start_refusal() {
-    let mut rig =
-        Rig::start_with_idle_ttl("completed-result-absent", Duration::from_millis(100)).await;
-    rig.script.push(&[Step::Text("answer")]);
-    let sent = rig.send("turn-0", "go", None).await;
-    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(1).await;
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-    std::fs::remove_file(&rig.wal_path).unwrap();
-    let reply = call(&mut rig, "run.result", serde_json::json!({"run_id":run_id})).await;
-    assert_eq!(reply.header.ty, FrameType::Error);
-    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(error["code"], "open_failed");
-    assert!(error["message"]
-        .as_str()
-        .unwrap()
-        .contains("has no readable RunStarted"));
-    assert!(error.get("detail").is_none());
-    assert!(!rig.wal_path.exists());
-    rig.finish().await;
-}
-
-/// A durable pause retains its reason after folding, without recreating the live WAL.
-#[tokio::test]
-async fn paused_run_answers_from_an_archived_session_without_restoring_it() {
-    let mut rig = Rig::start_with_idle_ttl("run-paused-archived", Duration::from_millis(100)).await;
-    *rig.script.pause_next_run.lock().unwrap() = true;
-    let sent = rig.send("turn-0", "go", None).await;
-    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    let records = rig.wait_for_finished(1).await;
-    let reason = records
-        .iter()
-        .find_map(|record| match record {
-            broca_wal::WalRecord::RunPaused { reason, .. } => {
-                Some(serde_json::to_value(reason).unwrap())
-            }
-            _ => None,
-        })
-        .unwrap();
-    rig.wait_idle().await;
-    rig.wait_closed().await;
-    fold_session(&rig);
-    for method in ["run.status", "run.result"] {
-        let answer = result(&call(&mut rig, method, serde_json::json!({"run_id": run_id})).await);
-        assert_eq!(answer["state"], "paused", "{method}: {answer}");
-        assert_eq!(answer["reason"], reason, "{method}: {answer}");
-        assert!(
-            !rig.wal_path.exists(),
-            "{method} must not restore the live WAL"
-        );
-    }
-    rig.finish().await;
-}
-
 // ---- session.subscribe and session.send ------------------------------------------------------
 
-fn seed_empty_lineage(rig: &Rig) {
-    use broca_core::WalStore;
-    // Opening a lineage can persist its header before any episode is admitted.
-    let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
-    drop(wal.open(&rig.session).unwrap());
-    assert!(rig.wal_path.exists());
-}
-
 async fn assert_first_send_defaults(tag: &str, delivery: serde_json::Value) {
-    for header_only in [false, true] {
-        let mut rig = Rig::start(&format!("{tag}-{header_only}")).await;
-        if header_only {
-            seed_empty_lineage(&rig);
-        }
+    {
+        let mut rig = Rig::start(tag).await;
         rig.script.push(&[Step::Text("revived")]);
         let reply = call(
             &mut rig,
@@ -2125,14 +1576,9 @@ async fn assert_first_send_defaults(tag: &str, delivery: serde_json::Value) {
             result(&reply)["state"].as_str(),
             Some("active" | "pending")
         ));
-        let records = rig.wait_for_finished(1).await;
-        let config = records
-            .iter()
-            .find_map(|record| match record {
-                broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-                _ => None,
-            })
-            .expect("the first send started an episode");
+        rig.wait_for_finished(1).await;
+        let config_all = rig.run_configs().await;
+        let config = &config_all[0];
         assert_eq!(
             config.model,
             broca_protocol::request::ModelHandle::new("fake", "fake")
@@ -2173,14 +1619,9 @@ async fn an_idle_start_only_list_does_not_inherit_an_existing_episode() {
     )
     .await;
     assert_eq!(result(&first)["state"], "active");
-    let initial = rig.wait_for_finished(1).await;
-    let frozen = initial
-        .iter()
-        .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-            _ => None,
-        })
-        .unwrap();
+    rig.wait_for_finished(1).await;
+    let frozen_all = rig.run_configs().await;
+    let frozen = frozen_all.first().unwrap();
     assert!(frozen.budget.is_some());
     assert_eq!(frozen.generation.temperature, Some(0.25));
     rig.wait_idle().await;
@@ -2203,15 +1644,9 @@ async fn an_idle_start_only_list_does_not_inherit_an_existing_episode() {
     )
     .await;
     result(&next);
-    let records = rig.wait_for_finished(2).await;
-    let config = records
-        .iter()
-        .filter_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-            _ => None,
-        })
-        .nth(1)
-        .unwrap();
+    rig.wait_for_finished(2).await;
+    let config_all = rig.run_configs().await;
+    let config = &config_all[1];
     assert_eq!(config.budget, None);
     assert_eq!(config.context_limit, None);
     assert_eq!(config.service_tier, None);
@@ -2247,15 +1682,9 @@ async fn joining_delivery_lists_inherit_the_existing_episode() {
         )
         .await;
         result(&next);
-        let records = rig.wait_for_finished(2).await;
-        let config = records
-            .iter()
-            .filter_map(|record| match record {
-                broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-                _ => None,
-            })
-            .nth(1)
-            .unwrap();
+        rig.wait_for_finished(2).await;
+        let config_all = rig.run_configs().await;
+        let config = &config_all[1];
         assert_eq!(config.generation.temperature, Some(0.25), "{mode}");
         assert_eq!(
             config.model,
@@ -2267,11 +1696,8 @@ async fn joining_delivery_lists_inherit_the_existing_episode() {
 
 #[tokio::test]
 async fn a_fresh_send_without_a_model_refuses_precisely() {
-    for header_only in [false, true] {
-        let mut rig = Rig::start(&format!("missing-model-{header_only}")).await;
-        if header_only {
-            seed_empty_lineage(&rig);
-        }
+    {
+        let mut rig = Rig::start("missing-model").await;
         let body = refused_writing_nothing(
             &mut rig,
             "session.send",
@@ -2346,13 +1772,12 @@ async fn a_steer_without_a_model_takes_the_sessions_frozen_model() {
     )
     .await;
     assert_eq!(result(&reply)["state"], "active");
-    let records = rig.wait_for_finished(2).await;
-    let models: Vec<_> = records
-        .iter()
-        .filter_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
-            _ => None,
-        })
+    rig.wait_for_finished(2).await;
+    let models: Vec<_> = rig
+        .run_configs()
+        .await
+        .into_iter()
+        .map(|config| config.model)
         .collect();
     assert_eq!(models.len(), 2);
     assert_eq!(models[0], models[1], "the steer ran on the frozen model");
@@ -2466,7 +1891,7 @@ async fn session_baseline_is_answered_only_to_the_owner() {
         }),
     )
     .await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let refused = rig
         .request(
             13,
@@ -2474,15 +1899,14 @@ async fn session_baseline_is_answered_only_to_the_owner() {
         )
         .await;
     assert_eq!(refusal(&refused)["code"], "scope_owner_mismatch");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
 /// An interrupt that omits the model, sent while a run is active, is recorded as a queued send
 /// carrying the session's frozen model (and its variant), not the serve layer's empty
-/// placeholder, beside `inherit_frozen`, the parameters it takes from the session at admission.
-/// A build that predates `inherit_frozen` decodes the record without that set and runs it on
-/// the recorded model, so the model must be the real one; this build runs it on the same model.
+/// placeholder, beside `inherit_frozen`, the parameters it takes from the session at admission,
+/// and its run runs on that model.
 #[tokio::test]
 async fn a_pending_interrupt_without_a_model_records_the_frozen_model() {
     let mut rig = Rig::start("pending-frozen-model").await;
@@ -2529,13 +1953,11 @@ async fn a_pending_interrupt_without_a_model_records_the_frozen_model() {
         _ => panic!("retry of a pending interrupt: {}", result(&retry)),
     }
 
-    let frames = broca_wal::replay_file(&rig.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-    let queued = frames
-        .iter()
-        .find_map(|framed| match &framed.record {
-            broca_wal::WalRecord::Queued { request, .. } => Some(request.clone()),
-            _ => None,
-        })
+    let queued = rig
+        .queued_requests()
+        .await
+        .into_iter()
+        .next()
         .expect("the interrupt is recorded as a queued send");
     assert_eq!(
         queued.model,
@@ -2550,15 +1972,12 @@ async fn a_pending_interrupt_without_a_model_records_the_frozen_model() {
         .contains(&broca_protocol::request::InheritedParam::Generation));
 
     rig.script.hold_model(false);
-    let records = rig.wait_for_finished(2).await;
-    let models: Vec<_> = records
-        .iter()
-        .filter_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => {
-                Some((config.model.clone(), config.variant.clone()))
-            }
-            _ => None,
-        })
+    rig.wait_for_finished(2).await;
+    let models: Vec<_> = rig
+        .run_configs()
+        .await
+        .into_iter()
+        .map(|config| (config.model, config.variant))
         .collect();
     assert_eq!(models.len(), 2);
     assert_eq!(
@@ -2571,8 +1990,8 @@ async fn a_pending_interrupt_without_a_model_records_the_frozen_model() {
 // ---- client_message_id ----------------------------------------------------------------------
 
 /// A send's `client_message_id` (llm-runner 0.5.1 §9.11) through the real serve path. It is
-/// stored only in the identity digest of the `RunStarted` record the send wrote, which then
-/// requires `client-message-id/v1`; it is never in `session.read`. A retry with the same id is
+/// stored only in the identity digest the send's run start (or queued send) records; it is never
+/// in `session.read`. A retry with the same id is
 /// answered as a retry; one with another id, or without the id, is refused `send_id_reuse`
 /// naming `client_message_id` and writes nothing. A malformed id, and an id on a send without
 /// a `send_id`, are refused `invalid_params` naming it and write nothing.
@@ -2586,14 +2005,11 @@ async fn client_message_id_is_part_of_the_send_identity_and_never_read() {
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
 
-    let records = rig.records();
+    let records = rig.records().await;
     let digest = records
         .iter()
         .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted {
-                request_identity_digest,
-                ..
-            } => request_identity_digest.clone(),
+            Record::RunStart(start) => start.request_identity_digest.clone(),
             _ => None,
         })
         .expect("the keyed send recorded its identity");
@@ -2601,13 +2017,6 @@ async fn client_message_id_is_part_of_the_send_identity_and_never_read() {
         broca_core::digest_client_message_id(&digest).as_deref(),
         Some("msg-1")
     );
-    let started = records
-        .iter()
-        .find(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
-        .unwrap();
-    assert!(started
-        .required_features()
-        .contains(&broca_wal::framing::CLIENT_MESSAGE_ID_FEATURE));
 
     let read = call(&mut rig, "session.read", serde_json::json!({})).await;
     assert!(
@@ -2658,14 +2067,23 @@ async fn client_message_id_is_part_of_the_send_identity_and_never_read() {
     )
     .await;
     assert_eq!(result(&queued)["state"], "pending", "{}", result(&queued));
-    let queued_record = rig
+    let queued_receipt = rig
         .records()
+        .await
         .into_iter()
-        .find(|record| matches!(record, broca_wal::WalRecord::Queued { .. }))
-        .expect("the send was queued");
-    assert!(queued_record
-        .required_features()
-        .contains(&broca_wal::framing::CLIENT_MESSAGE_ID_FEATURE));
+        .find_map(|record| match record {
+            Record::QueuedSend(send) => send.receipt.map(|receipt| receipt.parse()),
+            _ => None,
+        })
+        .expect("the queued send has a receipt");
+    assert_eq!(
+        queued_receipt["request_identity_digest"]
+            .as_str()
+            .and_then(broca_core::digest_client_message_id)
+            .as_deref(),
+        Some("msg-3"),
+        "{queued_receipt}"
+    );
     let again = call(&mut rig, "session.send", keyed("turn-3", queued_with)).await;
     assert_eq!(result(&again)["state"], "pending", "{}", result(&again));
     for extra in [
@@ -2704,192 +2122,6 @@ fn keyed(send_id: &str, extra: serde_json::Value) -> serde_json::Value {
     params
 }
 
-async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
-    use broca_protocol::caller::ControlUnit;
-    use broca_wal::WalRecord;
-    let page = read(rig, serde_json::json!({})).await;
-    let stored: Vec<_> = page
-        .messages
-        .iter()
-        .map(|entry| {
-            (
-                entry,
-                serde_json::from_value::<Message>(entry.message.clone()).unwrap(),
-            )
-        })
-        .collect();
-    let records = rig.records();
-    let frames: Vec<_> = records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| broca_wal::FramedRecord {
-            seq: index as u64 + 1,
-            fence: 1,
-            record: record.clone(),
-        })
-        .collect();
-    let units = broca_core::project_control_with_mids(&frames, &mut Default::default()).unwrap();
-    let mut checked = 0;
-    for frame in units {
-        let matches = |mid: &str, message: &Message| {
-            match &frame.unit {
-                ControlUnit::MessageBoundary { mid: boundary } => boundary == mid,
-            ControlUnit::AssistantMessage { message: assistant } => message.role == Role::Assistant && message.content == assistant.content,
-            ControlUnit::ToolCall { call } => message.role == Role::Assistant && message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(stored) if stored.tool_call_id == call.tool_call_id)),
-            ControlUnit::ToolResult { result } => message.role == Role::Tool && message.content.iter().any(|block| matches!(block, ContentBlock::ToolResult(stored) if stored.tool_call_id == result.tool_call_id)),
-            ControlUnit::StepStarted { step_id } | ControlUnit::StepFinished { step_id, .. } => records.iter().any(|record| matches!(record, WalRecord::ModelStepFinished { step_id: finished, assistant_message, .. } if finished == step_id && message.role == Role::Assistant && message.content == assistant_message.content)),
-            ControlUnit::BudgetFired { ordinal, .. } => records.iter().any(|record| matches!(record, WalRecord::BudgetFired { ordinal: stored_ordinal, caller_text: Some(text), .. } if stored_ordinal == ordinal && message.role == Role::User && message.content == vec![ContentBlock::Text { text: text.clone() }])),
-            _ => false,
-        }
-        };
-        if let Some(ordinal) = frame.message_ordinal {
-            let (entry, _) = stored
-                .iter()
-                .find(|(entry, message)| matches(&format!("m{}", entry.ordinal - 1), message))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "control payload has no session.read message: {:?}",
-                        frame.unit
-                    )
-                });
-            assert_eq!(ordinal + 1, entry.ordinal, "{:?}", frame.unit);
-            assert_eq!(
-                frame.mid().as_deref(),
-                Some(format!("m{}", entry.ordinal - 1).as_str()),
-                "{:?}",
-                frame.unit
-            );
-            checked += 1;
-        } else {
-            assert!(
-                !matches!(
-                    frame.unit,
-                    ControlUnit::AssistantMessage { .. }
-                        | ControlUnit::MessageBoundary { .. }
-                        | ControlUnit::ToolCall { .. }
-                        | ControlUnit::ToolResult { .. }
-                        | ControlUnit::StepStarted { .. }
-                        | ControlUnit::StepFinished { .. }
-                        | ControlUnit::BudgetFired { .. }
-                ),
-                "message control has no placement: {:?}",
-                frame.unit
-            );
-        }
-    }
-    assert!(
-        checked >= 8,
-        "the comparison must reach the complete tool turn"
-    );
-    // Core projection keeps native positions. The public stream must translate them to
-    // exactly the mids a reader already holds, for both boundaries and lifecycle events.
-    // Every caller has exactly one finished run, whose `run_finished` is the replay's last
-    // control frame. Waiting for it before the quiet window starts keeps a slow runner from
-    // closing the window partway through the replay.
-    let frames = rig
-        .subscribe_collect_until(
-            20,
-            serde_json::json!({"from":"start"}),
-            Duration::from_millis(100),
-            |frame| {
-                serde_json::from_slice::<serde_json::Value>(&frame.body)
-                    .is_ok_and(|body| body["event"]["type"] == "run_finished")
-            },
-        )
-        .await;
-    let mut public_mids = 0;
-    for frame in frames {
-        let value: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-        for mid in [
-            value["event"]["mid"].as_str(),
-            (value["unit"]["type"] == "message_boundary")
-                .then(|| value["unit"]["mid"].as_str())
-                .flatten(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            assert!(
-                page.messages.iter().any(|entry| entry.mid == mid),
-                "unreadable public mid {mid}: {value}"
-            );
-            public_mids += 1;
-        }
-    }
-    assert!(
-        public_mids >= 8,
-        "the public stream must include message identities"
-    );
-}
-
-#[tokio::test]
-async fn projected_control_mids_match_session_read_tool_steer_budget_and_resume() {
-    let (mut tool, _) = one_tool_turn("placed-tool").await;
-    assert_projected_control_mids_match_read(&mut tool).await;
-    tool.finish().await;
-
-    let mut steer = Rig::start("placed-steer").await;
-    steer
-        .script
-        .push(&[Step::Call("steer-call"), Step::Text("steered answer")]);
-    steer.script.hold_tool(true);
-    steer.send("steer-turn", "task", None).await;
-    steer.wait_entered().await;
-    steer.send("steer-input", "new steer", Some("steer")).await;
-    steer.script.hold_tool(false);
-    steer.wait_for_finished(1).await;
-    steer.wait_idle().await;
-    assert_projected_control_mids_match_read(&mut steer).await;
-    steer.finish().await;
-
-    let mut budget = Rig::start("placed-budget").await;
-    budget
-        .script
-        .push(&[Step::Call("budget-call"), Step::Text("budget answer")]);
-    budget.send_with("budget-turn", "task", None, serde_json::json!({"budget":{"nudges":[{"at_tool_calls":1,"text":"budget coordinate"}],"finalize_at_tool_calls":5,"finalize_text":"finish"}})).await;
-    budget.wait_for_finished(1).await;
-    budget.wait_idle().await;
-    assert!(budget
-        .records()
-        .iter()
-        .any(|record| matches!(record, broca_wal::WalRecord::BudgetFired { .. })));
-    assert_projected_control_mids_match_read(&mut budget).await;
-    budget.finish().await;
-
-    let mut resumed = Rig::start("placed-resume").await;
-    resumed.script.push(&[Step::Call("resume-call")]);
-    resumed.script.hold_tool(true);
-    let reply = resumed
-        .send_with(
-            "resume-turn",
-            "task",
-            None,
-            serde_json::json!({"on_restart":"resume"}),
-        )
-        .await;
-    let run_id = result(&reply)["run_id"].as_str().unwrap().to_owned();
-    resumed.wait_entered().await;
-    resumed = resumed.restart_at_tool_boundary().await;
-    resumed
-        .send("resumed-steer", "restart steer", Some("steer"))
-        .await;
-    resumed.script.push(&[Step::Text("resumed answer")]);
-    assert_eq!(
-        resumed
-            .registry()
-            .resume_restart_pauses(
-                std::sync::Arc::new(broca_core::FileWalStore::new(resumed.dir.join("wal"))),
-                vec![(run_id, resumed.session.clone())],
-            )
-            .await,
-        (1, 0)
-    );
-    resumed.wait_for_finished(2).await;
-    resumed.wait_idle().await;
-    assert_projected_control_mids_match_read(&mut resumed).await;
-    resumed.finish().await;
-}
-
 #[tokio::test]
 async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     use cortexkit_role_llm_runner::{capabilities as groups, describe::RoleDescribe, ops};
@@ -2919,7 +2151,7 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     // refused may have written.
     for flag in [true, false] {
         let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
-        let wal = rig.wal_bytes();
+        let wal = rig.records().await;
         let plan = serde_json::json!({"items":[{"output_refs":flag}]});
         let mut requests = vec![(
             ops::SESSION_SEND,
@@ -2949,7 +2181,11 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
                 error["detail"]["field"], "plan.items[].output_refs",
                 "{method}: {error}"
             );
-            assert_eq!(rig.wal_bytes(), wal, "{method} must refuse before writing");
+            assert_eq!(
+                rig.records().await,
+                wal,
+                "{method} must refuse before writing"
+            );
             let after = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
             assert_eq!(after, before, "{method} must preserve the session head");
         }
@@ -3031,20 +2267,18 @@ async fn delayed_tool_replay_survives_a_real_serve_restart() {
 
 async fn assert_tool_replay_survives_restart(tag: &str, replay_delay: Option<Duration>) {
     let (mut rig, _) = one_tool_turn(tag).await;
-    let records = rig.records();
+    let records = rig.records().await;
     let started = records
         .iter()
         .find_map(|record| match record {
-            broca_wal::WalRecord::ToolDispatchIntent {
-                dispatched_at_ms, ..
-            } => *dispatched_at_ms,
+            Record::ToolIntent(intent) => intent.dispatched_at_ms,
             _ => None,
         })
         .expect("the real tool call recorded its dispatch observation");
     let finished = records
         .iter()
         .find_map(|record| match record {
-            broca_wal::WalRecord::ToolResult { finished_at_ms, .. } => *finished_at_ms,
+            Record::ToolOutcome(outcome) => outcome.finished_at_ms,
             _ => None,
         })
         .expect("the real tool call recorded its finish observation");
@@ -3071,10 +2305,10 @@ async fn assert_tool_replay_survives_restart(tag: &str, replay_delay: Option<Dur
         .any(|value| value["event"]["type"] == "tool_finished"
             && value["event"]["finished_at"] == finished));
     // Closing a connection alone does not release a live registry's writer lease.
-    let bytes = rig.wal_bytes();
+    let bytes = rig.records().await;
     assert!(rig.registry().stop_and_seal().await);
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         bytes,
         "stopping an already-finished run writes nothing"
     );
@@ -3171,16 +2405,14 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         );
         let records = rig.wait_for_finished(1).await;
         let stored = records.iter().find_map(|record| match record {
-            broca_wal::WalRecord::ModelStepFinished {
-                assistant_message, ..
-            } => Some(&assistant_message.content),
+            Record::Assistant(assistant) => Some(&assistant.message.content),
             _ => None,
         });
         assert_eq!(stored, Some(&content));
         rig.wait_idle().await;
         let page = read(&mut rig, serde_json::json!({})).await;
         let descriptors = read(&mut rig, serde_json::json!({"media":"descriptors"})).await;
-        let wal = rig.wal_bytes();
+        let wal = rig.records().await;
         assert!(rig.registry().stop_and_seal().await);
         rig = rig.restart().await;
         let replay = assistant_frame(
@@ -3191,10 +2423,19 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
             )
             .await,
         );
+        // Reopening the session appends only its new writer's record; attaching adds nothing.
+        let after = rig.records().await;
         assert_eq!(
-            rig.wal_bytes(),
-            wal,
+            after[..wal.len()],
+            wal[..],
             "attaching never rewrites provider state"
+        );
+        assert!(
+            after[wal.len()..]
+                .iter()
+                .all(|record| matches!(record, Record::WriterOpened(_))),
+            "{:?}",
+            &after[wal.len()..]
         );
         rig.finish().await;
         eprintln!(
@@ -3288,11 +2529,12 @@ async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &s
 
 #[tokio::test]
 async fn live_display_samples_match_stored_parts_and_attach_replays_current_step() {
-    // The pins include two additions to the original samples: the resume cursor's incarnation
-    // and source-frame digest, and, for the "live" attach made while step 1 is streaming, the
-    // replay of that step's durable controls (its step_started record) before the display
-    // snapshot. The replayed frame takes seq 1, so the snapshot frames after it are numbered
-    // one higher.
+    // The control lane carries only durable units, and a step's start is written without a
+    // sync: nothing a crash could lose depends on it, since a resumed run sends the request
+    // again. So its `step_started` control is published when the next sync makes it durable,
+    // which is after the step's first display deltas, and an attach made while step 1 streams
+    // gets the display snapshot with no step controls before it. Display deltas name their
+    // message themselves, so a reader never needs the control to place them.
     use broca_protocol::{ToolCall, ToolCallId};
     let tool = ContentBlock::ToolCall(ToolCall {
         thought_signature: None,
@@ -3414,8 +2656,6 @@ async fn live_display_mid_after_reopen_comes_from_seeded_placement() {
         .unwrap();
     assert_eq!(delta["event"]["mid"], stored.mid);
     assert_eq!(stored.ordinal, 4);
-    // A session without a compaction provider keeps the established positional message ids.
-    assert_eq!(delta["event"]["mid"], "m3");
     rig.finish().await;
 }
 
@@ -3463,7 +2703,7 @@ async fn live_finalize_filter_restreams_the_stored_block_indices() {
     assert_eq!(
         final_deltas.len(),
         1,
-        "the omitted tool's live row is wiped"
+        "the omitted tool's live row is wiped: {final_deltas:?}"
     );
     assert_eq!(final_deltas[0]["event"]["type"], "text_delta");
     assert_eq!(final_deltas[0]["event"]["part"], "0");
@@ -3552,8 +2792,6 @@ async fn live_display_after_steer_uses_the_next_step_placement() {
         .unwrap();
     let page = read(&mut rig, serde_json::json!({})).await;
     assert_eq!(page.messages.last().unwrap().ordinal, 5);
-    // A session without a compaction provider keeps the established positional message ids.
-    assert_eq!(page.messages.last().unwrap().mid, "m4");
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
 }
@@ -3659,7 +2897,7 @@ async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
     rig.send("turn-1", "hi", None).await;
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let wal_before = rig.wal_bytes();
+    let wal_before = rig.records().await;
     let created = call(&mut rig, "session.upload_begin", begin).await;
     let id = result(&created)["upload_id"].as_str().unwrap().to_owned();
     let append = serde_json::json!({"upload_id":id,"offset":0,"data":"YWJj"});
@@ -3704,7 +2942,7 @@ async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
         .unwrap()
         .contains("pdf"));
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
-    assert_eq!(rig.wal_bytes(), wal_before);
+    assert_eq!(rig.records().await, wal_before);
     let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
     assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
@@ -3737,7 +2975,7 @@ async fn upload_requires_send_standing_before_any_staging_write() {
     )
     .await;
     let before = upload_staging_snapshot(&rig.dir);
-    let wal_before = rig.wal_bytes();
+    let wal_before = rig.records().await;
     for (method, params) in [
         ("session.upload_begin", begin),
         (
@@ -3756,7 +2994,7 @@ async fn upload_requires_send_standing_before_any_staging_write() {
             "{method}"
         );
         assert_eq!(upload_staging_snapshot(&rig.dir), before, "{method}");
-        assert_eq!(rig.wal_bytes(), wal_before);
+        assert_eq!(rig.records().await, wal_before);
     }
     rig.finish().await;
 }
@@ -3849,7 +3087,7 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
         }),
     )
     .await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let created = rig.request(13, serde_json::json!({"method":"session.upload_begin","params":{"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}})).await;
     let id = result(&created)["upload_id"].as_str().unwrap().to_owned();
     let appended = rig.request(13, serde_json::json!({"method":"session.upload_append","params":{"upload_id":id,"offset":0,"data":"YWJj"}})).await;
@@ -3861,7 +3099,7 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
         )
         .await;
     assert_eq!(result(&committed)["state"], "committed");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -3889,7 +3127,7 @@ async fn debug_pdf_send_is_refused_before_any_session_write() {
     uploads.append(&rig.session, &id, 0, bytes, now).unwrap();
     uploads.commit(&rig.session, &id, now).unwrap();
     let before = upload_staging_snapshot(&rig.dir);
-    assert!(!rig.wal_path.exists());
+    assert!(!rig.session_stored().await);
     let refused = rig
         .send_with(
             "pdf",
@@ -3904,7 +3142,10 @@ async fn debug_pdf_send_is_refused_before_any_session_write() {
         message.contains("pdf") && message.contains("modality") && message.contains("model"),
         "{message}"
     );
-    assert!(!rig.wal_path.exists(), "a refused send must not open a WAL");
+    assert!(
+        !rig.session_stored().await,
+        "a refused send must not create a session"
+    );
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
     for class in ["media", "media-durable", "media-ephemeral"] {
         for dir in ["objects", "refs"] {

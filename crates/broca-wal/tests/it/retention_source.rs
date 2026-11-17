@@ -92,23 +92,8 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
             "crates/broca-core/src/fresh_start.rs".to_owned(),
             vec!["RunStarted.retention".to_owned()],
         ),
-        (
-            "crates/broca-module/src/actor.rs".to_owned(),
-            // Two `Queued` writers: the plain queued send, and a send with an ordered `delivery`
-            // list, which is queued with the same retention fields.
-            vec![
-                "Queued.retention".to_owned(),
-                "Queued.retention".to_owned(),
-                "Queued.ts_ms".to_owned(),
-                "Queued.ts_ms".to_owned(),
-                "Steered.retention".to_owned(),
-                "Steered.retention".to_owned(),
-                "Steered.ts_ms".to_owned(),
-                "Steered.ts_ms".to_owned(),
-            ],
-        ),
-        // The new session storage's actor queues sends with the same retention-clock timestamp:
-        // a plain queued send and one with an ordered `delivery` list.
+        // The session store's actor queues sends with the retention-clock timestamp: a plain
+        // queued send and one with an ordered `delivery` list.
         (
             "crates/broca-module/src/store_actor.rs".to_owned(),
             vec!["Queued.ts_ms".to_owned()],

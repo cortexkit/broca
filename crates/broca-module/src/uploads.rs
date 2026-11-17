@@ -128,42 +128,19 @@ pub(crate) async fn media_read(
             &request.sha256,
         )));
     }
-    if let Some(store) = registry.store_holding(session)? {
-        return store_media_read(registry, &store, session, &request).await;
+    // Only a medium the session's own durable records name authorizes a digest, so a session
+    // the store doesn't hold names none.
+    match registry.store_holding(session)? {
+        Some(store) => store_media_read(registry, &store, session, &request).await,
+        None => Err(ServeError::Upload(UploadError::new(
+            "unknown_media",
+            &request.sha256,
+        ))),
     }
-    // The object trees are shared. Authorize against durable capture records in this
-    // bound session before opening any object, including for metadata-only probes.
-    let reference = registry
-        .captured_media_reference(session, &request.sha256)
-        .await?
-        .ok_or_else(|| ServeError::Upload(UploadError::new("unknown_media", &request.sha256)))?;
-    request
-        .check(reference.byte_size)
-        .map_err(|field| ServeError::Upload(UploadError::invalid(field, &request.sha256)))?;
-    let uploads = registry
-        .upload_store()
-        .ok_or_else(|| ServeError::Upload(UploadError::new("unknown_media", &request.sha256)))?;
-    let session = session.clone();
-    tokio::task::spawn_blocking(move || {
-        let bytes = uploads
-            .session_media_store(&session)
-            .and_then(|store| {
-                store
-                    .read_verified(&reference)
-                    .map_err(std::io::Error::other)
-            })
-            .map_err(|error| {
-                ServeError::Open(format!("read media {}: {error}", request.sha256), None)
-            })?;
-        media_reply(&request, reference, &bytes)
-    })
-    .await
-    .map_err(|error| ServeError::Open(format!("media read worker failed: {error}"), None))?
 }
 
-/// `session.media_read` on a session kept in the new storage. As on today's storage, only a
-/// medium the session's own durable records name authorizes a digest: the store's records play
-/// the part of today's captured history. Another session's media, and an upload no send named,
+/// `session.media_read` on a session the store holds. Only a medium the session's own durable
+/// records name authorizes a digest. Another session's media, and an upload no send named,
 /// read as `unknown_media`. The bytes come from the object the naming record stored, checked
 /// against the reference.
 async fn store_media_read(

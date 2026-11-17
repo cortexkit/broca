@@ -8,15 +8,7 @@ use broca_wal::StorageClass;
 
 struct NoRuns;
 #[async_trait]
-impl broca_module::executor::RunExecutor for NoRuns {
-    async fn execute(
-        &self,
-        job: broca_module::executor::RunJob,
-        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        panic!("move executed a model step for {:?}", job.req.session)
-    }
-}
+impl broca_module::executor::RunExecutor for NoRuns {}
 
 async fn rig(path: PathBuf, door: Arc<FakeDoor>, key: DeploymentKey) -> Rig {
     std::fs::create_dir_all(&path).unwrap();
@@ -38,18 +30,13 @@ async fn rig(path: PathBuf, door: Arc<FakeDoor>, key: DeploymentKey) -> Rig {
         &broca_core::ReadOnlyWalReader::new(&path),
     )
     .unwrap();
-    let registry = Arc::new(LineageRegistry::new_with_sources(
-        Arc::new(
-            broca_module::opener::DefaultOpener::new(
-                Arc::new(broca_core::FileLeaseStore::new(path.join("leases"))),
-                wal.clone(),
-                Arc::new(NoRuns),
-            )
-            .with_store_runtime(runtime),
-        ),
-        Some(wal.clone()),
-        Some(index.clone()),
-    ));
+    let registry = Arc::new(LineageRegistry::new(Arc::new(
+        broca_module::opener::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(path.join("leases"))),
+            Arc::new(NoRuns),
+        )
+        .with_store_runtime(runtime),
+    )));
     registry.set_session_address_inventory(index.clone());
     let service = Arc::new(AgentDataService::new(
         path.clone(),
@@ -65,6 +52,59 @@ async fn rig(path: PathBuf, door: Arc<FakeDoor>, key: DeploymentKey) -> Rig {
         registry,
         service,
         door,
+    }
+}
+
+/// The session triple a session's log names, as broca derives it from its bind identity.
+fn triple(session: &BindIdentity) -> broca_session_store::head::SessionTriple {
+    broca_session_store::head::SessionTriple {
+        project_root: session.project_root.display().to_string(),
+        harness: session.harness.clone(),
+        session: session.session.clone(),
+    }
+}
+
+/// A session's records and setup parts, as the storage keeps them: a run started on a stub
+/// model, either finished after one answer (`finished.json`) or still running with nothing
+/// answered (`running.json`). The records name no session, so one history serves every one.
+struct Seed {
+    records: Vec<broca_session_store::record::Record>,
+    parts: std::collections::BTreeMap<broca_session_store::codec::Digest, Vec<u8>>,
+}
+
+fn seed_history(terminal: bool) -> Seed {
+    let text = if terminal {
+        include_str!("fixtures/finished.json")
+    } else {
+        include_str!("fixtures/running.json")
+    };
+    let fixture: Value = serde_json::from_str(text).unwrap();
+    let bytes = |value: &Value| -> Vec<u8> {
+        let text = value.as_str().unwrap();
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
+    };
+    Seed {
+        records: fixture["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                let kind = u32::try_from(record["kind"].as_u64().unwrap()).unwrap();
+                broca_session_store::record::Record::decode(kind, &bytes(&record["body"])).unwrap()
+            })
+            .collect(),
+        parts: fixture["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                let digest: [u8; 32] = bytes(&part[0]).try_into().unwrap();
+                (broca_session_store::codec::Digest(digest), bytes(&part[1]))
+            })
+            .collect(),
     }
 }
 
@@ -94,28 +134,15 @@ async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, con
     let mut writer = Session::create(
         &backend,
         SessionAddr(broca_core::session_addr(session)),
-        broca_session_convert::stage::triple(session),
+        triple(session),
         runtime.deployment(),
         false,
     )
     .await
     .unwrap();
-    let source = Rig::new("store-fixture-wal", Arc::new(FakeDoor::default()));
-    source.seed(session, "synthetic-run", terminal);
-    let mut records = source.wal.read_records(session).unwrap();
-    for frame in &mut records {
-        if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut frame.record {
-            *written_at_ms = Some(2);
-        }
-        if let WalRecord::RunStarted { config, .. } = &mut frame.record {
-            config.frozen_render_config = json!({"family_id":broca_provider::spec::WireFamilyId::OpenAiChat,"renderer_version":1,"wire_model_id":"m","max_output_tokens":16,
-                "reasoning":broca_provider::policy::ReasoningPolicy::None,"tool_id":broca_provider::policy::ToolIdPolicy::Passthrough,
-                "system_prompt":broca_provider::policy::SystemPromptPolicy::SystemMessage,"usage":broca_provider::policy::UsagePolicy::OpenAiUsage});
-        }
-    }
-    let mut converted = broca_session_convert::convert(&records, None).unwrap();
+    let mut seeded = seed_history(terminal);
     if contract {
-        for record in &mut converted.records {
+        for record in &mut seeded.records {
             if let broca_session_store::record::Record::RunStart(start) = record {
                 start.compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
             }
@@ -126,12 +153,12 @@ async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, con
         .setup_key_for(runtime.deployment().new_sessions())
         .unwrap();
     let store = broca_session_store::setup::SetupStore::new(&backend, &key);
-    for record in &converted.records {
+    for record in &seeded.records {
         if let broca_session_store::record::Record::SetupStub(stub) = record {
             for part in &stub.parts {
                 use broca_session_loop::parts::Parts as _;
                 store
-                    .put(part.kind, &converted.parts[&part.digest])
+                    .put(part.kind, &seeded.parts[&part.digest])
                     .await
                     .unwrap();
                 runtime
@@ -139,13 +166,13 @@ async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, con
                     .clone()
                     .put(
                         part.kind,
-                        &serde_json::from_slice(&converted.parts[&part.digest]).unwrap(),
+                        &serde_json::from_slice(&seeded.parts[&part.digest]).unwrap(),
                     )
                     .unwrap();
             }
         }
     }
-    writer.append(&converted.records, true).await.unwrap();
+    writer.append(&seeded.records, true).await.unwrap();
     writer.close().await.unwrap();
 }
 
@@ -297,7 +324,7 @@ async fn store_move_plain_and_encrypted_roundtrip_release_and_move_back() {
         let writer = Session::load(
             &backend,
             addr.clone(),
-            &broca_session_convert::stage::triple(&session),
+            &triple(&session),
             runtime.deployment(),
         )
         .await
@@ -519,7 +546,7 @@ async fn store_prepare_refuses_an_unverifiable_next_request_before_freezing() {
     let mut writer = Session::load(
         &backend,
         SessionAddr(broca_core::session_addr(&session)),
-        &broca_session_convert::stage::triple(&session),
+        &triple(&session),
         runtime.deployment(),
     )
     .await

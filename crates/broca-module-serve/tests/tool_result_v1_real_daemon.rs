@@ -4,6 +4,7 @@
 
 mod delivery_rig;
 
+use broca_session_store::record::Record;
 use std::{path::PathBuf, sync::Arc};
 
 use broca_protocol::{ContentBlock, ToolCall, ToolCallId};
@@ -117,27 +118,20 @@ async fn capture(
     assert_eq!(
         records
             .iter()
-            .filter(|r| matches!(r, broca_wal::WalRecord::ToolResult { .. }))
+            .filter(|r| matches!(r, Record::ToolOutcome(_)))
             .count(),
         3
     );
-    let config = records
-        .iter()
-        .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-            _ => None,
-        })
-        .unwrap();
+    let config_all = rig.run_configs().await;
+    let config = config_all.first().unwrap();
     assert_eq!(config.model.model_id.as_str(), "fake");
     assert!(config.frozen_render_config.get("media").is_none());
     let captured = if mode == "v1" {
         let output = records
             .iter()
             .find_map(|record| match record {
-                broca_wal::WalRecord::ToolResult { result, .. }
-                    if result.tool_call_id.0 == "read-image" =>
-                {
-                    Some(&result.output)
+                Record::ToolReply(reply) if reply.result.tool_call_id.0 == "read-image" => {
+                    Some(&reply.result.output)
                 }
                 _ => None,
             })

@@ -22,7 +22,10 @@
 
 mod delivery_rig;
 mod step_transform_rig;
+#[path = "common/stored_log.rs"]
+mod stored_log;
 
+use broca_session_store::record::Record;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -327,8 +330,6 @@ mod bus;
 #[path = "llm_runner_conformance/catalog.rs"]
 mod catalog;
 
-#[path = "llm_runner_conformance/attribution.rs"]
-mod attribution;
 #[path = "llm_runner_conformance/boundary_cancel.rs"]
 mod boundary_cancel;
 #[path = "llm_runner_conformance/evidence.rs"]
@@ -337,8 +338,6 @@ mod evidence;
 mod fork_answer;
 #[path = "llm_runner_conformance/held_late_results.rs"]
 mod held_late_results;
-#[path = "llm_runner_conformance/optional_tools.rs"]
-mod optional_tools;
 #[path = "llm_runner_conformance/output_refs.rs"]
 mod output_refs;
 #[path = "llm_runner_conformance/reader_identity.rs"]
@@ -346,8 +345,8 @@ mod reader_identity;
 /// Retention deletion scenarios on the same real-daemon rig. They move the daemon's clock
 /// through its `test-clock` control file, which only a `test-clock` build reads.
 #[cfg(feature = "test-clock")]
-#[path = "llm_runner_conformance/retention.rs"]
-mod retention;
+#[path = "llm_runner_conformance/retention_clock.rs"]
+mod retention_clock;
 #[path = "llm_runner_conformance/routed_accounts.rs"]
 mod routed_accounts;
 #[path = "llm_runner_conformance/session_class.rs"]
@@ -1253,15 +1252,6 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             .get(&(handle.channel, handle.epoch))
             .cloned()
             .unwrap_or_default();
-        // For a cut at the step record the call is held before it runs or is counted: it never
-        // executes, and the harness then cuts the WAL back to before its dispatch intent.
-        if self.shared.reach(points::STEP_RECORDED, &session) {
-            self.shared.released.notified().await;
-            return subc_client_rs::HandlerOutcome::Error {
-                code: "conformance_killed".into(),
-                message: "the runner was killed while this call was held".into(),
-            };
-        }
         *self
             .shared
             .invocations
@@ -1665,7 +1655,6 @@ struct BrocaSubject {
     dump_dir: Option<PathBuf>,
     binary: Option<PathBuf>,
     backup_classes: Option<Vec<String>>,
-    plain_session_storage: bool,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     service_tier_enabled: bool,
@@ -1689,7 +1678,6 @@ impl BrocaSubject {
             dump_dir: None,
             binary: None,
             backup_classes: None,
-            plain_session_storage: false,
             bus_events_enabled: true,
             process_kills_disabled: false,
             service_tier_enabled: std::env::var_os("BROCA_CONFORMANCE_SERVICE_TIER").is_some(),
@@ -1718,27 +1706,6 @@ impl BrocaSubject {
             // Before routing, fixtures may author a legacy seed at this identity.
             None => identity,
         }
-    }
-
-    async fn fixture_identity(
-        &self,
-        handle: &Live,
-        session: &str,
-    ) -> Result<broca_protocol::BindIdentity, HarnessError> {
-        let connection = self.connection(handle, &self.owner_stamp()).await?;
-        let route = self
-            .open(&connection, &self.raw_bind_identity(session))
-            .await?;
-        let identity = broca_test_support::resolve_session_address(
-            &handle.state_root,
-            &self.raw_bind_identity(session),
-        )
-        .map_err(HarnessError::new);
-        connection
-            .route_close(&route)
-            .await
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        identity
     }
 
     async fn start(&self, root: &Path) -> Result<Live, HarnessError> {
@@ -1861,9 +1828,9 @@ impl BrocaSubject {
         if let Some(classes) = &self.backup_classes {
             settings["backup_classes"] = json!(classes);
         }
-        if self.plain_session_storage || routed_session.is_some_and(step_events::fixture_session) {
-            settings["session_storage"] = json!({"encryption": "off"});
-        }
+        // The daemons here have no deployment-key vault, so every session is stored plain: the
+        // harness reads its records from disk (`stored_log`).
+        settings["session_storage"] = json!({"encryption": "off"});
         if routed {
             routed_accounts::configure(root, &self.model_url, &mut config, &mut settings)?;
         }
@@ -2055,70 +2022,12 @@ impl BrocaSubject {
             })
     }
 
-    /// The records of `session`'s WAL on `live`'s state root.
-    fn records(&self, live: &Live, session: &str) -> Vec<broca_wal::WalRecord> {
-        use broca_core::WalStore;
-        broca_core::FileWalStore::new(live.state_root.join("wal"))
-            .read_records(&self.bind_identity(session))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|framed| framed.record)
-            .collect()
+    /// The records of `session`'s open log on `live`'s state root.
+    async fn records(&self, live: &Live, session: &str) -> Vec<Record> {
+        stored_log::stored_records(&live.state_root, &self.bind_identity(session)).await
     }
 
-    /// Cut `session`'s WAL back to end at its last model step record, dropping every frame
-    /// written after it (the batch start and the dispatch intents) but keeping the lineage
-    /// frame that follows each record. The process that wrote it is already dead.
-    ///
-    /// Frames are walked by their own length fields: a frame is a 53-byte header (payload
-    /// length as u32 LE, version byte, sequence, fence, digest) and its payload. A version-2
-    /// payload is the lineage identity; a version-3 payload is `{"requires", "record"}` with the
-    /// record's JSON under `record`; any other version's payload is the record's JSON itself.
-    fn cut_back_to_last_step(&self, live: &Live, session: &str) -> Result<(), HarnessError> {
-        let path = broca_core::FileWalStore::new(live.state_root.join("wal"))
-            .wal_path(&self.bind_identity(session));
-        let bytes = std::fs::read(&path)
-            .map_err(|e| HarnessError::new(format!("reading {}: {e}", path.display())))?;
-        let mut at = 0usize;
-        let mut cut = None;
-        while at + 53 <= bytes.len() {
-            let length = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            let version = bytes[at + 4];
-            let end = at + 53 + length;
-            if end > bytes.len() {
-                break;
-            }
-            if version == 2 {
-                // A lineage frame right after the step record stays with it.
-                if cut == Some(at) {
-                    cut = Some(end);
-                }
-            } else {
-                let payload: Value = serde_json::from_slice(&bytes[at + 53..end])
-                    .map_err(|e| HarnessError::new(format!("an undecodable frame: {e}")))?;
-                let record = if version == 3 {
-                    &payload["record"]
-                } else {
-                    &payload
-                };
-                if record["type"] == "model_step_finished" {
-                    cut = Some(end);
-                }
-            }
-            at = end;
-        }
-        let cut =
-            cut.ok_or_else(|| HarnessError::new("the WAL holds no step record to cut back to"))?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| HarnessError::new(e.to_string()))?;
-        file.set_len(cut as u64)
-            .and_then(|()| file.sync_all())
-            .map_err(|e| HarnessError::new(format!("cutting {} back: {e}", path.display())))
-    }
-
-    /// Whether `session`'s WAL holds exactly the durable state `point` names: what must be
+    /// Whether `session`'s log holds exactly the durable state `point` names: what must be
     /// there, and nothing the next step would have written.
     ///
     /// For a point in a run's tool loop the counts are of the cut run alone: the records from
@@ -2126,34 +2035,31 @@ impl BrocaSubject {
     /// first (the StepRecorded crash case runs one finished turn to read its lineage before the
     /// kill), and those runs must each have ended before the cut one started. The compaction
     /// points keep counting the whole WAL, as their scenarios run one turn per session.
-    fn holds_point(&self, live: &Live, session: &str, point: &str) -> Result<(), String> {
-        use broca_wal::WalRecord as R;
-        let all = self.records(live, session);
+    async fn holds_point(&self, live: &Live, session: &str, point: &str) -> Result<(), String> {
+        use Record as R;
+        let all = self.records(live, session).await;
         let current = all
             .iter()
-            .rposition(|r| matches!(r, R::RunStarted { .. }))
+            .rposition(|r| matches!(r, R::RunStart(_)))
             .unwrap_or(0);
         let (earlier, records) = all.split_at(current);
         let earlier_started = earlier
             .iter()
-            .filter(|r| matches!(r, R::RunStarted { .. }))
+            .filter(|r| matches!(r, R::RunStart(_)))
             .count();
-        let earlier_finished = earlier
-            .iter()
-            .filter(|r| matches!(r, R::RunFinished { .. }))
-            .count();
+        let earlier_finished = earlier.iter().filter(|r| matches!(r, R::RunEnd(_))).count();
         if earlier_started != earlier_finished {
             return Err(format!(
-                "session {session}'s WAL holds an earlier run that never finished before the one \
+                "session {session}'s log holds an earlier run that never finished before the one \
                  cut at {point}: {earlier_started} RunStarted, {earlier_finished} RunFinished"
             ));
         }
         let count = |want: fn(&R) -> bool| records.iter().filter(|r| want(r)).count();
-        let started = count(|r| matches!(r, R::RunStarted { .. }));
-        let steps = count(|r| matches!(r, R::ModelStepFinished { .. }));
-        let intents = count(|r| matches!(r, R::ToolDispatchIntent { .. }));
-        let results = count(|r| matches!(r, R::ToolResult { .. }));
-        let finished = count(|r| matches!(r, R::RunFinished { .. }));
+        let started = count(|r| matches!(r, R::RunStart(_)));
+        let steps = count(|r| matches!(r, R::StepEnd(_)));
+        let intents = count(|r| matches!(r, R::ToolIntent(_)));
+        let results = count(|r| matches!(r, R::ToolOutcome(_)));
+        let finished = count(|r| matches!(r, R::RunEnd(_)));
         let ok = match point {
             points::ADMITTED | points::SEND_RECORDED => started == 1 && steps == 0,
             points::STEP_RECORDED => steps == 1 && intents == 0,
@@ -2166,7 +2072,7 @@ impl BrocaSubject {
             Ok(())
         } else {
             Err(format!(
-                "session {session}'s WAL does not hold the state {point} names in its last run \
+                "session {session}'s log does not hold the state {point} names in its last run \
                  ({earlier_started} earlier finished runs): {started} RunStarted, {steps} steps, \
                  {intents} intents, {results} results, {finished} RunFinished"
             ))
@@ -2183,37 +2089,25 @@ impl Harness for BrocaSubject {
         if skip_crash_kills() || self.process_kills_disabled {
             return Vec::new();
         }
+        // StepRecorded is not declared: the run loop writes a step's dispatch intents right after
+        // the step, with nothing between them the rig can hold, so no process kill lands
+        // there. The store's in-process crash-cut tests cut its log at that boundary.
         let points: Vec<_> = [
             points::ADMITTED,
             points::SEND_RECORDED,
-            points::STEP_RECORDED,
             points::DISPATCH_INTENT,
             points::TOOL_RESULT_RECORDED,
             points::TERMINAL,
         ]
         .into_iter()
-        .map(|point| {
-            if point == points::STEP_RECORDED {
-                return PointDeclaration {
-                    point: KillPoint::new(point),
-                    mechanisms: vec![KillMechanism::LogTruncation],
-                    note: "broca writes a step's dispatch intents right after the step, with \
-                           nothing between them the rig can hold, so this cut kills ck-broca \
-                           (SIGKILL) while the call is held unrun at the tool provider, then \
-                           cuts the WAL back to the step record. A process was killed, but the \
-                           durable state was reached by truncation, so it is reported as that."
-                        .into(),
-                };
-            }
-            PointDeclaration {
-                point: KillPoint::new(point),
-                mechanisms: vec![KillMechanism::ProcessSignal],
-                note: "SIGKILL of the ck-broca process while the rig holds the next thing it \
-                       waits on, after the root's WAL is checked to hold exactly the point's \
-                       state. broca's start record holds the send with its send_id, so Admitted \
+        .map(|point| PointDeclaration {
+            point: KillPoint::new(point),
+            mechanisms: vec![KillMechanism::ProcessSignal],
+            note: "SIGKILL of the ck-broca process while the rig holds the next thing it \
+                       waits on, after the session's log is checked to hold exactly the point's \
+                       state. broca's run start holds the send with its send_id, so Admitted \
                        and SendRecorded cut at the same place."
-                    .into(),
-            }
+                .into(),
         })
         .collect();
         #[cfg(feature = "test-clock")]
@@ -2222,9 +2116,11 @@ impl Harness for BrocaSubject {
             points.push(PointDeclaration {
                 point: KillPoint::new(points::RETENTION_TOMBSTONED),
                 mechanisms: vec![KillMechanism::ProcessSignal],
-                note: "A directory at the deletion rename destination prevents content removal. \
-                   SIGKILL follows observation of a durable incomplete tombstone and live WAL; \
-                   the obstacle is removed only after the process dies, before restart."
+                note: "A session head folder the daemon can't write stops a retention deletion \
+                       after its expiry marker is durable and before the session is removed. \
+                       SIGKILL follows observation of that marker with the session whole; the \
+                       folder is made writable again only after the process dies, before \
+                       restart."
                     .into(),
             });
             points
@@ -2270,7 +2166,7 @@ impl Harness for BrocaSubject {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| HarnessError::new("the model answered no request"))?;
-            if let Err(problem) = self.holds_point(&handle, &session, name) {
+            if let Err(problem) = self.holds_point(&handle, &session, name).await {
                 handle.kill_all();
                 return Err(HarnessError::new(problem));
             }
@@ -2290,21 +2186,7 @@ impl Harness for BrocaSubject {
                 () = reached.notified() => {}
             }
             let session = session.lock().unwrap().clone().expect("set when reached");
-            if name == points::STEP_RECORDED {
-                if !handle.kill_all() {
-                    return Err(HarnessError::new("no ck-broca process was found to kill"));
-                }
-                self.shared.released.notify_waiters();
-                self.cut_back_to_last_step(&handle, &session)?;
-                self.holds_point(&handle, &session, name)
-                    .map_err(HarnessError::new)?;
-                drop(handle);
-                return Ok(KillReport {
-                    point: point.clone(),
-                    mechanism: KillMechanism::LogTruncation,
-                });
-            }
-            if let Err(problem) = self.holds_point(&handle, &session, name) {
+            if let Err(problem) = self.holds_point(&handle, &session, name).await {
                 handle.kill_all();
                 self.shared.released.notify_waiters();
                 return Err(HarnessError::new(problem));
@@ -2728,39 +2610,9 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(session)
             .cloned()
             .ok_or_else(|| HarnessError::new(format!("no state root for session {session}")))?;
-        let bind = self.bind_identity(session);
-        // Refusal must leave the log (including baseline, reservations and queued sends)
-        // and the session's projections untouched, not merely return an error reply.
-        let wal_path = broca_core::FileWalStore::new(root.join("wal")).wal_path(&bind);
-        let wal = match std::fs::read(wal_path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(HarnessError::new(error.to_string())),
-        };
-        let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        let checkpoint = broca_core::MaterializedStore::read_admission_snapshot(&store, &bind)
-            .map_err(HarnessError::new)?;
-        let connection = rusqlite::Connection::open_with_flags(
-            root.join("run-index.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|error| HarnessError::new(error.to_string()))?;
-        // run_index.session stores JSON BindIdentity, unlike the admission metadata key.
-        let key =
-            serde_json::to_string(&bind).map_err(|error| HarnessError::new(error.to_string()))?;
-        let mut query = connection
-            .prepare("SELECT * FROM run_index WHERE session=?1 ORDER BY run_id")
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        let columns = query.column_count();
-        let runs = query
-            .query_map([key], |row| {
-                (0..columns)
-                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .map_err(|error| HarnessError::new(error.to_string()))?;
+        // Refusal must leave the session's log (including its baseline, reservations and
+        // queued sends) untouched, not merely return an error reply.
+        let records = stored_log::stored_records(&root, &self.bind_identity(session)).await;
         // Catalog requests are observed at the provider, independently of runner replies.
         let requests = self
             .shared
@@ -2770,14 +2622,9 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(session)
             .cloned()
             .unwrap_or_default();
-        serde_json::to_vec(&(
-            wal,
-            format!("{checkpoint:?}"),
-            format!("{runs:?}"),
-            requests,
-        ))
-        .map(Some)
-        .map_err(|error| HarnessError::new(error.to_string()))
+        serde_json::to_vec(&(format!("{records:?}"), requests))
+            .map(Some)
+            .map_err(|error| HarnessError::new(error.to_string()))
     }
 
     async fn notices_stored_output(
@@ -2786,29 +2633,45 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
         arguments: &Value,
     ) -> Result<(String, u32, String, String), HarnessError> {
-        use broca_core::WalStore;
-        use broca_wal::WalRecord;
-        let range = broca_core::FileWalStore::new(handle.state_root.join("wal"))
-            .read_records_range(&self.bind_identity(session), 0, None, None)
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        let records = match range.records() {
-            broca_wal::WalRangeRecords::Complete(records) => records,
-            _ => return Err(HarnessError::new("native notice WAL is incomplete")),
-        };
-        let call = records
+        let records = self.records(handle, session).await;
+        // Stored arguments are canonical JSON text, so equal values have equal text.
+        let wanted = broca_protocol::json::Json::from_value(arguments);
+        // An intent keeps its arguments only when a hook or approval changed them; otherwise
+        // they are the call's own input, on the assistant message that made the call.
+        let calls_with_arguments: Vec<broca_protocol::ToolCallId> = records
             .iter()
-            .find_map(|frame| match &frame.record {
-                WalRecord::ToolDispatchIntent {
-                    tool_call_id, args, ..
-                } if args.as_ref() == arguments => Some(tool_call_id),
+            .filter_map(|record| match record {
+                Record::Assistant(assistant) => Some(assistant.message.content.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                broca_protocol::content::ContentBlock::ToolCall(call) if call.input == wanted => {
+                    Some(call.tool_call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let (call, key) = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ToolIntent(intent)
+                    if match &intent.args {
+                        Some(args) => *args == wanted,
+                        None => calls_with_arguments.contains(&intent.tool_call_id),
+                    } =>
+                {
+                    Some((intent.tool_call_id.clone(), intent.call_key.clone()))
+                }
                 _ => None,
             })
             .ok_or_else(|| HarnessError::new("notice carrying intent missing"))?;
+        let key = key.ok_or_else(|| HarnessError::new("native carrying key missing"))?;
         let output = records
             .iter()
-            .find_map(|frame| match &frame.record {
-                WalRecord::ToolResult { result, .. } if &result.tool_call_id == call => {
-                    match &result.output {
+            .find_map(|record| match record {
+                Record::ToolReply(reply) if reply.result.tool_call_id == call => {
+                    match &reply.result.output {
                         broca_protocol::ToolOutput::Text { text } => Some(text.clone()),
                         broca_protocol::ToolOutput::Json { value } => {
                             value.parse().as_str().map(str::to_owned)
@@ -2819,55 +2682,33 @@ impl LlmRunnerSubject for BrocaSubject {
                 _ => None,
             })
             .ok_or_else(|| HarnessError::new("native notice result text missing"))?;
-        let intent = records.iter().find(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id == call))
-            .ok_or_else(|| HarnessError::new("native carrying intent missing"))?;
-        let WalRecord::ToolDispatchIntent { call_key, .. } = &intent.record else {
-            unreachable!()
-        };
-        let lineage = range.lineage_id.map(|id| id.to_string());
-        let key = broca_core::tool_call_key(lineage.as_deref(), intent.seq, call_key.as_deref())
-            .ok_or_else(|| HarnessError::new("native carrying key missing"))?;
-        let mut placement = broca_core::placement::Placement::default();
-        let mut ordinal = None;
-        let mut part = None;
-        for frame in records {
-            placement
-                .observe(&frame.record)
-                .map_err(HarnessError::new)?;
-            match &frame.record {
-                WalRecord::ModelStepFinished {
-                    assistant_message, ..
-                } if assistant_message
-                    .tool_calls()
-                    .any(|item| &item.tool_call_id == call) =>
-                {
-                    ordinal = placement.held_tool_result_ordinal()
-                }
-                WalRecord::ToolBatchStarted { planned_calls, .. }
-                    if planned_calls.contains(call) =>
-                {
-                    part = planned_calls
-                        .iter()
-                        .position(|id| id == call)
-                        .and_then(|part| u32::try_from(part).ok())
+        // The call's part is its place among its batch's planned calls; its message is the tool
+        // message the batch's replies were written in, named by the entry facts that follow.
+        let part = records
+            .iter()
+            .find_map(|record| match record {
+                Record::BatchStart(batch) => batch
+                    .planned
+                    .iter()
+                    .position(|id| *id == call)
+                    .and_then(|part| u32::try_from(part).ok()),
+                _ => None,
+            })
+            .ok_or_else(|| HarnessError::new("native carrying part missing"))?;
+        let mut replied = false;
+        let mut mid = None;
+        for record in &records {
+            match record {
+                Record::ToolReply(reply) if reply.result.tool_call_id == call => replied = true,
+                Record::EntryFacts(facts) if replied => {
+                    mid = Some(facts.mid.clone());
+                    break;
                 }
                 _ => {}
             }
         }
-        let ordinal =
-            ordinal.ok_or_else(|| HarnessError::new("native carrying ordinal missing"))?;
-        let mid = broca_core::message_mid(
-            broca_core::is_mode3_log(records.iter().map(|frame| &frame.record)),
-            lineage.as_deref(),
-            ordinal,
-        )
-        .map_err(HarnessError::new)?;
-        Ok((
-            mid,
-            part.ok_or_else(|| HarnessError::new("native carrying part missing"))?,
-            key,
-            output,
-        ))
+        let mid = mid.ok_or_else(|| HarnessError::new("native carrying message missing"))?;
+        Ok((mid, part, key, output))
     }
     async fn routing_runner_declaration(&self) -> Result<Value, HarnessError> {
         Ok(routed_accounts::runner_declaration())
@@ -3020,89 +2861,6 @@ impl LlmRunnerSubject for BrocaSubject {
     fn runner_id(&self) -> &str {
         "broca"
     }
-    async fn seed_untimed_tool_call(
-        &self,
-        handle: &Live,
-        session: &str,
-        call: &cortexkit_role_llm_runner_conformance::ScriptedToolCall,
-    ) -> Result<(), HarnessError> {
-        use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
-        use broca_protocol::{
-            ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
-        };
-        let fail = |e: String| HarnessError::new(e);
-        let identity = self.fixture_identity(handle, session).await?;
-        let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
-        let source = FileWalStore::new(&seed_root);
-        let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
-            .map_err(|e| fail(e.to_string()))?;
-        broca_core::run_import(
-            broca_core::ImportRequest {
-                project_id: None,
-                principal: None,
-                run_id: broca_protocol::RunId(format!("untimed-import-{session}")),
-                session: identity.clone(),
-                messages: vec![
-                    Message::new(
-                        Role::Assistant,
-                        vec![ContentBlock::ToolCall(ToolCall {
-                            thought_signature: None,
-                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
-                            tool_name: call.tool.clone(),
-                            input: call.arguments.clone().into(),
-                        })],
-                    ),
-                    Message::new(
-                        Role::Tool,
-                        vec![ContentBlock::ToolResult(ToolResult {
-                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
-                            output: ToolOutput::Text {
-                                text: "historical result".into(),
-                            },
-                            is_error: false,
-                        })],
-                    ),
-                ],
-                origin: broca_core::ImportOrigin {
-                    source_ref: "fixture:untimed-history".into(),
-                },
-            },
-            &writer,
-            &source,
-        )
-        .await
-        .map_err(|e| fail(e.to_string()))?;
-        writer.shutdown().await.map_err(|e| fail(e.to_string()))?;
-        let records = source
-            .read_records(&identity)
-            .map_err(|e| fail(e.to_string()))?;
-        let leases = FileLeaseStore::new(handle.state_root.join("leases"));
-        let deadline = Instant::now() + Duration::from_secs(45);
-        let lease = loop {
-            match leases.acquire(&broca_core::lease_key_for(&identity)) {
-                Ok(lease) => break lease,
-                Err(broca_core::LeaseError::Held { .. }) if Instant::now() < deadline => {
-                    sleep(Duration::from_millis(25)).await
-                }
-                Err(error) => {
-                    return Err(fail(format!(
-                        "untimed fixture could not obtain idle lease: {error}"
-                    )))
-                }
-            }
-        };
-        let target = FileWalStore::new(handle.state_root.join("wal"));
-        let mut wal = target.open(&identity).map_err(|e| fail(e.to_string()))?;
-        for frame in records {
-            wal.append(lease.epoch(), &frame.record, false)
-                .map_err(|e| fail(e.to_string()))?;
-        }
-        wal.sync().map_err(|e| fail(e.to_string()))?;
-        drop(wal);
-        drop(lease);
-        std::fs::remove_dir_all(seed_root).map_err(|e| fail(e.to_string()))?;
-        Ok(())
-    }
 
     async fn hold_next_model_stream(
         &self,
@@ -3175,7 +2933,6 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::HistoryDisplay,
             Capability::RunOps,
             Capability::RunToolCalls,
-            Capability::InputTokenCap,
             Capability::StructuredOutput,
             Capability::SendStatus,
             Capability::MaxSteps,
@@ -3580,7 +3337,7 @@ impl LlmRunnerSubject for BrocaSubject {
             };
             let composition = json!({"providers":providers,"step_transform_items":[]});
             let mut plan = json!({
-                "tool_items":if flow {json!([])} else {json!([{"provider":TOOL_MODULE,"preset":"conformance","params":{}}])},
+                "tool_items":if flow {json!([])} else {json!([{"provider":TOOL_MODULE,"preset":held_late_results::preset(&self.shared, session),"params":{}}])},
                 "system_text_items":[],
                 "step_transform_items":[],
                 "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
@@ -3802,41 +3559,10 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(session)
             .cloned()
             .unwrap_or_default();
-        let bind = self.bind_identity(session);
-        // Observe the authoritative log and its session-scoped SQL projections;
-        // unrelated sessions may still be draining their own background writes.
-        let wal = broca_core::FileWalStore::new(handle.state_root.join("wal"))
-            .bytes_for_move(&self.bind_identity(session))
-            .map_err(|error| HarnessError::new(error.to_string()))?
-            .unwrap_or_default();
-        let store =
-            broca_store::SqliteStore::open_read_only(handle.state_root.join("run-index.db"))
-                .map_err(|error| HarnessError::new(error.to_string()))?;
-        let checkpoint = broca_core::MaterializedStore::read_admission_snapshot(&store, &bind)
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        let connection = rusqlite::Connection::open_with_flags(
-            handle.state_root.join("run-index.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|error| HarnessError::new(error.to_string()))?;
-        let key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            bind.project_root.display(),
-            bind.harness,
-            bind.session
-        );
-        let runs = connection.prepare("SELECT run_id,state,request_identity_digest,submission_id FROM run_index WHERE session=?1 ORDER BY run_id")
-            .and_then(|mut query| query.query_map([key], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?)))?.collect::<Result<Vec<_>,_>>())
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        let refs = connection.prepare("SELECT session_ref,address FROM agent_data_session_ref WHERE project_root=?1 AND harness=?2 AND session=?3 ORDER BY session_ref")
-            .and_then(|mut query| query.query_map(rusqlite::params![bind.project_root.to_string_lossy(),bind.harness,bind.session], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>())
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        let aliases = connection.prepare("SELECT session_ref,address FROM agent_data_session_ref_v2 WHERE address=?1 ORDER BY session_ref")
-            .and_then(|mut query| query.query_map([broca_core::session_addr(&bind)], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>())
-            .map_err(|error| HarnessError::new(error.to_string()))?;
-        observation.durable_state =
-            serde_json::to_vec(&(wal, format!("{checkpoint:?}"), runs, refs, aliases))
-                .map_err(|error| HarnessError::new(error.to_string()))?;
+        // Observe the session's log; unrelated sessions may still be draining their own
+        // background writes.
+        let records = self.records(handle, session).await;
+        observation.durable_state = format!("{records:?}").into_bytes();
         Ok(observation)
     }
 
@@ -4324,97 +4050,15 @@ impl LlmRunnerSubject for BrocaSubject {
     async fn pause(&self) {
         sleep(Duration::from_millis(50)).await;
     }
+
+    /// Every message the new storage keeps belongs to a run: a send's to the run it started or
+    /// joined, and an import's to the import's own run, which stands for the history it brought.
     async fn install_attribution_fixture(
         &self,
-        handle: &Live,
-        session: &str,
+        _handle: &Live,
+        _session: &str,
     ) -> Result<cortexkit_role_llm_runner_conformance::AttributionFixture, HarnessError> {
-        use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
-        let identity = self.fixture_identity(handle, session).await?;
-        let marker = format!("unattributable-import-{session}");
-        let seed_root = handle.state_root.join("attribution-import-fixture");
-        let seed_store = FileWalStore::new(&seed_root);
-        let writer = WalHandle::spawn(
-            seed_store
-                .open(&identity)
-                .map_err(|e| HarnessError::new(e.to_string()))?,
-            1,
-        )
-        .map_err(|e| HarnessError::new(e.to_string()))?;
-        // Use the real importer to construct the native historical episode. Its synthetic
-        // import id describes the ingest operation, not the original message's producer.
-        broca_core::run_import(
-            broca_core::ImportRequest {
-                project_id: None,
-                principal: None,
-                run_id: broca_protocol::RunId(format!("fixture-import-{session}")),
-                session: identity.clone(),
-                messages: vec![broca_protocol::Message::new(
-                    broca_protocol::Role::User,
-                    vec![broca_protocol::ContentBlock::Text {
-                        text: marker.clone(),
-                    }],
-                )],
-                origin: broca_core::ImportOrigin {
-                    source_ref: "fixture:unknown-harness".into(),
-                },
-            },
-            &writer,
-            &seed_store,
-        )
-        .await
-        .map_err(|e| HarnessError::new(e.to_string()))?;
-        let _ = writer.shutdown().await;
-        let import = seed_store
-            .read_records(&identity)
-            .map_err(|e| HarnessError::new(e.to_string()))?;
-        let leases = FileLeaseStore::new(handle.state_root.join("leases"));
-        let deadline = Instant::now() + Duration::from_secs(45);
-        let lease = loop {
-            match leases.acquire(&broca_core::lease_key_for(&identity)) {
-                Ok(lease) => break lease,
-                Err(broca_core::LeaseError::Held { .. }) if Instant::now() < deadline => {
-                    sleep(Duration::from_millis(25)).await
-                }
-                Err(error) => {
-                    return Err(HarnessError::new(format!(
-                        "fixture could not obtain the idle session lease: {error}"
-                    )))
-                }
-            }
-        };
-        let wal_store = FileWalStore::new(handle.state_root.join("wal"));
-        let previous = wal_store
-            .read_records(&identity)
-            .map_err(|e| HarnessError::new(e.to_string()))?;
-        let ordinal = broca_core::replay(
-            &previous
-                .iter()
-                .map(|frame| frame.record.clone())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| HarnessError::new(e.to_string()))?
-        .prompt
-        .len() as u64
-            // The imported message lands at that stored position; public ordinals start at 1.
-            + 1;
-        let mut wal = wal_store
-            .open(&identity)
-            .map_err(|e| HarnessError::new(e.to_string()))?;
-        for frame in import {
-            wal.append(lease.epoch(), &frame.record, false)
-                .map_err(|e| HarnessError::new(e.to_string()))?;
-        }
-        wal.sync().map_err(|e| HarnessError::new(e.to_string()))?;
-        drop(wal);
-        drop(lease);
-        std::fs::remove_dir_all(seed_root).map_err(|e| HarnessError::new(e.to_string()))?;
-        Ok(
-            cortexkit_role_llm_runner_conformance::AttributionFixture::Installed {
-                ordinal,
-                marker,
-            },
-        )
+        Ok(cortexkit_role_llm_runner_conformance::AttributionFixture::CannotHoldUnattributable)
     }
     #[cfg(feature = "test-clock")]
     async fn advance_retention_clock(
@@ -4438,7 +4082,7 @@ impl LlmRunnerSubject for BrocaSubject {
         handle: &Live,
         session: &str,
     ) -> Result<bool, HarnessError> {
-        retention::deletion_finished(&handle.state_root, &self.bind_identity(session))
+        retention_clock::deletion_finished(&handle.state_root, &self.bind_identity(session))
     }
     fn retention_probe_params(
         &self,
@@ -4623,7 +4267,11 @@ const UNNUMBERED_PLAN_INAPPLICABLE_CASES: &[&str] = &[
     "delivery_order_template_part_gone_refused",
 ];
 
-const REQUIRED_INPUT_CAP_CASES: &[&str] = &[
+/// Cases that need the input-token cap, which broca doesn't declare (it keeps no input-token
+/// budget): each must be skipped for that capability, never run. `finish_reason_no_model_step`
+/// is one: the kit stops its run before the first model request by exhausting that cap.
+const UNDECLARED_INPUT_CAP_CASES: &[&str] = &[
+    "finish_reason_no_model_step",
     "input_token_cap_at_limit",
     "input_token_cap_crossing_tools",
     "input_token_cap_restart_between_episodes",
@@ -5400,9 +5048,21 @@ fn check_named_contract_cases(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
     crash_kills_disabled: bool,
 ) -> Result<(), String> {
-    for name in REQUIRED_INPUT_CAP_CASES
+    for name in UNDECLARED_INPUT_CAP_CASES {
+        let case = cases
+            .iter()
+            .find(|case| case.case == *name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if !matches!(&case.outcome, CaseOutcome::Skipped { missing } if missing.contains(&Capability::InputTokenCap))
+        {
+            return Err(format!(
+                "{name} must be skipped for the undeclared input_token_cap: {:?}",
+                case.outcome
+            ));
+        }
+    }
+    for name in REQUIRED_STRUCTURED_OUTPUT_CASES
         .iter()
-        .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
         .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
         .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
         .chain(REQUIRED_SCOPE_DISPLAY_MEDIA_CASES)
@@ -5437,7 +5097,7 @@ mod named_contract_case_tests {
         CASES
             .iter()
             .filter(|case| {
-                case.name.starts_with("input_token_cap_")
+                UNDECLARED_INPUT_CAP_CASES.contains(&case.name)
                     || case.name.starts_with("structured_output_")
                     || case.name.starts_with("retract_own_send_")
                     || case.name.starts_with("run_cancel_by_interrupt_")
@@ -5449,6 +5109,10 @@ mod named_contract_case_tests {
                 outcome: if case.name == "structured_output_streamed_siblings" {
                     CaseOutcome::Inapplicable {
                         reason: STREAMED_SIBLINGS_INAPPLICABLE.into(),
+                    }
+                } else if UNDECLARED_INPUT_CAP_CASES.contains(&case.name) {
+                    CaseOutcome::Skipped {
+                        missing: vec![Capability::InputTokenCap],
                     }
                 } else {
                     CaseOutcome::Passed
@@ -5513,9 +5177,8 @@ mod named_contract_case_tests {
 
     #[test]
     fn named_contract_cases_require_each_supported_case_and_the_explicit_inapplicable_case() {
-        for name in REQUIRED_INPUT_CAP_CASES
+        for name in REQUIRED_STRUCTURED_OUTPUT_CASES
             .iter()
-            .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
             .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
             .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
             .chain(REQUIRED_SCOPE_DISPLAY_MEDIA_CASES)
@@ -5570,12 +5233,34 @@ mod named_contract_case_tests {
         cases[index].outcome = CaseOutcome::Skipped { missing };
         cases
             .iter_mut()
-            .find(|case| case.case == "input_token_cap_at_limit")
+            .find(|case| case.case == "structured_output_submit_tool_ends_run")
             .unwrap()
             .outcome = CaseOutcome::Skipped {
             missing: Vec::new(),
         };
         assert!(check_named_contract_cases(&cases, true).is_err());
+    }
+
+    /// An input-cap case broca would run, or one missing from the suite, is caught: broca keeps
+    /// no input-token budget, so running one means the capability came back undeclared.
+    #[test]
+    fn named_contract_cases_require_the_input_cap_cases_skipped() {
+        for name in UNDECLARED_INPUT_CAP_CASES {
+            let mut cases = outcomes();
+            cases
+                .iter_mut()
+                .find(|case| case.case == *name)
+                .unwrap()
+                .outcome = CaseOutcome::Passed;
+            assert!(check_named_contract_cases(&cases, false)
+                .unwrap_err()
+                .contains(name));
+            let mut cases = outcomes();
+            cases.retain(|case| case.case != *name);
+            assert!(check_named_contract_cases(&cases, false)
+                .unwrap_err()
+                .contains(name));
+        }
     }
 }
 
@@ -5617,9 +5302,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
     let mut subject = BrocaSubject::new(&scratch).await;
-    // These daemons have no deployment-key vault, so a head the new storage creates is plain.
-    // Fork heads and plans naming readers are served only there.
-    subject.plain_session_storage = true;
     #[cfg(feature = "test-clock")]
     attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
@@ -5729,7 +5411,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "client_message_id_on_display_rows_never_in_read",
         "display_row_names_the_sender_never_in_read",
         "finish_reason_provider_limit",
-        "finish_reason_no_model_step",
         "finish_reason_last_model_step",
         "output_refs_without_compaction_unknown_tag",
         "run_cancel_step_boundary_finishes_tool_batch",
@@ -5753,7 +5434,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "session_refresh_generation_stale_refused",
         "session_refresh_never_changes_a_running_run",
         "flush_prefix_applies_pending",
-        "run_attribution_per_message",
         "send_id_reuse_refused_naming_field",
         "delivery_change_refused",
         "send_id_retry_written_once",
@@ -5796,6 +5476,22 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
+    // The new storage keeps no message without the run that wrote it, so the harness can't
+    // plant one for the kit's unknown-origin rule (`install_attribution_fixture`). That one
+    // rule goes unchecked, by declaration; every other attribution rule must pass.
+    let attribution = report
+        .cases
+        .iter()
+        .find(|case| case.case == "run_attribution_per_message")
+        .expect("the suite has run_attribution_per_message");
+    assert_eq!(
+        attribution.outcome,
+        CaseOutcome::PassedWithInapplicableRule {
+            reason: "unknown-origin rule: adapter declares every native write path names a run (CannotHoldUnattributable)".into(),
+        },
+        "{}",
+        report.render()
+    );
     // These fixture plans deliberately omit compaction_item. The kit grades numbered
     // scenarios by the opening plan, not by whether a runner happened to render numbers.
     for name in UNNUMBERED_PLAN_INAPPLICABLE_CASES {
@@ -5916,219 +5612,6 @@ async fn attach_notice_bus(subject: &mut BrocaSubject, root: &Path) {
 /// Sandboxed runs can exercise every non-kill case without claiming crash conformance.
 fn skip_crash_kills() -> bool {
     std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
-}
-
-/// After a cut between a step's record and its calls' dispatch intents, broca does not resume
-/// the run: the restarted module seals it `interrupted` without sending the call. So the tool
-/// never ran and the run reads `interrupted`. The written step is kept, never dropped: the seal
-/// closes the call with a never-executed result in the message right after it, written with the
-/// terminal, so the call is not indeterminate and the session's next model request carries the
-/// call answered by that result.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
-    use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
-    if !sibling_bin("ck-subc", "SUBC_CORE_BIN").exists()
-        || !sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN").exists()
-    {
-        assert!(!require_subc(), "the subc rig binaries are missing");
-        println!("SKIP: the subc rig binaries are missing");
-        return;
-    }
-    std::env::remove_var("SUBC_MODULE_ID");
-    std::env::remove_var("SUBC_LAUNCH_NONCE");
-    let scratch =
-        broca_test_support::scratch_root().join(format!("broca-step-cut-{}", std::process::id()));
-    broca_test_support::remove_rig_dir(&scratch);
-    std::fs::create_dir_all(&scratch).unwrap();
-    let subject = BrocaSubject::new(&scratch).await;
-    let root = scratch.join("root");
-    std::fs::create_dir_all(&root).unwrap();
-
-    let session = "step-cut";
-    let call = ScriptedToolCall {
-        tool_call_id: "call_cut".into(),
-        tool: SCRIPTED_TOOL.into(),
-        arguments: json!({"marker": "step-cut-args"}),
-        result: json!({"marker": "step-cut-result"}),
-        hold: false,
-    };
-    let turn = |parts| {
-        ScriptedTurn::new(parts).with_usage(
-            cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
-        )
-    };
-    subject
-        .install_script(
-            session,
-            Script {
-                turns: vec![
-                    turn(vec![
-                        ScriptedPart::Text("before the call".into()),
-                        ScriptedPart::ToolCall(call.clone()),
-                    ]),
-                    turn(vec![ScriptedPart::Text("after the cut".into())]),
-                ],
-            },
-        )
-        .await
-        .unwrap();
-    let owner = subject.owner_stamp();
-    let send = |prompt: &str, send_id: &str, first: bool| {
-        let mut params = subject.send_fields(session, first);
-        params.insert("prompt".into(), json!(prompt));
-        params.insert("send_id".into(), json!(send_id));
-        Value::Object(params)
-    };
-    let response = |reply: Reply| match reply {
-        Reply::Response(value) => value,
-        Reply::Error(error) => panic!(
-            "refused {} {}: {:?}",
-            error.code, error.message, error.detail
-        ),
-    };
-
-    let live = subject.spawn(&root).await.unwrap();
-    let route = subject.session_route(&live, session, &owner).await.unwrap();
-    let first = send("first", "send-1", true);
-    let trigger: Trigger<'_> = Box::pin(async {
-        let _ = route.request("session.send", first.clone()).await;
-        sleep(Duration::from_secs(60)).await;
-    });
-    let report = subject
-        .kill_at(live, &KillPoint::new(points::STEP_RECORDED), trigger)
-        .await
-        .unwrap();
-    assert_eq!(report.mechanism, KillMechanism::LogTruncation);
-    drop(route);
-    assert_eq!(subject.tool_invocations(&call.arguments).await, 0);
-
-    let live = subject.restart(&root).await.unwrap();
-    let route = subject.session_route(&live, session, &owner).await.unwrap();
-    // The owner's retry of the cut send is answered with the run the restart sealed.
-    let retry = response(route.request("session.send", first.clone()).await.unwrap());
-    let run_id = retry["run_id"]
-        .as_str()
-        .expect("the retry names its run")
-        .to_owned();
-    let result = response(
-        route
-            .request("run.result", json!({"run_id": run_id}))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(result["state"], "interrupted", "{result}");
-    assert_eq!(
-        subject.tool_invocations(&call.arguments).await,
-        0,
-        "the call never ran"
-    );
-
-    // The sealed run's transcript keeps the cut step: the assistant message holding the call,
-    // then a tool message holding its never-executed result. The call never got a dispatch
-    // intent, so its key names the durable negative result, not a dispatch destination.
-    let range = {
-        use broca_core::WalStore;
-        broca_core::FileWalStore::new(live.state_root.join("wal"))
-            .read_records_range(&subject.bind_identity(session), 0, None, None)
-            .unwrap()
-    };
-    let terminal_seq = match range.records() {
-        broca_wal::WalRangeRecords::Complete(records) => {
-            assert!(!records.iter().any(|frame| matches!(&frame.record, broca_wal::WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id.0 == "call_cut")));
-            let terminals: Vec<_> = records.iter().filter(|frame| matches!(&frame.record,
-                broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call_cut")).collect();
-            assert_eq!(terminals.len(), 1, "one durable record closes the cut call");
-            terminals[0].seq
-        }
-        _ => panic!("the sealed step-cut WAL must be complete"),
-    };
-    let expected_key = format!("{}:{terminal_seq}", range.lineage_id.unwrap());
-    let page = response(route.request("session.read", json!({})).await.unwrap());
-    let messages = page["messages"].as_array().unwrap();
-    let roles: Vec<&str> = messages
-        .iter()
-        .filter_map(|m| m["message"]["role"].as_str())
-        .collect();
-    assert_eq!(roles, ["system", "user", "assistant", "tool"], "{page}");
-    let entries = messages[2]["tool_calls"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        matches!(entries.as_slice(), [entry] if entry["tool_call_id"] == "call_cut"
-            && entry["indeterminate"] == false
-            && entry["call_key"] == expected_key
-            && entry.get("dispatched_to").is_none()),
-        "{page}"
-    );
-    let results: Vec<broca_protocol::ToolResult> = messages[3]["message"]["content"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|part| serde_json::from_value(part.clone()).unwrap())
-        .collect();
-    assert_eq!(
-        results,
-        [broca_core::not_dispatched_result(
-            &broca_protocol::ToolCallId("call_cut".into())
-        )],
-        "{page}"
-    );
-
-    // The next send renders the kept step with its result right after it.
-    let next = response(
-        route
-            .request("session.send", send("next", "send-2", false))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(next["state"], "active", "{next}");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let request = loop {
-        let requests = subject
-            .shared
-            .requests
-            .lock()
-            .unwrap()
-            .get(session)
-            .cloned();
-        if let Some(request) = requests.and_then(|all| all.into_iter().nth(1)) {
-            break request;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the next send made no model request"
-        );
-        sleep(Duration::from_millis(50)).await;
-    };
-    println!(
-        "the next model request's messages: {}",
-        Value::Array(request.clone())
-    );
-    let call_at = request
-        .iter()
-        .position(|m| {
-            m["role"] == "assistant"
-                && m["tool_calls"]
-                    .as_array()
-                    .is_some_and(|calls| calls.iter().any(|c| c["id"] == "call_cut"))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "the next request drops the kept call: {}",
-                Value::Array(request.clone())
-            )
-        });
-    assert!(
-        request
-            .get(call_at + 1)
-            .is_some_and(|m| m["role"] == "tool" && m["tool_call_id"] == "call_cut"),
-        "the next request carries the kept call without its result right after it: {}",
-        Value::Array(request.clone())
-    );
-    drop(route);
-    drop(live);
-    broca_test_support::remove_rig_dir(&scratch);
 }
 
 /// An interrupt into an existing session that names only the role's members (prompt, send_id,
@@ -6392,258 +5875,6 @@ async fn held_provider_call_is_indeterminate_until_its_result() {
     broca_test_support::remove_rig_dir(&scratch);
 }
 
-/// A daemon restarted without retention admission must still discover and delete
-/// expired WALs left by a build that accepted retention.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_content() {
-    for (name, env_key) in [
-        ("ck-subc", "SUBC_CORE_BIN"),
-        ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
-    ] {
-        if !sibling_bin(name, env_key).exists() {
-            assert!(
-                !require_subc(),
-                "required real-daemon binary is missing: {name}"
-            );
-            println!("SKIP retention boot: missing {name}");
-            return;
-        }
-    }
-    let scratch =
-        broca_test_support::scratch_root().join(format!("retention-boot-{}", std::process::id()));
-    broca_test_support::remove_rig_dir(&scratch);
-    std::fs::create_dir_all(&scratch).unwrap();
-    let subject = BrocaSubject::new(&scratch).await;
-    let root = scratch.join("daemon");
-    let state = root.join("broca-state");
-    let key = subject.bind_identity("rolled-back-retention");
-    broca_test_support::register_legacy_session(&state, &key).unwrap();
-    let wal_store = broca_core::FileWalStore::new(state.join("wal"));
-    let live_path = wal_store.ephemeral_wal_path(&key);
-    let lineage;
-    {
-        let leases = broca_core::FileLeaseStore::new(state.join("leases"));
-        use broca_core::LeaseStore;
-        let _lease = leases.acquire(&broca_core::lease_key_for(&key)).unwrap();
-        let mut wal = wal_store.open_with_retention(&key, Some(1)).unwrap();
-        let mut start: broca_wal::WalRecord = serde_json::from_str(include_str!(
-            "../../broca-wal/tests/golden/pre_step_transforms/run_started.json"
-        ))
-        .unwrap();
-        if let broca_wal::WalRecord::RunStarted {
-            retention,
-            ts_ms,
-            session,
-            title,
-            ..
-        } = &mut start
-        {
-            *retention = Some(1);
-            *ts_ms = Some(100);
-            *session = key.clone();
-            *title = Some("RETENTION-REAL-BOOT-MARKER-8031".into());
-        }
-        wal.append(1, &start, true).unwrap();
-        wal.append(
-            1,
-            &broca_wal::WalRecord::RunFinished {
-                interrupt_reason: None,
-                ts_ms: Some(200),
-                reason: broca_protocol::RunFinishReason::Completed,
-                usage: Default::default(),
-                error: None,
-                retries_used: 0,
-            },
-            true,
-        )
-        .unwrap();
-        lineage = wal.lineage_id().unwrap().to_string();
-    }
-    // No retention deadline row or identity sidecar is seeded. Require completed deletion
-    // before any session request, not only a read-time expiry refusal.
-    assert!(!live_path.with_extension("session").exists());
-    let live = subject.start(&root).await.unwrap();
-    let stone = wal_store.tombstone_path(&key, &lineage);
-    broca_test_support::event_timeout(
-        "ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_content",
-        async {
-            loop {
-                if !live_path.exists() && stone.exists() {
-                    let value: Value =
-                        serde_json::from_slice(&std::fs::read(&stone).unwrap()).unwrap();
-                    if value.get("completed_at_ms").is_some() {
-                        assert_eq!(value["expired_at_ms"], 1200);
-                        break;
-                    }
-                }
-                sleep(Duration::from_millis(25)).await;
-            }
-        },
-        || {
-            format!(
-                "live_exists={}, stone_exists={}",
-                live_path.exists(),
-                stone.exists()
-            )
-        },
-    )
-    .await
-    .expect("startup enrollment and the first sweep must delete the WAL without a session read");
-    let route = subject
-        .session_route(&live, "rolled-back-retention", &subject.owner_stamp())
-        .await
-        .unwrap();
-    match route.request("session.read", json!({})).await.unwrap() {
-        Reply::Error(body) => {
-            assert_eq!(body.code, "expired");
-            assert_eq!(body.detail.unwrap()["expired_at_ms"], 1200);
-        }
-        other => panic!("expired content was served: {other:?}"),
-    }
-    drop(route);
-    drop(live);
-    broca_test_support::remove_rig_dir(scratch);
-}
-
-/// Recovery must finish incomplete deletion steps before the module begins serving requests.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
-    for (name, env_key) in [
-        ("ck-subc", "SUBC_CORE_BIN"),
-        ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
-    ] {
-        if !sibling_bin(name, env_key).exists() {
-            assert!(
-                !require_subc(),
-                "required real-daemon binary is missing: {name}"
-            );
-            println!("SKIP retention tombstone recovery: missing {name}");
-            return;
-        }
-    }
-    let scratch = broca_test_support::scratch_root()
-        .join(format!("retention-tombstone-boot-{}", std::process::id()));
-    broca_test_support::remove_rig_dir(&scratch);
-    std::fs::create_dir_all(&scratch).unwrap();
-    let subject = BrocaSubject::new(&scratch).await;
-    let root = scratch.join("daemon");
-    let state = root.join("broca-state");
-    let store = broca_core::FileWalStore::new(state.join("wal"));
-    let mut cuts = Vec::new();
-    for cut in ["live", "moved", "deleted"] {
-        let key = subject.bind_identity(cut);
-        broca_test_support::register_legacy_session(&state, &key).unwrap();
-        let mut wal = store.open_with_retention(&key, Some(1)).unwrap();
-        let mut start: broca_wal::WalRecord = serde_json::from_str(include_str!(
-            "../../broca-wal/tests/golden/pre_step_transforms/run_started.json"
-        ))
-        .unwrap();
-        if let broca_wal::WalRecord::RunStarted {
-            retention,
-            ts_ms,
-            session,
-            run_id,
-            ..
-        } = &mut start
-        {
-            *retention = Some(1);
-            *ts_ms = Some(100);
-            *session = key.clone();
-            *run_id = broca_protocol::RunId(format!("boot-{cut}"));
-        }
-        wal.append(1, &start, true).unwrap();
-        wal.append(
-            1,
-            &broca_wal::WalRecord::RunFinished {
-                interrupt_reason: None,
-                ts_ms: Some(200),
-                reason: broca_protocol::RunFinishReason::Completed,
-                usage: Default::default(),
-                error: None,
-                retries_used: 0,
-            },
-            true,
-        )
-        .unwrap();
-        let lineage = wal.lineage_id().unwrap();
-        drop(wal);
-        let live_path = store.ephemeral_wal_path(&key);
-        let deleting_path = store.deleting_path(&key, lineage);
-        let stone_path = store.tombstone_path(&key, &lineage.to_string());
-        std::fs::create_dir_all(stone_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &stone_path,
-            serde_json::to_vec(&json!({
-                "lineage_id": lineage.to_string(), "expired_at_ms": 1200, "seq": 1
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            live_path.with_extension("session"),
-            serde_json::to_vec(&key).unwrap(),
-        )
-        .unwrap();
-        match cut {
-            "moved" => std::fs::rename(&live_path, &deleting_path).unwrap(),
-            "deleted" => {
-                // File deletion follows the committed expiry transaction; recovery needs
-                // that content-free row when the WAL is no longer available to replay.
-                broca_store::SqliteStore::open(state.join("run-index.db"))
-                    .unwrap()
-                    .upsert_retention_lineage(
-                        &broca_store::retention::RetentionLineageRow {
-                            lineage_id: lineage.to_string(),
-                            session: key.clone(),
-                            retention_s: 1,
-                            last_activity_ms: 200,
-                            expires_at_ms: None,
-                            wal_bytes: std::fs::metadata(&live_path).unwrap().len(),
-                            expired_at_ms: Some(1200),
-                        },
-                        &[],
-                    )
-                    .unwrap();
-                std::fs::remove_file(&live_path).unwrap();
-            }
-            _ => {}
-        }
-        // A kill at any of these cuts also leaves the deletion in the index's pending
-        // deletions: the runner lists it before writing the incomplete tombstone and removes it
-        // only once the completed tombstone is synced. Boot finishes the deletions listed there
-        // before serving; an unlisted tombstone is found only by the inventory repair that runs
-        // after the module registers.
-        broca_store::SqliteStore::open(state.join("run-index.db"))
-            .unwrap()
-            .retention_deletion_pending(&lineage.to_string(), &key, true)
-            .unwrap();
-        cuts.push((key, live_path, deleting_path, stone_path));
-    }
-    let live = subject.start(&root).await.unwrap();
-    for (key, live_path, deleting_path, stone_path) in cuts {
-        let route = subject
-            .session_route(&live, &key.session, &subject.owner_stamp())
-            .await
-            .unwrap();
-        // Opening a management route proves the module is registered. Check deletion now,
-        // without polling for completion after the module has started accepting requests.
-        let stone: Value = serde_json::from_slice(&std::fs::read(stone_path).unwrap()).unwrap();
-        assert!(stone["completed_at_ms"].is_u64(), "{}", key.session);
-        assert_eq!(stone["expired_at_ms"], 1200);
-        assert!(!live_path.exists());
-        assert!(!deleting_path.exists());
-        match route.request("session.read", json!({})).await.unwrap() {
-            Reply::Error(body) => {
-                assert_eq!(body.code, "expired");
-                assert_eq!(body.detail.unwrap()["expired_at_ms"], 1200);
-            }
-            other => panic!("tombstoned content was served: {other:?}"),
-        }
-    }
-    drop(live);
-    broca_test_support::remove_rig_dir(scratch);
-}
-
 /// The production executor must expose the adapter to both the actor and the model loop.
 /// A test-only executor with a hook plane cannot prove this wiring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6769,25 +6000,30 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
                 sleep(Duration::from_millis(10)).await;
             }
         },
-        || broca_test_support::record_kinds(subject.records(&live, session)),
+        || "the run never completed".to_owned(),
     )
     .await
     .unwrap();
-    let records = subject.records(&live, session);
-    let started = records
+    let records = subject.records(&live, session).await;
+    // The run's input is stored as the pre_user hook rewrote it, and its start records the
+    // hooks it ran under.
+    let input = records
         .iter()
+        .rev()
         .find_map(|r| match r {
-            broca_wal::WalRecord::RunStarted { input, hooks, .. } => Some((input, hooks)),
+            Record::Input(input) => Some(input.message.clone()),
             _ => None,
         })
         .unwrap();
     assert_eq!(
-        started.0.last().unwrap().content[0],
+        input.content[0],
         broca_protocol::content::ContentBlock::Text {
             text: format!("{SESSION_MARKER}{session} input-hooked")
         }
     );
-    assert!(started.1.is_some());
+    assert!(records
+        .iter()
+        .any(|r| matches!(r, Record::RunStart(start) if start.hooks.is_some())));
     assert_eq!(
         state.counts(),
         [("pre_user".into(), 1), ("post_assistant".into(), 1)]
@@ -6812,317 +6048,8 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
     std::fs::remove_dir_all(scratch).unwrap();
 }
 
-/// The external binary is the independently built reader cut, never the writer under another
-/// name. Release-order verification sets both variables; ordinary test runs report its absence.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
-    use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
-    use cortexkit_role_step_transform_provider::answer::HookAnswer;
-    use step_transform_rig::*;
-    let Some(reader) = std::env::var_os("BROCA_STEP_TRANSFORM_READER_BIN").map(PathBuf::from)
-    else {
-        assert!(
-            std::env::var_os("BROCA_REQUIRE_STEP_READER").is_none(),
-            "the separately built step-transform reader is required"
-        );
-        println!(
-            "SKIP reader_release_reads_writer_records: BROCA_STEP_TRANSFORM_READER_BIN is not set"
-        );
-        return;
-    };
-    assert!(reader.exists(), "reader binary missing: {reader:?}");
-    // `--version` touches no state, but this is still a broca binary: clear its environment so
-    // it cannot resolve the operator's state root, as every broca spawn in the tests must.
-    let version = std::process::Command::new(&reader)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .unwrap();
-    assert!(version.status.success(), "reader version command failed");
-    assert!(
-        String::from_utf8_lossy(&version.stdout).contains("0.3.191"),
-        "rollback must use released reader v0.3.191, not a renamed writer: {version:?}"
-    );
-    let scratch = broca_test_support::scratch_root()
-        .join(format!("step-transform-rollback-{}", std::process::id()));
-    broca_test_support::remove_rig_dir(&scratch);
-    std::fs::create_dir_all(&scratch).unwrap();
-    let mut subject = BrocaSubject::new(&scratch).await;
-    let writer_root = scratch.join("writer");
-    std::fs::create_dir_all(&writer_root).unwrap();
-    let state = State::new(vec![
-        subscription("pre_user", None, "pass", 1000),
-        subscription("post_assistant", None, "pass", 1000),
-        subscription("pre_tool", Some("mutate"), "pass", 1000),
-        subscription("pre_tool", Some("validate"), "refuse", 1000),
-        subscription("post_tool", None, "pass", 1000),
-    ]);
-    state.answer_with(|c| {
-        let response = match key(c).as_str() {
-            "pre_tool:mutate" => HookAnswer::Mutate {
-                input: if c["tool_call_id"] == "invalid" {
-                    json!({"value":"x".repeat(1024*1024+1)})
-                } else {
-                    json!({"value":"mutated"})
-                },
-                note: None,
-            },
-            "pre_tool:validate" => {
-                if c["tool_call_id"] == "denied" {
-                    HookAnswer::Deny {
-                        text: "denied by provider".into(),
-                    }
-                } else {
-                    HookAnswer::Pass
-                }
-            }
-            _ => return append("-hooked"),
-        };
-        serde_json::to_value(response).unwrap()
-    });
-    state.held.lock().unwrap().insert("work".into());
-    let mut writer = subject.start(&writer_root).await.unwrap();
-    let serving = register(&writer.connection_file, state.clone()).await;
-    let session = "rollback-writer";
-    let call = |id: &str| {
-        ScriptedPart::ToolCall(ScriptedToolCall {
-            tool_call_id: id.into(),
-            tool: "work".into(),
-            arguments: json!({"value":"original"}),
-            result: json!("worked"),
-            hold: false,
-        })
-    };
-    subject
-        .install_script(
-            session,
-            Script {
-                turns: vec![
-                    ScriptedTurn::new(vec![
-                        ScriptedPart::Text("assistant".into()),
-                        call("good"),
-                        call("denied"),
-                        call("invalid"),
-                    ])
-                    .with_usage(
-                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
-                    ),
-                    ScriptedTurn::new(vec![ScriptedPart::Text("done".into())]).with_usage(
-                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
-                    ),
-                    ScriptedTurn::new(vec![ScriptedPart::Text("queued done".into())]).with_usage(
-                        cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
-                    ),
-                ],
-            },
-        )
-        .await
-        .unwrap();
-    let route = subject
-        .session_route(&writer, session, &subject.owner_stamp())
-        .await
-        .unwrap();
-    let response = |reply: Reply| match reply {
-        Reply::Response(value) => value,
-        other => panic!("expected response, got {other:?}"),
-    };
-    let frozen_plan = plan(&state.subscriptions, false);
-    let mut params = subject.send_fields(session, true);
-    params.remove("tools");
-    params.remove("system");
-    params.insert("plan".into(), frozen_plan.clone());
-    params.insert(
-        "prompt".into(),
-        json!(format!("{SESSION_MARKER}{session} input")),
-    );
-    params.insert("send_id".into(), json!("first"));
-    response(
-        route
-            .request("session.send", Value::Object(params))
-            .await
-            .unwrap(),
-    );
-    broca_test_support::event_timeout(
-        "reader_release_reads_writer_records_and_refuses_hooked_advancement",
-        async {
-            while state.tool_calls.lock().unwrap().is_empty() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        },
-        || broca_test_support::record_kinds(subject.records(&writer, session)),
-    )
-    .await
-    .unwrap();
-    for (id, delivery) in [("steer", "steer"), ("queued", "queue")] {
-        response(route.request("session.send",json!({"prompt":id,"send_id":id,"delivery":delivery,"model":{"provider":"mock","model":"mock-model"},"plan":frozen_plan})).await.unwrap());
-    }
-    state.held.lock().unwrap().clear();
-    state.release.notify_waiters();
-    broca_test_support::event_timeout(
-        "reader_release_reads_writer_records_and_refuses_hooked_advancement",
-        async {
-            loop {
-                let records = subject.records(&writer, session);
-                if records
-                    .iter()
-                    .filter(|r| matches!(r, broca_wal::WalRecord::RunFinished { .. }))
-                    .count()
-                    >= 2
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        },
-        || broca_test_support::record_kinds(subject.records(&writer, session)),
-    )
-    .await
-    .unwrap();
-    let records = subject.records(&writer, session);
-    for kind in [
-        "run_started",
-        "queued",
-        "steered",
-        "model_step_finished",
-        "tool_dispatch_intent",
-        "tool_no_dispatch",
-        "tool_result",
-    ] {
-        assert!(
-            records
-                .iter()
-                .map(|r| serde_json::to_value(r).unwrap())
-                .any(|r| r["type"] == kind && r.get("hooks").is_some()),
-            "writer must actually produce {kind} with hooks"
-        );
-    }
-    let written_page = response(
-        route
-            .request("session.read", json!({"limit":500}))
-            .await
-            .unwrap(),
-    );
-    let store = broca_core::FileWalStore::new(writer.state_root.join("wal"));
-    let bytes = std::fs::read(store.wal_path(&subject.bind_identity(session))).unwrap();
-    let mut cut_end = 0;
-    let mut at = 0;
-    let mut saw_intent = false;
-    while at < bytes.len() {
-        match broca_wal::framing::decode_next(&bytes[at..]) {
-            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                if saw_intent {
-                    break;
-                }
-                at += consumed;
-                if matches!(
-                    framed.record,
-                    broca_wal::WalRecord::ToolDispatchIntent { .. }
-                ) {
-                    saw_intent = true;
-                    cut_end = at;
-                }
-            }
-            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
-                at += consumed;
-                if saw_intent {
-                    cut_end = at;
-                }
-            }
-            _ => panic!("writer WAL is not fully decodable"),
-        }
-    }
-    assert!(saw_intent);
-    serving.abort();
-    writer.kill_all();
-    let reader_root = scratch.join("reader");
-    let state_root = reader_root.join("broca-state");
-    let store = broca_core::FileWalStore::new(state_root.join("wal"));
-    let complete_identity = subject.bind_identity(session);
-    broca_test_support::register_legacy_session(&state_root, &complete_identity).unwrap();
-    let complete_path = store.wal_path(&complete_identity);
-    std::fs::create_dir_all(complete_path.parent().unwrap()).unwrap();
-    std::fs::write(&complete_path, &bytes).unwrap();
-    let inflight = "rollback-inflight";
-    let inflight_identity = subject.bind_identity(inflight);
-    broca_test_support::register_legacy_session(&state_root, &inflight_identity).unwrap();
-    let inflight_path = store.wal_path(&inflight_identity);
-    std::fs::write(&inflight_path, &bytes[..cut_end]).unwrap();
-    subject.binary = Some(reader);
-    let mut reader_live = subject.start(&reader_root).await.unwrap();
-    state.clear();
-    state.tool_calls.lock().unwrap().clear();
-    let serving = register(&reader_live.connection_file, state.clone()).await;
-    let complete = subject
-        .session_route(&reader_live, session, &subject.owner_stamp())
-        .await
-        .unwrap();
-    let describe = response(complete.request("role.describe", json!({})).await.unwrap());
-    assert!(
-        !describe["capabilities"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(
-                cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES
-            )),
-        "the reader must not be the writer binary"
-    );
-    let read = response(
-        complete
-            .request("session.read", json!({"limit":500}))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        read["messages"], written_page["messages"],
-        "the reader must decode and project every writer record"
-    );
-    for target in [session, inflight, "rollback-fresh"] {
-        let route = subject
-            .session_route(&reader_live, target, &subject.owner_stamp())
-            .await
-            .unwrap();
-        let path = store.wal_path(&subject.bind_identity(target));
-        let before = std::fs::read(&path).unwrap_or_default();
-        for include_plan in [true, false] {
-            if target == "rollback-fresh" && !include_plan {
-                continue;
-            }
-            let mut params = json!({"prompt":"input","send_id":"first","model":{"provider":"fake","model":"fake"}});
-            if include_plan {
-                params["plan"] = frozen_plan.clone();
-            }
-            let reply = route.request("session.send", params).await.unwrap();
-            let Reply::Error(error) = reply else {
-                panic!("reader accepted a hooked send: {reply:?}")
-            };
-            assert_eq!(error.code, "invalid_params");
-            assert_eq!(
-                error.detail,
-                Some(json!({"field":"plan.step_transform_items"}))
-            );
-            assert_eq!(
-                std::fs::read(&path).unwrap_or_default(),
-                before,
-                "reader resume/send writes nothing"
-            );
-        }
-        if target == "rollback-fresh" {
-            assert!(!path.exists(), "refusal creates no lineage header");
-        }
-    }
-    assert!(state.hooks().is_empty());
-    assert_eq!(state.declares(), 0);
-    assert!(state.tool_calls.lock().unwrap().is_empty());
-    assert_eq!(std::fs::read(complete_path).unwrap(), bytes);
-    assert_eq!(std::fs::read(inflight_path).unwrap(), bytes[..cut_end]);
-    serving.abort();
-    reader_live.kill_all();
-    std::fs::remove_dir_all(scratch).unwrap();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orderly_handle_drop_seals_a_held_tool_with_shutdown_reason() {
-    use broca_core::WalStore;
     use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
     for (name, key) in [
         ("ck-subc", "SUBC_CORE_BIN"),
@@ -7182,19 +6109,15 @@ async fn orderly_handle_drop_seals_a_held_tool_with_shutdown_reason() {
     drop(route);
     // Dropping Live requests an orderly shutdown; verify its recorded cause before restarting.
     drop(live);
-    let records = broca_core::FileWalStore::new(state_root.join("wal"))
-        .read_records(&subject.bind_identity(session))
-        .unwrap();
-    let terminal = records.iter().rev().find_map(|frame| match &frame.record {
-        broca_wal::WalRecord::RunFinished {
-            interrupt_reason, ..
-        } => Some(interrupt_reason),
+    let records = stored_log::stored_records(&state_root, &subject.bind_identity(session)).await;
+    let terminal = records.iter().rev().find_map(|record| match record {
+        Record::RunEnd(end) => Some(end.interrupt_reason.as_deref()),
         _ => None,
     });
     assert_eq!(
-        terminal.and_then(|reason| reason.as_deref()),
+        terminal.flatten(),
         Some("runner_shutdown"),
-        "WAL after orderly stop: {records:?}"
+        "log after orderly stop: {records:?}"
     );
     let live = subject.restart(&root).await.unwrap();
     let route = subject
@@ -7374,7 +6297,6 @@ mod held_call_tests {
             dump_dir: None,
             binary: None,
             backup_classes: None,
-            plain_session_storage: false,
             bus_events_enabled: false,
             process_kills_disabled: true,
             service_tier_enabled: false,
@@ -7382,118 +6304,6 @@ mod held_call_tests {
             #[cfg(feature = "test-clock")]
             bus: None,
         }
-    }
-
-    #[tokio::test]
-    async fn call_yield_admission_snapshot_observes_wal_index_and_plan_fetches() {
-        use broca_core::{SessionInventory, WalStore};
-
-        let root = broca_test_support::scratch_root().join("call-yield-admission-state");
-        broca_test_support::remove_rig_dir(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let subject = subject(Arc::new(Shared::default()));
-        let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-        store.rebuild_inventory(&root).unwrap();
-        let session = "admission-snapshot";
-        let claim = subject.raw_bind_identity(session);
-        let bind = store.resolve_session_address(&claim, None, None).unwrap();
-        assert_ne!(bind, claim);
-        subject
-            .shared
-            .session_roots
-            .lock()
-            .unwrap()
-            .insert(session.into(), root.clone());
-        let snapshot = || async {
-            subject
-                .call_yield_admission_state(session)
-                .await
-                .unwrap()
-                .expect("independent admission snapshot")
-        };
-        let empty = snapshot().await;
-        assert_eq!(snapshot().await, empty);
-
-        let wal_store = broca_core::FileWalStore::new(root.join("wal"));
-        let mut wal = wal_store.open(&bind).unwrap();
-        wal.append(
-            1,
-            &broca_wal::WalRecord::RunFinished {
-                interrupt_reason: None,
-                reason: broca_protocol::RunFinishReason::Completed,
-                ts_ms: Some(1),
-                usage: Default::default(),
-                error: None,
-                retries_used: 0,
-            },
-            true,
-        )
-        .unwrap();
-        let with_wal = snapshot().await;
-        assert_ne!(with_wal, empty);
-        assert_eq!(snapshot().await, with_wal);
-
-        let connection = rusqlite::Connection::open(root.join("run-index.db")).unwrap();
-        let metadata_key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            bind.project_root.display(),
-            bind.harness,
-            bind.session
-        );
-        connection
-            .execute(
-                "INSERT INTO meta(session,watermark_seq,context_epoch) VALUES (?1,1,0)",
-                [metadata_key],
-            )
-            .unwrap();
-        let with_checkpoint = snapshot().await;
-        assert_ne!(with_checkpoint, with_wal);
-        let insert =
-            "INSERT INTO run_index(run_id,session,state,submission_id) VALUES (?1,?2,'active',?3)";
-        connection
-            .execute(
-                insert,
-                rusqlite::params!["other-run", "unrelated", "other-send"],
-            )
-            .unwrap();
-        assert_eq!(snapshot().await, with_checkpoint);
-        connection
-            .execute(
-                insert,
-                rusqlite::params![
-                    "observed-run",
-                    serde_json::to_string(&bind).unwrap(),
-                    "queued-send"
-                ],
-            )
-            .unwrap();
-        let with_index = snapshot().await;
-        assert_ne!(with_index, with_checkpoint);
-        connection
-            .execute(
-                "UPDATE run_index SET submission_id='another-send' WHERE run_id='observed-run'",
-                [],
-            )
-            .unwrap();
-        assert_ne!(snapshot().await, with_index);
-
-        let provider = ToolProvider {
-            shared: subject.shared.clone(),
-            routes: Mutex::new(HashMap::from([
-                ((1, 1), session.into()),
-                ((2, 1), "other".into()),
-            ])),
-        };
-        let before_fetch = snapshot().await;
-        let request = json!({"name":"tool.catalog", "arguments":{}});
-        provider.catalog_for_route((2, 1), &request);
-        assert_eq!(snapshot().await, before_fetch);
-        provider.catalog_for_route((1, 1), &request);
-        assert_ne!(snapshot().await, before_fetch);
-        assert!(subject
-            .call_yield_admission_state("unrouted")
-            .await
-            .is_err());
     }
 
     #[test]
@@ -7755,12 +6565,10 @@ mod held_call_tests {
                 u64::from(applied)
             );
             let models: Vec<_> = rig
-                .records()
+                .run_configs()
+                .await
                 .into_iter()
-                .filter_map(|record| match record {
-                    broca_wal::WalRecord::RunStarted { config, .. } => Some(config.model),
-                    _ => None,
-                })
+                .map(|config| config.model)
                 .collect();
             assert_eq!(models[0], models[1], "the adapter must not fake a rebuild");
             rig.finish().await;
@@ -8268,57 +7076,6 @@ fn attachment_report_guard_rejects_missing_or_skipped_cases() {
         reason: "not checked".into(),
     };
     assert_eq!(attachment_contract_gaps(&report), vec![name]);
-}
-
-#[tokio::test]
-async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_session() {
-    use broca_core::{SessionInventory, WalStore};
-
-    let scratch = broca_test_support::scratch_root().join("assertion-inventory-address");
-    let subject = BrocaSubject::new(&scratch).await;
-    let state = scratch.join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let inventory = broca_store::SqliteStore::open(state.join("run-index.db")).unwrap();
-    inventory.rebuild_inventory(&state).unwrap();
-    let session = "folderless";
-    let claim = subject.raw_bind_identity(session);
-    let resolved = inventory
-        .resolve_session_address(&claim, None, None)
-        .unwrap();
-    assert_ne!(resolved.project_root, claim.project_root);
-    subject
-        .shared
-        .session_roots
-        .lock()
-        .unwrap()
-        .insert(session.into(), state.clone());
-    let store = broca_core::FileWalStore::new(state.join("wal"));
-    let mut wal = store.open(&resolved).unwrap();
-    wal.append(
-        1,
-        &broca_wal::WalRecord::RunFinished {
-            interrupt_reason: None,
-            reason: broca_protocol::RunFinishReason::Completed,
-            ts_ms: Some(1),
-            usage: Default::default(),
-            error: None,
-            retries_used: 0,
-        },
-        true,
-    )
-    .unwrap();
-    drop(wal);
-    assert_eq!(subject.bind_identity(session), resolved);
-    let live_records = store.read_records(&subject.bind_identity(session)).unwrap();
-    assert_eq!(live_records.len(), 1);
-    assert!(matches!(
-        live_records[0].record,
-        broca_wal::WalRecord::RunFinished {
-            reason: broca_protocol::RunFinishReason::Completed,
-            ..
-        }
-    ));
-    assert!(!store.wal_path(&claim).exists());
 }
 
 #[tokio::test]

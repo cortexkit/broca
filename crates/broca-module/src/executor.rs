@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{OutputEvent, RunControl, RunError, RunId, RunRequest, RunSummary, WalHandle};
+use broca_core::{OutputEvent, RunControl, RunError, RunId, RunRequest};
 use broca_protocol::BindIdentity;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 #[path = "executor_fork.rs"]
 mod fork;
@@ -33,97 +33,6 @@ pub enum RunKind {
     AppendEpisode,
     /// Continue a run that paused awaiting re-auth (after the credential refreshed).
     ResumeAfterAuth,
-}
-
-/// One run the coordinator asks the executor to drive. The actor injects its
-/// SESSION-scoped writer (the run appends to it; the actor owns its lifecycle), so the
-/// run never spawns or shuts down a writer — a run ends with a `sync()` barrier and the
-/// writer lives on for the next episode.
-pub struct RunJob {
-    pub media: Vec<crate::person_media::StagedMedia>,
-    /// Keep the full profile off the actor's nested admission-future stack, including
-    /// text-only sends whose optional profile is absent.
-    pub media_profile: Option<Box<broca_provider::media_profile::MediaProfile>>,
-    /// Routing affinity supplied by the admitting send, including a drained queued send.
-    pub conversation_key: Option<String>,
-    /// Abstract level from the submission, separate from core's legacy provider-tier enum.
-    pub queued_service_tier: Option<String>,
-    pub req: RunRequest,
-    /// Caller-scoped credential selection carried separately from core's provider-agnostic request.
-    /// The executor resolves it at admission and freezes only the resulting credential id.
-    pub auth: Option<broca_protocol::AuthRequest>,
-    /// The session-scoped writer the run records to (shared, `record()` is `&self`).
-    pub writer: Arc<WalHandle>,
-    pub kind: RunKind,
-    /// Omit the derived session-store projection while retaining the authoritative WAL.
-    pub skip_materialization: bool,
-    pub control: RunControl,
-    /// The checkpoint-plus-tail view used to resolve admission fields. Core validates its
-    /// explicit head against the writer before reconstruction.
-    pub prior_snapshot: broca_core::PriorWalSnapshot,
-    /// The ADMISSION-ACK: the executor fires this exactly once when the run is durably
-    /// ADMITTED — `Ok` after `RunStarted` is fsynced (passed into `run_loop_on_writer`), or
-    /// `Err` if the executor fails to RESOLVE the run (build the provider) BEFORE writing
-    /// any `RunStarted` (so a resolution failure is a typed error, never a ghost run). The
-    /// actor awaits it to reply `active{run_id}` only after the run is durable. The Ok value
-    /// is the RESOLVED run_id — the original run_id on a resume (the loop continues under
-    /// it), or `req.run_id` on a fresh/appended episode. `None` for a fake/test executor
-    /// that doesn't model admission.
-    pub on_admitted: Option<oneshot::Sender<Result<RunId, RunError>>>,
-}
-
-impl RunJob {
-    fn protected_input(&self) -> Vec<broca_protocol::Message> {
-        self.control
-            .steer
-            .as_ref()
-            .map_or_else(|| self.req.input.clone(), |inbox| inbox.protected_inputs())
-    }
-
-    pub fn has_media_input(&self) -> bool {
-        broca_provider::person_media::references(&self.protected_input())
-            .next()
-            .is_some()
-    }
-    /// Validate against the provider that will actually admit the run, then publish
-    /// held bytes before RunStarted can name any reference.
-    pub fn admit_media(
-        &self,
-        provider: &dyn broca_core::Provider,
-        uploads: Option<&broca_core::media_uploads::Uploads>,
-    ) -> Result<(), RunError> {
-        let protected = self.protected_input();
-        if broca_provider::person_media::references(&protected)
-            .next()
-            .is_none()
-        {
-            return Ok(());
-        }
-        let frozen = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
-            provider.render_config_blob(),
-        )
-        .ok();
-        let model = format!(
-            "{}/{}",
-            self.req.model.provider_module_id, self.req.model.model_id
-        );
-        crate::person_media::check(
-            frozen.as_ref().and_then(|frozen| frozen.media.as_ref()),
-            &model,
-            &protected,
-        )?;
-        crate::person_media::publish(uploads, &self.req.session, &self.media)
-    }
-
-    /// Apply this send's projection policy to an available store. Only an explicit one-shot send
-    /// sets `skip_materialization`; every omitted, false, or recovery-defaulted policy keeps the
-    /// existing materialization behavior.
-    pub fn materialized_store(
-        &self,
-        store: Arc<dyn broca_core::SessionStore>,
-    ) -> Option<Arc<dyn broca_core::SessionStore>> {
-        (!self.skip_materialization).then_some(store)
-    }
 }
 
 /// Drives ONE agentic run to a terminal under an already-held lease, emitting its
@@ -194,11 +103,6 @@ pub trait RunExecutor: Send + Sync + 'static {
     ) -> Result<(), String> {
         Ok(())
     }
-    /// Current operator opt-in for source-cache maintenance, independent of durable routing.
-    fn source_warm_enabled(&self) -> bool {
-        false
-    }
-
     /// The email on a cached vault row, never a vault request on a read path.
     fn cached_account_email(&self, _selection: &broca_wal::AuthSelection) -> Option<String> {
         None
@@ -236,32 +140,14 @@ pub trait RunExecutor: Send + Sync + 'static {
         None
     }
 
-    /// Runs only with the session idle and its single writer held by the actor.
-    async fn apply_idle_compaction(
-        &self,
-        _session: &broca_protocol::BindIdentity,
-        _writer: &broca_core::WalHandle,
-        _records: Vec<broca_wal::WalRecord>,
-        _ready: &broca_core::compaction_provider::notice::ViewReady,
-    ) -> Result<bool, String> {
-        Ok(false)
-    }
-
     /// The same session-scoped hook adapter used by the run loop. Input hooks execute in
     /// the actor before a send writes or interrupts anything, never under the steer lock.
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         None
     }
 
-    async fn execute(
-        &self,
-        job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError>;
-
-    /// Runs one run of a session kept in the new storage. An executor that can't refuses with
-    /// nothing written, so a session opts into the new storage only on a build whose executor
-    /// serves it.
+    /// Runs one run of a session. An executor that runs no sessions (a test's) refuses with
+    /// nothing written.
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -270,7 +156,7 @@ pub trait RunExecutor: Send + Sync + 'static {
         StoreRunEnd {
             parts: job.parts,
             result: Err(StoreRunError::Admission(RunError::Config(
-                "this runner cannot run sessions kept in the new storage".into(),
+                "this executor runs no sessions".into(),
             ))),
         }
     }
@@ -385,14 +271,14 @@ pub trait RunExecutor: Send + Sync + 'static {
     }
 }
 
-/// One run of a session kept in the new storage, as the store actor hands it to the executor.
-/// Like [`RunJob`], the actor builds the request and the session's part of the run control; the
-/// executor resolves the credential, routing, provider and the model's entry in the model catalog,
+/// One run of a session, as the store actor hands it to the executor. The actor builds the
+/// request and the session's part of the run control; the executor resolves the credential, routing, provider and the model's entry in the model catalog,
 /// completes the control, admits the run by `broca_session_loop::admit::admission` and runs it
 /// through `writer`.
 pub struct StoreRunJob {
     pub req: RunRequest,
-    /// Caller-scoped credential selection, resolved at admission as for [`RunJob::auth`].
+    /// Caller-scoped credential selection carried separately from core's provider-agnostic
+    /// request. The executor resolves it at admission and freezes only the resulting credential.
     pub auth: Option<broca_protocol::AuthRequest>,
     pub control: RunControl,
     /// The run's writer: a client of the store actor, which owns the session.
@@ -404,8 +290,8 @@ pub struct StoreRunJob {
     /// What the run renders media from, as today's runs render it (see `store_media`), sent
     /// once the session's image index is ready. `None` for a seal, which calls no model.
     pub media: Option<crate::store_media::StoreRunMediaWait>,
-    /// The service tier level the send admitted, as [`RunJob::queued_service_tier`]: routing may
-    /// choose another, and a fresh run's admission applies it to the request it freezes.
+    /// The abstract service tier level the send admitted: routing may choose another, and a fresh
+    /// run's admission applies it to the request it freezes.
     pub queued_service_tier: Option<String>,
     /// What warms the prompt cache while the run waits on tool calls, for a run whose keep-warm
     /// is `auto` (`broca_session_loop::run::Seams::keep_warm`). `None` warms nothing.
@@ -605,14 +491,4 @@ pub enum WarmError {
     Unavailable(String),
 }
 
-impl WarmError {
-    pub(crate) fn variant_name(&self) -> &'static str {
-        match self {
-            Self::Unsupported(_) => "Unsupported",
-            Self::PrefixUnavailable(_) => "PrefixUnavailable",
-            Self::AccountChanged { .. } => "AccountChanged",
-            Self::Provider(_) => "Provider",
-            Self::Unavailable(_) => "Unavailable",
-        }
-    }
-}
+impl WarmError {}

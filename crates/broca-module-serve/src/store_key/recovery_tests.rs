@@ -1,5 +1,5 @@
 use super::*;
-use broca_module::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunJob, StoreRunMode};
+use broca_module::executor::{RunExecutor, StoreRunEnd, StoreRunJob, StoreRunMode};
 use broca_protocol::{BindIdentity, PauseReason, RunFinishReason};
 use broca_session_loop::Writer;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
@@ -14,14 +14,6 @@ struct Continuing(AtomicUsize);
 
 #[async_trait]
 impl RunExecutor for Continuing {
-    async fn execute(
-        &self,
-        _: RunJob,
-        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        panic!("store recovery must not use the WAL executor")
-    }
-
     async fn execute_on_store(
         &self,
         mut job: StoreRunJob,
@@ -124,19 +116,13 @@ impl Rig {
         std::fs::create_dir_all(&root).unwrap();
         let executor = Arc::new(Continuing::default());
         let slot = Arc::new(StoreSlot::awaiting_key(&root, 1).creating(Cipher::None));
-        let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
-        let registry = broca_module::LineageRegistry::new_with_reader(
-            Arc::new(
-                broca_module::DefaultOpener::new(
-                    Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
-                    wal.clone(),
-                    executor.clone(),
-                )
-                .with_store_slot(slot.clone()),
-            ),
-            wal,
-            None,
-        );
+        let registry = broca_module::LineageRegistry::new(Arc::new(
+            broca_module::DefaultOpener::new(
+                Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
+                executor.clone(),
+            )
+            .with_store_slot(slot.clone()),
+        ));
         registry.enable_restart_resumes();
         let rig = Self {
             root,

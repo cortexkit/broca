@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, WalStore as _};
+use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, WalStore as _};
 use broca_protocol::{BindIdentity, RunId};
 use broca_session_store::keys::Cipher;
 use broca_session_store::record::Record;
@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, Notify};
 use super::warm::{warmable, FamilyDeclarer};
 use super::{request, IDLE};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
+use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
 use crate::registry::LineageRegistry;
 
 cipher_tests!(
@@ -42,14 +42,6 @@ struct Loops {
 
 #[async_trait]
 impl RunExecutor for Loops {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -223,7 +215,6 @@ async fn side_events(
     );
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         executor,
     )
     .with_idle_ttl(IDLE)
@@ -231,13 +222,8 @@ async fn side_events(
     if let Some(events) = events {
         opener = opener.with_step_events(events);
     }
-    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+    let registry = LineageRegistry::new(Arc::new(opener));
     registry.set_cache_declarer(Arc::new(FamilyDeclarer));
-    let registry = if store {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
     Side {
         key: BindIdentity::new(dir.join("project"), "store-actor", "s1"),
         dir,

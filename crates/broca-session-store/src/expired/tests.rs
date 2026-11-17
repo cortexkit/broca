@@ -13,6 +13,7 @@ fn marker() -> Marker {
         next_tag: 42,
         next_notice_seq: 77,
         runs: vec!["deleted-run".into()],
+        history_version: None,
     }
 }
 

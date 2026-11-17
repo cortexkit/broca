@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
+use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent};
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
 use broca_module::executor::{
-    ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, RunExecutor, RunJob, RunKind,
+    ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, RunExecutor, RunKind,
     StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
 };
 use broca_module::{DefaultOpener, LineageRegistry};
@@ -233,14 +233,6 @@ struct StoreLoop {
 
 #[async_trait]
 impl RunExecutor for StoreLoop {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("every session here is kept in the new storage")
-    }
-
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         Some(self.compaction.clone() as Arc<dyn broca_core::CompactionPlane>)
     }
@@ -474,7 +466,7 @@ impl Rig {
         forks: Arc<ForkScript>,
         owns_dir: bool,
     ) -> Self {
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+        let _wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let compaction = Arc::new(CountingCompaction::default());
         let executor: Arc<dyn RunExecutor> = Arc::new(StoreLoop {
             provider: Attempting(broca_core::provider::StubProvider::new(steps)),
@@ -495,15 +487,11 @@ impl Rig {
             index: Arc::clone(&export) as Arc<dyn broca_core::ExportIndex>,
             resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 4)),
         });
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
-            executor,
-        )
-        .with_idle_ttl(Duration::from_millis(100))
-        .with_store_runtime(Arc::new(runtime));
-        let registry =
-            LineageRegistry::new_with_reader(Arc::new(opener), wal, None).with_store_new_sessions();
+        let opener =
+            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), executor)
+                .with_idle_ttl(Duration::from_millis(100))
+                .with_store_runtime(Arc::new(runtime));
+        let registry = LineageRegistry::new(Arc::new(opener));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &dir.join("store.db"),

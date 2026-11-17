@@ -8,7 +8,8 @@
 //!
 //! - HELLO: broca is configured `reserved`, so the daemon registers it only if its HELLO echoes
 //!   the nonce it spawned it with. Broca becoming live is that check passing.
-//! - Route open: broca opens a route to the tool module after HELLO, for as long as it runs. The
+//! - Route open: broca opens a route to the tool module after HELLO, when a run's model calls a
+//!   tool (a stand-in model answers the first request with one call to `read`). The
 //!   daemon attests the route as `reserved:broca` only if the route open presents the same nonce,
 //!   and relays that principal to the tool module, whose stub records it. A route open that read
 //!   the environment would present nothing here, and arrive as `direct`.
@@ -20,8 +21,74 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::time::{sleep, Instant};
+
+/// The stand-in model's first answer: one call to the tool module's `read`, so the run opens a
+/// route to it.
+const READ_CALL_SSE: &str = concat!(
+    "data: {\"id\":\"chatcmpl-read\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+    "data: {\"id\":\"chatcmpl-read\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_read\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+    "data: {\"id\":\"chatcmpl-read\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Every later answer: plain text, which ends the run.
+const TEXT_SSE: &str = concat!(
+    "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"}}]}\n\n",
+    "data: {\"id\":\"chatcmpl-done\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Serves the OpenAI-compatible endpoint broca's base URL override points every run at:
+/// [`READ_CALL_SSE`] to the first request, [`TEXT_SSE`] to later ones. Returns its URL.
+async fn serve_model() -> String {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind the model server");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let answered = std::sync::Arc::clone(&answered);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                let sse = if answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    READ_CALL_SSE
+                } else {
+                    TEXT_SSE
+                };
+                let mut stream = reader.into_inner();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    sse.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(sse.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    url
+}
 
 /// A sibling-checkout subc binary, env-overridable, matching the other rigs here.
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
@@ -109,11 +176,19 @@ impl Rig {
         }
 
         let aft_events = dir.join("aft-events.jsonl");
+        let model_url = serve_model().await;
         let fd_record = dir.join("broca-launch-nonce-fd.txt");
         let module_bin = broca_test_support::ckdev_binary(
             env!("CARGO_BIN_EXE_ck-broca"),
             broca_test_support::scratch_root(),
         );
+        let broca_config = config_home.join("cortexkit").join("broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&super::stored_log::plain_storage()).unwrap(),
+        )
+        .expect("write broca config");
+        let broca_config = broca_config.display().to_string();
         let config = serde_json::json!({
             "version": 1,
             "modules": {
@@ -127,9 +202,12 @@ impl Rig {
                         "CK_REAL_BROCA_BIN": module_bin,
                         "CK_TEST_FD_RECORD": fd_record,
                         // A base_url override puts every run on the AuthMode::None path, so the
-                        // rig needs no vault. The run fails at the unreachable URL, after the
-                        // tool route this test watches has been opened.
-                        "BROCA_PROVIDER_BASE_URL": "http://127.0.0.1:1/unused",
+                        // rig needs no vault. The stand-in model there calls the tool module's
+                        // `read`, which opens the route this test watches.
+                        "BROCA_PROVIDER_BASE_URL": model_url,
+                        "BROCA_TOOL_MODULE": "aft",
+                        // No deployment-key vault here either: sessions are stored plain.
+                        "BROCA_CONFIG_PATH": broca_config,
                     },
                     "enabled": true
                 },

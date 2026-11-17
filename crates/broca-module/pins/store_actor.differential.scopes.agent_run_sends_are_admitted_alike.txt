@@ -41,7 +41,7 @@ ScopeRefused(
     },
 )
 == control stream
-sha256:6d18fba247abb977aaea2d5bdfa0232c9446299943a6810f63a12fc231f26ab3 (3080 bytes)
+sha256:4922aca438fc228ed92b6f513cfc57d20693bf7d3e1753fd229c6e4e01b779a7 (3014 bytes)
 == the conversation
 [
     "first",

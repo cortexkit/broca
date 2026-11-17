@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::OutputEvent;
 use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_loop::writer::Writer as _;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
@@ -17,7 +17,7 @@ use super::tests::{
     bind, deployment, executor, idle, send, status, text_step, triple, Commands, LoopExecutor, ADDR,
 };
 use super::StoreActor;
-use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunJob};
+use crate::executor::{RunExecutor, StoreRunEnd, StoreRunJob};
 
 /// When the session's first seal committed.
 const SEALED_AT: u64 = 1_000;
@@ -132,14 +132,6 @@ pub(super) struct SealingExecutor {
 
 #[async_trait]
 impl RunExecutor for SealingExecutor {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     async fn execute_on_store(
         &self,
         mut job: StoreRunJob,

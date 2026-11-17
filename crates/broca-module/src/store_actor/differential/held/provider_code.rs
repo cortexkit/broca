@@ -1,7 +1,6 @@
 use super::*;
 
 struct Served {
-    store: bool,
     status: Value,
     head: Value,
     result: Value,
@@ -18,53 +17,34 @@ fn sample(name: &str, bytes: &[u8]) {
 }
 
 async fn stored_error(side: &Side) -> (Value, Option<u64>) {
-    if side.store {
-        let view = side
-            .registry
-            .store_runtime()
-            .unwrap()
-            .current_view(&side.key)
-            .await
-            .unwrap()
-            .unwrap();
-        view.records_from(1)
-            .await
-            .unwrap()
-            .into_iter()
-            .find_map(|(_, record)| match record {
-                broca_session_store::record::Record::RunEnd(end) => {
-                    end.error.map(|error| (error.parse(), end.ts_ms))
-                }
-                broca_session_store::record::Record::Pause(pause) => {
-                    pause.error.map(|error| (error.parse(), None))
-                }
-                _ => None,
-            })
-            .expect("the store recorded the provider error")
-    } else {
-        side.executor
-            .wal
-            .read_records(&side.key)
-            .unwrap()
-            .into_iter()
-            .find_map(|frame| match frame.record {
-                broca_wal::WalRecord::RunFinished {
-                    error: Some(error), ..
-                }
-                | broca_wal::WalRecord::RunPaused {
-                    error: Some(error), ..
-                } => Some((serde_json::to_value(error).unwrap(), None)),
-                _ => None,
-            })
-            .expect("the WAL recorded the provider error")
-    }
+    let view = side
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap();
+    view.records_from(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, record)| match record {
+            broca_session_store::record::Record::RunEnd(end) => {
+                end.error.map(|error| (error.parse(), end.ts_ms))
+            }
+            broca_session_store::record::Record::Pause(pause) => {
+                pause.error.map(|error| (error.parse(), None))
+            }
+            _ => None,
+        })
+        .expect("the store recorded the provider error")
 }
 
 async fn capture(side: &Side, name: &str) -> Served {
-    let storage = if side.store { "store" } else { "legacy" };
     let phase =
         std::env::var("BROCA_PROVIDER_CODE_SAMPLE_PHASE").unwrap_or_else(|_| "after".into());
-    let prefix = format!("{name}.{storage}.{phase}");
+    let prefix = format!("{name}.store.{phase}");
     let status = side
         .registry
         .run_status(&side.key, RunId("r1".into()))
@@ -122,7 +102,7 @@ async fn capture(side: &Side, name: &str) -> Served {
                         event.0.into(),
                         &event.1,
                         seq,
-                        &event.2,
+                        event.2.as_ref(),
                     )
                     .unwrap();
                     assert!(broca_wire::decode_subscribe_event(&bytes).is_ok());
@@ -140,7 +120,6 @@ async fn capture(side: &Side, name: &str) -> Served {
     .await;
     let (stored_error, ended_at_ms) = stored_error(side).await;
     Served {
-        store: side.store,
         status,
         head,
         result,
@@ -150,30 +129,27 @@ async fn capture(side: &Side, name: &str) -> Served {
     }
 }
 
-async fn scenario(class: &str, status: u16, name: &str) -> Vec<Served> {
-    let mut served = Vec::new();
-    for store in [false, true] {
-        let error = serde_json::from_value(json!({
-            "class":class, "message":"synthetic codeless provider refusal", "status":status,
-            "provider_subcode":"upstream_detail", "provider_details":{}
-        }))
-        .unwrap();
-        let side = Side::new(
-            store,
-            Cipher::None,
-            vec![vec![NormalizedEvent::Control(
-                broca_protocol::provider::ProviderControl::Error {
-                    error,
-                    retries_used: 0,
-                },
-            )]],
-        )
-        .await;
-        side.send().await;
-        side.idle().await;
-        served.push(capture(&side, name).await);
-        assert!(side.registry.stop_and_seal().await);
-    }
+async fn scenario(class: &str, status: u16, name: &str) -> Served {
+    let error = serde_json::from_value(json!({
+        "class":class, "message":"synthetic codeless provider refusal", "status":status,
+        "provider_subcode":"upstream_detail", "provider_details":{}
+    }))
+    .unwrap();
+    let side = Side::new(
+        true,
+        Cipher::None,
+        vec![vec![NormalizedEvent::Control(
+            broca_protocol::provider::ProviderControl::Error {
+                error,
+                retries_used: 0,
+            },
+        )]],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    let served = capture(&side, name).await;
+    assert!(side.registry.stop_and_seal().await);
     served
 }
 
@@ -201,14 +177,10 @@ fn assert_terminal(served: Served, code: &str, party: &str) {
     );
     assert_eq!(served.stored_error["provider_subcode"], "upstream_detail");
     let wait = &served.status["awaits"];
-    if served.store {
-        assert_eq!(wait["party"], party);
-        assert_eq!(wait["since_ms"].as_u64(), served.ended_at_ms);
-        assert_eq!(served.result["awaits"], *wait);
-        assert_eq!(served.head["last_run_state"]["awaits"], *wait);
-    } else {
-        assert!(wait.is_null(), "legacy storage still omits awaits");
-    }
+    assert_eq!(wait["party"], party);
+    assert_eq!(wait["since_ms"].as_u64(), served.ended_at_ms);
+    assert_eq!(served.result["awaits"], *wait);
+    assert_eq!(served.head["last_run_state"]["awaits"], *wait);
     assert_eq!(
         served
             .frames
@@ -233,44 +205,37 @@ fn assert_terminal(served: Served, code: &str, party: &str) {
 
 #[tokio::test]
 async fn run_provider_code_codeless_permanent_is_derived_on_every_surface() {
-    for served in scenario("permanent", 400, "terminal-unknown-code").await {
-        assert_terminal(served, "provider_error", "nobody");
-    }
+    let served = scenario("permanent", 400, "terminal-unknown-code").await;
+    assert_terminal(served, "provider_error", "nobody");
 }
 
 #[tokio::test]
 async fn run_provider_code_codeless_transient_is_derived_on_every_surface() {
-    for served in scenario("transient", 503, "transient-codeless").await {
-        assert_terminal(served, "transient", "caller");
-    }
+    let served = scenario("transient", 503, "transient-codeless").await;
+    assert_terminal(served, "transient", "caller");
 }
 
 #[tokio::test]
 async fn run_provider_code_codeless_auth_pause_is_derived_where_errors_are_served() {
-    for served in scenario("auth", 401, "auth-required-codeless").await {
-        assert_eq!(served.status["state"], "paused");
-        assert_error(&served.status["error"], "auth_required");
-        assert_error(&served.result["error"], "auth_required");
-        assert!(
-            served.head.get("last_run_error").is_none(),
-            "a pause is not a terminal error"
-        );
-        assert!(served.stored_error.get("provider_code").is_none());
-        assert_eq!(served.frames.len(), 1);
-        assert_eq!(served.frames[0].0, "paused");
-        assert_error(&served.frames[0].1["unit"]["error"], "auth_required");
-        if served.store {
-            assert_eq!(served.status["awaits"]["party"], "person");
-            assert_eq!(
-                served.head["last_run_state"]["awaits"],
-                served.status["awaits"]
-            );
-            assert_eq!(
-                served.frames[0].1["unit"]["awaits"],
-                served.status["awaits"]
-            );
-        } else {
-            assert!(served.status.get("awaits").is_none());
-        }
-    }
+    let served = scenario("auth", 401, "auth-required-codeless").await;
+    assert_eq!(served.status["state"], "paused");
+    assert_error(&served.status["error"], "auth_required");
+    assert_error(&served.result["error"], "auth_required");
+    assert!(
+        served.head.get("last_run_error").is_none(),
+        "a pause is not a terminal error"
+    );
+    assert!(served.stored_error.get("provider_code").is_none());
+    assert_eq!(served.frames.len(), 1);
+    assert_eq!(served.frames[0].0, "paused");
+    assert_error(&served.frames[0].1["unit"]["error"], "auth_required");
+    assert_eq!(served.status["awaits"]["party"], "person");
+    assert_eq!(
+        served.head["last_run_state"]["awaits"],
+        served.status["awaits"]
+    );
+    assert_eq!(
+        served.frames[0].1["unit"]["awaits"],
+        served.status["awaits"]
+    );
 }

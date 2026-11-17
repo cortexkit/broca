@@ -7,5 +7,4 @@
 # Format: package|exact nextest test name|measured seconds
 broca-crash-harness|v4_recovery_tests::v4_recovery_all_images_with_three_pending_appends|2007
 broca-provider|transport::tests::warm_idle_crash_and_power_loss_reclaim_once|639
-broca-module|actor::writer_reclaim::tests::reclaim_crash_and_power_loss_cuts_are_idempotent|328
 broca-crash-harness|v4_recovery_tests::v4_recovery_all_images_with_two_pending_appends|86

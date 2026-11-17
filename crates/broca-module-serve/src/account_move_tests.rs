@@ -601,7 +601,7 @@ async fn admit_chatgpt_resume(
         }),
         last_config: Some(&config),
         head_seq: 1,
-        persona: PersonaHistory::Store {
+        persona: PersonaHistory {
             first_user: None,
             first_user_sealed: false,
             human_prompts: 0,

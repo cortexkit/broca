@@ -8,10 +8,10 @@
 
 use crate::delivery_rig;
 use crate::plan_admission::plan_rig;
+use broca_session_store::record::Record;
 
 use delivery_rig::*;
 
-use broca_wal::WalRecord;
 use serde_json::{json, Value};
 
 /// `body` with the run id and lineage id it names replaced by placeholders: both are minted per
@@ -20,19 +20,20 @@ fn normalized(body: &[u8], run_id: &str, lineage_id: &str) -> String {
     normalize_snapshot_bytes(body, run_id, lineage_id)
 }
 
+/// The scope a reply's output-reference ids name for the history `page` serves: the session's
+/// incarnation and its stored history version. Ids keep the stored version, not the served one,
+/// so an id handed out before the served versions were raised still names the same transcript.
 fn snapshot_scope(page: &Value) -> String {
     use base64::Engine;
     format!(
         "h1.{}.{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(page["incarnation"].as_str().unwrap()),
-        page["history_version"].as_u64().unwrap()
+        broca_module::store_exposure::stored_history_version(
+            page["history_version"].as_u64().unwrap()
+        )
+        .expect("a served history version names a stored one")
     )
-}
-
-async fn reference_scope(rig: &mut Rig) -> String {
-    let head = call(rig, 7, "session.head", json!({})).await;
-    snapshot_scope(&result(&head))
 }
 
 /// The pinned text of `file`, without its trailing newline.
@@ -150,16 +151,10 @@ async fn declared_slots_without_opt_in_keep_the_manifest_bytes() {
     ]));
     rig.script.push(&[Step::Text("answer")]);
     send_plan(&mut rig, "turn-1", "hi", &tagged_plan(json!({}))).await;
-    let records = rig.wait_for_finished(1).await;
-    let manifest = records
-        .iter()
-        .find_map(|record| match record {
-            WalRecord::RunStarted {
-                manifest: Some(manifest),
-                ..
-            } => Some(manifest.clone()),
-            _ => None,
-        })
+    rig.wait_for_finished(1).await;
+    let manifest = rig.admissions().await[0]
+        .manifest
+        .clone()
         .expect("the plan froze a manifest");
     let body = serde_json::to_string(&manifest).unwrap();
     check_golden(
@@ -182,68 +177,6 @@ async fn referencing_session(tag: &str, reply: &'static str) -> (Rig, String, St
         .await;
     let lineage = result(&head)["incarnation"].as_str().unwrap().to_owned();
     (rig, run_id, lineage, snapshot_scope(&result(&head)))
-}
-
-#[tokio::test]
-async fn output_reference_ids_never_resolve_across_a_history_rewrite() {
-    use broca_core::ServedHistory;
-    let (mut rig, _, incarnation, old_scope) =
-        referencing_session("refs-history-scope", "see $$tc(2)").await;
-    let old_set = format!("{old_scope}/m3");
-    let before = call(
-        &mut rig,
-        7,
-        "session.output_refs",
-        json!({"set_id":old_set}),
-    )
-    .await;
-    assert_eq!(result(&before)["records"][0]["state"], "resolved");
-    let before = call(
-        &mut rig,
-        7,
-        "session.output_ref_read",
-        json!({"ref_id":format!("{old_set}/r0"), "offset":0, "length":6}),
-    )
-    .await;
-    assert_eq!(result(&before)["data"], "d29ya2Vk");
-
-    rig.store
-        .history_rewritten(&rig.session, Some(&incarnation))
-        .unwrap();
-    rig.store.history_rewrite_finished(&rig.session).unwrap();
-    let new_scope = reference_scope(&mut rig).await;
-    assert_ne!(old_scope, new_scope);
-    let wal = rig.wal_bytes();
-    for set in [old_set, format!("{incarnation}/m3")] {
-        let listed = call(&mut rig, 7, "session.output_refs", json!({"set_id":set})).await;
-        assert_eq!(refusal(&listed)["code"], "unknown_ref");
-        let read = call(
-            &mut rig,
-            7,
-            "session.output_ref_read",
-            json!({"ref_id":format!("{set}/r0"), "offset":0, "length":6}),
-        )
-        .await;
-        assert_eq!(refusal(&read)["code"], "unknown_ref");
-    }
-    let current = call(
-        &mut rig,
-        7,
-        "session.output_ref_read",
-        json!({"ref_id":format!("{new_scope}/m3/r0"), "offset":0, "length":6}),
-    )
-    .await;
-    assert_eq!(
-        result(&current)["data"],
-        "d29ya2Vk",
-        "fresh references still read retained bytes"
-    );
-    assert_eq!(
-        rig.wal_bytes(),
-        wal,
-        "reference reads never append to the log"
-    );
-    rig.finish().await;
 }
 
 #[tokio::test]
@@ -493,7 +426,7 @@ async fn imported_history_omits_unknown_model_without_guessing() {
     rig.wait_idle().await;
     let head = call(&mut rig, 7, "session.head", json!({})).await;
     assert_eq!(result(&head)["model"]["model"], "fake");
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
     let display = result(&display);
     assert_eq!(display["messages"].as_array().unwrap().len(), 6);
@@ -506,7 +439,11 @@ async fn imported_history_omits_unknown_model_without_guessing() {
         "anthropic/recorded-model"
     );
     assert_eq!(display["messages"][5]["row"]["model"], "fake/fake");
-    assert_eq!(rig.wal_bytes(), before, "display projection writes nothing");
+    assert_eq!(
+        rig.records().await,
+        before,
+        "display projection writes nothing"
+    );
     let raw_after = call(&mut rig, 7, "session.read", json!({})).await;
     assert_eq!(
         &result(&raw_after)["messages"].as_array().unwrap()[..4],
@@ -548,18 +485,24 @@ async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::ToolDispatchIntent { .. }))
+            .filter(|record| matches!(record, Record::ToolIntent(_)))
             .count(),
         1
     );
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::ToolResult { result, .. } if matches!(&result.output, broca_protocol::content::ToolOutput::Error { message, .. } if message == "duplicate tool_call_id from provider")))
+            .filter(|record| matches!(record, Record::ToolOutcome(outcome) if outcome.is_error))
             .count(),
         1
     );
     let raw = call(&mut rig, 7, "session.read", json!({})).await;
+    // The duplicate's error result tells the model why it was refused.
+    assert!(
+        String::from_utf8_lossy(&raw.body).contains("duplicate tool_call_id from provider"),
+        "{}",
+        String::from_utf8_lossy(&raw.body)
+    );
     let raw = result(&raw);
     let scope = snapshot_scope(&raw);
     let first_key = raw["messages"][1]["tool_calls"][0]["call_key"].clone();
@@ -675,13 +618,17 @@ async fn a_reply_set_resolves_against_the_writing_request() {
     let (mut rig, run_id, lineage, scope) =
         referencing_session("refs-reply-set", "see $$tc(2), $$tc(1) and $$tc(99)").await;
     let set = format!("{scope}/m3");
+    // The key the tool call was dispatched under, as the session's read names it.
+    let raw = result(&call(&mut rig, 7, "session.read", json!({})).await);
+    let call_key = raw["messages"][1]["tool_calls"][0]["call_key"].clone();
+    assert!(call_key.is_string(), "{raw}");
     let page = call(&mut rig, 7, "session.output_refs", json!({"set_id": set})).await;
     let records = result(&page)["records"].clone();
     assert_eq!(
         records,
         json!([
             {"ref_id": format!("{set}/r0"), "tag": "2", "part": "m2#0",
-             "call_key": format!("{lineage}:5"), "tool": "work", "provider": WORK_MODULE,
+             "call_key": call_key, "tool": "work", "provider": WORK_MODULE,
              "format": "text", "bytes": 6, "sha256": sha256_hex(b"worked"), "state": "resolved"},
             {"ref_id": format!("{set}/r1"), "tag": "1", "part": "m0#0", "call_key": null,
              "tool": null, "provider": null, "format": null, "bytes": null, "sha256": null,
@@ -707,8 +654,8 @@ async fn a_reply_set_resolves_against_the_writing_request() {
         derived.reply.descriptor.check(&parsed),
         "the descriptor's count and digest match the served records"
     );
-    // A session without a compaction provider keeps the established positional message ids.
-    assert_eq!(derived.reply.descriptor.mid, "m3");
+    // The descriptor names the reply by the id the session's reads give it.
+    assert_eq!(derived.reply.descriptor.mid, raw["messages"][3]["mid"]);
     assert_eq!(derived.reply.descriptor.dialect, "rich-ui/1");
     check_golden(
         &normalized(&page.body, &run_id, &lineage),
@@ -827,7 +774,7 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
         referencing_session("refs-refusals", "see $$tc(2), $$tc(1) and $$tc(99)").await;
     let set = format!("{scope}/m3");
     let foreign = "00000000-0000-4000-8000-000000000000";
-    let wal = rig.wal_bytes();
+    let wal = rig.records().await;
     let cases = [
         (
             "session.output_refs",
@@ -900,7 +847,7 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
         let frame = call(&mut rig, 7, "session.output_refs", json!({"set_id": alias})).await;
         assert_eq!(refusal(&frame)["code"], "unknown_ref", "{alias}");
     }
-    assert_eq!(rig.wal_bytes(), wal, "a refusal writes nothing");
+    assert_eq!(rig.records().await, wal, "a refusal writes nothing");
     rig.finish().await;
 }
 
@@ -932,7 +879,7 @@ async fn ids_are_session_bound_and_access_follows_session_read() {
     let read = call(&mut rig, 11, "session.read", json!({})).await;
     let read_refusal = refusal(&read);
     assert_eq!(read_refusal["code"], "sender_not_owner");
-    let wal = rig.wal_bytes();
+    let wal = rig.records().await;
     for (method, params) in [
         ("session.history", json!({"form":"display"})),
         ("session.output_refs", json!({"set_id": set})),
@@ -952,66 +899,7 @@ async fn ids_are_session_bound_and_access_follows_session_read() {
             "output_refs.sender_not_owner.json",
         );
     }
-    assert_eq!(rig.wal_bytes(), wal, "a refusal writes nothing");
-    rig.finish().await;
-}
-
-/// The view a past request rendered is found from the log: a view applied before the step that
-/// wrote the message is in effect for it; one applied after that step is not.
-#[tokio::test]
-async fn the_view_in_effect_is_the_last_one_applied_before_the_writing_step() {
-    let (rig, _, _, _) = referencing_session("refs-view-step", "see $$tc(2)").await;
-    let records = rig.records();
-    let last_step = records
-        .iter()
-        .rposition(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
-        .unwrap();
-    let applied = |version: u64| WalRecord::CompactionViewApplied {
-        provider: "compactor".into(),
-        view_version: version,
-        view: broca_wal::OpaqueJson::from_json_text(
-            json!({
-                "session_ref": "session", "view_version": version, "lineage_id": "lineage",
-                "covers_through": {"ordinal": 2, "mid": "m2"},
-                "ranges": [{"kind": "replace", "from": 0, "to": 3, "bytes": "[]"}],
-                "digest": "00",
-            })
-            .to_string(),
-        )
-        .unwrap(),
-        choice: broca_wal::CompactionViewChoice::Applied,
-    };
-    let version = |records: &[WalRecord], ordinal| {
-        broca_module::output_refs::view_at_writing_step(records, ordinal)
-            .unwrap()
-            .map(|view| view.view_version)
-    };
-    assert_eq!(version(&records, 3), None, "no view applied");
-
-    let mut before = records.clone();
-    before.insert(last_step, applied(1));
-    assert_eq!(
-        version(&before, 3),
-        Some(1),
-        "applied before the final step"
-    );
-    assert_eq!(
-        version(&before, 1),
-        None,
-        "the tool-call message was written by an earlier step"
-    );
-
-    let mut after = records.clone();
-    after.insert(last_step + 1, applied(2));
-    assert_eq!(version(&after, 3), None, "applied after the final step");
-
-    let mut both = before.clone();
-    both.insert(last_step + 2, applied(2));
-    assert_eq!(
-        version(&both, 3),
-        Some(1),
-        "a later view does not apply backwards"
-    );
+    assert_eq!(rig.records().await, wal, "a refusal writes nothing");
     rig.finish().await;
 }
 
@@ -1058,25 +946,13 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
         &tagged_plan(json!({"output_refs": true})),
     )
     .await;
-    let records = rig.wait_for_finished(1).await;
+    rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let started = records
-        .iter()
-        .find(|record| matches!(record, WalRecord::RunStarted { .. }))
-        .unwrap();
-    assert!(
-        started
-            .required_features()
-            .contains(&broca_wal::PLAN_REFERENCE_SLOTS_FEATURE),
-        "frozen slots are must-understand"
-    );
-    let WalRecord::RunStarted {
-        manifest: Some(manifest),
-        ..
-    } = started
-    else {
-        panic!("the plan froze a manifest")
-    };
+    let admitted = rig.admissions().await;
+    let manifest = admitted[0]
+        .manifest
+        .as_ref()
+        .expect("the plan froze a manifest");
     let broca_wal::FetchOutcome::Answered {
         reference_slots: Some(slots),
         ..

@@ -12,12 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{
-    AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, WalStore,
-};
+use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, WalStore};
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
 use broca_module::executor::{
-    RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+    RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
 };
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
@@ -35,6 +33,7 @@ use subc_transport::{read_frame, write_frame};
 use tokio::sync::mpsc;
 
 mod app_readers;
+mod send_status;
 
 /// The compaction provider the planned session's plan names.
 const PROVIDER: &str = "ck-mc";
@@ -140,14 +139,6 @@ impl RunExecutor for StoreLoop {
         assert_eq!(model.provider, "stub");
         assert_eq!(model.model, "m");
         Ok(Some(200_000))
-    }
-
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("every session here is kept in the new storage")
     }
 
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
@@ -361,15 +352,11 @@ impl Rig {
         )
         .await
         .unwrap();
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
-            executor,
-        )
-        .with_idle_ttl(Duration::from_millis(100))
-        .with_store_runtime(Arc::new(runtime));
-        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None)
-            .with_store_new_sessions();
+        let opener =
+            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), executor)
+                .with_idle_ttl(Duration::from_millis(100))
+                .with_store_runtime(Arc::new(runtime));
+        let registry = LineageRegistry::new(Arc::new(opener));
         // A bind resolves the session's address through the deployment's inventory, which
         // today's store keeps.
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
@@ -543,15 +530,10 @@ impl Rig {
     /// Installs retention over the rig's own leases and store, as the module installs it at
     /// startup: what deletes a session from the new storage.
     fn install_retention(&self) {
-        let store = Arc::new(broca_store::SqliteStore::open(self.dir.join("store.db")).unwrap());
-        let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
         self.registry.set_retention_service(Arc::new(
             broca_module::retention::RetentionService::new(
-                self.wal.clone(),
-                store.clone(),
+                &self.dir,
                 Arc::new(FileLeaseStore::new(self.dir.join("leases"))),
-                store,
-                resolver,
             )
             .unwrap(),
         ));

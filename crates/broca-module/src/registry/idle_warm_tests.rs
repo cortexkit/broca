@@ -40,10 +40,7 @@ impl LineageOpener for Opener {
         Ok(ActorHandle {
             tx,
             gen,
-            media_head: None,
-            durable_head: Arc::new(AtomicU64::new(0)),
             run_in_flight: Arc::new(AtomicU64::new(0)),
-            approvals: Arc::default(),
             first_episode: Arc::default(),
         })
     }

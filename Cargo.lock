@@ -353,7 +353,6 @@ version = "0.4.56"
 dependencies = [
  "async-trait",
  "broca-core",
- "broca-module",
  "broca-protocol",
  "broca-store",
  "broca-test-support",
@@ -416,11 +415,9 @@ dependencies = [
  "broca-crash-harness",
  "broca-diagnostics",
  "broca-fetch-plan",
- "broca-memory-relief",
  "broca-owner-only",
  "broca-protocol",
  "broca-provider",
- "broca-session-convert",
  "broca-session-loop",
  "broca-session-store",
  "broca-store",
@@ -464,7 +461,6 @@ dependencies = [
  "broca-owner-only",
  "broca-protocol",
  "broca-provider",
- "broca-session-convert",
  "broca-session-loop",
  "broca-session-store",
  "broca-store",
@@ -613,33 +609,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "broca-session-convert"
-version = "0.4.56"
-dependencies = [
- "async-trait",
- "broca-core",
- "broca-fetch-plan",
- "broca-module",
- "broca-protocol",
- "broca-provider",
- "broca-session-loop",
- "broca-session-store",
- "broca-store",
- "broca-test-support",
- "broca-wal",
- "cortexkit-role-compaction",
- "cortexkit-role-llm-runner 0.8.49",
- "futures",
- "rusqlite",
- "serde",
- "serde_jcs",
- "serde_json",
- "sha2",
- "tokio",
- "zstd",
-]
-
-[[package]]
 name = "broca-session-loop"
 version = "0.4.56"
 dependencies = [
@@ -648,7 +617,6 @@ dependencies = [
  "broca-crash-harness",
  "broca-protocol",
  "broca-provider",
- "broca-session-convert",
  "broca-session-store",
  "broca-test-support",
  "broca-wal",

@@ -1,22 +1,25 @@
 //! Private JetStream tests. No production daemon, credentials, or installed ck-* binaries.
 //!
-//! Most tests here drive the outbox and publisher directly. `real_daemon_turn_publishes_*`
-//! instead runs the real `ck-broca` under the real `ck-subc` daemon, with run events switched on
-//! in its config file, and checks that one ordinary turn reaches the stream with nothing but the
-//! process's own wiring in between. The ck-bus credential service is a stand-in registered from
-//! this process; it mints user credentials from the private broker's own trust chain.
+//! Most tests here record run events in the outbox and drive the publisher directly.
+//! `real_daemon_turn_publishes_*` instead runs the real `ck-broca` under the real `ck-subc` daemon,
+//! with run events switched on in its config file, and checks that one ordinary turn reaches the
+//! stream with nothing but the process's own wiring in between. The ck-bus credential service is
+//! a stand-in registered from this process; it mints user credentials from the private broker's
+//! own trust chain.
 #[path = "common/routing_fixture.rs"]
 mod routing_fixture;
+#[cfg(unix)]
+#[path = "common/stored_log.rs"]
+mod stored_log;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use broca_core::{FileWalStore, WalStore};
 use broca_module_serve::{bus_events::now_ms, bus_events_nats::NatsPublisher};
-use broca_protocol::{request::ModelHandle, BindIdentity, RunFinishReason, RunId, Usage};
+use broca_protocol::run_events::{RunEvent, RunEventDetail};
+use broca_protocol::{BindIdentity, PauseReason, RunFinishReason};
 use broca_store::{
-    bus_events::{BusPublisher, DrainResult},
+    bus_events::{BusPublisher, DrainResult, RunEventStore as _},
     SqliteStore,
 };
-use broca_wal::{RunConfig, WalRecord};
 use cortexkit_bus_naming::AccountNames;
 use cortexkit_bus_nats::{ConnectConfig, NatsConnection};
 use cortexkit_bus_testkit::{
@@ -58,68 +61,6 @@ fn scratch() -> Scratch {
     ));
     std::fs::create_dir_all(&path).unwrap();
     Scratch(path)
-}
-
-fn started(session: &BindIdentity) -> WalRecord {
-    started_at(session, "bus-run", now_ms())
-}
-
-fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
-    WalRecord::RunStarted {
-        message_marks: None,
-        compaction_plan_version: None,
-        sent_by: None,
-        written_at_ms: None,
-        tags: None,
-        run_id: RunId(run_id.into()),
-        session: session.clone(),
-        ts_ms: Some(ts_ms),
-        config: Box::new(RunConfig {
-            global_system: None,
-            account_route: None,
-            route_decision_id: None,
-            served_provider: None,
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("fixture", "model"),
-            tools: vec![].into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
-        }),
-        input: Arc::new(vec![]),
-        origin: Default::default(),
-        on_restart: None,
-        keep_warm: None,
-        project_id: None,
-        principal: None,
-        retention: None,
-        session_class: None,
-        submission_id: None,
-        send_id: None,
-        request_identity_digest: None,
-        title: None,
-        scope: None,
-        marker_order_version: None,
-        manifest: None,
-        hooks: None,
-    }
 }
 
 fn jwt(signer: &KeyPair, subject: &str, nats: serde_json::Value) -> String {
@@ -211,305 +152,55 @@ async fn provision(conn: &NatsConnection, names: &AccountNames) -> NatsPublisher
     }
 }
 
-struct NoConnector;
-#[async_trait::async_trait]
-impl broca_module_serve::bus_events::BusConnector for NoConnector {
-    async fn connect(&self) -> Result<broca_module_serve::bus_events::BusConnection, String> {
-        Err("not used by direct delivery tests".into())
-    }
-}
-
-struct ReceiptAckCursor {
-    inner: Box<dyn StreamCursor>,
-    store: Arc<SqliteStore>,
-    inbox: Arc<broca_core::ViewReadyInbox>,
-    ready: broca_core::compaction_provider::notice::ViewReady,
-}
-#[async_trait::async_trait]
-impl StreamCursor for ReceiptAckCursor {
-    async fn next(
-        &mut self,
-    ) -> cortexkit_bus_trait::BusResult<Option<cortexkit_bus_trait::StreamDelivery>> {
-        self.inner.next().await
-    }
-    async fn ack(&mut self) -> cortexkit_bus_trait::BusResult<()> {
-        use broca_core::CompactionViews;
-        assert_eq!(
-            self.store
-                .compaction_receipts("", 256)
-                .unwrap()
-                .first()
-                .map(|r| &r.ready),
-            Some(&self.ready),
-            "ACK preceded durable receipt"
-        );
-        assert_eq!(
-            self.inbox
-                .newest_ready(&self.ready.session_ref, "ignored", None),
-            Some(self.ready.clone()),
-            "ACK preceded inbox enqueue"
-        );
-        self.inner.ack().await
-    }
-    async fn nak(&mut self, delay: Duration) -> cortexkit_bus_trait::BusResult<()> {
-        self.inner.nak(delay).await
-    }
-    async fn term(&mut self, reason: Option<&str>) -> cortexkit_bus_trait::BusResult<()> {
-        self.inner.term(reason).await
-    }
-    async fn in_progress(&mut self) -> cortexkit_bus_trait::BusResult<()> {
-        self.inner.in_progress().await
-    }
-}
-
-async fn provision_compaction(conn: &NatsConnection, names: &AccountNames) {
-    let spec = cortexkit_bus_naming::event_consumer_specs(names)
-        .unwrap()
-        .into_iter()
-        .find(|s| s.consumer.durable == "m_broca")
-        .unwrap();
-    async_nats::jetstream::new(conn.client())
-        .get_stream(&spec.consumer.stream)
-        .await
-        .unwrap()
-        .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            durable_name: Some(spec.consumer.durable),
-            filter_subjects: spec.consumer.filter_subjects,
-            ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
-            ack_wait: spec.ack_wait,
-            max_ack_pending: spec.max_ack_pending,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
-    use broca_core::compaction_provider::notice::{event_subject, ViewReady, VIEW_READY_EVENT};
-    use broca_core::{CompactionViews, ViewReadyInbox};
-    let Some((_bus, conn, names, _)) = fixture().await else {
-        return;
+/// The events a store session's writer hands the outbox for one run: it started, a steer it
+/// took was consumed at its first step, it paused for a restart, and it ended. The seqs are its
+/// records' seqs, as the writer's projection gives them (the steer's own record is seq 2).
+fn run_events(session: &BindIdentity, run_id: &str) -> Vec<RunEvent> {
+    let event = |seq, detail| RunEvent {
+        v: 1,
+        session_ref: broca_core::wal_writer::agent_session_ref(session),
+        run_id: run_id.into(),
+        seq,
+        at_ms: now_ms(),
+        detail,
     };
-    let _publisher = provision(&conn, &names).await;
-    provision_compaction(&conn, &names).await;
-    let temp = scratch();
-    let db = temp.path().join("run-index.db");
-    let store = Arc::new(SqliteStore::open(&db).unwrap());
-    let wal = Arc::new(FileWalStore::new(temp.path().join("wal")));
-    wal.set_session_ref_index(store.clone());
-    let session = BindIdentity::new("/fixture", "broca", "compaction-receipt");
-    let mut writer = wal.open(&session).unwrap();
-    writer.append(1, &started(&session), true).unwrap();
-    writer
-        .append(
-            2,
-            &WalRecord::CompactionMessage {
-                provider: "magic-context".into(),
-                kind: broca_wal::CompactionMessageKind::Setup,
-                request_id: None,
-                cursor: None,
-                compaction_id: "initial".into(),
-                version: 1,
-                range: broca_wal::CompactionRange { from: 0, to: 0 },
-                replacement: Arc::new(vec![]),
-                sha256: broca_wal::compaction_replacement_sha256(&[]).unwrap(),
-                call_when: None,
-                stability: None,
-                ceiling: Some(broca_wal::OpaqueJson::from_json_text("{}").unwrap()),
-                tag_checkpoint: None,
-                ride_wait_ms: None,
-                view_features: None,
-                view_due: None,
+    vec![
+        event(1, RunEventDetail::Started {}),
+        event(
+            3,
+            RunEventDetail::SteerConsumed {
+                step: 1,
+                consumed: 1,
+                send_ids: vec!["steer-a".into()],
+                truncated: false,
             },
-            true,
-        )
-        .unwrap();
-    drop(writer);
-    broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(temp.path()))
-        .unwrap();
-    let registry =
-        broca_module::LineageRegistry::new_with_reader(Arc::new(NoActor), wal.clone(), None);
-    let inbox = Arc::new(ViewReadyInbox::default());
-    let service = broca_module_serve::compaction_bus::Service::new(
-        store.clone(),
-        registry.clone(),
-        wal.clone(),
-        inbox.clone(),
-        Arc::new(NoConnector),
-        Default::default(),
-    );
-    let ready = ViewReady::new(
-        broca_core::agent_session_ref(&session),
-        7,
-        3,
-        "a".repeat(64),
-    );
-    let subject = event_subject(names.account(), "magic-context", VIEW_READY_EVENT);
-    let publication = conn
-        .stream(names.streams().event.clone())
-        .publish(
-            &subject,
-            &ready.message_id(),
-            ready.digest.parse().unwrap(),
-            ready.to_headers(),
-        )
-        .await
-        .unwrap();
-    assert!(!publication.duplicate());
-    let mut reader = broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
-        .await
-        .unwrap();
-    let delivery = reader.next().await.unwrap().unwrap();
-    // Simulate loss after the receipt commit but before ACK; redelivery must be idempotent.
-    service
-        .handle(&delivery.message, names.account())
-        .await
-        .unwrap();
-    service
-        .handle(&delivery.message, names.account())
-        .await
-        .unwrap();
-    assert_eq!(store.compaction_receipts("", 256).unwrap().len(), 1);
-    assert_eq!(
-        inbox.newest_ready(&ready.session_ref, "ignored", None),
-        Some(ready.clone())
-    );
-    store
-        .clear_compaction_receipt(&store.compaction_receipts("", 256).unwrap()[0])
-        .unwrap();
-    inbox.forget(&ready.session_ref);
-    let mut reader = ReceiptAckCursor {
-        inner: reader,
-        store: store.clone(),
-        inbox: inbox.clone(),
-        ready: ready.clone(),
-    };
-    service
-        .settle_delivery(&delivery.message, names.account(), &mut reader)
-        .await
-        .unwrap();
-    assert_eq!(service.metrics.snapshot()["acked"], 1);
-    let info = async_nats::jetstream::new(conn.client())
-        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
-            "m_broca",
-            &names.streams().event,
-        )
-        .await
-        .unwrap();
-    assert!(
-        info.cached_info().delivered.stream_sequence > 0,
-        "delivery used a durable other than m_broca"
-    );
-    drop(service);
-    drop(reader);
-    drop(inbox);
-    drop(store);
-    // The ACK already reached JetStream; only the database can supply this announcement now.
-    let store = Arc::new(SqliteStore::open(&db).unwrap());
-    let restored = Arc::new(ViewReadyInbox::default());
-    let service = broca_module_serve::compaction_bus::Service::new(
-        store.clone(),
-        registry,
-        wal,
-        restored.clone(),
-        Arc::new(NoConnector),
-        Default::default(),
-    );
-    service.restore().await.unwrap();
-    assert_eq!(
-        restored.newest_ready(&ready.session_ref, "ignored", None),
-        Some(ready.clone())
-    );
-    let unknown = ViewReady::new("f".repeat(32), 8, 0, "b".repeat(64));
-    let message = cortexkit_bus_trait::Message {
-        subject,
-        id: unknown.message_id(),
-        digest: unknown.digest.parse().unwrap(),
-        headers: unknown.to_headers(),
-    };
-    service.handle(&message, names.account()).await.unwrap();
-    assert_eq!(service.metrics.snapshot()["dropped_unknown_session"], 1);
-    assert_eq!(store.compaction_receipts("", 256).unwrap().len(), 1);
+        ),
+        event(
+            4,
+            RunEventDetail::Paused {
+                pause_reason: PauseReason::Restart,
+            },
+        ),
+        event(
+            5,
+            RunEventDetail::Ended {
+                terminal: RunFinishReason::Completed,
+                error_class: None,
+                structured_output: None,
+            },
+        ),
+    ]
 }
 
-#[tokio::test]
-async fn real_bus_compaction_attach_never_creates_or_modifies_consumers() {
-    let Some((_bus, conn, names, _)) = fixture().await else {
-        return;
-    };
-    let _publisher = provision(&conn, &names).await;
+/// Records `events` in `store`'s outbox, as the store writer's sink does once their records are
+/// durable.
+fn record(store: &SqliteStore, session: &BindIdentity, mut events: Vec<RunEvent>) {
     assert!(
-        broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
-            .await
-            .is_err()
+        store
+            .record_run_events(session, "0123456789abcdef", &mut events, now_ms())
+            .unwrap(),
+        "the outbox records events once the bus account is known"
     );
-    let js = async_nats::jetstream::new(conn.client());
-    assert!(js
-        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
-            "m_broca",
-            &names.streams().event
-        )
-        .await
-        .is_err());
-    provision_compaction(&conn, &names).await;
-    let mut consumer = js
-        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
-            "m_broca",
-            &names.streams().event,
-        )
-        .await
-        .unwrap();
-    let before = consumer.info().await.unwrap().clone();
-    broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
-        .await
-        .unwrap();
-    assert_eq!(consumer.info().await.unwrap().config, before.config);
-    let stream = js.get_stream(&names.streams().event).await.unwrap();
-    stream.delete_consumer("m_broca").await.unwrap();
-    let wrong = async_nats::jetstream::consumer::pull::Config {
-        durable_name: Some("m_broca".into()),
-        filter_subjects: before.config.filter_subjects,
-        ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-        ack_wait: Duration::from_secs(5),
-        max_ack_pending: 1000,
-        ..Default::default()
-    };
-    let mut consumer = stream.create_consumer(wrong).await.unwrap();
-    let before = consumer.info().await.unwrap().config.clone();
-    assert!(
-        broca_module_serve::bus_events_nats::attach_compaction(&conn, &names)
-            .await
-            .is_err(),
-        "attached an incompatible ACK wait"
-    );
-    assert_eq!(
-        consumer.info().await.unwrap().config,
-        before,
-        "attachment changed bootstrap's consumer"
-    );
-}
-
-fn project(store: &SqliteStore, wal: &FileWalStore, session: &BindIdentity) {
-    // `flush_for_read` returns the WAL file's optional identity, not a sequence. Take
-    // the head from the records decoded before the flush, which that flush then proves durable.
-    let candidate = wal.read_records_range(session, 0, None, None).unwrap();
-    let broca_wal::WalRangeRecords::Complete(candidate) = candidate.records() else {
-        panic!("WAL missing");
-    };
-    let head = candidate.last().map_or(0, |record| record.seq);
-    wal.flush_for_read(session).unwrap();
-    let range = wal
-        .read_records_range(session, 0, Some(head), None)
-        .unwrap();
-    let epoch = range.lineage_id.unwrap().to_string();
-    let broca_wal::WalRangeRecords::Complete(records) = range.into_records() else {
-        panic!("WAL missing");
-    };
-    store
-        .project_bus_events(session, &epoch, &records, now_ms())
-        .unwrap();
 }
 
 #[tokio::test]
@@ -520,74 +211,12 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
     };
     let bus = provision(&conn, &names).await;
     let temp = scratch();
-    let wal = Arc::new(FileWalStore::new(temp.path().join("wal")));
     let session = BindIdentity::new("/test", "test", "events");
     let store = Arc::new(SqliteStore::open(temp.path().join("run-index.db")).unwrap());
     store.enable_bus_events(names.account()).unwrap();
-    let mut writer = wal.open(&session).unwrap();
-    writer.append(1, &started(&session), true).unwrap();
-    writer
-        .append(
-            1,
-            &WalRecord::Steered {
-                message_marks: None,
-                sent_by: None,
-                written_at_ms: None,
-                tags: None,
-                retention: None,
-                ts_ms: Some(now_ms()),
-                send_id: Some("steer-a".into()),
-                request_identity_digest: None,
-                delivery: Some(broca_protocol::request::Delivery::Steer),
-                title: None,
-                input: Arc::new(vec![]),
-                hooks: None,
-            },
-            true,
-        )
-        .unwrap();
-    writer
-        .append(
-            1,
-            &WalRecord::StepStarted {
-                step_id: broca_protocol::StepId(1),
-            },
-            true,
-        )
-        .unwrap();
-    writer
-        .append(
-            1,
-            &WalRecord::RunPaused {
-                account_limit: None,
-                run_id: RunId("bus-run".into()),
-                ts_ms: Some(now_ms()),
-                reason: broca_protocol::PauseReason::Restart,
-                error: None,
-            },
-            true,
-        )
-        .unwrap();
-    writer
-        .append(
-            1,
-            &WalRecord::RunFinished {
-                interrupt_reason: None,
-                reason: RunFinishReason::Completed,
-                ts_ms: Some(now_ms()),
-                usage: Usage::default(),
-                error: None,
-                retries_used: 0,
-            },
-            true,
-        )
-        .unwrap();
-    project(&store, &wal, &session);
-    let registry = broca_module::LineageRegistry::new_with_reader(
-        Arc::new(NoActor),
-        wal.clone(),
-        Some(store.clone()),
-    );
+    record(&store, &session, run_events(&session, "bus-run"));
+    let registry =
+        broca_module::LineageRegistry::new_with_run_index(Arc::new(NoActor), Some(store.clone()));
     let mut cursor = bus
         .stream
         .consumer(DurableOwner::Module("prefrontal-core"))
@@ -647,19 +276,17 @@ async fn real_bus_outage_queues_then_reconnect_resumes_identical_event() {
         return;
     };
     let publisher = provision(&conn, &names).await;
-    let temp = scratch();
-    let wal = FileWalStore::new(temp.path().join("wal"));
     let session = BindIdentity::new("/test", "test", "outage");
     let store = SqliteStore::open_in_memory().unwrap();
     store.enable_bus_events(names.account()).unwrap();
     let directory = broker.dir.clone();
     let trust = broker.trust.clone();
     broker.stop().await;
-    wal.open(&session)
-        .unwrap()
-        .append(1, &started(&session), true)
-        .unwrap();
-    project(&store, &wal, &session);
+    record(
+        &store,
+        &session,
+        run_events(&session, "bus-run")[..1].to_vec(),
+    );
     let event = store.pending_bus_event().unwrap().unwrap();
     assert_eq!(
         tokio::time::timeout(
@@ -706,102 +333,6 @@ async fn real_bus_outage_queues_then_reconnect_resumes_identical_event() {
         .unwrap();
     assert_eq!(delivery.message.id, event.event_key);
     assert_eq!(delivery.message.digest, event.digest());
-    cursor.ack().await.unwrap();
-}
-
-#[test]
-fn bus_crash_child() {
-    let Some(root) = std::env::var_os("BROCA_BUS_CRASH_FIXTURE") else {
-        return;
-    };
-    let root = std::path::PathBuf::from(root);
-    let session = BindIdentity::new("/test", "test", "crash");
-    let wal = FileWalStore::new(root.join("wal"));
-    let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
-    // As the module does with events on: the period is recorded, and the run is admitted into
-    // the run index, which is where recovery after a crash finds it.
-    index.begin_bus_event_period(now_ms()).unwrap();
-    {
-        use broca_core::RunIndex;
-        index
-            .index_run_active(&broca_core::RunIndexRow {
-                run_id: "bus-run".into(),
-                session: session.clone(),
-                submission_id: None,
-                request_identity_digest: None,
-                state: broca_core::RunIndexState::Active,
-                usage: None,
-                final_step_finish_reason: None,
-                retries_used: 0,
-                title: None,
-                withdrawals_owed: false,
-            })
-            .unwrap();
-    }
-    wal.set_session_ref_index(index);
-    wal.open(&session)
-        .unwrap()
-        .append(1, &started(&session), true)
-        .unwrap();
-    // Exit without destructors after the WAL barrier but before any outbox projection or publish.
-    std::process::exit(86);
-}
-
-#[tokio::test]
-async fn real_bus_crash_after_wal_commit_replays_after_restart() {
-    let Some((_bus, conn, names, _)) = fixture().await else {
-        return;
-    };
-    let publisher = provision(&conn, &names).await;
-    let temp = scratch();
-    // The child is this test binary, not the module. It writes only under its fixture root, and
-    // the pinned state root keeps it there even if that ever changed; this file also starts the
-    // real module, which is why its every spawn site is checked for a pinned state root.
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "bus_crash_child"])
-        .env("BROCA_BUS_CRASH_FIXTURE", temp.path())
-        .env("BROCA_STATE_ROOT", temp.path())
-        // The child is a test harness too; its own result lines would read as this test's.
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert_eq!(child.code(), Some(86));
-    let store = SqliteStore::open(temp.path().join("run-index.db")).unwrap();
-    store.enable_bus_events(names.account()).unwrap();
-    // The restarted publisher continues the period the crashed process began.
-    assert!(!store.begin_bus_event_period(now_ms()).unwrap().fresh);
-    let wal = FileWalStore::new(temp.path().join("wal"));
-    let session = BindIdentity::new("/test", "test", "crash");
-    assert!(
-        store.bus_event_open_sessions().unwrap().contains(&session),
-        "startup recovery must list the crash-committed run from its run-index admission row"
-    );
-    project(&store, &wal, &session);
-    let pending = store.pending_bus_event().unwrap().unwrap();
-    drop(store);
-    // A second crash, this time after the outbox transaction, preserves the exact body and id.
-    let store = SqliteStore::open(temp.path().join("run-index.db")).unwrap();
-    store.enable_bus_events(names.account()).unwrap();
-    assert_eq!(
-        store.pending_bus_event().unwrap().unwrap().body,
-        pending.body
-    );
-    assert_eq!(
-        store.drain_bus_event(&publisher, now_ms()).await.unwrap(),
-        DrainResult::Published
-    );
-    let mut cursor = publisher
-        .stream
-        .consumer(DurableOwner::Module("prefrontal-core"))
-        .await
-        .unwrap();
-    let delivery = tokio::time::timeout(Duration::from_secs(5), cursor.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(delivery.message.id, pending.event_key);
-    assert_eq!(delivery.message.digest, pending.digest());
     cursor.ack().await.unwrap();
 }
 
@@ -945,35 +476,6 @@ impl Drop for DaemonRig {
     }
 }
 
-/// The records of the WAL whose `RunStarted` names `session`, found by scanning: the address
-/// hashes the project root as the daemon normalised it, which need not be this test's spelling.
-#[cfg(unix)]
-fn session_records(wal_dir: &std::path::Path, session: &str) -> Option<Vec<WalRecord>> {
-    for entry in std::fs::read_dir(wal_dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
-            continue;
-        }
-        let Ok(range) =
-            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
-        else {
-            continue;
-        };
-        let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
-            continue;
-        };
-        let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
-        if records.iter().any(
-            |record| matches!(record, WalRecord::RunStarted { session: bound, .. } if bound.session == session),
-        ) {
-            return Some(records);
-        }
-    }
-    None
-}
-
-/// The outbox rows of `run_id`, as `(subject, published_ms)`, read without migrating the file
-/// the running module owns.
 #[cfg(unix)]
 fn outbox_rows(db: &std::path::Path, run_id: &str) -> Result<Vec<(String, Option<u64>)>, String> {
     let conn =
@@ -991,9 +493,10 @@ fn outbox_rows(db: &std::path::Path, run_id: &str) -> Result<Vec<(String, Option
 }
 
 /// One ordinary turn on a module whose config switches run events on must put its `run.started`
-/// and `run.ended` on the account's event stream, acknowledged, with no test code between the WAL
-/// and the broker. The publisher's health block must also show that it saw the run's WAL barrier
-/// and projected it, which is what tells an operator an armed publisher is actually working.
+/// and `run.ended` on the account's event stream, acknowledged, with no test code between the
+/// session store and the broker. The publisher's health block must also count the event batches
+/// the run recorded in the store's outbox, which is what tells an operator an armed publisher is
+/// actually working.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_daemon_turn_publishes_run_started_and_run_ended() {
@@ -1025,7 +528,6 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
         std::fs::create_dir_all(path).unwrap();
     }
     let project = project.canonicalize().unwrap();
-    seed_history(&state_root, &project, history_sessions());
     std::fs::write(
         state_root.join("catalog/fusiform-lkg.json"),
         serde_json::to_vec_pretty(&routing_fixture::with_served_routing(json!({
@@ -1050,7 +552,7 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
     let broca_config = dir.join("broca.jsonc");
     std::fs::write(
         &broca_config,
-        "{\n  // run events on, as in production\n  \"bus_run_events_enabled\": true,\n}\n",
+        "{\n  // run events on, as in production\n  \"bus_run_events_enabled\": true,\n  // no deployment-key vault here: sessions are stored plain\n  \"session_storage\": {\"encryption\": \"off\"},\n}\n",
     )
     .unwrap();
     let subc_config = config_home.join("cortexkit/subc.jsonc");
@@ -1148,9 +650,9 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
         let _ = serving.await;
     }));
 
-    // Durable barriers that land before the publisher learns its account are left to the
-    // recovery walk, by design. Send the turn once ck-bus has issued the credential: the connect
-    // that asked for it sets the account before the publisher next takes its barriers.
+    // Events a run records before the publisher learns its account wait in memory until it does.
+    // Send the turn once ck-bus has issued the credential, so this test watches events published
+    // as the run records them.
     broca_test_support::wait_until("broca's ckbus.credential request", || async {
         let seen = methods.lock().unwrap().clone();
         if seen.iter().any(|method| method == "ckbus.credential") {
@@ -1187,21 +689,26 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
         )
         .await
         .expect("session.send");
-    let wal_dir = state_root.join("wal");
     let sent = Instant::now();
-    let run_id = broca_test_support::wait_until("the turn's RunFinished", || async {
-        let records = session_records(&wal_dir, "bus-turn");
-        let run_id = records.as_ref().and_then(|records| {
-            records.iter().find_map(|record| match record {
-                WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
-                _ => None,
-            })
+    // The route carries no scope, so the daemon keys the session under the unscoped root,
+    // whatever folder the bind named.
+    let stored_as = BindIdentity::new(
+        broca_protocol::session::UNSCOPED_SESSION_ROOT,
+        "runner",
+        "bus-turn",
+    );
+    let run_id = broca_test_support::wait_until("the turn's run end", || async {
+        use broca_session_store::record::Record;
+        let records = stored_log::stored_records(&state_root, &stored_as).await;
+        let run_id = records.iter().find_map(|record| match record {
+            Record::RunStart(start) => Some(start.run_id.clone()),
+            _ => None,
         });
-        match (&records, run_id) {
-            (Some(records), Some(run_id))
+        match run_id {
+            Some(run_id)
                 if records
                     .iter()
-                    .any(|record| matches!(record, WalRecord::RunFinished { .. })) =>
+                    .any(|record| matches!(record, Record::RunEnd(_))) =>
             {
                 Ok(run_id)
             }
@@ -1291,13 +798,10 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
     );
     assert_eq!(events["bus_outbox_depth"], 0, "{events}");
     assert!(
-        events["bus_hints_seen"].as_u64() >= Some(1),
-        "health must count the turn's durable WAL barriers: {events}"
+        events["bus_store_batches_recorded"].as_u64() >= Some(1),
+        "health must count the turn's recorded event batches: {events}"
     );
-    assert!(
-        events["bus_sessions_projected"].as_u64() >= Some(1),
-        "health must count the session projections: {events}"
-    );
+    assert_eq!(events["bus_store_batches_waiting"], 0, "{events}");
     assert!(
         events["bus_loop_pass_age_ms"]
             .as_u64()
@@ -1305,132 +809,14 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
         "the publisher loop must still be making passes: {events}"
     );
 
-    // History stays history: none of the seeded runs became an event, and starting the
-    // publisher cost work in proportion to the runs open during this period, which is none,
-    // not to the sessions the store holds.
-    assert_eq!(
-        events["bus_outbox_dropped"], 0,
-        "historical events were projected and then dropped: {events}"
-    );
-    assert!(
-        events["bus_recovery_walks"].as_u64() >= Some(1),
-        "the startup recovery walk must have finished: {events}"
-    );
-    assert!(
-        events["bus_recovery_visits"].as_u64() <= Some(1),
-        "startup recovery must visit only sessions with a run open in this period: {events}"
-    );
-    let (foreign_rows, checkpoints) = history_footprint(&db, &run_id).unwrap();
-    assert_eq!(foreign_rows, 0, "the outbox holds events of other runs");
-    assert!(
-        checkpoints <= 1,
-        "{checkpoints} sessions were projected; only the live one should be"
-    );
+    assert_eq!(events["bus_outbox_dropped"], 0, "{events}");
+    assert_eq!(events["bus_store_batches_dropped"], 0, "{events}");
     drop(rig);
 }
-
-/// Outbox rows of runs other than `run_id`, and how many sessions have a projection checkpoint.
-#[cfg(unix)]
-fn history_footprint(db: &std::path::Path, run_id: &str) -> Result<(u64, u64), String> {
-    let conn =
-        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| e.to_string())?;
-    let count = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
-        conn.query_row(sql, params, |row| row.get::<_, u64>(0))
-            .map_err(|e| e.to_string())
-    };
-    Ok((
-        count(
-            "SELECT count(*) FROM bus_event_outbox WHERE run_id != ?1",
-            &[&run_id],
-        )?,
-        count("SELECT count(*) FROM bus_event_projection", &[])?,
-    ))
-}
-
-/// How many finished sessions from before this launch the state root holds. A production state
-/// root carries tens of thousands; a fresh rig with none hides any cost the publisher spends on
-/// them, and any events it wrongly makes from them.
-#[cfg(unix)]
-fn history_sessions() -> usize {
-    std::env::var("BROCA_BUS_TEST_HISTORY")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(HISTORY_SESSIONS)
-}
-
-#[cfg(unix)]
-const HISTORY_SESSIONS: usize = 3000;
 
 /// Seconds from a turn's terminal to both of its lifecycle events on the stream.
 #[cfg(unix)]
 const STREAM_DEADLINE_S: u64 = 5;
-
-/// Write `count` sessions that each ran and finished an hour ago, recorded in the run index as
-/// finished, as a production state root holds them. Their events are well inside the outbox
-/// retention, so a publisher that turned history into events would publish them all.
-#[cfg(unix)]
-fn seed_history(state_root: &std::path::Path, project: &std::path::Path, count: usize) {
-    use broca_core::{RunIndex, RunIndexRow, RunIndexState};
-    let started = std::time::Instant::now();
-    let index = Arc::new(SqliteStore::open(state_root.join("run-index.db")).unwrap());
-    let wal = FileWalStore::new(state_root.join("wal"));
-    wal.set_session_ref_index(index.clone());
-    let hour_ago = now_ms() - 60 * 60 * 1000;
-    for n in 0..count {
-        let session = BindIdentity::new(project, "runner", format!("history-{n}"));
-        let run_id = format!("history-run-{n}");
-        index
-            .index_run_active(&RunIndexRow {
-                run_id: run_id.clone(),
-                session: session.clone(),
-                submission_id: None,
-                request_identity_digest: None,
-                state: RunIndexState::Active,
-                usage: None,
-                final_step_finish_reason: None,
-                retries_used: 0,
-                title: None,
-                withdrawals_owed: false,
-            })
-            .unwrap();
-        let mut writer = wal.open(&session).unwrap();
-        writer
-            .append(1, &started_at(&session, &run_id, hour_ago), false)
-            .unwrap();
-        writer
-            .append(
-                1,
-                &WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    reason: RunFinishReason::Completed,
-                    ts_ms: Some(hour_ago),
-                    usage: Usage::default(),
-                    error: None,
-                    retries_used: 0,
-                },
-                false,
-            )
-            .unwrap();
-        index
-            .index_run_terminal(&run_id, RunIndexState::Completed, None, None, 0)
-            .unwrap();
-    }
-    drop(index);
-    drop(wal);
-    // A production state root finished its one-time session-ref census long ago. Without it the
-    // module would start that census at boot, on a second connection that holds the run index's
-    // write lock for seconds at a time, which is not the state this test reproduces.
-    broca_store::session_refs::migrate(
-        &state_root.join("run-index.db"),
-        &broca_core::ReadOnlyWalReader::new(state_root),
-    )
-    .expect("complete the session-ref census for the seeded history");
-    println!(
-        "seeded {count} historical sessions in {:?}",
-        started.elapsed()
-    );
-}
 
 /// The module's own run event log lines, without the per-session notice that recovered history
 /// was too old to publish, which the seeded history repeats thousands of times.

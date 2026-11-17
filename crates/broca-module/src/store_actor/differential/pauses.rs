@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::OutputEvent;
 use broca_protocol::{Delivery, PauseReason, RunId, SubmissionRequest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::tests::{self as store, request};
 use super::{compare, hello, keyed, refused_at_admission, send, steered, tweaked, Step};
 use crate::actor::{SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunJob};
+use crate::executor::{RunExecutor, StoreRunEnd, StoreRunJob};
 
 /// A steer joins the running run; its retry under the same key is answered by that run, active
 /// while it runs and finished with the steer's delivery once it ended, and a retry with another
@@ -114,17 +114,6 @@ impl<E: RunExecutor> RunExecutor for StopsFirstRun<E> {
 
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         self.inner.compaction_plane()
-    }
-
-    async fn execute(
-        &self,
-        mut job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        if let Some(stop) = self.stop() {
-            job.control.stop_requested = Some(stop);
-        }
-        self.inner.execute(job, out).await
     }
 
     async fn execute_on_store(

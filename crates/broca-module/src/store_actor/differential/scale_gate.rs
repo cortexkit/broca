@@ -118,7 +118,7 @@ async fn scale_gate_imported_head() {
     for _ in 0..3 * rounds + 5 {
         steps.extend(hello());
     }
-    let module = module_options(true, steps, None, None, IDLE, None).await;
+    let module = module_options(steps, None, None, IDLE, None).await;
     let mut report = Vec::new();
 
     let params = serde_json::from_value(serde_json::json!({

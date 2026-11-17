@@ -172,6 +172,66 @@ async fn the_live_stream_is_the_caught_up_one_and_resumes_at_every_unit() {
     assert!(after[0].0 > live.last().unwrap().0);
 }
 
+/// A tool step's stored assistant message, as a subscriber's control lane carries it: the
+/// message ends with `message_finished`, and the step's call and its end follow with no live
+/// event. A `display_reset` there would tell a reader to drop words already stored (the phone
+/// and desktop live views blanked at every tool call). With `BROCA_CONTROL_FRAME_SAMPLES` naming a folder, the first
+/// run's control frames are written there as wire samples, one file per frame.
+#[tokio::test]
+async fn a_tool_steps_call_and_end_carry_no_display_reset() {
+    use cortexkit_role_llm_runner::live::LiveEvent;
+    let (_commands, _served, _backend, _parts, live) = two_runs().await;
+    let first_run_end = live
+        .iter()
+        .position(|event| matches!(event.1, ControlUnit::RunFinished { .. }))
+        .expect("the first run finishes");
+    if let Some(folder) = std::env::var_os("BROCA_CONTROL_FRAME_SAMPLES") {
+        let folder = std::path::PathBuf::from(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        for (index, event) in live[..=first_run_end].iter().enumerate() {
+            let bytes = broca_wire::encode_live_subscribe_control_with_cursor(
+                event.0.into(),
+                &event.1,
+                index as u64 + 1,
+                event.2.as_ref(),
+            )
+            .unwrap();
+            let kind = serde_json::to_value(&event.1).unwrap()["type"]
+                .as_str()
+                .unwrap_or("unit")
+                .to_owned();
+            std::fs::write(folder.join(format!("{index:02}-{kind}.json")), bytes).unwrap();
+        }
+    }
+    let of = |wanted: fn(&ControlUnit) -> bool| -> Vec<Option<LiveEvent>> {
+        live[..first_run_end]
+            .iter()
+            .filter(|event| wanted(&event.1))
+            .map(|event| event.2.clone())
+            .collect()
+    };
+    assert_eq!(
+        of(|unit| matches!(unit, ControlUnit::ToolCall { .. })),
+        vec![None],
+        "{:#?}",
+        wires(&live)
+    );
+    assert!(
+        of(|unit| matches!(unit, ControlUnit::StepFinished { .. }))
+            .iter()
+            .all(Option::is_none),
+        "{:#?}",
+        wires(&live)
+    );
+    assert!(
+        !live
+            .iter()
+            .any(|event| matches!(event.2, Some(LiveEvent::DisplayReset))),
+        "no control unit carries a display reset: {:#?}",
+        wires(&live)
+    );
+}
+
 /// A position-only cursor resumes after its position, unchecked, as today.
 #[tokio::test]
 async fn a_position_only_cursor_resumes_after_its_position() {
@@ -470,7 +530,7 @@ async fn a_ride_is_one_notice_and_text_without_an_envelope_is_none() {
     let notices: Vec<(String, String, String, u64)> = stream
         .iter()
         .filter_map(|event| match &event.2 {
-            LiveEvent::NoticeDelivered(notice) => Some((
+            Some(LiveEvent::NoticeDelivered(notice)) => Some((
                 notice.send_id.clone(),
                 notice.sender.clone(),
                 notice.call_key.clone(),

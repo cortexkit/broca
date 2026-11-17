@@ -11,7 +11,6 @@ async fn session(steps: Vec<Vec<NormalizedEvent>>) -> Side {
         std::process::id(),
         N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let provider = broca_core::provider::StubProvider::new(steps).with_refusal_fallback(
         ModelHandle {
             provider_module_id: "stub".into(),
@@ -35,14 +34,12 @@ async fn session(steps: Vec<Vec<NormalizedEvent>>) -> Side {
     .unwrap();
     let opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        wal.clone(),
         executor,
     )
     .with_idle_ttl(idle)
     .with_store_runtime(Arc::new(runtime));
     Side {
-        registry: LineageRegistry::new_with_reader(Arc::new(opener), wal, None)
-            .with_store_new_sessions(),
+        registry: LineageRegistry::new(Arc::new(opener)),
         key: BindIdentity::new(dir.join("project"), "model-fallback", "s1"),
         dir,
         gate: None,

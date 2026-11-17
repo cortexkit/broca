@@ -1264,6 +1264,8 @@ mod operations {
         request_identity_digest,
         message_marks,
         named_speaker,
+        waits_for_run,
+        expires_at_ms,
     });
     crate::fuzzing::gen::fields!(Operations {
         run,
@@ -1294,7 +1296,9 @@ mod operations {
         tag_high_water,
         source_lineage,
         run_going,
-        ordered_next_starts_run
+        ordered_next_starts_run,
+        ordered_next_waits_for_run,
+        ordered_next_expires_at_ms
     });
     crate::fuzzing::gen::fields!(Enrollment {
         through_ordinal,

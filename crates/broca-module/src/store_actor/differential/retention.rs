@@ -15,7 +15,7 @@ struct Retained {
     runtime: Arc<crate::store_open::StoreRuntime>,
 }
 
-async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Notify>>) -> Retained {
+async fn retained(cipher: Cipher, idle: Duration, gate: Option<Arc<Notify>>) -> Retained {
     let dir = scratch_dir();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -23,19 +23,8 @@ async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Not
         serde_json::json!({"now_ms": NOW}).to_string(),
     )
     .unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let leases = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let index = Arc::new(broca_store::SqliteStore::open(dir.join("run-index.db")).unwrap());
-    let service = Arc::new(
-        RetentionService::new(
-            wal.clone(),
-            index.clone(),
-            leases.clone(),
-            index,
-            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
-        )
-        .unwrap(),
-    );
+    let service = Arc::new(RetentionService::new(&dir, leases.clone()).unwrap());
     let steps = [hello(), hello()].concat();
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, gate));
     let runtime = Arc::new(
@@ -48,27 +37,17 @@ async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Not
         .await
         .unwrap(),
     );
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(leases, wal.clone(), executor.clone())
-                .with_idle_ttl(idle)
-                .with_store_runtime(runtime.clone()),
-        ),
-        wal.clone(),
-        None,
-    );
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(leases, executor.clone())
+            .with_idle_ttl(idle)
+            .with_store_runtime(runtime.clone()),
+    ));
     registry.set_retention_service(service.clone());
-    let registry = if on {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
     let key = BindIdentity::new(dir.join("project"), "retention-differential", "s1");
     Retained {
         module: Module {
             dir,
             registry,
-            wal,
             key,
             caller: Default::default(),
         },
@@ -135,15 +114,10 @@ impl Retained {
     async fn deleted(&self) {
         broca_test_support::wait_until("retained actor deleted its session", || async {
             let held = self.runtime.holds(&self.module.key).unwrap();
-            let wal = self
-                .module
-                .wal
-                .ephemeral_wal_path(&self.module.key)
-                .exists();
-            if self.module.registry.slot_state(&self.module.key).is_none() && !held && !wal {
+            if self.module.registry.slot_state(&self.module.key).is_none() && !held {
                 Ok(())
             } else {
-                Err(format!("head={held}, wal={wal}"))
+                Err(format!("head={held}"))
             }
         })
         .await;
@@ -178,7 +152,7 @@ impl Retained {
 }
 
 async fn retained_creating_sends_validate_alike(cipher: Cipher) {
-    let new = retained(true, cipher, TTL, None).await;
+    let new = retained(cipher, TTL, None).await;
     let new_invalid = new.send("invalid", Some(0)).await.unwrap_err();
     broca_test_support::pin!("an invalid retention", new_invalid.to_string());
     assert!(!new.runtime.holds(&new.module.key).unwrap());
@@ -198,7 +172,7 @@ async fn retained_creating_sends_validate_alike(cipher: Cipher) {
 }
 
 async fn swept_retained_reads_and_fresh_sends_match(cipher: Cipher) {
-    let new = retained(true, cipher, Duration::from_millis(1), None).await;
+    let new = retained(cipher, Duration::from_millis(1), None).await;
     broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
@@ -227,7 +201,7 @@ async fn swept_retained_reads_and_fresh_sends_match(cipher: Cipher) {
 }
 
 async fn closed_retained_sessions_expire_before_any_sweep_alike(cipher: Cipher) {
-    let new = retained(true, cipher, Duration::from_millis(1), None).await;
+    let new = retained(cipher, Duration::from_millis(1), None).await;
     broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
@@ -245,7 +219,7 @@ async fn closed_retained_sessions_expire_before_any_sweep_alike(cipher: Cipher) 
 }
 
 async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
-    let new = retained(true, cipher, TTL, None).await;
+    let new = retained(cipher, TTL, None).await;
     broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     new.idle().await;
     assert!(new.module.registry.slot_state(&new.module.key).is_some());
@@ -278,7 +252,7 @@ async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
 async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher) {
     use broca_session_store::backend::SessionAddr;
     use broca_wal::StorageClass;
-    let new = retained(true, cipher, Duration::from_millis(1), None).await;
+    let new = retained(cipher, Duration::from_millis(1), None).await;
     new.send("r1", Some(SECONDS)).await.unwrap();
     new.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
@@ -340,7 +314,7 @@ async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher
 }
 
 async fn expiry_reads_before_the_key_load_never_become_absent(cipher: Cipher) {
-    let rig = retained(true, cipher, Duration::from_millis(1), None).await;
+    let rig = retained(cipher, Duration::from_millis(1), None).await;
     rig.send("r1", Some(SECONDS)).await.unwrap();
     rig.module.closed().await;
     let deadline = NOW + SECONDS * 1000;
@@ -359,18 +333,13 @@ async fn expiry_reads_before_the_key_load_never_become_absent(cipher: Cipher) {
         .await
         .unwrap(),
     );
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(rig.module.dir.join("leases"))),
-                rig.module.wal.clone(),
-                executor,
-            )
-            .with_store_runtime(runtime),
-        ),
-        rig.module.wal.clone(),
-        None,
-    );
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(rig.module.dir.join("leases"))),
+            executor,
+        )
+        .with_store_runtime(runtime),
+    ));
     let error = registry
         .read(SessionReadRequest::new(rig.module.key.clone(), None, None))
         .await
@@ -388,7 +357,7 @@ async fn expiry_reads_before_the_key_load_never_become_absent(cipher: Cipher) {
 
 async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
     use broca_wal::StorageClass;
-    let new = retained(true, cipher, Duration::from_millis(1), None).await;
+    let new = retained(cipher, Duration::from_millis(1), None).await;
     let plan = || {
         let mut manifest =
             (*super::controls::manifest(serde_json::json!({"render_tags":true}), vec![])).clone();
@@ -460,7 +429,7 @@ async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
 
 async fn stored_ledger_tags_set_the_next_number(cipher: Cipher) {
     use broca_session_store::record::Record;
-    let new = retained(true, cipher, Duration::from_millis(1), None).await;
+    let new = retained(cipher, Duration::from_millis(1), None).await;
     new.send("r1", Some(SECONDS)).await.unwrap();
     new.module.closed().await;
     // Converted sessions retain v1's arrays. Give the recorded messages ledger-stamped numbers,
@@ -493,7 +462,7 @@ async fn stored_ledger_tags_set_the_next_number(cipher: Cipher) {
 
 async fn an_active_run_outlives_the_retention_deadline_alike(cipher: Cipher) {
     let new_gate = Arc::new(Notify::new());
-    let new = retained(true, cipher, TTL, Some(new_gate.clone())).await;
+    let new = retained(cipher, TTL, Some(new_gate.clone())).await;
     broca_test_support::pin!("alike", new.send("r1", Some(SECONDS)).await.unwrap());
     let crossed = NOW + SECONDS * 1000;
     new.advance(crossed);
@@ -517,7 +486,35 @@ async fn an_active_run_outlives_the_retention_deadline_alike(cipher: Cipher) {
     new.stop().await;
 }
 
+/// A later send may shorten a retained session's retention, and the session then expires at the
+/// shorter deadline; once shortened, a send can't lengthen it back.
+async fn a_later_send_shortens_the_retention(cipher: Cipher) {
+    let new = retained(cipher, Duration::from_millis(1), None).await;
+    let shorter = SECONDS / 2;
+    assert!(matches!(
+        new.send("r1", Some(SECONDS)).await.unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    new.idle().await;
+    assert!(matches!(
+        new.send("r2", Some(shorter)).await.unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    new.idle().await;
+    let longer = new.send("r3", Some(SECONDS)).await.unwrap();
+    assert!(
+        matches!(longer, SendOutcome::RetentionInvalid(_)),
+        "{longer:?}"
+    );
+    new.module.closed().await;
+    let deadline = NOW + shorter * 1000;
+    new.advance(deadline);
+    new.expired_read(deadline).await;
+    new.stop().await;
+}
+
 cipher_tests!(
+    a_later_send_shortens_the_retention,
     retained_creating_sends_validate_alike,
     swept_retained_reads_and_fresh_sends_match,
     closed_retained_sessions_expire_before_any_sweep_alike,

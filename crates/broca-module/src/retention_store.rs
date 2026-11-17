@@ -1,34 +1,25 @@
-//! Retention of the sessions kept in the new storage (`broca_session_store`).
+//! Retention of the sessions kept in the session store (`broca_session_store`).
 //!
-//! A session with a retention policy is placed in the new storage's ephemeral root
-//! (`session-store-ephemeral/`), whether it was created there or moved there from today's
-//! `wal-ephemeral/` (`broca_wal::placement`). Today's retention never reaches such a session: its
-//! index enrolls only WALs, and each of its steps leaves alone a session the new storage owns. So
-//! each pass of the sweep that expires today's sessions also walks that root, and deletes every
-//! session whose policy has expired, by the same rule ([`super::policy_of`]), read from the
-//! session's own records ([`store_policy`]).
+//! A session with a retention policy is placed in the store's ephemeral root
+//! (`session-store-ephemeral/`). Each pass of the sweep walks that root and deletes every
+//! session whose policy has expired ([`super::policy_of`]), read from the session's own records
+//! ([`store_policy`]).
 //!
-//! A session is deleted only under its lease, as today's are. The sweep leaves a held lease
-//! alone; an open actor expires itself once no run is active. No actor can open while deletion
-//! holds the lease: an open that finds it held waits for the deletion to finish
+//! A session is deleted only under its lease. The sweep leaves a held lease alone; an open actor
+//! expires itself once no run is active. No actor can open while deletion holds the lease: an
+//! open that finds it held waits for the deletion to finish
 //! ([`RetentionService::store_deletion_in_flight`]). Deletion first publishes a sealed,
-//! content-free expiry marker under `expired/`, then removes, in this order:
-//! 1. what a move from today's storage left behind: the retired WAL in `wal-ephemeral/` and its
-//!    identity sidecars, today's media manifest of the session, then the `moved` marker that
-//!    refuses the address on today's storage;
-//! 2. the session itself, through `Session::delete`: its head first, then its kept head versions,
-//!    its logs and its objects, which hold its media and its id index.
+//! content-free expiry marker under `expired/`, then removes the session through
+//! `Session::delete`: its head first, then its kept head versions, its logs and its objects,
+//! which hold its media and its id index.
 //!
-//! The head goes last, so a crash part way leaves the session in place, still expired, and the
-//! next pass finishes the deletion. A crash inside the store's own deletion leaves at most logs
-//! and objects that no head names, which nothing reads. Afterwards reads stay expired through
-//! the marker, while the next send may start a new session carrying the marker's counter floors.
+//! A crash part way leaves at most logs and objects that no head names, which nothing reads.
+//! Afterwards reads stay expired through the marker, while the next send may start a new
+//! session carrying the marker's counter floors.
 
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::sync::Mutex;
 
-use broca_core::WalStore as _;
 use broca_protocol::BindIdentity;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::{self, SessionTriple};
@@ -37,7 +28,7 @@ use broca_session_store::record::Record;
 use broca_session_store::session::{Position, Session, SessionError};
 use broca_wal::StorageClass;
 
-use super::{policy_of, sync_dir, PolicyEvent, RetentionService};
+use super::{policy_of, PolicyEvent, RetentionService};
 use crate::store_open::StoreRuntime;
 
 #[path = "retention_store_counters.rs"]
@@ -92,7 +83,7 @@ impl Drop for Deleting<'_> {
 ///
 /// A fork's session (see [`crate::fork_state`]) has no run: its retention seconds, last activity
 /// and deadline come from its fork's records.
-pub(crate) fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)> {
+pub fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)> {
     // A fork's session runs nothing: its own records say how long it is kept
     // (`ForkState::retained_until_ms`). One whose records can't be folded has no deadline, so
     // nothing a reader can't decide is deleted.
@@ -200,10 +191,6 @@ impl RetentionService {
         runtime: &StoreRuntime,
         now_ms: u64,
     ) -> Vec<BindIdentity> {
-        // On an overhaul root today's retention deletes nothing yet; neither does this.
-        if self.wal.wal_config().is_overhaul() {
-            return Vec::new();
-        }
         let backend = LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
         let addresses = match backend.stored_sessions() {
             Ok(addresses) => addresses,
@@ -547,16 +534,12 @@ impl RetentionService {
                         _ => None,
                     })
                     .collect(),
+                history_version: Some(view.head().history_version),
             },
             view.head().cipher(),
             deployment,
         )
         .map_err(described)?;
-        let moved = records.iter().find_map(|(_, record)| match record {
-            Record::Moved(moved) => Some(moved.move_id.as_str()),
-            _ => None,
-        });
-        self.remove_move_leftovers(key, moved)?;
         Session::delete(backend, addr, version)
             .await
             .map_err(described)?;
@@ -578,67 +561,6 @@ impl RetentionService {
         }
         crate::diagnostics::retention_deleted(key);
         Ok(())
-    }
-
-    /// Removes what the move `move_id` left of the session `key` on today's storage: the retired
-    /// WAL in `wal-ephemeral/` and its identity sidecars, today's media manifest of the session,
-    /// and last the `moved` marker that refuses the address there. A session the new storage
-    /// created (`move_id` is `None`) left nothing there. A marker of another move, or a WAL at the
-    /// address that no marker of this move retires, isn't this session's, and is refused rather
-    /// than deleted.
-    fn remove_move_leftovers(
-        &self,
-        key: &BindIdentity,
-        move_id: Option<&str>,
-    ) -> Result<(), String> {
-        let wal = self.wal.ephemeral_wal_path(key);
-        // A move's sidecars stay at the session's address in `wal/`, whichever folder held it.
-        let marker = self.wal.wal_path(key).with_extension("moved");
-        let moved = broca_wal::migration::read_json::<broca_wal::migration::Moved>(&marker)
-            .map_err(|error| error.to_string())?;
-        let ours = moved
-            .as_ref()
-            .is_some_and(|moved| Some(moved.cut_id.as_str()) == move_id);
-        if moved.is_some() && !ours {
-            return Err("today's moved marker at the session's address names another move".into());
-        }
-        let retired = wal.try_exists().map_err(|error| error.to_string())?;
-        if retired && !ours {
-            return Err("a WAL at the session's address isn't one its move retired".into());
-        }
-        let Some(moved) = moved else {
-            return Ok(());
-        };
-        if retired && self.initial_lineage(&wal)? != moved.lineage_id {
-            return Err("the retired WAL isn't the lineage the session moved from".into());
-        }
-        let session = wal.with_extension("session");
-        for path in [wal, session.clone(), session.with_extension("session.tmp")] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        sync_dir(&self.wal.ephemeral_root())?;
-        let state_root = self
-            .wal
-            .root()
-            .parent()
-            .ok_or("WAL tree has no state root")?;
-        if state_root
-            .join("media-ephemeral")
-            .try_exists()
-            .map_err(|error| error.to_string())?
-        {
-            broca_core::media_store::MediaStore::open(
-                state_root,
-                broca_core::media_store::MediaStoreClass::Ephemeral,
-            )
-            .and_then(|store| store.remove_session_after_wal_removal(key))
-            .map_err(|error| error.to_string())?;
-        }
-        broca_wal::migration::unlink(&marker).map_err(|error| error.to_string())
     }
 }
 

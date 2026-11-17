@@ -32,7 +32,6 @@ broca-module = { path = "../broca-module" }
 broca-session-loop = { path = "../broca-session-loop" }
 broca-session-store = { path = "../broca-session-store" }
 # Moving a session from today's storage into the new one converts its WAL and checks the copy.
-broca-session-convert = { path = "../broca-session-convert" }
 # Fetch-plan admission: checks a send's plan and builds the manifest its first episode freezes.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 cortexkit-role-step-transform-provider = { workspace = true }

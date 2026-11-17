@@ -4,7 +4,7 @@ use super::tests::{
 use super::*;
 use crate::session_cmd::SendKey;
 use broca_core::provider::Provider;
-use broca_core::{OutputEvent, RunError, RunSummary, StubProvider, StubToolPlane};
+use broca_core::{OutputEvent, RunError, StubProvider, StubToolPlane};
 use broca_session_loop::account_move::{AccountContinue, Answer, Move, Wall};
 use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
@@ -105,13 +105,6 @@ impl AccountContinue<Box<dyn Provider>> for Continuation<'_> {
 
 #[async_trait::async_trait]
 impl RunExecutor for ScriptedExecutor {
-    async fn execute(
-        &self,
-        _: crate::executor::RunJob,
-        _: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("the fixture uses the real new-store loop")
-    }
     async fn execute_on_store(
         &self,
         job: StoreRunJob,

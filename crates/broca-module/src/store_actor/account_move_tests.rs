@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use broca_core::provider::Provider;
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::OutputEvent;
 use broca_protocol::provider::{
     AccountLimitDisposition, AttemptAccountLimit, AttemptAccountObservation, ProviderControl,
 };
@@ -26,7 +26,7 @@ use broca_session_store::session::Session;
 use super::tests::{bind, deployment, idle, send, triple, Commands, ADDR};
 use super::StoreActor;
 use crate::actor::SendOutcome;
-use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode};
+use crate::executor::{RunExecutor, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode};
 
 /// The selection routing gave the run for `account`.
 fn routed(account: &str) -> broca_wal::AuthSelection {
@@ -156,14 +156,6 @@ struct MovingExecutor {
 
 #[async_trait]
 impl RunExecutor for MovingExecutor {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     async fn execute_on_store(
         &self,
         job: StoreRunJob,

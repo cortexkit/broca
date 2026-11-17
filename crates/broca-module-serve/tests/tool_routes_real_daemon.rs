@@ -3,18 +3,22 @@
 
 #[path = "../../broca-subc/tests/common/mod.rs"]
 mod common;
+#[path = "common/store_exec.rs"]
+mod store_exec;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, RunError, RunSummary, WalStore};
+use broca_core::{FileLeaseStore, OutputEvent, StubProvider, StubToolPlane};
 use broca_module::{
-    executor::{RunExecutor, RunJob, RunKind},
+    executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunJob},
     opener::DefaultOpener,
     LineageRegistry,
 };
-use broca_protocol::{BindIdentity, RunFinishReason, RunId};
+use broca_protocol::{
+    AssistantMessage, BindIdentity, ContentBlock, FinishReason, MessageId, NormalizedEvent,
+    ProviderControl, RunId, Usage,
+};
 use broca_subc::SubcToolPlane;
-use broca_wal::{RunConfig, WalRecord};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -57,66 +61,36 @@ impl subc_client_rs::ModuleHandler for Provider {
     }
 }
 
+/// A run that answers in one text step, after opening the session's tool route the way a run's
+/// first tool batch does; and the module's hooks that close a session's routes.
 struct Executor(Arc<SubcToolPlane>);
 #[async_trait]
 impl RunExecutor for Executor {
-    async fn execute(
+    async fn execute_on_store(
         &self,
-        job: RunJob,
-        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
+        job: StoreRunJob,
+        out: tokio::sync::mpsc::Sender<OutputEvent>,
+    ) -> StoreRunEnd {
         self.0
             .warm_bind(&job.req.session, Duration::from_secs(10))
             .await
-            .map_err(|e| RunError::Config(e.to_string()))?;
-        job.writer.record(WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: job.req.retention,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            run_id: job.req.run_id.clone(),
-            session: job.req.session.clone(),
-            ts_ms: None,
-            config: Box::new(config()),
-            input: job.req.input.clone().into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: job.req.submission_id.clone(),
-        });
-        job.writer.sync().await?;
-        if let Some(ack) = job.on_admitted {
-            let _ = ack.send(Ok(job.req.run_id));
-        }
-        job.writer.record(WalRecord::RunFinished {
-            interrupt_reason: None,
-            ts_ms: None,
-            reason: RunFinishReason::Completed,
-            usage: Default::default(),
-            error: None,
-            retries_used: 0,
-        });
-        job.writer.sync().await?;
-        Ok(RunSummary {
-            reason: RunFinishReason::Completed,
-            paused: None,
-            steps: 0,
-            usage: Default::default(),
-            retries_used: 0,
-            final_step_finish_reason: None,
-        })
+            .expect("the session's tool route binds");
+        let provider = StubProvider::new(vec![vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: MessageId("m1".into()),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+                retries_used: 0,
+            }),
+        ]]);
+        store_exec::run_on_store(job, &out, &provider, &StubToolPlane::new(), None).await
     }
     async fn on_session_close(&self, session: &BindIdentity) {
         self.0.close_session_routes(session).await;
@@ -126,45 +100,12 @@ impl RunExecutor for Executor {
     }
 }
 
-fn config() -> RunConfig {
-    RunConfig {
-        global_system: None,
-        account_route: None,
-        route_decision_id: None,
-        served_provider: None,
-        account_limit_pause: false,
-        model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-        generation: Default::default(),
-        tool_choice: Default::default(),
-        tools: vec![].into(),
-        response_format: Default::default(),
-        provider_options: Value::Null,
-        cache_tiers: Value::Null,
-        context_epoch: 0,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        renderer_version: 1,
-        frozen_render_config: Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: vec![],
-        context_management: None,
-    }
-}
-
 struct Fixture {
     rig: common::Rig,
     provider: tokio::task::JoinHandle<()>,
     observed: Arc<Observed>,
     plane: Arc<SubcToolPlane>,
     registry: Arc<LineageRegistry>,
-    wal: Arc<FileWalStore>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -205,17 +146,16 @@ impl Fixture {
         });
         let plane = Arc::new(SubcToolPlane::new(connection, "aft"));
         common::wait_for_aft(&plane, "echo").await;
-        let wal = Arc::new(FileWalStore::new(rig.dir.join("wal")));
+        let executor: Arc<dyn RunExecutor> = Arc::new(Executor(plane.clone()));
+        // A session closes once idle for the runtime's 100 ms, and its close hook releases its
+        // routes; the time a session stays open is the runtime's, not what this test measures.
+        let runtime = store_exec::store_runtime(&rig.dir, executor.clone()).await;
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(rig.dir.join("leases"))),
-            wal.clone(),
-            Arc::new(Executor(plane.clone())),
-        );
-        let registry = Arc::new(LineageRegistry::new_with_reader(
-            Arc::new(opener),
-            wal.clone(),
-            None,
-        ));
+            executor,
+        )
+        .with_store_runtime(runtime);
+        let registry = Arc::new(LineageRegistry::new(Arc::new(opener)));
         let health = plane.clone();
         registry.set_tool_route_health(Arc::new(move |open| health.tool_routes_health(open)));
         Some(Self {
@@ -224,27 +164,47 @@ impl Fixture {
             observed,
             plane,
             registry,
-            wal,
         })
     }
     fn bind(&self, name: &str) -> BindIdentity {
         BindIdentity::new(&self.rig.dir, "alfonso", name)
     }
-    async fn run(&self, bind: &BindIdentity) {
+    /// Runs one turn on `bind`'s session, kept `retention` seconds after it ends when given.
+    async fn run(&self, bind: &BindIdentity, retention: Option<u64>) {
         let request = serde_json::from_value(json!({
             "model": broca_protocol::request::ModelHandle::new("fake", "fake"),
             "input": [json!({"role":"user", "content":[{"type":"text", "text":"finish"}]})], "tools": []
         })).unwrap();
         self.registry
-            .route_submission(
+            .route_submission_with_retention(
                 bind,
                 RunId("worker".into()),
                 request,
                 RunKind::FreshOrResume,
+                broca_module::actor::SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                retention,
                 false,
             )
             .await
             .unwrap();
+    }
+
+    async fn settled(&self, bind: &BindIdentity) {
+        broca_test_support::wait_until("the run settles", || async {
+            if self.registry.route_status(bind).await.unwrap()
+                == broca_module::actor::LineageStatus::Idle
+            {
+                Ok(())
+            } else {
+                Err("run still active".into())
+            }
+        })
+        .await;
     }
     async fn wait_closed(&self) {
         tokio::time::timeout(
@@ -278,16 +238,8 @@ async fn worker_idle_releases_tool_routes() {
         .route_subscribe(&bind, broca_module::fanout::FromCursor::Start, sink)
         .await
         .unwrap();
-    f.run(&bind).await;
-    broca_test_support::wait_until("worker run settles", || async {
-        if f.registry.route_status(&bind).await.unwrap() == broca_module::actor::LineageStatus::Idle
-        {
-            Ok(())
-        } else {
-            Err("run still active".into())
-        }
-    })
-    .await;
+    f.run(&bind, None).await;
+    f.settled(&bind).await;
     assert_eq!(
         f.registry.tool_routes_health()["open_actor_reasons"]["live_subscriber"],
         1
@@ -296,7 +248,6 @@ async fn worker_idle_releases_tool_routes() {
     drop(stream);
     assert_eq!(f.observed.bound.load(Ordering::SeqCst), 1);
     assert_eq!(f.registry.tool_routes_health()["cached_routes"], 1);
-    // This uses the production 30-second idle TTL, not a shorter test TTL.
     f.wait_closed().await;
     assert_eq!(f.observed.gone.load(Ordering::SeqCst), 1);
     let health = f.registry.tool_routes_health();
@@ -312,65 +263,19 @@ async fn sweeper_deleted_session_releases_tool_routes() {
         return;
     };
     let bind = f.bind("retained-reader");
-    let mut wal = f.wal.open(&bind).unwrap();
-    wal.append(
-        1,
-        &WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: Some(1),
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            run_id: RunId("expired".into()),
-            session: bind.clone(),
-            ts_ms: Some(0),
-            config: Box::new(config()),
-            input: vec![].into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: None,
-        },
-        true,
-    )
-    .unwrap();
-    wal.append(
-        1,
-        &WalRecord::RunFinished {
-            interrupt_reason: None,
-            ts_ms: Some(0),
-            reason: RunFinishReason::Completed,
-            usage: Default::default(),
-            error: None,
-            retries_used: 0,
-        },
-        true,
-    )
-    .unwrap();
-    drop(wal);
-    let store = Arc::new(broca_store::SqliteStore::open(f.rig.dir.join("retention.db")).unwrap());
     let retention = Arc::new(
         broca_module::retention::RetentionService::new(
-            f.wal.clone(),
-            store.clone(),
+            &f.rig.dir,
             Arc::new(FileLeaseStore::new(f.rig.dir.join("leases"))),
-            store,
-            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
         )
         .unwrap(),
     );
     f.registry.set_retention_service(retention.clone());
+    f.run(&bind, Some(1)).await;
+    f.settled(&bind).await;
+    // The idle session closes, and its close hook releases the route its run opened.
+    f.wait_closed().await;
+    let released = f.observed.gone.load(Ordering::SeqCst);
     // Exercise deletion with cached routes but no actor available to call on_session_close.
     f.plane
         .warm_bind(&bind, Duration::from_secs(10))
@@ -380,16 +285,15 @@ async fn sweeper_deleted_session_releases_tool_routes() {
         f.registry.tool_routes_health()["routes_for_closed_sessions"],
         1
     );
-    f.registry.boot_retention().await.unwrap();
     assert_eq!(
         f.registry
-            .sweep_once(retention.clock.now_ms())
+            .sweep_once(retention.clock.now_ms() + 5_000)
             .await
             .unwrap(),
         1
     );
     broca_test_support::wait_until("sweeper route Goodbye", || async {
-        if f.observed.gone.load(Ordering::SeqCst) == 1 {
+        if f.observed.gone.load(Ordering::SeqCst) == released + 1 {
             Ok(())
         } else {
             Err(f.registry.tool_routes_health().to_string())

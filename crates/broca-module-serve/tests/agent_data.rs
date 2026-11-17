@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use broca_core::{ExportIndex, FileWalStore, WalStore};
+use broca_core::{FileWalStore, WalStore};
 use broca_module::{
     registry::{ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle},
     LineageRegistry,
@@ -35,25 +35,6 @@ fn root(tag: &str) -> PathBuf {
     ))
 }
 struct NeverOpen;
-struct CountingWalReads {
-    inner: Arc<FileWalStore>,
-    reads: Arc<AtomicUsize>,
-}
-impl WalStore for CountingWalReads {
-    fn open(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-        self.inner.open(session)
-    }
-    fn read_records(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        self.inner.read_records(session)
-    }
-}
 #[async_trait]
 impl LineageOpener for NeverOpen {
     async fn open(
@@ -305,11 +286,7 @@ impl Rig {
             &broca_core::ReadOnlyWalReader::new(&root),
         )
         .unwrap();
-        let registry = Arc::new(LineageRegistry::new_with_sources(
-            Arc::new(NeverOpen),
-            Some(wal.clone()),
-            Some(index.clone()),
-        ));
+        let registry = Arc::new(LineageRegistry::new(Arc::new(NeverOpen)));
         registry.set_session_address_inventory(index.clone());
         let service = Arc::new(AgentDataService::new(
             root.clone(),
@@ -487,7 +464,6 @@ impl Wire {
                 VaultGauge::not_in_use(),
                 None,
                 Default::default(),
-                Default::default(),
                 None,
                 None,
                 None,
@@ -625,67 +601,6 @@ fn assert_code(result: Result<Value, Value>, code: &str) -> Value {
 }
 
 #[tokio::test]
-async fn stamped_principal_admission_precedes_json_and_every_store_read() {
-    let mut rig = Rig::new("admission", Arc::new(FakeDoor::default()));
-    let reads = Arc::new(AtomicUsize::new(0));
-    rig.registry = Arc::new(LineageRegistry::new_with_sources(
-        Arc::new(NeverOpen),
-        Some(Arc::new(CountingWalReads {
-            inner: rig.wal.clone(),
-            reads: reads.clone(),
-        })),
-        Some(rig.index.clone()),
-    ));
-    rig.registry
-        .set_session_address_inventory(rig.index.clone());
-    std::fs::write(
-        rig.root.join("wal/not-a-valid-address.wal"),
-        b"must not be read",
-    )
-    .unwrap();
-    let forged = BindIdentity::new("/untrusted", "reserved:entorhinal", "forged");
-    // Readable unscoped history would refuse scope adoption. Count the actual
-    // read seam too: unreadable history is deliberately ignored by bind adoption.
-    rig.seed(&forged, "unscoped-history", true);
-    for principal in [
-        Value::Null,
-        json!({"kind":"direct"}),
-        json!({"kind":"unverified"}),
-        json!({"kind":"reserved","module_id":"broca"}),
-    ] {
-        for scope in [
-            Value::Null,
-            json!({"owner":{"kind":"reserved","module_id":"owner"},"ref":"scope","scope_epoch":1,"kind":"head","owner_authorized":true}),
-        ] {
-            let mut wire = Wire::new_with_scope(&rig, principal.clone(), true, scope).await;
-            assert_code(
-                wire.raw(b"not even JSON".to_vec()).await,
-                "caller_forbidden",
-            );
-            for op in contract::REQUIRED_OPS {
-                assert_code(
-                    wire.raw(
-                        serde_json::to_vec(
-                            &json!({"method":op,"params":{"principal":"reserved:entorhinal"}}),
-                        )
-                        .unwrap(),
-                    )
-                    .await,
-                    "caller_forbidden",
-                );
-            }
-        }
-    }
-    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        reads.load(Ordering::SeqCst),
-        0,
-        "an internal bind or forbidden RPC read WAL history"
-    );
-    assert!(!rig.root.join("agent-data").exists());
-}
-
-#[tokio::test]
 async fn describe_is_internal_and_declares_the_agent_owned_store() {
     let rig = Rig::new("describe", Arc::new(FakeDoor::default()));
     let mut internal = Wire::new(&rig, entorhinal(), true).await;
@@ -715,178 +630,6 @@ async fn describe_is_internal_and_declares_the_agent_owned_store() {
         management.call("describe", json!({})).await.is_err(),
         "agent-data is not a management operation"
     );
-}
-
-#[tokio::test]
-async fn move_and_move_back_replays_and_rejoins_only_a_prefix() {
-    let door = Arc::new(FakeDoor::default());
-    let mut source = Rig::new("source", door.clone());
-    let receiver = Rig::new("receiver", door.clone());
-    let session = source.session("moves");
-    source.seed_tool_run(&session, "original-run");
-    let resolver = |_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1);
-    source
-        .index
-        .emit_run(
-            &source.wal.read_records(&session).unwrap(),
-            &RunId("original-run".into()),
-            &resolver,
-        )
-        .unwrap();
-    assert!(
-        source.index.high_water() > 0,
-        "the fixture produces a real billed fact"
-    );
-    let original = source.bytes(&session);
-    let mut source_reader = Wire::new(&source, Value::Null, false).await;
-    source_reader.bind_session(&session).await;
-    let transcript = source_reader
-        .management("session.read", json!({"include_tools":true}))
-        .await
-        .unwrap();
-    let params = source.params(CUT, std::slice::from_ref(&session));
-    let mut from = Wire::new(&source, entorhinal(), true).await;
-    let mut to = Wire::new(&receiver, entorhinal(), true).await;
-    assert_eq!(
-        from.call("busy", json!({"refs":params["refs"]}))
-            .await
-            .unwrap(),
-        json!({"refs":[{"state":"idle"}]})
-    );
-    let prepared = from.call("prepare", params.clone()).await.unwrap();
-    assert_eq!(prepared["items"][0]["sessionRef"], params["refs"][0]["ref"]);
-    assert_eq!(
-        prepared["items"][0]["digest"],
-        broca_wal::migration::digest(&original)
-    );
-    assert!(source.wal.check_move(&session, true).is_err());
-    assert_code(
-        source_reader.management("session.send", json!({})).await,
-        "session_moving",
-    );
-    assert_eq!(source.bytes(&session), original);
-    assert_eq!(
-        from.call("prepare", params.clone()).await.unwrap(),
-        prepared
-    );
-    let exported = from.call("export", params.clone()).await.unwrap();
-    assert_eq!(from.call("export", params.clone()).await.unwrap(), exported);
-    door.seal(CUT);
-    assert_eq!(
-        to.call("diverged", params.clone()).await.unwrap(),
-        json!({"refs":[{"state":"at_cut"}]})
-    );
-    let imported = to.call("import", params.clone()).await.unwrap();
-    let calls = door.calls.load(Ordering::SeqCst);
-    *door.refusal.lock().unwrap() = Some("unavailable".into());
-    assert_eq!(
-        to.call("import", params.clone()).await.unwrap(),
-        imported,
-        "lost reply replay needs no door"
-    );
-    assert_eq!(
-        to.call("activate", params.clone()).await.unwrap(),
-        json!({})
-    );
-    assert_eq!(
-        door.calls.load(Ordering::SeqCst),
-        calls,
-        "activation uses verified durable staging"
-    );
-    *door.refusal.lock().unwrap() = None;
-    assert_eq!(receiver.bytes(&session), original);
-    let mut receiver_reader = Wire::new(&receiver, Value::Null, false).await;
-    receiver_reader.bind_session(&session).await;
-    let mut received = receiver_reader
-        .management("session.read", json!({"include_tools":true}))
-        .await
-        .unwrap();
-    // The receiver serves the same incarnation under a history version above any the source
-    // served, so clients reload; every other byte of the page is the source's.
-    assert!(received["history_version"].as_u64() > transcript["history_version"].as_u64());
-    received["history_version"] = transcript["history_version"].clone();
-    assert_eq!(received, transcript);
-    receiver
-        .index
-        .emit_run(
-            &receiver.wal.read_records(&session).unwrap(),
-            &RunId("original-run".into()),
-            &resolver,
-        )
-        .unwrap();
-    assert_eq!(
-        receiver.index.high_water(),
-        0,
-        "imported runs are not billed on the receiver"
-    );
-    let mut release = params.clone();
-    release["holder"] = json!("receiver-mac");
-    assert_eq!(
-        from.call("release", release.clone()).await.unwrap(),
-        json!({"enforced":true})
-    );
-    assert_eq!(
-        from.call("release", release).await.unwrap(),
-        json!({"enforced":true})
-    );
-    assert!(source.wal.check_move(&session, false).is_err());
-    assert_code(
-        source_reader.management("session.read", json!({})).await,
-        "session_moved",
-    );
-    assert_code(
-        source_reader.management("session.send", json!({})).await,
-        "session_moved",
-    );
-    drop(from);
-    drop(source_reader);
-    // Reopen while the tombstone is present so the boot inventory must rediscover the old copy.
-    source = source.reopen();
-    let mut from = Wire::new(&source, entorhinal(), true).await;
-    receiver.seed(&session, "receiver-run", true);
-    receiver
-        .index
-        .emit_run(
-            &receiver.wal.read_records(&session).unwrap(),
-            &RunId("receiver-run".into()),
-            &resolver,
-        )
-        .unwrap();
-    assert!(
-        receiver.index.high_water() > 0,
-        "a receiver-local run is billed normally"
-    );
-    let extended = receiver.bytes(&session);
-    assert!(extended.starts_with(&original));
-    let back = source.params(BACK, std::slice::from_ref(&session));
-    to.call("prepare", back.clone()).await.unwrap();
-    to.call("export", back.clone()).await.unwrap();
-    door.seal(BACK);
-    assert_eq!(
-        from.call("diverged", back.clone()).await.unwrap(),
-        json!({"refs":[{"state":"at_cut"}]})
-    );
-    from.call("import", back.clone()).await.unwrap();
-    from.call("activate", back).await.unwrap();
-    assert_eq!(source.bytes(&session), extended);
-    assert!(!source
-        .wal
-        .wal_path(&session)
-        .with_extension("moved")
-        .exists());
-    assert!(source.wal.check_move(&session, true).is_ok());
-    let fork = Rig::new("fork", door);
-    fork.seed(&session, "fork-run", true);
-    let mut fork_wire = Wire::new(&fork, entorhinal(), true).await;
-    let params = fork.params(BACK, std::slice::from_ref(&session));
-    let before = fork.bytes(&session);
-    assert_eq!(
-        fork_wire.call("diverged", params.clone()).await.unwrap(),
-        json!({"refs":[{"state":"advanced"}]})
-    );
-    assert_code(fork_wire.call("import", params).await, "local_advanced");
-    assert_eq!(fork.bytes(&session), before);
-    assert!(!fork.root.join("wal-staging").exists());
 }
 
 #[tokio::test]

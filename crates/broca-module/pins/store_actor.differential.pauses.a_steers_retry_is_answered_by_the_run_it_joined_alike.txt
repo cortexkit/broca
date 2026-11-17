@@ -45,7 +45,7 @@ Finished {
     ),
 }
 == control stream
-sha256:a0732ffe5b3328c59ece221eb1bd1fc16050ce98e6f926ef6c4c475ed8547991 (2568 bytes)
+sha256:7a3e701bd93c5014471a8983760052b3ab73e4125a68c3ff34d82b0266c2a980 (2502 bytes)
 == the conversation
 [
     "first",

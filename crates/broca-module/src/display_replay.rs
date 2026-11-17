@@ -5,8 +5,6 @@ use std::sync::{Arc, Mutex, Weak};
 use broca_protocol::DisplayEvent;
 use tokio::sync::broadcast;
 
-use super::LazyRing;
-
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_PARTS: usize = 1024;
 
@@ -148,11 +146,6 @@ impl DisplaySender {
         }
         (rx, events)
     }
-
-    #[cfg(test)]
-    pub(super) fn is_allocated(&self) -> bool {
-        self.ring.is_allocated()
-    }
 }
 
 impl From<broadcast::Sender<Arc<DisplayEvent>>> for DisplaySender {
@@ -160,6 +153,64 @@ impl From<broadcast::Sender<Arc<DisplayEvent>>> for DisplaySender {
         Self {
             ring: sender.into(),
             state: Arc::default(),
+        }
+    }
+}
+
+/// A broadcast ring that allocates its slot buffer when the first receiver subscribes.
+///
+/// Tokio's `broadcast::channel` allocates all of its slots up front. Most sessions never get a
+/// subscriber (a one-shot send, a background run), so creating the control and display rings at
+/// actor open cost every open actor about 40 KB for nothing. Until something subscribes there is
+/// no receiver, and a broadcast send with no receiver delivers nothing and retains nothing, so
+/// dropping those sends here is the same behavior the eager channel had. Once created, the ring
+/// lives as long as the fan-out that owns it.
+pub struct LazyRing<T> {
+    capacity: usize,
+    sender: Arc<std::sync::OnceLock<broadcast::Sender<T>>>,
+}
+
+impl<T> Clone for LazyRing<T> {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            sender: Arc::clone(&self.sender),
+        }
+    }
+}
+
+impl<T: Clone> LazyRing<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            sender: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Register a receiver, creating the ring on the first call.
+    fn subscribe(&self) -> broadcast::Receiver<T> {
+        self.sender
+            .get_or_init(|| broadcast::channel(self.capacity).0)
+            .subscribe()
+    }
+
+    /// Broadcast to the current receivers. Before the first subscribe there are none, so the
+    /// value is returned as unsent, exactly as a broadcast send with no receivers reports it.
+    pub fn send(&self, value: T) -> Result<usize, broadcast::error::SendError<T>> {
+        match self.sender.get() {
+            Some(sender) => sender.send(value),
+            None => Err(broadcast::error::SendError(value)),
+        }
+    }
+}
+
+impl<T> From<broadcast::Sender<T>> for LazyRing<T> {
+    /// Wrap a channel that already exists, for callers that build their own sender. The ring is
+    /// allocated already, so the capacity used for lazy creation is never read.
+    fn from(sender: broadcast::Sender<T>) -> Self {
+        Self {
+            capacity: 0,
+            sender: Arc::new(std::sync::OnceLock::from(sender)),
         }
     }
 }

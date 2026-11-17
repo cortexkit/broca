@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
+use broca_core::{FileLeaseStore, OutputEvent, RunError};
 use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, RunId, SubmissionRequest};
 use broca_session_store::keys::Cipher;
 use serde_json::{json, Value};
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::{core, head_scope, request};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob};
+use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunJob};
 use crate::registry::LineageRegistry;
 use crate::serve::ServeHandler;
 
@@ -103,14 +103,6 @@ impl RunExecutor for Executor {
         Ok(Some(Box::new(image_profile())))
     }
 
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
-
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -139,15 +131,13 @@ impl Drop for Side {
     }
 }
 
-/// A module whose sessions start in the new storage when `store`, over the scripted model
-/// `steps`. Its new storage creates sessions in mode `cipher`.
-pub(super) async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>, cipher: Cipher) -> Side {
-    side_gated(store, steps, false, cipher).await
+/// A module over the scripted model `steps`. Its new storage creates sessions in mode `cipher`.
+pub(super) async fn side(steps: Vec<Vec<NormalizedEvent>>, cipher: Cipher) -> Side {
+    side_gated(steps, false, cipher).await
 }
 
 /// [`side`], with every model step waiting for the side's gate when `gated`.
 pub(super) async fn side_gated(
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     cipher: Cipher,
@@ -162,7 +152,7 @@ pub(super) async fn side_gated(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let gate = gated.then(|| Arc::new(tokio::sync::Notify::new()));
-    let registry = registry_gated(&dir, store, steps, gate.clone(), cipher).await;
+    let registry = registry_gated(&dir, steps, gate.clone(), cipher).await;
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Side {
         dir,
@@ -179,23 +169,20 @@ pub(super) async fn side_gated(
 /// creates sessions in mode `cipher`.
 pub(super) async fn registry_at(
     dir: &std::path::Path,
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     cipher: Cipher,
 ) -> LineageRegistry {
-    registry_gated(dir, store, steps, None, cipher).await
+    registry_gated(dir, steps, None, cipher).await
 }
 
 /// [`registry_at`], with every model step waiting for `gate` when there is one.
 async fn registry_gated(
     dir: &std::path::Path,
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<tokio::sync::Notify>>,
     cipher: Cipher,
 ) -> LineageRegistry {
     broca_core::media_store::create_media_directories(dir).unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     // The runs freeze the media profile of a model that takes images.
     let mut store_executor = crate::store_actor::tests::executor(steps, gate);
     store_executor.provider.render_config = Some(image_render_config());
@@ -210,24 +197,14 @@ async fn registry_gated(
     )
     .await
     .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(super::IDLE)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal,
-        None,
-    );
-    if store {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    }
+    LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(super::IDLE)
+        .with_store_runtime(Arc::new(runtime)),
+    ))
 }
 
 impl Side {
@@ -461,7 +438,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
             super::super::tests::text_step("a2", "seen"),
         ]
     };
-    let store = side(true, steps(), cipher).await;
+    let store = side(steps(), cipher).await;
     let image = bytes_of(PNG);
     let unsent = bytes_of(WIDE);
 
@@ -553,7 +530,7 @@ async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
 /// reads it back byte-equal, whole and by byte range. Another session of the module, whose
 /// records don't name the image, can't read it, though the image's bytes are stored beside it.
 async fn a_store_sessions_media_survives_a_restart_and_stays_its_own(cipher: Cipher) {
-    let store = side(true, Vec::new(), cipher).await;
+    let store = side(Vec::new(), cipher).await;
     let (image, other_image) = (bytes_of(PNG), bytes_of(WIDE));
     import_with(&store, &image).await;
     assert_eq!(store.stored_mode(), cipher);
@@ -566,7 +543,7 @@ async fn a_store_sessions_media_survives_a_restart_and_stays_its_own(cipher: Cip
     );
     assert!(store.registry.stop_and_seal().await);
 
-    let restarted = registry_at(&store.dir, true, Vec::new(), cipher).await;
+    let restarted = registry_at(&store.dir, Vec::new(), cipher).await;
     let reply = ServeHandler::media_read(&restarted, &store.key, read.clone())
         .await
         .unwrap();

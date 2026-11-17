@@ -107,6 +107,7 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
             cancel: Some(cancel),
             ..Default::default()
         },
+        None,
     )
     .await;
     let finished = end.result.expect("cancellation does not require admission");

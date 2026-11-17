@@ -825,7 +825,6 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
         Arc::new(
             crate::opener::DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
                 Arc::clone(&executor),
             )
             .with_idle_ttl(IDLE)
@@ -834,11 +833,7 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
     };
     let key = broca_protocol::BindIdentity::new(dir.join("project"), "broca", "alfonso:head:a1");
     assert!(!runtime.holds(&key).unwrap());
-    let registry = crate::registry::LineageRegistry::new_with_reader(
-        opener(Arc::clone(&runtime)),
-        wal.clone(),
-        None,
-    );
+    let registry = crate::registry::LineageRegistry::new(opener(Arc::clone(&runtime)));
     let reply = imported(
         registry
             .route_store_command(&key, source.import(source.params("imp-1")))
@@ -886,20 +881,14 @@ async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
             .await
             .unwrap(),
     );
-    let registry = crate::registry::LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::clone(&runtime)),
-        ),
-        wal.clone(),
-        None,
-    )
-    .with_store_new_sessions();
+    let registry = crate::registry::LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(Arc::clone(&runtime)),
+    ));
     let inventory = super::tests::Inventory::open(&dir, &dir);
     registry.set_session_address_inventory(Arc::clone(&inventory.store));
     let another = BindPrincipal::Reserved {
@@ -978,29 +967,22 @@ async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
 /// roots.
 #[tokio::test]
 async fn an_imported_head_is_created_in_the_durable_root_and_reopens_from_it() {
-    use broca_core::{FileLeaseStore, FileWalStore};
+    use broca_core::FileLeaseStore;
     use broca_wal::StorageClass;
     const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
     let source = Source::new("durable");
     let dir = source.dir.join("state");
     // No backup classes: an import's placement doesn't consult them.
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")).with_backup_classes(Vec::new()));
     let executor: Arc<dyn crate::executor::RunExecutor> = Arc::new(executor(Vec::new(), None));
     let module = |runtime: Arc<crate::store_open::StoreRuntime>| {
-        crate::registry::LineageRegistry::new_with_reader(
-            Arc::new(
-                crate::opener::DefaultOpener::new(
-                    Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                    wal.clone(),
-                    Arc::clone(&executor),
-                )
-                .with_idle_ttl(IDLE)
-                .with_store_runtime(runtime),
-            ),
-            wal.clone(),
-            None,
-        )
-        .with_store_new_sessions()
+        crate::registry::LineageRegistry::new(Arc::new(
+            crate::opener::DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                Arc::clone(&executor),
+            )
+            .with_idle_ttl(IDLE)
+            .with_store_runtime(runtime),
+        ))
     };
     let open = || async {
         Arc::new(
@@ -1217,6 +1199,10 @@ struct Unsealed<'a>(&'a mut Session<&'static MemoryBackend>);
 impl Writer for Unsealed<'_> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         Writer::append(&mut *self.0, records, barrier).await
+    }
+
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        Writer::caught_up(&mut *self.0).await
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {

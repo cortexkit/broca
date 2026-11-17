@@ -1,8 +1,7 @@
 //! The session actor for a session kept in the new storage (`broca_session_store`).
 //!
-//! It takes the same commands as today's actor ([`crate::actor::LineageActor`]) and answers with
-//! the same outcome types, so the registry and the serve layer can route a session to either.
-//! It owns the session's `Session` for the session's whole life and is its only writer. A run
+//! It takes the registry's session commands ([`crate::actor::LineageCmd`]) and answers with the
+//! shared outcome types. It owns the session's `Session` for the session's whole life and is its only writer. A run
 //! writes through a [`broca_session_loop::shared::ActorWriter`], whose requests this actor
 //! serves in its own command loop, so the run's appends and the actor's own (a cancel request,
 //! later steers and queued sends) take their seqs in one order.
@@ -1596,6 +1595,35 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                 }
+                // A plan-named module's keyed send takes the run id its `send_id` derives only
+                // while no other sender's send holds it; another sender's send under the same
+                // `send_id` is a different send.
+                let run_id = match (
+                    ordered_by.clone().or_else(|| request.principal.clone()),
+                    key.send_id(),
+                ) {
+                    (
+                        Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }),
+                        Some(send_id),
+                    ) => {
+                        match crate::store_status::sender_send_run_id(
+                            &self.session,
+                            &self.parts,
+                            &run_id,
+                            send_id,
+                            &sender,
+                        )
+                        .await
+                        {
+                            Ok((run_id, _)) => run_id,
+                            Err(error) => {
+                                let _ = reply.send(SendOutcome::Error(error));
+                                return false;
+                            }
+                        }
+                    }
+                    _ => run_id,
+                };
                 // Whether the queue holds work that starts a run on its own, which a send that
                 // would freeze the session's scope, or start a run now, has to wait behind.
                 let queue_starts_runs = match self.queue_starts_runs().await {
@@ -1692,6 +1720,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         return false;
                     }
                 }
+                // The account route chose the running run's account at its admission, so a send
+                // joining that run, or retrying it, can't name another one; a send that only
+                // leaves the route out keeps the run's.
+                let joins_running = delivery == broca_protocol::Delivery::Steer
+                    || order.as_ref().is_some_and(ordered::joins_a_run);
+                if let (Some(requested), Some(start)) = (
+                    &request.account_route,
+                    self.running()
+                        .and_then(|run| run.start.as_ref())
+                        .filter(|start| joins_running || start.run_id == run_id.0),
+                ) {
+                    if frozen_account_route(start).as_ref() != Some(requested) {
+                        let _ = reply.send(SendOutcome::AccountRouteFixed);
+                        return false;
+                    }
+                }
                 // As in today's actor, a running run's routing decision is fixed, and a send naming
                 // another is refused before its key is looked at.
                 if let Some(fixed) = self.running().map(|run| {
@@ -1737,6 +1781,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 }
                             }
                         }
+                    }
+                    // At open, a run paused for sign-in on a routed account gets one probe, which
+                    // may ask routing for another account and move the run there; it never
+                    // resumes the run on the account that lost its sign-in. A retry of the paused
+                    // send arriving meanwhile would read the probe as its run running and be
+                    // answered `active`, with nothing left to run it once the probe ends. So the
+                    // probe finishes first, and the retry then resumes the pause itself.
+                    if self
+                        .run
+                        .as_ref()
+                        .is_some_and(|active| active.preserve_auth_pause)
+                    {
+                        self.run_current_to_end().await;
                     }
                     match self
                         .keyed(retries::KeyedSend {
@@ -2053,7 +2110,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         self.steer_restart_paused(start, paused, &mut reply).await
                     };
                     let _ = reply.send(outcome);
-                } else if self.running().is_some() {
+                } else if self.run.is_some() || self.running().is_some() {
+                    // A run whose end is written still owns the session until its task returns
+                    // and `finish_run` takes it: a run started now would replace it, and the
+                    // finished run's remaining work (its warm records, the queue drain, the
+                    // one-shot close) would never be handled. The send waits behind it.
                     let outcome = self.queue(start, delivery, &mut reply).await;
                     let _ = reply.send(outcome);
                 } else if queue_starts_runs {
@@ -2433,6 +2494,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .run
                 .as_ref()
                 .is_some_and(|run| run.paused == Some(broca_protocol::PauseReason::Restart));
+        // Replacing a run whose task is still out would drop its handle, so its end would
+        // never reach `finish_run`.
+        debug_assert!(
+            self.run.is_none(),
+            "a run starts while another run's task is out"
+        );
         let done = tokio::spawn(async move { executor.execute_on_store(job, out).await });
         self.run = Some(ActiveRun {
             restart_from_seq: self.restart_admitting.then(|| self.session.next_seq()),
@@ -3016,7 +3083,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// stop the run from starting: the run ends with that refusal before any model call, as
     /// today's does. A failure to run them refuses the send.
     async fn transform_fresh_input(
-        &self,
+        &mut self,
         start: &mut Start,
         delivery: broca_protocol::Delivery,
         reply: &mut oneshot::Sender<SendOutcome>,
@@ -3052,9 +3119,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// transforms `manifest`'s plan declares, by the rules today's actor runs them
     /// (`crate::actor::pre_user`). They run under `scope`, the scope a session's first send
     /// freezes, else under the one the session froze. They give up, with today's answers, when
-    /// the module stops or the sender waiting on `reply` stops waiting.
+    /// the module stops or the sender waiting on `reply` stops waiting. A running run goes on
+    /// writing while they run: a slow transform holds up only the send it transforms.
     async fn transform_input(
-        &self,
+        &mut self,
         input: Vec<broca_protocol::Message>,
         delivery: broca_protocol::Delivery,
         manifest: Option<&broca_wal::PlanManifest>,
@@ -3085,16 +3153,47 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 _ = reply.closed() => SendOutcome::Transient("send cancelled".into()),
             }
         };
-        pre_user::transform_input(
-            &plan,
-            &plane,
-            &self.key,
-            scope.as_ref(),
-            delivery,
-            prepared,
-            abandon,
-        )
-        .await
+        let key = self.key.clone();
+        let transform = async move {
+            pre_user::transform_input(
+                &plan,
+                &plane,
+                &key,
+                scope.as_ref(),
+                delivery,
+                prepared,
+                abandon,
+            )
+            .await
+        };
+        self.while_serving_run(transform).await
+    }
+
+    /// Awaits `work`, serving the running run's writes and reads meanwhile, so the run doesn't
+    /// stall behind it. Nothing else is served: commands wait, and a run that ends meanwhile is
+    /// seen ending only once `work` is done.
+    async fn while_serving_run<T>(&mut self, work: impl std::future::Future<Output = T>) -> T {
+        // Both futures live on the heap: inlined, they would grow every command handler that
+        // transforms input by a whole request's state.
+        let mut work = Box::pin(work);
+        loop {
+            let request = match self.run.as_mut() {
+                Some(active) if !active.writer_gone => tokio::select! {
+                    biased;
+                    done = &mut work => return done,
+                    request = active.link.next() => request,
+                },
+                _ => return work.await,
+            };
+            match request {
+                Some(request) => Box::pin(self.serve_request(request)).await,
+                None => {
+                    if let Some(active) = self.run.as_mut() {
+                        active.writer_gone = true;
+                    }
+                }
+            }
+        }
     }
 
     /// The session's owner summary, from its run starts, as today's admission rules read it.
@@ -3378,6 +3477,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     run_id.0
                 )),
             },
+        };
+        // An ordered send that started its own run was delivered as that run's turn, so its
+        // retry carries the `turn` receipt naming the run, as a retry of one delivered into a
+        // running run carries `step`. The send's order is in its records, so this holds after a
+        // restart.
+        let ordered = self
+            .session
+            .find_id(IdKind::SubmissionId, &format!("sub-{}", run_id.0))
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .iter()
+            .any(|(_, record)| matches!(record, Record::DeliveryOrdered(_)));
+        let outcome = if ordered {
+            with_turn_receipt(outcome, run_id)
+        } else {
+            outcome
         };
         Ok(Keyed::Answered(outcome))
     }
@@ -4188,9 +4303,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Joins `start` to the running run as a steer, as today's actor steers it: refused when it
     /// names a setting the run froze otherwise, and queued as a steer when the run has already
-    /// written its end. Otherwise its input goes through the session's `pre_user` transforms,
-    /// and its record is written, durable before the reply, and the run places its messages at
-    /// its next step boundary. The actor writes nothing while the run builds a batch, so the run
+    /// written its end, before its transforms run or while they run. Otherwise its input goes
+    /// through the session's `pre_user` transforms, and its record is written, durable before
+    /// the reply, and the run places its messages at its next step boundary. The actor writes nothing while the run builds a batch, so the run
     /// either takes the steer or has ended before it. `reply` is the sender's, which the
     /// transforms stop for when it stops waiting.
     async fn steer(
@@ -4293,8 +4408,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
-        if let Some(provider) = prepared.refused {
+        if let Some(provider) = prepared.refused.clone() {
             return SendOutcome::PreUserUnavailable { provider };
+        }
+        // The run went on while the transforms ran, and may have ended meanwhile: the steer then
+        // queues with the input they left, as a steer that meets an ended run queues.
+        if self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .is_some_and(|run| run.finished.is_some())
+        {
+            return self
+                .queue_transformed(start, broca_protocol::Delivery::Steer, prepared, &staged)
+                .await;
         }
         let receipt = queue::SteerReceipt {
             sent_by: start.sent_by,
@@ -4333,9 +4461,87 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// transforms stop for when it stops waiting.
     async fn queue(
         &mut self,
-        start: Start,
+        mut start: Start,
         delivery: broca_protocol::Delivery,
         reply: &mut oneshot::Sender<SendOutcome>,
+    ) -> SendOutcome {
+        if let Some(retry) = self.retry_of_queued_send(&start, delivery).await {
+            return retry;
+        }
+        // As today's actor queues a send, its attachments are staged into its input and checked
+        // before its input transforms, and the queued record keeps them.
+        let staged = match self.stage_media(&mut start.request, None).await {
+            Ok(staged) => staged,
+            Err(outcome) => return outcome,
+        };
+        let manifest = match self.frozen_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => return SendOutcome::Error(error),
+        };
+        let prepared = match self
+            .transform_input(
+                start.request.input.clone(),
+                delivery,
+                manifest.as_deref(),
+                None,
+                self.retention_timestamp()
+                    .or_else(broca_core::clock::epoch_millis),
+                reply,
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        if let Some(provider) = prepared.refused.clone() {
+            return SendOutcome::PreUserUnavailable { provider };
+        }
+        self.queue_transformed(start, delivery, prepared, &staged)
+            .await
+    }
+
+    /// The answer to a send that repeats one still queued under the same id, compared with its
+    /// record; `None` for a new send.
+    async fn retry_of_queued_send(
+        &self,
+        start: &Start,
+        delivery: broca_protocol::Delivery,
+    ) -> Option<SendOutcome> {
+        let submission_id = broca_protocol::SubmissionId(format!("sub-{}", start.run_id.0));
+        let existing = match self.queued(&submission_id.0).await {
+            Err(error) => return Some(SendOutcome::Error(error)),
+            Ok(existing) => existing?,
+        };
+        // A plain retry of an ordered send asks for another delivery.
+        match self.queued_order(&submission_id.0).await {
+            Err(error) => return Some(SendOutcome::Error(error)),
+            Ok(Some(_)) => {
+                return Some(SendOutcome::SendIdReuse {
+                    differing: "delivery",
+                })
+            }
+            Ok(None) => {}
+        }
+        Some(retry_of_queued(
+            &existing,
+            start.request.clone(),
+            start.message_marks.as_ref(),
+            start.identity.as_deref(),
+            start.conversation_key.as_deref(),
+            delivery,
+            &self.parts,
+            submission_id,
+        ))
+    }
+
+    /// Writes the queued record of `start`, whose input its transforms left as `prepared` and
+    /// whose attachments are `staged`.
+    async fn queue_transformed(
+        &mut self,
+        start: Start,
+        delivery: broca_protocol::Delivery,
+        prepared: crate::actor::pre_user::PreparedInput,
+        staged: &[crate::person_media::StagedMedia],
     ) -> SendOutcome {
         let Start {
             run_id,
@@ -4355,59 +4561,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             message_marks,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
-        match self.queued(&submission_id.0).await {
-            Err(error) => return SendOutcome::Error(error),
-            Ok(Some(existing)) => {
-                // A plain retry of an ordered send asks for another delivery.
-                match self.queued_order(&submission_id.0).await {
-                    Err(error) => return SendOutcome::Error(error),
-                    Ok(Some(_)) => {
-                        return SendOutcome::SendIdReuse {
-                            differing: "delivery",
-                        }
-                    }
-                    Ok(None) => {}
-                }
-                return retry_of_queued(
-                    &existing,
-                    request,
-                    identity.as_deref(),
-                    conversation_key.as_deref(),
-                    delivery,
-                    &self.parts,
-                    submission_id,
-                );
-            }
-            Ok(None) => {}
-        }
-        // As today's actor queues a send, its attachments are staged into its input and checked
-        // before its input transforms, and the queued record keeps them.
-        let staged = match self.stage_media(&mut request, None).await {
-            Ok(staged) => staged,
-            Err(outcome) => return outcome,
-        };
-        let manifest = match self.frozen_manifest() {
-            Ok(manifest) => manifest,
-            Err(error) => return SendOutcome::Error(error),
-        };
-        let prepared = match self
-            .transform_input(
-                request.input.clone(),
-                delivery,
-                manifest.as_deref(),
-                None,
-                self.retention_timestamp()
-                    .or_else(broca_core::clock::epoch_millis),
-                reply,
-            )
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
-        };
-        if let Some(provider) = prepared.refused.clone() {
-            return SendOutcome::PreUserUnavailable { provider };
-        }
         request.staged_uploads = None;
         let receipt = queue::Receipt {
             session_class: session_class.filter(|_| self.frozen_session_class().is_none()),
@@ -4437,7 +4590,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(send) => Record::QueuedSend(send),
             Err(error) => return SendOutcome::Error(error),
         };
-        if let Err(error) = self.append_own_with_media(record, &staged).await {
+        if let Err(error) = self.append_own_with_media(record, staged).await {
             return SendOutcome::Error(format!("{error:?}"));
         }
         if one_shot {
@@ -4527,13 +4680,26 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .await;
             return CancelOutcome::Ack;
         }
-        let Some(active) = self.run.as_mut().filter(|active| &active.run_id == run_id) else {
-            return CancelOutcome::NotActive;
-        };
         let point = match at {
             broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
             broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
         };
+        // A stop the run already owes is acknowledged again without writing: one asked for now,
+        // or one at the same point. Only a stop now after one at the step boundary moves it.
+        let owed = self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .filter(|run| run.run_id == run_id.0 && run.finished.is_none())
+            .and_then(|run| run.cancel);
+        let already = owed == Some(CancelPoint::Now) || owed == Some(point);
+        let Some(active) = self.run.as_mut().filter(|active| &active.run_id == run_id) else {
+            return CancelOutcome::NotActive;
+        };
+        if already {
+            return CancelOutcome::Ack;
+        }
         let record = Record::CancelRequest(CancelRequest {
             run_id: run_id.0.clone(),
             at: point,
@@ -4557,13 +4723,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 }
 
-/// A retry of a send still queued, compared with its record as today's actor compares it with
-/// the queued entry: the same payload is `pending`, and anything else is refused naming what
-/// differs. A retry that omits the routing decision or tier its first send fixed takes them
-/// from the record, when the two sends' identities are the same.
+/// A retry of a send still queued, compared with its record: the same payload is `pending`,
+/// and anything else is refused naming what differs. Its display marks, as admission
+/// normalized them, must be the ones the record kept; they are left out of the request's
+/// identity digest, so they're compared here. A retry that omits the routing decision or tier
+/// its first send fixed takes them from the record, when the two sends' identities are the
+/// same.
+#[allow(clippy::too_many_arguments)]
 fn retry_of_queued(
     existing: &QueuedSend,
     mut request: SubmissionRequest,
+    message_marks: Option<&broca_protocol::MessageMarks>,
     identity: Option<&str>,
     conversation_key: Option<&str>,
     delivery: broca_protocol::Delivery,
@@ -4571,6 +4741,25 @@ fn retry_of_queued(
     submission_id: broca_protocol::SubmissionId,
 ) -> SendOutcome {
     let reuse = |differing| SendOutcome::SendIdReuse { differing };
+    let kept: Option<broca_protocol::MessageMarks> = match existing
+        .message_marks
+        .as_ref()
+        .map(|marks| serde_json::from_value(marks.clone()))
+        .transpose()
+    {
+        Ok(kept) => kept,
+        Err(error) => return SendOutcome::Error(format!("the queued send's marks: {error}")),
+    };
+    if kept.as_ref().and_then(|marks| marks.speaks_for.as_ref())
+        != message_marks.and_then(|marks| marks.speaks_for.as_ref())
+    {
+        return reuse("speaks_for");
+    }
+    if kept.as_ref().is_some_and(|marks| marks.notice)
+        != message_marks.is_some_and(|marks| marks.notice)
+    {
+        return reuse("notice");
+    }
     if queue::receipt_field(existing, "conversation_key")
         .as_ref()
         .and_then(serde_json::Value::as_str)
@@ -4669,7 +4858,13 @@ pub(crate) fn recovery_changes_reads(
                 || (run.paused != Some(broca_protocol::PauseReason::ToolHeld)
                     && matches!(run.resolution(), Resolution::ProviderHeld(waiting) if !waiting.is_empty()))
         }
-        None => !operations.queue.is_empty(),
+        None => {
+            let now = broca_core::clock::epoch_millis();
+            operations
+                .queue
+                .iter()
+                .any(|pending| crate::store_open::recovery::opening_drains(pending, now))
+        }
     }
 }
 
@@ -4784,17 +4979,10 @@ fn reopen(command: LineageCmd) {
             let _ = reply.send(crate::actor::WarmOutcome::Reopen);
         }
         LineageCmd::CutLock { reply, .. } => drop(reply),
-        // Today's actor sends these two to itself; nothing sends them to this one.
-        LineageCmd::WarmFinished { .. }
-        | LineageCmd::RunFinished { .. }
-        | LineageCmd::IdleTick
+        LineageCmd::IdleTick
         | LineageCmd::CompactionChanged { .. }
         | LineageCmd::ApplyCompaction { .. }
         | LineageCmd::CompactionV2 { .. } => {}
-        #[cfg(test)]
-        LineageCmd::RetainedAdmissionIdentityState { reply } => {
-            let _ = reply.send((usize::MAX, usize::MAX));
-        }
         #[cfg(test)]
         LineageCmd::PanicInActor => {}
     }
@@ -4859,12 +5047,6 @@ fn refuse(command: LineageCmd) {
                     None,
                 ),
             ));
-        }
-        // Today's actor sends these to itself; nothing sends them to this one.
-        LineageCmd::WarmFinished { .. } | LineageCmd::RunFinished { .. } => {}
-        #[cfg(test)]
-        LineageCmd::RetainedAdmissionIdentityState { reply } => {
-            let _ = reply.send((0, 0));
         }
         #[cfg(test)]
         LineageCmd::PanicInActor => {}
@@ -4956,3 +5138,47 @@ mod subscribed_heads_tests;
 mod tests;
 #[cfg(test)]
 mod tool_calls_tests;
+
+/// The account route `start`'s run was admitted under, as its config members keep it; `None` for a
+/// run admitted without one. A member that doesn't decode reads as no route, which refuses every
+/// join naming one rather than letting it through.
+fn frozen_account_route(
+    start: &broca_session_store::record::RunStart,
+) -> Option<cortexkit_role_llm_runner::send::AccountRoute> {
+    start
+        .run_choices
+        .as_ref()?
+        .get("config")?
+        .get("account_route")
+        .and_then(|route| serde_json::from_value(route.clone()).ok())
+}
+
+/// `outcome`, a retry's answer naming the run `run_id`, with the `turn` delivery receipt naming
+/// that run.
+fn with_turn_receipt(outcome: SendOutcome, run_id: &RunId) -> SendOutcome {
+    let turn = || {
+        Some(
+            cortexkit_role_llm_runner::send::Delivered::new(
+                cortexkit_role_llm_runner::send::delivered_as::TURN,
+            )
+            .with_ref(run_id.0.clone()),
+        )
+    };
+    match outcome {
+        SendOutcome::Finished { run_id, reason, .. } => SendOutcome::Finished {
+            run_id,
+            reason,
+            delivered: turn(),
+        },
+        SendOutcome::Active { run_id, .. } => SendOutcome::Active {
+            run_id,
+            delivered: turn(),
+        },
+        SendOutcome::Paused { run_id, reason, .. } => SendOutcome::Paused {
+            run_id,
+            reason,
+            delivered: turn(),
+        },
+        other => other,
+    }
+}

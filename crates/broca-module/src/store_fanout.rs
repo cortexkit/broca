@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::fanout::{
     deliver, deliver_from_ring, AttachFrom, ControlEvent, Delivery, DisplaySender, FromCursor,
-    StepRecord, StepReplay,
+    StepReplay,
 };
 use crate::store_control::{StoreControl, StoreUnit};
 
@@ -119,7 +119,7 @@ impl LiveProjection {
         next: Option<&Record>,
         identity: &CursorIdentity,
     ) -> Result<Vec<Arc<ControlEvent>>, String> {
-        self.step.observe(StepRecord::Store(record));
+        self.step.observe(record);
         let units = self.control.project(seq, record, next)?;
         let digest = identity.key.digest(record);
         let mut visible = Vec::new();

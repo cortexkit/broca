@@ -401,14 +401,20 @@ impl subc_client_rs::ModuleHandler for Router {
     }
 }
 
+/// The vault's rows: each method's fixture account and a spare. Each serves its vendor and is filed
+/// under it and under the kit's routing pool for it, `kit-pool-<vendor>`, the way a paid key is
+/// filed under the pool routing names it by: a send naming that pool as its `account_route` offers
+/// routing the pool's accounts.
 fn credentials() -> Vec<Value> {
     let mut rows = vec![];
     for method in ["oauth", "chatgpt", "apikey", "antigravity"] {
         let fixture = fixture(method).unwrap();
+        let vendor = fixture["provider"].as_str().unwrap();
+        let filed = [vendor.to_string(), format!("kit-pool-{vendor}")];
         for spare in [false, true] {
             let mut row = json!({"id":format!("{}{}",fixture["credential_id"].as_str().unwrap(),if spare {"-spare"} else {""}),
-                "categories":["llm-provider"],"type":if method == "apikey" {"apikey"} else {"oauth"},"serves":[fixture["provider"]],
-                "provider_ids":[fixture["provider"]],"auth_method":method,"state":"active","record_version":1,
+                "categories":["llm-provider"],"type":if method == "apikey" {"apikey"} else {"oauth"},"serves":[vendor],
+                "provider_ids":filed,"auth_method":method,"state":"active","record_version":1,
                 "operations":["read"],"account_id":format!("{}{}",fixture["account_id"].as_str().unwrap(),if spare {"-spare"} else {""})});
             if method == "apikey" {
                 row.as_object_mut().unwrap().remove("account_id");

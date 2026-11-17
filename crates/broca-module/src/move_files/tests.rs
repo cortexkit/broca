@@ -1,7 +1,5 @@
 use super::*;
 
-#[path = "websocket_tests.rs"]
-mod websocket;
 use crate::cut_state::CutStore;
 use crate::registry::{ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle};
 use broca_core::WalStore;
@@ -148,7 +146,7 @@ impl Rig {
             fail_reply: AtomicBool::new(false),
             fail_second: AtomicBool::new(false),
         });
-        let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpen), wal.clone(), None);
+        let registry = LineageRegistry::new(Arc::new(NeverOpen));
         let export = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
         let artifacts =
             FileCutArtifacts::new(root.clone(), registry, wal.clone(), export, driver.clone());
@@ -281,165 +279,6 @@ async fn installed_wal_without_recorded_activation_stays_fenced_on_reader_releas
     }
 }
 
-struct NeverExecute;
-#[async_trait::async_trait]
-impl crate::executor::RunExecutor for NeverExecute {
-    async fn execute(
-        &self,
-        _job: crate::executor::RunJob,
-        _out: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        panic!("reader guard started execution")
-    }
-}
-
-#[tokio::test]
-async fn actor_critical_section_holds_dispatch_until_completion_and_then_refuses_warm() {
-    let root =
-        broca_test_support::scratch_root().join(format!("move-actor-{}", std::process::id()));
-    let wal = Arc::new(FileWalStore::new(root.join("wal")));
-    let opener = Arc::new(crate::opener::DefaultOpener::new(
-        Arc::new(FileLeaseStore::new(root.join("leases"))),
-        wal.clone(),
-        Arc::new(NeverExecute),
-    ));
-    let registry = LineageRegistry::new_with_reader(opener, wal.clone(), None);
-    let session = BindIdentity::new("/p", "runner", "idle");
-    let handle = registry.actor_for(&session).await.unwrap();
-    let guard = registry
-        .lock_move_sessions(std::slice::from_ref(&session), false)
-        .await
-        .unwrap();
-    assert_eq!(guard.busy[0].1, None);
-    let (reply, mut wait) = tokio::sync::oneshot::channel();
-    handle
-        .send(crate::actor::LineageCmd::Status { reply })
-        .await
-        .unwrap_or_else(|_| panic!("actor closed"));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(10), &mut wait)
-            .await
-            .is_err(),
-        "actor dispatched while cut completion was not durable"
-    );
-    let path = wal.wal_path(&session);
-    let before = std::fs::read(&path).unwrap();
-    migration::freeze(
-        &root,
-        &path,
-        &Freeze {
-            store_head_version: None,
-            cut_id: CUT.into(),
-            end_offset: before.len() as u64,
-            lineage_id: "lineage".into(),
-        },
-    )
-    .unwrap()
-    .unwrap();
-    drop(guard);
-    assert_eq!(wait.await.unwrap(), crate::actor::LineageStatus::Idle);
-    let (reply, wait) = tokio::sync::oneshot::channel();
-    handle
-        .send(crate::actor::LineageCmd::Warm {
-            idle_auto: false,
-            lineage_id: None,
-            reply,
-        })
-        .await
-        .unwrap_or_else(|_| panic!("actor closed"));
-    assert_eq!(
-        wait.await.unwrap(),
-        crate::actor::WarmOutcome::SessionMoving { cut_id: CUT.into() }
-    );
-    for delivery in [
-        broca_protocol::Delivery::Queue,
-        broca_protocol::Delivery::Steer,
-        broca_protocol::Delivery::Interrupt,
-    ] {
-        let (reply, wait) = tokio::sync::oneshot::channel();
-        let request = serde_json::from_value(
-            json!({"model":broca_protocol::ModelHandle::new("stub","m"),"input":[]}),
-        )
-        .unwrap();
-        handle
-            .send(crate::actor::LineageCmd::Send {
-                session_class: None,
-                retention: None,
-                stop_sequences_named: false,
-                conversation_key: None,
-                title: None,
-                run_id: broca_protocol::RunId("new".into()),
-                request: Box::new(request),
-                kind: crate::executor::RunKind::FreshOrResume,
-                key: crate::actor::SendKey::RunId,
-                skip_materialization: false,
-                delivery,
-                plan: None,
-                order: None,
-                reply,
-            })
-            .await
-            .unwrap_or_else(|_| panic!("actor closed"));
-        assert_eq!(
-            wait.await.unwrap(),
-            crate::actor::SendOutcome::SessionMoving { cut_id: CUT.into() }
-        );
-    }
-    let (reply, wait) = tokio::sync::oneshot::channel();
-    handle
-        .send(crate::actor::LineageCmd::Cancel {
-            at: broca_wal::record::RunCancelAt::Now,
-            run_id: broca_protocol::RunId("new".into()),
-            reply,
-        })
-        .await
-        .unwrap_or_else(|_| panic!("actor closed"));
-    assert_eq!(
-        wait.await.unwrap(),
-        crate::actor::CancelOutcome::SessionMoving { cut_id: CUT.into() }
-    );
-    let (reply, wait) = tokio::sync::oneshot::channel();
-    handle
-        .send(crate::actor::LineageCmd::Retract {
-            submission_id: broca_protocol::SubmissionId("new".into()),
-            reply,
-        })
-        .await
-        .unwrap_or_else(|_| panic!("actor closed"));
-    assert_eq!(
-        wait.await.unwrap(),
-        crate::actor::RetractOutcome::SessionMoving { cut_id: CUT.into() }
-    );
-    let (reply, wait) = tokio::sync::oneshot::channel();
-    let request = broca_core::ImportRequest {
-        project_id: None,
-        principal: None,
-        run_id: broca_protocol::RunId("import".into()),
-        session: session.clone(),
-        messages: vec![broca_protocol::content::Message::new(
-            broca_protocol::content::Role::User,
-            vec![broca_protocol::content::ContentBlock::Text {
-                text: "hello".into(),
-            }],
-        )],
-        origin: broca_core::ImportOrigin {
-            source_ref: "copy".into(),
-        },
-    };
-    handle
-        .send(crate::actor::LineageCmd::Import {
-            request: Box::new(request),
-            reply,
-        })
-        .await
-        .unwrap_or_else(|_| panic!("actor closed"));
-    assert!(
-        matches!(wait.await.unwrap(),crate::actor::ImportOutcome::SessionMoving {cut_id} if cut_id == CUT)
-    );
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert!(registry.stop_and_seal().await);
-}
-
 #[tokio::test]
 async fn source_rekey_without_current_run_started_is_refused_before_freezing() {
     let rig = Rig::new("source-rekey-no-run", true);
@@ -550,30 +389,6 @@ async fn prepare_refuses_a_session_the_new_storage_holds_before_any_freeze() {
             .exists());
     }
     assert!(!rig.store.path(CUT).exists());
-}
-
-#[tokio::test]
-async fn receiver_open_actor_refuses_the_entire_set_before_any_staging() {
-    let mut rig = Rig::new("receiver-busy", false);
-    for plan in &rig.driver.plans {
-        std::fs::write(rig.wal.wal_path(&plan.session), &plan.bytes).unwrap();
-    }
-    let opener = Arc::new(crate::opener::DefaultOpener::new(
-        Arc::new(FileLeaseStore::new(rig.root.join("leases"))),
-        rig.wal.clone(),
-        Arc::new(NeverExecute),
-    ));
-    rig.artifacts.registry = LineageRegistry::new_with_reader(opener, rig.wal.clone(), None);
-    rig.artifacts
-        .registry
-        .actor_for(&rig.driver.plans[1].session)
-        .await
-        .unwrap();
-    let error = rig.op(Op::Import).await.unwrap_err();
-    assert_eq!(error.code.as_str(), "busy");
-    assert!(!rig.root.join("wal-staging").exists());
-    assert!(!rig.store.path(CUT).exists());
-    assert!(rig.artifacts.registry.stop_and_seal().await);
 }
 
 #[tokio::test]
@@ -819,7 +634,7 @@ async fn import_reconciliation_syncs_staging_before_recording_imported() {
         .join(CUT)
         .canonicalize()
         .unwrap();
-    let registry = LineageRegistry::new_with_reader(Arc::new(NeverOpen), rig.wal.clone(), None);
+    let registry = LineageRegistry::new(Arc::new(NeverOpen));
     let export = Arc::new(broca_store::SqliteStore::open(rig.root.join("run-index.db")).unwrap());
     let artifacts = FileCutArtifacts::new(
         rig.root.clone(),

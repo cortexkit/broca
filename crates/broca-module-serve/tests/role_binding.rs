@@ -12,7 +12,6 @@ use broca_module::serve::{
     ServeHandler, SessionReadRequest, SessionReadResponse, StatusResponse, SubscribeFrom,
 };
 use broca_module::LineageRegistry;
-include!("common/address_inventory.rs");
 use broca_module_serve::serve::{
     serve_connection_with_services, ServeEnd, ServeIoError, VaultGauge,
 };
@@ -87,29 +86,75 @@ impl LineageOpener for NoLineages {
     }
 }
 
-#[derive(Default)]
-struct PoisonWal(AtomicUsize);
+/// The session-address inventory, with the scope reservation a stamped bind's history
+/// authorization reads poisoned: each such read is counted and refused, so a route that
+/// authorizes against session history can't pass unnoticed. Addresses resolve as usual.
+struct PoisonAddresses {
+    reads: AtomicUsize,
+    inventory: Arc<broca_store::SqliteStore>,
+}
 
-impl broca_core::WalStore for PoisonWal {
-    fn wal_present(&self, _: &BindIdentity) -> Option<bool> {
-        // The log exists; only decoding its contents is poisoned.
-        Some(true)
+impl PoisonAddresses {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "role-binding-inventory-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("run-index.db");
+        let inventory = Arc::new(broca_store::SqliteStore::open(&db).unwrap());
+        broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(&root))
+            .unwrap();
+        Self {
+            reads: AtomicUsize::new(0),
+            inventory,
+        }
     }
-    fn open(
+}
+
+impl broca_store::SessionAddressResolver for PoisonAddresses {
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&std::path::Path>,
+        reservation: Option<&broca_store::session_address::ScopeReservation>,
+    ) -> Result<BindIdentity, broca_store::session_address::SessionAddressError> {
+        broca_store::SessionAddressResolver::resolve_session_address(
+            &*self.inventory,
+            bind,
+            workdir,
+            reservation,
+        )
+    }
+
+    fn scope_reservation(
         &self,
         _: &BindIdentity,
-    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-        panic!("sessionless route opened a WAL writer")
+    ) -> Result<
+        Option<broca_store::session_address::ScopeReservation>,
+        broca_store::session_address::SessionAddressError,
+    > {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Err(
+            broca_store::session_address::SessionAddressError::Unavailable(
+                broca_store::session_address::InventoryUnavailable::StoreError(
+                    "poisoned inventory".into(),
+                ),
+            ),
+        )
     }
 
-    fn read_records(
+    fn session_log_state(
         &self,
-        _: &BindIdentity,
-    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Err(broca_wal::WalError::Io(std::io::Error::other(
-            "poisoned WAL",
-        )))
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<
+        broca_store::session_log_evidence::SessionLogState,
+        broca_store::session_log_evidence::SessionLogError,
+    > {
+        broca_store::SessionAddressResolver::session_log_state(&*self.inventory, session, wal)
     }
 }
 
@@ -128,7 +173,7 @@ fn flags() -> Flags {
 struct Rig {
     daemon: tokio::io::DuplexStream,
     opens: Arc<NoLineages>,
-    history: Arc<PoisonWal>,
+    history: Arc<PoisonAddresses>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, ServeIoError>>,
 }
 
@@ -137,7 +182,7 @@ impl Rig {
         let (daemon, module) = tokio::io::duplex(1 << 20);
         let (reader, writer) = tokio::io::split(module);
         let opens = Arc::new(NoLineages::default());
-        let history = Arc::new(PoisonWal::default());
+        let history = Arc::new(PoisonAddresses::new());
         let system_one = classifier.then(|| {
             Arc::new(SystemOne::new(
                 Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
@@ -153,14 +198,13 @@ impl Rig {
             writer,
             "broca",
             Arc::new(NoSessions),
-            Arc::new(test_registry(LineageRegistry::new_with_reader(
-                opens.clone(),
-                history.clone(),
-                None,
-            ))),
+            Arc::new({
+                let registry = LineageRegistry::new(opens.clone());
+                registry.set_session_address_resolver(history.clone());
+                registry
+            }),
             VaultGauge::not_in_use(),
             None,
-            Default::default(),
             Default::default(),
             None,
             None,
@@ -400,7 +444,7 @@ async fn new_roles_are_sessionless_and_answer_only_unknown_method() {
         .bind_with_stamp(3, Some(&[("llm-runner", "v1")]), false, true)
         .await;
     assert_eq!(ordinary.header.ty, FrameType::Error);
-    assert!(rig.history.0.swap(0, Ordering::SeqCst) > 0);
+    assert!(rig.history.reads.swap(0, Ordering::SeqCst) > 0);
     for (channel, role) in [(1, "tool-provider"), (2, "permissions")] {
         let bound = rig.bind(channel, Some(&[(role, "v1")]), true).await;
         assert_eq!(
@@ -431,7 +475,7 @@ async fn new_roles_are_sessionless_and_answer_only_unknown_method() {
         }
     }
     assert_eq!(
-        rig.history.0.load(Ordering::SeqCst),
+        rig.history.reads.load(Ordering::SeqCst),
         0,
         "sessionless routes read session history"
     );

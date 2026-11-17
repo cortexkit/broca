@@ -8,28 +8,6 @@ use broca_module::serve::{
     SessionReadResponse, StatusResponse,
 };
 
-struct EmptyFlowHistory;
-impl broca_core::WalStore for EmptyFlowHistory {
-    fn wal_present(&self, _: &BrocaBindIdentity) -> Option<bool> {
-        Some(true)
-    }
-    fn live_wal_bytes(&self, _: &BrocaBindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
-        Ok(Some(0))
-    }
-    fn open(
-        &self,
-        _: &BrocaBindIdentity,
-    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
-        panic!("the frame admission fixture must not open an actor")
-    }
-    fn read_records(
-        &self,
-        _: &BrocaBindIdentity,
-    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-        Ok(vec![])
-    }
-}
-
 struct NoFlowActor;
 #[async_trait::async_trait]
 impl broca_module::registry::LineageOpener for NoFlowActor {
@@ -114,11 +92,7 @@ impl FlowFrames {
         Self {
             routes: Routes::new(true),
             handler: Arc::new(FlowSendHandler { sends: sender }),
-            registry: Arc::new(test_registry(LineageRegistry::new_with_reader(
-                Arc::new(NoFlowActor),
-                Arc::new(EmptyFlowHistory),
-                None,
-            ))),
+            registry: Arc::new(test_registry(LineageRegistry::new(Arc::new(NoFlowActor)))),
             writer,
             written,
             requests: JoinSet::new(),

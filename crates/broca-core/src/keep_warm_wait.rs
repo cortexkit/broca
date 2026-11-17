@@ -366,6 +366,134 @@ mod tests {
         }
     }
 
+    /// A Responses run's driver whose every warm reports `cached` cached and `fresh` uncached
+    /// input tokens. Each warm is due a second after the last send, which reads as now, so the
+    /// scheduler waits on the paused clock between warms rather than warming in a busy loop.
+    struct ResponsesDriver {
+        usage: broca_protocol::Usage,
+        warms: AtomicUsize,
+        stops: std::sync::Mutex<Vec<String>>,
+    }
+    impl ResponsesDriver {
+        fn new(cached: u64, fresh: u64) -> Arc<Self> {
+            Arc::new(Self {
+                usage: broca_protocol::Usage {
+                    input_tokens: Some(fresh),
+                    cached_input_tokens: Some(cached),
+                    ..Default::default()
+                },
+                warms: AtomicUsize::new(0),
+                stops: Default::default(),
+            })
+        }
+        fn warms(&self) -> usize {
+            self.warms.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl KeepWarmDriver<()> for ResponsesDriver {
+        fn note_stop(&self, _: &RunId, reason: &str) {
+            self.stops.lock().unwrap().push(reason.into());
+        }
+        fn timing(&self, _: &()) -> Result<WarmTiming, String> {
+            Ok(WarmTiming {
+                ttl_ms: 1000,
+                lead_ms: 0,
+                after_send_ms: Some(1000),
+            })
+        }
+        fn last_sent_at_ms(&self) -> Option<u64> {
+            Some(now_ms())
+        }
+        fn costs(&self, _: &()) -> Result<crate::keep_warm::WarmCosts, String> {
+            Ok(crate::keep_warm::WarmCosts {
+                warm: 0.0,
+                bust: 1.0,
+            })
+        }
+        async fn warm(&self, _: &(), _: &RunId) -> WarmTick {
+            self.warms.fetch_add(1, Ordering::SeqCst);
+            WarmTick::ResponsesSent {
+                usage: self.usage,
+                cost: 0.0,
+            }
+        }
+    }
+
+    /// Waits on `tools` while `driver` warms, as one tool wait of run `r` whose earlier waits
+    /// set `missed`.
+    async fn responses_wait(
+        driver: &Arc<ResponsesDriver>,
+        missed: &AtomicBool,
+        tools: impl Future<Output = ()>,
+    ) {
+        let dynamic: Arc<dyn KeepWarmDriver<()>> = driver.clone();
+        let unsupported = AtomicBool::new(false);
+        let run = RunId("r".into());
+        wait_tools(
+            tools,
+            Some(WarmWait {
+                driver: &dynamic,
+                config: &(),
+                run_id: &run,
+                cancel: None,
+                unsupported_logged: &unsupported,
+                warm_missed: missed,
+            }),
+        )
+        .await;
+    }
+
+    /// A Responses warm whose cached tokens are fewer than its uncached ones missed the cached
+    /// prefix: warming stops after that one warm, noted `warm_missed`, for this tool wait and
+    /// every later one of the run.
+    #[tokio::test(start_paused = true)]
+    async fn a_responses_warm_that_missed_the_prefix_stops_warming_for_the_run() {
+        let driver = ResponsesDriver::new(15_616, 164_384);
+        let missed = AtomicBool::new(false);
+        // The tools finish an hour after the scheduler stops, or after ten warms if it never
+        // does: room for many more warms either way.
+        responses_wait(&driver, &missed, async {
+            while driver.stops.lock().unwrap().is_empty() && driver.warms() < 10 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        })
+        .await;
+        assert_eq!(driver.warms(), 1);
+        assert_eq!(*driver.stops.lock().unwrap(), ["warm_missed"]);
+        assert!(missed.load(Ordering::SeqCst));
+        responses_wait(
+            &driver,
+            &missed,
+            tokio::time::sleep(Duration::from_secs(3600)),
+        )
+        .await;
+        assert_eq!(
+            driver.warms(),
+            1,
+            "a later tool wait of the run sends no warm"
+        );
+    }
+
+    /// A Responses warm that read most of its input from the cache keeps warming at its cadence.
+    #[tokio::test(start_paused = true)]
+    async fn a_responses_warm_that_hit_the_prefix_keeps_warming() {
+        let driver = ResponsesDriver::new(170_000, 10_000);
+        let missed = AtomicBool::new(false);
+        // The tools finish after three warms, or as soon as the scheduler stops, so a wrongly
+        // stopped scheduler fails the assertions below rather than leaving the wait hanging.
+        responses_wait(&driver, &missed, async {
+            while driver.warms() < 3 && driver.stops.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(driver.warms() >= 3, "warms: {}", driver.warms());
+        assert!(driver.stops.lock().unwrap().is_empty());
+        assert!(!missed.load(Ordering::SeqCst));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn live_budget_counts_failed_usage_before_a_successful_resend() {
         let driver = Arc::new(ChargedDriver {

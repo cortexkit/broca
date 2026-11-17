@@ -22,12 +22,11 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
-use broca_module::executor::{RunExecutor, RunJob};
+use broca_core::{FileLeaseStore, FileWalStore};
+use broca_module::executor::RunExecutor;
 include!("common/address_inventory.rs");
 use broca_module::{DefaultOpener, LineageRegistry};
 use subc_protocol::{FrameType, ModuleHelloBody};
-use tokio::sync::mpsc;
 
 /// Names the scenario a child copy of this binary is running. Absent in the parent.
 const ROLE_ENV: &str = "BROCA_LAUNCH_NONCE_TEST_ROLE";
@@ -74,15 +73,7 @@ fn assert_child_passed(test_name: &str, output: Output) {
 struct NoRuns;
 
 #[async_trait]
-impl RunExecutor for NoRuns {
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("the launch-nonce tests start no runs")
-    }
-}
+impl RunExecutor for NoRuns {}
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = broca_test_support::scratch_root()
@@ -105,9 +96,9 @@ async fn serve_until_hello(
 ) {
     let dir = scratch(tag);
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let _wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
-        DefaultOpener::new(lease, wal, Arc::new(NoRuns)),
+        DefaultOpener::new(lease, Arc::new(NoRuns)),
     ))));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut client_read, _client_write) = tokio::io::split(client);

@@ -14,10 +14,6 @@
 "Ok(Run { status: Unknown, delivered: None })"
 == run.admission
 "Ok(None)"
-== a log on today's storage
-Some(
-    false,
-)
 == send.status
 "Err(UnknownSend)"
 == session.read

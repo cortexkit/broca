@@ -8,7 +8,6 @@ use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
-use cortexkit_role_llm_runner::live::LiveEvent;
 use tokio::sync::mpsc;
 
 use super::*;
@@ -42,7 +41,7 @@ fn unit(seq: u64) -> LiveItem {
         ControlUnit::StepStarted {
             step_id: broca_protocol::StepId(seq),
         },
-        LiveEvent::DisplayReset,
+        None,
     )))
 }
 

@@ -1,4 +1,5 @@
 //! Person uploads and captured tool bytes cross the real daemon on each native wire shape.
+use broca_session_store::record::Record;
 use super::*;
 use broca_provider::spec::WireFamilyId;
 
@@ -499,7 +500,7 @@ async fn real_daemon_portable_media_recovery_after_kill_preserves_request_bytes(
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .filter(|record| matches!(record, Record::RunStart(_)))
             .count(),
         2,
         "recovery must continue the capture episode without starting another turn"
@@ -594,7 +595,7 @@ async fn real_daemon_legacy_no_profile_resume_keeps_tool_markers() {
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .filter(|record| matches!(record, Record::RunStart(_)))
             .count(),
         1
     );

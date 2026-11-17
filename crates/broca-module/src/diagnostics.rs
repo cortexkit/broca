@@ -103,47 +103,6 @@ pub fn initialize() {
     LazyLock::force(&TOOL_OUTAGES);
 }
 
-/// Called only for new durable records, never replay. Unrelated append variants do no work.
-pub(crate) fn observe_outage<'a>(record: &broca_wal::WalRecord, ring: impl FnOnce() -> &'a Ring) {
-    use broca_wal::{NoDispatchReason, WalRecord};
-    let (module, code, at) = match record {
-        WalRecord::ToolNoDispatch {
-            reason:
-                NoDispatchReason::Unavailable {
-                    module: Some(module),
-                    code: Some(code),
-                    ..
-                },
-            dispatched_at_ms,
-            ..
-        } => (module, code, *dispatched_at_ms),
-        WalRecord::ToolResult {
-            result,
-            finished_at_ms,
-            ..
-        } => match &result.output {
-            broca_protocol::ToolOutput::Error {
-                message,
-                module: Some(module),
-                code: Some(code),
-                nothing_sent: Some(true),
-                ..
-            } if result.is_error && message == broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE => {
-                (module, code, *finished_at_ms)
-            }
-            _ => return,
-        },
-        _ => return,
-    };
-    ring().record(Event {
-        module: module.clone(),
-        code: code.clone(),
-        at_ms: at
-            .and_then(|ms| i64::try_from(ms).ok())
-            .unwrap_or_else(now_ms),
-    });
-}
-
 #[derive(Clone, Debug)]
 pub struct Fence {
     pub session: String,
@@ -217,12 +176,5 @@ mod tests {
         assert_eq!(snapshot.events.len(), CAP);
         assert!(snapshot.truncated);
         assert!(snapshot.since_ms > 100);
-    }
-    #[test]
-    fn diagnostics_outage_match_ignores_unrelated_appends_without_resolving_ring() {
-        observe_outage(
-            &broca_wal::WalRecord::WriterClosed { writer_id: [0; 16] },
-            || panic!("unrelated record resolved outage ring"),
-        );
     }
 }

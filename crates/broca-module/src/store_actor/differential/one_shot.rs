@@ -4,12 +4,8 @@ use super::*;
 
 const LONG_IDLE: Duration = Duration::from_secs(3_600);
 
-async fn opened(
-    store: bool,
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<Arc<Notify>>,
-) -> Module {
-    module_options(store, steps, None, None, LONG_IDLE, gate).await
+async fn opened(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Module {
+    module_options(steps, None, None, LONG_IDLE, gate).await
 }
 
 async fn send(module: &Module, run_id: &str, text: &str, one_shot: bool) -> SendOutcome {
@@ -52,14 +48,14 @@ async fn closed(module: &Module) {
 #[tokio::test]
 async fn a_one_shot_closes_at_its_terminal_and_reads_back_alike() {
     let mut pages = Vec::new();
-    for store in [true] {
-        let module = opened(store, hello(), None).await;
+    {
+        let module = opened(hello(), None).await;
         assert!(matches!(
             send(&module, "r1", "first", true).await,
             SendOutcome::Active { .. }
         ));
         closed(&module).await;
-        if store {
+        {
             let session = module.load().await;
             assert!(session.operations.run.as_ref().unwrap().finished.is_some());
             assert_eq!(module.store_texts().await, ["first", "hello"]);
@@ -74,8 +70,8 @@ async fn a_one_shot_closes_at_its_terminal_and_reads_back_alike() {
 
 #[tokio::test]
 async fn an_ordinary_run_waits_for_idle_close_alike() {
-    for store in [true] {
-        let module = module_options(store, hello(), None, None, Duration::from_secs(1), None).await;
+    {
+        let module = module_options(hello(), None, None, Duration::from_secs(1), None).await;
         assert!(matches!(
             send(&module, "r1", "first", false).await,
             SendOutcome::Active { .. }
@@ -89,10 +85,9 @@ async fn an_ordinary_run_waits_for_idle_close_alike() {
 
 #[tokio::test]
 async fn a_live_subscriber_holds_a_one_shot_open_alike() {
-    for store in [true] {
+    {
         let gate = Arc::new(tokio::sync::Notify::new());
         let module = module_options(
-            store,
             hello(),
             None,
             None,
@@ -126,10 +121,10 @@ async fn a_live_subscriber_holds_a_one_shot_open_alike() {
 
 #[tokio::test]
 async fn queued_work_holds_a_one_shot_open_and_keeps_its_own_policy_alike() {
-    for store in [true] {
+    {
         for queued_one_shot in [false, true] {
             let gate = Arc::new(Notify::new());
-            let module = opened(store, hello(), Some(gate.clone())).await;
+            let module = opened(hello(), Some(gate.clone())).await;
             assert!(matches!(
                 send(&module, "r1", "first", true).await,
                 SendOutcome::Active { .. }
@@ -157,7 +152,7 @@ async fn queued_work_holds_a_one_shot_open_and_keeps_its_own_policy_alike() {
                 assert_eq!(module.registry.slot_state(&module.key), Some("open"));
             }
             assert!(module.registry.stop_and_seal().await);
-            if store {
+            {
                 assert_eq!(
                     module.store_texts().await,
                     ["first", "hello", "second", "again"]
@@ -169,10 +164,10 @@ async fn queued_work_holds_a_one_shot_open_and_keeps_its_own_policy_alike() {
 
 #[tokio::test]
 async fn a_one_shot_pause_stays_open_and_its_resume_keeps_the_hint_alike() {
-    for store in [true] {
+    {
         let mut steps = vec![auth_failure()];
         steps.extend(hello());
-        let module = opened(store, steps, None).await;
+        let module = opened(steps, None).await;
         assert!(matches!(
             send(&module, "r1", "first", true).await,
             SendOutcome::Active { .. }
@@ -185,7 +180,7 @@ async fn a_one_shot_pause_stays_open_and_its_resume_keeps_the_hint_alike() {
             SendOutcome::Active { .. }
         ));
         closed(&module).await;
-        if store {
+        {
             assert_eq!(module.store_texts().await, ["first", "hello"]);
         }
         assert!(module.registry.stop_and_seal().await);

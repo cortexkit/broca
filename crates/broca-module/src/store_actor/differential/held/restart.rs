@@ -356,11 +356,9 @@ async fn background_candidates_resume_an_untouched_restart_paused_store_session(
     let original = paused(true).await;
     let side = original.restarted().await;
     assert!(side.registry.slot_state(&side.key).is_none());
-    // No store session is supplied by the legacy index: only durable store candidates can
-    // discover this continuation. The observer below reads storage, never an actor route.
-    side.registry
-        .resume_restart_pauses(side.executor.wal.clone(), Vec::new())
-        .await;
+    // Only the store's durable candidates can discover this continuation. The observer below
+    // reads storage, never an actor route.
+    side.registry.enable_restart_resumes();
     side.registry.recover_store_crash_orphans().await.unwrap();
     ended_without_reading(&side, "r1").await;
     assert_eq!(side.executor.provider.inner.calls().len(), 1);
@@ -370,9 +368,7 @@ async fn background_candidates_resume_an_untouched_restart_paused_store_session(
 }
 
 /// A restart pause older than the continuation window is not continued on the new storage:
-/// the run ends Interrupted without a model call, and the send queued behind it starts. The
-/// old storage is not compared: it resumes every restart pause at its next start, so its
-/// pauses never age, and it gets no such limit.
+/// the run ends Interrupted without a model call, and the send queued behind it starts.
 #[tokio::test]
 async fn an_old_restart_pause_ends_interrupted_and_the_next_send_starts() {
     let two_hours_ms = 2 * 60 * 60 * 1000;

@@ -223,7 +223,6 @@ async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Ri
         Arc::new(test_registry(LineageRegistry::new(Arc::new(NoLineages)))),
         VaultGauge::not_in_use(),
         None,
-        crate::wal_archive::WalArchiveConfig::default(),
         crate::consumer_routes::ConsumerRoutes::default(),
         None,
         None,

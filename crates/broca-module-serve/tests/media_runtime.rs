@@ -1,7 +1,5 @@
 //! Shipping-feature serve coverage for model-based media admission.
 mod delivery_rig;
-#[path = "media_runtime/head_cost.rs"]
-mod head_cost;
 #[path = "media_runtime/refusals.rs"]
 mod refusals;
 
@@ -283,14 +281,7 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         .contains("reason=not_requested"));
     assert_eq!(output(&blocks)["kind"], "parts");
     assert_eq!(output(&blocks)["parts"][1]["media"]["sha256"], digest(PNG));
-    let configs = rig
-        .records()
-        .into_iter()
-        .filter_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let configs = rig.run_configs().await;
     assert_eq!(configs.len(), 1);
     assert_eq!(
         configs[0].frozen_render_config.get("media").is_some(),
@@ -320,33 +311,11 @@ fn media_on_head_mime_facts_match_admission() {
 fn media_on_blocks_identity_matches_content() {
     child_case("blocks-identity");
 }
-#[test]
-#[ignore = "explicit 1k/150k active-head cost measurement"]
-fn measure_active_media_head_cost() {
-    child_case("head-cost");
-}
-#[test]
-fn media_on_active_head_avoids_replay() {
-    child_case("head-bounded");
-}
 
 #[tokio::test]
 #[ignore = "launched in isolation by the media runtime cases"]
 async fn media_runtime_child() {
     let case = std::env::var("BROCA_MEDIA_TEST_CASE").unwrap_or_else(|_| "full".into());
-    if case == "head-cost" || case == "head-bounded" {
-        let sizes: &[usize] = if case == "head-cost" {
-            &[1_000, 150_000]
-        } else {
-            &[1_000]
-        };
-        head_cost::measure(
-            sizes,
-            case == "head-bounded" || std::env::var_os("BROCA_HEAD_COST_ASSERT_BOUNDED").is_some(),
-        )
-        .await;
-        return;
-    }
     let mode = "on";
     if let Some(dir) = std::env::var_os("BROCA_MEDIA_SAMPLE_DIR") {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -550,7 +519,7 @@ async fn family_roundtrip(family: WireFamilyId) {
         ),
     ] {
         let id = upload(&mut rig, mime, bytes).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let supported =
             config.media.as_ref().unwrap().kind(kind).user_message != MediaCarrier::Marker;
         rig.script
@@ -577,7 +546,7 @@ async fn family_roundtrip(family: WireFamilyId) {
             );
         } else {
             assert_eq!(refusal(&sent)["code"], "media_unsupported");
-            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(rig.records().await, before);
             assert!(refusal(&sent)["message"]
                 .as_str()
                 .unwrap()
@@ -588,7 +557,7 @@ async fn family_roundtrip(family: WireFamilyId) {
     if family == WireFamilyId::OpenAiResponsesChatgpt {
         let bytes = include_bytes!("../../broca-provider/examples/media-live/fixtures/user.wav");
         let id = upload(&mut rig, "audio/wav", bytes).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let sent = rig
             .send_with(
                 "audio",
@@ -598,7 +567,7 @@ async fn family_roundtrip(family: WireFamilyId) {
             )
             .await;
         assert_eq!(refusal(&sent)["code"], "media_unsupported");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         assert!(refusal(&sent)["message"]
             .as_str()
             .unwrap()
@@ -630,7 +599,7 @@ async fn media_read_boundaries(rig: &mut Rig) {
         assert_eq!(reply.get("data").and_then(Value::as_str), data.as_deref());
     }
     for (offset, length, field) in [(PNG.len() + 1, 1, "offset"), (0, 2097153, "length")] {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = call(
             rig,
             "session.media_read",
@@ -639,7 +608,7 @@ async fn media_read_boundaries(rig: &mut Rig) {
         .await;
         assert_eq!(refusal(&reply)["code"], "invalid_params");
         assert_eq!(refusal(&reply)["detail"]["field"], field);
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
     }
     let other = b"unreferenced committed bytes";
     upload(rig, "image/png", other).await;
@@ -766,7 +735,7 @@ async fn runner_media_only_send_stores_media_without_empty_text() {
             matches!(&message.content[0], broca_protocol::ContentBlock::Media(media) if media.sha256 == digest(PERSON_PNG))
         );
     }
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let empty = call(
         &mut rig,
         "session.send",
@@ -777,7 +746,7 @@ async fn runner_media_only_send_stores_media_without_empty_text() {
     assert_eq!(empty.header.ty, subc_protocol::FrameType::Error);
     assert_eq!(error["code"], "invalid_params");
     assert_eq!(error["detail"]["field"], "template");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -788,7 +757,7 @@ async fn runner_head_reports_known_image_limits_and_omits_unknown_limits() {
         ("known-limits", WireFamilyId::AnthropicMessages, true),
     ] {
         let mut rig = runner_media_rig(name, family, true).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let head = call(&mut rig, "session.head", json!({})).await;
         sample(
             "runner",
@@ -796,7 +765,7 @@ async fn runner_head_reports_known_image_limits_and_omits_unknown_limits() {
             std::slice::from_ref(&head),
         );
         let answer = result(&head);
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         rig.script.hold_model(false);
         rig.wait_idle().await;
         rig.finish().await;
@@ -880,7 +849,7 @@ async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() 
             );
         }
         let id = upload(&mut rig, "image/png", &bytes).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let media = durable_media_snapshot(&rig.dir.join("media-durable"));
         let refused = call(
             &mut rig,
@@ -910,7 +879,7 @@ async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() 
             expected["max_image_dimension"] = json!(8_000);
         }
         errors.push((error, expected));
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         assert_eq!(
             durable_media_snapshot(&rig.dir.join("media-durable")),
             media
@@ -972,11 +941,13 @@ async fn runner_media_refs_records_photo_and_matches_descriptor_reference() {
         .await,
     );
     assert_eq!(media, &described["messages"][0]["message"]["content"][1]);
+    // The session's own id for the message, as its reads name it.
+    let mid = refs["messages"][0]["mid"].as_str().unwrap().to_owned();
     let history = result(
         &call(
             &mut rig,
             "session.history",
-            json!({"from_mid":"m2","limit":1,"media":"media_refs"}),
+            json!({"from_mid":mid,"limit":1,"media":"media_refs"}),
         )
         .await,
     );

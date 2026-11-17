@@ -37,8 +37,8 @@ use std::{
 use broca_module::held_slots::{EntryMapper, HeldRunResumer, HeldSlots, SlotDelivery};
 use broca_module::held_withdrawals::{HeldWithdrawals, WithdrawTransport};
 use broca_module::late_results_puller::{
-    rebuild_store_from_sessions_with_progress, rebuild_store_from_wals_with_progress, FeedError,
-    FeedReply, HeldDelivery, LateResultsFeed, LateResultsIntake, RebuildReport,
+    rebuild_store_from_sessions_with_progress, FeedError, FeedReply, HeldDelivery, LateResultsFeed,
+    LateResultsIntake, RebuildReport,
 };
 use broca_module::late_results_store::LateResultsStore;
 use broca_protocol::BindIdentity;
@@ -159,8 +159,8 @@ pub struct HeldRuntime {
     pub slots: Arc<HeldSlots>,
     pub intake: Arc<LateResultsIntake>,
     pub store: Arc<LateResultsStore>,
-    /// The state root whose live WAL trees a rebuild scans.
-    wal_root: PathBuf,
+    /// The state root whose session storage a rebuild scans.
+    state_root: PathBuf,
     /// The store was missing or unreadable when this process opened it.
     needs_rebuild: bool,
     withdrawals: Arc<HeldWithdrawals>,
@@ -229,7 +229,6 @@ impl HeldRuntime {
     /// feeds on `conn`, delivering through `resumer`.
     pub fn build(
         state_root: &Path,
-        wal: Arc<broca_core::FileWalStore>,
         consumer_module: impl Into<String>,
         feed: Arc<dyn LateResultsFeed>,
         withdraw: Arc<dyn WithdrawTransport>,
@@ -239,19 +238,12 @@ impl HeldRuntime {
         let (store, needs_rebuild) = open_or_recreate(&path)?;
         let store = Arc::new(store);
         let slots = HeldSlots::new();
-        let withdrawals = HeldWithdrawals::new(store.clone(), wal.clone(), withdraw);
+        let withdrawals = HeldWithdrawals::new(store.clone(), withdraw);
         slots.with_withdrawals(withdrawals.clone());
         let mapper: Arc<EntryMapper> = Arc::new(broca_subc::late_entry_tool_result);
         let delivery: Arc<dyn HeldDelivery> =
             Arc::new(SlotDelivery::new(Arc::clone(&slots), resumer, mapper));
-        // The live WAL trees (`wal`, `wal-ephemeral`, `wal-durable`) are siblings under the
-        // state root, which is the parent of the ordinary tree the store was built on.
-        let wal_root = wal
-            .root()
-            .parent()
-            .map_or_else(|| state_root.to_path_buf(), Path::to_path_buf);
-        let intake =
-            LateResultsIntake::new(Arc::clone(&store), wal, consumer_module, delivery, feed);
+        let intake = LateResultsIntake::new(Arc::clone(&store), consumer_module, delivery, feed);
         // Until the rebuild below completes, no missing registration proves anything.
         intake.set_rebuilding(needs_rebuild);
         // A call that is held in a live batch joins its module's puller as soon as its held
@@ -271,7 +263,7 @@ impl HeldRuntime {
             slots,
             intake,
             store,
-            wal_root,
+            state_root: state_root.to_path_buf(),
             needs_rebuild,
             withdrawals,
             progress: Arc::new(Mutex::new(RebuildReport::default())),
@@ -306,18 +298,9 @@ impl HeldRuntime {
         }
         if self.needs_rebuild {
             loop {
-                let store = Arc::clone(&self.store);
-                let root = self.wal_root.clone();
-                let progress = self.progress.clone();
                 let started = std::time::Instant::now();
-                let scan = tokio::task::spawn_blocking(move || {
-                    let report = rebuild_store_from_wals_with_progress(&store, &root, |report| {
-                        *progress.lock().expect("rebuild progress") = report.clone();
-                    })?;
-                    Ok::<_, String>(report)
-                });
                 let scan = async {
-                    let mut report = scan.await.map_err(|error| error.to_string())??;
+                    let mut report = RebuildReport::default();
                     let runtime = registry.store_runtime();
                     if let Some(runtime) = &runtime {
                         self.intake.set_session_store(runtime.clone());
@@ -325,7 +308,7 @@ impl HeldRuntime {
                     }
                     rebuild_store_from_sessions_with_progress(
                         &self.store,
-                        &self.wal_root,
+                        &self.state_root,
                         runtime.as_deref(),
                         &mut report,
                         |report| {
@@ -356,7 +339,7 @@ impl HeldRuntime {
                             registered = report.registered,
                             skipped_by_floor = report.skipped_by_floor,
                             elapsed_ms = started.elapsed().as_millis() as u64,
-                            "late-results intake rebuilt from WALs and session storage"
+                            "late-results intake rebuilt from session storage"
                         );
                         break;
                     }

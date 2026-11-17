@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::keys::Cipher;
 use broca_session_store::record::Placement;
@@ -39,26 +39,20 @@ struct Module {
 
 async fn module(dir: &Path, cipher: Cipher) -> Module {
     std::fs::create_dir_all(dir).unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn crate::executor::RunExecutor> = Arc::new(executor(Vec::new(), None));
     let runtime = Arc::new(
         StoreRuntime::open(dir, deployment_in(cipher), Arc::clone(&executor), IDLE)
             .await
             .unwrap(),
     );
-    let registry = crate::registry::LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::clone(&runtime)),
-        ),
-        wal,
-        None,
-    );
+    let registry = crate::registry::LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(Arc::clone(&runtime)),
+    ));
     Module { runtime, registry }
 }
 

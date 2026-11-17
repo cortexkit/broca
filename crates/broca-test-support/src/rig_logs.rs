@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::Path;
 
-/// Log tails, watchdog stall files and the WAL file inventory of a real-daemon rig.
+/// Log tails, watchdog stall files and the stored-session inventory of a real-daemon rig.
 /// `data_home` is the `cortexkit` directory under the daemon's `XDG_DATA_HOME`;
 /// `state_root` is broca's `BROCA_STATE_ROOT`, which may live elsewhere.
 pub fn rig_log_diagnostics(data_home: &Path, state_root: &Path) -> String {
@@ -38,7 +38,7 @@ pub fn rig_log_diagnostics(data_home: &Path, state_root: &Path) -> String {
         &state_root.join("logs"),
         |name| name.starts_with("stall-") && name.ends_with(".jsonl"),
     );
-    append_wal_inventory(&mut output, &state_root.join("wal"));
+    append_session_inventory(&mut output, state_root);
     output
 }
 
@@ -132,32 +132,42 @@ fn append_matching_file_tails(
     }
 }
 
-fn append_wal_inventory(output: &mut String, wal_dir: &Path) {
-    output.push_str(&format!(
-        "--- WAL file inventory: {} ---\n",
-        wal_dir.display()
-    ));
-    let entries = match std::fs::read_dir(wal_dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            output.push_str(&format!("unavailable: {error}\n"));
-            return;
+/// The sessions each of the new storage's roots under `state_root` holds: one line per session
+/// head, with its size. The roots' folder names are the storage's (`session-store` and its
+/// durable and ephemeral siblings).
+fn append_session_inventory(output: &mut String, state_root: &Path) {
+    for root in [
+        "session-store",
+        "session-store-durable",
+        "session-store-ephemeral",
+    ] {
+        let heads = state_root.join(root).join("heads");
+        output.push_str(&format!(
+            "--- stored session inventory: {} ---\n",
+            heads.display()
+        ));
+        let entries = match std::fs::read_dir(&heads) {
+            Ok(entries) => entries,
+            Err(error) => {
+                output.push_str(&format!("unavailable: {error}\n"));
+                continue;
+            }
+        };
+        let mut files = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("head"))
+            .filter_map(|path| {
+                let size = std::fs::metadata(&path).ok()?.len();
+                Some((path, size))
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        if files.is_empty() {
+            output.push_str("(no sessions)\n");
         }
-    };
-    let mut files = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter_map(|path| {
-            let size = std::fs::metadata(&path).ok()?.len();
-            Some((path, size))
-        })
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    if files.is_empty() {
-        output.push_str("(no WAL files)\n");
-    }
-    for (path, size) in files {
-        output.push_str(&format!("{}: {size} bytes\n", path.display()));
+        for (path, size) in files {
+            output.push_str(&format!("{}: {size} bytes\n", path.display()));
+        }
     }
 }
 

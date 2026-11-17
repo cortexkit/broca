@@ -46,104 +46,12 @@ fn render(request: &broca_core::RecordedRequest) -> Vec<u8> {
     broca_core::provider::Provider::render_request(&provider, &request.opts)
 }
 
-/// Render each fixture attempt from its explicit live config rather than deriving it from
-/// the store's recorded requests. The second step hits A's quota wall before succeeding on B.
-fn moved_history() -> (broca_session_convert::Converted, Vec<Vec<u8>>) {
-    let mut history = finished_head();
-    let WalRecord::RunStarted { config, .. } = &mut history[0] else {
-        unreachable!()
-    };
-    config.auth_selection = Some(selection("A"));
-    config.frozen_render_config = serde_json::to_value(frozen("A")).unwrap();
-    let original = config.clone();
-    let mut moved = original.clone();
-    moved.auth_selection = Some(selection("B"));
-    moved.frozen_render_config = serde_json::to_value(frozen("B")).unwrap();
-    let mut records = Vec::new();
-    let mut bodies = Vec::new();
-    for item in history {
-        let WalRecord::ModelAttemptFinished { step_id, .. } = &item else {
-            records.push(item);
-            continue;
-        };
-        let step = step_id.0;
-        let render_attempt = |config: &broca_wal::RunConfig, records: &[WalRecord]| {
-            crate::wal_render::render_step_with_lineage(
-                None,
-                records,
-                config,
-                "r1",
-                step,
-                (step == 2).then_some(256),
-                None,
-            )
-            .unwrap()
-            .2
-        };
-        let body = render_attempt(if step == 1 { &original } else { &moved }, &records);
-        if step == 2 {
-            let body = render_attempt(&original, &records);
-            records.push(record(json!({
-                "type":"model_attempt_finished", "step_id":step, "attempt":0,
-                "outcome":"http_error", "http_status":429,
-                "ts_ms":crate::actor::epoch_ms(), "sent_at_ms":crate::actor::epoch_ms(),
-                "request_body_len":body.len(),
-                "request_body_sha256":broca_core::render::request_digest_hex(&body),
-                "response_body_len":0,
-                "response_body_sha256":broca_core::render::request_digest_hex(b""),
-                "telemetry":{"account_observation":{
-                    "account_ref":"A", "limit":{
-                        "kind":"account_limit_exhausted", "limit_window":"five_hour",
-                        "observed_at_ms":crate::actor::epoch_ms(),
-                        "resets_at_ms":crate::actor::epoch_ms() + 3_600_000,
-                    },
-                }},
-            })));
-            bodies.push(body);
-        }
-        let mut attempt = serde_json::to_value(item).unwrap();
-        attempt["attempt"] = json!(if step == 1 { 0 } else { 1 });
-        attempt["request_body_len"] = json!(body.len());
-        attempt["request_body_sha256"] = json!(broca_core::render::request_digest_hex(&body));
-        records.push(record(attempt));
-        bodies.push(body);
-    }
-    let frames: Vec<_> = records
-        .into_iter()
-        .enumerate()
-        .map(|(at, record)| FramedRecord {
-            seq: at as u64 + 1,
-            fence: 0,
-            record,
-        })
-        .collect();
-    let mut converted = broca_session_convert::convert(&frames, None).unwrap();
-    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
-    let moved_at = converted
-        .records
-        .iter()
-        .rposition(|record| matches!(record, Record::Attempt(_)))
-        .unwrap();
-    // Account moves belong to the store format. The legacy fixture converter only accepts
-    // config refreezes before the first call, so insert the move into the converted history.
-    converted.records.splice(
-        moved_at..moved_at,
-        [
-            Record::ConfigRefrozen(broca_session_store::record::ConfigRefrozen {
-                run_id: "r1".into(),
-                ts_ms: None,
-                renderer_version: moved.renderer_version,
-                render_config: moved.frozen_render_config.clone(),
-            }),
-            Record::AuthRefrozen(broca_session_store::record::AuthRefrozen {
-                run_id: "r1".into(),
-                ts_ms: None,
-                auth_selection: serde_json::to_value(moved.auth_selection.as_ref().unwrap())
-                    .unwrap(),
-            }),
-        ],
-    );
-    (converted, bodies)
+/// The `moved-account` history and the requests its three attempts sent. Its first step ran
+/// on account A; its second hit A's usage limit, moved to B, and succeeded there.
+fn moved_history() -> (Converted, Vec<Vec<u8>>) {
+    let mut history = converted("moved-account");
+    let bodies = std::mem::take(&mut history.bodies);
+    (history, bodies)
 }
 
 async fn idle_warm_uses_moved_account_and_recorded_bytes(cipher: Cipher) {
@@ -155,7 +63,7 @@ async fn idle_warm_uses_moved_account_and_recorded_bytes(cipher: Cipher) {
         ..Default::default()
     });
     let read_clock = clock.clone();
-    let mut actor = reopened_converted(&side, converted, cipher, executor.clone())
+    let mut actor = reopened(&side, converted, cipher, executor.clone())
         .await
         .with_clock(Arc::new(move || read_clock.load(Ordering::SeqCst)));
     let rebuilt = actor.recorded_warm_request().await.unwrap();
@@ -192,7 +100,7 @@ async fn idle_warm_uses_moved_account_and_recorded_bytes(cipher: Cipher) {
 async fn recorded_request_uses_config_at_its_attempt(cipher: Cipher) {
     let side = super::super::super::side(false, cipher).await;
     let (converted, bodies) = moved_history();
-    let actor = reopened_converted(&side, converted, cipher, Arc::new(Warming::default())).await;
+    let actor = reopened(&side, converted, cipher, Arc::new(Warming::default())).await;
     // The current account selection reflects the later move. Rebuilding an older attempt must
     // not borrow that account.
     let stored = actor.session.open_log_records().await.unwrap();
@@ -233,12 +141,11 @@ async fn recorded_request_uses_config_at_its_attempt(cipher: Cipher) {
 
 async fn recorded_request_without_refreezes_keeps_pinned_bytes(cipher: Cipher) {
     let side = super::super::super::side(false, cipher).await;
-    let records = finished_head();
     let actor = head(
         &side,
         cipher,
         Arc::new(Warming::default()),
-        &records,
+        converted("finished-head"),
         Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
     )
     .await;

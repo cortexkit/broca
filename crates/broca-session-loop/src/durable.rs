@@ -122,6 +122,10 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
             .await
     }
 
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        self.writer.caught_up().await
+    }
+
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
         self.writer.send_records(submission_id).await
     }

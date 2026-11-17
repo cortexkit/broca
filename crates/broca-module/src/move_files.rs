@@ -1091,7 +1091,6 @@ impl CutArtifacts for FileCutArtifacts {
                     &self.installations(&wal_plans, &paths),
                     self.export.as_ref(),
                     |session| {
-                        self.registry.handle().invalidate_history_caches(session);
                         if let Some(history) =
                             broca_core::WalStore::served_history(self.wal.as_ref())
                         {
@@ -1110,7 +1109,6 @@ impl CutArtifacts for FileCutArtifacts {
                         migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
                             .map_err(|error| error.to_string())?;
                         self.driver.drop_projection(session)?;
-                        self.registry.handle().invalidate_history_caches(session);
                         if let Some(history) =
                             broca_core::WalStore::served_history(self.wal.as_ref())
                         {

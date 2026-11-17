@@ -184,16 +184,6 @@ impl BrocaSubject {
         sessions.sort();
         for session in sessions {
             output.push_str(&self.session_evidence(&session, false));
-            let root = self
-                .shared
-                .session_roots
-                .lock()
-                .unwrap()
-                .get(&session)
-                .cloned();
-            if let Some(root) = root {
-                session_client::append_session_wal(&mut output, &root.join("wal"), &session);
-            }
         }
         output
     }

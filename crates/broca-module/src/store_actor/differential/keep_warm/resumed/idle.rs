@@ -18,15 +18,11 @@ cipher_tests!(
 
 async fn idle_warm_recognises_an_adopted_head(cipher: Cipher) {
     let side = super::super::side(false, cipher).await;
-    let mut records = finished_head();
-    if let WalRecord::RunStarted { session_class, .. } = &mut records[0] {
-        *session_class = None;
-    }
     let mut actor = head(
         &side,
         cipher,
         Arc::new(Warming::default()),
-        &records,
+        converted("finished-head-unclassed"),
         Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
     )
     .await
@@ -68,25 +64,14 @@ async fn idle_warm_recognises_an_adopted_head(cipher: Cipher) {
     side.registry.stop_and_seal().await;
 }
 
-fn finished_head() -> Vec<WalRecord> {
-    let mut records = history(true);
-    if let WalRecord::RunStarted { session_class, .. } = &mut records[0] {
-        *session_class = Some("head".into());
-    }
-    records.push(record(
-        json!({"type":"run_finished", "reason":"completed", "usage":{}}),
-    ));
-    records
-}
-
 async fn head(
     side: &super::super::Side,
     cipher: Cipher,
     executor: Arc<Warming>,
-    records: &[WalRecord],
+    history: Converted,
     clock: Arc<AtomicU64>,
 ) -> StoreActor<LocalBackend> {
-    reopened(side, records, cipher, executor)
+    reopened(side, history, cipher, executor)
         .await
         .with_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
 }
@@ -104,13 +89,13 @@ async fn warm(actor: &mut StoreActor<LocalBackend>) -> crate::actor::WarmOutcome
 
 async fn idle_head_uses_hour_lifetime_and_stops_at_durable_cap(cipher: Cipher) {
     let side = super::super::side(false, cipher).await;
-    let records = finished_head();
+    let history = converted("finished-head");
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let executor = Arc::new(Warming {
         clock: Some(clock.clone()),
         ..Default::default()
     });
-    let mut actor = head(&side, cipher, executor.clone(), &records, clock.clone()).await;
+    let mut actor = head(&side, cipher, executor.clone(), history, clock.clone()).await;
     let sent = actor
         .session
         .operations()
@@ -143,13 +128,13 @@ async fn idle_head_uses_hour_lifetime_and_stops_at_durable_cap(cipher: Cipher) {
 
 async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: Cipher) {
     let side = super::super::side(false, cipher).await;
-    let records = finished_head();
+    let history = converted("finished-head");
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let executor = Arc::new(Warming {
         clock: Some(clock.clone()),
         ..Default::default()
     });
-    let mut actor = head(&side, cipher, executor.clone(), &records, clock.clone()).await;
+    let mut actor = head(&side, cipher, executor.clone(), history, clock.clone()).await;
     let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
     let billing = crate::store_billing::StoreBilling {
         index: export.clone(),
@@ -279,7 +264,7 @@ async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: 
 
 async fn idle_real_run_cancels_timer_and_end_rearms(cipher: Cipher) {
     let side = super::super::side(false, cipher).await;
-    let records = finished_head();
+    let history = converted("finished-head");
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let mut store = super::super::super::executor(
         vec![crate::store_actor::tests::text_step("next", "done")],
@@ -291,7 +276,7 @@ async fn idle_real_run_cancels_timer_and_end_rearms(cipher: Cipher) {
         store: Some(store),
         ..Default::default()
     });
-    let mut actor = head(&side, cipher, executor, &records, clock).await;
+    let mut actor = head(&side, cipher, executor, history, clock).await;
     actor.arm_idle_warm().await;
     assert!(side.registry.handle().has_idle_warm(&bind()));
     let mut start = actor
@@ -318,7 +303,7 @@ async fn idle_real_run_cancels_timer_and_end_rearms(cipher: Cipher) {
 async fn idle_warm_failure_and_no_cache_read_stop(cipher: Cipher) {
     for no_cache in [false, true] {
         let side = super::super::side(false, cipher).await;
-        let records = finished_head();
+        let history = converted("finished-head");
         let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
         let executor = Arc::new(Warming {
             clock: Some(clock.clone()),
@@ -326,7 +311,7 @@ async fn idle_warm_failure_and_no_cache_read_stop(cipher: Cipher) {
             fail: !no_cache,
             ..Default::default()
         });
-        let mut actor = head(&side, cipher, executor, &records, clock.clone()).await;
+        let mut actor = head(&side, cipher, executor, history, clock.clone()).await;
         actor.arm_idle_warm().await;
         assert!(side.registry.handle().has_idle_warm(&bind()));
         let sent = actor
@@ -358,25 +343,16 @@ async fn idle_warm_failure_and_no_cache_read_stop(cipher: Cipher) {
 async fn idle_warm_never_arms_off_non_head_or_one_shot(cipher: Cipher) {
     for case in ["off", "non_head", "one_shot"] {
         let side = super::super::side(false, cipher).await;
-        let mut records = finished_head();
-        if let WalRecord::RunStarted {
-            session_class,
-            keep_warm,
-            ..
-        } = &mut records[0]
-        {
-            if case == "off" {
-                *keep_warm = Some(broca_protocol::request::KeepWarm::Off);
-            }
-            if case == "non_head" {
-                *session_class = None;
-            }
-        }
+        let history = converted(match case {
+            "off" => "finished-head-keep-warm-off",
+            "non_head" => "finished-head-unclassed",
+            _ => "finished-head",
+        });
         let mut actor = head(
             &side,
             cipher,
             Arc::new(Warming::default()),
-            &records,
+            history,
             Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
         )
         .await;

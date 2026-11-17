@@ -20,8 +20,6 @@ pub mod billing_routing;
 pub mod bundle;
 pub mod bus_events;
 pub mod bus_events_nats;
-pub mod cache_diagnose;
-pub mod cache_dump;
 pub mod cache_routing;
 pub mod cache_warm;
 pub mod catalog_refresh;
@@ -36,7 +34,6 @@ pub mod config;
 pub mod config_home;
 pub mod consumer_routes;
 pub mod context_management;
-pub mod conversion_ledger;
 pub mod held_runtime;
 pub mod keep_warm_quota;
 pub mod llm_tools;
@@ -46,13 +43,11 @@ pub mod opencode_go_identity;
 pub mod provider_overrides;
 pub mod refusal_fallback_config;
 pub mod routing_capabilities;
-pub mod run_routing;
 mod scope_workdir;
 pub mod send_audit;
 pub mod serve;
 mod session_address_health;
 pub mod session_class;
-pub mod session_conversion;
 mod session_inventory;
 pub mod session_lookup;
 mod session_readers;
@@ -62,15 +57,12 @@ pub mod state_root_lock;
 pub mod step_events;
 pub mod store_key;
 pub mod store_layout;
-pub mod store_move;
 pub mod store_restore;
 pub mod system_one;
-pub mod trajectory;
 pub mod transport_config;
 pub mod usage_observe;
 pub mod vault_audit;
 pub mod vault_config;
-pub mod wal_archive;
 // Moved into broca-module with `claude_code_identity`, for the same reason.
 pub use broca_module::wal_render;
 pub mod wire;
@@ -83,7 +75,6 @@ pub use cache_routing::{
 pub use catalog_refresh::{spawn_catalog_poll, CatalogPoller, CATALOG_POLL_INTERVAL};
 pub use client::SessionClient;
 pub use consumer_routes::ConsumerRoutes;
-pub use run_routing::start_mode_after_auth;
 pub use serve::{
     serve_connection, serve_connection_configured, serve_connection_with_catalog, ServeEnd,
     ServeIoError,

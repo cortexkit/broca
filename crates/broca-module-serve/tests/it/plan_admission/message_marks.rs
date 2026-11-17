@@ -176,7 +176,7 @@ async fn invalid_or_unauthorized_marks_refuse_before_any_write() {
     .into_iter()
     .enumerate()
     {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = send_plan(
             &mut rig,
             8,
@@ -192,11 +192,11 @@ async fn invalid_or_unauthorized_marks_refuse_before_any_write() {
         }
         assert_eq!(error["code"], "invalid_params", "{error}");
         assert_eq!(error["detail"]["field"], field, "{error}");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
     }
     rig.finish().await;
     let mut rig = Rig::start("unscoped-agent-words").await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = send_plan(
         &mut rig,
         7,
@@ -208,7 +208,7 @@ async fn invalid_or_unauthorized_marks_refuse_before_any_write() {
     .await;
     let error = error_body(&reply);
     assert_eq!(error["detail"]["field"], "speaks_for", "{error}");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -237,7 +237,7 @@ async fn retry_fixture(tag: &str, marks: Value, hold: bool) -> (Rig, Value, subc
 async fn notice_retry_without_notice_refuses_notice_without_writing() {
     let (mut rig, plan, _) =
         retry_fixture("notice-retry-diff", json!({"notice":true}), false).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = send_plan(
         &mut rig,
         8,
@@ -250,7 +250,7 @@ async fn notice_retry_without_notice_refuses_notice_without_writing() {
     let error = error_body(&reply);
     assert_eq!(error["code"], "send_id_reuse", "{error}");
     assert_eq!(error["detail"]["field"], "notice", "{error}");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     sample("marks-notice-reuse.json", &reply);
     rig.finish().await;
 }
@@ -267,12 +267,12 @@ async fn changed_speaks_for_retry_refuses_speaks_for_first_without_writing() {
         json!({"speaks_for":{"agent_id":"ada"}}),
         json!({"notice":true}),
     ] {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), marks).await;
         let error = error_body(&reply);
         assert_eq!(error["code"], "send_id_reuse", "{error}");
         assert_eq!(error["detail"]["field"], "speaks_for", "{error}");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         sample("marks-speaks-for-reuse.json", &reply);
     }
     rig.finish().await;
@@ -288,18 +288,18 @@ async fn a_changed_speaker_name_refuses_the_retry_naming_speaks_for() {
         json!({"speaks_for":{"agent_id":"Ada","name":"Ada King"},"notice":true}),
         json!({"speaks_for":{"agent_id":"Ada"},"notice":true}),
     ] {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), marks).await;
         let error = error_body(&reply);
         assert_eq!(error["code"], "send_id_reuse", "{error}");
         assert_eq!(error["detail"]["field"], "speaks_for", "{error}");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         sample("named-marks-reuse.json", &reply);
     }
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), named).await;
     assert_eq!(reply.body, sent.body);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
@@ -348,25 +348,13 @@ async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
     let entry = &result(&read)["messages"][0];
     assert_eq!(entry["speaks_for"], marks["speaks_for"], "{entry}");
     assert_eq!(entry["notice"], true, "{entry}");
-    let records = broca_core::WalStore::read_records(
-        &broca_core::FileWalStore::new(rig.dir.join("wal")),
-        &rig.session,
-    )
-    .unwrap();
-    let named: Vec<_> = records
-        .iter()
-        .filter(|frame| {
-            frame
-                .record
-                .required_features()
-                .contains(&broca_wal::framing::SPEAKS_FOR_NAME_FEATURE)
-        })
-        .collect();
+    let records = rig.records().await;
     assert!(
-        named
-            .iter()
-            .any(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. })),
-        "the run's start records the named speaker behind the name reader: {records:?}"
+        records.iter().any(|record| matches!(
+            record,
+            Record::RunStart(start) if start.named_speaker == Some(true)
+        )),
+        "the run's start records the named speaker: {records:?}"
     );
     assert!(rig.registry().stop_and_seal().await);
     let mut rig = rig.restart().await;
@@ -388,10 +376,10 @@ async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
 async fn identical_marks_retry_replays_original_reply_without_writing() {
     let marks = json!({"speaks_for":{"agent_id":"Ada"}});
     let (mut rig, plan, sent) = retry_fixture("identical-mark-retry", marks.clone(), true).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), marks).await;
     assert_eq!(reply.body, sent.body);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
@@ -402,10 +390,10 @@ async fn identical_marks_retry_replays_original_reply_without_writing() {
 async fn notice_absent_and_false_retry_replay_original_reply_without_writing() {
     let (mut rig, plan, sent) = retry_fixture("false-mark-retry", json!({}), true).await;
     for marks in [json!({"notice":false}), json!({})] {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), marks).await;
         assert_eq!(reply.body, sent.body);
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
     }
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
@@ -433,7 +421,7 @@ async fn queued_marks_retries_compare_normalized_marks_without_writing() {
     ] {
         let pending = send_plan(&mut rig, 8, key, "queued words", Some(&plan), marks.clone()).await;
         assert_eq!(result(&pending)["state"], "pending");
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let retry = send_plan(&mut rig, 8, key, "queued words", Some(&plan), marks).await;
         assert_eq!(retry.body, pending.body);
         let changed = send_plan(&mut rig, 8, key, "queued words", Some(&plan), changed).await;
@@ -444,7 +432,7 @@ async fn queued_marks_retries_compare_normalized_marks_without_writing() {
         } else {
             assert_eq!(changed.body, pending.body);
         }
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
     }
     rig.script.hold_model(false);
     rig.wait_idle().await;
@@ -473,7 +461,7 @@ async fn assert_undeclared_notice_member(wanted: &str) {
         if field != wanted {
             continue;
         }
-        let before = std::fs::read(&rig.wal_path).unwrap_or_default();
+        let before = rig.records().await;
         let reply = send_plan(&mut rig, 8, "undeclared", "words", Some(&plan), extra).await;
         assert_eq!(
             reply.header.ty,
@@ -485,7 +473,7 @@ async fn assert_undeclared_notice_member(wanted: &str) {
         assert_eq!(error["code"], "invalid_params");
         assert_eq!(error["detail"]["field"], field, "{error}");
         sample(&format!("undeclared-{field}.after.json"), &reply);
-        assert_eq!(std::fs::read(&rig.wal_path).unwrap_or_default(), before);
+        assert_eq!(rig.records().await, before);
     }
     assert!(admitter.calls().is_empty());
     rig.finish().await;
@@ -509,7 +497,7 @@ async fn undeclared_plan_yields_refuses_before_any_write() {
 #[tokio::test]
 async fn undeclared_tag_selector_names_tag_before_lookup_without_writing() {
     let mut rig = Rig::start("undeclared-tag-selector").await;
-    let before = std::fs::read(&rig.wal_path).unwrap_or_default();
+    let before = rig.records().await;
     let reply = rig
         .request(
             7,
@@ -521,7 +509,7 @@ async fn undeclared_tag_selector_names_tag_before_lookup_without_writing() {
     assert_eq!(error["code"], "invalid_params");
     assert_eq!(error["detail"]["field"], "tag", "{error}");
     sample("undeclared-tag.after.json", &reply);
-    assert_eq!(std::fs::read(&rig.wal_path).unwrap_or_default(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -585,15 +573,13 @@ async fn marks_follow_steered_queued_and_riding_sends_into_reader_facts() {
             "{}",
             String::from_utf8_lossy(&sent.body)
         );
-        assert!(rig.records().iter().any(|record| match record {
-            broca_wal::WalRecord::Steered {
-                message_marks: Some(stored),
-                ..
-            } if delivery == "steer" => serde_json::to_value(stored).unwrap() == marks,
-            broca_wal::WalRecord::Queued {
-                message_marks: Some(stored),
-                ..
-            } if delivery != "steer" => serde_json::to_value(stored).unwrap() == marks,
+        assert!(rig.records().await.iter().any(|record| match record {
+            Record::Steer(steer) if delivery == "steer" => {
+                steer.message_marks.as_ref() == Some(&marks)
+            }
+            Record::QueuedSend(send) if delivery != "steer" => {
+                send.message_marks.as_ref() == Some(&marks)
+            }
             _ => false,
         }));
         rig.script.hold_tool(false);
@@ -632,29 +618,30 @@ async fn marks_follow_steered_queued_and_riding_sends_into_reader_facts() {
                 .expect("the riding send retains its own agent attribution");
             assert_eq!(notice["speaks_for"], marks["speaks_for"]);
             assert!(notice.get("notice").is_none());
-            let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
-            let records = broca_core::WalStore::read_records(&wal, &rig.session).unwrap();
-            let projected =
-                broca_core::project_control_with_mids(&records, &mut Default::default()).unwrap();
-            let event = projected
+            let frames = rig
+                .subscribe_collect_until(
+                    20,
+                    json!({"from":"start"}),
+                    std::time::Duration::from_millis(20),
+                    |frame| {
+                        serde_json::from_slice::<serde_json::Value>(&frame.body)
+                            .is_ok_and(|value| value["event"]["type"] == "run_finished")
+                    },
+                )
+                .await;
+            let event = frames
                 .iter()
-                .find_map(|placed| match &placed.event {
-                    cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(notice) => {
-                        Some(notice)
-                    }
-                    _ => None,
-                })
+                .filter_map(|frame| serde_json::from_slice::<serde_json::Value>(&frame.body).ok())
+                .find(|value| value["event"]["type"] == "notice_delivered")
+                .map(|value| value["event"].clone())
                 .expect("the riding send emits its durable delivery event");
             if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
                 let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cortexkit/internal-docs/runner-0821-samples/notice-delivered.after.json");
-                std::fs::write(path, serde_json::to_vec(event).unwrap()).unwrap();
+                std::fs::write(path, serde_json::to_vec(&event).unwrap()).unwrap();
             }
             // llm-runner contract 9.7.2: notice_delivered omits delivered_as for tool_result.
-            assert_eq!(event.delivered_as, None);
-            assert_eq!(
-                serde_json::to_value(&event.speaks_for).unwrap(),
-                marks["speaks_for"]
-            );
+            assert!(event.get("delivered_as").is_none(), "{event}");
+            assert_eq!(event["speaks_for"], marks["speaks_for"]);
         } else {
             let entry = facts["messages"]
                 .as_array()
@@ -687,7 +674,7 @@ async fn non_owner_and_automated_routes_cannot_carry_agent_words_without_writes(
     ] {
         rig.bind_with_scope(channel, Some(principal), Some(stamp))
             .await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = send_plan(
             &mut rig,
             channel,
@@ -700,7 +687,7 @@ async fn non_owner_and_automated_routes_cannot_carry_agent_words_without_writes(
         let error = error_body(&reply);
         assert_eq!(error["code"], "invalid_params", "{error}");
         assert_eq!(error["detail"]["field"], "speaks_for", "{error}");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
     }
     rig.finish().await;
 }

@@ -13,7 +13,6 @@ use cortexkit_role_llm_runner::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
 
 use crate::{
     registry::LineageKey,
@@ -94,179 +93,6 @@ fn media(media: &MediaRef) -> Reference {
         width: media.width.map(u64::from),
         height: media.height.map(u64::from),
     }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct RowMetadata {
-    client_message_id: Option<String>,
-    pub(crate) sender: Option<String>,
-    tool_pins: BTreeMap<String, broca_wal::DispatchSchemaPin>,
-}
-
-fn send_metadata(
-    digest: Option<&str>,
-    principal: Option<&broca_protocol::BindPrincipal>,
-) -> RowMetadata {
-    RowMetadata {
-        client_message_id: digest.and_then(broca_core::digest_client_message_id),
-        sender: match principal {
-            Some(broca_protocol::BindPrincipal::Reserved { module_id }) => Some(module_id.clone()),
-            _ => None,
-        },
-        tool_pins: Default::default(),
-    }
-}
-
-/// Sender metadata and tool schema pins are durable beside message bodies. Reuse
-/// replay placement so held messages and their dispatch facts keep the same ordinals.
-pub(crate) fn metadata(
-    records: &[broca_wal::WalRecord],
-) -> Result<BTreeMap<u64, RowMetadata>, ServeError> {
-    use broca_core::placement::{AppendKind, Placement, PlacementAction};
-    use broca_wal::WalRecord;
-    let mut placement = Placement::default();
-    let mut queued = BTreeMap::new();
-    let mut senders = BTreeMap::new();
-    let mut pending = VecDeque::new();
-    let mut rows = BTreeMap::new();
-    let mut assistant = None;
-    let mut tool_pins: BTreeMap<u64, BTreeMap<String, broca_wal::DispatchSchemaPin>> =
-        BTreeMap::new();
-    for record in records {
-        let mut current = RowMetadata::default();
-        match record {
-            WalRecord::DeliveryOrdered {
-                submission_id,
-                sent_by,
-                ..
-            } => {
-                senders.insert(submission_id.0.clone(), sent_by.clone());
-            }
-            WalRecord::Queued {
-                sent_by,
-                submission_id,
-                request_identity_digest,
-                principal,
-                ..
-            } => {
-                let principal = sent_by.as_ref().or_else(|| {
-                    senders
-                        .get(&submission_id.0)
-                        .and_then(Option::as_ref)
-                        .or(principal.as_ref())
-                });
-                queued.insert(
-                    submission_id.0.clone(),
-                    send_metadata(request_identity_digest.as_deref(), principal),
-                );
-            }
-            WalRecord::RunStarted {
-                sent_by,
-                request_identity_digest,
-                principal,
-                submission_id,
-                origin,
-                ..
-            } => {
-                pending.clear();
-                assistant = None;
-                if matches!(origin, broca_wal::RunOrigin::Fresh) {
-                    current = submission_id
-                        .as_ref()
-                        .and_then(|id| queued.get(&id.0))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            send_metadata(
-                                request_identity_digest.as_deref(),
-                                sent_by.as_ref().or(principal.as_ref()),
-                            )
-                        });
-                }
-            }
-            WalRecord::Steered {
-                sent_by,
-                request_identity_digest,
-                input,
-                ..
-            } => {
-                // Legacy steers have no display stamp; do not guess the session owner's.
-                pending.extend(std::iter::repeat_n(
-                    send_metadata(request_identity_digest.as_deref(), sent_by.as_ref()),
-                    input.len(),
-                ));
-            }
-            WalRecord::SendDelivered {
-                submission_id,
-                input: Some(input),
-                ..
-            } => {
-                pending.extend(std::iter::repeat_n(
-                    queued.get(&submission_id.0).cloned().unwrap_or_default(),
-                    input.len(),
-                ));
-            }
-            WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                schema_pin: Some(pin),
-                ..
-            } => {
-                if let Some(ordinal) = assistant {
-                    tool_pins
-                        .entry(ordinal)
-                        .or_default()
-                        .entry(tool_call_id.0.clone())
-                        .or_insert_with(|| pin.clone());
-                }
-            }
-            _ => {}
-        }
-        let actions = placement.observe(record).map_err(|message| {
-            ServeError::Open(
-                format!("session.history metadata placement: {message}"),
-                Some(broca_protocol::ErrorClass::Transient),
-            )
-        })?;
-        if matches!(record, WalRecord::ModelStepFinished { .. }) {
-            assistant = actions
-                .iter()
-                .find_map(|action| match action {
-                    PlacementAction::Append {
-                        first,
-                        kind: AppendKind::Assistant | AppendKind::Finalize,
-                        ..
-                    } => Some(*first),
-                    _ => None,
-                })
-                .or_else(|| placement.held_assistant_ordinal());
-        }
-        for action in actions {
-            match action {
-                PlacementAction::Append {
-                    first,
-                    count,
-                    kind: AppendKind::Input,
-                } => {
-                    for ordinal in first..first + count {
-                        rows.insert(ordinal, current.clone());
-                    }
-                }
-                PlacementAction::PlaceHeld { first, count } => {
-                    for ordinal in first..first + count {
-                        rows.insert(ordinal, pending.pop_front().unwrap_or_default());
-                    }
-                }
-                PlacementAction::Truncate { to } => {
-                    rows.retain(|ordinal, _| *ordinal < to);
-                    tool_pins.retain(|ordinal, _| *ordinal < to);
-                }
-                _ => {}
-            }
-        }
-    }
-    for (ordinal, pins) in tool_pins {
-        rows.entry(ordinal).or_default().tool_pins = pins;
-    }
-    Ok(rows)
 }
 
 /// The pure projection for broca's canonical stored message schema. Part keys are the same
@@ -442,7 +268,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
     // A session kept in the new storage is read from it: its head facts here, its pages through
     // `handler.read`, and what output references need through the handler's store reads.
     let store = handler.store_history_head(session, named).await?;
-    let stored = store.is_some();
+
     // The store's own ids aren't positions, so it resolves a named message itself.
     let store_mid = store.as_ref().map(|store| store.mid_ordinal);
     let head = match store {
@@ -582,21 +408,6 @@ pub async fn read<H: ServeHandler + ?Sized>(
             field: "written_at",
         })?);
     }
-    // Today's sender and send metadata come from the session's log; a session kept in the new
-    // storage recorded them beside each message, and its pages serve them.
-    let records = if request.form() == HistoryForm::Display && !stored {
-        match entries.iter().find_map(|entry| entry.run.as_ref()) {
-            Some(run) => handler.session_log(session, &run.run_id).await?,
-            None => None,
-        }
-    } else {
-        None
-    };
-    let metadata = records
-        .as_deref()
-        .map(metadata)
-        .transpose()?
-        .unwrap_or_default();
     let refs = if request.form() == HistoryForm::Display {
         crate::output_refs::page_output_refs(
             handler,
@@ -604,7 +415,6 @@ pub async fn read<H: ServeHandler + ?Sized>(
             &lineage,
             head.history_version,
             &entries,
-            records,
         )
         .await?
     } else {
@@ -617,33 +427,9 @@ pub async fn read<H: ServeHandler + ?Sized>(
             if entry.message.role == Role::Assistant {
                 row.rich_ui = entry.rich_ui.clone();
             }
-            if let Some(metadata) = metadata.get(&entry.ordinal.saturating_sub(1)) {
-                for call in row.tool_calls_mut() {
-                    if entry
-                        .tool_times
-                        .iter()
-                        .any(|time| time.tool_call_id == call.tool_call_id)
-                    {
-                        continue;
-                    }
-                    call.schema_pin = metadata.tool_pins.get(&call.tool_call_id).and_then(|pin| {
-                        cortexkit_role_tool_provider::call::SchemaPin::new(
-                            &call.name,
-                            &pin.schema_digest,
-                            pin.semantics,
-                        )
-                        .encode()
-                        .ok()
-                    });
-                }
-            }
             if entry.message.role == Role::User {
-                if stored {
-                    row.client_message_id.clone_from(&entry.client_message_id);
-                } else if let Some(metadata) = metadata.get(&entry.ordinal.saturating_sub(1)) {
-                    row.client_message_id = metadata.client_message_id.clone();
-                    row.sender = metadata.sender.clone();
-                }
+                // The store recorded each message's client id beside it.
+                row.client_message_id.clone_from(&entry.client_message_id);
             }
             if let Some(refs) = refs.get(&entry.ordinal.saturating_sub(1)) {
                 row = refs.attach(row);

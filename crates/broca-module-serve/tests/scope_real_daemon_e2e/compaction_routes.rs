@@ -190,10 +190,12 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     assert!(setup["params"].get("session").is_none());
     let mut stored = identity.clone();
     stored.project_root = checkout;
-    let records =
-        broca_wal::replay_file(rig.wal_path(&stored), broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-    assert!(records.iter().any(|framed| matches!(&framed.record,
-        broca_wal::WalRecord::RunStarted { scope:Some(scope), .. }
-        if scope.scope_ref == SCOPE_REF && scope.scope_epoch == SCOPE_EPOCH)));
+    assert!(rig
+        .admissions(&stored)
+        .await
+        .into_iter()
+        .any(|admission| admission.send.scope.is_some_and(|scope| {
+            scope.scope_ref == SCOPE_REF && scope.scope_epoch == SCOPE_EPOCH
+        })));
     serving.abort();
 }

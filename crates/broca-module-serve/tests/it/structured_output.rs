@@ -4,6 +4,7 @@
 use crate::delivery_rig::*;
 use broca_protocol::{ContentBlock, ToolCall, ToolCallId};
 use broca_provider::spec::CapabilityFlag;
+use broca_session_store::record::Record;
 use serde_json::{json, Value};
 
 fn schema() -> Value {
@@ -108,25 +109,25 @@ async fn submit_result_ends_the_run_and_skips_its_sibling_through_serve() {
             broca_protocol::structured_output::SkippedSibling::new("sibling-1", "work")
         ])
     );
-    let records = rig.records();
+    let records = rig.records().await;
     let skipped: Vec<_> = records
         .iter()
         .filter_map(|record| match record {
-            broca_wal::WalRecord::ToolResult {
-                result,
-                reason: Some(reason),
-                ..
-            } if reason == "skipped_after_submit" => Some(result.tool_call_id.0.clone()),
+            Record::ToolOutcome(outcome)
+                if outcome.reason.as_deref() == Some("skipped_after_submit") =>
+            {
+                Some(outcome.tool_call_id.0.clone())
+            }
             _ => None,
         })
         .collect();
     assert_eq!(skipped, ["sibling-1"]);
     assert!(!records
         .iter()
-        .any(|record| matches!(record, broca_wal::WalRecord::ToolDispatchIntent { .. })));
+        .any(|record| matches!(record, Record::ToolIntent(_))));
     assert!(records.iter().any(|record| matches!(
         record,
-        broca_wal::WalRecord::StructuredOutputResult { run_id, .. } if run_id.0 == run
+        Record::StructuredResult(structured) if structured.run_id == run
     )));
     rig.finish().await;
 }
@@ -206,7 +207,17 @@ async fn admission_refuses_by_field_and_writes_nothing() {
         )
         .await;
     assert_eq!(refusal(&reply)["detail"]["field"], "structured_output");
-    assert!(rig.records().is_empty(), "a refused send writes nothing");
+    // The refused creating send opened the session to ask its actor; the actor deletes the
+    // empty session once it has answered.
+    broca_test_support::wait_until("the refused send's session is deleted", || async {
+        let left = rig.records().await;
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("a refused send writes nothing: {left:?}"))
+        }
+    })
+    .await;
     rig.finish().await;
 }
 
@@ -286,15 +297,10 @@ async fn the_frozen_schema_survives_a_restart_between_steps_byte_for_byte() {
         json!({"answer": "y"}),
     )])]);
     // The boot resume of a restart pause, as the module runs it after its routes are back.
-    assert_eq!(
-        rig.registry()
-            .resume_restart_pauses(
-                std::sync::Arc::new(broca_core::FileWalStore::new(rig.dir.join("wal"))),
-                vec![(run.clone(), rig.session.clone())],
-            )
-            .await,
-        (1, 0)
-    );
+    // The boot sweep resumes the restart pause once dependency routes are back.
+    rig.registry().enable_restart_resumes();
+    let sweep = rig.registry().recover_store_crash_orphans().await.unwrap();
+    assert_eq!((sweep.recovered, sweep.failed.len()), (1, 0), "{sweep:?}");
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     let rendered = rig.script.rendered.lock().unwrap().clone();

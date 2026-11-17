@@ -427,7 +427,6 @@ pub const ALL: &[Scenario] = &[
     REFUSAL_FALLBACK,
     OUTPUT_RESERVATION,
     CACHE_WARMED,
-    SESSION_CHANGES,
     PROVIDER_HELD,
 ];
 
@@ -619,97 +618,6 @@ pub const CACHE_WARMED: Scenario = Scenario {
     render: Render::WarmCompletion,
     extension: Some(&ManualWarm),
     ..TEXT_ONLY_MAX_STEPS
-};
-
-struct MetadataOnlyExecutor;
-
-#[async_trait::async_trait]
-impl broca_module::executor::RunExecutor for MetadataOnlyExecutor {
-    async fn execute(
-        &self,
-        _: broca_module::executor::RunJob,
-        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        panic!("session metadata operations must not start a model run")
-    }
-}
-
-struct SessionChanges;
-
-#[async_trait::async_trait]
-impl broca_crash_harness::scenario::ScenarioExtension for SessionChanges {
-    fn setup(
-        &self,
-        _: &std::path::Path,
-        _: &mut RunControl,
-        _: &mut broca_crash_harness::HarnessPlane,
-    ) {
-    }
-
-    async fn complete_reference(
-        &self,
-        root: &std::path::Path,
-        store: &broca_crash_harness::wal::ObservedWalStore,
-        _: &broca_crash_harness::ScriptedProvider,
-    ) {
-        use broca_module::actor::{
-            SessionFlushPrefixOutcome, SessionRefreshOutcome, SessionRefreshPolicyOutcome,
-        };
-        use std::sync::Arc;
-        let store = Arc::new(store.clone());
-        let opener = broca_module::DefaultOpener::new(
-            Arc::new(broca_core::FileLeaseStore::new(root.join("lease"))),
-            store.clone(),
-            Arc::new(MetadataOnlyExecutor),
-        );
-        let registry =
-            broca_module::LineageRegistry::new_with_reader(Arc::new(opener), store, None);
-        let request = planned_request();
-        let manifest = planned_manifest();
-        assert!(matches!(
-            registry
-                .route_session_refresh(
-                    &request.session,
-                    1,
-                    "on_prefix_rebuild".into(),
-                    Box::new(manifest)
-                )
-                .await
-                .unwrap(),
-            SessionRefreshOutcome::Accepted { .. }
-        ));
-        assert!(matches!(
-            registry
-                .route_session_refresh_policy(
-                    &request.session,
-                    1,
-                    "immediately".into(),
-                    "policy-change".into()
-                )
-                .await
-                .unwrap(),
-            SessionRefreshPolicyOutcome::Changed
-        ));
-        assert!(matches!(
-            registry
-                .route_session_flush_prefix(&request.session, "flush-prefix".into())
-                .await
-                .unwrap(),
-            SessionFlushPrefixOutcome::Flushed { .. }
-        ));
-        assert!(
-            registry.stop_and_seal().await,
-            "the metadata actor must release its writer"
-        );
-    }
-}
-
-/// After a planned episode, the idle session actor accepts a refreshed provider manifest,
-/// changes when it applies, and clears the frozen conversation prefix for the next run.
-pub const SESSION_CHANGES: Scenario = Scenario {
-    name: "session_changes",
-    extension: Some(&SessionChanges),
-    ..PLANNED_EDITS
 };
 
 struct HeldPlane;

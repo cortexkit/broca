@@ -128,6 +128,51 @@ async fn a_subscriber_holds_an_idle_head_open_until_it_leaves() {
     module.closed().await;
 }
 
+/// A subscriber to a session no send has created yet waits for its first send, then follows it
+/// from its start: the first run's units reach it on the stream it already holds. A subscriber
+/// that names a cursor can't wait: a cursor only names a session that exists.
+#[tokio::test]
+async fn a_subscriber_before_the_first_send_follows_the_session_once_it_exists() {
+    let module = module(true, vec![text_step("a1", "hello")], None).await;
+    let mut deliveries = subscribed(&module).await;
+    let (cursor_sink, _cursor_deliveries) = mpsc::channel(16);
+    let refused = module
+        .registry
+        .route_subscribe(
+            &module.key,
+            FromCursor::After(broca_core::Cursor::new(1, 0)),
+            cursor_sink,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(crate::registry::OpenError::UnknownSession)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        module
+            .registry
+            .store_holding(&module.key)
+            .unwrap()
+            .map(|_| ()),
+        None,
+        "a waiting subscriber creates nothing"
+    );
+    let first = send(
+        &module,
+        "r1",
+        request("first"),
+        Some(HEAD_SESSION_CLASS),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+    finished(&mut deliveries, "r1").await;
+    drop(deliveries);
+    module.closed().await;
+}
+
 /// A module stop closes a head a subscriber holds open, and ends the subscription.
 #[tokio::test]
 async fn a_module_stop_ends_a_subscription_holding_a_head_open() {

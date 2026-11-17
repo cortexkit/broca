@@ -46,8 +46,6 @@ use broca_session_store::record::{CallOutcome, Record, RunStart};
 use broca_session_store::session::{Session, SessionError};
 use serde_json::Value;
 
-pub mod todays;
-
 /// Why a run or send fact of a session kept in the new storage wasn't served.
 #[derive(Debug)]
 pub enum StatusError {
@@ -1670,6 +1668,25 @@ pub(crate) async fn authorization_own_send<B: SessionBackend>(
         return Ok(false);
     };
     Ok(lookup.recorded_sender(&run).await?.as_ref() == Some(&recorded))
+}
+
+/// The run id a send by a plan-named module `sender` under `send_id` takes, and the sender its
+/// retry answers for: the run id the `send_id` derives (`base`) while no other sender's send
+/// holds it, else one qualified by the sender's module, so two senders reusing a `send_id` never
+/// answer each other's sends. A successor the plan names answers for its predecessor's send. The
+/// same rule `send.status` reads a receipt by.
+pub(crate) async fn sender_send_run_id<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    base: &RunId,
+    send_id: &str,
+    sender: &broca_protocol::BindPrincipal,
+) -> Result<(RunId, broca_protocol::BindPrincipal), String> {
+    let senders = broca_session_loop::plan::senders(&session.operations, parts)?;
+    SendLookup { session }
+        .retry_run_id(base, send_id, sender, &senders)
+        .await
+        .map_err(|error| format!("{error:?}"))?
 }
 
 /// The key of the call `call` in `step`, a step's records from its assistant message on, as

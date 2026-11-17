@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, LeaseStore as _, OutputEvent, RunError, RunSummary};
+use broca_core::{FileLeaseStore, LeaseStore as _};
 use broca_protocol::BindIdentity;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::codec::{hex, Id128};
@@ -13,22 +13,14 @@ use broca_wal::StorageClass;
 use tokio_util::sync::CancellationToken;
 
 use super::{StoreCollectSweep, SweepPass};
-use crate::executor::{RunExecutor, RunJob};
+use crate::executor::RunExecutor;
 use crate::store_open::{triple, StoreRuntime, StoreSlot};
 
 /// An executor for sessions whose tests run nothing.
 struct NoRuns;
 
 #[async_trait::async_trait]
-impl RunExecutor for NoRuns {
-    async fn execute(
-        &self,
-        _: RunJob,
-        _: tokio::sync::mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("these tests run no model step")
-    }
-}
+impl RunExecutor for NoRuns {}
 
 /// When the finished sessions' seals committed.
 const SEALED_AT: u64 = 1_000;

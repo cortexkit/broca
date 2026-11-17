@@ -888,6 +888,10 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         self.took(appended)
     }
 
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        broca_session_loop::Writer::caught_up(&mut *self.session).await
+    }
+
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
         broca_session_loop::Writer::send_records(&mut *self.session, submission_id).await
     }

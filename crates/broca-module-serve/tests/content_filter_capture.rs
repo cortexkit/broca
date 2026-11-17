@@ -1,4 +1,4 @@
-//! Capture-shaped synthetic replies at the family, run-loop, WAL, and reader boundaries.
+//! Capture-shaped synthetic replies at the family, run-loop, stored-record and reader boundaries.
 mod delivery_rig;
 
 use broca_core::refusal_fallback::{self, CommittedStep, StepRoute};
@@ -11,7 +11,8 @@ use broca_provider::{
     families::{anthropic_frozen_config, anthropic_renderer_version, AnthropicMessages},
     wire::WireFamily,
 };
-use broca_wal::{RefusalFallbackPhase, WalRecord};
+use broca_session_store::record::Record;
+use broca_wal::RefusalFallbackPhase;
 use delivery_rig::{result, Rig};
 use serde_json::{json, Value};
 
@@ -117,28 +118,36 @@ async fn l2_thinking_only_refusal_resends_the_same_step() {
         .await;
     assert!(result(&sent)["run_id"].is_string());
     rig.wait_idle().await;
-    let records = rig.records();
+    let records = rig.records().await;
     let refused: Vec<_> = records
         .iter()
-        .filter(|r| matches!(r, WalRecord::ModelStepRefused { .. }))
+        .filter_map(|r| match r {
+            Record::StepRefused(refused) => Some(refused),
+            _ => None,
+        })
         .collect();
     assert_eq!(refused.len(), 1);
-    assert!(
-        matches!(refused[0], WalRecord::ModelStepRefused { step_id: StepId(1), usage, .. }
-        if usage.output_tokens == Some(1596) && usage.cache_write_tokens == Some(20068))
-    );
+    assert_eq!(refused[0].step_id, 1);
+    assert_eq!(refused[0].usage.output_tokens, Some(1596));
+    assert_eq!(refused[0].usage.cache_write_tokens, Some(20068));
     let committed: Vec<_> = records
         .iter()
         .filter_map(|r| match r {
-            WalRecord::ModelStepFinished {
-                step_id, fallback, ..
-            } => Some((step_id, fallback)),
+            Record::StepEnd(end) => Some(end),
             _ => None,
         })
         .collect();
     assert_eq!(committed.len(), 1);
-    assert_eq!(*committed[0].0, StepId(1));
-    assert_eq!(committed[0].1.route.as_ref().unwrap().model, target());
+    assert_eq!(committed[0].step_id, 1);
+    let fallback = committed[0]
+        .fallback
+        .as_ref()
+        .expect("the step records its fallback")
+        .parse();
+    assert_eq!(
+        fallback["route"]["model"],
+        serde_json::to_value(target()).unwrap()
+    );
     let prompts = rig.script.prompts.lock().unwrap().clone();
     assert_eq!(prompts.len(), 2);
     assert_eq!(
@@ -342,28 +351,33 @@ async fn l3_real_serve_readers_keep_the_stored_handoff_and_iterations() {
     })).await;
     assert!(result(&sent)["run_id"].is_string());
     rig.wait_idle().await;
-    let records = rig.records();
+    let records = rig.records().await;
     assert!(!records
         .iter()
-        .any(|record| matches!(record, WalRecord::ModelStepRefused { .. })));
-    let (record, usage, fallback) = records
+        .any(|record| matches!(record, Record::StepRefused(_))));
+    let message = records
         .iter()
         .find_map(|record| match record {
-            WalRecord::ModelStepFinished {
-                step_id: StepId(1),
-                assistant_message: message,
-                usage,
-                fallback,
-                ..
-            } => {
-                assert_eq!(message.content, expected);
-                Some((record, usage, fallback))
-            }
+            Record::Assistant(assistant) if assistant.step_id == 1 => Some(&assistant.message),
             _ => None,
         })
         .expect("L3 committed by the real run loop");
-    assert_eq!(fallback.served_model.as_deref(), Some("claude-opus-4-8"));
-    let iterations = serde_json::to_value(fallback.usage_iterations.as_ref().unwrap()).unwrap();
+    assert_eq!(message.content, expected);
+    let record = records
+        .iter()
+        .find_map(|record| match record {
+            Record::StepEnd(end) if end.step_id == 1 => Some(end),
+            _ => None,
+        })
+        .expect("L3's step ended");
+    let usage = record.usage.unwrap_or_default();
+    let fallback = record
+        .fallback
+        .as_ref()
+        .expect("the step records its fallback")
+        .parse();
+    assert_eq!(fallback["served_model"], "claude-opus-4-8");
+    let iterations = fallback["usage_iterations"].clone();
     assert_eq!(
         iterations,
         wire_event(L3, "message_delta")["usage"]["iterations"]
@@ -375,44 +389,23 @@ async fn l3_real_serve_readers_keep_the_stored_handoff_and_iterations() {
     // Neither iteration reports a reasoning-token breakdown; the last iteration's top-level
     // breakdown cannot describe reasoning usage for the whole step.
     assert_eq!(usage.reasoning_tokens, None);
-    let mut projection = broca_core::replay::RunUsageProjection::new(
-        records
-            .iter()
-            .find_map(|record| match record {
-                WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
-                _ => None,
-            })
-            .unwrap(),
-    );
-    for record in &records {
-        projection.observe(record);
-        if matches!(
-            record,
-            WalRecord::ModelStepFinished {
-                step_id: StepId(1),
-                ..
-            }
-        ) {
-            break;
-        }
-    }
-    let by_model = serde_json::to_value(&projection.usage).unwrap()["by_model"].clone();
+    // The step's usage, split by the model that served each part of it.
+    let by_model = serde_json::to_value(&record.by_model).unwrap();
     let by_model = by_model.as_array().unwrap();
     assert_eq!(by_model.len(), 2);
     let source_usage = by_model
         .iter()
         .find(|row| row["model"] == "claude-opus-5-5")
-        .unwrap();
+        .unwrap()["usage"]
+        .clone();
     let target_usage = by_model
         .iter()
         .find(|row| row["model"] == "claude-opus-4-8")
-        .unwrap();
+        .unwrap()["usage"]
+        .clone();
     assert_eq!(source_usage["output_tokens"], 2124);
     assert_eq!(target_usage["output_tokens"], 29287);
-    capture(
-        "model-step-finished.json",
-        &serde_json::to_vec(record).unwrap(),
-    );
+    capture("step-end.json", &serde_json::to_vec(record).unwrap());
 
     for (name, method, params) in [
         ("session.read.default.json", "session.read", json!({})),

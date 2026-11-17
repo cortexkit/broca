@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_core::hooks::{HookAnswer, HookCall};
-use broca_core::WalStore as _;
 use broca_core::{HookPlane, HookUnavailable};
 use broca_protocol::content::ContentBlock;
 use broca_protocol::SubmissionRequest;
@@ -122,19 +121,6 @@ impl Compactor {
 
     pub(super) fn reads(&self, read: ReadEntries) {
         *self.read_entries.lock().unwrap() = Some(read);
-    }
-
-    pub(super) fn reads_today(&self, wal: Arc<broca_core::FileWalStore>, key: BindIdentity) {
-        self.reads(Arc::new(move || {
-            let (records, lineage) = wal.read_records_with_lineage(&key).unwrap();
-            let entries = broca_core::compaction_v2::transcript::project(
-                &records,
-                &lineage.unwrap().to_string(),
-            )
-            .unwrap()
-            .entries;
-            Box::pin(async move { entries })
-        }));
     }
 
     pub(super) fn reads_memory(&self, backend: &'static MemoryBackend) {

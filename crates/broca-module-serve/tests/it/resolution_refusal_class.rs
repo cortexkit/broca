@@ -24,10 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, WalStore};
-use broca_module::executor::{
-    RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
-};
+use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError};
+use broca_module::executor::{RunExecutor, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode};
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
 use serde_json::{json, Value};
@@ -62,78 +60,6 @@ impl Refusing {
 
 #[async_trait]
 impl RunExecutor for Refusing {
-    async fn execute(
-        &self,
-        job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        if let Some(error) = self.error() {
-            if let Some(ack) = job.on_admitted {
-                let _ = ack.send(Err(error.clone()));
-            }
-            return Err(error);
-        }
-        job.writer.record(broca_wal::WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: job.req.session_class.clone(),
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: job.control.manifest.as_deref().cloned().map(Box::new),
-            scope: job.req.scope.clone(),
-            send_id: job.req.send_id.clone(),
-            request_identity_digest: job.req.request_identity_digest.clone(),
-            project_id: job.req.project_id.clone(),
-            principal: job.req.principal.clone(),
-            ts_ms: None,
-            run_id: job.req.run_id.clone(),
-            session: job.req.session.clone(),
-            config: Box::new(super::wire::min_config()),
-            input: job.req.input.clone().into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: job.req.submission_id.clone(),
-        });
-        job.writer
-            .sync()
-            .await
-            .map_err(|error| RunError::Wal(error.to_string()))?;
-        if let Some(ack) = job.on_admitted {
-            let _ = ack.send(Ok(job.req.run_id.clone()));
-        }
-        // A held run stays running after its start until the test releases it.
-        let hold = self.hold.lock().unwrap().clone();
-        if let Some(hold) = hold {
-            hold.notified().await;
-        }
-        job.writer.record(broca_wal::WalRecord::RunFinished {
-            interrupt_reason: None,
-            ts_ms: None,
-            reason: broca_protocol::RunFinishReason::Completed,
-            usage: broca_protocol::Usage::default(),
-            error: None,
-            retries_used: 0,
-        });
-        job.writer
-            .sync()
-            .await
-            .map_err(|error| RunError::Wal(error.to_string()))?;
-        Ok(RunSummary {
-            reason: broca_protocol::RunFinishReason::Completed,
-            paused: None,
-            steps: 1,
-            usage: broca_protocol::Usage::default(),
-            retries_used: 0,
-            final_step_finish_reason: None,
-        })
-    }
-
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -258,10 +184,8 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    /// A module on a fresh state root. With `new_storage`, a `consult` session is created in the
-    /// new storage, as the module's daemon configures it; without, every session is kept in
-    /// today's storage.
-    async fn start(tag: &str, new_storage: bool) -> Self {
+    /// A module on a fresh state root.
+    async fn start(tag: &str) -> Self {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-resolution-refusal-{}-{tag}",
             std::process::id()
@@ -269,41 +193,31 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         broca_core::media_store::create_media_directories(&dir).unwrap();
-        Self::open(dir, new_storage).await
+        Self::open(dir).await
     }
 
     /// A module serving the state root `dir` as it is, as a restarted module does.
-    async fn open(dir: PathBuf, new_storage: bool) -> Self {
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    async fn open(dir: PathBuf) -> Self {
+        let _wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor = Arc::new(Refusing {
             error: Mutex::new(None),
             hold: Mutex::new(None),
         });
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
             executor.clone(),
         )
         .with_idle_ttl(Duration::from_millis(100));
-        let opener = if new_storage {
-            let runtime = broca_module::store_open::StoreRuntime::open(
-                &dir,
-                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-                executor.clone() as Arc<dyn RunExecutor>,
-                Duration::from_millis(100),
-            )
-            .await
-            .unwrap();
-            opener.with_store_runtime(Arc::new(runtime))
-        } else {
-            opener
-        };
-        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
-        let registry = if new_storage {
-            registry.with_store_new_session_classes([CONSULT])
-        } else {
-            registry
-        };
+        let runtime = broca_module::store_open::StoreRuntime::open(
+            &dir,
+            broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+            executor.clone() as Arc<dyn RunExecutor>,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let opener = opener.with_store_runtime(Arc::new(runtime));
+        let registry = LineageRegistry::new(Arc::new(opener));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &dir.join("store.db"),
@@ -605,8 +519,9 @@ async fn each_resolution_refusal_has_one_body_on_every_path() {
         std::fs::create_dir_all(samples).unwrap();
     }
     let mut mismatches = Vec::new();
-    for (storage, new_storage) in [("todays", false), ("new", true)] {
-        let mut rig = Rig::start(storage, new_storage).await;
+    {
+        let storage = "new";
+        let mut rig = Rig::start(storage).await;
         for case in cases() {
             for (plan_name, plan) in [("plain", false), ("plan", true)] {
                 let session = format!("{}-{plan_name}", case.name);
@@ -683,8 +598,9 @@ async fn a_keyed_resend_refused_while_stopping_is_answered_after_the_restart() {
         std::fs::create_dir_all(samples).unwrap();
     }
     let mut mismatches = Vec::new();
-    for (storage, new_storage) in [("todays", false), ("new", true)] {
-        let mut rig = Rig::start(&format!("resend-{storage}"), new_storage).await;
+    {
+        let storage = "new";
+        let mut rig = Rig::start(&format!("resend-{storage}")).await;
         rig.remove_dir = false;
         let dir = rig.dir.clone();
         let channel = rig.bind("resend").await;
@@ -739,7 +655,7 @@ async fn a_keyed_resend_refused_while_stopping_is_answered_after_the_restart() {
         );
         drop(rig);
 
-        let mut rig = Rig::open(dir, new_storage).await;
+        let mut rig = Rig::open(dir).await;
         let channel = rig.bind("resend").await;
         let again = rig.send(channel, "turn-1", true).await;
         assert_eq!(
@@ -754,7 +670,7 @@ async fn a_keyed_resend_refused_while_stopping_is_answered_after_the_restart() {
             "{storage}: the resend is answered with the original run: {again}"
         );
         assert_eq!(
-            run_starts(&rig, &key, new_storage).await,
+            run_starts(&rig, &key).await,
             1,
             "{storage}: the session holds one run for the send id"
         );
@@ -782,29 +698,19 @@ async fn wait_until_finished(rig: &Rig, key: &broca_protocol::BindIdentity, run_
     .await;
 }
 
-/// How many runs the session holds: its `RunStarted` records on today's storage; on the new
-/// storage, the distinct runs its messages are attributed to.
-async fn run_starts(rig: &Rig, key: &broca_protocol::BindIdentity, new_storage: bool) -> usize {
+/// How many runs the session holds: the distinct runs its messages are attributed to.
+async fn run_starts(rig: &Rig, key: &broca_protocol::BindIdentity) -> usize {
     use broca_module::serve::{ServeHandler, SessionReadRequest};
-    if new_storage {
-        let read = rig
-            .registry
-            .read(SessionReadRequest::new(key.clone(), None, None))
-            .await
-            .expect("the session reads");
-        read.messages
-            .iter()
-            .filter_map(|message| message.run.as_ref().map(|run| run.run_id.clone()))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-    } else {
-        FileWalStore::new(rig.dir.join("wal"))
-            .read_records(key)
-            .unwrap()
-            .into_iter()
-            .filter(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }))
-            .count()
-    }
+    let read = rig
+        .registry
+        .read(SessionReadRequest::new(key.clone(), None, None))
+        .await
+        .expect("the session reads");
+    read.messages
+        .iter()
+        .filter_map(|message| message.run.as_ref().map(|run| run.run_id.clone()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
 }
 
 /// A provider that waits for `hold` before answering its step, so a run on the new storage stays
@@ -892,8 +798,9 @@ async fn account_selection_refusals_say_by_their_code_whether_to_wait() {
         std::fs::create_dir_all(samples).unwrap();
     }
     let mut mismatches = Vec::new();
-    for (storage, new_storage) in [("todays", false), ("new", true)] {
-        let mut rig = Rig::start(&format!("account-{storage}"), new_storage).await;
+    {
+        let storage = "new";
+        let mut rig = Rig::start(&format!("account-{storage}")).await;
         for case in account_cases() {
             for (plan_name, plan) in [("plain", false), ("plan", true)] {
                 let channel = rig.bind(&format!("{}-{plan_name}", case.name)).await;
@@ -951,8 +858,9 @@ async fn a_queued_send_refused_by_routing_ends_with_the_refusal_code() {
             Value::Null,
         ),
     ];
-    for (storage, new_storage) in [("todays", false), ("new", true)] {
-        let mut rig = Rig::start(&format!("account-queued-{storage}"), new_storage).await;
+    {
+        let storage = "new";
+        let mut rig = Rig::start(&format!("account-queued-{storage}")).await;
         for (routing, provider_code, class, retry_after_secs, resets_at_ms) in &cases {
             let channel = rig.bind(&format!("queued-{provider_code}")).await;
             let hold = Arc::new(tokio::sync::Notify::new());

@@ -10,71 +10,56 @@ use futures::executor::block_on;
 use super::{run_records, today_records};
 use crate::parts::MemoryParts;
 
-fn start(run: &str) -> String {
-    format!(
-        r#"{{"type":"run_started","run_id":"{run}","ts_ms":1,"session":{{"project_root":"/project","harness":"runner","session":"s"}},"config":{{"model":{{"provider_module_id":"p","model_id":"m"}},"tools":[],"tool_choice":{{"type":"auto"}},"generation":{{}},"response_format":{{"type":"text"}},"context_epoch":0,"renderer_version":1}},"input":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],"origin":{{"kind":"fresh"}}}}"#
-    )
+/// A stored history: its records and setup parts, as the converter that moved sessions from the
+/// old storage wrote them. In `log`, run `r1` ends and is warmed twice, once after `r2`
+/// started; `r2` pauses, then continues to its end; `r3` pauses and never ends. Every run
+/// starts on model `p/m` with the input "hi", and each step answers "ok" with 3 input tokens.
+/// `cache-write-split` is `log` whose first step reports 30 cache-write tokens, split 10
+/// five-minute and 20 one-hour, served on the priority tier.
+struct Stored {
+    records: Vec<broca_session_store::record::Record>,
+    parts: std::collections::BTreeMap<broca_session_store::codec::Digest, Vec<u8>>,
 }
 
-fn step_started(id: u64) -> String {
-    format!(r#"{{"type":"step_started","step_id":{id}}}"#)
+fn stored(name: &str) -> Stored {
+    let text = match name {
+        "log" => include_str!("fixtures/log.json"),
+        "cache-write-split" => include_str!("fixtures/cache-write-split.json"),
+        other => panic!("no stored history {other}"),
+    };
+    let fixture: serde_json::Value = serde_json::from_str(text).unwrap();
+    let bytes = |value: &serde_json::Value| -> Vec<u8> {
+        let text = value.as_str().unwrap();
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
+    };
+    Stored {
+        records: fixture["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                let kind = u32::try_from(record["kind"].as_u64().unwrap()).unwrap();
+                broca_session_store::record::Record::decode(kind, &bytes(&record["body"])).unwrap()
+            })
+            .collect(),
+        parts: fixture["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                let digest: [u8; 32] = bytes(&part[0]).try_into().unwrap();
+                (broca_session_store::codec::Digest(digest), bytes(&part[1]))
+            })
+            .collect(),
+    }
 }
 
-fn step(id: u64) -> String {
-    format!(
-        r#"{{"type":"model_step_finished","step_id":{id},"assistant_message":{{"message_id":"m{id}","content":[{{"type":"text","text":"ok"}}]}},"usage":{{"input_tokens":3}},"finish_reason":"stop","retries_used":0}}"#
-    )
-}
-
-const FINISHED: &str =
-    r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#;
-
-fn paused(run: &str) -> String {
-    format!(r#"{{"type":"run_paused","run_id":"{run}","reason":"restart"}}"#)
-}
-
-fn warm(run: &str) -> String {
-    let a = "a".repeat(64);
-    format!(
-        r#"{{"type":"cache_warmed","run_id":"{run}","step_id":1,"request_body_sha256":"{a}","warm_body_sha256":"{a}","usage":{{}},"sent_at_ms":9}}"#
-    )
-}
-
-/// `r1` ends and is warmed twice, once after `r2` started; `r2` pauses, then continues to its
-/// end; `r3` pauses and never ends.
-fn log() -> Vec<FramedRecord> {
-    [
-        start("r1"),
-        step_started(1),
-        step(1),
-        FINISHED.into(),
-        warm("r1"),
-        start("r2"),
-        warm("r1"),
-        step_started(1),
-        step(1),
-        paused("r2"),
-        step_started(2),
-        step(2),
-        FINISHED.into(),
-        start("r3"),
-        step_started(1),
-        step(1),
-        paused("r3"),
-    ]
-    .iter()
-    .enumerate()
-    .map(|(i, line)| FramedRecord {
-        seq: i as u64 + 1,
-        fence: 0,
-        record: serde_json::from_str::<WalRecord>(line).unwrap(),
-    })
-    .collect()
-}
-
-/// The session `log()` converts to, and its setup parts.
+/// The session `log` is stored as, and its setup parts.
 async fn session(backend: &MemoryBackend) -> (Session<&MemoryBackend>, MemoryParts) {
-    let converted = broca_session_convert::convert(&log(), None).unwrap();
+    let converted = stored("log");
     let triple = SessionTriple {
         project_root: "/project".into(),
         harness: "runner".into(),
@@ -103,24 +88,7 @@ fn bind() -> BindIdentity {
 #[test]
 fn stored_cache_write_lifetimes_reach_the_shared_billing_builder() {
     block_on(async {
-        let mut records = log();
-        let WalRecord::ModelStepFinished {
-            usage,
-            service_tier_used,
-            ..
-        } = &mut records[2].record
-        else {
-            unreachable!()
-        };
-        *usage = broca_protocol::Usage {
-            input_tokens: Some(3),
-            cache_write_tokens: Some(30),
-            cache_write_5m_tokens: Some(10),
-            cache_write_1h_tokens: Some(20),
-            ..Default::default()
-        };
-        *service_tier_used = Some("priority".into());
-        let converted = broca_session_convert::convert(&records, None).unwrap();
+        let converted = stored("cache-write-split");
         let backend = MemoryBackend::default();
         let mut session = Session::create(
             &backend,

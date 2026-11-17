@@ -15,6 +15,7 @@
 
 mod delivery_rig;
 
+use broca_session_store::record::Record;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -33,28 +34,17 @@ const OUTAGE_DETAIL: &str = "supervised_not_registered";
 /// binary-framed (length, version, sequence, fence, digest, payload), so scan every `{`
 /// position, stream-decode one JSON value there, and take the first value that is (or
 /// wraps, under a `requires` envelope) the call's `tool_result` record.
-fn tool_result_payload(wal: &[u8], tool_call_id: &str) -> Vec<u8> {
-    for start in 0..wal.len() {
-        if wal[start] != b'{' {
-            continue;
-        }
-        let mut stream = serde_json::Deserializer::from_slice(&wal[start..]).into_iter::<Value>();
-        let head = stream.next();
-        let end = stream.byte_offset();
-        let Some(Ok(value)) = head else {
-            continue;
-        };
-        let record = value.get("record").unwrap_or(&value);
-        if record.get("type").and_then(Value::as_str) == Some("tool_result")
-            && value.to_string().contains(tool_call_id)
-        {
-            return wal[start..start + end].to_vec();
-        }
-    }
-    panic!(
-        "no tool_result payload for {tool_call_id} in {} WAL bytes",
-        wal.len()
-    );
+/// The stored result of `tool_call_id`, as JSON: the tool reply record's `result`.
+fn stored_result(records: &[Record], tool_call_id: &str) -> Value {
+    records
+        .iter()
+        .find_map(|record| match record {
+            Record::ToolReply(reply) if reply.result.tool_call_id.0 == tool_call_id => {
+                Some(serde_json::to_value(&reply.result).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no stored result for {tool_call_id}"))
 }
 
 /// The attributed result the real plane returns for a call refused past the wait.
@@ -222,11 +212,8 @@ async fn capture_module_outage_tool_result_bytes() {
     assert_eq!(finished["event"]["outcome"], "error");
     assert_eq!(finished["event"]["tool_call_id"], "call-1");
 
-    // (4) The WAL `tool_result` record payload, exactly as stored (bare record or
-    // `requires` envelope — see the framing docs).
-    let record_payload = tool_result_payload(&rig.wal_bytes(), "call-1");
-    let record: Value = serde_json::from_slice(&record_payload).unwrap();
-    let record_output = record.get("record").unwrap_or(&record)["result"]["output"].clone();
+    // (4) The stored tool reply's result.
+    let record_output = stored_result(&rig.records().await, "call-1")["output"].clone();
     assert_attributed(&record_output);
 
     // The captured bytes, for a strict reader out of band.
@@ -241,7 +228,10 @@ async fn capture_module_outage_tool_result_bytes() {
             serde_json::to_vec_pretty(&finished["event"]).unwrap(),
         ),
         ("tool_finished.frame.json", finished_frame.body.clone()),
-        ("tool_result.record.json", record_payload.clone()),
+        (
+            "tool_result.record.json",
+            serde_json::to_vec_pretty(&record_output).unwrap(),
+        ),
     ]);
     rig.finish().await;
 }
@@ -394,16 +384,13 @@ enum OldNoDispatchReason {
     PolicyBlocked { detail: String },
 }
 
-/// An older broca decodes the captured WAL record's output: the message survives exactly,
-/// and the attribution it never knew rides along ignored.
+/// An older broca decodes the stored output: the message survives exactly, and the attribution
+/// it never knew rides along ignored.
 #[tokio::test]
 async fn older_build_reads_the_captured_outage_output() {
     let rig = outage_session("tool-outage-compat").await;
-    let record_payload = tool_result_payload(&rig.wal_bytes(), "call-1");
-    // The record envelope itself is new-reader business; the output object is what an older
-    // build must still swallow.
-    let record: Value = serde_json::from_slice(&record_payload).unwrap();
-    let output_json = record.get("record").unwrap_or(&record)["result"]["output"].clone();
+    // The output object is what an older build must still swallow.
+    let output_json = stored_result(&rig.records().await, "call-1")["output"].clone();
     // Sanity: the captured bytes really are the attributed outage.
     assert_attributed(&output_json);
     let old: OldToolOutput = serde_json::from_value(output_json).unwrap();

@@ -5,8 +5,6 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use broca_wal::FramedRecord;
-
 /// The last update `session.head` serves from what it knows without reading a session's whole
 /// WAL: a retained session's retention activity, which maintenance never moves; else when its
 /// live WAL file was last written; else the newest time a record of the WAL's tail carries.
@@ -20,25 +18,6 @@ pub fn known_updated_at(
     retention_activity_ms
         .or(live_wal_written_ms)
         .or(tail_newest_ms)
-}
-
-/// The newest time any of `records` carries.
-pub fn newest_record_ms(records: &[FramedRecord]) -> Option<u64> {
-    records
-        .iter()
-        .rev()
-        .find_map(|framed| broca_core::record_time_ms(&framed.record))
-}
-
-/// The last update `session.head` serves for a session whose whole WAL is `records` and whose
-/// live WAL file was last written at `live_wal_written_ms`.
-pub fn updated_at_of_wal(records: &[FramedRecord], live_wal_written_ms: Option<u64>) -> u64 {
-    known_updated_at(
-        crate::retention::policy(records).map(|(_, activity, _)| activity),
-        live_wal_written_ms,
-        newest_record_ms(records),
-    )
-    .unwrap_or(0)
 }
 
 /// `time` in milliseconds since the Unix epoch; `None` before it.

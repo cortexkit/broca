@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use broca_core::keep_warm_wait::KeepWarmDriver as _;
 use broca_core::keep_warm_wait::WarmTick;
-use broca_core::{OutputEvent, RunError, RunSummary};
+use broca_core::OutputEvent;
 use broca_protocol::RunId;
 use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
@@ -14,12 +14,11 @@ use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{FramedRecord, WalRecord};
 use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 
 use super::super::warm::{warmable, Probe};
-use crate::executor::{RunExecutor, RunJob, StoreRunMode, WarmError, WarmJob};
+use crate::executor::{RunExecutor, StoreRunMode, WarmError, WarmJob};
 use crate::store_actor::tests::bind;
 use crate::store_actor::StoreActor;
 
@@ -45,18 +44,10 @@ struct Warming {
 
 async fn cold_cache_predecessor_rebuilds_the_previous_run_lazily(cipher: Cipher) {
     let side = super::side(false, cipher).await;
-    let mut records = history(true);
-    let expected =
-        broca_core::cache_warm::last_recorded_request_with_lineage(&records, None).unwrap();
-    records.push(record(
-        json!({"type":"run_finished", "reason":"completed", "usage":{}}),
-    ));
-    let mut next = records[0].clone();
-    if let WalRecord::RunStarted { run_id, .. } = &mut next {
-        *run_id = RunId("r2".into());
-    }
-    records.push(next);
-    let actor = reopened(&side, &records, cipher, Arc::new(Warming::default())).await;
+    // Run r1's two tool steps, then a run r2 that started and sent nothing yet.
+    let history = converted("cold-predecessor");
+    let expected = history.recorded_sha256.clone().unwrap();
+    let actor = reopened(&side, history, cipher, Arc::new(Warming::default())).await;
     let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(&actor.session, None);
     let loader = writer.cache_predecessor_loader();
     assert!(
@@ -78,20 +69,14 @@ async fn cold_cache_predecessor_rebuilds_the_previous_run_lazily(cipher: Cipher)
         "the new run has no durable attempt yet"
     );
     assert_eq!(recovered.request.step_id.0, 2);
-    assert_eq!(
-        recovered.request.request_body_sha256,
-        expected.request_body_sha256
-    );
+    assert_eq!(recovered.request.request_body_sha256, expected);
     let live = broca_provider::LiveProvider::new(
         broca_provider::families::AnthropicMessages,
         serde_json::from_value(recovered.request.config.frozen_render_config).unwrap(),
         broca_provider::wire::AuthHandle::None,
     );
     let bytes = broca_core::provider::Provider::render_request(&live, &recovered.request.opts);
-    assert_eq!(
-        broca_core::render::request_digest_hex(&bytes),
-        expected.request_body_sha256
-    );
+    assert_eq!(broca_core::render::request_digest_hex(&bytes), expected);
     assert!(recovered.locator.ends_with(&format!(
         ":{}",
         actor
@@ -129,13 +114,6 @@ impl RunExecutor for Warming {
             bust: 1.0,
         })
     }
-    async fn execute(
-        &self,
-        _: RunJob,
-        _: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("the resumed tool wait calls no model")
-    }
 
     async fn warm(&self, job: WarmJob) -> Result<broca_core::WarmSent, WarmError> {
         self.warm_configs.lock().unwrap().push(job.config.clone());
@@ -171,102 +149,100 @@ impl RunExecutor for Warming {
     }
 }
 
-fn record(value: serde_json::Value) -> WalRecord {
-    serde_json::from_value(value).unwrap()
+/// A session converted from the old storage, as the converter that ran at the storage cutover
+/// wrote it: its records, its setup parts, the digest of the request its last recorded attempt
+/// sent, and the request bodies a test compares with. The fixtures were written from today's
+/// histories by that converter, which no longer exists; this is how those sessions are stored.
+struct Converted {
+    records: Vec<Record>,
+    parts: std::collections::BTreeMap<broca_session_store::codec::Digest, Vec<u8>>,
+    recorded_sha256: Option<String>,
+    bodies: Vec<Vec<u8>>,
 }
 
-/// Two recorded tool steps distinguish the last request from the run's first request. The last
-/// turn can still be held, or already placed with replies while its post-tool wait continues.
-fn history(closed: bool) -> Vec<WalRecord> {
-    let frozen = warmable();
-    let mut records = vec![record(json!({
-        "type": "run_started", "run_id": "r1", "ts_ms": crate::actor::epoch_ms(),
-        "session": bind(), "keep_warm": "auto",
-        "config": {
-            "model": {"provider_module_id":"anthropic", "model_id":"claude-opus-4-8"},
-            "tools": [{"name":"read", "description":"Read", "input_schema":{"type":"object"}, "execution_mode":"parallel"}],
-            "tool_choice":{"type":"auto"}, "generation":{}, "response_format":{"type":"text"},
-            "context_epoch":0, "renderer_version":frozen.renderer_version,
-            "frozen_render_config": frozen,
-        },
-        "input":[{"role":"user", "content":[{"type":"text", "text":"hello"}]}],
-        "origin":{"kind":"fresh"},
-    }))];
-    for step in 1..=2 {
-        records.push(record(json!({"type":"step_started", "step_id":step})));
-        if step == 2 {
-            records.push(record(
-                json!({"type":"output_reservation_clamped", "step_id":step,
-                "max_output_tokens":256, "estimated_input_tokens":100, "context_limit":4096}),
-            ));
+/// The converted history `name`. Every history has a run started with two recorded tool steps,
+/// which distinguish the run's last request from its first:
+/// - `open-tool-wait`: the second step's call is still held by its tool.
+/// - `closed-tool-wait`: its reply is placed, and the run's post-tool wait continues.
+/// - `cold-predecessor`: `closed-tool-wait`, finished, then a run `r2` that sent nothing yet.
+/// - `mismatched-digest`: `open-tool-wait` whose last attempt records another request's digest.
+/// - `finished-head`: `closed-tool-wait`, finished, in a session of class `head`.
+/// - `finished-head-unclassed`: `finished-head` with no session class.
+/// - `finished-head-keep-warm-off`: `finished-head` whose run turned keep-warm off.
+/// - `moved-account`: `finished-head` whose second step moved from account A to B after a
+///   usage limit; `bodies` are the requests its three attempts sent.
+///
+/// Times are moved forward by the age of the fixture, so its last request is as recent as when
+/// it was written and a cache it warmed is still alive.
+fn converted(name: &str) -> Converted {
+    let text = match name {
+        "open-tool-wait" => include_str!("resumed/fixtures/open-tool-wait.json"),
+        "closed-tool-wait" => include_str!("resumed/fixtures/closed-tool-wait.json"),
+        "cold-predecessor" => include_str!("resumed/fixtures/cold-predecessor.json"),
+        "mismatched-digest" => include_str!("resumed/fixtures/mismatched-digest.json"),
+        "finished-head" => include_str!("resumed/fixtures/finished-head.json"),
+        "finished-head-unclassed" => include_str!("resumed/fixtures/finished-head-unclassed.json"),
+        "finished-head-keep-warm-off" => {
+            include_str!("resumed/fixtures/finished-head-keep-warm-off.json")
         }
-        let config = match &records[0] {
-            WalRecord::RunStarted { config, .. } => config.clone(),
-            _ => unreachable!(),
-        };
-        let (_, _, bytes) = crate::wal_render::render_step_with_lineage(
-            None,
-            &records,
-            &config,
-            "r1",
-            step,
-            (step == 2).then_some(256),
-            None,
-        )
-        .unwrap();
-        records.push(record(json!({"type":"model_attempt_finished", "step_id":step, "attempt":0,
-            "outcome":"complete", "http_status":200, "ts_ms":crate::actor::epoch_ms(),
-            "sent_at_ms":crate::actor::epoch_ms(), "request_body_len":bytes.len(),
-            "request_body_sha256":broca_core::render::request_digest_hex(&bytes),
-            "response_body_len":0, "response_body_sha256":broca_core::render::request_digest_hex(b""),
-        })));
-        records.push(record(json!({"type":"model_step_finished", "step_id":step,
-            "assistant_message":{"message_id":format!("m{step}"), "content":[{
-                "type":"tool_call", "tool_call_id":format!("c{step}"), "tool_name":"read", "input":{},
-            }]}, "usage":{"input_tokens":100, "output_tokens":20},
-            "finish_reason":"tool_calls", "retries_used":0,
-        })));
-        records.push(record(
-            json!({"type":"tool_batch_started", "batch_id":format!("b{step}"),
-            "step_id":step, "planned_calls":[format!("c{step}")]}),
-        ));
-        if step == 1 || closed {
-            records.push(record(json!({"type":"tool_result", "batch_id":format!("b{step}"),
-                "result":{"tool_call_id":format!("c{step}"), "output":{"kind":"text", "text":"answer"}, "is_error":false},
-                "outcome":"unknown"})));
-            records.push(record(
-                json!({"type":"tool_batch_finished", "batch_id":format!("b{step}")}),
-            ));
-            records.push(record(json!({"type":"turn_finished", "step_id":step})));
-        }
+        "moved-account" => include_str!("resumed/fixtures/moved-account.json"),
+        other => panic!("no converted history {other}"),
+    };
+    let fixture: serde_json::Value = serde_json::from_str(text).unwrap();
+    let bytes = |value: &serde_json::Value| -> Vec<u8> {
+        let text = value.as_str().unwrap();
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
+    };
+    let age = crate::actor::epoch_ms() - fixture["generated_at_ms"].as_u64().unwrap();
+    let records = fixture["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| {
+            let kind = u32::try_from(record["kind"].as_u64().unwrap()).unwrap();
+            let mut record = Record::decode(kind, &bytes(&record["body"])).unwrap();
+            match &mut record {
+                Record::RunStart(start) => {
+                    start.ts_ms = start.ts_ms.map(|ts| ts + age);
+                    start.written_at_ms = start.written_at_ms.map(|ts| ts + age);
+                }
+                Record::Attempt(attempt) => {
+                    attempt.ts_ms += age;
+                    attempt.sent_at_ms = attempt.sent_at_ms.map(|ts| ts + age);
+                }
+                _ => {}
+            }
+            record
+        })
+        .collect();
+    let parts = fixture["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|part| {
+            let digest: [u8; 32] = bytes(&part[0]).try_into().unwrap();
+            (broca_session_store::codec::Digest(digest), bytes(&part[1]))
+        })
+        .collect();
+    Converted {
+        records,
+        parts,
+        recorded_sha256: fixture["recorded_sha256"].as_str().map(str::to_owned),
+        bodies: fixture["bodies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(bytes)
+            .collect(),
     }
-    records
 }
 
 async fn reopened(
     side: &super::Side,
-    records: &[WalRecord],
-    cipher: Cipher,
-    executor: Arc<Warming>,
-) -> StoreActor<LocalBackend> {
-    let frames: Vec<_> = records
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, record)| FramedRecord {
-            seq: i as u64 + 1,
-            fence: 0,
-            record,
-        })
-        .collect();
-    let converted = broca_session_convert::convert(&frames, None).unwrap();
-    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
-    reopened_converted(side, converted, cipher, executor).await
-}
-
-async fn reopened_converted(
-    side: &super::Side,
-    converted: broca_session_convert::Converted,
+    converted: Converted,
     cipher: Cipher,
     executor: Arc<Warming>,
 ) -> StoreActor<LocalBackend> {
@@ -314,11 +290,14 @@ async fn finish_media(actor: &mut StoreActor<LocalBackend>) {
 async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
     for closed in [false, true] {
         let side = super::side(false, cipher).await;
-        let records = history(closed);
-        let recorded =
-            broca_core::cache_warm::last_recorded_request_with_lineage(&records, None).unwrap();
+        let history = converted(if closed {
+            "closed-tool-wait"
+        } else {
+            "open-tool-wait"
+        });
+        let recorded = history.recorded_sha256.clone().unwrap();
         let executor = Arc::new(Warming::default());
-        let mut actor = reopened(&side, &records, cipher, Arc::clone(&executor)).await;
+        let mut actor = reopened(&side, history, cipher, Arc::clone(&executor)).await;
         let mut media = Some(actor.run_media().await);
         let (driver, mut warming) = actor
             .keep_warm_for(
@@ -347,10 +326,7 @@ async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
         actor.record_kept_warm(kept).await;
         assert!(matches!(warm.await, WarmTick::Sent));
         assert_eq!(store_warm.step_id, 2);
-        assert_eq!(
-            super::hex(&store_warm.request_body_sha256),
-            recorded.request_body_sha256
-        );
+        assert_eq!(super::hex(&store_warm.request_body_sha256), recorded);
         assert_eq!(
             actor.session.conversation.placed,
             if closed { 5 } else { 3 },
@@ -381,10 +357,10 @@ async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
 
 async fn resumed_warm_waits_for_the_media_fold(cipher: Cipher) {
     let side = super::side(false, cipher).await;
-    let records = history(false);
+    let history = converted("open-tool-wait");
     let executor = Arc::new(Warming::default());
     let gate = Arc::new(Notify::new());
-    let mut actor = reopened(&side, &records, cipher, Arc::clone(&executor))
+    let mut actor = reopened(&side, history, cipher, Arc::clone(&executor))
         .await
         .with_media_build_gate(Arc::clone(&gate));
     let mut media = Some(actor.run_media().await);
@@ -419,21 +395,9 @@ async fn resumed_warm_waits_for_the_media_fold(cipher: Cipher) {
 
 async fn mismatched_recorded_digest_never_warms(cipher: Cipher) {
     let side = super::side(false, cipher).await;
-    let mut records = history(false);
-    let attempt = records
-        .iter_mut()
-        .rev()
-        .find(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
-        .unwrap();
-    if let WalRecord::ModelAttemptFinished {
-        request_body_sha256,
-        ..
-    } = attempt
-    {
-        *request_body_sha256 = "ff".repeat(32);
-    }
+    let history = converted("mismatched-digest");
     let executor = Arc::new(Warming::default());
-    let mut actor = reopened(&side, &records, cipher, Arc::clone(&executor)).await;
+    let mut actor = reopened(&side, history, cipher, Arc::clone(&executor)).await;
     let mut media = Some(actor.run_media().await);
     let (driver, mut warming) = actor
         .keep_warm_for(

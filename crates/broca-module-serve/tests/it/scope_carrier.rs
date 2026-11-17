@@ -7,17 +7,15 @@
 //! request the serve layer built. The daemon side is played by the test: it sends the HELLO_ACK
 //! (with or without `scopes/v1`) and stamps each bind the way the daemon does.
 
+use broca_session_store::record::Record;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{
-    run_loop_on_writer_admitted, AllowAll, FileLeaseStore, FileWalStore, OutputEvent, Provider,
-    RunError, RunSummary, StartMode, StubProvider, StubToolPlane,
-};
-use broca_module::executor::{RunExecutor, RunJob, RunKind};
+use broca_core::{FileLeaseStore, OutputEvent, Provider, StubProvider, StubToolPlane};
+use broca_module::executor::RunExecutor;
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
 use broca_protocol::{
@@ -26,7 +24,6 @@ use broca_protocol::{
     provider::{NormalizedEvent, ProviderControl},
     BindIdentity, FinishReason, MessageId, Usage,
 };
-use broca_wal::WalRecord;
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp, CAP_SCOPES_V1};
 use subc_protocol::session::ModuleControlRequest;
 use subc_protocol::{
@@ -133,8 +130,6 @@ impl Provider for GatedProvider {
 /// The real core loop. Only the first run waits on `gate`; with `pause_first`, the first run
 /// instead pauses for auth at its start, as a run whose credential needs re-authentication does.
 struct CoreExec {
-    wal_store: Arc<FileWalStore>,
-    store: Arc<broca_store::SqliteStore>,
     gate: Arc<Notify>,
     held: Arc<Notify>,
     pause_first: bool,
@@ -144,42 +139,32 @@ struct CoreExec {
 
 #[async_trait]
 impl RunExecutor for CoreExec {
-    async fn execute(
+    /// Every session is kept in the new storage: its runs go through the new loop over the
+    /// same gated provider.
+    async fn execute_on_store(
         &self,
-        job: RunJob,
+        job: broca_module::executor::StoreRunJob,
         out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        let mode = match job.kind {
-            RunKind::AppendEpisode => StartMode::AppendEpisode,
-            RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
-            RunKind::FreshOrResume => StartMode::FreshOrResume,
-        };
+    ) -> broca_module::executor::StoreRunEnd {
+        let (provider, first) = self.provider();
+        let pause = (first && self.pause_first).then(auth_required_error);
+        crate::store_exec::run_on_store(job, &out, &provider, &StubToolPlane::new(), pause).await
+    }
+}
+
+impl CoreExec {
+    /// The gated provider for the next run: only the first run waits on the gate, unless the
+    /// first run pauses for auth instead.
+    fn provider(&self) -> (GatedProvider, bool) {
         let first = self.runs.fetch_add(1, Ordering::SeqCst) == 0;
-        let provider = GatedProvider {
-            stub: StubProvider::new(vec![one_step_text_reply()]),
-            gate: (first && !self.pause_first).then(|| (self.gate.clone(), self.held.clone())),
-            prompts: self.prompts.clone(),
-        };
-        let materialized_store =
-            job.materialized_store(self.store.clone() as Arc<dyn broca_core::SessionStore>);
-        let mut control = job.control;
-        if first && self.pause_first {
-            control.pause_for_auth_at_start = Some(auth_required_error());
-        }
-        run_loop_on_writer_admitted(
-            job.req,
-            &job.writer,
-            mode,
-            &provider,
-            &StubToolPlane::new(),
-            &AllowAll,
-            self.wal_store.as_ref(),
-            materialized_store,
-            control,
-            &out,
-            job.on_admitted,
+        (
+            GatedProvider {
+                stub: StubProvider::new(vec![one_step_text_reply()]),
+                gate: (first && !self.pause_first).then(|| (self.gate.clone(), self.held.clone())),
+                prompts: self.prompts.clone(),
+            },
+            first,
         )
-        .await
     }
 }
 
@@ -235,7 +220,7 @@ struct Rig {
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
-    wal_path: PathBuf,
+    session: BindIdentity,
     gate: Arc<Notify>,
     held: Arc<Notify>,
     /// The number of messages in each model step's prompt, in call order.
@@ -259,35 +244,36 @@ impl Rig {
 
     /// Serve the state root at `dir` as it is on disk.
     async fn open(dir: PathBuf, scopes: bool, pause_first: bool) -> Self {
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         let gate = Arc::new(Notify::new());
         let held = Arc::new(Notify::new());
         let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fail_reservation_reads = Arc::new(AtomicBool::new(false));
         let exec = Arc::new(CoreExec {
-            wal_store: wal.clone(),
-            store: store.clone(),
             gate: gate.clone(),
             held: held.clone(),
             pause_first,
             runs: AtomicUsize::new(0),
             prompts: prompts.clone(),
         });
-        let opener = Arc::new(
-            DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                exec,
+        let runtime = Arc::new(
+            broca_module::store_open::StoreRuntime::open(
+                &dir,
+                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                exec.clone() as Arc<dyn RunExecutor>,
+                Duration::from_millis(100),
             )
-            .with_run_index(store.clone())
-            .with_materialized_store(store.clone()),
+            .await
+            .unwrap(),
         );
-        let registry = Arc::new(LineageRegistry::new_with_reader(
-            opener,
-            wal.clone(),
-            Some(store.clone()),
-        ));
+        let opener = Arc::new(
+            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), exec)
+                .with_store_runtime(runtime)
+                .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
+                    (broca_core::ChargeBasis::Unknown, 1)
+                })),
+        );
+        let registry = Arc::new(LineageRegistry::new(opener));
         broca_store::session_refs::migrate(
             &dir.join("store.db"),
             &broca_core::ReadOnlyWalReader::new(&dir),
@@ -335,13 +321,12 @@ impl Rig {
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
         let session = BindIdentity::new("broca-unscoped-v1", "runner", "scoped");
-        let wal_path = wal.wal_path(&session);
         Self {
             dir,
             reader,
             writer,
             serve,
-            wal_path,
+            session,
             gate,
             held,
             prompts,
@@ -349,28 +334,6 @@ impl Rig {
             fail_reservation_reads,
             corr: 1,
         }
-    }
-
-    /// Stop serving as a module stopping gracefully does, so every session's writer lease is
-    /// released, and return the state root, left on disk for [`Rig::open`].
-    async fn close(self) -> PathBuf {
-        let Self {
-            dir,
-            reader,
-            writer,
-            serve,
-            registry,
-            ..
-        } = self;
-        drop(writer);
-        drop(reader);
-        let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
-        assert!(
-            registry.stop_and_seal().await,
-            "the stop sealed every session"
-        );
-        drop(registry);
-        dir
     }
 
     async fn request(&mut self, channel: u16, body: serde_json::Value) -> Frame {
@@ -474,7 +437,6 @@ impl Rig {
 
     /// [`Rig::send_ok_once_idle`], returning the admitted reply's frame.
     async fn send_once_idle(&mut self, channel: u16, send_id: &str) -> Frame {
-        let wal_path = self.wal_path.clone();
         broca_test_support::wait_for(
             "scope freeze admits send after idle",
             async {
@@ -489,12 +451,7 @@ impl Rig {
                     return reply;
                 }
             },
-            || {
-                format!(
-                    "WAL bytes={:?}",
-                    std::fs::metadata(&wal_path).map(|m| m.len())
-                )
-            },
+            || "the session stayed busy".to_owned(),
         )
         .await
     }
@@ -504,13 +461,13 @@ impl Rig {
         broca_test_support::event_timeout(
             "first provider reaches held gate",
             self.held.notified(),
-            || broca_test_support::record_kinds(self.records()),
+            || "see the session's records".to_owned(),
         )
         .await
         .expect("the first run's provider reaches its gate");
     }
 
-    /// Wait until the WAL on disk holds the first run's step start.
+    /// Wait until the session holds the first run's step start.
     async fn wait_for_step_started(&self) {
         broca_test_support::wait_for(
             "durable StepStarted",
@@ -518,45 +475,97 @@ impl Rig {
                 loop {
                     if self
                         .records()
+                        .await
                         .iter()
-                        .any(|record| matches!(record, WalRecord::StepStarted { .. }))
+                        .any(|record| matches!(record, Record::StepStart(_)))
                     {
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             },
-            || broca_test_support::record_kinds(self.records()),
+            || "see the session's records".to_owned(),
         )
         .await
     }
 
-    fn wal_bytes(&self) -> Vec<u8> {
-        std::fs::read(&self.wal_path).unwrap_or_default()
+    /// The session's records in the new storage, in log order. Empty while it doesn't exist.
+    async fn records(&self) -> Vec<Record> {
+        let runtime = self.registry.store_runtime().unwrap();
+        match runtime.current_view(&self.session).await {
+            Ok(Some(view)) => view
+                .open_log_records()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
-    fn records(&self) -> Vec<WalRecord> {
-        broca_wal::replay_file(&self.wal_path, broca_wal::DEFAULT_MAX_READ_BYTES)
-            .unwrap()
-            .into_iter()
-            .map(|frame| frame.record)
+    /// The session's records, each as its debug text: what a refused send must leave as it was.
+    async fn stored(&self) -> Vec<String> {
+        self.records()
+            .await
+            .iter()
+            .map(|record| format!("{record:?}"))
             .collect()
     }
 
-    async fn wait_for_finished(&self, n: usize) -> Vec<WalRecord> {
+    /// Whether the new storage holds the session at all.
+    fn exists(&self) -> bool {
+        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.session))
+            .unwrap()
+            .is_some()
+    }
+
+    /// What each run the session started was admitted with, in the order the runs started.
+    async fn admissions(&self) -> Vec<broca_session_loop::run::Admission> {
+        let runtime = self.registry.store_runtime().unwrap();
+        let Some(class) = runtime.class_of(&self.session).unwrap() else {
+            return Vec::new();
+        };
+        let parts = runtime.parts_for(class, runtime.new_sessions());
+        self.records()
+            .await
+            .iter()
+            .filter_map(|record| match record {
+                Record::RunStart(start) => Some(
+                    broca_session_loop::run::admission_of_start(start, parts)
+                        .expect("a run's start reads back its admission"),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The scopes each run froze at its start, as `(owner, ref, epoch)`.
+    async fn frozen_scopes(&self) -> Vec<Option<(String, String, u64)>> {
+        self.admissions()
+            .await
+            .into_iter()
+            .map(|admission| {
+                admission.send.scope.as_ref().map(|scope| {
+                    (
+                        scope.owner.as_owner_string(),
+                        scope.scope_ref.clone(),
+                        scope.scope_epoch,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    async fn wait_for_finished(&self, n: usize) -> Vec<Record> {
         broca_test_support::wait_for(
             "durable RunFinished or RunPaused",
             async {
                 loop {
-                    let records = self.records();
+                    let records = self.records().await;
                     let finished = records
                         .iter()
-                        .filter(|record| {
-                            matches!(
-                                record,
-                                WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. }
-                            )
-                        })
+                        .filter(|record| matches!(record, Record::RunEnd(_) | Record::Pause(_)))
                         .count();
                     if finished >= n {
                         return records;
@@ -564,13 +573,9 @@ impl Rig {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             },
-            || broca_test_support::record_kinds(self.records()),
+            || "see the session's records".to_owned(),
         )
         .await
-    }
-
-    fn floor(&self) -> Option<String> {
-        std::fs::read_to_string(self.dir.join(broca_wal::FEATURE_FLOOR_FILENAME)).ok()
     }
 
     async fn finish(self) {
@@ -586,34 +591,6 @@ impl Rig {
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
         let _ = std::fs::remove_dir_all(dir);
     }
-}
-
-/// The scopes each `RunStarted` froze, as `(owner, ref, epoch)`.
-fn frozen_scopes(records: &[WalRecord]) -> Vec<Option<(String, String, u64)>> {
-    records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::RunStarted { scope, .. } => Some(scope.as_ref().map(|scope| {
-                (
-                    scope.owner.as_owner_string(),
-                    scope.scope_ref.clone(),
-                    scope.scope_epoch,
-                )
-            })),
-            _ => None,
-        })
-        .collect()
-}
-
-/// How many `RunStarted` records sit in gated frames requiring `scope/v1`, found by their
-/// payload bytes: such a payload opens with the envelope, so an ordinary frame never matches.
-fn gated_run_started_count(bytes: &[u8]) -> usize {
-    // Newly admitted episodes carry computed tags and a durable input time beside the scope.
-    let needle = br#"{"requires":["message-times/v1","runner-tags/v2","scope/v1"],"record":{"type":"run_started""#;
-    bytes
-        .windows(needle.len())
-        .filter(|window| *window == needle)
-        .count()
 }
 
 fn error_body(frame: &Frame) -> (String, serde_json::Value) {
@@ -649,21 +626,24 @@ async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
     rig.gate.notify_one();
     let first = rig.send_ok(7, "turn-1").await;
     assert_eq!(first["state"], "active", "{first}");
-    let records = rig.wait_for_finished(1).await;
+    rig.wait_for_finished(1).await;
     assert_eq!(
-        frozen_scopes(&records),
+        rig.frozen_scopes().await,
         [Some((
             "reserved:prefrontal-core".into(),
             "head-1".into(),
             3
         ))]
     );
-    assert_eq!(gated_run_started_count(&rig.wal_bytes()), 1);
     assert_eq!(
-        rig.floor().as_deref(),
-        Some("message-times/v1\nrunner-tags/v2\nscope/v1\n")
+        rig.frozen_scopes()
+            .await
+            .iter()
+            .filter(|scope| scope.is_some())
+            .count(),
+        1
     );
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
 
     rig.bind_ok(8, Some(other()), Some(stamp(core(), 3))).await;
     rig.bind_ok(9, Some(core()), None).await;
@@ -684,7 +664,11 @@ async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
         assert_eq!(body["detail"]["scope_epoch"], 3);
         assert_eq!(body["detail"]["presented_principal"], presented, "{body}");
     }
-    assert_eq!(rig.wal_bytes(), before, "a refused send must write nothing");
+    assert_eq!(
+        rig.stored().await,
+        before,
+        "a refused send must write nothing"
+    );
 
     // The owner under the frozen scope is still admitted, and its episode repeats the scope.
     // `pending` when the actor has not yet folded the first run's terminal into its state: the
@@ -694,15 +678,22 @@ async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
         matches!(again["state"].as_str(), Some("active" | "pending")),
         "{again}"
     );
-    let records = rig.wait_for_finished(2).await;
+    rig.wait_for_finished(2).await;
     assert_eq!(
-        frozen_scopes(&records),
+        rig.frozen_scopes().await,
         [
             Some(("reserved:prefrontal-core".into(), "head-1".into(), 3)),
             Some(("reserved:prefrontal-core".into(), "head-1".into(), 3)),
         ]
     );
-    assert_eq!(gated_run_started_count(&rig.wal_bytes()), 2);
+    assert_eq!(
+        rig.frozen_scopes()
+            .await
+            .iter()
+            .filter(|scope| scope.is_some())
+            .count(),
+        2
+    );
     rig.finish().await;
 }
 
@@ -736,7 +727,7 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
         .await;
     assert_reserved_for_core(&import, "reserved:other-agent");
     assert!(
-        !rig.wal_path.exists(),
+        !rig.exists(),
         "a refused first send or import must not create the session's log"
     );
 
@@ -745,16 +736,15 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
         "reserved:other-agent",
     );
 
-    // Opening the session's actor writes its log; the actor then makes the same decision.
-    rig.registry.actor_for(&session).await.unwrap();
-    assert!(
-        rig.wal_path.exists(),
-        "the open actor wrote the session's log"
-    );
-    let before = rig.wal_bytes();
+    // Only a send the reservation admits creates the session, so nothing can open it yet.
+    assert!(matches!(
+        rig.registry.actor_for(&session).await,
+        Err(broca_module::registry::OpenError::UnknownSession)
+    ));
+    let before = rig.stored().await;
     assert_reserved_for_core(&rig.send(8, "stranger-2").await, "reserved:other-agent");
-    assert_eq!(rig.wal_bytes(), before, "a refused send writes nothing");
-    assert!(frozen_scopes(&rig.records()).is_empty(), "no run started");
+    assert_eq!(rig.stored().await, before, "a refused send writes nothing");
+    assert!(rig.frozen_scopes().await.is_empty(), "no run started");
     let ownership = rig
         .registry
         .session_ownership_for_bind(&session)
@@ -774,9 +764,9 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
     rig.gate.notify_one();
     let first = rig.send_ok(7, "owner-1").await;
     assert_eq!(first["state"], "active", "{first}");
-    let records = rig.wait_for_finished(1).await;
+    rig.wait_for_finished(1).await;
     assert_eq!(
-        frozen_scopes(&records),
+        rig.frozen_scopes().await,
         [Some((
             "reserved:prefrontal-core".into(),
             "head-1".into(),
@@ -791,8 +781,8 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
     rig.gate.notify_one();
     let first = rig.send_ok(8, "unscoped-1").await;
     assert_eq!(first["state"], "active", "{first}");
-    let records = rig.wait_for_finished(1).await;
-    assert_eq!(frozen_scopes(&records), [None]);
+    rig.wait_for_finished(1).await;
+    assert_eq!(rig.frozen_scopes().await, [None]);
     rig.finish().await;
 }
 
@@ -840,9 +830,9 @@ async fn a_reservation_admits_its_scope_at_any_epoch_and_refuses_another_ref() {
         rig.gate.notify_one();
         let first = rig.send_ok(9, "moved-1").await;
         assert_eq!(first["state"], "active", "{tag}: {first}");
-        let records = rig.wait_for_finished(1).await;
+        rig.wait_for_finished(1).await;
         assert_eq!(
-            frozen_scopes(&records),
+            rig.frozen_scopes().await,
             [Some((
                 "reserved:prefrontal-core".into(),
                 "head-1".into(),
@@ -862,7 +852,6 @@ async fn a_reservation_admits_its_scope_at_any_epoch_and_refuses_another_ref() {
 #[tokio::test]
 async fn an_unreadable_reservation_refuses_the_first_send_as_transient() {
     let mut rig = Rig::start("reservation-unreadable", true, false).await;
-    let session = BindIdentity::new("broca-unscoped-v1", "runner", "scoped");
     rig.bind_ok(7, Some(core()), Some(stamp(core(), 3))).await;
     rig.bind_ok(8, Some(other()), None).await;
     rig.fail_reservation_reads.store(true, Ordering::SeqCst);
@@ -884,21 +873,15 @@ async fn an_unreadable_reservation_refuses_the_first_send_as_transient() {
     assert_eq!(body["detail"]["class"], "transient", "{body}");
     assert_eq!(body["detail"]["cause"], "open_failed", "{body}");
     assert!(
-        !rig.wal_path.exists(),
+        !rig.exists(),
         "a send or import refused for an unreadable reservation must not create the log"
     );
 
-    // Opening the session's actor writes its log, so the next send reaches the actor's check.
-    rig.registry.actor_for(&session).await.unwrap();
-    assert!(
-        rig.wal_path.exists(),
-        "the open actor wrote the session's log"
-    );
-    let before = rig.wal_bytes();
+    // A second send meets the same check and creates nothing either.
     let (code, body) = error_body(&rig.send(8, "stranger-2").await);
     assert_eq!(code, "transient", "{body}");
-    assert_eq!(rig.wal_bytes(), before, "a refused send writes nothing");
-    assert!(frozen_scopes(&rig.records()).is_empty(), "no run started");
+    assert!(!rig.exists(), "a refused send writes nothing");
+    assert!(rig.frozen_scopes().await.is_empty(), "no run started");
     rig.finish().await;
 }
 
@@ -911,12 +894,12 @@ async fn a_scoped_send_on_a_daemon_without_scopes_is_refused_as_unsupported() {
     rig.gate.notify_one();
     rig.send_ok(7, "turn-1").await;
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
 
     rig.bind_ok(8, Some(core()), None).await;
     let (code, body) = error_body(&rig.send(8, "turn-2").await);
     assert_eq!(code, "scope_unsupported", "{body}");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.stored().await, before);
     rig.finish().await;
 }
 
@@ -943,15 +926,22 @@ async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind
     rig.wait_for_finished(1).await;
     let adopted = rig.send_ok_once_idle(8, "scoped-1").await;
     assert_eq!(adopted["state"], "active", "{adopted}");
-    let records = rig.wait_for_finished(2).await;
+    rig.wait_for_finished(2).await;
     assert_eq!(
-        frozen_scopes(&records),
+        rig.frozen_scopes().await,
         [
             None,
             Some(("reserved:prefrontal-core".into(), "head-1".into(), 3))
         ]
     );
-    assert_eq!(gated_run_started_count(&rig.wal_bytes()), 1);
+    assert_eq!(
+        rig.frozen_scopes()
+            .await
+            .iter()
+            .filter(|scope| scope.is_some())
+            .count(),
+        1
+    );
     // Once adopted, the session is scoped: a stamped bind is admitted.
     rig.bind_ok(9, Some(core()), Some(stamp(core(), 3))).await;
     rig.finish().await;
@@ -978,7 +968,7 @@ async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind
         rig.gate.notify_one();
         rig.send_ok(7, "unscoped-1").await;
         rig.wait_for_finished(1).await;
-        let before = rig.wal_bytes();
+        let before = rig.stored().await;
 
         let refused = rig.send(8, "scoped-1").await;
         let (code, _) = error_body(&refused);
@@ -1006,15 +996,9 @@ async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind
             "{tag}: the bind refusal's detail"
         );
         assert_eq!(
-            rig.wal_bytes(),
+            rig.stored().await,
             before,
             "{tag}: a refused adoption writes nothing"
-        );
-        // The unscoped episode's runner tags raised the floor; the refusal added no scope.
-        assert_eq!(
-            rig.floor().as_deref(),
-            Some("message-times/v1\nrunner-tags/v2\n"),
-            "{tag}: nothing scoped was written"
         );
         rig.finish().await;
     }
@@ -1035,10 +1019,10 @@ async fn an_auth_paused_resend_meets_the_same_refusal_byte_for_byte() {
     assert!(
         records
             .iter()
-            .any(|record| matches!(record, WalRecord::RunPaused { .. })),
+            .any(|record| matches!(record, Record::Pause(_))),
         "the first run must pause for auth: {records:?}"
     );
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
 
     let first = rig.send(8, "paused-turn").await;
     let second = rig.send(8, "paused-turn").await;
@@ -1052,7 +1036,7 @@ async fn an_auth_paused_resend_meets_the_same_refusal_byte_for_byte() {
         golden("scope_adoption_refused.no_recorded_principal.json")
     );
     assert_eq!(
-        rig.wal_bytes(),
+        rig.stored().await,
         before,
         "the refused resend resumed nothing"
     );
@@ -1079,7 +1063,7 @@ async fn a_send_that_would_freeze_while_a_run_is_active_is_refused_busy() {
     // writes nothing, so the comparison below sees only what the refusal writes.
     rig.wait_until_held().await;
     rig.wait_for_step_started().await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
 
     let busy = rig.send(8, "adopting").await;
     let expected = serde_json::to_vec(&broca_wire::ScopeFreezeBusy::new(
@@ -1091,19 +1075,20 @@ async fn a_send_that_would_freeze_while_a_run_is_active_is_refused_busy() {
         String::from_utf8_lossy(&expected)
     );
     assert_eq!(error_body(&busy).0, "scope_freeze_busy");
-    assert_eq!(rig.wal_bytes(), before, "a busy refusal writes nothing");
+    assert_eq!(rig.stored().await, before, "a busy refusal writes nothing");
     assert!(!rig
         .records()
+        .await
         .iter()
-        .any(|record| matches!(record, WalRecord::Queued { .. })));
+        .any(|record| matches!(record, Record::QueuedSend(_))));
 
     rig.gate.notify_one();
     rig.wait_for_finished(1).await;
     let adopted = rig.send_ok_once_idle(8, "adopting").await;
     assert_eq!(adopted["state"], "active", "{adopted}");
-    let records = rig.wait_for_finished(2).await;
+    rig.wait_for_finished(2).await;
     assert_eq!(
-        frozen_scopes(&records),
+        rig.frozen_scopes().await,
         [
             None,
             Some(("reserved:prefrontal-core".into(), "head-1".into(), 3))
@@ -1128,22 +1113,30 @@ async fn queued_sends_in_a_scoped_session_are_checked_when_queued_and_drain_scop
     assert_eq!(code, "scope_owner_mismatch");
     let queued_records = rig
         .records()
+        .await
         .into_iter()
-        .filter(|record| matches!(record, WalRecord::Queued { .. }))
+        .filter(|record| matches!(record, Record::QueuedSend(_)))
         .count();
     assert_eq!(queued_records, 1, "only the owner's send was queued");
 
     rig.gate.notify_one();
-    let records = rig.wait_for_finished(2).await;
+    rig.wait_for_finished(2).await;
     assert_eq!(
-        frozen_scopes(&records),
+        rig.frozen_scopes().await,
         [
             Some(("reserved:prefrontal-core".into(), "head-1".into(), 3)),
             Some(("reserved:prefrontal-core".into(), "head-1".into(), 3)),
         ],
         "the drained episode carries the frozen scope"
     );
-    assert_eq!(gated_run_started_count(&rig.wal_bytes()), 2);
+    assert_eq!(
+        rig.frozen_scopes()
+            .await
+            .iter()
+            .filter(|scope| scope.is_some())
+            .count(),
+        2
+    );
     rig.finish().await;
 }
 
@@ -1158,7 +1151,7 @@ async fn an_unscoped_session_accepts_later_sends_only_from_its_first_principal()
     rig.gate.notify_one();
     rig.send_ok(7, "turn-1").await;
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
     for (channel, presented) in [
         (8, serde_json::json!("reserved:other-agent")),
         (9, serde_json::Value::Null),
@@ -1169,7 +1162,7 @@ async fn an_unscoped_session_accepts_later_sends_only_from_its_first_principal()
         assert_eq!(body["detail"]["first"], "reserved:prefrontal-core");
         assert_eq!(body["detail"]["presented_principal"], presented);
     }
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.stored().await, before);
     let again = rig.send_ok(7, "turn-2").await;
     assert!(
         matches!(again["state"].as_str(), Some("active" | "pending")),
@@ -1197,7 +1190,7 @@ async fn basal_unscoped_delivery_refusal_preserves_wal_bytes() {
     // provider can reach its gate before that record is on disk. Take the before-snapshot only
     // once it is, or the late step start reads as a refused send writing to the WAL.
     rig.wait_for_step_started().await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
     rig.bind_ok(
         2,
         Some(Principal::Reserved {
@@ -1218,7 +1211,7 @@ async fn basal_unscoped_delivery_refusal_preserves_wal_bytes() {
         let (code, body) = error_body(&reply);
         assert_eq!(code, "flow_scope_required", "{body}");
         assert_eq!(
-            rig.wal_bytes(),
+            rig.stored().await,
             before,
             "refused {delivery} changed the WAL"
         );
@@ -1305,9 +1298,16 @@ async fn a_later_epoch_of_the_owners_scope_reopens_an_idle_session() {
         Some(&run_id),
         REOPENED_REPLY_SHA256,
     );
-    let records = rig.wait_for_finished(2).await;
-    assert_eq!(frozen_scopes(&records), [head(1), head(2)]);
-    assert_eq!(gated_run_started_count(&rig.wal_bytes()), 2);
+    rig.wait_for_finished(2).await;
+    assert_eq!(rig.frozen_scopes().await, [head(1), head(2)]);
+    assert_eq!(
+        rig.frozen_scopes()
+            .await
+            .iter()
+            .filter(|scope| scope.is_some())
+            .count(),
+        2
+    );
     let prompts = rig.prompts.lock().unwrap().clone();
     assert_eq!(prompts.len(), 2, "one model step per episode: {prompts:?}");
     assert_eq!(
@@ -1316,7 +1316,7 @@ async fn a_later_epoch_of_the_owners_scope_reopens_an_idle_session() {
         "the reopened episode's prompt holds the first turn's question and answer: {prompts:?}"
     );
 
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
     let (code, body) = error_body(&rig.send(7, "turn-3").await);
     assert_eq!(code, "scope_owner_mismatch", "{body}");
     assert_eq!(body["detail"]["scope_epoch"], 2, "{body}");
@@ -1324,15 +1324,19 @@ async fn a_later_epoch_of_the_owners_scope_reopens_an_idle_session() {
         body["detail"]["presented_scope"]["scope_epoch"], 1,
         "{body}"
     );
-    assert_eq!(rig.wal_bytes(), before, "a refused send must write nothing");
+    assert_eq!(
+        rig.stored().await,
+        before,
+        "a refused send must write nothing"
+    );
 
     let again = rig.send_ok_once_idle(8, "turn-3").await;
     assert!(
         matches!(again["state"].as_str(), Some("active" | "pending")),
         "{again}"
     );
-    let records = rig.wait_for_finished(3).await;
-    assert_eq!(frozen_scopes(&records), [head(1), head(2), head(2)]);
+    rig.wait_for_finished(3).await;
+    assert_eq!(rig.frozen_scopes().await, [head(1), head(2), head(2)]);
     rig.finish().await;
 }
 
@@ -1348,7 +1352,7 @@ async fn an_equal_or_lower_epoch_or_another_scope_identity_is_still_refused() {
     rig.gate.notify_one();
     rig.send_ok(7, "turn-1").await;
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
 
     let refused = [
         (8, Some(core()), stamp_of(core(), "head-2", 3, None)),
@@ -1371,7 +1375,11 @@ async fn an_equal_or_lower_epoch_or_another_scope_identity_is_still_refused() {
         assert_eq!(body["detail"]["ref"], "head-1", "{body}");
         assert_eq!(body["detail"]["scope_epoch"], 3, "{body}");
     }
-    assert_eq!(rig.wal_bytes(), before, "a refused send must write nothing");
+    assert_eq!(
+        rig.stored().await,
+        before,
+        "a refused send must write nothing"
+    );
     rig.finish().await;
 
     let mut rig = Rig::start("reopen-flow", true, false).await;
@@ -1384,7 +1392,7 @@ async fn an_equal_or_lower_epoch_or_another_scope_identity_is_still_refused() {
     rig.gate.notify_one();
     rig.send_ok(7, "flow-1").await;
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
     rig.bind_ok(
         8,
         Some(other()),
@@ -1393,7 +1401,11 @@ async fn an_equal_or_lower_epoch_or_another_scope_identity_is_still_refused() {
     .await;
     let (code, body) = error_body(&rig.send(8, "flow-2").await);
     assert_eq!(code, "scope_flow_id_mismatch", "{body}");
-    assert_eq!(rig.wal_bytes(), before, "a refused send must write nothing");
+    assert_eq!(
+        rig.stored().await,
+        before,
+        "a refused send must write nothing"
+    );
     rig.bind_ok(
         9,
         Some(other()),
@@ -1402,18 +1414,18 @@ async fn an_equal_or_lower_epoch_or_another_scope_identity_is_still_refused() {
     .await;
     let reopened = rig.send_ok_once_idle(9, "flow-reopened").await;
     assert_eq!(reopened["state"], "active", "{reopened}");
-    let records = rig.wait_for_finished(2).await;
-    let flows: Vec<_> = records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::RunStarted {
-                scope: Some(scope), ..
-            } => Some((
+    rig.wait_for_finished(2).await;
+    let flows: Vec<_> = rig
+        .admissions()
+        .await
+        .into_iter()
+        .filter_map(|admission| admission.send.scope)
+        .map(|scope| {
+            (
                 scope.scope_epoch,
                 scope.flow_id.clone(),
                 scope.sender.as_ref().map(|sender| sender.as_owner_string()),
-            )),
-            _ => None,
+            )
         })
         .collect();
     let flow = |epoch| {
@@ -1447,7 +1459,7 @@ async fn a_reopen_that_cannot_open_its_own_episode_now_is_refused_and_writes_not
     // `a_send_that_would_freeze_while_a_run_is_active_is_refused_busy`.
     rig.wait_until_held().await;
     rig.wait_for_step_started().await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
 
     rig.bind_ok(8, Some(core()), Some(stamp(core(), 2))).await;
     let steer = rig.send_as(8, "steer-2", Some("steer")).await;
@@ -1481,116 +1493,25 @@ async fn a_reopen_that_cannot_open_its_own_episode_now_is_refused_and_writes_not
         String::from_utf8_lossy(&queued.body),
         "an interrupt is refused busy like a queued send"
     );
-    assert_eq!(rig.wal_bytes(), before, "a refused send must write nothing");
+    assert_eq!(
+        rig.stored().await,
+        before,
+        "a refused send must write nothing"
+    );
 
     rig.gate.notify_one();
     let records = rig.wait_for_finished(1).await;
     assert!(
         records.iter().any(|record| matches!(
             record,
-            WalRecord::RunFinished {
-                reason: broca_protocol::caller::RunFinishReason::Completed,
-                ..
-            }
+            Record::RunEnd(end) if end.reason == broca_protocol::caller::RunFinishReason::Completed
         )),
         "the refused interrupt cancelled nothing: {records:?}"
     );
     let reopened = rig.send_ok_once_idle(8, "after").await;
     assert_eq!(reopened["state"], "active", "{reopened}");
-    let records = rig.wait_for_finished(2).await;
-    assert_eq!(frozen_scopes(&records), [head(1), head(2)]);
-    rig.finish().await;
-}
-
-/// Turn the auth pause that ends the WAL at `wal_path` into a restart pause, as a graceful stop
-/// leaves a run it paused at a boundary: the last frame is rewritten with the same sequence and
-/// fence.
-fn rewrite_last_pause_as_restart(wal_path: &Path) {
-    let bytes = std::fs::read(wal_path).unwrap();
-    let mut offset = 0;
-    let mut last = None;
-    while offset < bytes.len() {
-        match broca_wal::framing::decode_next(&bytes[offset..]) {
-            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                last = Some((offset, framed));
-                offset += consumed;
-            }
-            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
-            _ => panic!("the WAL decodes to its end"),
-        }
-    }
-    let (start, framed) = last.expect("a record");
-    let WalRecord::RunPaused {
-        run_id,
-        ts_ms,
-        error,
-        ..
-    } = framed.record
-    else {
-        panic!("the WAL ends with a pause: {:?}", framed.record);
-    };
-    let restart = WalRecord::RunPaused {
-        account_limit: None,
-        run_id,
-        ts_ms,
-        reason: broca_protocol::PauseReason::Restart,
-        error,
-    };
-    let mut rewritten = bytes[..start].to_vec();
-    rewritten.extend(broca_wal::framing::encode(framed.seq, framed.fence, &restart).unwrap());
-    std::fs::write(wal_path, rewritten).unwrap();
-}
-
-/// Behind a restart-paused run of the old epoch, a reopening queued send or interrupt would wait
-/// in the queue, so each is refused `scope_freeze_busy` naming the paused run, and a steer
-/// would join that run, so it is refused `scope_owner_mismatch`. None writes anything.
-#[tokio::test]
-async fn a_reopen_behind_a_restart_paused_run_is_refused_and_writes_nothing() {
-    let mut rig = Rig::start("reopen-restart-paused", true, true).await;
-    rig.bind_ok(7, Some(core()), Some(stamp(core(), 1))).await;
-    let paused = rig.send_ok(7, "paused-turn").await;
-    let run_id = paused["run_id"].as_str().unwrap().to_owned();
-    let records = rig.wait_for_finished(1).await;
-    assert!(
-        matches!(records.last(), Some(WalRecord::RunPaused { .. })),
-        "the first run pauses: {records:?}"
-    );
-    let wal_path = rig.wal_path.clone();
-    let dir = rig.close().await;
-    rewrite_last_pause_as_restart(&wal_path);
-    // The store's admission checkpoint still names the auth pause at the same sequence; without
-    // it the session is read from the rewritten WAL alone.
-    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-        if entry.file_name().to_string_lossy().starts_with("store.db") {
-            std::fs::remove_file(entry.path()).unwrap();
-        }
-    }
-    let mut rig = Rig::open(dir, true, false).await;
-    rig.gate.notify_one();
-    rig.bind_ok(7, Some(core()), Some(stamp(core(), 1))).await;
-    let status = rig
-        .request(
-            7,
-            serde_json::json!({"method": "run.status", "params": {"run_id": run_id}}),
-        )
-        .await;
-    let status: serde_json::Value = serde_json::from_slice(&status.body).unwrap();
-    assert_eq!(status["result"]["pause_reason"], "restart", "{status}");
-    let before = rig.wal_bytes();
-
-    rig.bind_ok(8, Some(core()), Some(stamp(core(), 2))).await;
-    for delivery in ["queue", "interrupt"] {
-        let (code, body) = error_body(&rig.send_as(8, delivery, Some(delivery)).await);
-        assert_eq!(code, "scope_freeze_busy", "{delivery}: {body}");
-        assert_eq!(
-            body["detail"]["run_id"],
-            run_id.as_str(),
-            "{delivery}: {body}"
-        );
-    }
-    let (code, body) = error_body(&rig.send_as(8, "steer", Some("steer")).await);
-    assert_eq!(code, "scope_owner_mismatch", "{body}");
-    assert_eq!(rig.wal_bytes(), before, "a refused send must write nothing");
+    rig.wait_for_finished(2).await;
+    assert_eq!(rig.frozen_scopes().await, [head(1), head(2)]);
     rig.finish().await;
 }
 
@@ -1668,7 +1589,7 @@ async fn unknown_run_status_and_paused_cancel_match_the_role_contract() {
     let records = rig.wait_for_finished(1).await;
     assert!(records
         .iter()
-        .any(|record| matches!(record, WalRecord::RunPaused { .. })));
+        .any(|record| matches!(record, Record::Pause(_))));
     let cancel = rig
         .request(
             7,
@@ -1687,7 +1608,7 @@ async fn unknown_run_status_and_paused_cancel_match_the_role_contract() {
 async fn unlisted_cancel_points_refuse_at_without_changing_the_run() {
     let mut rig = Rig::start("cancel-unlisted", true, true).await;
     rig.bind_ok(7, Some(core()), Some(stamp(core(), 1))).await;
-    let before = rig.wal_bytes();
+    let before = rig.stored().await;
     for at in [
         serde_json::json!("later"),
         serde_json::json!(0),
@@ -1704,7 +1625,7 @@ async fn unlisted_cancel_points_refuse_at_without_changing_the_run() {
         assert_eq!(error.code, "invalid_params");
         assert_eq!(error.detail.unwrap()["field"], "at");
         assert_eq!(
-            rig.wal_bytes(),
+            rig.stored().await,
             before,
             "refused cancellation must write nothing"
         );

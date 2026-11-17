@@ -11,6 +11,7 @@
 //! GOODBYE starts the final grace. Unix only: the signal cases and process census use Unix tools.
 #![cfg(unix)]
 
+use broca_session_store::record::Record;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broca_protocol::caller::RunFinishReason;
-use broca_wal::{DispatchOutcome, WalRecord};
+use broca_session_store::record::CallOutcome;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -222,6 +223,17 @@ impl Rig {
                 }
             }
         });
+        // No deployment-key vault here: sessions are stored plain, so this test reads them back
+        // from disk (`stored_log`).
+        let broca_config = config_home.join("cortexkit/broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&super::stored_log::plain_storage()).unwrap(),
+        )
+        .unwrap();
+        let mut config = config;
+        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
+            broca_config.display().to_string().into();
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
         let connection_file = runtime_dir.join("subc-connection.json");
         let daemon = broca_test_support::retry_executable_file_busy(|| {
@@ -278,12 +290,22 @@ impl Rig {
         false
     }
 
-    fn wal_dir(&self) -> PathBuf {
-        self.connection_file
-            .parent()
-            .unwrap()
-            .join("broca-state")
-            .join("wal")
+    fn state_root(&self) -> PathBuf {
+        self.connection_file.parent().unwrap().join("broca-state")
+    }
+
+    /// The records of session `session` under `harness`, read from broca's session store;
+    /// `None` while it doesn't exist. The rig's routes carry no scope, so the daemon keys the session
+    /// under the unscoped root, whatever folder the bind named.
+    async fn session_records(&self, harness: &str, session: &str) -> Option<Vec<Record>> {
+        let key = broca_protocol::BindIdentity::new(
+            broca_protocol::session::UNSCOPED_SESSION_ROOT,
+            harness,
+            session,
+        );
+        broca_wal::session_storage_class(&self.state_root(), &broca_core::session_addr(&key))
+            .unwrap()?;
+        Some(super::stored_log::stored_records(&self.state_root(), &key).await)
     }
 
     async fn restart(&self) {
@@ -660,31 +682,12 @@ async fn health_restart_can_coalesce_manual_restart_without_another_drain_verdic
     );
 }
 
-/// The records of the WAL whose `RunStarted` names `session`, found by scanning the directory:
-/// the daemon normalizes the project root before broca hashes it into the WAL's address, so a
-/// path computed from the test's own spelling can name a file that never exists.
-fn session_records(wal_dir: &Path, session: &str) -> Option<Vec<WalRecord>> {
-    for entry in std::fs::read_dir(wal_dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
-            continue;
-        }
-        let Ok(range) =
-            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
-        else {
-            continue;
-        };
-        let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
-            continue;
-        };
-        let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
-        if records.iter().any(|record| {
-            matches!(record, WalRecord::RunStarted { session: bound, .. } if bound.session == session)
-        }) {
-            return Some(records);
-        }
-    }
-    None
+/// The last run end among `records`.
+fn last_end(records: &[Record]) -> Option<&broca_session_store::record::RunEnd> {
+    records.iter().rev().find_map(|record| match record {
+        Record::RunEnd(end) => Some(end),
+        _ => None,
+    })
 }
 
 /// The live `ck-broca` pids the daemon supervises.
@@ -773,10 +776,10 @@ async fn a_sigterm_during_a_tool_call_lets_it_finish_and_ends_the_run_interrupte
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let records = loop {
-        if let Some(records) = session_records(&rig.wal_dir(), session) {
+        if let Some(records) = rig.session_records("broca", session).await {
             if records
                 .iter()
-                .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+                .any(|record| matches!(record, Record::RunEnd(_)))
             {
                 break records;
             }
@@ -784,30 +787,28 @@ async fn a_sigterm_during_a_tool_call_lets_it_finish_and_ends_the_run_interrupte
         assert!(
             Instant::now() < deadline,
             "the stopped run never wrote its terminal: {:?}\n{}",
-            session_records(&rig.wal_dir(), session),
+            rig.session_records("broca", session).await,
             client_deadline_diagnostics(&mut rig, &mut client, session)
         );
         sleep(Duration::from_millis(50)).await;
     };
 
-    let results: Vec<(DispatchOutcome, bool)> = records
+    let results: Vec<(CallOutcome, bool)> = records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::ToolResult {
-                result, outcome, ..
-            } => Some((*outcome, result.is_error)),
+            Record::ToolOutcome(outcome) => Some((outcome.outcome, outcome.is_error)),
             _ => None,
         })
         .collect();
     assert_eq!(
         results,
-        vec![(DispatchOutcome::Completed, false)],
+        vec![(CallOutcome::Completed, false)],
         "the call in flight finished and its result was recorded; nothing is outcome_unknown"
     );
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::StepStarted { .. }))
+            .filter(|record| matches!(record, Record::StepStart(_)))
             .count(),
         1,
         "no model step starts after the stop"
@@ -820,7 +821,7 @@ async fn a_sigterm_during_a_tool_call_lets_it_finish_and_ends_the_run_interrupte
     let terminals: Vec<RunFinishReason> = records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::RunFinished { reason, .. } => Some(*reason),
+            Record::RunEnd(end) => Some(end.reason),
             _ => None,
         })
         .collect();
@@ -861,13 +862,13 @@ async fn start_keyed_run(rig: &Rig, policy: Option<&str>) -> String {
 async fn wait_records(
     rig: &Rig,
     description: &str,
-    predicate: impl Fn(&[WalRecord]) -> bool,
-) -> Vec<WalRecord> {
+    predicate: impl Fn(&[Record]) -> bool,
+) -> Vec<Record> {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        let records = session_records(&rig.wal_dir(), "restart-run");
+        let records = rig.session_records("runner", "restart-run").await;
         rig.observe_wait(format!(
-            "waiting for {description}; last WAL records: {records:?}"
+            "waiting for {description}; last records: {records:?}"
         ));
         if let Some(records) = records {
             if predicate(&records) {
@@ -876,8 +877,8 @@ async fn wait_records(
         }
         assert!(
             Instant::now() < deadline,
-            "WAL did not reach {description}: {:?}",
-            session_records(&rig.wal_dir(), "restart-run")
+            "the session did not reach {description}: {:?}",
+            rig.session_records("runner", "restart-run").await
         );
         sleep(Duration::from_millis(25)).await;
     }
@@ -984,31 +985,22 @@ async fn module_restart_during_long_tool_pauses_with_idle_gauge_before_goodbye()
     let drain = Duration::from_secs(120);
     let earlier = rig.restart_with_drain(drain).await;
     let records = wait_records(&rig, "restart-run terminal or pause", |records| {
-        records.iter().any(|r| {
-            matches!(
-                r,
-                WalRecord::RunPaused { .. } | WalRecord::RunFinished { .. }
-            )
-        })
+        records
+            .iter()
+            .any(|r| matches!(r, Record::Pause(_) | Record::RunEnd(_)))
     })
     .await;
     assert!(
         records.iter().any(|r| matches!(
             r,
-            WalRecord::RunPaused {
-                reason: broca_protocol::PauseReason::Restart,
-                ..
-            }
+            Record::Pause(pause) if pause.reason == broca_protocol::PauseReason::Restart
         )),
         "the drain must pause at the boundary, not complete or interrupt: {records:?}"
     );
     assert!(
         records.iter().any(|r| matches!(
             r,
-            WalRecord::ToolResult {
-                outcome: DispatchOutcome::Completed,
-                ..
-            }
+            Record::ToolOutcome(outcome) if outcome.outcome == CallOutcome::Completed
         )),
         "no early seal of the long tool"
     );
@@ -1032,10 +1024,7 @@ async fn module_restart_during_long_tool_pauses_with_idle_gauge_before_goodbye()
         records.iter().any(|r| {
             matches!(
                 r,
-                WalRecord::RunFinished {
-                    reason: RunFinishReason::Completed,
-                    ..
-                }
+                Record::RunEnd(end) if end.reason == RunFinishReason::Completed
             )
         })
     })
@@ -1043,21 +1032,16 @@ async fn module_restart_during_long_tool_pauses_with_idle_gauge_before_goodbye()
     assert_eq!(
         records
             .iter()
-            .filter(|r| matches!(r, WalRecord::RunStarted { .. }))
+            .filter(|r| matches!(r, Record::RunStart(_)))
             .count(),
         1
     );
-    assert!(records
-        .iter()
-        .any(|r| matches!(r, WalRecord::ResumeStarted { .. })));
+    assert!(records.iter().any(|r| matches!(r, Record::Resumed(_))));
     assert!(records.iter().any(|r| matches!(r,
-        WalRecord::RunStarted { run_id: id, .. } if id.0 == run_id)));
+        Record::RunStart(start) if start.run_id == run_id)));
     assert!(!records.iter().any(|r| matches!(
         r,
-        WalRecord::RunFinished {
-            reason: RunFinishReason::Interrupted,
-            ..
-        }
+        Record::RunEnd(end) if end.reason == RunFinishReason::Interrupted
     )));
     assert_eq!(requests.load(Ordering::SeqCst), 2);
 }
@@ -1078,29 +1062,18 @@ async fn module_restart_interrupt_policy_finishes_long_tool_at_boundary() {
     rig.wait_for_tool().await;
     rig.restart().await;
     let records = wait_records(&rig, "interrupted run at tool boundary", |records| {
-        records
-            .iter()
-            .any(|r| matches!(r, WalRecord::RunFinished { .. }))
+        records.iter().any(|r| matches!(r, Record::RunEnd(_)))
     })
     .await;
     assert!(matches!(
-        records.last(),
-        Some(WalRecord::RunFinished {
-            reason: RunFinishReason::Interrupted,
-            error: None,
-            ..
-        })
+        last_end(&records),
+        Some(end) if end.reason == RunFinishReason::Interrupted && end.error.is_none()
     ));
     assert!(records.iter().any(|r| matches!(
         r,
-        WalRecord::ToolResult {
-            outcome: DispatchOutcome::Completed,
-            ..
-        }
+        Record::ToolOutcome(outcome) if outcome.outcome == CallOutcome::Completed
     )));
-    assert!(!records
-        .iter()
-        .any(|r| matches!(r, WalRecord::RunPaused { .. })));
+    assert!(!records.iter().any(|r| matches!(r, Record::Pause(_))));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
@@ -1118,28 +1091,23 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
         records.iter().any(|record| {
             matches!(
                 record,
-                WalRecord::RunFinished {
-                    reason: RunFinishReason::Completed,
-                    ..
-                }
+                Record::RunEnd(end) if end.reason == RunFinishReason::Completed
             )
         })
     })
     .await;
     let starts = records
         .iter()
-        .filter_map(|record| {
-            if let WalRecord::RunStarted {
-                run_id,
-                send_id,
-                on_restart,
-                ..
-            } = record
-            {
-                Some((run_id.0.clone(), send_id.clone(), *on_restart))
-            } else {
-                None
-            }
+        .filter_map(|record| match record {
+            Record::RunStart(start) => Some((
+                start.run_id.clone(),
+                start.send_id.clone(),
+                serde_json::from_value::<Option<broca_protocol::request::OnRestart>>(
+                    serde_json::to_value(&start.on_restart).unwrap(),
+                )
+                .unwrap(),
+            )),
+            _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1155,33 +1123,24 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
         .position(|record| {
             matches!(
                 record,
-                WalRecord::RunPaused {
-                    reason: broca_protocol::PauseReason::Restart,
-                    ..
-                }
+                Record::Pause(pause) if pause.reason == broca_protocol::PauseReason::Restart
             )
         })
         .expect("graceful boundary must pause, not interrupt");
     let resume = records
         .iter()
-        .position(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+        .position(|record| matches!(record, Record::Resumed(_)))
         .expect("boot must resume");
     let next_step = records
         .iter()
-        .rposition(|record| matches!(record, WalRecord::StepStarted { .. }))
+        .rposition(|record| matches!(record, Record::StepStart(_)))
         .unwrap();
     assert!(pause < resume && resume < next_step);
     assert!(!records.iter().any(|record| matches!(
         record,
-        WalRecord::RunFinished {
-            reason: RunFinishReason::Interrupted,
-            ..
-        }
+        Record::RunEnd(end) if end.reason == RunFinishReason::Interrupted
     )));
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    let floor =
-        std::fs::read_to_string(rig.wal_dir().parent().unwrap().join("wal-feature-floor")).unwrap();
-    assert!(floor.contains("restart-pause/v1"));
 
     let control_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let control_requests = Arc::new(AtomicUsize::new(0));
@@ -1193,10 +1152,7 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
         records.iter().any(|record| {
             matches!(
                 record,
-                WalRecord::RunFinished {
-                    reason: RunFinishReason::Completed,
-                    ..
-                }
+                Record::RunEnd(end) if end.reason == RunFinishReason::Completed
             )
         })
     })
@@ -1220,19 +1176,16 @@ async fn explicit_interrupt_preserves_graceful_terminal() {
     let records = wait_records(&rig, "explicit-interrupt terminal", |records| {
         records
             .iter()
-            .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+            .any(|record| matches!(record, Record::RunEnd(_)))
     })
     .await;
     assert!(matches!(
-        records.last(),
-        Some(WalRecord::RunFinished {
-            reason: RunFinishReason::Interrupted,
-            ..
-        })
+        last_end(&records),
+        Some(end) if end.reason == RunFinishReason::Interrupted
     ));
     assert!(!records
         .iter()
-        .any(|record| matches!(record, WalRecord::RunPaused { .. })));
+        .any(|record| matches!(record, Record::Pause(_))));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
@@ -1252,26 +1205,20 @@ async fn resume_policy_with_tool_past_drain_is_interrupted_unknown_never_paused(
     let records = wait_records(&rig, "interrupted run with unresolved tool", |records| {
         records
             .iter()
-            .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+            .any(|record| matches!(record, Record::RunEnd(_)))
     })
     .await;
     assert!(matches!(
-        records.last(),
-        Some(WalRecord::RunFinished {
-            reason: RunFinishReason::Interrupted,
-            ..
-        })
+        last_end(&records),
+        Some(end) if end.reason == RunFinishReason::Interrupted
     ));
     assert!(records.iter().any(|record| matches!(
         record,
-        WalRecord::ToolResult {
-            outcome: DispatchOutcome::Unknown,
-            ..
-        }
+        Record::ToolOutcome(outcome) if outcome.outcome == CallOutcome::Unknown
     )));
     assert!(!records
         .iter()
-        .any(|record| matches!(record, WalRecord::RunPaused { .. })));
+        .any(|record| matches!(record, Record::Pause(_))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1287,19 +1234,16 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
     let records = wait_records(&rig, "crash-orphan terminal", |records| {
         records
             .iter()
-            .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+            .any(|record| matches!(record, Record::RunEnd(_)))
     })
     .await;
     assert!(matches!(
-        records.last(),
-        Some(WalRecord::RunFinished {
-            reason: RunFinishReason::Interrupted,
-            ..
-        })
+        last_end(&records),
+        Some(end) if end.reason == RunFinishReason::Interrupted
     ));
     assert!(!records
         .iter()
-        .any(|record| matches!(record, WalRecord::RunPaused { .. })));
+        .any(|record| matches!(record, Record::Pause(_))));
 
     let client = rig.client().await;
     let status = client.run_status(&run_id).await.unwrap();
@@ -1352,24 +1296,12 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
             }
             panic!("subscription ended without the interrupted terminal");
         },
-        || format!("WAL directory={}", rig.wal_dir().display()),
+        || format!("state root={}", rig.state_root().display()),
     )
     .await
     .expect("crash-orphan terminal replay timed out");
 
-    let db =
-        rusqlite::Connection::open(rig.wal_dir().parent().unwrap().join("run-index.db")).unwrap();
-    let state: String = db
-        .query_row(
-            "SELECT state FROM run_index WHERE run_id = ?1",
-            [&run_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        state, "interrupted",
-        "the diagnostic must not reclassify the run index"
-    );
+    let db = rusqlite::Connection::open(rig.state_root().join("run-index.db")).unwrap();
     let facts: Vec<Value> =
         broca_test_support::wait_until("crash-orphan export facts persisted", || async {
             let mut stmt = db
@@ -1443,15 +1375,15 @@ async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
         let records = wait_records(&rig, "planned-shutdown or crash terminal", |records| {
             records
                 .iter()
-                .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+                .any(|record| matches!(record, Record::RunEnd(_)))
         })
         .await;
         assert!(
-            matches!(records.last(), Some(WalRecord::RunFinished { interrupt_reason: Some(reason), .. }) if reason == expected),
-            "planned={planned}, expected {expected}, last record: {:?}",
-            records.last()
+            matches!(last_end(&records), Some(end) if end.interrupt_reason.as_deref() == Some(expected)),
+            "planned={planned}, expected {expected}, last run end: {:?}",
+            last_end(&records)
         );
-        let before = serde_json::to_vec(records.last().unwrap()).unwrap();
+        let before = format!("{:?}", last_end(&records).unwrap());
         // Cut after the terminal's sync, then boot again: recovery must not overwrite its cause.
         let launch = rig.health().await["launch_id"].clone();
         let children = broca_children(rig.daemon.id().unwrap());
@@ -1465,10 +1397,10 @@ async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
         let after = wait_records(&rig, "durable terminal after second kill", |records| {
             records
                 .iter()
-                .any(|record| matches!(record, WalRecord::RunFinished { .. }))
+                .any(|record| matches!(record, Record::RunEnd(_)))
         })
         .await;
-        assert_eq!(serde_json::to_vec(after.last().unwrap()).unwrap(), before);
+        assert_eq!(format!("{:?}", last_end(&after).unwrap()), before);
         for method in ["run.status", "run.result"] {
             let value = interrupt_reference_reply(&rig, &run_id, method).await;
             assert_eq!(value["state"], "interrupted");

@@ -13,6 +13,7 @@
 //!   result twice nor runs the call again.
 
 use super::*;
+use broca_session_store::record::Record;
 use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
 use cortexkit_role_tool_provider::late_results::{kinds, LateEntry};
 
@@ -104,6 +105,20 @@ pub(super) fn declare_in_catalog(shared: &Shared, session: &str, answer: &mut Va
                 tool["capabilities"] = json!(["call.yield/v1"]);
             }
         }
+    }
+}
+
+/// The preset a session's plan names this provider with. Broca keeps each provider's transport
+/// declarations for a minute by provider and preset, as a real provider declares the same to
+/// every session. This one declares held results and yields only to the sessions that use them,
+/// so those sessions name presets of their own, and never read another session's declarations.
+pub(super) fn preset(shared: &Shared, session: &str) -> &'static str {
+    if yields_session(shared, session) {
+        "conformance-yield"
+    } else if shared.held_feed.lock().unwrap().sessions.contains(session) {
+        "conformance-held"
+    } else {
+        "conformance"
     }
 }
 
@@ -482,22 +497,22 @@ impl HeldCase {
         }
     }
 
-    /// Wait until the session's WAL satisfies `ready`, failing after a minute with `what`.
+    /// Wait until the session's log satisfies `ready`, failing after a minute with `what`.
     async fn wait_for(
         &self,
         live: &Live,
         what: &str,
-        ready: impl Fn(&[broca_wal::WalRecord]) -> bool,
-    ) -> Vec<broca_wal::WalRecord> {
+        ready: impl Fn(&[Record]) -> bool,
+    ) -> Vec<Record> {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let records = self.subject.records(live, self.session);
+            let records = self.subject.records(live, self.session).await;
             if ready(&records) {
                 return records;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {what}; the WAL holds {records:#?}"
+                "timed out waiting for {what}; the log holds {records:#?}"
             );
             sleep(Duration::from_millis(50)).await;
         }
@@ -510,21 +525,18 @@ impl HeldCase {
                 records.iter().any(|record| {
                     matches!(
                         record,
-                        broca_wal::WalRecord::RunPaused {
-                            reason: broca_protocol::PauseReason::ToolHeld,
-                            ..
-                        }
+                        Record::Pause(pause) if pause.reason == broca_protocol::PauseReason::ToolHeld
                     )
                 })
             })
             .await;
         let held_at = records
             .iter()
-            .position(|record| matches!(record, broca_wal::WalRecord::ToolCallProviderHeld { .. }))
+            .position(|record| matches!(record, Record::ToolHeld(_)))
             .expect("the held record precedes the pause");
         let paused_at = records
             .iter()
-            .position(|record| matches!(record, broca_wal::WalRecord::RunPaused { .. }))
+            .position(|record| matches!(record, Record::Pause(_)))
             .unwrap();
         assert!(
             held_at < paused_at,
@@ -604,27 +616,24 @@ impl HeldCase {
             self.wait_for(live, "the resumed run to finish", |records| {
                 records
                     .iter()
-                    .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. }))
+                    .any(|record| matches!(record, Record::RunEnd(_)))
             })
             .await
         } else {
-            self.subject.records(live, self.session)
+            self.subject.records(live, self.session).await
         };
         let held_batch = records
             .iter()
             .find_map(|record| match record {
-                broca_wal::WalRecord::ToolCallProviderHeld { batch_id, .. } => {
-                    Some(batch_id.clone())
-                }
+                Record::ToolHeld(held) => Some(held.batch_id.clone()),
                 _ => None,
             })
             .expect("a held record");
-        let terminals: Vec<(usize, &broca_wal::WalRecord)> = records
+        let terminals: Vec<(usize, &Record)> = records
             .iter()
             .enumerate()
             .filter(|(_, record)| {
-                matches!(record, broca_wal::WalRecord::ToolResult { result, .. }
-                    if result.tool_call_id.0 == self.call.tool_call_id)
+                matches!(record, Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == self.call.tool_call_id)
             })
             .collect();
         assert_eq!(
@@ -633,15 +642,26 @@ impl HeldCase {
             "the held call has exactly one terminal: {records:#?}"
         );
         let (at, terminal) = terminals[0];
-        let broca_wal::WalRecord::ToolResult {
-            batch_id, result, ..
-        } = terminal
-        else {
+        let Record::ToolOutcome(outcome) = terminal else {
             unreachable!()
         };
-        assert_eq!(batch_id, &held_batch, "written under the original batch");
+        assert_eq!(
+            outcome.batch_id, held_batch,
+            "written under the original batch"
+        );
+        let result = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ToolReply(reply)
+                    if reply.result.tool_call_id.0 == self.call.tool_call_id =>
+                {
+                    Some(&reply.result)
+                }
+                _ => None,
+            })
+            .expect("the late result is stored");
         assert!(
-            serde_json::to_string(result.as_ref())
+            serde_json::to_string(result)
                 .unwrap()
                 .contains(&self.late_text()),
             "the terminal is the late result: {result:?}"
@@ -668,10 +688,9 @@ impl HeldCase {
         if completes {
             let committed_at = records
                 .iter()
-                .position(|record| {
-                    matches!(record, broca_wal::WalRecord::ToolBatchFinished { batch_id }
-                        if batch_id == &held_batch)
-                })
+                .position(
+                    |record| matches!(record, Record::BatchEnd(end) if end.batch_id == held_batch),
+                )
                 .expect("the held batch commits");
             assert!(at < committed_at, "the result precedes its batch's commit");
             assert_eq!(requests.len(), 2, "one request before the hold, one after");
@@ -993,8 +1012,7 @@ async fn a_kill_after_the_result_is_written_and_before_its_ack_never_writes_it_t
     let tool_call_id = case.call.tool_call_id.clone();
     case.wait_for(&live, "the delivered terminal", |records| {
         records.iter().any(|record| {
-            matches!(record, broca_wal::WalRecord::ToolResult { result, .. }
-                if result.tool_call_id.0 == tool_call_id)
+            matches!(record, Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == tool_call_id)
         })
     })
     .await;
@@ -1039,13 +1057,13 @@ async fn held_cancel_sends_one_real_withdraw_and_restart_does_not_repeat_it() {
         .wait_for(&live, "run start", |records| {
             records
                 .iter()
-                .any(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
+                .any(|record| matches!(record, Record::RunStart(_)))
         })
         .await;
     let run_id = records
         .iter()
         .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
+            Record::RunStart(start) => Some(broca_protocol::RunId(start.run_id.clone())),
             _ => None,
         })
         .unwrap();
@@ -1060,10 +1078,7 @@ async fn held_cancel_sends_one_real_withdraw_and_restart_does_not_repeat_it() {
         records.iter().any(|record| {
             matches!(
                 record,
-                broca_wal::WalRecord::RunFinished {
-                    reason: broca_protocol::RunFinishReason::Cancelled,
-                    ..
-                }
+                Record::RunEnd(end) if end.reason == broca_protocol::RunFinishReason::Cancelled
             )
         })
     })
@@ -1180,8 +1195,9 @@ async fn named_sender_cancel_survives_real_kill_and_withdraws_without_redispatch
     assert!(case
         .subject
         .records(&live, case.session)
+        .await
         .iter()
-        .any(|record| matches!(record, broca_wal::WalRecord::RunCancelRequested { .. })));
+        .any(|record| matches!(record, Record::CancelRequest(_))));
     assert!(
         live.kill_all(),
         "the accepted stop is followed by a real SIGKILL"
@@ -1202,10 +1218,7 @@ async fn named_sender_cancel_survives_real_kill_and_withdraws_without_redispatch
             records.iter().any(|record| {
                 matches!(
                     record,
-                    broca_wal::WalRecord::RunFinished {
-                        reason: broca_protocol::RunFinishReason::Cancelled,
-                        ..
-                    }
+                    Record::RunEnd(end) if end.reason == broca_protocol::RunFinishReason::Cancelled
                 )
             })
         },
@@ -1247,8 +1260,9 @@ async fn named_sender_cancel_survives_real_kill_and_withdraws_without_redispatch
     assert_eq!(
         case.subject
             .records(&live, case.session)
+            .await
             .iter()
-            .filter(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. }))
+            .filter(|record| matches!(record, Record::RunEnd(_)))
             .count(),
         1
     );
@@ -1323,12 +1337,9 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
     assert!(!case
         .subject
         .records(&live, case.session)
+        .await
         .iter()
-        .any(|record| matches!(
-            record,
-            broca_wal::WalRecord::ToolCallProviderHeld { .. }
-                | broca_wal::WalRecord::RunFinished { .. }
-        )));
+        .any(|record| matches!(record, Record::ToolHeld(_) | Record::RunEnd(_))));
     let old_pid = supervised_broca_pid(&case.root).expect("broca child before restart");
     let cli = sibling_bin("ck-subc", "SUBC_CORE_BIN")
         .with_file_name(format!("ck{}", std::env::consts::EXE_SUFFIX));
@@ -1354,11 +1365,11 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
     .unwrap();
     assert!(output.status.success(), "ck restart failed: {output:?}");
     assert_eq!(case.await_pause(&live).await, key);
-    let paused = case.subject.records(&live, case.session);
+    let paused = case.subject.records(&live, case.session).await;
     assert!(
         !paused
             .iter()
-            .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. })),
+            .any(|record| matches!(record, Record::RunEnd(_))),
         "a held pause is not an interrupted terminal"
     );
     broca_test_support::wait_until("replacement broca child", || async {
@@ -1372,22 +1383,22 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
     drop(route);
     case.publish(&key);
     case.assert_delivered_once(&live, true).await;
-    let records = case.subject.records(&live, case.session);
+    let records = case.subject.records(&live, case.session).await;
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
+            .filter(|record| matches!(record, Record::RunStart(_)))
             .count(),
         1,
         "late result continues the original run"
     );
     let resumed = records
         .iter()
-        .position(|record| matches!(record, broca_wal::WalRecord::ResumeStarted { .. }))
+        .position(|record| matches!(record, Record::Resumed(_)))
         .expect("held recovery resumes the run");
     assert!(!records[..resumed]
         .iter()
-        .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. })));
+        .any(|record| matches!(record, Record::RunEnd(_))));
     assert_eq!(
         case.subject
             .shared

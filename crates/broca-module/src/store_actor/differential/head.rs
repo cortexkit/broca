@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, ProviderControl, RunId};
 use broca_protocol::{SendScope, SubmissionRequest};
 use tokio::sync::Notify;
@@ -21,13 +21,8 @@ use crate::serve::ServeHandler;
 
 /// A module as [`super::module`] builds it, with every model step on both sides waiting for
 /// `gate` when one is given, so a head can be read while a run runs.
-async fn gated_module(
-    on: bool,
-    steps: Vec<Vec<NormalizedEvent>>,
-    gate: Option<Arc<Notify>>,
-) -> Module {
+async fn gated_module(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Module {
     gated_module_in(
-        on,
         steps,
         gate,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -37,7 +32,6 @@ async fn gated_module(
 
 /// [`gated_module`], whose new storage creates sessions under `deployment`.
 async fn gated_module_in(
-    on: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<Notify>>,
     deployment: broca_session_store::keys::DeploymentKey,
@@ -50,35 +44,23 @@ async fn gated_module_in(
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, gate));
     let runtime =
         crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), IDLE)
             .await
             .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal.clone(),
-        None,
-    );
-    let registry = if on {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    };
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(Arc::new(runtime)),
+    ));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Module {
         dir,
         registry,
-        wal,
         key,
         caller: Default::default(),
     }
@@ -106,7 +88,7 @@ pub(super) async fn both_with_cipher(
 ) -> (Module, Option<Arc<Notify>>) {
     let gate = gated.then(|| Arc::new(Notify::new()));
     let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
-    let store = gated_module_in(true, steps, gate.clone(), deployment).await;
+    let store = gated_module_in(steps, gate.clone(), deployment).await;
     (store, gate)
 }
 
@@ -116,7 +98,7 @@ pub(super) async fn both_in(
     cipher: broca_session_store::keys::Cipher,
 ) -> Module {
     let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
-    gated_module_in(true, steps, None, deployment).await
+    gated_module_in(steps, None, deployment).await
 }
 
 /// A send through the registry's own route, with the title and plan the serve layer hands over,
@@ -506,7 +488,7 @@ async fn a_planned_session_heads_alike() {
 /// the interrupted terminal and its reason unchanged.
 #[tokio::test]
 async fn a_run_no_live_actor_holds_reads_interrupted() {
-    let store = gated_module(true, vec![text_step("a1", "hello")], None).await;
+    let store = gated_module(vec![text_step("a1", "hello")], None).await;
     let sent = send_titled(&store, "r1", request("first"), None, None).await;
     assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
     store.closed().await;
@@ -563,7 +545,7 @@ async fn a_run_no_live_actor_holds_reads_interrupted() {
 /// a log that recorded no time can be one: every run start the store actor writes is timed.
 #[tokio::test]
 async fn a_session_with_no_recorded_time_is_refused_by_name() {
-    let store = gated_module(true, Vec::new(), None).await;
+    let store = gated_module(Vec::new(), None).await;
     let triple = broca_session_store::head::SessionTriple {
         project_root: store.key.project_root.display().to_string(),
         harness: store.key.harness.clone(),

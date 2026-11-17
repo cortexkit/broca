@@ -10,6 +10,7 @@
 //! fetch-plan vectors.
 
 use crate::delivery_rig;
+use broca_session_store::record::Record;
 
 use delivery_rig::*;
 
@@ -17,43 +18,17 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_fetch_plan::{DescribeAnswer, FetchError, Fetcher, Plan, PlanAdmitter, Refusal};
-use broca_wal::WalRecord;
 use cortexkit_role_step_transform_provider::subscription::DeclareRequest;
 use cortexkit_role_tool_provider::catalog::CatalogRequest;
 use serde_json::{json, Value};
 use subc_protocol::FrameType;
 
-/// The `RunStarted` a plan-less first send writes, as record JSON, with the parts that differ
-/// per run (the scratch project root, the run id and the timestamp) replaced by placeholders. Every other byte is pinned.
-const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","written_at_ms":0,"run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"},"computed_tags":{"checkpoint":0}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1}"#;
-
 /// The `session.baseline` reply of a session admitted without a plan, running the rig's one
 /// tool: no items, no composition digest, both generations 0.
 const PLAN_LESS_BASELINE_REPLY: &str = r#"{"result":{"state":"ready","baseline":{"items":[],"tool_names":["work"],"accepted_generation":0,"applied_generation":0,"rungs":{"tools":["on_prefix_rebuild","immediately"],"system_text":["on_prefix_rebuild","immediately"]}}}}"#;
 
-/// `record` as JSON with the per-run parts replaced, so the rest can be compared byte for byte.
-fn normalized_run_started(record: &WalRecord, run_id: &str, root: &str) -> String {
-    let mut normalized = record.clone();
-    if let WalRecord::RunStarted {
-        ts_ms,
-        written_at_ms,
-        ..
-    } = &mut normalized
-    {
-        *ts_ms = Some(0);
-        *written_at_ms = Some(0);
-    }
-    // The root as it appears inside a JSON string (backslashes escaped on Windows).
-    let escaped_root = serde_json::to_string(root).unwrap();
-    let escaped_root = &escaped_root[1..escaped_root.len() - 1];
-    serde_json::to_string(&normalized)
-        .unwrap()
-        .replace(run_id, "@RUN_ID@")
-        .replace(escaped_root, "@ROOT@")
-}
-
-/// A plan-less session keeps its bytes: the `RunStarted` its first send writes, the reply to that
-/// send (with the plan-less baseline), and the `session.baseline` reply.
+/// A plan-less session keeps its bytes: the reply to its first send (with the plan-less
+/// baseline) and the `session.baseline` reply. Its run freezes no plan manifest.
 #[tokio::test]
 async fn a_plan_less_session_keeps_its_bytes() {
     let mut rig = Rig::start("plan-less-pin").await;
@@ -61,29 +36,10 @@ async fn a_plan_less_session_keeps_its_bytes() {
     let active = rig.send("turn-1", "hi", None).await;
     let run_id = result(&active)["run_id"].as_str().unwrap().to_owned();
     assert_golden_admitting(&active, "send_reply.active.json", &run_id);
-    let records = rig.wait_for_finished(1).await;
-    let started = records
-        .iter()
-        .find(|record| matches!(record, WalRecord::RunStarted { .. }))
-        .expect("the first send wrote a RunStarted");
-    let root = rig.session.project_root.to_string_lossy().into_owned();
-    assert_eq!(
-        normalized_run_started(started, &run_id, &root),
-        PLAN_LESS_RUN_STARTED
-    );
-    let WalRecord::RunStarted { manifest, .. } = started else {
-        unreachable!()
-    };
-    assert!(manifest.is_none());
-    // Plan-less episodes freeze computed tags and their newly recorded input time; both
-    // facts require an understanding reader even without a plan manifest.
-    assert_eq!(
-        started.required_features(),
-        [
-            broca_wal::MESSAGE_TIMES_FEATURE,
-            broca_wal::RUNNER_TAGS_V2_FEATURE
-        ]
-    );
+    rig.wait_for_finished(1).await;
+    let admissions = rig.admissions().await;
+    assert_eq!(admissions.len(), 1);
+    assert!(admissions[0].manifest.is_none());
 
     let baseline = rig
         .request(
@@ -358,7 +314,7 @@ async fn a_worker_preset_plan_requires_a_scoped_route() {
         json!({"field": "plan.tool_items", "preset": "worker"})
     );
     assert!(
-        rig.wal_bytes().is_empty(),
+        rig.records().await.is_empty(),
         "refusal must precede the first WAL byte"
     );
     assert!(
@@ -401,7 +357,7 @@ async fn absent_system_text_preset_refuses_before_fetch_or_wal_write() {
         json!({"provider":plan["system_text_items"][0]["provider"]})
     );
     assert!(admitter.calls().is_empty());
-    assert!(rig.wal_bytes().is_empty());
+    assert!(rig.records().await.is_empty());
     rig.finish().await;
 }
 
@@ -435,7 +391,7 @@ async fn invalid_reply_refuses_before_any_wal_write() {
                 assert!(member.ends_with(expected), "{}: {member}", case["name"]);
             }
             assert!(
-                rig.wal_bytes().is_empty(),
+                rig.records().await.is_empty(),
                 "{} wrote WAL bytes",
                 case["name"]
             );
@@ -475,7 +431,7 @@ fn legacy_tools() -> Value {
 #[tokio::test]
 async fn scoped_legacy_tools_require_a_plan_before_any_fetch_or_wal_write() {
     let (mut rig, admitter) = scoped_plan_rig("scoped-tools-refused", false).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert!(before.is_empty());
     let reply = send_plan(
         &mut rig,
@@ -488,7 +444,7 @@ async fn scoped_legacy_tools_require_a_plan_before_any_fetch_or_wal_write() {
     .await;
     assert_eq!(error_body(&reply)["code"], "scoped_tools_require_plan");
     assert_golden(&reply, "scoped_tools_require_plan.json", "");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert!(admitter.calls().is_empty());
     assert!(rig.script.prompts.lock().unwrap().is_empty());
     rig.finish().await;
@@ -502,14 +458,8 @@ async fn scoped_plan_and_toolless_sends_still_admit() {
     result(&reply);
     let records = rig.wait_for_finished(1).await;
     assert_eq!(admitter.calls().len(), 3);
-    assert!(matches!(
-        run_started(&records)[0],
-        WalRecord::RunStarted {
-            scope: Some(_),
-            manifest: Some(_),
-            ..
-        }
-    ));
+    assert!(start_scope(&records).is_some());
+    assert!(rig.admissions().await[0].manifest.is_some());
     // A later send uses the frozen plan without carrying the plan again.
     let reply = send_plan(&mut rig, 8, "turn-2", "hi", None, json!({})).await;
     result(&reply);
@@ -526,14 +476,8 @@ async fn scoped_plan_and_toolless_sends_still_admit() {
         let reply = send_plan(&mut rig, 8, "turn-1", "hi", None, extra).await;
         result(&reply);
         let records = rig.wait_for_finished(1).await;
-        assert!(matches!(
-            run_started(&records)[0],
-            WalRecord::RunStarted {
-                scope: Some(_),
-                manifest: None,
-                ..
-            }
-        ));
+        assert!(start_scope(&records).is_some());
+        assert!(rig.admissions().await[0].manifest.is_none());
         assert!(admitter.calls().is_empty());
         rig.finish().await;
     }
@@ -561,14 +505,16 @@ async fn scoped_toolless_steers_interrupts_and_queued_sends_still_admit() {
             assert_eq!(result(&reply)["run_id"], first_id);
             assert!(rig
                 .records()
+                .await
                 .iter()
-                .any(|record| matches!(record, WalRecord::Steered { .. })));
+                .any(|record| matches!(record, Record::Steer(_))));
         } else {
             assert_eq!(result(&reply)["state"], "pending");
             assert!(rig
                 .records()
+                .await
                 .iter()
-                .any(|record| matches!(record, WalRecord::Queued { .. })));
+                .any(|record| matches!(record, Record::QueuedSend(_))));
         }
         assert!(admitter.calls().is_empty());
         rig.script.hold_model(false);
@@ -587,7 +533,7 @@ async fn later_scoped_planless_tool_declarations_refuse_without_writing() {
     result(&first);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     for delivery in ["queue", "steer", "interrupt"] {
         let reply = send_plan(
             &mut rig,
@@ -600,7 +546,7 @@ async fn later_scoped_planless_tool_declarations_refuse_without_writing() {
         .await;
         assert_eq!(error_body(&reply)["code"], "invalid_params");
         assert_eq!(error_body(&reply)["detail"]["field"], "tools");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
     }
     let plan = vector("plans/broca-head-no-compaction.json");
     let reply = send_plan(&mut rig, 8, "plan", "hi", Some(&plan), json!({})).await;
@@ -617,7 +563,7 @@ async fn later_scoped_planless_tool_declarations_refuse_without_writing() {
     )
     .await;
     assert_eq!(error_body(&reply)["code"], "scope_owner_mismatch");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert!(admitter.calls().is_empty());
     rig.finish().await;
 }
@@ -647,7 +593,7 @@ async fn an_admitted_legacy_tool_run_keeps_its_keyed_answer_after_scope_adoption
     result(&adopted);
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let retry = send_plan(
         &mut rig,
         8,
@@ -672,7 +618,7 @@ async fn an_admitted_legacy_tool_run_keeps_its_keyed_answer_after_scope_adoption
     )
     .await;
     assert_eq!(error_body(&changed)["code"], "send_id_reuse");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -691,7 +637,7 @@ async fn flow_sends_keep_their_own_tool_refusal() {
     let body = error_body(&reply);
     assert_eq!(body["code"], "invalid_params");
     assert_eq!(body["detail"]["field"], "tools");
-    assert!(rig.wal_bytes().is_empty());
+    assert!(rig.records().await.is_empty());
     let accepted = send_plan(&mut rig, 8, "turn-2", "hi", None, json!({})).await;
     result(&accepted);
     rig.wait_for_finished(1).await;
@@ -733,21 +679,23 @@ fn error_body(frame: &subc_protocol::Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
-fn run_started(records: &[WalRecord]) -> Vec<&WalRecord> {
+/// The scope the session's first run start recorded.
+fn start_scope(records: &[Record]) -> Option<&serde_json::Value> {
     records
         .iter()
-        .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
-        .collect()
+        .find_map(|record| match record {
+            Record::RunStart(start) => Some(start.scope.as_ref()),
+            _ => None,
+        })
+        .expect("a run started")
 }
 
-fn manifest_of(record: &WalRecord) -> &broca_wal::PlanManifest {
-    match record {
-        WalRecord::RunStarted {
-            manifest: Some(manifest),
-            ..
-        } => manifest,
-        other => panic!("no manifest on {other:?}"),
-    }
+/// The plan manifest a run froze at admission.
+fn manifest_of(admission: &broca_session_loop::run::Admission) -> &broca_wal::PlanManifest {
+    admission
+        .manifest
+        .as_deref()
+        .unwrap_or_else(|| panic!("run {} froze no manifest", admission.run_id))
 }
 
 const HEAD_TOOLS: [&str; 9] = [
@@ -786,19 +734,10 @@ async fn a_plan_is_fetched_once_frozen_and_rendered_from_the_record() {
     let reply = send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await;
     let first = result(&reply);
     let records = rig.wait_for_finished(1).await;
-    // A reader-only release must not introduce transform metadata into production writes.
+    // A plan that asks for no transforms freezes none on its run.
     for record in &records {
         let value = serde_json::to_value(record).unwrap();
-        assert!(
-            value.get("hooks").is_none(),
-            "reader release wrote hooks: {value}"
-        );
-        if let Some(manifest) = value.get("manifest") {
-            assert!(
-                manifest.get("declarations").is_none(),
-                "reader release wrote declarations: {value}"
-            );
-        }
+        assert!(value["hooks"].is_null(), "the run froze hooks: {value}");
     }
     let mut calls = admitter.calls();
     calls.sort();
@@ -811,9 +750,9 @@ async fn a_plan_is_fetched_once_frozen_and_rendered_from_the_record() {
         ],
         "one catalog fetch per provider"
     );
-    let started = run_started(&records);
+    let started = rig.admissions().await;
     assert_eq!(started.len(), 1);
-    let manifest = manifest_of(started[0]);
+    let manifest = manifest_of(&started[0]);
     assert_eq!(
         manifest.plan_identity,
         broca_fetch_plan::plan_identity(&plan).unwrap()
@@ -860,13 +799,13 @@ async fn a_plan_is_fetched_once_frozen_and_rendered_from_the_record() {
     // episode carries the system text. (A resend of the plan itself is covered below.)
     let fetched = admitter.calls().len();
     send_plan(&mut rig, 7, "turn-2", "next", None, json!({})).await;
-    let records = rig.wait_for_finished(2).await;
+    rig.wait_for_finished(2).await;
     assert_eq!(
         admitter.calls().len(),
         fetched,
         "a later send fetches nothing"
     );
-    let started = run_started(&records);
+    let started = rig.admissions().await;
     assert_eq!(started.len(), 2);
     for record in &started {
         assert_eq!(
@@ -899,7 +838,7 @@ async fn a_worker_plan_forwards_its_vector_tool_list() {
     rig.script.push(&[Step::Text("worker")]);
     let reply = send_plan(&mut rig, 7, "worker-turn", "hi", Some(&plan), json!({})).await;
     let first = result(&reply);
-    let records = rig.wait_for_finished(1).await;
+    rig.wait_for_finished(1).await;
 
     let mut calls = admitter.calls();
     calls.sort();
@@ -908,9 +847,9 @@ async fn a_worker_plan_forwards_its_vector_tool_list() {
         ["delivery:catalog:aft", "delivery:catalog:prefrontal-core",],
         "the worker plan fetches its two catalog providers once"
     );
-    let started = run_started(&records);
+    let started = rig.admissions().await;
     assert_eq!(started.len(), 1);
-    let manifest = manifest_of(started[0]);
+    let manifest = manifest_of(&started[0]);
     let manifest_tools: Vec<&str> = manifest
         .tools
         .iter()
@@ -932,27 +871,24 @@ async fn a_worker_plan_forwards_its_vector_tool_list() {
 /// episode's manifest, offers exactly the manifest's tools, and its input holds no second system
 /// message; the model is offered the manifest's tools on every step and sees the system text
 /// once.
-fn assert_later_episode_renders_the_frozen_manifest(rig: &Rig, records: &[WalRecord], label: &str) {
-    let started = run_started(records);
-    assert_eq!(started.len(), 2, "{label}: a second episode started");
-    let frozen = manifest_of(started[0]);
-    let WalRecord::RunStarted {
-        manifest: Some(manifest),
-        config,
-        input,
-        ..
-    } = started[1]
-    else {
-        panic!("{label}: the later episode carries no manifest");
-    };
-    assert_eq!(&**manifest, frozen, "{label}: the same frozen manifest");
+async fn assert_later_episode_renders_the_frozen_manifest(rig: &Rig, label: &str) {
+    let started = rig.admissions().await;
+    assert_eq!(started.len(), 2, "{label}: a second run started");
+    let frozen = manifest_of(&started[0]);
+    let later = &started[1];
     assert_eq!(
-        config.tools.as_ref(),
+        manifest_of(later),
+        frozen,
+        "{label}: the same frozen manifest"
+    );
+    assert_eq!(
+        later.tools.as_ref(),
         frozen.tools.as_ref(),
         "{label}: the manifest's tools"
     );
     assert!(
-        input
+        later
+            .input
             .iter()
             .all(|message| message.role != broca_protocol::content::Role::System),
         "{label}: no second system message"
@@ -992,13 +928,13 @@ async fn a_queued_send_on_a_planned_session_drains_with_the_frozen_manifest() {
         "the send queued behind the running episode"
     );
     rig.script.hold_model(false);
-    let records = rig.wait_for_finished(2).await;
+    rig.wait_for_finished(2).await;
     assert_eq!(
         admitter.calls().len(),
         fetched,
         "the drained send fetches nothing"
     );
-    assert_later_episode_renders_the_frozen_manifest(&rig, &records, "queued");
+    assert_later_episode_renders_the_frozen_manifest(&rig, "queued").await;
     rig.finish().await;
 }
 
@@ -1031,7 +967,7 @@ async fn an_interrupt_on_a_planned_session_starts_with_the_frozen_manifest() {
     let endings: Vec<_> = records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::RunFinished { reason, .. } => Some(*reason),
+            Record::RunEnd(end) => Some(end.reason),
             _ => None,
         })
         .collect();
@@ -1047,7 +983,7 @@ async fn an_interrupt_on_a_planned_session_starts_with_the_frozen_manifest() {
         fetched,
         "the interrupt fetches nothing"
     );
-    assert_later_episode_renders_the_frozen_manifest(&rig, &records, "interrupt");
+    assert_later_episode_renders_the_frozen_manifest(&rig, "interrupt").await;
     rig.finish().await;
 }
 
@@ -1079,44 +1015,11 @@ async fn a_resent_paused_first_send_fetches_nothing_and_redrives_its_episode() {
         fetched,
         "the resend fetches nothing"
     );
-    let records = rig.records();
-    let started = run_started(&records);
+    rig.records().await;
+    let started = rig.admissions().await;
     assert_eq!(started.len(), 1, "the resend re-drives the same episode");
     assert!(
-        manifest_of(started[0]).plan_identity == broca_fetch_plan::plan_identity(&plan).unwrap()
-    );
-    rig.finish().await;
-}
-
-/// The first `RunStarted` carrying a manifest is a gated frame requiring `plan-manifest/v1`, and
-/// the WAL raised its feature floor to that name before writing it, so placement never lets a
-/// build that cannot read the frame run on this machine. Before it, the floor names nothing.
-/// The manifest also freezes the catalog's tool schema pins inside its provider declarations,
-/// so the frame requires `provider-declarations/v1` and `tool-schema-pins/v1` as well.
-#[tokio::test]
-async fn the_first_planned_episode_raises_the_feature_floor() {
-    let (mut rig, _admitter) = plan_rig("plan-floor").await;
-    let floor_path = rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME);
-    assert!(broca_wal::read_floor(&floor_path).unwrap().is_empty());
-    let plan = vector("plans/broca-head-no-compaction.json");
-    rig.script.push(&[Step::Text("first")]);
-    result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
-    let records = rig.wait_for_finished(1).await;
-    let started = run_started(&records);
-    assert_eq!(
-        started[0].required_features(),
-        [
-            broca_wal::MESSAGE_TIMES_FEATURE,
-            broca_wal::PLAN_MANIFEST_FEATURE,
-            broca_wal::PROVIDER_DECLARATIONS_FEATURE,
-            broca_wal::RUNNER_TAGS_V2_FEATURE,
-            broca_wal::framing::TOOL_SCHEMA_PINS_FEATURE,
-        ]
-    );
-    let floor = broca_wal::read_floor(&floor_path).unwrap();
-    assert!(
-        floor.contains(broca_wal::PLAN_MANIFEST_FEATURE),
-        "{floor:?}"
+        manifest_of(&started[0]).plan_identity == broca_fetch_plan::plan_identity(&plan).unwrap()
     );
     rig.finish().await;
 }
@@ -1163,13 +1066,13 @@ async fn session_baseline_refuses_a_non_owner() {
 async fn text_only_and_hook_only_plan_refuses_before_fetch_or_write() {
     let (mut rig, admitter) = plan_rig("plan-text-only-hook-refusal").await;
     let plan = vector("plans/text-only-and-hook-only.json");
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let frame = send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await;
     assert_eq!(
         error_body(&frame)["detail"],
         json!({"field": "plan.composition.compaction"})
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert!(admitter.calls().is_empty());
     rig.finish().await;
 }
@@ -1305,7 +1208,7 @@ async fn every_admission_refusal_writes_nothing() {
         assert_eq!(body["code"], code, "{label}");
         assert_eq!(body["detail"], detail, "{label}");
         assert!(
-            rig.wal_bytes().is_empty(),
+            rig.records().await.is_empty(),
             "{label}: a refused first send writes nothing"
         );
     }
@@ -1315,7 +1218,7 @@ async fn every_admission_refusal_writes_nothing() {
     rig.script.push(&[Step::Text("first")]);
     result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let mut reordered = plan.clone();
     reordered["tool_items"][0]["preset"] = json!("alternate");
     let drift = send_plan(&mut rig, 7, "turn-2", "next", Some(&reordered), json!({})).await;
@@ -1332,7 +1235,7 @@ async fn every_admission_refusal_writes_nothing() {
     let reused = send_plan(&mut rig, 7, "turn-1", "hi", Some(&reordered), json!({})).await;
     assert_eq!(error_body(&reused)["code"], "plan_drift");
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "a refused later send writes nothing"
     );
@@ -1344,13 +1247,13 @@ async fn every_admission_refusal_writes_nothing() {
     rig.script.push(&[Step::Text("first")]);
     result(&rig.send("turn-1", "hi", None).await);
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let drift = send_plan(&mut rig, 7, "turn-2", "next", Some(&plan), json!({})).await;
     assert_eq!(
         error_body(&drift)["detail"],
         json!({"sent": broca_fetch_plan::plan_identity(&plan).unwrap()})
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -1363,7 +1266,7 @@ fn model_plan(model: Value) -> Value {
 async fn assert_model_refused(tag: &str, model: Value, send_model: Value) {
     let (mut rig, admitter) = worker_plan_rig(tag).await;
     let plan = model_plan(model.clone());
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let frame = send_plan(
         &mut rig,
         7,
@@ -1383,7 +1286,11 @@ async fn assert_model_refused(tag: &str, model: Value, send_model: Value) {
         body["detail"],
         json!({"provider": "prefrontal-core", "plan_model": model, "send_model": expected_send})
     );
-    assert_eq!(rig.wal_bytes(), before, "refusal must preserve WAL bytes");
+    assert_eq!(
+        rig.records().await,
+        before,
+        "refusal must preserve WAL bytes"
+    );
     assert!(
         admitter.calls().is_empty(),
         "refusal must precede every provider fetch"
@@ -1499,7 +1406,7 @@ async fn plan_model_malformed_refuses_with_field_path() {
         (json!({"provider": "fake", "id": 1}), ".id"),
     ] {
         let (mut rig, admitter) = worker_plan_rig("plan-model-malformed").await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let plan = model_plan(model);
         let body =
             error_body(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
@@ -1508,7 +1415,7 @@ async fn plan_model_malformed_refuses_with_field_path() {
             body["detail"],
             json!({"field": format!("plan.system_text_items[0].params.model{suffix}")})
         );
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         assert!(admitter.calls().is_empty());
         rig.finish().await;
     }
@@ -1521,7 +1428,7 @@ async fn plan_model_later_send_mismatch_refuses_before_fetch_or_write() {
     rig.script.push(&[Step::Text("first")]);
     result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let calls = admitter.calls();
     assert!(!before.is_empty());
     assert!(!calls.is_empty());
@@ -1546,7 +1453,7 @@ async fn plan_model_later_send_mismatch_refuses_before_fetch_or_write() {
         })
     );
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "later refusal must preserve WAL bytes"
     );
@@ -1576,7 +1483,7 @@ async fn invalid_presets_and_composition_compaction_refuse_before_any_wal_write(
                 r#"{{"code":"invalid_params","message":"invalid plan or send: {{\"field\":\"{field}\"}}","detail":{{"field":"{field}"}}}}"#
             );
             assert_eq!(String::from_utf8(frame.body).unwrap(), expected);
-            assert!(rig.wal_bytes().is_empty());
+            assert!(rig.records().await.is_empty());
         }
     }
     for compaction in [Value::Null, json!({"provider": "magic-context"})] {
@@ -1588,7 +1495,7 @@ async fn invalid_presets_and_composition_compaction_refuse_before_any_wal_write(
             String::from_utf8(frame.body).unwrap(),
             r#"{"code":"invalid_params","message":"invalid plan or send: {\"field\":\"plan.composition.compaction\"}","detail":{"field":"plan.composition.compaction"}}"#
         );
-        assert!(rig.wal_bytes().is_empty());
+        assert!(rig.records().await.is_empty());
     }
     rig.finish().await;
 }
@@ -1615,7 +1522,7 @@ async fn approve_on_unavailable_pass_refuses_before_any_fetch_or_wal_write() {
         &plan["composition"]
     )
     .unwrap());
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let frame = send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await;
     let body = error_body(&frame);
     assert_eq!(body["code"], "invalid_params");
@@ -1627,7 +1534,11 @@ async fn approve_on_unavailable_pass_refuses_before_any_fetch_or_wal_write() {
         String::from_utf8(frame.body.clone()).unwrap(),
         r#"{"code":"invalid_params","message":"invalid plan or send: {\"field\":\"plan.step_transform_items\",\"item\":0,\"problem\":\"approve_on_unavailable_pass\",\"subscription\":0}","detail":{"field":"plan.step_transform_items","item":0,"problem":"approve_on_unavailable_pass","subscription":0}}"#
     );
-    assert_eq!(rig.wal_bytes(), before, "refusal must preserve WAL bytes");
+    assert_eq!(
+        rig.records().await,
+        before,
+        "refusal must preserve WAL bytes"
+    );
     assert!(
         admitter.calls().is_empty(),
         "refusal must precede every provider fetch"
@@ -1668,8 +1579,9 @@ async fn approve_with_refuse_is_admitted_and_declaration_is_frozen() {
     .unwrap());
     let frame = send_plan(&mut rig, 8, "turn-1", "hi", Some(&plan), json!({})).await;
     assert_eq!(frame.header.ty, FrameType::Response);
-    let records = rig.wait_for_finished(1).await;
-    let manifest = manifest_of(run_started(&records)[0]);
+    rig.wait_for_finished(1).await;
+    let admitted = rig.admissions().await;
+    let manifest = manifest_of(&admitted[0]);
     assert_eq!(manifest.declarations[0].provider, "magic-context");
     assert_eq!(
         serde_json::from_str::<Value>(manifest.declarations[0].answer.as_json_text()).unwrap(),
@@ -1679,11 +1591,11 @@ async fn approve_with_refuse_is_admitted_and_declaration_is_frozen() {
         .calls()
         .iter()
         .any(|call| call == "delivery:declare:magic-context"));
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let frame = send_plan(&mut rig, 7, "turn-2", "hi", None, json!({})).await;
     assert_eq!(error_body(&frame)["code"], "approve_requires_scope");
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "a frozen approval plan still requires scope"
     );
@@ -1720,7 +1632,7 @@ async fn approve_requires_scope_refuses_before_any_fetch_or_wal_write() {
         }
         assert_eq!(frame.body, std::fs::read(path).unwrap());
         assert!(
-            rig.wal_bytes().is_empty(),
+            rig.records().await.is_empty(),
             "refusal must precede the first WAL byte"
         );
         assert!(
@@ -1851,7 +1763,7 @@ async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration
     let composition = json!({"providers":[{"provider":"admission-transform", "tools":[]}], "step_transform_items":steps});
     let plan = json!({"tool_items":[], "system_text_items":[], "step_transform_items":steps,
         "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(), "composition":composition});
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert!(before.is_empty());
     let frame = send_plan(&mut rig, 7, "no-plane", "hi", Some(&plan), json!({})).await;
     let refusal = error_body(&frame);
@@ -1861,13 +1773,13 @@ async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration
         json!({"field":"plan.step_transform_items"})
     );
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "hookless admission must allocate no lineage header"
     );
     assert!(
-        !rig.wal_path.exists(),
-        "hookless admission must not open a WAL"
+        !rig.session_stored().await,
+        "hookless admission must not create a session"
     );
     assert!(
         requests.lock().unwrap().is_empty(),
@@ -1876,16 +1788,16 @@ async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration
     rig.set_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(conn)));
     let frame = send_plan(&mut rig, 7, "stale", "hi", Some(&plan), json!({})).await;
     assert_eq!(error_body(&frame)["code"], "plan_stale");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     let declaration =
         json!({"subscriptions":[subscription], "provider_extra":{"keep":[null,false]}});
     *answer.lock().unwrap() = declaration.clone();
     rig.script.push(&[Step::Text("done")]);
     let frame = send_plan(&mut rig, 7, "admitted", "hi", Some(&plan), json!({})).await;
     result(&frame);
-    let records = rig.wait_for_finished(1).await;
-    let started = run_started(&records);
-    let manifest = manifest_of(started[0]);
+    rig.wait_for_finished(1).await;
+    let started = rig.admissions().await;
+    let manifest = manifest_of(&started[0]);
     assert!(manifest.fetches.is_empty());
     assert_eq!(manifest.declarations.len(), 1);
     assert_eq!(manifest.declarations[0].provider, "admission-transform");
@@ -1980,7 +1892,7 @@ async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing()
         "compaction must refuse before any hook declaration or catalog fetch"
     );
     assert!(
-        rig.wal_bytes().is_empty(),
+        rig.records().await.is_empty(),
         "dormant writer must produce zero WAL bytes"
     );
     assert_eq!(
@@ -1989,35 +1901,6 @@ async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing()
         "dormant writer must make zero Setup calls"
     );
     assert!(rig.script.prompts.lock().unwrap().is_empty());
-    rig.finish().await;
-}
-
-/// A caller need not resend its plan. Reader admission must consult the frozen manifest
-/// before an actor could resume the run or queue an untransformed input.
-#[tokio::test]
-async fn reader_refuses_frozen_step_transform_session_without_plan() {
-    use broca_wal::{FileWal, Wal};
-    let mut rig = Rig::start("frozen-reader-refusal").await;
-    let value: Value = serde_json::from_str(include_str!(
-        "../../../broca-wal/tests/golden/step_transforms/run_started.json"
-    ))
-    .unwrap();
-    let started: WalRecord = serde_json::from_value(value["record"].clone()).unwrap();
-    let mut wal = FileWal::open(&rig.wal_path)
-        .unwrap()
-        .with_feature_floor(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
-    wal.append(1, &started, true).unwrap();
-    drop(wal);
-    let before = rig.wal_bytes();
-    let frame = send_plan(&mut rig, 7, "reader-send", "hi", None, json!({})).await;
-    let refusal = error_body(&frame);
-    assert_eq!(refusal["code"], "invalid_params");
-    assert_eq!(
-        refusal["detail"],
-        json!({"field":"plan.step_transform_items"})
-    );
-    assert_eq!(rig.wal_bytes(), before);
-    assert!(rig.script.dispatched.lock().unwrap().is_empty());
     rig.finish().await;
 }
 
@@ -2232,20 +2115,11 @@ async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
     send_plan(&mut rig, 7, "first", "freeze plan", Some(&plan), json!({})).await;
     rig.wait_entered().await;
     let calls = admitter.calls();
-    let identical = rig
-        .records()
-        .iter()
-        .find_map(|record| match record {
-            WalRecord::RunStarted { config, .. } => {
-                Some(serde_json::to_value(config.tools.as_ref()).unwrap())
-            }
-            _ => None,
-        })
-        .unwrap();
+    let identical = serde_json::to_value(rig.admissions().await[0].tools.as_ref()).unwrap();
     for (index, tools) in [json!([]), identical].into_iter().enumerate() {
         for delivery in ["queue", "steer", "interrupt"] {
             for repeat_plan in [false, true] {
-                let before = rig.wal_bytes();
+                let before = rig.records().await;
                 let reply = send_plan(
                     &mut rig,
                     7,
@@ -2257,14 +2131,18 @@ async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
                 .await;
                 assert_eq!(error_body(&reply)["code"], "invalid_params");
                 assert_eq!(error_body(&reply)["detail"]["field"], "tools");
-                assert_eq!(rig.wal_bytes(), before, "refused tools must write nothing");
+                assert_eq!(
+                    rig.records().await,
+                    before,
+                    "refused tools must write nothing"
+                );
                 assert_eq!(admitter.calls(), calls, "no provider fetch on refusal");
             }
         }
     }
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = send_plan(
         &mut rig,
         7,
@@ -2276,7 +2154,7 @@ async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
     .await;
     assert_eq!(error_body(&reply)["code"], "invalid_params");
     assert_eq!(error_body(&reply)["detail"]["field"], "tools");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -2286,11 +2164,12 @@ async fn creating_planless_send_accepts_tools() {
     let mut tools = legacy_tools();
     tools[0]["execution_mode"] = json!("parallel");
     result(&send_plan(&mut rig, 7, "first", "hi", None, json!({"tools": tools})).await);
-    let records = rig.wait_for_finished(1).await;
-    let WalRecord::RunStarted { config, .. } = run_started(&records)[0] else {
-        unreachable!()
-    };
-    assert_eq!(serde_json::to_value(config.tools.as_ref()).unwrap(), tools);
+    rig.wait_for_finished(1).await;
+    let admitted = rig.admissions().await;
+    assert_eq!(
+        serde_json::to_value(admitted[0].tools.as_ref()).unwrap(),
+        tools
+    );
     assert!(admitter.calls().is_empty());
     rig.finish().await;
 }
@@ -2303,35 +2182,38 @@ async fn identical_creating_tools_retry_replays_without_writing() {
     let first = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
     let admitted = result(&first);
     rig.wait_entered().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let retry = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
     assert_eq!(result(&retry), admitted);
     assert_eq!(retry.body, first.body);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
 
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let finished = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
     let answer = result(&finished);
     assert_eq!(answer["state"], "finished");
     assert_eq!(answer["run_id"], admitted["run_id"]);
     let replay = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
     assert_eq!(replay.body, finished.body);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
 
     let changed = send_plan(&mut rig, 7, "first", "hi", None, json!({"tools":[]})).await;
     assert_eq!(error_body(&changed)["code"], "send_id_reuse");
     assert_eq!(error_body(&changed)["detail"]["field"], "tools");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
 
     assert!(rig.registry().stop_and_seal().await);
     let mut rig = rig.restart().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let replay = send_plan(&mut rig, 7, "first", "hi", None, tools).await;
     assert_eq!(replay.body, finished.body);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(
+        without_writer_opens(rig.records().await),
+        without_writer_opens(before)
+    );
     rig.finish().await;
 }
 
@@ -2353,7 +2235,7 @@ async fn later_planless_tools_are_refused_in_every_delivery_without_writes() {
     rig.wait_entered().await;
     for tools in [json!([]), legacy_tools()] {
         for delivery in ["queue", "steer", "interrupt"] {
-            let before = rig.wal_bytes();
+            let before = rig.records().await;
             let reply = send_plan(
                 &mut rig,
                 7,
@@ -2371,17 +2253,17 @@ async fn later_planless_tools_are_refused_in_every_delivery_without_writes() {
             }
             assert_eq!(error_body(&reply)["code"], "invalid_params");
             assert_eq!(error_body(&reply)["detail"]["field"], "tools");
-            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(rig.records().await, before);
         }
     }
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = send_plan(&mut rig, 7, "idle", "next", None, json!({"tools": []})).await;
     assert_eq!(error_body(&reply)["code"], "invalid_params");
     assert_eq!(error_body(&reply)["detail"]["field"], "tools");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -2446,7 +2328,7 @@ async fn a_model_less_steer_checks_its_plan_against_the_inherited_model() {
     );
     rig.wait_for_finished(2).await;
 
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let refused = send_plan(
         &mut rig,
         7,
@@ -2469,28 +2351,12 @@ async fn a_model_less_steer_checks_its_plan_against_the_inherited_model() {
             "send_model": {"provider": "fake", "id": "fake", "variant": "low"},
         })
     );
-    assert_eq!(rig.wal_bytes(), before, "refusal must preserve WAL bytes");
+    assert_eq!(
+        rig.records().await,
+        before,
+        "refusal must preserve WAL bytes"
+    );
     rig.finish().await;
-}
-
-/// The `requires` list of every gated `RunStarted` frame in `wal`, read from the raw frames
-/// (a decoded record does not keep its frame's `requires`).
-fn run_started_requires(wal: &[u8]) -> Vec<Vec<String>> {
-    use broca_wal::{GATED_FRAMING_VERSION, HEADER_LEN};
-    let mut lists = Vec::new();
-    let mut at = 0;
-    while at + HEADER_LEN <= wal.len() {
-        let len = u32::from_le_bytes(wal[at..at + 4].try_into().unwrap()) as usize;
-        let payload = &wal[at + HEADER_LEN..at + HEADER_LEN + len];
-        if wal[at + 4] == GATED_FRAMING_VERSION {
-            let gated: Value = serde_json::from_slice(payload).unwrap();
-            if gated["record"]["type"] == "run_started" {
-                lists.push(serde_json::from_value(gated["requires"].clone()).unwrap());
-            }
-        }
-        at += HEADER_LEN + len;
-    }
-    lists
 }
 
 fn agent_run_stamp() -> subc_protocol::scope::ScopeStamp {
@@ -2505,18 +2371,11 @@ fn agent_run_stamp() -> subc_protocol::scope::ScopeStamp {
 }
 
 /// A session with a session class, admitted with a plan whose providers declare result formats
-/// and late results (every worker Core launches), writes its first `RunStarted` in a frame
-/// that requires both the session-class and the provider-declarations features. The same
-/// holds with an agent-run scope and with an input cap, the other two features added through
-/// a precomputed union. The provider-declarations feature once reached the session-class
-/// union, which did not list it, and the WAL writer panicked on every such send.
+/// and late results (every worker Core launches), freezes those declarations into its run's
+/// manifest, and so does one admitted under an agent-run scope.
 #[tokio::test]
-async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
-    use broca_wal::framing::{
-        AGENT_RUN_SCOPE_FEATURE, INPUT_TOKEN_CAP_FEATURE, PLAN_MANIFEST_FEATURE,
-        PROVIDER_DECLARATIONS_FEATURE, SESSION_CLASS_FEATURE,
-    };
-    for case in ["classed", "agent-run", "input-cap"] {
+async fn a_classed_session_freezes_its_providers_declarations() {
+    for case in ["classed", "agent-run"] {
         let tag = format!("declaring-{case}");
         let mut plan = vector("plans/broca-head-no-compaction.json");
         let (mut rig, admitter, channel) = if case == "agent-run" {
@@ -2539,26 +2398,13 @@ async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
         };
         *admitter.declare.lock().unwrap() = true;
         rig.script.push(&[Step::Text("done")]);
-        let mut extra = json!({"session_class": "mason"});
-        let mut expected = vec![
-            PLAN_MANIFEST_FEATURE,
-            PROVIDER_DECLARATIONS_FEATURE,
-            SESSION_CLASS_FEATURE,
-        ];
-        match case {
-            "agent-run" => expected.push(AGENT_RUN_SCOPE_FEATURE),
-            "input-cap" => {
-                extra["budget"] = json!({"max_input_tokens": 1_000_000});
-                expected.push(INPUT_TOKEN_CAP_FEATURE);
-            }
-            _ => {}
-        }
+        let extra = json!({"session_class": "mason"});
         let reply = send_plan(&mut rig, channel, "turn-1", "hi", Some(&plan), extra).await;
         result(&reply);
-        let records = rig.wait_for_finished(1).await;
+        rig.wait_for_finished(1).await;
 
         // The catalog answers' declarations were frozen into the manifest.
-        let manifest = serde_json::to_value(manifest_of(run_started(&records)[0])).unwrap();
+        let manifest = serde_json::to_value(manifest_of(&rig.admissions().await[0])).unwrap();
         let fetches = manifest["fetches"].as_array().unwrap();
         assert!(!fetches.is_empty(), "{case}: {manifest}");
         for fetch in fetches {
@@ -2575,16 +2421,6 @@ async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
                         .as_object()
                         .is_some_and(|formats| !formats.is_empty())),
                 "{case}: {manifest}"
-            );
-        }
-
-        let requires = run_started_requires(&rig.wal_bytes());
-        assert_eq!(requires.len(), 1, "{case}: {requires:?}");
-        for feature in expected {
-            assert!(
-                requires[0].iter().any(|name| name == feature),
-                "{case}: the RunStarted frame requires {:?}, without {feature}",
-                requires[0]
             );
         }
         rig.finish().await;
@@ -2619,7 +2455,7 @@ async fn finish_carrier_rig(mut rig: Rig) {
     rig.finish().await;
 }
 
-fn assert_carrier_owner_refusal(rig: &Rig, before: &[u8], reply: &subc_protocol::Frame) {
+async fn assert_carrier_owner_refusal(rig: &Rig, before: &[Record], reply: &subc_protocol::Frame) {
     if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
         println!(
             "BROCA_SAMPLE owner-refusal.json {}",
@@ -2627,21 +2463,21 @@ fn assert_carrier_owner_refusal(rig: &Rig, before: &[u8], reply: &subc_protocol:
         );
     }
     assert_eq!(error_body(reply)["code"], "scope_owner_mismatch");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
 }
 
 #[tokio::test]
 async fn flow_and_run_carrier_cannot_cancel_as_owner() {
     for run_scope in [false, true] {
         let (mut rig, sent) = carrier_owner_rig("carrier-cancel", run_scope).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = rig
             .request(
                 8,
                 json!({"method":"run.cancel","params":{"run_id":sent["run_id"]}}),
             )
             .await;
-        assert_carrier_owner_refusal(&rig, &before, &reply);
+        assert_carrier_owner_refusal(&rig, &before, &reply).await;
         finish_carrier_rig(rig).await;
     }
 }
@@ -2650,10 +2486,10 @@ async fn flow_and_run_carrier_cannot_cancel_as_owner() {
 async fn flow_and_run_carrier_cannot_retract_as_owner() {
     for run_scope in [false, true] {
         let (mut rig, _) = carrier_owner_rig("carrier-retract", run_scope).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         // No recorded send has this submission ID, so the sender cannot retract its own send.
         let reply = rig.request(8, json!({"method":"session.retract","params":{"submission_id":"other-sender-submission"}})).await;
-        assert_carrier_owner_refusal(&rig, &before, &reply);
+        assert_carrier_owner_refusal(&rig, &before, &reply).await;
         finish_carrier_rig(rig).await;
     }
 }
@@ -2663,9 +2499,9 @@ async fn flow_and_run_carrier_cannot_upload_as_owner() {
     for run_scope in [false, true] {
         let (mut rig, _) = carrier_owner_rig("carrier-upload", run_scope).await;
         broca_core::media_store::create_media_directories(&rig.dir).unwrap();
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = rig.request(8, json!({"method":"session.upload_begin","params":{"mime":"image/png","bytes":1,"sha256":"0".repeat(64)}})).await;
-        assert_carrier_owner_refusal(&rig, &before, &reply);
+        assert_carrier_owner_refusal(&rig, &before, &reply).await;
         for tree in ["objects", "refs"] {
             assert_eq!(
                 std::fs::read_dir(rig.dir.join("media-uploads").join(tree))
@@ -2682,7 +2518,7 @@ async fn flow_and_run_carrier_cannot_upload_as_owner() {
 async fn flow_and_run_carrier_head_has_no_owner_grant() {
     for run_scope in [false, true] {
         let (mut rig, _) = carrier_owner_rig("carrier-head", run_scope).await;
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let reply = rig
             .request(8, json!({"method":"session.head","params":{}}))
             .await;
@@ -2694,7 +2530,7 @@ async fn flow_and_run_carrier_head_has_no_owner_grant() {
             );
         }
         assert_ne!(head["sender"]["owner"], true);
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         rig.bind_as(9, Some(scope_owner())).await;
         let owner_head = result(
             &rig.request(9, json!({"method":"session.head","params":{}}))

@@ -551,7 +551,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{RunJob, WarmError};
+    use crate::executor::WarmError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// An executor that prices warms and counts the warms it is asked to send, answering each.
@@ -563,14 +563,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunExecutor for Counting {
-        async fn execute(
-            &self,
-            _job: RunJob,
-            _out: mpsc::Sender<broca_core::OutputEvent>,
-        ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-            unreachable!("no run is executed")
-        }
-
         fn warm_costs(
             &self,
             _config: &RunConfig,

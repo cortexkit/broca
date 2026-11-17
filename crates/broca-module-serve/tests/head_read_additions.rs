@@ -1,7 +1,6 @@
 //! Default reply bytes captured through the session-bound management route.
 mod delivery_rig;
-use broca_core::{FileWalStore, WalStore};
-use broca_wal::WalRecord;
+use broca_session_store::record::Record;
 use delivery_rig::*;
 use serde_json::json;
 
@@ -36,10 +35,6 @@ async fn unknown_facts_keep_pre_addition_default_reply_bytes() {
         .await;
     assert_capture(&head, "session_head.before_head_additions.json");
     rig.finish().await;
-}
-
-fn capture_known(frame: &subc_protocol::Frame, name: &str) {
-    capture_known_with_run(frame, name, None);
 }
 
 fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<&str>) {
@@ -97,296 +92,11 @@ fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<
     assert_eq!(bytes, std::fs::read_to_string(path).unwrap().trim_end());
 }
 
-fn seed_history(rig: &Rig, planned: bool, owner: Option<&str>) {
-    seed_history_with_stamp(rig, planned, owner, None);
-}
-
-fn seed_history_with_stamp(
-    rig: &Rig,
-    planned: bool,
-    owner: Option<&str>,
-    stamp: Option<broca_protocol::RichUiStamp>,
-) {
-    seed_history_with_content(
-        rig,
-        planned,
-        owner,
-        stamp,
-        json!([{"type":"text","text":"answer"}]),
-    );
-}
-
-fn seed_history_with_content(
-    rig: &Rig,
-    planned: bool,
-    owner: Option<&str>,
-    stamp: Option<broca_protocol::RichUiStamp>,
-    content: serde_json::Value,
-) {
-    seed_history_with_fact_times(rig, planned, owner, stamp, content, None, None);
-}
-
-fn seed_history_with_fact_times(
-    rig: &Rig,
-    planned: bool,
-    owner: Option<&str>,
-    stamp: Option<broca_protocol::RichUiStamp>,
-    content: serde_json::Value,
-    accepted_at: Option<u64>,
-    sent_at: Option<u64>,
-) {
-    let mut start: WalRecord = serde_json::from_str(
-        include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
-            .lines()
-            .next()
-            .unwrap(),
-    )
-    .unwrap();
-    if let WalRecord::RunStarted {
-        run_id,
-        session,
-        principal,
-        ts_ms,
-        written_at_ms,
-        manifest,
-        ..
-    } = &mut start
-    {
-        *run_id = broca_protocol::RunId("r1".into());
-        *session = rig.session.clone();
-        *principal = owner.map(|owner| broca_protocol::BindPrincipal::Reserved {
-            module_id: owner.into(),
-        });
-        *ts_ms = Some(500);
-        *written_at_ms = accepted_at;
-        *manifest = Some(Box::new(broca_wal::PlanManifest {
-            rich_ui: stamp,
-            plan: broca_wal::OpaqueJson::from_json_text(
-                json!({"composition":{}, "senders":[
-                    {"module":"named"}, {"module":"starter","idle_start":true,"interrupt":true}
-                ]})
-                .to_string(),
-            )
-            .unwrap(),
-            plan_identity: "plan".into(),
-            composition_digest: "digest".into(),
-            tools: Default::default(),
-            system_text: String::new(),
-            system_digest: String::new(),
-            join_version: 1,
-            role_versions: Default::default(),
-            fetches: vec![],
-            declarations: vec![],
-        }));
-        if !planned {
-            *manifest = None;
-        }
-    }
-    let steps = [
-        start,
-        serde_json::from_value(json!({"type":"step_started","step_id":1})).unwrap(),
-        serde_json::from_value(json!({"type":"model_attempt_finished","step_id":1,"attempt":0,
-            "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b",
-            "outcome":"complete","ts_ms":505,"sent_at_ms":sent_at})).unwrap(),
-        serde_json::from_value(json!({"type":"model_step_finished","step_id":1,
-            "assistant_message":{"message_id":"a","content":content},
-            "usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap(),
-        serde_json::from_value(json!({"type":"turn_finished","step_id":1})).unwrap(),
-        serde_json::from_value(json!({"type":"run_finished","reason":"completed","ts_ms":506,
-            "usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap(),
-    ];
-    let store = FileWalStore::new(rig.dir.join("wal"));
-    let mut wal = store.open(&rig.session).unwrap();
-    for record in steps {
-        wal.append(1, &record, false).unwrap();
-    }
-    wal.sync().unwrap();
-}
-
-#[tokio::test]
-async fn rich_ui_stamp_serves_frozen_metadata_and_preserves_default_read_bytes() {
-    let mut rig = Rig::start("rich-ui-stamp-samples").await;
-    let stamp = json!({"dialect":"1.0", "catalog_digest":"a".repeat(64)});
-    seed_history_with_stamp(
-        &rig,
-        true,
-        Some("owner"),
-        Some(serde_json::from_value(stamp.clone()).unwrap()),
-    );
-    let default_read = rig
-        .request(7, json!({"method":"session.read","params":{}}))
-        .await;
-    capture_known(&default_read, "session_read.written_at.json");
-    let explicit_false = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"include_rich_ui":false}}),
-        )
-        .await;
-    assert_eq!(default_read.body, explicit_false.body);
-    let read = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"include_rich_ui":true}}),
-        )
-        .await;
-    let mut opted = result(&read);
-    assert!(opted["messages"][0].get("rich_ui").is_none());
-    assert_eq!(opted["messages"][1]["rich_ui"], stamp);
-    opted["messages"][1]
-        .as_object_mut()
-        .unwrap()
-        .remove("rich_ui");
-    assert_eq!(opted, result(&default_read));
-    let history = rig
-        .request(
-            7,
-            json!({"method":"session.history","params":{"form":"display"}}),
-        )
-        .await;
-    let history_value = result(&history);
-    assert!(history_value["messages"][0]["row"].get("rich_ui").is_none());
-    assert_eq!(history_value["messages"][1]["row"]["rich_ui"], stamp);
-    let head = rig
-        .request(7, json!({"method":"session.head","params":{}}))
-        .await;
-    assert_eq!(result(&head)["last_run_rich_ui"], stamp);
-    let frames = rig
-        .subscribe_collect(
-            8,
-            json!({"from":"start"}),
-            std::time::Duration::from_millis(100),
-        )
-        .await;
-    let start = frames
-        .iter()
-        .find(|frame| {
-            serde_json::from_slice::<serde_json::Value>(&frame.body)
-                .ok()
-                .is_some_and(|value| value["event"]["type"] == "run_started")
-        })
-        .expect("run_started live frame");
-    let live: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
-    assert_eq!(live["event"]["rich_ui"], stamp);
-    for (name, frame) in [
-        ("session.history.json", &history),
-        ("run_started.json", start),
-        ("session.head.json", &head),
-        ("session.read.opt-in.json", &read),
-        ("session.read.default.json", &default_read),
-    ] {
-        println!(
-            "RICH_UI_SAMPLE {name} {}",
-            String::from_utf8_lossy(&frame.body)
-        );
-    }
-    let rig = rig.restart().await;
-    let mut rig = rig;
-    let restarted = rig
-        .request(7, json!({"method":"session.head","params":{}}))
-        .await;
-    assert_eq!(result(&restarted)["last_run_rich_ui"], stamp);
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
-    let mut rig = Rig::start("head-additions-goldens").await;
-    let describe = rig
-        .request(7, json!({"method":"role.describe","params":{}}))
-        .await;
-    for capability in ["head_sender", "session_usage"] {
-        assert!(result(&describe)["capabilities"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(capability)));
-    }
-    capture_known(&describe, "role_describe.head_additions.json");
-    seed_history(&rig, true, Some("owner"));
-    let read = rig
-        .request(7, json!({"method":"session.read","params":{}}))
-        .await;
-    let entries = result(&read)["messages"].as_array().unwrap().clone();
-    assert_eq!(entries[0]["written_at"], 500);
-    assert_eq!(entries[1]["written_at"], 505);
-    assert!(entries
-        .iter()
-        .all(|entry| entry["message"].get("written_at").is_none()));
-    capture_known(&read, "session_read.written_at.json");
-    for (channel, caller, golden, expected_modes, interrupt, owner) in [
-        (
-            8,
-            "owner",
-            "session_head.owner.json",
-            vec!["tool_result", "turn_system", "steer", "idle_start"],
-            true,
-            true,
-        ),
-        (
-            9,
-            "named",
-            "session_head.named.json",
-            vec!["tool_result", "turn_system", "steer"],
-            false,
-            false,
-        ),
-        (
-            10,
-            "stranger",
-            "session_head.ungranted.json",
-            vec![],
-            false,
-            false,
-        ),
-        (
-            11,
-            "starter",
-            "session_head.starter.json",
-            vec!["tool_result", "turn_system", "steer", "idle_start"],
-            true,
-            false,
-        ),
-    ] {
-        rig.bind_as(
-            channel,
-            Some(subc_protocol::Principal::Reserved {
-                module_id: caller.into(),
-            }),
-        )
-        .await;
-        let head = rig
-            .request(channel, json!({"method":"session.head","params":{}}))
-            .await;
-        let answer = result(&head);
-        assert_eq!(answer["model"], json!({"provider":"p","model":"m"}));
-        assert_eq!(
-            answer["usage"],
-            json!({"since":"r1","steps":1,"unreported_steps":0,"input_tokens":7,"output_tokens":3,
-            "by_model":[{"provider":"p","model":"m","steps":1,"unreported_steps":0,"input_tokens":7,"output_tokens":3}]})
-        );
-        assert!(answer["incarnation"].is_string());
-        assert!(
-            answer.get("lineage_id").is_none(),
-            "llm-runner 0.8 heads carry no lineage_id"
-        );
-        if expected_modes.is_empty() {
-            assert!(answer.get("sender").is_none());
-        } else {
-            assert_eq!(answer["sender"]["modes"], json!(expected_modes));
-            assert_eq!(answer["sender"]["interrupt"], interrupt);
-            assert_eq!(answer["sender"].get("owner").is_some(), owner);
-        }
-        capture_known(&head, golden);
-    }
-    rig.finish().await;
-}
-
 #[tokio::test]
 async fn newly_written_times_and_session_spend_survive_projection_and_restart() {
     let mut rig =
         Rig::start_with_idle_ttl("new-message-times", std::time::Duration::from_millis(100)).await;
     let _diagnostics = rig.failure_diagnostics();
-    *rig.script.attempt_time.lock().unwrap() = Some(777);
     rig.script.push(&[Step::Usage {
         content: vec![broca_protocol::ContentBlock::Text {
             text: "answer".into(),
@@ -405,22 +115,11 @@ async fn newly_written_times_and_session_spend_survive_projection_and_restart() 
         &rig.request(7, json!({"method":"session.read","params":{}}))
             .await,
     );
-    assert_eq!(before["messages"][1]["written_at"], 777);
     assert!(before["messages"]
         .as_array()
         .unwrap()
         .iter()
         .all(|entry| entry["written_at"].as_u64().is_some_and(|at| at > 0)));
-    for record in rig.records() {
-        if matches!(
-            record,
-            WalRecord::RunStarted { .. } | WalRecord::ModelStepFinished { .. }
-        ) {
-            assert!(record
-                .required_features()
-                .contains(&broca_wal::framing::MESSAGE_TIMES_FEATURE));
-        }
-    }
     let first_head = result(
         &rig.request(7, json!({"method":"session.head","params":{}}))
             .await,
@@ -459,34 +158,6 @@ async fn newly_written_times_and_session_spend_survive_projection_and_restart() 
 }
 
 #[tokio::test]
-async fn planless_head_reports_a_grant_only_to_its_owner() {
-    let mut rig = Rig::start("head-planless-grants").await;
-    seed_history(&rig, false, Some("owner"));
-    for (channel, caller) in [(8, "owner"), (9, "named")] {
-        rig.bind_as(
-            channel,
-            Some(subc_protocol::Principal::Reserved {
-                module_id: caller.into(),
-            }),
-        )
-        .await;
-        let head = result(
-            &rig.request(channel, json!({"method":"session.head","params":{}}))
-                .await,
-        );
-        if caller == "owner" {
-            assert_eq!(
-                head["sender"],
-                json!({"modes":["tool_result","turn_system","steer","idle_start"],"interrupt":true,"owner":true})
-            );
-        } else {
-            assert!(head.get("sender").is_none());
-        }
-    }
-    rig.finish().await;
-}
-
-#[tokio::test]
 async fn queued_input_and_steer_keep_their_admission_times() {
     let mut rig = Rig::start("queued-admission-times").await;
     let _diagnostics = rig.failure_diagnostics();
@@ -502,18 +173,18 @@ async fn queued_input_and_steer_keep_their_admission_times() {
     assert_eq!(queued.header.ty, subc_protocol::FrameType::Response);
     let steered = rig.send("steered", "steered input", Some("steer")).await;
     assert_eq!(steered.header.ty, subc_protocol::FrameType::Response);
-    let records = rig.records();
+    let records = rig.records().await;
     let queued_at = records
         .iter()
         .find_map(|record| match record {
-            WalRecord::Queued { written_at_ms, .. } => *written_at_ms,
+            Record::QueuedSend(send) => send.written_at_ms,
             _ => None,
         })
         .expect("queue admission records a time");
     let steered_at = records
         .iter()
         .find_map(|record| match record {
-            WalRecord::Steered { written_at_ms, .. } => *written_at_ms,
+            Record::Steer(steer) => steer.written_at_ms,
             _ => None,
         })
         .expect("steer admission records a time");
@@ -521,14 +192,7 @@ async fn queued_input_and_steer_keep_their_admission_times() {
     let records = rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     assert!(records.iter().any(|record| matches!(record,
-        WalRecord::RunStarted { submission_id: Some(_), written_at_ms: Some(at), .. } if *at == queued_at)));
-    for record in &records {
-        if matches!(record, WalRecord::Queued { .. } | WalRecord::Steered { .. }) {
-            assert!(record
-                .required_features()
-                .contains(&broca_wal::MESSAGE_TIMES_FEATURE));
-        }
-    }
+        Record::RunStart(start) if start.submission_id.is_some() && start.written_at_ms == Some(queued_at))));
     let page = result(
         &rig.request(7, json!({"method":"session.read","params":{}}))
             .await,
@@ -542,159 +206,6 @@ async fn queued_input_and_steer_keep_their_admission_times() {
             .unwrap();
         assert_eq!(entry["written_at"], at);
     }
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn ownerless_legacy_head_matches_permissive_real_send_admission() {
-    let mut rig = Rig::start("legacy-head-owner").await;
-    let _diagnostics = rig.failure_diagnostics();
-    seed_history(&rig, false, None);
-    rig.bind_as(
-        8,
-        Some(subc_protocol::Principal::Reserved {
-            module_id: "legacy-caller".into(),
-        }),
-    )
-    .await;
-    let head = result(
-        &rig.request(8, json!({"method":"session.head","params":{}}))
-            .await,
-    );
-    assert_eq!(
-        head["sender"],
-        json!({"modes":["tool_result","turn_system","steer","idle_start"],"interrupt":true,"owner":true})
-    );
-    rig.script.push(&[Step::Text("accepted legacy send")]);
-    let send = rig
-        .request(
-            8,
-            json!({"method":"session.send","params":{"send_id":"legacy","prompt":"more","model":{"provider":"p","model":"m"}}}),
-        )
-        .await;
-    assert_eq!(
-        send.header.ty,
-        subc_protocol::FrameType::Response,
-        "{}",
-        String::from_utf8_lossy(&send.body)
-    );
-    rig.wait_for_finished(2).await;
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn retained_head_checkpoint_and_typical_read_cost_through_serve() {
-    use broca_core::MaterializedStore;
-    let mut rig = Rig::start("retained-head-cost").await;
-    let store = FileWalStore::new(rig.dir.join("wal"));
-    let mut wal = store.open_with_retention(&rig.session, Some(3600)).unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    for turn in 0..16 {
-        let mut start: WalRecord = serde_json::from_str(
-            include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        if let WalRecord::RunStarted {
-            run_id,
-            session,
-            retention,
-            ts_ms,
-            written_at_ms,
-            ..
-        } = &mut start
-        {
-            *run_id = broca_protocol::RunId(format!("metric-{turn}"));
-            *session = rig.session.clone();
-            *retention = Some(3600);
-            *ts_ms = Some(now + turn);
-            *written_at_ms = Some(now + turn);
-        }
-        let records = [start,
-            serde_json::from_value(json!({"type":"step_started","step_id":1})).unwrap(),
-            serde_json::from_value(json!({"type":"model_step_finished","step_id":1,"written_at_ms":now + turn,
-                "assistant_message":{"message_id":format!("m{turn}"),"content":[{"type":"text","text":"a typical short answer"}]},
-                "usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap(),
-            serde_json::from_value(json!({"type":"turn_finished","step_id":1})).unwrap(),
-            serde_json::from_value(json!({"type":"run_finished","reason":"completed","ts_ms":now + turn,
-                "usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap(),
-        ];
-        for record in records {
-            wal.append(1, &record, false).unwrap();
-        }
-    }
-    wal.sync().unwrap();
-    drop(wal);
-    let cold = std::time::Instant::now();
-    let first = result(
-        &rig.request(7, json!({"method":"session.head","params":{}}))
-            .await,
-    );
-    let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
-    assert_eq!(first["last_ordinal"], 32);
-    assert_eq!(first["usage"]["steps"], 16);
-    let db = broca_store::SqliteStore::open(rig.dir.join("store.db")).unwrap();
-    // A framed log serves its lineage as the incarnation.
-    let lineage = first["incarnation"].as_str().unwrap();
-    assert_eq!(
-        db.read_retained_head(&rig.session, lineage)
-            .unwrap()
-            .unwrap()
-            .facts
-            .usage
-            .unwrap()
-            .totals
-            .steps,
-        16
-    );
-    let mut costs = Vec::new();
-    for _ in 0..25 {
-        let started = std::time::Instant::now();
-        let head = result(
-            &rig.request(7, json!({"method":"session.head","params":{}}))
-                .await,
-        );
-        costs.push(started.elapsed().as_secs_f64() * 1000.0);
-        assert_eq!(head["usage"], first["usage"]);
-    }
-    costs.sort_by(f64::total_cmp);
-    println!("retained session.head: messages=32 runs=16 samples=25 cold_ms={cold_ms:.3} median_ms={:.3} p95_ms={:.3} mean_ms={:.3}",
-        costs[12], costs[23], costs.iter().sum::<f64>() / costs.len() as f64);
-    rig.wal_path = store.ephemeral_wal_path(&rig.session);
-    rig.script.push(&[Step::Text("one more retained step")]);
-    let sent = rig
-        .request(
-            7,
-            json!({"method":"session.send","params":{"send_id":"retained-next","prompt":"next",
-        "model":{"provider":"p","model":"m"}}}),
-        )
-        .await;
-    assert_eq!(
-        sent.header.ty,
-        subc_protocol::FrameType::Response,
-        "{}",
-        String::from_utf8_lossy(&sent.body)
-    );
-    rig.wait_for_finished(17).await;
-    rig.wait_idle().await;
-    assert_eq!(
-        db.read_retained_head(&rig.session, lineage)
-            .unwrap()
-            .unwrap()
-            .facts
-            .usage
-            .unwrap()
-            .totals
-            .steps,
-        17,
-        "the run writer checkpoints new spend before any subsequent head read"
-    );
-    drop(db);
     rig.finish().await;
 }
 
@@ -768,8 +279,8 @@ fn capture_runner_display_sample(name: &str, frame: &subc_protocol::Frame) {
     }
 }
 
-async fn head_run_error_matches_status(storage: &str, move_to_store: bool) {
-    let mut rig = Rig::start_movable(&format!("head-run-error-{storage}")).await;
+async fn head_run_error_matches_status(storage: &str) {
+    let mut rig = Rig::start(&format!("head-run-error-{storage}")).await;
     let _diagnostics = rig.failure_diagnostics();
     *rig.script.media_frozen.lock().unwrap() =
         Some(broca_provider::families::frozen_config_for_family(
@@ -784,19 +295,6 @@ async fn head_run_error_matches_status(storage: &str, move_to_store: bool) {
     assert_eq!(sent.header.ty, subc_protocol::FrameType::Response);
     rig.wait_idle().await;
     rig.wait_closed().await;
-    if move_to_store {
-        rig.bind_as(2, Some(subc_protocol::Principal::Direct)).await;
-        let moved = rig
-            .request(2, json!({"method":"session.move_to_store","params":{}}))
-            .await;
-        assert_eq!(
-            moved.header.ty,
-            subc_protocol::FrameType::Response,
-            "{}",
-            String::from_utf8_lossy(&moved.body)
-        );
-        assert_eq!(result(&moved)["moved"], true);
-    }
 
     let cases = [
         (
@@ -873,150 +371,6 @@ async fn head_run_error_matches_status(storage: &str, move_to_store: bool) {
 }
 
 #[tokio::test]
-async fn legacy_head_run_error_carries_provider_code_from_status() {
-    head_run_error_matches_status("legacy", false).await;
-}
-
-#[tokio::test]
 async fn store_head_run_error_carries_provider_code_from_status() {
-    head_run_error_matches_status("store", true).await;
-}
-
-#[tokio::test]
-async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and_digests() {
-    let mut rig = Rig::start("synthetic-responses-summary").await;
-    let summary = json!({"type":"reasoning","id":"synthetic-reasoning",
-        "summary":[{"type":"summary_text","text":"I checked the arithmetic."}],
-        "encrypted_content":"synthetic-opaque-must-not-be-a-summary"})
-    .to_string();
-    seed_history_with_content(
-        &rig,
-        false,
-        Some("owner"),
-        None,
-        json!([
-            {"type":"text","text":"answer"},
-            {"type":"redacted_reasoning","provider_format":"open_ai_responses","data":summary},
-            {"type":"redacted_reasoning","provider_format":"open_router","data":"opaque-synthetic"}
-        ]),
-    );
-    let plain = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"media":"blocks"}}),
-        )
-        .await;
-    assert_eq!(
-        plain.header.ty,
-        subc_protocol::FrameType::Response,
-        "{plain:?}"
-    );
-    capture_known(&plain, "session_read.responses_before_display_facts.json");
-    let history = rig
-        .request(7, json!({"method":"session.history","params":{}}))
-        .await;
-    // llm-runner 0.8.11 §4.2: raw history carries sender; history has no display-facts flag.
-    assert_eq!(result(&history)["messages"][0]["sender"], "owner");
-    capture_known(
-        &history,
-        "session_history.responses_before_display_facts.json",
-    );
-    let descriptors = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"media":"descriptors"}}),
-        )
-        .await;
-    capture_known(
-        &descriptors,
-        "session_read.responses_descriptors_before_display_facts.json",
-    );
-    let opted = rig.request(7, json!({"method":"session.read","params":{"media":"descriptors","include_display_facts":true}})).await;
-    capture_runner_display_sample("session.read.display_facts.json", &opted);
-    let body = result(&opted);
-    assert_eq!(body["messages"][0]["sender"], "owner");
-    assert!(result(&descriptors)["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|entry| entry.get("sender").is_none()));
-    let assistant = &body["messages"][1];
-    assert_eq!(
-        assistant["reasoning_summaries"],
-        json!([{"part":1,"text":"I checked the arithmetic."}])
-    );
-    assert_eq!(assistant["completed_at"], 505);
-    assert!(body["messages"][0].get("completed_at").is_none());
-    assert!(body["messages"][0].get("reasoning_summaries").is_none());
-    let mut stripped = String::from_utf8(opted.body.clone()).unwrap();
-    assert_eq!(stripped.matches("\"sender\":\"owner\",").count(), 1);
-    stripped = stripped.replacen("\"sender\":\"owner\",", "", 1);
-    stripped = stripped.replace(",\"completed_at\":505", "");
-    stripped = stripped.replace(
-        ",\"reasoning_summaries\":[{\"part\":1,\"text\":\"I checked the arithmetic.\"}]",
-        "",
-    );
-    assert_eq!(
-        stripped.as_bytes(),
-        descriptors.body,
-        "display facts changed default entry bytes or digests"
-    );
-    let again = rig
-        .request(7, json!({"method":"session.history","params":{}}))
-        .await;
-    assert_eq!(
-        again.body, history.body,
-        "display reads changed default history bytes"
-    );
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn created_at_uses_recorded_acceptance_and_request_send_time_only_when_opted_in() {
-    let mut rig = Rig::start("synthetic-created-at").await;
-    seed_history_with_fact_times(
-        &rig,
-        false,
-        Some("owner"),
-        None,
-        json!([{"type":"text","text":"answer"}]),
-        Some(250),
-        Some(600),
-    );
-    let plain = rig
-        .request(
-            7,
-            json!({"method":"session.read","params":{"media":"descriptors"}}),
-        )
-        .await;
-    let opted = rig.request(7, json!({"method":"session.read","params":{"media":"descriptors","include_display_facts":true}})).await;
-    capture_runner_display_sample("session.read.created_at.json", &opted);
-    let answer = result(&opted);
-    assert_eq!(answer["messages"][0]["sender"], "owner");
-    assert!(result(&plain)["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|entry| entry.get("sender").is_none()));
-    assert_eq!(answer["messages"][0]["created_at"], 250);
-    assert_eq!(answer["messages"][0]["written_at"], 250);
-    assert_eq!(answer["messages"][1]["created_at"], 600);
-    assert_eq!(answer["messages"][1]["written_at"], 505);
-    assert_eq!(answer["messages"][1]["completed_at"], 505);
-    let mut stripped = String::from_utf8(opted.body.clone()).unwrap();
-    assert_eq!(stripped.matches("\"sender\":\"owner\",").count(), 1);
-    for field in [
-        ",\"created_at\":250",
-        ",\"created_at\":600",
-        ",\"completed_at\":505",
-        "\"sender\":\"owner\",",
-    ] {
-        stripped = stripped.replace(field, "");
-    }
-    assert_eq!(
-        stripped.as_bytes(),
-        plain.body,
-        "creation facts changed default bytes or message/part digests"
-    );
-    rig.finish().await;
+    head_run_error_matches_status("store").await;
 }

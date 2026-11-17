@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId};
 use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_store::backend::{
@@ -446,18 +446,9 @@ async fn module(steps: Vec<Vec<NormalizedEvent>>) -> Module {
 #[cfg(feature = "test-clock")]
 async fn module_with_retention(steps: Vec<Vec<NormalizedEvent>>) -> Module {
     let m = module(steps).await;
-    let wal = Arc::new(FileWalStore::new(m.dir.join("wal")));
     let leases = Arc::new(FileLeaseStore::new(m.dir.join("leases")));
-    let index = Arc::new(broca_store::SqliteStore::open(m.dir.join("run-index.db")).unwrap());
     m.registry.set_retention_service(Arc::new(
-        crate::retention::RetentionService::new(
-            wal,
-            index.clone(),
-            leases,
-            index,
-            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
-        )
-        .unwrap(),
+        crate::retention::RetentionService::new(&m.dir, leases).unwrap(),
     ));
     m
 }
@@ -472,7 +463,6 @@ async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecu
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let gate = Arc::new(Notify::new());
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor = make_executor(Arc::clone(&gate));
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
@@ -482,20 +472,14 @@ async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecu
     )
     .await
     .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(OPEN)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal,
-        None,
-    )
-    .with_store_new_sessions();
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(OPEN)
+        .with_store_runtime(Arc::new(runtime)),
+    ));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Module {
         dir,

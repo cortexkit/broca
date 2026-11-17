@@ -147,7 +147,6 @@ struct Messages<'a, H: ?Sized> {
     history_version: u64,
     cache: BTreeMap<u64, Option<SessionReadMessage>>,
     locations: BTreeMap<u64, Option<broca_core::TagLocation>>,
-    records: Option<Vec<broca_wal::WalRecord>>,
 }
 
 impl<H: ServeHandler + ?Sized> Messages<'_, H> {
@@ -504,7 +503,6 @@ fn plan_compacts(manifest: Option<&broca_wal::PlanManifest>) -> bool {
 async fn writing_request<H: ServeHandler + ?Sized>(
     messages: &mut Messages<'_, H>,
     ordinal: u64,
-    run_id: &str,
     wanted: &BTreeSet<u64>,
     compacts: bool,
 ) -> Result<BTreeMap<u64, Target>, ServeError> {
@@ -580,36 +578,13 @@ async fn writing_request<H: ServeHandler + ?Sized>(
         from = last + 1;
     }
     let view = if compacts && !found.is_empty() {
-        match messages
+        // The store recorded the view each message was written under beside it; a session the
+        // store doesn't hold has no view.
+        messages
             .handler
             .store_writing_view(messages.session, ordinal)
             .await?
-        {
-            // A session kept in the new storage recorded the view beside the message.
-            Some(view) => view,
-            None => {
-                if messages.records.is_none() {
-                    messages.records = Some(
-                        messages
-                            .handler
-                            .session_log(messages.session, run_id)
-                            .await?
-                            .ok_or_else(|| {
-                                ServeError::Open(
-                                    "the session log is not readable here, so output references \
-                                     cannot tell which parts a compaction view left out"
-                                        .into(),
-                                    Some(broca_protocol::ErrorClass::Transient),
-                                )
-                            })?,
-                    );
-                }
-                view_at_writing_step(
-                    messages.records.as_deref().expect("loaded session log"),
-                    ordinal,
-                )?
-            }
-        }
+            .flatten()
     } else {
         None
     };
@@ -685,7 +660,6 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
         history_version,
         cache: BTreeMap::new(),
         locations: BTreeMap::new(),
-        records: None,
     };
     let manifest = handler.frozen_manifest(session).await?;
     let refs = derive_message(&mut messages, &entry, manifest.as_deref()).await?;
@@ -701,7 +675,6 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
     lineage: &str,
     history_version: u64,
     entries: &[SessionReadMessage],
-    records: Option<Vec<broca_wal::WalRecord>>,
 ) -> Result<BTreeMap<u64, MessageOutputDescriptors>, ServeError> {
     let namespace = handler.output_ref_namespace(session, lineage).await?;
     let scope = handler
@@ -719,7 +692,6 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
             .map(|entry| (entry.ordinal, Some(entry)))
             .collect(),
         locations: BTreeMap::new(),
-        records,
     };
     let manifest = handler.frozen_manifest(session).await?;
     let mut sets = BTreeMap::new();
@@ -742,11 +714,6 @@ async fn derive_message<H: ServeHandler + ?Sized>(
 ) -> Result<MessageOutputRefs, ServeError> {
     let ordinal = entry.ordinal;
     let lineage = messages.lineage.clone();
-    let run_id = entry
-        .run
-        .as_ref()
-        .map(|run| run.run_id.clone())
-        .unwrap_or_default();
     let texts = reply_texts(&entry.message);
     let calls = call_scans(entry, manifest);
     let mut wanted = named_numbers(|probe, empty| {
@@ -762,7 +729,7 @@ async fn derive_message<H: ServeHandler + ?Sized>(
     let request = if wanted.is_empty() {
         BTreeMap::new()
     } else {
-        writing_request(messages, ordinal, &run_id, &wanted, plan_compacts(manifest)).await?
+        writing_request(messages, ordinal, &wanted, plan_compacts(manifest)).await?
     };
     let mid = &entry.mid;
     let reply = resolve_set(

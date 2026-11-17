@@ -22,9 +22,7 @@ use broca_session_store::fold::operations::Run;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError, StoredEntry};
 
-pub mod history_sides;
 mod model_fallback;
-pub mod todays;
 
 /// Why a store read refused.
 #[derive(Debug)]
@@ -467,6 +465,23 @@ pub async fn serve_read(
         }
     };
     finish(answer, &req)
+}
+
+/// The `session.read` reply for a session no send created: an empty transcript. A late cursor
+/// names no read of it, and is refused as [`serve_read`] refuses it.
+pub fn serve_unwritten(
+    req: &crate::serve::SessionReadRequest,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    if let Some(cursor) = req.late_after.as_deref() {
+        let refusal = broca_wire::InvalidLateCursor::new(cursor);
+        return Err(crate::serve::ServeError::InvalidParams {
+            field: refusal.detail.field,
+            message: refusal.message,
+        });
+    }
+    let mut response = crate::serve::session_read_response(empty_page(), None);
+    response.incarnation = "unwritten".into();
+    Ok(response)
 }
 
 /// The `session.read` reply for `req` from `session`, loaded by the caller, reading its run

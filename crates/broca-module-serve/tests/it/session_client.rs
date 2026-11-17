@@ -97,12 +97,13 @@ pub fn daemon_diagnostics(rig_dir: &Path, session: &str, daemon: &mut Child) -> 
     output
 }
 
-/// The log tails, watchdog stall files and session WAL of one rig whose directories are not
-/// under the `runtime/` layout [`daemon_diagnostics`] assumes, so the caller passes the paths. `data_home` is the `cortexkit` directory under the daemon's
-/// `XDG_DATA_HOME`; `state_root` is broca's `BROCA_STATE_ROOT`.
+/// The log tails, watchdog stall files and stored sessions of one rig whose directories are not
+/// under the `runtime/` layout [`daemon_diagnostics`] assumes, so the caller passes the paths.
+/// `data_home` is the `cortexkit` directory under the daemon's `XDG_DATA_HOME`; `state_root`
+/// is broca's `BROCA_STATE_ROOT`. `session` names the session the failure is about.
 pub fn rig_diagnostics(data_home: &Path, state_root: &Path, session: &str) -> String {
     let mut output = rig_log_diagnostics(data_home, state_root);
-    append_session_wal(&mut output, &state_root.join("wal"), session);
+    output.push_str(&format!("--- failing session: {session} ---\n"));
     output
 }
 
@@ -131,115 +132,5 @@ pub fn append_process_status(output: &mut String, name: &str, child: &mut Child)
             child.id()
         )),
         Err(error) => output.push_str(&format!("{name} process status: unavailable ({error})\n")),
-    }
-}
-
-pub fn append_session_wal(output: &mut String, wal_dir: &Path, session: &str) {
-    output.push_str(&format!("--- session WAL record kinds: {session} ---\n"));
-    output.push_str("Decoded physical prefix, not a durable-head assertion; a concurrent torn tail may be omitted.\n");
-    let entries = match std::fs::read_dir(wal_dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            output.push_str(&format!("unavailable: {error}\n"));
-            return;
-        }
-    };
-    let mut paths: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .collect();
-    paths.sort();
-    let mut found = false;
-    for path in paths {
-        let frames = match broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES) {
-            Ok(frames) => frames,
-            Err(error) => {
-                output.push_str(&format!("{}: decode error: {error}\n", path.display()));
-                continue;
-            }
-        };
-        // The daemon canonicalizes project roots, so find the admitted session rather
-        // than guessing its WAL address from the client's spelling of that root.
-        if !frames.iter().any(|frame| matches!(&frame.record, broca_wal::WalRecord::RunStarted { session: bind, .. } if bind.session == session)) {
-            continue;
-        }
-        found = true;
-        output.push_str(&format!("{}:\n", path.display()));
-        for frame in frames {
-            match serde_json::to_value(&frame.record) {
-                Ok(value) => {
-                    let kind = value["type"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .split('_')
-                        .map(|part| {
-                            let mut chars = part.chars();
-                            chars
-                                .next()
-                                .map(|first| {
-                                    first.to_ascii_uppercase().to_string() + chars.as_str()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect::<String>();
-                    output.push_str(&format!(
-                        "seq={} {kind}{}\n",
-                        frame.seq,
-                        record_detail(&frame.record)
-                    ));
-                }
-                Err(error) => {
-                    output.push_str(&format!("seq={} kind unavailable: {error}\n", frame.seq))
-                }
-            }
-        }
-    }
-    if !found {
-        output.push_str("No decoded RunStarted matched this session.\n");
-    }
-}
-
-/// Identifiers, outcomes and timings of the records that decide whether a run ends: run
-/// boundaries and compaction calls, answers and waits. Never message content.
-fn record_detail(record: &broca_wal::WalRecord) -> String {
-    use broca_wal::WalRecord as R;
-    match record {
-        R::RunStarted {
-            run_id, send_id, ..
-        } => format!(" run_id={} send_id={send_id:?}", run_id.0),
-        R::RunFinished {
-            reason,
-            ts_ms,
-            error,
-            ..
-        } => format!(
-            " reason={reason:?} ts_ms={ts_ms:?} provider_code={:?}",
-            error
-                .as_ref()
-                .and_then(|error| error.provider_code.as_deref())
-        ),
-        R::CompactionRequest { request_id, .. } => format!(" request_id={request_id}"),
-        R::CompactionAnswer {
-            request_id,
-            disposition,
-            wait,
-            ..
-        } => format!(
-            " request_id={request_id} disposition={disposition:?} wait_bound_ms={:?}",
-            wait.as_ref().map(|wait| wait.bound_ms)
-        ),
-        R::CompactionWait { exited, .. } => format!(" exited={exited:?}"),
-        R::CompactionMessage {
-            kind,
-            version,
-            range,
-            request_id,
-            ..
-        } => format!(
-            " kind={kind:?} version={version} range=[{},{}) request_id={request_id:?}",
-            range.from, range.to
-        ),
-        _ => String::new(),
     }
 }

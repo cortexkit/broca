@@ -136,13 +136,7 @@ impl Intake {
             ),
             calls: AtomicUsize::new(0),
         });
-        let intake = LateResultsIntake::new(
-            store.clone(),
-            side.executor.wal.clone(),
-            "broca",
-            delivery.clone(),
-            feed.clone(),
-        );
+        let intake = LateResultsIntake::new(store.clone(), "broca", delivery.clone(), feed.clone());
         intake.set_session_store(side.registry.store_runtime().unwrap());
         Self {
             intake,
@@ -454,7 +448,6 @@ async fn store_rebuild_cost_on_three_hundred_encrypted_sessions() {
 
 cipher_tests!(
     new_storage_feed_resumes_held_run_and_duplicate_is_noop,
-    legacy_storage_feed_resumes_held_run,
     new_storage_ended_run_does_not_deliver_into_later_run
 );
 
@@ -524,10 +517,6 @@ async fn new_storage_feed_resumes_held_run_and_duplicate_is_noop(cipher: Cipher)
     resumes(true, cipher).await;
 }
 
-async fn legacy_storage_feed_resumes_held_run(cipher: Cipher) {
-    resumes(false, cipher).await;
-}
-
 #[tokio::test]
 async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike() {
     use broca_session_store::record::{Record, Stream};
@@ -548,11 +537,7 @@ async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike()
         let entries = std::mem::take(&mut *rig.feed.entries.lock().unwrap());
         let entry = entries.into_iter().next().unwrap();
         let transport = Arc::new(Withdrawals::default());
-        let withdrawals = HeldWithdrawals::new(
-            rig.store.clone(),
-            side.executor.wal.clone(),
-            transport.clone(),
-        );
+        let withdrawals = HeldWithdrawals::new(rig.store.clone(), transport.clone());
         withdrawals.bind_stopping_signal(CancellationToken::new());
         withdrawals.with_store_runtime(side.registry.store_runtime().unwrap());
         side.executor.slots.with_withdrawals(withdrawals.clone());

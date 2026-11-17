@@ -301,6 +301,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
         first.ok_or_else(|| SessionError::Fold("a placed batch was never built".into()))
     }
 
+    async fn caught_up(&mut self) -> Result<(), SessionError> {
+        self.inner.caught_up().await
+    }
+
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
         self.inner.send_records(submission_id).await
     }
@@ -2196,6 +2200,8 @@ mod send_id_tests {
                     message_marks: None,
                     named_speaker: None,
                     send_id: Some(id.into()),
+                    waits_for_run: None,
+                    expires_at_ms: None,
                 });
                 let mut message = Message::new(
                     if placement == Placement::DeliveredTurnSystem {

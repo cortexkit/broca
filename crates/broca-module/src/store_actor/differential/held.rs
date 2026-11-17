@@ -210,80 +210,6 @@ impl RunExecutor for HeldExecutor {
     ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
         Some(self.slots.clone())
     }
-    async fn execute(
-        &self,
-        mut job: RunJob,
-        out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        if self.refuse_restart.load(Ordering::SeqCst)
-            && job
-                .prior_snapshot
-                .checkpoint_at_head
-                .last_episode
-                .as_ref()
-                .is_some_and(|episode| {
-                    episode.disposition == broca_core::EpisodeDisposition::Paused
-                        && episode.pause_reason == Some(broca_protocol::PauseReason::Restart)
-                })
-        {
-            let error = RunError::Config("restart admission refused".into());
-            if let Some(reply) = job.on_admitted.take() {
-                let _ = reply.send(Err(error.clone()));
-            }
-            return Err(error);
-        }
-        job.control.admitted_context_limit =
-            job.control.admitted_context_limit.or(job.req.context_limit);
-        job.control.pause_for_auth_at_start = self.sign_in_error();
-        if self.sign_in_fixture.load(Ordering::SeqCst) {
-            job.control.auth_selection = Some(
-                self.auth_selection
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(sign_in::selection),
-            );
-        }
-        let mode = if self.sign_in_fixture.load(Ordering::SeqCst)
-            && job.control.pause_for_auth_at_start.is_none()
-        {
-            StartMode::ResumeAfterAuth
-        } else {
-            StartMode::FreshOrResume
-        };
-        let writer = job.writer.clone();
-        let run_id = job.req.run_id.clone();
-        let mut result = run_loop_on_writer_admitted_with_prior_snapshot(
-            job.req,
-            &job.writer,
-            mode,
-            &self.provider,
-            self.tools.as_ref(),
-            &AllowAll,
-            self.wal.as_ref(),
-            None,
-            job.control,
-            &out,
-            job.on_admitted,
-            Some(&job.prior_snapshot),
-        )
-        .await?;
-        let pause_as = *self.pause_as.lock().unwrap();
-        if let Some(reason) = pause_as {
-            if result.paused == Some(broca_protocol::PauseReason::AuthRequired) {
-                writer.record(broca_wal::WalRecord::RunPaused {
-                    run_id,
-                    reason,
-                    ts_ms: self.pause_ts_ms(reason),
-                    error: None,
-                    account_limit: None,
-                });
-                writer.sync().await?;
-                result.paused = Some(reason);
-            }
-        }
-        Ok(result)
-    }
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -457,17 +383,11 @@ impl Side {
         .unwrap();
         let opener = crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
             executor.clone(),
         )
         .with_idle_ttl(IDLE)
         .with_store_runtime(Arc::new(runtime));
-        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
-        let registry = if store {
-            registry.with_store_new_sessions()
-        } else {
-            registry
-        };
+        let registry = LineageRegistry::new(Arc::new(opener));
         Self {
             dir,
             key,

@@ -36,7 +36,6 @@ pub const OP_INSTALL_VIEW: &str = broca_wire::head_import::OP_SESSION_INSTALL_VI
 pub const OP_RETRACT: &str = "session.retract";
 /// Move a live, idle session from today's storage into the new storage. Only the operator calls
 /// it, through `broca-session move-to-store`.
-pub const OP_MOVE_TO_STORE: &str = "session.move_to_store";
 /// Restore a session kept in the new storage, or every such session, from the files its store
 /// holds after a backup came back. Only the operator calls it, through `broca-session
 /// restore-from-backup`.
@@ -148,14 +147,7 @@ fn reported_launch_nonce_source(source: subc_os::LaunchNonceSource) -> LaunchNon
 }
 
 pub fn manifest(module_id: &str) -> ModuleManifest {
-    manifest_with_archive(module_id, crate::wal_archive::WalArchiveConfig::default())
-}
-
-pub fn manifest_with_archive(
-    module_id: &str,
-    archive: crate::wal_archive::WalArchiveConfig,
-) -> ModuleManifest {
-    manifest_configured(module_id, archive, &ConsumerRoutes::default())
+    manifest_configured(module_id, &ConsumerRoutes::default())
 }
 
 /// The management request list is also the source of `health.check` request-counter names.
@@ -224,14 +216,6 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "Seed an EMPTY lineage with transcript history from another harness; refuses a non-empty lineage."
-                    .to_string(),
-            ),
-        },
-        ManagementOperation {
-            name: OP_MOVE_TO_STORE.to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Move a live, idle session from today's storage into the new storage; operator only."
                     .to_string(),
             ),
         },
@@ -547,13 +531,8 @@ fn routing_declarations() -> ConsumerDeclarations {
     declarations
 }
 
-/// The manifest for a fully configured process: the archive timer's configuration shapes
-/// `self_signals`, and the resolved consumer routes shape `consumes`.
-pub fn manifest_configured(
-    module_id: &str,
-    archive: crate::wal_archive::WalArchiveConfig,
-    consumer_routes: &ConsumerRoutes,
-) -> ModuleManifest {
+/// The manifest for a fully configured process: the resolved consumer routes shape `consumes`.
+pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) -> ModuleManifest {
     // BUILT THROUGH THE BUILDER, because `ModuleManifest` is `#[non_exhaustive]` upstream.
     //
     // The attribute is the point rather than an obstacle: a field ADDED upstream can no longer
@@ -611,8 +590,7 @@ pub fn manifest_configured(
     // NOT DECLARED, deliberately: the detached catalog-readiness watches at startup. They are
     // bounded, they stop once the module goes live, and declaring a transient as a standing
     // behavior would misdescribe the steady state this field exists to describe.
-    .self_signals(Some({
-        let mut signals = vec![SelfSignalDeclaration {
+    .self_signals(Some(vec![SelfSignalDeclaration {
         name: "catalog_refresh".to_string(),
         kind: SelfSignalKind::Poller,
         effect: SelfSignalEffect::Observe,
@@ -649,23 +627,7 @@ pub fn manifest_configured(
         cadence: None,
         domain: Some("runs".to_string()),
         note: Some("Active runs, actors opening or closing, and System One batch calls. Restart-paused runs are idle and do not hold the drain open.".to_string()),
-    }];
-        // An absent retention creates no timer, so it must make no standing signal claim.
-        if archive.enabled() {
-            signals.push(SelfSignalDeclaration {
-                name: "wal_archive_fold".to_string(),
-                kind: SelfSignalKind::Poller,
-                effect: SelfSignalEffect::Mutate,
-                anchored_to: SignalAnchor::FixedInterval,
-                cadence: Some(SignalCadence::Literal {
-                    interval_ms: crate::wal_archive::WAL_ARCHIVE_INTERVAL.as_millis() as u64,
-                }),
-                domain: Some("wal-archive".to_string()),
-                note: Some("Archives idle session WALs after a full-day initial delay; skips held archive-pass leases.".to_string()),
-            });
-        }
-        signals
-    }))
+    }]))
     .provenance(build_provenance())
     // The daemon validates a present block at HELLO, and a name outside its grammar
     // (`[a-z0-9-]+/v<N>`: no colon, no dot) refuses the HELLO, so a test checks this block
@@ -887,11 +849,7 @@ mod routing_tests {
     }
 
     fn serialized_routing_slot() -> serde_json::Value {
-        let manifest = manifest_configured(
-            "broca",
-            crate::wal_archive::WalArchiveConfig::default(),
-            &ConsumerRoutes::default(),
-        );
+        let manifest = manifest_configured("broca", &ConsumerRoutes::default());
         serde_json::to_value(manifest).unwrap()["role_declarations"]
             [cortexkit_role_routing::ROLE_DECLARATIONS_KEY]
             .clone()
@@ -1269,48 +1227,12 @@ mod provenance_tests {
 }
 
 #[cfg(test)]
-mod archive_tests {
-    use super::*;
-    #[test]
-    fn archive_signal_follows_configuration() {
-        let off = manifest("broca");
-        assert!(!off
-            .self_signals
-            .unwrap()
-            .iter()
-            .any(|s| s.name == "wal_archive_fold"));
-        let config =
-            crate::wal_archive::WalArchiveConfig::parse("{\"wal_archive_idle_retention_days\":30}")
-                .unwrap();
-        let on = manifest_with_archive("broca", config);
-        let signals = on.self_signals.unwrap();
-        let fold = signals
-            .iter()
-            .find(|s| s.name == "wal_archive_fold")
-            .unwrap();
-        assert_eq!(fold.kind, SelfSignalKind::Poller);
-        assert_eq!(fold.effect, SelfSignalEffect::Mutate);
-        assert_eq!(fold.anchored_to, SignalAnchor::FixedInterval);
-        assert_eq!(
-            fold.cadence,
-            Some(SignalCadence::Literal {
-                interval_ms: 86_400_000
-            })
-        );
-    }
-}
-
-#[cfg(test)]
 mod consumes_tests {
     use super::*;
     use subc_protocol::manifest::ConsumerRole;
 
     fn declared(routes: &ConsumerRoutes) -> (Vec<String>, Vec<String>) {
-        let m = manifest_configured(
-            "broca",
-            crate::wal_archive::WalArchiveConfig::default(),
-            routes,
-        );
+        let m = manifest_configured("broca", routes);
         let mut tools = Vec::new();
         let mut services = Vec::new();
         for role in m.consumes {

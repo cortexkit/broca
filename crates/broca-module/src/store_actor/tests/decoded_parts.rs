@@ -235,14 +235,6 @@ impl Recording {
 
 #[async_trait]
 impl RunExecutor for Recording {
-    async fn execute(
-        &self,
-        job: RunJob,
-        out: mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        self.inner.execute(job, out).await
-    }
-
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         self.inner.hook_plane()
     }

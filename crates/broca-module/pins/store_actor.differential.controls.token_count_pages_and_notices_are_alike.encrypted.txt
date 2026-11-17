@@ -6,7 +6,7 @@ Active {
     delivered: None,
 }
 == control stream
-sha256:d76966b3773ae7a45a68af14fa35c009536ba873193a8b72c53f4af8404cdc43 (3593 bytes)
+sha256:5e9fae12a504d2178fbb37818648b008d1365bca67e45e64805f8a5cc491a278 (3494 bytes)
 == full count-bearing page
 sha256:c144ee0326ab879afd6c583933100c59f78d9cb07e583fd195818b01868a39ed (3279 bytes)
 == the notices

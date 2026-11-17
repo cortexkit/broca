@@ -1,6 +1,5 @@
 //! A session kept in the new storage while the deployment key hasn't loaded: refused
-//! `key_unavailable`, never served from today's storage, and served once the key loads, without
-//! a restart. A run that ends on such a session writes its spend facts to the usage export.
+//! `key_unavailable`, and served once the key loads, without a restart. A run that ends on such a session writes its spend facts to the usage export.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,14 +27,14 @@ const KEY: [u8; 32] = [0x5a; 32];
 const OPEN: Duration = Duration::from_secs(600);
 
 /// A module over a scratch state root holding one session in the new storage (`held`), whose
-/// deployment key hasn't loaded, beside a session on today's storage (`today`).
+/// deployment key hasn't loaded, and naming one no storage holds (`absent`).
 struct Module {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
     slot: Arc<StoreSlot>,
     setup: StoreRuntimeSetup,
     held: BindIdentity,
-    today: BindIdentity,
+    absent: BindIdentity,
 }
 
 impl Drop for Module {
@@ -56,32 +55,14 @@ async fn module(name: &str, billing: Option<StoreBilling>) -> Module {
     module_with(name, billing, Cipher::XChaCha20Poly1305).await
 }
 
-/// [`module`] whose new storage creates sessions in mode `new_sessions` and takes every new
-/// session a creating send opens.
+/// [`module`] whose new storage creates sessions in mode `new_sessions`.
 async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Cipher) -> Module {
-    module_placing(
-        name,
-        billing,
-        new_sessions,
-        LineageRegistry::with_store_new_sessions,
-    )
-    .await
-}
-
-/// [`module_with`], with `place` choosing which new sessions the registry starts in the new
-/// storage.
-async fn module_placing(
-    name: &str,
-    billing: Option<StoreBilling>,
-    new_sessions: Cipher,
-    place: impl FnOnce(LineageRegistry) -> LineageRegistry,
-) -> Module {
     let dir =
         broca_test_support::scratch_root().join(format!("store-key-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let held = BindIdentity::new(dir.join("project"), "store-actor", "held");
-    let today = BindIdentity::new(dir.join("project"), "store-actor", "today");
+    let absent = BindIdentity::new(dir.join("project"), "store-actor", "absent");
     Session::create(
         LocalBackend::new(dir.join(broca_wal::SESSION_STORAGE_DIR)),
         SessionAddr(broca_core::session_addr(&held)),
@@ -91,21 +72,15 @@ async fn module_placing(
     )
     .await
     .unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(vec![text_step("a1", "hello")], None));
     let slot = Arc::new(StoreSlot::awaiting_key(&dir, 1).creating(new_sessions));
-    let registry = place(LineageRegistry::new_with_reader(
-        Arc::new(
-            DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                Arc::clone(&executor),
-            )
-            .with_idle_ttl(OPEN)
-            .with_store_slot(Arc::clone(&slot)),
-        ),
-        wal,
-        None,
+    let registry = LineageRegistry::new(Arc::new(
+        DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            Arc::clone(&executor),
+        )
+        .with_idle_ttl(OPEN)
+        .with_store_slot(Arc::clone(&slot)),
     ));
     let setup = StoreRuntimeSetup {
         state_root: dir.clone(),
@@ -121,17 +96,11 @@ async fn module_placing(
         slot,
         setup,
         held,
-        today,
+        absent,
     }
 }
 
 impl Module {
-    fn wal_file(&self, key: &BindIdentity) -> std::path::PathBuf {
-        self.dir
-            .join("wal")
-            .join(format!("{}.wal", broca_core::session_addr(key)))
-    }
-
     async fn load_key(&self) {
         self.slot
             .load(&self.setup, DeploymentKey::new(1, &KEY))
@@ -152,13 +121,10 @@ fn assert_key_unavailable(error: OpenError) {
     }
 }
 
-/// With no key loaded, a session kept in the new storage is refused `key_unavailable` on open
-/// and on a read, before today's storage is asked: the refusal is the transient
-/// `key_unavailable` one, not the `NewerWriter` refusal today's storage gives a session it doesn't
-/// keep, and no WAL is created for it. A session on today's storage at the same root is served
-/// as before.
+/// With no key loaded, a session kept in the new storage is refused with the transient
+/// `key_unavailable` on open and on a read.
 #[tokio::test]
-async fn a_held_session_is_refused_key_unavailable_and_never_served_from_todays_storage() {
+async fn a_held_session_is_refused_key_unavailable_while_the_key_loads() {
     let module = module("refused", None).await;
     assert!(!module.slot.key_loaded());
     assert_key_unavailable(
@@ -176,15 +142,11 @@ async fn a_held_session_is_refused_key_unavailable_and_never_served_from_todays_
             .err()
             .expect("a read of the held session is refused"),
     );
-    assert!(
-        !module.wal_file(&module.held).exists(),
-        "nothing was written for the held session on today's storage"
-    );
-    module
-        .registry
-        .actor_for(&module.today)
-        .await
-        .expect("a session on today's storage opens without the key");
+    // A session the storage doesn't hold is unknown, key or no key: nothing creates it.
+    assert!(matches!(
+        module.registry.actor_for(&module.absent).await,
+        Err(OpenError::UnknownSession)
+    ));
     assert_eq!(module.slot.take_refused(), vec![module.held.clone()]);
 }
 
@@ -339,7 +301,7 @@ async fn a_flipped_head_mode_is_refused_as_damage_both_ways() {
 
 /// A head's creating send while the new storage can't create its session, because it creates
 /// encrypted sessions and the deployment key hasn't loaded, is refused `key_unavailable`,
-/// transient, and never started on today's storage: nothing of it is created in either storage.
+/// transient, and nothing of it is created.
 /// Once the key loads, the same send starts the head in the new storage's durable root.
 #[tokio::test]
 async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
@@ -387,21 +349,12 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
     }
 }
 
-/// A worker or sidekick is held to the same rule as a head: a creating send naming a class that
-/// starts in the new storage, sent before the deployment key loads (the first seconds after a
-/// start), is refused `key_unavailable`, transient, and leaves nothing in either storage. Before,
-/// it started on today's storage, where it stayed, and today's storage refuses plan members it
-/// doesn't serve, such as `readers` (the apps a plan lets read the session). Once the key loads,
-/// the same send starts it in the new storage.
+/// A worker or sidekick is held to the same rule as a head: its creating send, sent before the
+/// deployment key loads (the first seconds after a start), is refused `key_unavailable`,
+/// transient, and leaves nothing behind. Once the key loads, the same send starts the session.
 #[tokio::test]
-async fn a_listed_class_is_refused_transient_until_the_new_storage_can_create_it() {
-    let module = module_placing(
-        "sidekick-early",
-        None,
-        Cipher::XChaCha20Poly1305,
-        |registry| registry.with_store_new_session_classes(["sidekick"]),
-    )
-    .await;
+async fn a_creating_send_is_refused_transient_until_the_new_storage_can_create_it() {
+    let module = module_with("sidekick-early", None, Cipher::XChaCha20Poly1305).await;
     module.slot.open_without_key(&module.setup).await.unwrap();
     let session = BindIdentity::new(module.dir.join("project"), "store-actor", "early-sidekick");
     let send = || {
@@ -445,35 +398,12 @@ async fn a_listed_class_is_refused_transient_until_the_new_storage_can_create_it
 
 /// A plan naming `readers` (the apps it lets read the session), as every worker plan core sends
 /// does, takes the same retryable refusal while the key loads. Its check runs before the session
-/// opens, and it used to read "can't create in the new storage now" as "will stay on today's
-/// storage", refusing the launch for good with `invalid_params` (`plan.readers is not supported
-/// for a session on today's storage`).
+/// opens, and must never refuse the launch for good with `invalid_params`.
 #[tokio::test]
 async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
-    readers_plan_waits_for_the_key("mason-early", false).await;
-}
-
-/// The same, when whether the session has a log on today's storage can't be read: every new
-/// session starts in the new storage, so not knowing is no reason to refuse its readers for good.
-/// A worker launched 21 s after a restart (15 Nov 22:14:52Z) got the permanent refusal this way.
-#[tokio::test]
-async fn a_readers_plan_waits_for_the_key_when_todays_logs_cant_be_read() {
-    readers_plan_waits_for_the_key("mason-unreadable", true).await;
-}
-
-async fn readers_plan_waits_for_the_key(name: &str, unreadable_wal: bool) {
-    let module = module_placing(name, None, Cipher::XChaCha20Poly1305, |registry| {
-        registry.with_store_new_session_classes(["mason"])
-    })
-    .await;
+    let module = module_with("mason-early", None, Cipher::XChaCha20Poly1305).await;
     module.slot.open_without_key(&module.setup).await.unwrap();
     let session = BindIdentity::new(module.dir.join("project"), "store-actor", "early-mason");
-    if unreadable_wal {
-        // A file where today's log folder should be: every lookup there fails.
-        let _ = std::fs::remove_dir_all(module.dir.join("wal"));
-        std::fs::write(module.dir.join("wal"), b"not a folder").unwrap();
-        assert_eq!(module.registry.wal_written(&session), None);
-    }
     let composition = serde_json::json!({
         "providers": [{"provider": "fixture", "tools": []}],
         "step_transform_items": [],
@@ -551,10 +481,6 @@ async fn readers_plan_waits_for_the_key(name: &str, unreadable_wal: bool) {
         None
     );
 
-    if unreadable_wal {
-        // The window passes: today's logs can be read again by the time the key loads.
-        std::fs::remove_file(module.dir.join("wal")).unwrap();
-    }
     module.load_key().await;
     assert!(
         matches!(front(), Ok(true)),
@@ -565,64 +491,6 @@ async fn readers_plan_waits_for_the_key(name: &str, unreadable_wal: bool) {
     assert!(broca_wal::session_storage_class(&module.dir, &address)
         .unwrap()
         .is_some());
-}
-
-/// Production starts new sessions in the new storage one class at a time: a creating send naming
-/// a listed class starts there, and one naming another class, or none, starts on today's storage.
-#[tokio::test]
-async fn only_listed_classes_start_new_sessions_in_the_new_storage() {
-    let module = module_placing("classes", None, Cipher::XChaCha20Poly1305, |registry| {
-        registry.with_store_new_session_classes(["sidekick"])
-    })
-    .await;
-    module.load_key().await;
-    let wal = FileWalStore::new(module.dir.join("wal"));
-    for (name, class, in_store) in [
-        ("a-sidekick", Some("sidekick"), true),
-        ("a-mason", Some("mason"), false),
-        ("no-class", None, false),
-    ] {
-        let session = BindIdentity::new(module.dir.join("project"), "store-actor", name);
-        let outcome = module
-            .registry
-            .route_submission_with_class(
-                &session,
-                RunId(format!("r-{name}")),
-                request("first"),
-                RunKind::FreshOrResume,
-                SendKey::Minted,
-                false,
-                broca_protocol::Delivery::Queue,
-                None,
-                None,
-                None,
-                None,
-                class.map(str::to_owned),
-                false,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        // This module's executor runs only store sessions, so only that row's run is checked;
-        // a session on today's storage is checked by where its log was written.
-        if in_store {
-            assert!(
-                matches!(outcome, SendOutcome::Active { .. }),
-                "{name}: {outcome:?}"
-            );
-        }
-        let stored =
-            broca_wal::session_storage_class(&module.dir, &broca_core::session_addr(&session))
-                .unwrap();
-        let has_wal = broca_wal::StorageClass::ALL
-            .into_iter()
-            .any(|storage| wal.class_wal_path(storage, &session).exists());
-        assert_eq!(
-            stored.is_some(),
-            in_store,
-            "{name}: kept in the new storage"
-        );
-        assert_eq!(has_wal, !in_store, "{name}: has a log on today's storage");
-    }
 }
 
 /// With new sessions plain, a send that creates a session creates it plain, before the key has
@@ -655,10 +523,6 @@ async fn a_module_creating_plain_sessions_creates_the_next_one_plain() {
     assert!(matches!(outcome, SendOutcome::Active { .. }));
     assert!(!module.slot.key_loaded());
     assert_eq!(module.stored_mode(&fresh), Cipher::None);
-    assert!(
-        !module.wal_file(&fresh).exists(),
-        "the session was created in the new storage, not today's"
-    );
     module.load_key().await;
     module.registry.actor_for(&module.held).await.unwrap();
     assert_eq!(module.stored_mode(&module.held), Cipher::XChaCha20Poly1305);

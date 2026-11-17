@@ -126,11 +126,6 @@ impl CacheTable {
         sessions.eviction_order.retain(|queued| queued != key);
     }
 
-    /// The session's clock, created on first use; clones share it.
-    pub(crate) fn clock(&self, key: &BindIdentity) -> CacheClock {
-        self.with_session(key, |session| session.clock.clone())
-    }
-
     /// The session's clock reading, without creating an entry for a session never seen.
     pub(crate) fn reading(&self, key: &BindIdentity) -> Option<CacheClockReading> {
         self.sessions
@@ -154,41 +149,5 @@ impl CacheTable {
             .and_then(|session| session.admitted.as_ref())
             .filter(|(admitted, _)| admitted == run_id)
             .map(|(_, decl)| decl.clone())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capacity_evicts_only_inactive_clocks_and_reclaims_after_owners_drop() {
-        let table = CacheTable::default();
-        let mut held = Vec::new();
-        for n in 0..MAX_SESSIONS {
-            let key = BindIdentity::new("/cache", "runner", n.to_string());
-            held.push((key.clone(), table.clock(&key)));
-        }
-        let extra = BindIdentity::new("/cache", "runner", "extra");
-        drop(table.clock(&extra));
-        assert_eq!(
-            table.sessions.lock().unwrap().entries.len(),
-            MAX_SESSIONS + 1
-        );
-        for (key, clock) in &held {
-            clock.note_sent(123, None);
-            assert_eq!(table.reading(key).unwrap().last_sent_at_ms, 123);
-        }
-        drop(held);
-        let next = BindIdentity::new("/cache", "runner", "next");
-        drop(table.clock(&next));
-        let sessions = table.sessions.lock().unwrap();
-        assert_eq!(sessions.entries.len(), MAX_SESSIONS);
-        assert_eq!(sessions.eviction_order.len(), sessions.entries.len());
-        drop(sessions);
-        table.remove(&next);
-        let sessions = table.sessions.lock().unwrap();
-        assert_eq!(sessions.eviction_order.len(), sessions.entries.len());
-        assert!(!sessions.eviction_order.contains(&next));
     }
 }

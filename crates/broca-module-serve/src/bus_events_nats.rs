@@ -869,7 +869,10 @@ impl BusPublisher for LazyPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_store::{bus_events::DrainResult, SqliteStore};
+    use broca_store::{
+        bus_events::{DrainResult, RunEventStore as _},
+        SqliteStore,
+    };
     use serde_json::json;
     use std::{
         collections::VecDeque,
@@ -1196,24 +1199,34 @@ mod tests {
         }
     }
 
-    /// Queue one run's start and end for `session` in the outbox.
+    /// Queue one run's start and end for `session` in the outbox, as a session in the store
+    /// records them when the barrier that wrote them is durable.
     fn queue_run(store: &SqliteStore, session: &BindIdentity, run_id: &str, seq: u64) {
-        use crate::bus_events::tests::{run_finished, run_started};
-        let records = [
-            broca_wal::FramedRecord {
-                seq,
-                fence: 1,
-                record: run_started(session, run_id, now_ms()),
-            },
-            broca_wal::FramedRecord {
-                seq: seq + 1,
-                fence: 1,
-                record: run_finished(now_ms()),
-            },
+        use broca_protocol::run_events::{RunEvent, RunEventDetail};
+        let event = |seq: u64, detail: RunEventDetail| RunEvent {
+            v: 1,
+            session_ref: broca_core::wal_writer::agent_session_ref(session),
+            run_id: run_id.into(),
+            seq,
+            at_ms: now_ms(),
+            detail,
+        };
+        let mut events = [
+            event(seq, RunEventDetail::Started {}),
+            event(
+                seq + 1,
+                RunEventDetail::Ended {
+                    terminal: broca_protocol::RunFinishReason::Completed,
+                    error_class: None,
+                    structured_output: Some(
+                        broca_protocol::run_events::StructuredOutputStatus::Absent,
+                    ),
+                },
+            ),
         ];
-        store
-            .project_bus_events(session, "epoch", &records, now_ms())
-            .unwrap();
+        assert!(store
+            .record_run_events(session, "epoch", &mut events, now_ms())
+            .unwrap());
     }
 
     /// Drain until the outbox is empty, allowing for publish failures; returns how many

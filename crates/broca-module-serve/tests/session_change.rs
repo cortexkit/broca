@@ -3,6 +3,7 @@ mod delivery_rig;
 #[path = "session_change/interrupt_cancel.rs"]
 mod interrupt_cancel;
 
+use broca_session_store::record::Record;
 use delivery_rig::*;
 use serde_json::{json, Value};
 use std::sync::{
@@ -95,18 +96,13 @@ fn plan_with_absent_optional(text: &str) -> Value {
     next
 }
 
-fn assert_effective_manifest(rig: &Rig, baseline: &Value) {
+async fn assert_effective_manifest(rig: &Rig, baseline: &Value) {
     let manifest = rig
-        .records()
+        .admissions()
+        .await
         .into_iter()
         .rev()
-        .find_map(|record| {
-            if let broca_wal::WalRecord::RunStarted { manifest, .. } = record {
-                manifest
-            } else {
-                None
-            }
-        })
+        .find_map(|admission| admission.manifest)
         .unwrap();
     assert_eq!(
         baseline["effective"]["composition_digest"],
@@ -171,70 +167,6 @@ async fn refresh(rig: &mut Rig, plan: &Value, policy: &str, generation: u64) -> 
     .await
 }
 
-#[tokio::test]
-async fn compaction_item_refresh_is_refused_before_fetch_and_actor_write() {
-    let (mut rig, admitter, initial) = ready("fixed-compaction-item").await;
-    let mut changed = initial.clone();
-    changed["compaction_item"] = json!({"provider":"ck-mc","preset":"head","params":{}});
-    changed["composition"]["compaction"] = json!({"provider":"ck-mc"});
-    changed["composition"]["providers"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"provider":"ck-mc","tools":[]}));
-    changed["composition_digest"] = json!(
-        cortexkit_role_tool_provider::catalog::composition_digest(&changed["composition"]).unwrap()
-    );
-    let before = rig.wal_bytes();
-    let fetched = admitter.0.load(Ordering::SeqCst);
-    let response = refresh(&mut rig, &changed, "immediately", 1).await;
-    assert_eq!(
-        std::str::from_utf8(&response.body).unwrap(),
-        r#"{"code":"invalid_params","message":"invalid plan or send: {\"field\":\"plan.compaction_item\"}","detail":{"field":"plan.compaction_item"}}"#,
-    );
-    let refused = error(&response);
-    assert_eq!(refused["code"], "invalid_params");
-    assert_eq!(refused["detail"]["field"], "plan.compaction_item");
-    assert_eq!(rig.wal_bytes(), before);
-    assert_eq!(admitter.0.load(Ordering::SeqCst), fetched);
-
-    let mut manifest = rig
-        .records()
-        .into_iter()
-        .find_map(|record| match record {
-            broca_wal::WalRecord::RunStarted {
-                manifest: Some(manifest),
-                ..
-            } => Some(manifest),
-            _ => None,
-        })
-        .unwrap();
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(changed.to_string()).unwrap();
-    manifest.plan_identity = broca_fetch_plan::plan_identity(&changed).unwrap();
-    let outcome = rig
-        .registry()
-        .route_session_refresh(&rig.session, 1, "immediately".into(), manifest)
-        .await
-        .unwrap();
-    assert!(
-        matches!(outcome, broca_module::actor::SessionRefreshOutcome::Refused(broca_module::serve::SessionChangeError::InvalidParams { field, .. }) if field == "plan.compaction_item")
-    );
-    assert_eq!(rig.wal_bytes(), before);
-
-    let mut composition_only = initial;
-    composition_only["composition"]["opaque"] = json!({"updated":true});
-    composition_only["composition_digest"] = json!(
-        cortexkit_role_tool_provider::catalog::composition_digest(&composition_only["composition"])
-            .unwrap()
-    );
-    assert_eq!(
-        refresh(&mut rig, &composition_only, "immediately", 1)
-            .await
-            .header
-            .ty,
-        FrameType::Response
-    );
-}
-
 async fn baseline(rig: &mut Rig) -> Value {
     result(&call(rig, "session.baseline", json!({})).await)["baseline"].clone()
 }
@@ -288,7 +220,7 @@ async fn refresh_applies_once_and_keeps_later_episodes_on_the_effective_manifest
     assert_eq!(result(&applied)["baseline"]["tool_names"], json!(["work"]));
     let applied_baseline = &result(&applied)["baseline"];
     assert_eq!(applied_baseline["effective"]["applied_by"], "append");
-    assert_effective_manifest(&rig, applied_baseline);
+    assert_effective_manifest(&rig, applied_baseline).await;
     assert_eq!(
         applied_baseline["composition_digest"],
         result(&initial)["baseline"]["composition_digest"]
@@ -298,12 +230,12 @@ async fn refresh_applies_once_and_keeps_later_episodes_on_the_effective_manifest
         applied_baseline["effective"]["composition_digest"]
     );
     assert!(applied_baseline.get("absent_items").is_none());
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert_eq!(
         refresh(&mut rig, &next, "immediately", 1).await.body,
         accepted.body
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(admitter.0.load(Ordering::SeqCst), 2);
     rig.finish().await;
 }
@@ -346,14 +278,14 @@ async fn refresh_waits_for_real_rebuild_and_flush_survives_restart() {
         }),
     )
     .await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert_eq!(
         call(&mut rig, "session.flush_prefix", json!({"send_id":"flush"}))
             .await
             .body,
         flush.body
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.script.push(&[Step::Text("new")]);
     assert_eq!(
         send(&mut rig, "after-flush", Some(next), "fake")
@@ -367,7 +299,7 @@ async fn refresh_waits_for_real_rebuild_and_flush_survives_restart() {
     let applied = baseline(&mut rig).await;
     assert_eq!(applied["effective"]["generation"], 3);
     assert_eq!(applied["effective"]["applied_by"], "fold");
-    assert_effective_manifest(&rig, &applied);
+    assert_effective_manifest(&rig, &applied).await;
     assert_eq!(
         applied["composition_digest"],
         applied["effective"]["composition_digest"]
@@ -433,12 +365,12 @@ async fn refresh_never_changes_a_running_episode_and_repeats_keep_the_original_r
     rig.wait_idle().await;
     let tools = rig.script.offered_tools.lock().unwrap().clone();
     assert_eq!(tools, vec![vec!["work"], vec!["work"], vec!["work"]]);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert_eq!(
         refresh(&mut rig, &next, "immediately", 1).await.body,
         accepted.body
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.wait_closed().await;
     rig = rig.restart().await;
     rig.bind_as(
@@ -448,12 +380,12 @@ async fn refresh_never_changes_a_running_episode_and_repeats_keep_the_original_r
         }),
     )
     .await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert_eq!(
         refresh(&mut rig, &next, "immediately", 1).await.body,
         accepted.body
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.script.push(&[Step::Text("new run")]);
     assert_eq!(
         send(&mut rig, "new-run", Some(next), "fake")
@@ -491,7 +423,12 @@ async fn episode_started_before_refresh_resumes_with_its_original_manifest() {
         let started = call(&mut rig, "session.send", json!({"send_id":"old-episode","prompt":"old","model":{"provider":"fake","model":"fake"},"on_restart":"resume"})).await;
         let old_run = result(&started)["run_id"].as_str().unwrap().to_string();
         rig.wait_entered().await;
-        let before = rig.records().into_iter().find(|r| matches!(r, broca_wal::WalRecord::RunStarted {run_id, ..} if run_id.0 == old_run)).unwrap();
+        let before = rig
+            .records()
+            .await
+            .into_iter()
+            .find(|r| matches!(r, Record::RunStart(start) if start.run_id == old_run))
+            .unwrap();
         let generation = if refreshed_episode { 2 } else { 1 };
         let accepted = refresh(
             &mut rig,
@@ -510,17 +447,25 @@ async fn episode_started_before_refresh_resumes_with_its_original_manifest() {
         )
         .await;
         rig.script.push(&[Step::Text("resumed")]);
-        assert_eq!(
-            rig.registry()
-                .resume_restart_pauses(
-                    Arc::new(broca_core::FileWalStore::new(rig.dir.join("wal"))),
-                    vec![(old_run.clone(), rig.session.clone())]
-                )
-                .await,
-            (1, 0)
-        );
+        // As the module does once its routes are up: the session's actor opens, finds the run
+        // paused for the restart and resumes it.
+        rig.registry().enable_restart_resumes();
         rig.wait_idle().await;
-        let after = rig.records().into_iter().find(|r| matches!(r, broca_wal::WalRecord::RunStarted {run_id, ..} if run_id.0 == old_run)).unwrap();
+        assert_eq!(
+            rig.records()
+                .await
+                .iter()
+                .filter(|r| matches!(r, Record::Resumed(_)))
+                .count(),
+            1,
+            "the restart-paused run resumed once"
+        );
+        let after = rig
+            .records()
+            .await
+            .into_iter()
+            .find(|r| matches!(r, Record::RunStart(start) if start.run_id == old_run))
+            .unwrap();
         assert_eq!(
             serde_json::to_vec(&after).unwrap(),
             serde_json::to_vec(&before).unwrap()
@@ -564,10 +509,10 @@ fn vector(code: &str) -> Value {
 async fn refresh_and_policy_refusals_match_the_pinned_vectors_and_write_nothing() {
     let (mut rig, _, _) = ready("change-vector-refusals").await;
     let next = plan(&[], "new");
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let unsupported = error(&refresh(&mut rig, &next, "on_history_rebuild", 3).await);
     assert_eq!(unsupported, vector("rung_unsupported"));
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(
         refresh(&mut rig, &next, "on_prefix_rebuild", 3)
             .await
@@ -587,7 +532,7 @@ async fn refresh_and_policy_refusals_match_the_pinned_vectors_and_write_nothing(
         .ty,
         FrameType::Response
     );
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let superseded = error(
         &call(
             &mut rig,
@@ -600,7 +545,7 @@ async fn refresh_and_policy_refusals_match_the_pinned_vectors_and_write_nothing(
     let stale = error(&refresh(&mut rig, &next, "immediately", 4).await);
     assert_eq!(stale["code"], "generation_stale");
     assert_eq!(stale["detail"], vector("generation_stale")["detail"]);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     // Apply generation 3 in a separate session so the vector's exact generation and cause match.
     rig.finish().await;
     let (mut rig, _, _) = ready("change-already-applied").await;
@@ -612,7 +557,7 @@ async fn refresh_and_policy_refusals_match_the_pinned_vectors_and_write_nothing(
         FrameType::Response
     );
     rig.wait_idle().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let applied = error(
         &call(
             &mut rig,
@@ -623,7 +568,7 @@ async fn refresh_and_policy_refusals_match_the_pinned_vectors_and_write_nothing(
     );
     assert_eq!(applied["code"], vector("already_applied")["code"]);
     assert_eq!(applied["detail"], vector("already_applied")["detail"]);
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -658,7 +603,7 @@ async fn policy_repeat_remains_identical_after_application_and_restart() {
         }),
     )
     .await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert_eq!(
         call(&mut rig, "session.refresh_policy", params).await.body,
         changed.body
@@ -676,7 +621,7 @@ async fn policy_repeat_remains_identical_after_application_and_restart() {
         refresh(&mut rig, &next, "on_prefix_rebuild", 1).await.body,
         original.body
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -690,7 +635,7 @@ async fn all_three_ops_are_owner_only_and_requests_are_strict() {
         }),
     )
     .await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     for (method, params) in [
         (
             "session.refresh",
@@ -707,7 +652,7 @@ async fn all_three_ops_are_owner_only_and_requests_are_strict() {
             .await;
         assert_eq!(error(&frame)["code"], "scope_owner_mismatch");
     }
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     for (method, params) in [
         (
             "session.refresh",
@@ -728,7 +673,7 @@ async fn all_three_ops_are_owner_only_and_requests_are_strict() {
             "invalid_params"
         );
     }
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -765,8 +710,9 @@ async fn concurrent_identical_refreshes_fetch_and_write_once() {
     assert_eq!(admitter.0.load(Ordering::SeqCst), 2);
     assert_eq!(
         rig.records()
+            .await
             .iter()
-            .filter(|r| matches!(r, broca_wal::WalRecord::SessionRefreshAccepted { .. }))
+            .filter(|r| matches!(r, Record::SessionRefresh(_)))
             .count(),
         1
     );
@@ -788,7 +734,7 @@ async fn pending_model_mismatch_writes_nothing_keeps_pending_and_allows_both_rec
             refresh(&mut rig, &next, "immediately", 1).await.header.ty,
             FrameType::Response
         );
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         for supplied in [None, Some(initial)] {
             let frame = send(&mut rig, "mismatched", supplied, "fake").await;
             capture("session.refresh.plan_model_mismatch.json", &frame);
@@ -800,7 +746,7 @@ async fn pending_model_mismatch_writes_nothing_keeps_pending_and_allows_both_rec
                 json!({"provider":"fake","id":"fake"})
             );
             assert_eq!(refused["detail"]["class"], "permanent");
-            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(rig.records().await, before);
         }
         let inherited = error(
             &call(
@@ -815,7 +761,7 @@ async fn pending_model_mismatch_writes_nothing_keeps_pending_and_allows_both_rec
             inherited["detail"]["send_model"],
             json!({"provider":"fake","id":"fake"})
         );
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         assert_eq!(baseline(&mut rig).await["pending"]["generation"], 1);
         rig.script.push(&[Step::Text("recovered")]);
         if supersede {
@@ -891,7 +837,7 @@ async fn frozen_flow_ready(tag: &str) -> (Rig, Arc<Admitter>, Value) {
 async fn frozen_flow_send_refuses_other_plan_senders_before_writes() {
     let (mut rig, admitter, mut changed) = frozen_flow_ready("frozen-plan-send").await;
     changed["senders"] = json!([{"module":"owner-module"}]);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let fetched = admitter.0.load(Ordering::SeqCst);
     let refused = send(&mut rig, "refused", Some(changed), "fake").await;
     capture_runner_scope_sample("plan.senders.send.json", &refused);
@@ -899,7 +845,7 @@ async fn frozen_flow_send_refuses_other_plan_senders_before_writes() {
     let error: Value = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!(error["code"], "invalid_params");
     assert_eq!(error["detail"]["field"], "plan.senders");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(admitter.0.load(Ordering::SeqCst), fetched);
     rig.finish().await;
 }
@@ -915,7 +861,7 @@ async fn frozen_flow_refresh_refuses_other_plan_senders_before_writes() {
     )
     .await;
     changed["senders"] = json!([{"module":"owner-module"}]);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let fetched = admitter.0.load(Ordering::SeqCst);
     let refused = refresh(&mut rig, &changed, "immediately", 1).await;
     capture_runner_scope_sample("plan.senders.refresh.json", &refused);
@@ -923,7 +869,7 @@ async fn frozen_flow_refresh_refuses_other_plan_senders_before_writes() {
     let error: Value = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!(error["code"], "invalid_params");
     assert_eq!(error["detail"]["field"], "plan.senders");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(admitter.0.load(Ordering::SeqCst), fetched);
     changed["senders"] = json!([{"module":"flow-carrier"}]);
     assert_eq!(
@@ -940,13 +886,13 @@ async fn frozen_flow_refresh_refuses_other_plan_senders_before_writes() {
 async fn flow_creation_refuses_other_plan_senders_before_actor_open() {
     let (mut rig, admitter, mut changed) = unwritten_flow_ready("frozen-plan-create").await;
     changed["senders"] = json!([{"module":"owner-module"}]);
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let refused = send(&mut rig, "refused", Some(changed), "fake").await;
     assert_eq!(refused.header.ty, FrameType::Error);
     let error: Value = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!(error["code"], "invalid_params");
     assert_eq!(error["detail"]["field"], "plan.senders");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(admitter.0.load(Ordering::SeqCst), 0);
     rig.finish().await;
 }

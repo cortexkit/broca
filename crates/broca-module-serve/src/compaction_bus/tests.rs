@@ -155,7 +155,7 @@ impl Fixture {
             ranges: AtomicU64::new(0),
             tails: AtomicU64::new(0),
         });
-        let registry = LineageRegistry::new_with_reader(Arc::new(NoActor), wal.clone(), None);
+        let registry = LineageRegistry::new(Arc::new(NoActor));
         let service = Service::new(
             store.clone(),
             registry,

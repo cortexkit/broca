@@ -5,6 +5,7 @@
 //! normalization against the checked-in provider body.
 
 use super::session_client::{self, ClientRun, CLIENT_DEADLINE};
+use broca_session_store::record::Record;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -271,8 +272,8 @@ impl Daemon {
                     "program": module_serve,
                     "args": [],
                     "env": {
-                        // Named explicitly so the WAL lands where `wal_dir` reads it back and
-                        // where the catalog LKG above is seeded.
+                        // Named explicitly so sessions land where `broca_state_root` reads them
+                        // back and where the catalog LKG above is seeded.
                         "BROCA_STATE_ROOT": runtime_dir.join("broca-state"),
                         "BROCA_PROVIDER_BASE_URL": provider_base_url,
                         "BROCA_TOOL_MODULE": "aft"
@@ -294,6 +295,16 @@ impl Daemon {
         for (key, value) in broca_env {
             config["modules"]["broca"]["env"][*key] = (*value).into();
         }
+        // No deployment-key vault here: sessions are stored plain, so this test reads them back
+        // from disk (`stored_log`).
+        let broca_config = config_home.join("cortexkit/broca.jsonc");
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&super::stored_log::plain_storage()).unwrap(),
+        )
+        .expect("write broca config");
+        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
+            broca_config.display().to_string().into();
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .expect("write subc config");
 
@@ -354,10 +365,6 @@ impl Daemon {
             sleep(Duration::from_millis(50)).await;
         }
         false
-    }
-
-    fn wal_dir(&self) -> PathBuf {
-        self.broca_state_root().join("wal")
     }
 
     fn broca_state_root(&self) -> PathBuf {
@@ -615,34 +622,36 @@ async fn real_module_completes_against_captured_openai_chat_bytes() {
     assert_eq!(request["model"], "mock/mock-model");
     assert_eq!(request["stream"], true);
 
-    let wal_dir = daemon.wal_dir();
-    assert!(wal_dir.exists(), "WAL directory should exist: {wal_dir:?}");
-    assert!(std::fs::read_dir(wal_dir)
-        .expect("read WAL directory")
-        .next()
-        .is_some());
-    let diagnostics = session_client::daemon_diagnostics(
-        &daemon.dir,
-        "captured-replay",
-        &mut daemon.child.borrow_mut(),
+    assert!(
+        !super::stored_log::stored_files(&daemon.broca_state_root()).is_empty(),
+        "the run is stored in the new storage"
     );
-    let kinds = diagnostics
-        .split("--- session WAL record kinds:")
-        .nth(1)
-        .unwrap();
-    let mut previous = 0;
-    for kind in [
-        "RunStarted",
-        "StepStarted",
-        "ModelAttemptFinished",
-        "RunFinished",
-    ] {
-        let position = kinds
-            .find(kind)
-            .unwrap_or_else(|| panic!("missing {kind}: {kinds}"));
-        assert!(position > previous, "record kinds out of order: {kinds}");
-        previous = position;
-    }
+    // The run's boundaries, in the order the run wrote them, read back from the new storage. An
+    // unscoped route's session is keyed under the unscoped root, whatever folder the bind named.
+    let stored = broca_protocol::BindIdentity::new(
+        broca_protocol::session::UNSCOPED_SESSION_ROOT,
+        "broca",
+        "captured-replay",
+    );
+    let records = super::stored_log::stored_records(&daemon.broca_state_root(), &stored).await;
+    let position = |kind: fn(&Record) -> bool, name: &str| {
+        records.iter().position(kind).unwrap_or_else(|| {
+            panic!(
+                "missing {name}: {records:#?} under {stored:?}; stored files: {:#?}",
+                super::stored_log::stored_files(&daemon.broca_state_root())
+            )
+        })
+    };
+    let order = [
+        position(|r| matches!(r, Record::RunStart(_)), "run start"),
+        position(|r| matches!(r, Record::StepStart(_)), "step start"),
+        position(|r| matches!(r, Record::Attempt(_)), "model attempt"),
+        position(|r| matches!(r, Record::RunEnd(_)), "run end"),
+    ];
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "record kinds out of order: {order:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -715,12 +724,10 @@ async fn real_module_closes_a_tool_loop_against_sequential_captures() {
         .iter()
         .any(|message| { message["role"] == "tool" && message["content"] == "TOKEN-REFRESHED" }));
 
-    let wal_dir = daemon.wal_dir();
-    assert!(wal_dir.exists(), "WAL directory should exist: {wal_dir:?}");
-    assert!(std::fs::read_dir(wal_dir)
-        .expect("read WAL directory")
-        .next()
-        .is_some());
+    assert!(
+        !super::stored_log::stored_files(&daemon.broca_state_root()).is_empty(),
+        "the run is stored in the new storage"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -759,10 +766,8 @@ async fn client_deadline_dumps_rig_diagnostics_when_capture_server_holds_respons
         "daemon dated subc.*.log segments:",
         "broca structured log segments:",
         "broca watchdog stall-*.jsonl files:",
-        "WAL file inventory:",
-        "session WAL record kinds: held-capture-deadline",
-        "RunStarted",
-        "StepStarted",
+        "stored session inventory:",
+        "failing session: held-capture-deadline",
         "reaped broca-session after deadline:",
     ] {
         assert!(
@@ -884,12 +889,10 @@ async fn real_module_completes_against_captured_anthropic_bytes() {
                 })
         }));
 
-    let wal_dir = daemon.wal_dir();
-    assert!(wal_dir.exists(), "WAL directory should exist: {wal_dir:?}");
-    assert!(std::fs::read_dir(wal_dir)
-        .expect("read WAL directory")
-        .next()
-        .is_some());
+    assert!(
+        !super::stored_log::stored_files(&daemon.broca_state_root()).is_empty(),
+        "the run is stored in the new storage"
+    );
 }
 
 /// Send one Anthropic tool-loop turn through the real module on its own session. `Err` is the
@@ -965,105 +968,44 @@ async fn send_anthropic_turn(
         ),
         "an idle session starts the run: {outcome:?}"
     );
+    // An unscoped route's session is keyed under the unscoped root, whatever folder the bind
+    // named, so it is read back there. A wrong address never finds the run, and this wait fails
+    // rather than passing.
+    let stored = broca_protocol::BindIdentity::new(
+        broca_protocol::session::UNSCOPED_SESSION_ROOT,
+        "variant-e2e",
+        session,
+    );
+    let state_root = daemon.broca_state_root();
     broca_test_support::wait_for(
         "variant run durably finishes",
         async {
             loop {
-                if let Some(frames) = session_frames(&daemon.wal_dir(), session) {
-                    let started = frames.iter().find_map(|record| match record {
-                        broca_wal::WalRecord::RunStarted { config, .. } => Some((**config).clone()),
-                        _ => None,
-                    });
-                    let finished = frames
-                        .iter()
-                        .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. }));
-                    if let (Some(config), true) = (started, finished) {
+                let finished = super::stored_log::stored_records(&state_root, &stored)
+                    .await
+                    .iter()
+                    .any(|record| matches!(record, Record::RunEnd(_)));
+                if finished {
+                    if let Some(config) =
+                        super::stored_log::stored_run_configs(&state_root, &stored)
+                            .await
+                            .into_iter()
+                            .next()
+                    {
                         return Ok(config);
                     }
                 }
                 sleep(Duration::from_millis(50)).await;
             }
         },
-        || describe_wal_dir(&daemon.wal_dir()),
+        || {
+            format!(
+                "stored files: {:?}",
+                super::stored_log::stored_files(&daemon.broca_state_root()).keys()
+            )
+        },
     )
     .await
-}
-
-/// The records of the WAL whose `RunStarted` names `session`, found by SCANNING the WAL
-/// directory rather than computing the address.
-///
-/// The address is a hash over the bind triple as the MODULE keyed it, and the daemon normalizes
-/// the project root before the module sees it (on macOS /var becomes /private/var). A test that
-/// recomputes the address from its own spelling of the root is only right where the two
-/// normalizations agree -- and where they don't, it polls a file that never exists, so a run
-/// that finished reads as one that hung, and a check that a refused send wrote nothing passes
-/// no matter what was written. Each session name here is unique within the test, so the name
-/// is enough to find its log.
-fn session_frames(wal_dir: &Path, session: &str) -> Option<Vec<broca_wal::WalRecord>> {
-    for entry in std::fs::read_dir(wal_dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
-            continue;
-        }
-        let Ok(range) =
-            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
-        else {
-            continue;
-        };
-        let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
-            continue;
-        };
-        let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
-        let names_session = records.iter().any(|record| {
-            matches!(record, broca_wal::WalRecord::RunStarted { session: bound, .. }
-                if bound.session == session)
-        });
-        if names_session {
-            return Some(records);
-        }
-    }
-    None
-}
-
-/// Every WAL in the directory with the sessions its `RunStarted` records name, for a failure
-/// message that says whether the run's log is missing or merely unfinished.
-fn describe_wal_dir(wal_dir: &Path) -> String {
-    let Ok(entries) = std::fs::read_dir(wal_dir) else {
-        return format!("<cannot read {wal_dir:?}>");
-    };
-    let mut lines = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let sessions =
-            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
-                .map(|range| match range.records() {
-                    broca_wal::WalRangeRecords::Complete(frames) => frames
-                        .iter()
-                        .filter_map(|frame| match &frame.record {
-                            broca_wal::WalRecord::RunStarted { session, .. } => Some(format!(
-                                "{:?}|{}|{}",
-                                session.project_root, session.harness, session.session
-                            )),
-                            broca_wal::WalRecord::RunFinished { .. } => {
-                                Some("finished".to_string())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    other => format!("{other:?}").chars().take(40).collect(),
-                })
-                .unwrap_or_else(|error| format!("read error: {error}"));
-        lines.push(format!(
-            "{:?}: [{sessions}]",
-            path.file_name().unwrap_or_default()
-        ));
-    }
-    if lines.is_empty() {
-        "<none>".to_string()
-    } else {
-        lines.join("; ")
-    }
 }
 
 /// A send carrying `model.variant` through the real module: a variant the model's catalog
@@ -1183,7 +1125,11 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
     assert_eq!(strip(varied), strip(plain));
 
     let requests_before_refusal = bodies.len();
-    let records_before_refusal = wal_record_count(&daemon.wal_dir());
+    let stored_before_refusal = super::stored_log::stored_files(&daemon.broca_state_root());
+    assert!(
+        !stored_before_refusal.is_empty(),
+        "the admitted sessions are stored where the snapshot reads"
+    );
     let error = refused_variant_frame(&daemon, &project_root).await;
     assert_eq!(error.code, "variant_unsupported");
     assert_eq!(
@@ -1197,18 +1143,13 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
     );
     assert_eq!(error.message,
         "open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]");
+    // Every file of every session, compared whole: a refused send writes nothing anywhere,
+    // whatever address it would have keyed. The two admitted sessions were read back from these
+    // same roots above, which proves the snapshot sees where sessions are written.
     assert_eq!(
-        wal_record_count(&daemon.wal_dir()),
-        records_before_refusal,
-        "a refused send adds no WAL record, including records without RunStarted"
-    );
-    // Found by scanning, not by computed address (see `session_frames`), so this cannot pass
-    // by looking at a file the module never keyed. The two admitted sessions are found the same
-    // way above, which proves the scan sees this directory's logs.
-    assert!(
-        session_frames(&daemon.wal_dir(), "undefined-variant").is_none(),
-        "a refused send writes no RunStarted. WALs present: {}",
-        describe_wal_dir(&daemon.wal_dir())
+        super::stored_log::stored_files(&daemon.broca_state_root()),
+        stored_before_refusal,
+        "a refused send writes nothing to the new storage"
     );
     assert_eq!(
         replay.request_bodies.lock().unwrap().len(),
@@ -1289,26 +1230,4 @@ async fn refused_variant_frame(daemon: &Daemon, _project_root: &Path) -> subc_pr
         .unwrap();
     assert_eq!(refused.header.ty, FrameType::Error);
     serde_json::from_slice(&refused.body).unwrap()
-}
-
-fn wal_record_count(wal_dir: &Path) -> usize {
-    std::fs::read_dir(wal_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wal"))
-        .map(|path| {
-            let range = broca_wal::read_records_range(
-                &path,
-                broca_wal::DEFAULT_MAX_READ_BYTES,
-                0,
-                None,
-                None,
-            )
-            .unwrap();
-            let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
-                panic!("incomplete WAL read");
-            };
-            frames.len()
-        })
-        .sum()
 }

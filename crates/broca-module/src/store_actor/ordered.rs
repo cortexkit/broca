@@ -252,8 +252,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// The number the session's next request shows for each part, by its message id and part
-    /// id, as `LineageActor::next_request_numbers` (today's storage) looks them up for a
-    /// template's `part_tag` slots: that request renders the newest accepted compaction view when
+    /// id, for a template's `part_tag` slots: that request renders the newest accepted compaction
+    /// view when
     /// it still passes the boundary check under the latest run's frozen rules, else the applied
     /// one (`compaction_v2::shown::next_request`). The views come from the compaction state this
     /// actor keeps for the session, read from the open log the first time, as
@@ -262,8 +262,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ///
     /// Only a session on the current compaction contract numbers its parts: off it, its
     /// requests render no part numbers, so none is shown and every `part_tag` slot's part is
-    /// gone. `LineageActor` reads such a session's numbers from its replayed transcript, which
-    /// holds numbers only where runs on today's storage rendered them.
+    /// gone.
     async fn shown_numbers(
         &self,
     ) -> Result<std::collections::HashMap<(String, String), u64>, String> {
@@ -485,12 +484,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return Err(retry_of_queued(
                 &existing,
                 request,
+                message_marks.as_ref(),
                 identity.as_deref(),
                 conversation_key.as_deref(),
                 broca_protocol::Delivery::Queue,
                 &self.parts,
                 submission_id,
             ));
+        }
+        // A list that starts its run now meets that run's plan check here, writing nothing when
+        // it fails, as a plain send that starts a run does (`Self::freeze_plan`): a pending
+        // refresh that applies at the run must accept the model the send runs on.
+        if order.starts_runs()
+            && self.run.is_none()
+            && !self.session.operations().owner.needs_admission()
+        {
+            self.run_plan(&request.model, request.variant.as_deref())?;
         }
         let expired = order.expired_at(now_ms());
         let staged = self.stage_ordered_media(&mut request, &order).await?;

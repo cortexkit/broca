@@ -11,10 +11,10 @@
 //! send was delivered, the re-send's `delivered` receipt says so, before and after a restart.
 
 use crate::delivery_rig::*;
+use broca_session_store::record::Record;
 
 use std::time::Duration;
 
-use broca_wal::WalRecord;
 use subc_protocol::Frame;
 
 /// Short, so an idle session's actor closes quickly and a restart reopens a closed session.
@@ -50,25 +50,23 @@ async fn run_status(rig: &mut Rig, run_id: &str) -> Frame {
     .await
 }
 
-fn send_delivered(records: &[WalRecord]) -> Vec<(String, String)> {
+fn send_delivered(records: &[Record]) -> Vec<(String, String)> {
     records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::SendDelivered {
-                submission_id,
-                run_id,
-                ..
-            } => Some((submission_id.0.clone(), run_id.0.clone())),
+            Record::Delivery(delivery) => {
+                Some((delivery.submission_id.clone(), delivery.run_id.clone()))
+            }
             _ => None,
         })
         .collect()
 }
 
-fn started_runs(records: &[WalRecord]) -> Vec<String> {
+fn started_runs(records: &[Record]) -> Vec<String> {
     records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+            Record::RunStart(start) => Some(start.run_id.clone()),
             _ => None,
         })
         .collect()
@@ -119,7 +117,7 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
     rig.script.hold_tool(true);
     rig.script.hold_model(false);
     rig.wait_entered().await;
-    let records = rig.records();
+    let records = rig.records().await;
     assert_eq!(
         send_delivered(&records),
         [(format!("sub-{provisional}"), joined.clone())],
@@ -199,7 +197,7 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
 
     rig.wait_closed().await;
     rig = rig.restart().await;
-    let records = rig.records();
+    let records = rig.records().await;
     assert_eq!(
         started_runs(&records),
         std::slice::from_ref(&joined),
@@ -246,7 +244,7 @@ async fn a_send_delivered_as_a_steer_answers_the_run_it_joined_across_a_restart(
     assert_eq!(reopened.body, restarted.body);
     assert_eq!(rig.cancel(&provisional).await, "not_active");
     assert_eq!(
-        started_runs(&rig.records()),
+        started_runs(&rig.records().await),
         [joined],
         "nothing ran the send again"
     );
@@ -272,7 +270,7 @@ async fn an_ordered_send_that_starts_its_own_run_answers_that_run() {
     let provisional = provisional_run_id(&queued);
     rig.script.hold_model(false);
     rig.wait_for_finished(2).await;
-    let records = rig.records();
+    let records = rig.records().await;
     assert_eq!(started_runs(&records), [first, provisional.clone()]);
     assert!(send_delivered(&records).is_empty(), "{records:?}");
 
@@ -416,7 +414,7 @@ async fn an_undelivered_send_answers_its_terminal_state_across_a_restart() {
 #[tokio::test]
 async fn send_status_writes_nothing_and_never_opens_a_closed_actor() {
     let mut rig = Rig::start_with_idle_ttl("send-status-read-only", IDLE_TTL).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = rig
         .request(
             7,
@@ -425,7 +423,7 @@ async fn send_status_writes_nothing_and_never_opens_a_closed_actor() {
         .await;
     assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "even an unknown send must not create a WAL"
     );
@@ -434,7 +432,7 @@ async fn send_status_writes_nothing_and_never_opens_a_closed_actor() {
     rig.wait_for_finished(1).await;
     rig.wait_closed().await;
     rig = rig.restart().await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = rig
         .request(
             7,
@@ -442,13 +440,13 @@ async fn send_status_writes_nothing_and_never_opens_a_closed_actor() {
         )
         .await;
     assert_eq!(result(&reply)["state"], "finished");
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(
         rig.registry().slot_counts().open,
         0,
         "polling a closed session must not reopen it"
     );
-    assert_eq!(started_runs(&rig.records()).len(), 1);
+    assert_eq!(started_runs(&rig.records().await).len(), 1);
     rig.finish().await;
 }
 

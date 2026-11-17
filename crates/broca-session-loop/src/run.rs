@@ -128,6 +128,9 @@ pub struct Admission {
     pub account_limit_pause: bool,
     /// The routing decision the run was admitted under.
     pub route_decision_id: Option<String>,
+    /// The provider and model the send asked routing to choose an account for, which a joining
+    /// send must not change. Stored in the run's config members.
+    pub account_route: Option<cortexkit_role_llm_runner::send::AccountRoute>,
     /// The catalog provider whose rows the run borrowed, for a model whose provider the catalog
     /// doesn't carry (`RunConfig::served_provider`). Stored in the run's config members, so a
     /// resume and the run's spend read it back and never resolve it again.
@@ -1852,6 +1855,7 @@ pub fn admission_of_start(
         budget: decode::<broca_protocol::request::BudgetConfig>(member("budget"))?
             .filter(|budget| *budget != broca_protocol::request::BudgetConfig::default()),
         route_decision_id: start.route_decision_id.clone(),
+        account_route: decode(member("account_route"))?,
         served_provider: None,
         service_tier: decode(start.service_tier.clone().map(Value::String))?,
         variant: decode(member("variant"))?,
@@ -2500,15 +2504,9 @@ where
         {
             BatchOutcome::Closed { unknown: false } => {}
             BatchOutcome::Closed { unknown: true } => {
-                return finish(
-                    writer,
-                    seams,
-                    &admission.run_id,
-                    RunFinishReason::Interrupted,
-                )
-                .await;
+                return finish_in_doubt(writer, seams, &admission.run_id).await;
             }
-            BatchOutcome::Held(finished) => return Ok(finished),
+            BatchOutcome::Held(finished) | BatchOutcome::Stopped(finished) => return Ok(finished),
             BatchOutcome::Cancelled(closed) => {
                 let finished =
                     finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await?;
@@ -3602,15 +3600,9 @@ where
         {
             BatchOutcome::Closed { unknown: false } => {}
             BatchOutcome::Closed { unknown: true } => {
-                return finish(
-                    writer,
-                    seams,
-                    &admission.run_id,
-                    RunFinishReason::Interrupted,
-                )
-                .await;
+                return finish_in_doubt(writer, seams, &admission.run_id).await;
             }
-            BatchOutcome::Held(finished) => return Ok(finished),
+            BatchOutcome::Held(finished) | BatchOutcome::Stopped(finished) => return Ok(finished),
             BatchOutcome::Cancelled(closed) => {
                 let finished =
                     finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await?;
@@ -3785,6 +3777,7 @@ async fn admit<W: Writer>(
             to_value(admission.directives.as_ref())?,
         ),
         ("work_class", to_value(admission.work_class.as_ref())?),
+        ("account_route", to_value(admission.account_route.as_ref())?),
         (
             "served_provider",
             to_value(admission.served_provider.as_ref())?,
@@ -4794,6 +4787,9 @@ enum BatchOutcome {
     /// The caller cancelled while a provider held calls: they were closed and the run must end
     /// cancelled, then ask each provider to withdraw its call.
     Cancelled(Vec<ProviderHeldReply>),
+    /// A stop or the caller's cancel cut a pre-tool hook short: the batch closed unsent and
+    /// the run ended.
+    Stopped(Finished),
 }
 
 /// Dispatches one assistant message's tool calls and records every result. `planned` is every
@@ -4857,7 +4853,7 @@ where
             call.input = args.into();
         }
     }
-    let plans = plan_calls(
+    let Some(plans) = plan_calls(
         &mut calls,
         known,
         refusal.as_ref(),
@@ -4866,7 +4862,23 @@ where
         hooks,
         step_id,
     )
-    .await?;
+    .await?
+    else {
+        // A pre-tool hook was cut short, so nothing of the batch was written or sent. The
+        // plane, told of the batch above, is told it ended; the batch then closes as a stop
+        // before gating closes it. A resumed batch already has records of its own, which that
+        // close-out would repeat.
+        let _ = seams.tools.batch_finished(&ctx).await;
+        if started || !known.is_empty() {
+            return Err(LoopError::Unsupported(
+                "a pre-tool hook cut short by a stop in a resumed batch",
+            ));
+        }
+        let cancelled = seams.cancel.is_cancelled();
+        return stopped_batch(writer, seams, run_id, step_id, planned, cancelled)
+            .await
+            .map(BatchOutcome::Stopped);
+    };
     let calls = &calls[..];
     let session = writer.session_id();
     let now = (seams.now_ms)();
@@ -5232,7 +5244,8 @@ enum CallPlan {
     },
 }
 
-/// Decides each call's plan in the message's order, as today's gate does: a call a resume
+/// Decides each call's plan in the message's order, or `None` when a stop or the caller's
+/// cancel cuts a pre-tool hook short, as today's gate does: a call a resume
 /// already knows is sent as recorded; a repeated call id gets an error; a refused batch refuses
 /// every call; a call the run's manifest doesn't allow is never sent. A valid call then goes
 /// through the pre-tool mutate hooks, a second manifest check, the approval policy and the
@@ -5246,18 +5259,23 @@ async fn plan_calls(
     approval: &dyn ApprovalPolicy,
     hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     step_id: u64,
-) -> Result<Vec<CallPlan>, LoopError> {
+) -> Result<Option<Vec<CallPlan>>, LoopError> {
     let mut seen = std::collections::HashSet::new();
     let mut plans = Vec::with_capacity(calls.len());
     for call in calls.iter_mut() {
         let first = seen.insert(call.tool_call_id.clone());
         let plan = match gate_call(call, first, known, refusal, manifest) {
             Some(plan) => plan,
-            None => gate_hooked(call, manifest, approval, hooks, step_id).await?,
+            None => match gate_hooked(call, manifest, approval, hooks, step_id).await? {
+                Some(plan) => plan,
+                // A stop or the caller's cancel cut a pre-tool hook short: no call of the
+                // batch is sent.
+                None => return Ok(None),
+            },
         };
         plans.push(plan);
     }
-    Ok(plans)
+    Ok(Some(plans))
 }
 
 /// A valid call through the pre-tool hooks and the approval policy.
@@ -5267,7 +5285,7 @@ async fn gate_hooked(
     approval: &dyn ApprovalPolicy,
     hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     step_id: u64,
-) -> Result<CallPlan, LoopError> {
+) -> Result<Option<CallPlan>, LoopError> {
     use broca_core::hooks::{Subject, Trace};
     use cortexkit_role_step_transform_provider::subscription::Phase;
     let original = call.input.clone();
@@ -5287,40 +5305,38 @@ async fn gate_hooked(
             .await;
         trace = output.trace;
         if output.cancellation.is_some() {
-            return Err(LoopError::Unsupported(
-                "a pre-tool hook cut short by a stop",
-            ));
+            return Ok(None);
         }
         if let Subject::PreTool { input, .. } = output.subject {
             call.input = input.into();
         }
         if let Some((provider, text, unavailable)) = output.refusal {
-            return Ok(hook_refused(
+            return Ok(Some(hook_refused(
                 call,
                 &trace,
                 &provider,
                 &text,
                 unavailable,
                 &metadata,
-            ));
+            )));
         }
     }
     if let Err(invalid) = manifest.validate_call(call) {
-        return Ok(CallPlan::NoDispatch(
+        return Ok(Some(CallPlan::NoDispatch(
             NoDispatchReason::ValidationFailed {
                 detail: invalid.to_string(),
             },
             metadata(&trace, &(call.input).parse(), true),
-        ));
+        )));
     }
     match approval.decide(call).await {
         ApprovalResponse::Allow { .. } => {}
         ApprovalResponse::AllowNarrowed { input, .. } => call.input = input.into(),
         ApprovalResponse::Deny { reason, .. } => {
-            return Ok(CallPlan::NoDispatch(
+            return Ok(Some(CallPlan::NoDispatch(
                 NoDispatchReason::Denied { reason },
                 metadata(&trace, &(call.input).parse(), true),
-            ));
+            )));
         }
     }
     if let Some(runtime) = hooks {
@@ -5333,26 +5349,24 @@ async fn gate_hooked(
             .await;
         trace = output.trace;
         if output.cancellation.is_some() {
-            return Err(LoopError::Unsupported(
-                "a pre-tool hook cut short by a stop",
-            ));
+            return Ok(None);
         }
         if let Some((provider, text, unavailable)) = output.refusal {
-            return Ok(hook_refused(
+            return Ok(Some(hook_refused(
                 call,
                 &trace,
                 &provider,
                 &text,
                 unavailable,
                 &metadata,
-            ));
+            )));
         }
     }
-    Ok(CallPlan::Dispatch(metadata(
+    Ok(Some(CallPlan::Dispatch(metadata(
         &trace,
         &(call.input).parse(),
         false,
-    )))
+    ))))
 }
 
 /// The plan for a call a pre-tool hook refused: today's refusal result and reason code.
@@ -6212,6 +6226,10 @@ fn module_or_broca(principal: Option<&broca_protocol::BindPrincipal>) -> String 
 async fn ordered_sends<W: Writer>(
     writer: &mut W,
 ) -> Result<std::collections::BTreeMap<String, OrderedSend>, LoopError> {
+    // The session's actor queues sends while the run waits on its model or its tools, so the
+    // run's copy of the queue may lag. Without catching up, a send queued while a tool ran
+    // would miss that tool's results and wait for a later boundary.
+    writer.caught_up().await?;
     let ids: Vec<String> = writer
         .operations()
         .queue
@@ -7351,6 +7369,30 @@ async fn finish<W: Writer, P, T>(
     reason: RunFinishReason,
 ) -> Result<Finished, LoopError> {
     let record = run_end(writer, run_id, reason, (seams.now_ms)());
+    append_end(writer, run_id, vec![record]).await?;
+    Ok(finished(writer, reason))
+}
+
+/// Ends a run whose batch left a call that may have run without its result: the call is never
+/// sent again, so the run stops. The caller's cancel ends it cancelled, since interrupted names a
+/// stop nobody asked for; the runner's shutdown ends it interrupted, saying so, as a stop at a
+/// boundary does; anything else ends it interrupted.
+async fn finish_in_doubt<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+) -> Result<Finished, LoopError> {
+    let reason = if seams.cancel.is_cancelled() {
+        RunFinishReason::Cancelled
+    } else {
+        RunFinishReason::Interrupted
+    };
+    let mut record = run_end(writer, run_id, reason, (seams.now_ms)());
+    if let Record::RunEnd(end) = &mut record {
+        if reason == RunFinishReason::Interrupted && seams.stop.is_cancelled() {
+            end.interrupt_reason = Some("runner_shutdown".into());
+        }
+    }
     append_end(writer, run_id, vec![record]).await?;
     Ok(finished(writer, reason))
 }

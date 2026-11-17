@@ -1,8 +1,8 @@
 //! `session.warm` on a session kept in the new storage: re-send the session's next model request
 //! shaped to generate nothing, keeping the provider's cached prefix alive, by today's rules.
 //!
-//! Every refusal is decided from what the actor holds before anything is sent, in today's order
-//! (see `LineageActor::prepare_warm`): a lineage named, a running or paused run, no model step
+//! Every refusal is decided from what the actor holds before anything is sent, in this order: a
+//! lineage named, a running or paused run, no model step
 //! yet, an exhausted account, a cache the session's frozen config can't warm, and a cache whose
 //! estimated lifetime is spent. The cache's clock is the session's own: the operations fold's
 //! last request that reached the cache (`last_cache_send`), a warm included.

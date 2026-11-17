@@ -6,6 +6,7 @@ mod delivery_rig;
 
 use broca_core::DispatchResult;
 use broca_protocol::{ToolCallId, ToolOutput, ToolResult};
+use broca_session_store::record::Record;
 use delivery_rig::{result, Rig, Step};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -71,7 +72,7 @@ async fn sample(v1: bool) -> Vec<u8> {
     assert_eq!(
         records
             .iter()
-            .filter(|r| matches!(r, broca_wal::WalRecord::ToolResult { .. }))
+            .filter(|r| matches!(r, Record::ToolOutcome(_)))
             .count(),
         3
     );

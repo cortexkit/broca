@@ -1,18 +1,16 @@
 //! Commands and outcomes shared by the session actors.
 //!
-//! The legacy actor still owns `PendingWarm` (an in-flight warm and its reply) and `RetiredForCut`
-//! (the lease returned after closing its writer). Shared commands carry them opaquely; the store
-//! actor has its own warm task and lease, so it does not build those payloads.
+//! `RetiredForCut` carries the session lease a retired actor hands to a cut.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{ReconciledRunState, RunSummary};
+use broca_core::ReconciledRunState;
 use broca_protocol::{request::SubmissionRequest, RunId};
 use cortexkit_role_llm_runner::send::Delivered;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::actor::{PendingWarm, RetiredForCut};
+use crate::actor::RetiredForCut;
 use crate::executor::RunKind;
 
 pub(crate) mod pre_user;
@@ -238,13 +236,6 @@ pub enum LineageCmd {
         idle_auto: bool,
         reply: oneshot::Sender<WarmOutcome>,
     },
-    /// Internal: a warm's task ended (sent on the dedicated completion channel, like `RunFinished`).
-    WarmFinished {
-        warm: Box<(
-            PendingWarm,
-            Result<broca_core::WarmSent, crate::executor::WarmError>,
-        )>,
-    },
     /// The idle-TTL timer fired — consider closing.
     IdleTick,
     /// A durable compaction view/notice or effective model-window change may unblock the
@@ -267,20 +258,9 @@ pub enum LineageCmd {
             >,
         >,
     },
-    /// Test-only: report the entry count and serialized size of the admission identity cache.
-    #[cfg(test)]
-    RetainedAdmissionIdentityState {
-        reply: oneshot::Sender<(usize, usize)>,
-    },
     /// Test-only: panic inside the actor task (exercises `ActorExitGuard`).
     #[cfg(test)]
     PanicInActor,
-    /// Internal: the active run finished (the run task tells the actor).
-    RunFinished {
-        run_id: RunId,
-        attempt_id: u64,
-        result: Box<Result<RunSummary, broca_core::RunError>>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -564,7 +544,7 @@ pub enum LineageStatus {
     Closing,
 }
 
-/// How a send with a legacy string `delivery` is admitted ([`crate::actor::LineageActor::string_sender`]).
+/// How a send with a legacy string `delivery` is admitted.
 pub(crate) enum StringSender {
     /// The session's owner, or a caller the plan does not name: admitted as before.
     Owner,

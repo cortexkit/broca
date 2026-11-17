@@ -1,6 +1,6 @@
 use super::*;
 use broca_protocol::RunFinishReason;
-use broca_wal::WalRecord;
+use broca_session_store::record::Record;
 
 fn sender_plan(interrupt: bool) -> Value {
     let mut plan = plan(&["work"], "system");
@@ -60,7 +60,7 @@ async fn stop(rig: &mut Rig, run: &str, at: Option<&str>) -> Frame {
 }
 
 async fn refused(rig: &mut Rig, run: &str, at: Option<&str>) {
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let reply = stop(rig, run, at).await;
     assert_eq!(reply.header.ty, FrameType::Error, "{reply:?}");
     let error: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -70,7 +70,7 @@ async fn refused(rig: &mut Rig, run: &str, at: Option<&str>) {
         "{error}"
     );
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         before,
         "refused cancellation wrote history"
     );
@@ -103,13 +103,11 @@ async fn assert_cancelled(rig: &mut Rig, run: &str) {
     assert_eq!(result(&reply)["state"], "cancelled");
     assert_eq!(
         rig.records()
+            .await
             .iter()
             .filter(|r| matches!(
                 r,
-                WalRecord::RunFinished {
-                    reason: RunFinishReason::Cancelled,
-                    ..
-                }
+                Record::RunEnd(end) if end.reason == RunFinishReason::Cancelled
             ))
             .count(),
         1
@@ -122,12 +120,12 @@ async fn interrupt_granted_sender_stops_model_and_repeated_stop_writes_no_termin
     let run = start_held(&mut rig, "held", false).await;
     assert_eq!(result(&stop(&mut rig, &run, None).await), json!("ack"));
     assert_cancelled(&mut rig, &run).await;
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     assert_eq!(
         result(&stop(&mut rig, &run, Some("now")).await),
         json!("not_active")
     );
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     rig.finish().await;
 }
 
@@ -139,10 +137,10 @@ async fn interrupt_granted_sender_stops_waiting_tool_without_resending_it() {
         result(&stop(&mut rig, &run, Some("now")).await),
         json!("ack")
     );
-    let accepted = rig.wal_bytes();
+    let accepted = rig.records().await;
     assert_eq!(result(&stop(&mut rig, &run, None).await), json!("ack"));
     assert_eq!(
-        rig.wal_bytes(),
+        rig.records().await,
         accepted,
         "an outstanding stop is idempotent"
     );
@@ -234,77 +232,6 @@ async fn another_sessions_sender_is_refused_without_writes() {
     other.finish().await;
 }
 
-fn accepted_stop_prefix(bytes: &[u8]) -> Vec<u8> {
-    let mut at = 0;
-    while at + 53 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        let end = at + 53 + len;
-        assert!(end <= bytes.len());
-        if bytes[at + 4] != 2 {
-            let payload: Value = serde_json::from_slice(&bytes[at + 53..end]).unwrap();
-            let record = if bytes[at + 4] == 3 {
-                &payload["record"]
-            } else {
-                &payload
-            };
-            if record["type"] == "run_cancel_requested" {
-                return bytes[..end].to_vec();
-            }
-        }
-        at = end;
-    }
-    panic!("ack must follow a durable cancel request");
-}
-
-#[tokio::test]
-async fn crash_after_sender_stop_acceptance_recovers_one_terminal_and_never_resends_call() {
-    let mut rig = ready_sender("sender-stop-crash", true).await;
-    let run = start_held(&mut rig, "held", true).await;
-    assert_eq!(result(&stop(&mut rig, &run, None).await), json!("ack"));
-    let prefix = accepted_stop_prefix(&rig.wal_bytes());
-    rig.finish().await;
-
-    // Replay the accepted stop's WAL prefix into a fresh SQLite-backed rig, with no
-    // cached run status or terminal. Recovery must close the run from the durable request
-    // without dispatching the tool again.
-    let dir = broca_test_support::scratch_root()
-        .join(format!("sender-stop-recovered-{}", std::process::id()));
-    broca_test_support::remove_rig_dir(&dir);
-    let mut recovered = Rig::open_fixture(dir.clone()).await;
-    recovered.seed_fixture_wal(&prefix);
-    recovered
-        .bind_as(
-            7,
-            Some(Principal::Reserved {
-                module_id: "owner".into(),
-            }),
-        )
-        .await;
-    bind_phone(&mut recovered).await;
-    assert_cancelled(&mut recovered, &run).await;
-    assert!(recovered.script.dispatched.lock().unwrap().is_empty());
-    assert!(recovered.script.prompts.lock().unwrap().is_empty());
-    assert_eq!(
-        result(&stop(&mut recovered, &run, None).await),
-        json!("not_active")
-    );
-    assert_eq!(
-        recovered
-            .records()
-            .iter()
-            .filter(|r| matches!(
-                r,
-                WalRecord::RunFinished {
-                    reason: RunFinishReason::Cancelled,
-                    ..
-                }
-            ))
-            .count(),
-        1
-    );
-    recovered.finish().await;
-}
-
 async fn unlisted_cancel_at_is_read_only(channel: u16, tag: &str) {
     let mut rig = Rig::start(tag).await;
     rig.bind_as(
@@ -333,35 +260,9 @@ async fn unlisted_cancel_at_is_read_only(channel: u16, tag: &str) {
     let before_transcript = call(&mut rig, "session.read", json!({"limit":500}))
         .await
         .body;
-    let before_records = rig
-        .registry()
-        .read_durable_wal(&rig.session)
-        .await
-        .unwrap()
-        .0;
-    let before_records = serde_json::to_vec(
-        &before_records
-            .iter()
-            .map(|frame| (frame.seq, &frame.record))
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let before_wal = rig.wal_bytes();
+    let before_wal = rig.records().await;
     let reply = rig.request(channel, json!({"method":"run.cancel","params":{"run_id":run,"at":"not-a-declared-cancellation-point"}})).await;
-    let after_wal = rig.wal_bytes();
-    let after_records = rig
-        .registry()
-        .read_durable_wal(&rig.session)
-        .await
-        .unwrap()
-        .0;
-    let after_records = serde_json::to_vec(
-        &after_records
-            .iter()
-            .map(|frame| (frame.seq, &frame.record))
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
+    let after_wal = rig.records().await;
     let after_head = call(&mut rig, "session.head", json!({})).await.body;
     let after_result = call(&mut rig, "run.result", json!({"run_id":run}))
         .await
@@ -375,12 +276,8 @@ async fn unlisted_cancel_at_is_read_only(channel: u16, tag: &str) {
     rig.finish().await;
     assert_eq!(reply.header.ty, FrameType::Error, "{reply:?}");
     assert_eq!(
-        after_records, before_records,
-        "unlisted at changed durable run records"
-    );
-    assert_eq!(
         after_wal, before_wal,
-        "unlisted at changed physical WAL bytes"
+        "unlisted at changed the session's records"
     );
     assert_eq!(
         after_transcript, before_transcript,

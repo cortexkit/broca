@@ -749,11 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn shipping_build_wires_the_bus_publisher_on_both_storages() {
+    fn shipping_build_wires_the_bus_publisher() {
         let main = include_str!("../../broca-module-serve/src/main.rs");
         assert!(main.contains("StepEvents::start_on_bus"));
         assert!(main.contains(".with_step_events("));
-        assert!(include_str!("opener.rs").contains("events.observe(observer)"));
         assert!(include_str!("opener.rs").contains("self.step_events.as_deref()"));
     }
 

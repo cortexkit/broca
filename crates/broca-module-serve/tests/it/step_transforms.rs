@@ -3,7 +3,7 @@ use crate::delivery_rig::{result, Rig, Step};
 use crate::step_transform_rig::*;
 use broca_protocol::content::{ContentBlock, ToolCall, ToolOutput, ToolResult};
 use broca_protocol::ToolCallId;
-use broca_wal::WalRecord;
+use broca_session_store::record::Record;
 use cortexkit_role_step_transform_provider::answer::{HookAnswer, Operation};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -200,11 +200,90 @@ async fn finish(rig: Rig, daemon: Daemon) {
     daemon.finish().await;
     rig.finish().await;
 }
-fn values(records: &[WalRecord]) -> Vec<Value> {
-    records
-        .iter()
-        .map(|r| serde_json::to_value(r).unwrap())
-        .collect()
+/// The session's records these tests assert on, each as one JSON object whose `type` names it:
+/// a run's start (with the input its run placed) and end, a queued send and a steer (with their
+/// receipt's hooks), a step's end (with the answer it wrote), a dispatch intent, and a call's
+/// outcome, split into `tool_not_dispatched` (with its reason) and `tool_outcome` (with its
+/// stored result). Other records are left out.
+fn values(records: &[Record]) -> Vec<Value> {
+    let receipt_hooks = |receipt: &Option<broca_protocol::json::Json>| {
+        receipt
+            .as_ref()
+            .map(|receipt| receipt.parse()["hooks"].clone())
+            .unwrap_or(Value::Null)
+    };
+    let json = |value: &Option<broca_protocol::json::Json>| {
+        value.as_ref().map(Value::from).unwrap_or(Value::Null)
+    };
+    let mut out = Vec::new();
+    for (at, record) in records.iter().enumerate() {
+        let view = match record {
+            Record::RunStart(start) => {
+                let input: Vec<_> = records[at..]
+                    .iter()
+                    .filter_map(|record| match record {
+                        Record::Input(input) if input.run_id == start.run_id => {
+                            Some(serde_json::to_value(input.message.as_ref()).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                json!({"type":"run_start","run_id":start.run_id,"input":input,"hooks":start.hooks})
+            }
+            Record::RunEnd(end) => {
+                json!({"type":"run_end","reason":end.reason,"error":json(&end.error)})
+            }
+            Record::QueuedSend(send) => json!({
+                "type":"queued_send","input":send.input,"hooks":receipt_hooks(&send.receipt)
+            }),
+            Record::Steer(steer) => json!({
+                "type":"steer","input":steer.input,"hooks":receipt_hooks(&steer.receipt)
+            }),
+            Record::StepEnd(end) => {
+                let message = records[..at].iter().rev().find_map(|record| match record {
+                    Record::Assistant(assistant) if assistant.step_id == end.step_id => {
+                        Some(serde_json::to_value(assistant.message.as_ref()).unwrap())
+                    }
+                    _ => None,
+                });
+                let mut view = json!({"type":"step_end","assistant_message":message});
+                if let Some(hooks) = &end.hooks {
+                    view["hooks"] = Value::from(hooks);
+                }
+                view
+            }
+            Record::ToolIntent(intent) => json!({
+                "type":"tool_intent","tool_call_id":intent.tool_call_id.0,
+                "args":json(&intent.args),"hooks":json(&intent.hooks)
+            }),
+            Record::ToolOutcome(outcome)
+                if outcome.outcome == broca_session_store::record::CallOutcome::NotDispatched =>
+            {
+                json!({
+                    "type":"tool_not_dispatched","tool_call_id":outcome.tool_call_id.0,
+                    "reason":json(&outcome.detail),"hooks":json(&outcome.hooks)
+                })
+            }
+            Record::ToolOutcome(outcome) => {
+                let result = records.iter().find_map(|record| match record {
+                    Record::ToolReply(reply)
+                        if reply.result.tool_call_id == outcome.tool_call_id =>
+                    {
+                        Some(serde_json::to_value(&reply.result).unwrap())
+                    }
+                    _ => None,
+                });
+                json!({
+                    "type":"tool_outcome","tool_call_id":outcome.tool_call_id.0,
+                    "outcome":outcome.outcome,"reason":outcome.reason,"detail":json(&outcome.detail),
+                    "hooks":json(&outcome.hooks),"result":result
+                })
+            }
+            _ => continue,
+        };
+        out.push(view);
+    }
+    out
 }
 fn only<'a>(records: &'a [Value], kind: &str) -> &'a Value {
     let matches: Vec<_> = records.iter().filter(|r| r["type"] == kind).collect();
@@ -307,9 +386,7 @@ async fn post_assistant_routes_text_only_and_publishes_final_values() {
     let message = records
         .iter()
         .find_map(|r| match r {
-            WalRecord::ModelStepFinished {
-                assistant_message, ..
-            } => Some(assistant_message),
+            Record::Assistant(assistant) => Some(assistant.message.as_ref()),
             _ => None,
         })
         .unwrap();
@@ -351,8 +428,12 @@ async fn post_assistant_routes_text_only_and_publishes_final_values() {
     assert!(
         records
             .iter()
-            .rfind(|r| matches!(r, WalRecord::ModelStepFinished { .. }))
-            .is_some_and(|r| serde_json::to_value(r).unwrap().get("hooks").is_none()),
+            .rev()
+            .find_map(|r| match r {
+                Record::StepEnd(end) => Some(end.hooks.is_none()),
+                _ => None,
+            })
+            .unwrap_or(false),
         "all-pass step carries no hooks"
     );
     finish(rig, daemon).await;
@@ -385,7 +466,7 @@ async fn pre_tool_mutation_is_dispatched_but_original_is_rendered() {
     ]);
     result(&send(&mut rig, "first", Some(&plan), None).await);
     let records = values(&rig.wait_for_finished(1).await);
-    let intent = only(&records, "tool_dispatch_intent");
+    let intent = only(&records, "tool_intent");
     assert_eq!(intent["args"], json!({"value":"changed"}));
     assert_eq!(intent["hooks"]["original"], json!({"value":"model"}));
     assert_eq!(intent["hooks"]["ops"][0]["phase"], "mutate");
@@ -434,7 +515,7 @@ async fn invalid_mutation_has_one_mutate_no_validate_and_hookless_replay() {
     ]);
     result(&send(&mut rig, "first", Some(&plan), None).await);
     let records = values(&rig.wait_for_finished(1).await);
-    let terminal = only(&records, "tool_no_dispatch");
+    let terminal = only(&records, "tool_not_dispatched");
     assert_eq!(terminal["reason"]["kind"], "validation_failed");
     assert_eq!(terminal["hooks"]["original"], json!({"value":"model"}));
     assert_eq!(
@@ -448,10 +529,10 @@ async fn invalid_mutation_has_one_mutate_no_validate_and_hookless_replay() {
         [("pre_tool:mutate".into(), 1)].into_iter().collect()
     );
     state.clear();
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     result(&send(&mut rig, "first", Some(&plan), None).await);
     assert!(state.hooks().is_empty());
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     finish(rig, daemon).await;
 }
 
@@ -475,7 +556,7 @@ async fn approval_denies_mutated_input_before_validate() {
     ]);
     result(&send(&mut rig, "first", Some(&plan), None).await);
     let records = values(&rig.wait_for_finished(1).await);
-    let terminal = only(&records, "tool_no_dispatch");
+    let terminal = only(&records, "tool_not_dispatched");
     assert_eq!(terminal["reason"]["kind"], "denied");
     assert_eq!(terminal["hooks"]["final"], json!({"value":"denied"}));
     assert!(rig.script.dispatched.lock().unwrap().is_empty());
@@ -512,14 +593,14 @@ async fn validate_sees_approved_narrowing_and_denial_does_not_cancel_siblings() 
     let records = values(&rig.wait_for_finished(1).await);
     let denied: Vec<_> = records
         .iter()
-        .filter(|r| r["type"] == "tool_result" && r["result"]["tool_call_id"] == "deny")
+        .filter(|r| r["type"] == "tool_outcome" && r["result"]["tool_call_id"] == "deny")
         .collect();
     assert_eq!(denied.len(), 1);
     assert_eq!(denied[0]["reason"], "pre_tool_denied");
     assert!(denied[0].to_string().contains("provider says no"));
     assert!(records
         .iter()
-        .all(|r| !(r["type"] == "tool_dispatch_intent" && r["tool_call_id"] == "deny")));
+        .all(|r| !(r["type"] == "tool_intent" && r["tool_call_id"] == "deny")));
     assert_eq!(*rig.script.dispatched.lock().unwrap(), vec!["allow"]);
     assert_eq!(state.hooks().len(), 2);
     finish(rig, daemon).await;
@@ -553,7 +634,7 @@ async fn post_tool_replace_requires_frozen_grant() {
         rig.script.push(&[Step::Call("c"), Step::Text("done")]);
         result(&send(&mut rig, "first", Some(&plan), None).await);
         let records = values(&rig.wait_for_finished(1).await);
-        let result = only(&records, "tool_result");
+        let result = only(&records, "tool_outcome");
         if grants {
             assert_eq!(result["result"]["output"]["text"], "replacement");
             assert_eq!(
@@ -648,7 +729,7 @@ async fn each_hook_budget_includes_route_open_and_hanging_provider() {
             records
                 .iter()
                 .any(|r| r.to_string().contains("unavailable")),
-            "{hook} must end unavailable"
+            "{hook} must end unavailable: {records:#?}"
         );
         assert_eq!(
             state.hooks().len(),
@@ -672,26 +753,23 @@ async fn pre_user_steer_queue_and_keyed_retries_transform_once() {
         .push(&[Step::Text("done"), Step::Text("queued done")]);
     result(&send(&mut rig, "first", Some(&plan), None).await);
     rig.wait_entered().await;
-    for (id, delivery) in [("steer", "steer"), ("queued", "queue")] {
+    for (id, delivery) in [("steer", "steer"), ("queued_send", "queue")] {
         result(&send(&mut rig, id, Some(&plan), Some(delivery)).await);
-        let bytes = rig.wal_bytes();
+        let bytes = rig.records().await;
         result(&send(&mut rig, id, Some(&plan), Some(delivery)).await);
-        assert_eq!(rig.wal_bytes(), bytes);
+        assert_eq!(rig.records().await, bytes);
     }
     assert_eq!(state.hooks().len(), 3);
     rig.script.hold_model(false);
     let records = values(&rig.wait_for_finished(2).await);
-    let queued = only(&records, "queued");
+    let queued = only(&records, "queued_send");
     assert_eq!(
         queued["hooks"]["final"][0]["content"][0]["text"],
         "input-once"
     );
-    let drained = records
-        .iter()
-        .rfind(|r| r["type"] == "run_started")
-        .unwrap();
+    let drained = records.iter().rfind(|r| r["type"] == "run_start").unwrap();
     assert_eq!(drained["input"], queued["hooks"]["final"]);
-    assert_eq!(drained["hooks"]["original"], queued["request"]["input"]);
+    assert_eq!(drained["hooks"]["original"], queued["input"]);
     assert_eq!(
         state.hooks().len(),
         3,
@@ -700,7 +778,7 @@ async fn pre_user_steer_queue_and_keyed_retries_transform_once() {
     for (id, delivery) in [
         ("first", None),
         ("steer", Some("steer")),
-        ("queued", Some("queue")),
+        ("queued_send", Some("queue")),
     ] {
         result(&send(&mut rig, id, Some(&plan), delivery).await);
     }
@@ -724,13 +802,13 @@ async fn pre_user_refused_interrupt_does_not_write_or_stop_running_run() {
     rig.wait_entered().await;
     state.never.lock().unwrap().insert("pre_user".into());
     for delivery in ["steer", "queue", "interrupt"] {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let frame = send(&mut rig, delivery, Some(&plan), Some(delivery)).await;
         let error: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(frame.header.ty, subc_protocol::FrameType::Error);
         assert_eq!(error["code"], "pre_user_unavailable");
         assert_eq!(error["detail"]["provider"], MODULE);
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         let status = result(
             &rig.request(7, json!({"method":"run.status","params":{}}))
                 .await,
@@ -757,7 +835,8 @@ async fn pre_user_steer_falling_back_to_queue_keeps_one_suffix() {
     state.held.lock().unwrap().insert("pre_user".into());
     let shared = state.clone();
     let script = rig.script.clone();
-    let path = rig.wal_path.clone();
+    let runtime = rig.registry().store_runtime().unwrap();
+    let key = rig.session.clone();
     let release = tokio::spawn(async move {
         shared.entered.notified().await;
         script.hold_model(false);
@@ -765,18 +844,22 @@ async fn pre_user_steer_falling_back_to_queue_keeps_one_suffix() {
             "pre_user_steer_falling_back_to_queue_keeps_one_suffix",
             async {
                 loop {
-                    let records =
-                        broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-                    if records
-                        .iter()
-                        .any(|f| matches!(f.record, WalRecord::RunFinished { .. }))
-                    {
+                    let ended = match runtime.current_view(&key).await {
+                        Ok(Some(view)) => view
+                            .open_log_records()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .any(|(_, record)| matches!(record, Record::RunEnd(_))),
+                        _ => false,
+                    };
+                    if ended {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             },
-            || format!("WAL bytes={:?}", std::fs::metadata(&path).map(|m| m.len())),
+            || "the first run never ended".to_owned(),
         )
         .await
         .unwrap();
@@ -786,7 +869,7 @@ async fn pre_user_steer_falling_back_to_queue_keeps_one_suffix() {
     result(&send(&mut rig, "fallback", Some(&plan), Some("steer")).await);
     release.await.unwrap();
     let records = values(&rig.wait_for_finished(2).await);
-    let queued = only(&records, "queued");
+    let queued = only(&records, "queued_send");
     assert_eq!(
         queued["hooks"]["final"][0]["content"][0]["text"],
         "input-once"
@@ -862,7 +945,8 @@ async fn post_tool_excludes_tool_no_dispatch() {
         .wait_for_finished(1)
         .await
         .iter()
-        .any(|r| matches!(r, WalRecord::ToolNoDispatch { .. })));
+        .any(|r| matches!(r, Record::ToolOutcome(outcome)
+            if outcome.outcome == broca_session_store::record::CallOutcome::NotDispatched)));
     assert!(state.hooks().is_empty());
     finish(rig, daemon).await;
 }
@@ -925,7 +1009,7 @@ async fn post_tool_excludes_pre_tool_unavailable() {
     let records = values(&rig.wait_for_finished(1).await);
     // The call ends unavailable and is never dispatched, so post_tool has no subject.
     assert_eq!(
-        only(&records, "tool_result")["reason"],
+        only(&records, "tool_outcome")["reason"],
         "pre_tool_unavailable"
     );
     assert!(rig.script.dispatched.lock().unwrap().is_empty());
@@ -967,7 +1051,7 @@ async fn post_tool_excludes_structured_json_between_caps() {
     let recorded = records
         .iter()
         .find_map(|r| match r {
-            WalRecord::ToolResult { result, .. } => Some(&result.output),
+            Record::ToolReply(reply) => Some(&reply.result.output),
             _ => None,
         })
         .unwrap();
@@ -992,9 +1076,7 @@ async fn cancellation_during_pre_tool_writes_no_intent_for_any_call() {
     state.entered.notified().await;
     rig.cancel(admitted["run_id"].as_str().unwrap()).await;
     let records = rig.wait_for_finished(1).await;
-    assert!(records
-        .iter()
-        .all(|r| !matches!(r, WalRecord::ToolDispatchIntent { .. })));
+    assert!(records.iter().all(|r| !matches!(r, Record::ToolIntent(_))));
     assert!(rig.script.dispatched.lock().unwrap().is_empty());
     assert_eq!(*rig.script.batch_finishes.lock().unwrap(), 1);
     assert_eq!(
@@ -1004,13 +1086,15 @@ async fn cancellation_during_pre_tool_writes_no_intent_for_any_call() {
     finish(rig, daemon).await;
 }
 
+/// The runner shuts down while `hook`'s provider never answers: the run's stop ends the hook as
+/// unavailable, and the step or call keeps what `policy` says an unavailable hook leaves, written
+/// once, before the run's terminal.
 async fn seal_at_hook(hook: &str, policy: &str, parallel: bool) {
     let (mut rig, daemon, state, plan) = start(
         &format!("seal-{hook}-{policy}-{parallel}"),
         vec![subscription(hook, None, policy, 30000)],
     )
     .await;
-    *rig.script.ignore_graceful_stop.lock().unwrap() = true;
     state.never.lock().unwrap().insert(hook.into());
     rig.script.push(&[if hook == "post_assistant" {
         Step::Text("billed")
@@ -1022,20 +1106,20 @@ async fn seal_at_hook(hook: &str, policy: &str, parallel: bool) {
     result(&send(&mut rig, "first", Some(&plan), None).await);
     state.entered.notified().await;
     assert!(rig.registry().stop_and_seal().await);
-    let records = values(&rig.records());
+    let records = values(&rig.records().await);
     assert_eq!(
         records.last().unwrap()["type"],
-        "run_finished",
+        "run_end",
         "seal never permits writes after the terminal"
     );
     if hook == "post_assistant" {
-        let step = only(&records, "model_step_finished");
+        let step = only(&records, "step_end");
         assert_eq!(step["assistant_message"]["content"][0]["text"], "billed");
         assert_eq!(step["hooks"]["unavailable"], json!([MODULE]));
     } else {
         let results: Vec<_> = records
             .iter()
-            .filter(|r| r["type"] == "tool_result")
+            .filter(|r| r["type"] == "tool_outcome")
             .collect();
         assert_eq!(results.len(), if parallel { 2 } else { 1 });
         for r in results {
@@ -1051,19 +1135,19 @@ async fn seal_at_hook(hook: &str, policy: &str, parallel: bool) {
     finish(rig, daemon).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actor_seal_during_post_assistant_records_one_billed_fallback() {
+async fn shutdown_during_post_assistant_records_one_billed_fallback() {
     seal_at_hook("post_assistant", "pass", false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actor_seal_during_post_tool_pass_records_one_fallback() {
+async fn shutdown_during_post_tool_pass_records_one_fallback() {
     seal_at_hook("post_tool", "pass", false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actor_seal_during_post_tool_refuse_withholds_executed_output() {
+async fn shutdown_during_post_tool_refuse_withholds_executed_output() {
     seal_at_hook("post_tool", "refuse", false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actor_seal_parallel_post_tool_writes_two_fallbacks_once() {
+async fn shutdown_during_parallel_post_tool_writes_two_fallbacks_once() {
     seal_at_hook("post_tool", "pass", true).await;
 }
 
@@ -1084,8 +1168,8 @@ async fn paused_restart_steer_and_retry_call_pre_user_once() {
     *state.refuse_declare.lock().unwrap() = true;
     let receipt = result(&send(&mut rig, "steer", Some(&plan), Some("steer")).await);
     assert_eq!(receipt["state"], "paused");
-    let records = values(&rig.records());
-    let steered = only(&records, "steered");
+    let records = values(&rig.records().await);
+    let steered = only(&records, "steer");
     assert_eq!(steered["input"][0]["content"][0]["text"], "input-once");
     assert_eq!(state.hooks().len(), 2);
     result(&send(&mut rig, "steer", Some(&plan), Some("steer")).await);
@@ -1104,7 +1188,7 @@ async fn queued_restart_drains_frozen_final_without_declare_or_pre_user() {
     rig.script.hold_model(true);
     result(&send(&mut rig, "first", Some(&plan), None).await);
     rig.wait_entered().await;
-    result(&send(&mut rig, "queued", Some(&plan), Some("queue")).await);
+    result(&send(&mut rig, "queued_send", Some(&plan), Some("queue")).await);
     assert_eq!(state.hooks().len(), 2);
     assert!(rig.registry().stop_and_seal().await);
     let mut rig = rig.restart().await;
@@ -1113,16 +1197,13 @@ async fn queued_restart_drains_frozen_final_without_declare_or_pre_user() {
     *state.refuse_declare.lock().unwrap() = true;
     rig.registry().actor_for(&rig.session).await.unwrap();
     let records = values(&rig.wait_for_finished(2).await);
-    let queued = only(&records, "queued");
-    let started = records
-        .iter()
-        .rfind(|r| r["type"] == "run_started")
-        .unwrap();
+    let queued = only(&records, "queued_send");
+    let started = records.iter().rfind(|r| r["type"] == "run_start").unwrap();
     assert_eq!(started["input"], queued["hooks"]["final"]);
-    assert_eq!(started["hooks"]["original"], queued["request"]["input"]);
+    assert_eq!(started["hooks"]["original"], queued["input"]);
     assert!(state.hooks().is_empty());
     assert_eq!(state.declares(), 0);
-    result(&send(&mut rig, "queued", Some(&plan), Some("queue")).await);
+    result(&send(&mut rig, "queued_send", Some(&plan), Some("queue")).await);
     assert!(state.hooks().is_empty());
     finish(rig, daemon).await;
 }
@@ -1145,10 +1226,8 @@ async fn post_tool_excludes_interrupted_batch_closures() {
     let records = rig.wait_for_finished(1).await;
     assert!(records.iter().any(|r| matches!(
         r,
-        WalRecord::ToolResult {
-            outcome: broca_wal::DispatchOutcome::Interrupted,
-            ..
-        }
+        Record::ToolOutcome(outcome)
+            if outcome.outcome == broca_session_store::record::CallOutcome::Interrupted
     )));
     assert_eq!(
         state.counts(),
@@ -1167,7 +1246,6 @@ async fn cancel_pass_then_refuse(seal: bool) {
         vec![subscription("post_tool", None, "pass", 30000)],
     )
     .await;
-    *rig.script.ignore_graceful_stop.lock().unwrap() = seal;
     let later = "later-refuse";
     let second = State::new(vec![subscription("post_tool", None, "refuse", 30000)]);
     let serving = register_as(&daemon.connection_file, later, second.clone()).await;
@@ -1202,8 +1280,8 @@ async fn cancel_pass_then_refuse(seal: bool) {
         rig.cancel(admitted["run_id"].as_str().unwrap()).await;
         rig.wait_for_finished(1).await;
     }
-    let records = values(&rig.records());
-    let result = only(&records, "tool_result");
+    let records = values(&rig.records().await);
+    let result = only(&records, "tool_outcome");
     assert_eq!(result["reason"], "post_tool_unavailable");
     assert!(result.to_string().contains(later));
     assert!(result.to_string().contains("executed"));
@@ -1212,7 +1290,7 @@ async fn cancel_pass_then_refuse(seal: bool) {
         second.hooks().is_empty(),
         "cancellation never calls an unanswered later provider"
     );
-    assert_eq!(records.last().unwrap()["type"], "run_finished");
+    assert_eq!(records.last().unwrap()["type"], "run_end");
     serving.abort();
     finish(rig, daemon).await;
 }
@@ -1221,7 +1299,7 @@ async fn stop_during_post_tool_pass_then_refuse_withholds_naming_later_provider(
     cancel_pass_then_refuse(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actor_seal_during_post_tool_pass_then_refuse_withholds_naming_later_provider() {
+async fn shutdown_during_post_tool_pass_then_refuse_withholds_naming_later_provider() {
     cancel_pass_then_refuse(true).await;
 }
 
@@ -1238,7 +1316,7 @@ async fn stop_during_post_assistant_keeps_billed_step_and_marks_unavailable() {
     state.entered.notified().await;
     rig.cancel(admitted["run_id"].as_str().unwrap()).await;
     let records = values(&rig.wait_for_finished(1).await);
-    let step = only(&records, "model_step_finished");
+    let step = only(&records, "step_end");
     assert_eq!(step["assistant_message"]["content"][0]["text"], "billed");
     assert_eq!(step["hooks"]["unavailable"], json!([MODULE]));
     assert_eq!(state.hooks().len(), 1);
@@ -1256,7 +1334,7 @@ async fn caller_cancel_during_pre_user_discards_send_without_interrupting_run() 
     rig.wait_entered().await;
     state.entered.notified().await;
     state.never.lock().unwrap().insert("pre_user".into());
-    let before = rig.wal_bytes();
+    let before = rig.records().await;
     let registry = rig.registry().clone();
     let key = rig.session.clone();
     let request=serde_json::from_value(json!({"model":{"provider_module_id":"fake","model_id":"fake"},"input":[{"role":"user","content":[{"type":"text","text":"cancelled"}]}]})).unwrap();
@@ -1287,7 +1365,7 @@ async fn caller_cancel_during_pre_user_discards_send_without_interrupting_run() 
         status,
         broca_module::actor::LineageStatus::Active { .. }
     ));
-    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(rig.records().await, before);
     assert_eq!(state.hooks().len(), 2);
     rig.script.hold_model(false);
     rig.wait_for_finished(1).await;
@@ -1316,7 +1394,7 @@ async fn all_pass_post_assistant_emits_no_display_reset() {
         )
         .await;
     let records = values(&rig.wait_for_finished(1).await);
-    assert!(only(&records, "model_step_finished").get("hooks").is_none());
+    assert!(only(&records, "step_end").get("hooks").is_none());
     let stream = serde_json::to_string(&hook_display_frames(&frames)).unwrap();
     assert!(stream.contains("unchanged"));
     assert!(!stream.contains("display_reset"));

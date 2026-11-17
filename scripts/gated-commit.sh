@@ -77,7 +77,14 @@ if [ "$#" -eq 0 ]; then
     local path="$1" name
     case "$path" in
       Cargo.lock|Cargo.toml) echo broca-subc ;;
-      crates/*/*) name="${path#crates/}"; printf '%s\n' "${name%%/*}" ;;
+      # A crate deleted outright has nothing left to check: naming it makes cargo refuse
+      # the whole gate as "not a member of the workspace". Its removal still changes the
+      # root manifest and lock file, which select broca-subc above.
+      crates/*/*)
+        name="${path#crates/}"
+        name="${name%%/*}"
+        if [ -f "crates/$name/Cargo.toml" ]; then printf '%s\n' "$name"; fi
+        ;;
     esac
   }
   changed_crates() {

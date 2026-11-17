@@ -30,6 +30,21 @@ crate::message! {
         5 req next_tag: u64,
         6 req next_notice_seq: u64,
         7 rep runs: String,
+        /// The deleted session's served-history counter, so a session created later at the same
+        /// address starts past it: a reader that kept the old history's version must not mistake
+        /// the new history for it. Absent on markers written before it was kept; an older build
+        /// skips it.
+        8 opt history_version: u64,
+    }
+}
+
+impl Marker {
+    /// The served-history counter a session created after this deletion starts at: one past
+    /// the deleted session's. A marker that doesn't keep that counter uses its own sequence
+    /// instead, which is one past it whenever every session at the address was created this way.
+    pub fn next_history_version(&self) -> u64 {
+        self.history_version
+            .map_or(self.seq, |version| version.saturating_add(1))
     }
 }
 

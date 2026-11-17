@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
+use broca_core::{FileLeaseStore, OutputEvent, RunError};
 use broca_protocol::provider::NormalizedEvent;
 use broca_protocol::{BindIdentity, PauseReason, SubmissionRequest};
 use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend};
@@ -42,7 +42,7 @@ use super::super::controls::Compactor;
 use super::super::media::{base64, bytes_of, image_profile, image_render_config, photo, Side, PNG};
 use super::{install_store, photo_step, text, text_step, PhotoPlane, Rendering, Sent};
 use crate::actor::SendOutcome;
-use crate::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob};
+use crate::executor::{RunExecutor, StoreRunEnd, StoreRunError, StoreRunJob};
 use crate::registry::LineageRegistry;
 
 cipher_tests!(every_record_boundary_cut_of_a_session_with_images_resumes_as_sent);
@@ -76,16 +76,6 @@ impl RunExecutor for CutExecutor {
 
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         Some(Arc::clone(&self.compactor) as Arc<dyn broca_core::CompactionPlane>)
-    }
-
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        Err(RunError::Wal(
-            "this module keeps its sessions in the new storage".into(),
-        ))
     }
 
     async fn execute_on_store(
@@ -199,7 +189,6 @@ async fn module(
     cipher: Cipher,
 ) -> (LineageRegistry, Arc<Compactor>) {
     broca_core::media_store::create_media_directories(dir).unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let compactor = Arc::new(Compactor::default());
     let executor: Arc<dyn RunExecutor> = Arc::new(CutExecutor {
         script: Arc::new(super::super::super::tests::Gated {
@@ -230,20 +219,14 @@ async fn module(
                 .unwrap()
         })
     }));
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(runtime),
-        ),
-        wal,
-        None,
-    )
-    .with_store_new_sessions();
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(runtime),
+    ));
     (registry, compactor)
 }
 
@@ -543,8 +526,7 @@ async fn expected(dir: &Path, key: &BindIdentity, cipher: Cipher) -> Expected {
 /// sessions a crash or a shutdown left unfinished, sealing crash orphans and resuming runs that
 /// paused for the restart, after enabling admission once dependency routes are ready.
 async fn restart(side: &Side) {
-    let wal: Arc<dyn broca_core::WalStore> = Arc::new(FileWalStore::new(side.dir.join("wal")));
-    side.registry.resume_restart_pauses(wal, Vec::new()).await;
+    side.registry.enable_restart_resumes();
     side.registry.recover_store_crash_orphans().await.unwrap();
 }
 

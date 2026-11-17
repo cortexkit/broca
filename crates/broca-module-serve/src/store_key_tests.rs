@@ -23,24 +23,16 @@ struct NeverRuns;
 
 #[async_trait::async_trait]
 impl broca_module::executor::RunExecutor for NeverRuns {
-    async fn execute(
-        &self,
-        _: broca_module::executor::RunJob,
-        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
-    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
-        panic!("opening a session runs nothing")
-    }
 }
 
 /// A state root holding one session in the new storage (`held`), created under
-/// [`deployment_key`], beside one on today's storage (`today`), and a registry over it whose
-/// new storage awaits its key, wired as `main` wires it.
+/// [`deployment_key`], and a registry over it whose new storage awaits its key, wired as `main`
+/// wires it.
 struct KeyRig {
     root: std::path::PathBuf,
     registry: broca_module::LineageRegistry,
     slot: Arc<broca_module::store_open::StoreSlot>,
     held: BindIdentity,
-    today: BindIdentity,
 }
 
 impl Drop for KeyRig {
@@ -55,7 +47,6 @@ async fn key_rig(name: &str) -> KeyRig {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let held = BindIdentity::new(root.join("project"), "runner", "held");
-    let today = BindIdentity::new(root.join("project"), "runner", "today");
     broca_session_store::session::Session::create(
         broca_session_store::backend::LocalBackend::new(root.join(broca_wal::SESSION_STORAGE_DIR)),
         broca_session_store::backend::SessionAddr(broca_core::session_addr(&held)),
@@ -70,26 +61,19 @@ async fn key_rig(name: &str) -> KeyRig {
     .await
     .unwrap();
     let slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(&root, 1));
-    let wal = Arc::new(FileWalStore::new(root.join("wal")));
-    let registry = broca_module::LineageRegistry::new_with_reader(
-        Arc::new(
-            broca_module::DefaultOpener::new(
-                Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
-                wal.clone(),
-                Arc::new(NeverRuns),
-            )
-            .with_idle_ttl(Duration::from_secs(600))
-            .with_store_slot(Arc::clone(&slot)),
-        ),
-        wal,
-        None,
-    );
+    let registry = broca_module::LineageRegistry::new(Arc::new(
+        broca_module::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
+            Arc::new(NeverRuns),
+        )
+        .with_idle_ttl(Duration::from_secs(600))
+        .with_store_slot(Arc::clone(&slot)),
+    ));
     KeyRig {
         root,
         registry,
         slot,
         held,
-        today,
     }
 }
 
@@ -289,17 +273,15 @@ async fn a_vault_serving_the_deployment_key_loads_it_and_a_held_session_opens() 
     daemon.assert_healthy();
 }
 
-/// WITHOUT THE RECORD, TODAY'S SESSIONS ARE SERVED AND A HELD ONE IS REFUSED, UNTIL THE KEY
-/// ARRIVES.
+/// WITHOUT THE RECORD, A HELD SESSION IS REFUSED UNTIL THE KEY ARRIVES.
 ///
 /// The vault answers `not_found`, as it does for a missing record or a missing grant. The
-/// module keeps serving today's sessions, refuses the held one `key_unavailable` (transient),
-/// never reports the read to the vault as an auth failure, and keeps reading. Once the record
-/// exists the key loads and the held session is served, with no restart; the loader opens the
-/// session refused meanwhile, so the recovery its open runs isn't left for its next command.
+/// module refuses the held session `key_unavailable` (transient), never reports the read to the
+/// vault as an auth failure, and keeps reading. Once the record exists the key loads and the
+/// held session is served, with no restart; the loader opens the session refused meanwhile, so
+/// the recovery its open runs isn't left for its next command.
 #[tokio::test]
-async fn with_the_record_missing_todays_sessions_are_served_and_the_key_arriving_later_serves_the_held_session(
-) {
+async fn with_the_record_missing_a_held_session_is_refused_until_the_key_arrives() {
     let rig = key_rig("later").await;
     let daemon = CapturingVaultDaemon::start(&rig.root).await;
     let loading = tokio::spawn(rig.loader(&daemon).await.run(rig.registry.clone()));
@@ -311,18 +293,7 @@ async fn with_the_record_missing_todays_sessions_are_served_and_the_key_arriving
     })
     .await;
     assert!(!rig.slot.key_loaded());
-    rig.registry
-        .actor_for(&rig.today)
-        .await
-        .expect("today's session is served without the key");
     assert_key_unavailable(rig.open_held().await);
-    assert!(
-        !rig.root
-            .join("wal")
-            .join(format!("{}.wal", broca_core::session_addr(&rig.held)))
-            .exists(),
-        "the held session was not served from today's storage"
-    );
     assert!(
         daemon
             .requests()

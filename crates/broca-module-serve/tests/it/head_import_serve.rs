@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
-use broca_module::executor::{RunExecutor, RunJob};
+use broca_core::{FileLeaseStore, OutputEvent};
+use broca_module::executor::RunExecutor;
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
 use broca_session_loop::Writer as _;
@@ -56,13 +56,6 @@ impl RunExecutor for HeadRunner {
         _: &cortexkit_role_llm_runner::head_selection::PlanModel,
     ) -> Option<String> {
         Some("openai".into())
-    }
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("an import runs no model step")
     }
 
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
@@ -261,12 +254,10 @@ impl Rig {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let runner = HeadRunner::default();
         let executor: Arc<dyn RunExecutor> = Arc::new(runner.clone());
         let mut opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
             executor.clone(),
         );
         let mut runtime = None;
@@ -284,11 +275,8 @@ impl Rig {
             opener = opener.with_store_runtime(opened.clone());
             runtime = Some(opened);
         }
-        let mut registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+        let registry = LineageRegistry::new(Arc::new(opener));
         if let Some(runtime) = runtime {
-            registry = registry.with_store_new_sessions();
-            // Moves are refused by precondition 1 until the new storage serves every
-            // operation the move requires, read from the serve layer's own allowlist.
             registry.set_store_restorer(Arc::new(
                 broca_module_serve::store_restore::StoreRestore::new(
                     registry.clone(),
@@ -297,15 +285,6 @@ impl Rig {
                     Arc::new(FileLeaseStore::new(dir.join("leases"))),
                 ),
             ));
-            let mover = broca_module_serve::store_move::StoreMove::new(
-                registry.clone(),
-                &dir,
-                Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
-                wal,
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                broca_module_serve::store_move::served_by_serve_layer(),
-            );
-            registry.set_store_mover(Arc::new(mover));
         }
         // A bind resolves the session's address through the deployment's inventory, which
         // today's store keeps.
@@ -1742,29 +1721,6 @@ async fn an_import_from_outside_the_import_folder_is_refused_through_serve() {
     );
 }
 
-/// A module without the new storage refuses a file import and a view install by name, and an
-/// inline-message import still reaches today's import.
-#[tokio::test]
-async fn a_module_without_the_new_storage_refuses_file_imports_by_name() {
-    let mut rig = Rig::start("no-store", false).await;
-    rig.bind(1, core(), Some(stamp(core()))).await;
-    let params = rig.import_params("imp-1");
-    assert_eq!(
-        rig.refused(1, "session.import", params).await,
-        "new_storage_unavailable"
-    );
-    assert_eq!(
-        rig.refused(
-            1,
-            "session.install_view",
-            serde_json::json!({"view": view(1)})
-        )
-        .await,
-        "new_storage_unavailable"
-    );
-    assert!(rig.import_folder().join("imp-1.json").exists());
-}
-
 /// On a session kept in the new storage, an op with no store implementation yet is refused by
 /// name before authorization reads anything, never with today's storage's advice to run a newer
 /// build. `run.tool_calls` and `session.baseline` are served from the store: a run the session
@@ -1799,12 +1755,6 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     // once the import's own run has ended.
     let idle = rig.result(1, "run.status", serde_json::json!({})).await;
     assert_eq!(idle, serde_json::json!({"state": "idle"}));
-    // Moving a session to the store is not served when the session is already kept there.
-    assert_eq!(
-        rig.refused(1, "session.move_to_store", serde_json::json!({}))
-            .await,
-        "not_served_on_new_storage"
-    );
     let describe = rig
         .request(
             1,
@@ -1853,72 +1803,6 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     );
 }
 
-/// `session.move_to_store` through real dispatch. Only the operator's own connection may call
-/// it. The new storage serves every operation a move requires, so precondition 1 passes; a
-/// session with no WAL on today's storage then has nothing to move, and the move refuses
-/// `not_movable {no_live_wal}`, writing nothing. The operator's `class` param reaches the move
-/// when it is `"durable"` and is refused `invalid_params` otherwise. The full move is
-/// `store_move_serve::a_live_session_moves_to_the_new_storage_and_keeps_serving`.
-#[tokio::test]
-async fn a_move_is_operator_only_and_refuses_a_session_with_no_wal() {
-    let mut rig = Rig::start("move-to-store", true).await;
-    rig.bind(1, core(), None).await;
-    assert_eq!(
-        rig.refused(1, "session.move_to_store", serde_json::json!({}))
-            .await,
-        "operator_required"
-    );
-    rig.bind(2, Principal::Direct, None).await;
-    let reply = rig
-        .request(
-            2,
-            serde_json::json!({"method": "session.move_to_store", "params": {}}),
-        )
-        .await;
-    assert_eq!(reply.header.ty, FrameType::Error);
-    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
-    let served = broca_module_serve::store_move::served_by_serve_layer();
-    assert!(
-        broca_module_serve::store_move::REQUIRED_OPERATIONS
-            .iter()
-            .all(|op| served(op)),
-        "the new storage serves every operation a move requires"
-    );
-    assert_eq!(body["code"], "not_movable", "{body}");
-    assert_eq!(body["detail"]["reason"], "no_live_wal", "{body}");
-    assert!(
-        !broca_wal::session_storage_moves(&rig.dir)
-            .join(broca_wal::MOVE_JOURNAL_DIR)
-            .exists(),
-        "a refused move writes no journal"
-    );
-    // The operator may ask for the durable root; the request reaches the move, which refuses
-    // for the missing WAL as before. Any other class is refused before the move starts.
-    let durable = rig
-        .request(
-            2,
-            serde_json::json!({"method": "session.move_to_store", "params": {"class": "durable"}}),
-        )
-        .await;
-    let body: serde_json::Value = serde_json::from_slice(&durable.body).unwrap();
-    assert_eq!(body["detail"]["reason"], "no_live_wal", "{body}");
-    for class in [
-        serde_json::json!("ordinary"),
-        serde_json::json!("ephemeral"),
-        serde_json::json!(true),
-    ] {
-        let refused = rig
-            .request(
-                2,
-                serde_json::json!({"method": "session.move_to_store", "params": {"class": class}}),
-            )
-            .await;
-        assert_eq!(refused.header.ty, FrameType::Error);
-        let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
-        assert_eq!(body["code"], "invalid_params", "{class}: {body}");
-    }
-}
-
 /// Every file under `dir` whose name ends with `suffix`.
 fn files_ending(dir: &std::path::Path, suffix: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -1964,9 +1848,13 @@ async fn a_restore_is_operator_only_keeps_a_whole_session_and_cuts_one_lacking_a
         .await,
         "invalid_params"
     );
+    // The session's own files. The store's set of sessions that may owe recovery is left out:
+    // the import's registration there is retired whenever its session closes, which can fall
+    // on either side of a restore and says nothing about whether the restore wrote the session.
     let stored = |dir: &std::path::Path| {
         files_ending(dir, "")
             .into_iter()
+            .filter(|path| !path.starts_with(dir.join("recovery-candidates")))
             .map(|path| {
                 let bytes = std::fs::read(&path).unwrap();
                 (path, bytes)

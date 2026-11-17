@@ -60,7 +60,7 @@ pub(super) async fn run(rig: &mut Rig, case: &str) -> bool {
         "strict-append" => {
             let id = begin(rig, PNG.len(), digest(PNG)).await;
             assert_eq!(result(&append(rig, &id, 0, &PNG[..3]).await)["received"], 3);
-            let before = rig.wal_bytes();
+            let before = rig.records().await;
             let replay = append(rig, &id, 0, &PNG[..3]).await;
             assert_eq!(refusal(&replay)["code"], "upload_offset_mismatch");
             assert_eq!(refusal(&replay)["detail"]["received"], 3);
@@ -68,7 +68,7 @@ pub(super) async fn run(rig: &mut Rig, case: &str) -> bool {
                 std::fs::read(rig.dir.join("media-uploads/objects").join(&id)).unwrap(),
                 &PNG[..3]
             );
-            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(rig.records().await, before);
             assert_eq!(
                 result(&call(rig, "session.upload_status", json!({"upload_id":id})).await),
                 json!({"state":"open","received":3})
@@ -91,27 +91,24 @@ pub(super) async fn run(rig: &mut Rig, case: &str) -> bool {
                 std::fs::read(rig.dir.join("media-uploads/objects").join(id)).unwrap(),
                 PNG
             );
-            assert_eq!(rig.wal_bytes(), before);
+            assert_eq!(rig.records().await, before);
         }
         "head-mime" => {
-            let before = rig.wal_bytes();
+            let before = rig.records().await;
             let head = result(&call(rig, "session.head", json!({})).await);
             assert_eq!(
                 head["input"]["mime_types"],
                 json!(["image/png", "image/jpeg"])
             );
             assert_eq!(
-                rig.wal_bytes(),
+                rig.records().await,
                 before,
                 "a head quote wrote or refroze the config"
             );
             assert!(rig
-                .records()
+                .run_configs()
+                .await
                 .iter()
-                .filter_map(|record| match record {
-                    broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
-                    _ => None,
-                })
                 .all(|config| config.frozen_render_config.get("media").is_none()));
         }
         "model-media" | "model-free" | "blocks-identity" => {
@@ -245,7 +242,7 @@ async fn upload_refusals(rig: &mut Rig) {
         cases.push((id, "upload_not_committed"));
     }
     for (index, (id, code)) in cases.into_iter().enumerate() {
-        let before = rig.wal_bytes();
+        let before = rig.records().await;
         let calls = rig.script.rendered.lock().unwrap().len();
         let reply = rig
             .send_with(
@@ -258,11 +255,10 @@ async fn upload_refusals(rig: &mut Rig) {
         let error = refusal(&reply);
         assert_eq!(error["code"], code, "{error}");
         assert_eq!(error["detail"]["class"], "permanent", "{error}");
-        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(rig.records().await, before);
         assert_eq!(rig.script.rendered.lock().unwrap().len(), calls);
     }
-    rig.bind_session(23, "never-written").await;
-    let before = std::fs::read_dir(rig.dir.join("wal")).unwrap().count();
+    let never = rig.bind_session(23, "never-written").await;
     let reply = rig.request(23, json!({"method":"session.send","params":{
         "prompt":"inspect","send_id":"fresh-invalid-upload","model":{"provider":"fake","model":"fake"},
         "content":[{"type":"upload","upload_id":"missing-upload"}]
@@ -270,8 +266,17 @@ async fn upload_refusals(rig: &mut Rig) {
     let error = refusal(&reply);
     assert_eq!(error["code"], "unknown_upload");
     assert_eq!(error["detail"]["class"], "permanent");
-    assert_eq!(
-        std::fs::read_dir(rig.dir.join("wal")).unwrap().count(),
-        before
-    );
+    broca_test_support::wait_until("the refused send's session is deleted", || async {
+        match rig
+            .registry()
+            .store_runtime()
+            .unwrap()
+            .current_view(&never)
+            .await
+        {
+            Ok(None) => Ok(()),
+            other => Err(format!("{:?}", other.map(|view| view.is_some()))),
+        }
+    })
+    .await;
 }

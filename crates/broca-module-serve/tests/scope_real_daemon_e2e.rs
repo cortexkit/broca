@@ -19,6 +19,9 @@
 #[path = "../../broca-wire/tests/support/run_usage.rs"]
 mod usage_compat;
 
+#[path = "common/stored_log.rs"]
+mod stored_log;
+use broca_session_store::record::Record;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -487,7 +490,7 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
         let route = project_identity_open(&owner, &legacy, scoped).await;
         let first = send(&owner, &route, "first-consult-round").await.unwrap();
         let run_id = first["result"]["run_id"].as_str().unwrap().to_owned();
-        let prefix = std::fs::read(rig.wal_path(&legacy)).unwrap();
+        let prefix = rig.debug_records(&legacy).await;
         owner.route_close(&route).await.unwrap();
         let roster: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
@@ -520,23 +523,11 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
             .await
             .unwrap();
         assert_eq!(second["result"]["run_id"], run_id);
-        let resumed = std::fs::read(rig.wal_path(&legacy)).unwrap();
+        // The session resumed under its recorded folder: its records continue there, and
+        // nothing is stored under the folder the client bound with.
+        let resumed = rig.debug_records(&legacy).await;
         assert_eq!(&resumed[..prefix.len()], prefix);
-        assert!(!rig.wal_path(&rebound).exists());
-        let index =
-            broca_store::SqliteStore::open_read_only(rig.state_root.join("run-index.db")).unwrap();
-        let row = broca_core::RunIndex::lookup_run(&index, &run_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.session, legacy);
-        let leases = broca_core::FileLeaseStore::new(rig.state_root.join("leases"));
-        assert!(matches!(
-            broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&legacy)),
-            Err(broca_core::LeaseError::Held { .. })
-        ));
-        assert!(
-            broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&rebound)).is_ok()
-        );
+        assert!(!rig.exists(&rebound));
     }
 }
 
@@ -562,8 +553,8 @@ async fn project_identity_new_scoped_session_uses_stamped_workdir() {
     send(&owner, &route, "first").await.unwrap();
     let mut storage = route_identity.clone();
     storage.project_root = checkout;
-    assert!(rig.wal_path(&storage).exists());
-    assert!(!rig.wal_path(&route_identity).exists());
+    assert!(rig.exists(&storage));
+    assert!(!rig.exists(&route_identity));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -578,10 +569,8 @@ async fn project_identity_new_unscoped_session_uses_namespace_under_state_root()
     send(&owner, &route, "first").await.unwrap();
     let expected =
         broca_protocol::BindIdentity::new("broca-unscoped-v1", &claimed.harness, &claimed.session);
-    let path = rig.wal_path(&expected);
-    assert_eq!(path.parent(), Some(rig.state_root.join("wal").as_path()));
-    assert!(path.exists());
-    assert!(!rig.wal_path(&claimed).exists());
+    assert!(rig.exists(&expected));
+    assert!(!rig.exists(&claimed));
     let inventory =
         broca_store::SqliteStore::open_read_only(rig.state_root.join("run-index.db")).unwrap();
     let reference = broca_core::agent_session_ref(&expected);
@@ -816,10 +805,12 @@ impl Rig {
                 })),
             }
         });
-        if let Some(broca_config) = &broca_config {
-            config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
-                serde_json::json!(Self::write_broca_config(&config_home, broca_config));
-        }
+        // No deployment-key vault here: sessions are stored plain, so this test reads them back
+        // from disk (`stored_log`).
+        let mut broca_config = broca_config.unwrap_or_else(|| serde_json::json!({}));
+        broca_config["session_storage"] = serde_json::json!({"encryption": "off"});
+        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
+            serde_json::json!(Self::write_broca_config(&config_home, &broca_config));
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
         let connection_file = runtime_dir.join("subc-connection.json");
@@ -1031,8 +1022,63 @@ impl Rig {
         broca_protocol::BindIdentity::new("broca-unscoped-v1", "scope-e2e", name)
     }
 
-    fn wal_path(&self, session: &broca_protocol::BindIdentity) -> PathBuf {
-        broca_core::FileWalStore::new(self.state_root.join("wal")).wal_path(session)
+    /// `session` as the daemon keys it: a folder as it resolves it (on macOS /var is
+    /// /private/var); the unscoped namespace as it is.
+    fn keyed(&self, session: &broca_protocol::BindIdentity) -> broca_protocol::BindIdentity {
+        let mut keyed = session.clone();
+        if let Ok(resolved) = std::fs::canonicalize(&session.project_root) {
+            keyed.project_root = resolved;
+        }
+        keyed
+    }
+
+    /// `session`'s records, each as its debug text, for comparing what a later step kept.
+    async fn debug_records(&self, session: &broca_protocol::BindIdentity) -> Vec<String> {
+        self.records(session)
+            .await
+            .iter()
+            .map(|record| format!("{record:?}"))
+            .collect()
+    }
+
+    /// Whether the new storage holds `session`.
+    fn exists(&self, session: &broca_protocol::BindIdentity) -> bool {
+        broca_wal::session_storage_class(
+            &self.state_root,
+            &broca_core::session_addr(&self.keyed(session)),
+        )
+        .unwrap()
+        .is_some()
+    }
+
+    /// `session`'s records in the new storage, in log order; empty while it doesn't exist.
+    async fn records(&self, session: &broca_protocol::BindIdentity) -> Vec<Record> {
+        stored_log::stored_records(&self.state_root, &self.keyed(session)).await
+    }
+
+    /// What each run `session` started was admitted with, in the order the runs started.
+    async fn admissions(
+        &self,
+        session: &broca_protocol::BindIdentity,
+    ) -> Vec<broca_session_loop::run::Admission> {
+        stored_log::stored_admissions(&self.state_root, &self.keyed(session)).await
+    }
+
+    /// The runs `session` started and the sends it queued: what an admitted send writes. The
+    /// owner's run keeps retrying the unreachable provider in the background, so the session
+    /// may still grow; a refused send must add to neither count.
+    async fn admitted_sends(&self, session: &broca_protocol::BindIdentity) -> (usize, usize) {
+        let records = self.records(session).await;
+        (
+            records
+                .iter()
+                .filter(|record| matches!(record, Record::RunStart(_)))
+                .count(),
+            records
+                .iter()
+                .filter(|record| matches!(record, Record::QueuedSend(_)))
+                .count(),
+        )
     }
 }
 
@@ -1105,62 +1151,6 @@ async fn send(
         .await
 }
 
-/// The episodes and queued sends a session's WAL holds: what an admitted send writes. The
-/// owner's run keeps retrying the unreachable provider in the background, so the file itself
-/// may still grow; a refused send must add to neither count.
-fn admitted_sends(path: &Path) -> (usize, usize) {
-    let records = broca_wal::replay_file(path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-    let count = |want: fn(&broca_wal::WalRecord) -> bool| {
-        records.iter().filter(|framed| want(&framed.record)).count()
-    };
-    (
-        count(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. })),
-        count(|record| matches!(record, broca_wal::WalRecord::Queued { .. })),
-    )
-}
-
-/// The `requires` list of every frame in a WAL's bytes that carries a `run_started` record,
-/// in file order: `Some(names)` for a gated frame, `None` for an ordinary one that any reader
-/// would accept. Walks the frame headers (`[len u32 LE][ver u8][seq][fence][digest]`) so a
-/// payload is read whole, not matched by a byte prefix that depends on every other feature.
-fn run_started_frame_requires(wal: &[u8]) -> Vec<Option<Vec<String>>> {
-    use broca_wal::framing::{FRAMING_VERSION as ORDINARY, GATED_FRAMING_VERSION as GATED};
-    let header = broca_wal::framing::HEADER_LEN;
-    let mut found = Vec::new();
-    let mut rest = wal;
-    while rest.len() >= header {
-        let len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
-        let ver = rest[4];
-        let Some(payload) = rest.get(header..header + len) else {
-            break; // a torn tail: the record was never durable
-        };
-        let parsed = || serde_json::from_slice::<serde_json::Value>(payload).ok();
-        match ver {
-            ORDINARY => {
-                if parsed().is_some_and(|record| record["type"] == "run_started") {
-                    found.push(None);
-                }
-            }
-            GATED => {
-                if let Some(envelope) =
-                    parsed().filter(|envelope| envelope["record"]["type"] == "run_started")
-                {
-                    let requires = envelope["requires"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|name| name.as_str().map(str::to_owned))
-                        .collect();
-                    found.push(Some(requires));
-                }
-            }
-            _ => {}
-        }
-        rest = &rest[header + len..];
-    }
-    found
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity() {
     let Some(rig) = Rig::start().await else {
@@ -1179,23 +1169,16 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         .expect("the owner's send");
     assert_eq!(reply["result"]["state"], "active", "{reply}");
 
-    let wal = std::fs::read(rig.wal_path(&session)).unwrap_or_else(|error| {
-        panic!(
-            "the session's WAL {}: {error}; the rig holds {:?}",
-            rig.wal_path(&session).display(),
-            walk(&rig.dir)
-        )
-    });
-    let records = broca_wal::replay_file(rig.wal_path(&session), broca_wal::DEFAULT_MAX_READ_BYTES)
-        .expect("the WAL reads");
-    let frozen: Vec<_> = records
-        .iter()
-        .filter_map(|framed| match &framed.record {
-            broca_wal::WalRecord::RunStarted {
-                scope, principal, ..
-            } => Some((scope.clone(), principal.clone())),
-            _ => None,
-        })
+    assert!(
+        rig.exists(&session),
+        "the session is stored; the rig holds {:?}",
+        walk(&rig.dir)
+    );
+    let frozen: Vec<_> = rig
+        .admissions(&session)
+        .await
+        .into_iter()
+        .map(|admission| (admission.send.scope, admission.send.principal))
         .collect();
     let owner_principal = broca_protocol::BindPrincipal::Reserved {
         module_id: OWNER.into(),
@@ -1217,29 +1200,6 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         )],
         "broca froze exactly the (owner, ref, scope_epoch) the daemon stamped"
     );
-    // The scoped RunStarted must sit in a gated frame whose `requires` names scope/v1, so a
-    // reader that predates scopes refuses the WAL instead of reading the episode as unscoped.
-    // The frame also names whatever other features the record uses (runner tags, message
-    // times, ...); those may grow with later records and are not what this test guards.
-    let run_started = run_started_frame_requires(&wal);
-    assert_eq!(
-        run_started.len(),
-        1,
-        "exactly one RunStarted frame: {run_started:?}"
-    );
-    assert!(
-        run_started[0]
-            .as_ref()
-            .is_some_and(|requires| requires.iter().any(|name| name == "scope/v1")),
-        "the scoped RunStarted is a gated frame requiring scope/v1: {run_started:?}"
-    );
-    let floor = std::fs::read_to_string(rig.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-        .unwrap_or_default();
-    assert!(
-        floor.lines().any(|name| name == "scope/v1"),
-        "the feature floor lists scope/v1: {floor:?}"
-    );
-
     // A second identity, admitted by the daemon as a listed carrier of the same scope, is not
     // the scope's owner: broca refuses its send by name and writes nothing.
     let carrier = rig
@@ -1248,7 +1208,7 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
     let carrier_route = open_scoped(&carrier, &session)
         .await
         .expect("the daemon admits a listed carrier's scoped open");
-    let before = admitted_sends(&rig.wal_path(&session));
+    let before = rig.admitted_sends(&session).await;
     let refused = send(&carrier, &carrier_route, "intruder")
         .await
         .expect_err("a second identity's send is refused");
@@ -1257,7 +1217,7 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         "{refused}"
     );
     assert_eq!(
-        admitted_sends(&rig.wal_path(&session)),
+        rig.admitted_sends(&session).await,
         before,
         "the refused send admitted nothing"
     );
@@ -1323,14 +1283,11 @@ async fn an_ordered_first_send_freezes_the_stamped_scope() {
         .await
         .expect("the owner's ordered send");
     assert_eq!(reply["result"]["state"], "active", "{reply}");
-    let records = broca_wal::replay_file(rig.wal_path(&session), broca_wal::DEFAULT_MAX_READ_BYTES)
-        .expect("the WAL reads");
-    let scopes: Vec<_> = records
-        .iter()
-        .filter_map(|framed| match &framed.record {
-            broca_wal::WalRecord::RunStarted { scope, .. } => Some(scope.clone()),
-            _ => None,
-        })
+    let scopes: Vec<_> = rig
+        .admissions(&session)
+        .await
+        .into_iter()
+        .map(|admission| admission.send.scope)
         .collect();
     assert_eq!(
         scopes,
@@ -1366,11 +1323,9 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         .await
         .expect("daemon admits flow carrier");
 
-    // Refused tool requests must not create a WAL, even before the first episode.
+    // Refused tool requests must not create the session, even before the first episode.
     let tools_session = rig.session("flow-tools");
     let tools_route = open_scoped(&carrier, &tools_session).await.unwrap();
-    let wal_path = rig.wal_path(&tools_session);
-    let bytes_before = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     for (field, extra) in [
         (
             "tools",
@@ -1391,16 +1346,12 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
             .route_request(&tools_route, serde_json::to_vec(&body).unwrap())
             .await
             .expect_err("flow tools refused");
-        println!("FLOW sent reserved:basal session.send with {field}; returned {error}; WAL bytes before={bytes_before} after={}", std::fs::metadata(&wal_path).map_or(0, |m| m.len()));
+        println!("FLOW sent reserved:basal session.send with {field}; returned {error}");
         assert!(
             error.to_string().contains("invalid_params") && error.to_string().contains(field),
             "{error}"
         );
-        assert_eq!(
-            std::fs::metadata(&wal_path).map_or(0, |m| m.len()),
-            bytes_before,
-            "tool refusal changes no WAL bytes"
-        );
+        assert!(!rig.exists(&tools_session), "a tool refusal stores nothing");
     }
 
     let reply = send(&carrier, &route, "flow-first")
@@ -1408,19 +1359,14 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         .expect("flow carrier send accepted");
     println!("FLOW sent reserved:basal session.send flow-a owner=reserved:prefrontal-core agent_id=owner-agent delegates=true; returned {reply}");
     assert_eq!(reply["result"]["state"], "active", "{reply}");
-    let records =
-        broca_wal::replay_file(rig.wal_path(&session), broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
     let sender = broca_protocol::BindPrincipal::Reserved {
         module_id: CARRIER.into(),
     };
-    let scopes: Vec<_> = records
-        .iter()
-        .filter_map(|r| match &r.record {
-            broca_wal::WalRecord::RunStarted {
-                scope, principal, ..
-            } => Some((scope.clone(), principal.clone())),
-            _ => None,
-        })
+    let scopes: Vec<_> = rig
+        .admissions(&session)
+        .await
+        .into_iter()
+        .map(|admission| (admission.send.scope, admission.send.principal))
         .collect();
     assert_eq!(
         scopes,
@@ -1445,7 +1391,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         .connect_as(OTHER_CARRIER, &rig.other_carrier_nonce)
         .await;
     let other_route = open_scoped(&other, &session).await.unwrap();
-    let before = admitted_sends(&rig.wal_path(&session));
+    let before = rig.admitted_sends(&session).await;
     let error = send(&other, &other_route, "wrong-carrier")
         .await
         .expect_err("wrong_carrier_refused: a non-Basal carrier cannot drive the frozen flow");
@@ -1454,10 +1400,10 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         error.to_string().contains("scope_sender_mismatch"),
         "wrong_carrier_refused: {error}"
     );
-    assert_eq!(admitted_sends(&rig.wal_path(&session)), before);
+    assert_eq!(rig.admitted_sends(&session).await, before);
 
     let owner_route = open_scoped(&owner, &session).await.unwrap();
-    let before = admitted_sends(&rig.wal_path(&session));
+    let before = rig.admitted_sends(&session).await;
     let error = send(&owner, &owner_route, "changed-sender")
         .await
         .expect_err("sender cannot switch to owner");
@@ -1468,7 +1414,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         error.to_string().contains("scope_sender_mismatch"),
         "{error}"
     );
-    assert_eq!(admitted_sends(&rig.wal_path(&session)), before);
+    assert_eq!(rig.admitted_sends(&session).await, before);
 
     // Even history belonging entirely to the owner must not become an automation's history.
     let unscoped = rig.session("owner-unscoped");
@@ -1491,7 +1437,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
 
     rig.sync_scope_with(Some("flow-b"), 2).await;
     let route = open_scoped(&carrier, &session).await.unwrap();
-    let before = admitted_sends(&rig.wal_path(&session));
+    let before = rig.admitted_sends(&session).await;
     let error = send(&carrier, &route, "changed-flow")
         .await
         .expect_err("flow id cannot change");
@@ -1500,12 +1446,11 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         error.to_string().contains("scope_flow_id_mismatch"),
         "{error}"
     );
-    assert_eq!(admitted_sends(&rig.wal_path(&session)), before);
+    assert_eq!(rig.admitted_sends(&session).await, before);
 
     rig.sync_scope_with(None, 3).await;
     let plain = rig.session("plain-basal");
     let plain_route = open_scoped(&carrier, &plain).await.unwrap();
-    let plain_wal = rig.wal_path(&plain);
 
     let error = send(&carrier, &plain_route, "plain-basal")
         .await
@@ -1513,7 +1458,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
     println!("FLOW sent reserved:basal session.send without flow_id on non-owner scope; returned {error}");
     assert!(error.to_string().contains("flow_scope_required"), "{error}");
     assert_eq!(
-        admitted_sends(&plain_wal),
+        rig.admitted_sends(&plain).await,
         (0, 0),
         "plain Basal refusal admits no run or queued send"
     );
@@ -1521,7 +1466,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
 
 /// Basal cannot start unscoped work, but empty-session reads cannot start work either.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_basal_unscoped_send_refused_without_wal_and_reads_allowed() {
+async fn real_basal_unscoped_send_refused_writing_nothing_and_reads_allowed() {
     let Some(rig) = Rig::start().await else {
         return;
     };
@@ -1531,8 +1476,7 @@ async fn real_basal_unscoped_send_refused_without_wal_and_reads_allowed() {
         .route_open_management("broca", &session)
         .await
         .unwrap();
-    let path = rig.wal_path(&session);
-    let before = std::fs::read(&path).unwrap_or_default();
+    let before = rig.debug_records(&session).await;
     for delivery in ["queue", "steer", "interrupt"] {
         let request = serde_json::json!({"method":"session.send", "params": {
             "prompt":"hi", "delivery":delivery,
@@ -1543,8 +1487,8 @@ async fn real_basal_unscoped_send_refused_without_wal_and_reads_allowed() {
             .await
             .expect_err("unscoped Basal cannot send");
         assert!(error.to_string().contains("flow_scope_required"), "{error}");
-        assert_eq!(std::fs::read(&path).unwrap_or_default(), before);
-        assert_eq!(admitted_sends(&path), (0, 0));
+        assert_eq!(rig.debug_records(&session).await, before);
+        assert_eq!(rig.admitted_sends(&session).await, (0, 0));
     }
     for method in ["run.status", "session.head", "session.read"] {
         let response = basal
@@ -1612,12 +1556,11 @@ async fn real_basal_sender_guard_protects_other_runs_and_allows_own_flow() {
         status["result"]["state"], "active",
         "foreign run was not cancelled: {status}"
     );
-    let records =
-        broca_wal::replay_file(rig.wal_path(&foreign), broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
+    let records = rig.records(&foreign).await;
     assert!(
         !records
             .iter()
-            .any(|frame| matches!(&frame.record, broca_wal::WalRecord::RunFinished { .. })),
+            .any(|record| matches!(record, Record::RunEnd(_))),
         "foreign run stays running"
     );
 
@@ -1775,47 +1718,25 @@ fn fact_bytes(rig: &Rig, run: &str) -> Vec<String> {
 }
 
 async fn wait_for_export(rig: &Rig, run: &str) {
-    // The terminal WAL state is observable before the asynchronous index projection finishes.
-    // Wait for that projection before taking the no-write snapshots of index rows and facts.
+    // The run's end is observable before its usage fact is written. Wait for the fact before
+    // taking the no-write snapshots of the facts.
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let db = rusqlite::Connection::open_with_flags(
-            rig.state_root.join("run-index.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let state: String = db
-            .query_row(
-                "SELECT state FROM run_index WHERE run_id = ?1",
-                [run],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if state == "completed" && !fact_bytes(rig, run).is_empty() {
-            return;
-        }
+    while fact_bytes(rig, run).is_empty() {
         assert!(
             Instant::now() < deadline,
-            "completed run {run} was not projected/exported"
+            "completed run {run} was not exported"
         );
         sleep(Duration::from_millis(25)).await;
     }
 }
 
-fn admission_index_rows(rig: &Rig) -> (Vec<(String, String, String)>, Vec<String>) {
+/// Every usage fact in the index, in fact order: what a refused send must not add to.
+fn admission_index_rows(rig: &Rig) -> Vec<String> {
     let db = rusqlite::Connection::open_with_flags(
         rig.state_root.join("run-index.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    let mut runs = db
-        .prepare("SELECT run_id, session, state FROM run_index ORDER BY run_id")
-        .unwrap();
-    let runs = runs
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
     let mut facts = db
         .prepare("SELECT segment_json FROM export_facts ORDER BY fact_id")
         .unwrap();
@@ -1824,7 +1745,7 @@ fn admission_index_rows(rig: &Rig) -> (Vec<(String, String, String)>, Vec<String
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    (runs, facts)
+    facts
 }
 
 async fn run_scoped_send(
@@ -1857,15 +1778,15 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
         return;
     };
     let (basal, route, session, run) = run_scoped_send(&rig).await;
-    let path = rig.wal_path(&session);
-    let records = broca_wal::replay_file(&path, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-    let scopes = records
-        .iter()
-        .filter_map(|frame| match &frame.record {
-            broca_wal::WalRecord::RunStarted {
-                scope, principal, ..
-            } => Some((scope.clone().unwrap(), principal.clone().unwrap())),
-            _ => None,
+    let scopes = rig
+        .admissions(&session)
+        .await
+        .into_iter()
+        .map(|admission| {
+            (
+                admission.send.scope.unwrap(),
+                admission.send.principal.unwrap(),
+            )
         })
         .collect::<Vec<_>>();
     assert_eq!(scopes.len(), 1);
@@ -1877,10 +1798,6 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
     assert_eq!(scope.scope_epoch, SCOPE_EPOCH);
     assert_eq!(scope.sender.as_ref(), Some(principal));
     assert_eq!(principal.as_owner_string(), "reserved:basal");
-    let wal = std::fs::read(&path).unwrap();
-    assert!(wal
-        .windows(b"agent-run-scopes/v1".len())
-        .any(|w| w == b"agent-run-scopes/v1"));
     let facts = fact_bytes(&rig, &run);
     assert_eq!(facts.len(), 1);
     let fact: serde_json::Value = serde_json::from_str(&facts[0]).unwrap();
@@ -1908,8 +1825,7 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
                     .unwrap(),
             ),
         ] {
-            let path = rig.wal_path(test_session);
-            let before = std::fs::read(&path).unwrap_or_default();
+            let before = rig.debug_records(test_session).await;
             let index_before = admission_index_rows(&rig);
             let mut params = serde_json::json!({"prompt":"not written","model":{"provider":"mock","model":"mock-model"}});
             params
@@ -1924,17 +1840,20 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
                 "{error}"
             );
             assert_eq!(
-                std::fs::read(&path).unwrap_or_default(),
+                rig.debug_records(test_session).await,
                 before,
-                "{field} refusal wrote WAL bytes"
+                "{field} refusal wrote records"
             );
             if test_session != &session {
-                assert!(!path.exists(), "fresh {field} refusal created a WAL");
+                assert!(
+                    !rig.exists(test_session),
+                    "fresh {field} refusal created the session"
+                );
             }
             assert_eq!(
                 admission_index_rows(&rig),
                 index_before,
-                "{field} refusal wrote index rows"
+                "{field} refusal wrote usage facts"
             );
         }
     }
@@ -1945,8 +1864,7 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
         let conn = rig.connect_as(module, nonce).await;
         for key in [&session, &rig.session(&format!("run-{module}"))] {
             let other_route = open_scoped(&conn, key).await.unwrap();
-            let path = rig.wal_path(key);
-            let before = std::fs::read(&path).unwrap_or_default();
+            let before = rig.debug_records(key).await;
             let index_before = admission_index_rows(&rig);
             let error = send(&conn, &other_route, "wrong-sender").await.unwrap_err();
             let expected = if key == &session {
@@ -1956,17 +1874,20 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
             };
             assert_eq!(error.code(), Some(expected), "{module}: {error}");
             assert_eq!(
-                std::fs::read(&path).unwrap_or_default(),
+                rig.debug_records(key).await,
                 before,
-                "{module} refusal wrote WAL bytes"
+                "{module} refusal wrote records"
             );
             if key != &session {
-                assert!(!path.exists(), "fresh {module} refusal created a WAL");
+                assert!(
+                    !rig.exists(key),
+                    "fresh {module} refusal created the session"
+                );
             }
             assert_eq!(
                 admission_index_rows(&rig),
                 index_before,
-                "{module} refusal wrote index rows"
+                "{module} refusal wrote usage facts"
             );
         }
     }
@@ -1984,7 +1905,7 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
     ] {
         rig.sync_attributes(attributes, generation).await;
         let changed = open_scoped(&basal, &session).await.unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = rig.debug_records(&session).await;
         let index_before = admission_index_rows(&rig);
         let body = serde_json::json!({"method":"session.send","params":{
             "prompt":"hi","send_id":"changed-identity","model":{"provider":"mock","model":"mock-model"}
@@ -2001,14 +1922,14 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
         assert_eq!(error.code, format!("scope_{field}_mismatch"));
         assert_eq!(error.detail.unwrap()["field"], field);
         assert_eq!(
-            std::fs::read(&path).unwrap(),
+            rig.debug_records(&session).await,
             before,
-            "{field} refusal wrote WAL bytes"
+            "{field} refusal wrote records"
         );
         assert_eq!(
             admission_index_rows(&rig),
             index_before,
-            "{field} refusal wrote index rows"
+            "{field} refusal wrote usage facts"
         );
     }
     assert_eq!(
@@ -2041,107 +1962,6 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
     }
 }
 
-/// A separately built live-release reader must read the writer's session, but may not
-/// append another episode. Reading the old release independently also exercises its WAL gate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn released_reader_reads_agent_run_writer_session_and_refuses_advancement() {
-    let Some(reader) = std::env::var_os("BROCA_AGENT_RUN_READER_BIN").map(PathBuf::from) else {
-        assert!(
-            std::env::var_os("BROCA_REQUIRE_AGENT_RUN_READER").is_none(),
-            "released agent-run reader is required"
-        );
-        println!("SKIP agent-run rollback: BROCA_AGENT_RUN_READER_BIN is not set");
-        return;
-    };
-    let version = std::process::Command::new(&reader)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .unwrap();
-    assert!(version.status.success());
-    assert_eq!(
-        String::from_utf8(version.stdout).unwrap().trim(),
-        "ck-broca 0.3.194"
-    );
-    let model = ScopeModel::start().await;
-    let Some(mut writer) = Rig::start_configured(None, None, Some(&model.url)).await else {
-        return;
-    };
-    assert_ne!(
-        std::fs::read(&reader).unwrap(),
-        std::fs::read(broca_test_support::ckdev_binary(
-            env!("CARGO_BIN_EXE_ck-broca"),
-            &writer.dir
-        ))
-        .unwrap(),
-        "the reader must not be a renamed writer"
-    );
-    let (basal, route, session, run) = run_scoped_send(&writer).await;
-    let page = scope_request(&basal, &route, "session.read", serde_json::json!({}))
-        .await
-        .unwrap();
-    assert!(page.to_string().contains("scope answer"));
-    drop(basal);
-    if let Some(pid) = writer.child.id() {
-        subc_os::Process::open(pid)
-            .unwrap()
-            .unwrap()
-            .signal(subc_os::Signal::Terminate)
-            .unwrap();
-    }
-    tokio::time::timeout(Duration::from_secs(30), writer.child.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    let before = std::fs::read(writer.wal_path(&session)).unwrap();
-    let facts = fact_bytes(&writer, &run);
-    let rollback = Rig::start_configured(Some(&reader), Some(&writer.state_root), Some(&model.url))
-        .await
-        .unwrap();
-    let owner = rollback.connect_as(OWNER, &rollback.owner_nonce).await;
-    let route = owner
-        .route_open_management("broca", &session)
-        .await
-        .unwrap();
-    assert_eq!(
-        scope_request(&owner, &route, "session.read", serde_json::json!({}))
-            .await
-            .unwrap(),
-        page
-    );
-    let status = scope_request(
-        &owner,
-        &route,
-        "run.status",
-        serde_json::json!({"run_id":run}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(status["result"]["state"], "completed");
-    let error = send(&owner, &route, "reader-next").await.unwrap_err();
-    assert!(
-        error.to_string().contains("agent_run_scopes_unsupported"),
-        "{error}"
-    );
-    assert_eq!(
-        std::fs::read(writer.wal_path(&session)).unwrap(),
-        before,
-        "reader refusal appended WAL bytes"
-    );
-    assert_eq!(
-        fact_bytes(&writer, &run),
-        facts,
-        "reader changed export bytes"
-    );
-    assert_eq!(
-        scope_request(&owner, &route, "session.read", serde_json::json!({}))
-            .await
-            .unwrap(),
-        page,
-        "reader still serves after refusing advancement"
-    );
-}
-
 /// A head's creating send, over a route the daemon stamped with its owner's scope, starts the
 /// head in the durable root of the new storage, not on today's storage: the real `ck-broca`,
 /// supervised by the real `ck-subc`, creating plain sessions. Its first turn completes there.
@@ -2159,20 +1979,12 @@ async fn a_new_head_runs_two_turns_across_a_restart_in_the_new_storage() {
         return;
     };
     let session = first.session("alfonso:head:agent_0123456789abcdef");
-    // Where the head is kept: the new storage's root holding its head file, if any, and how
-    // many logs today's storage holds for it.
+    // Where the head is kept: the new storage's root holding its head file, if any.
     let kept = |rig: &Rig| {
-        let wal = broca_core::FileWalStore::new(rig.state_root.join("wal"));
-        (
-            broca_wal::session_storage_class(&rig.state_root, &broca_core::session_addr(&session))
-                .unwrap(),
-            broca_wal::StorageClass::ALL
-                .into_iter()
-                .filter(|class| wal.class_wal_path(*class, &session).is_file())
-                .count(),
-        )
+        broca_wal::session_storage_class(&rig.state_root, &broca_core::session_addr(&session))
+            .unwrap()
     };
-    let in_the_new_storage = (Some(broca_wal::StorageClass::Durable), 0);
+    let in_the_new_storage = Some(broca_wal::StorageClass::Durable);
     let turn = |prompt: &str, send_id: &str, class: Option<&str>| {
         let mut params = serde_json::json!({
             "prompt": prompt,
@@ -2504,14 +2316,14 @@ async fn assert_owner_refusal_writes_nothing(
     method: &str,
     params: serde_json::Value,
 ) -> Vec<u8> {
-    let before = std::fs::read(rig.wal_path(session)).unwrap();
+    let before = rig.debug_records(session).await;
     let body = owner_op(conn, route, method, params)
         .await
         .expect_err("non-owner is refused");
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(error["code"], "scope_owner_mismatch", "{error}");
     assert_eq!(
-        std::fs::read(rig.wal_path(session)).unwrap(),
+        rig.debug_records(session).await,
         before,
         "{method} refusal writes nothing"
     );
@@ -2787,118 +2599,4 @@ async fn real_unscoped_session_uses_only_attested_first_sender() {
     .await
     .unwrap();
     assert_eq!(response["result"], "ack", "{response}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn real_legacy_and_direct_histories_remain_unprotected() {
-    use broca_core::WalStore;
-    let model = HeldOwnerModel::start().await;
-    let Some(rig) = Rig::start_configured(None, None, Some(&model.url)).await else {
-        return;
-    };
-    let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
-    let basal = rig.connect_as(CARRIER, &rig.carrier_nonce).await;
-    let foreign = rig
-        .connect_as(OTHER_CARRIER, &rig.other_carrier_nonce)
-        .await;
-    let direct = SubcConnection::connect(&rig.connection_file).await.unwrap();
-    let source = rig.session("legacy-config-source");
-    let source_route = owner.route_open_management("broca", &source).await.unwrap();
-    send(&owner, &source_route, "first").await.unwrap();
-    model.wait_request().await;
-    let records =
-        broca_wal::replay_file(rig.wal_path(&source), broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
-    let start = records
-        .iter()
-        .find(|frame| matches!(&frame.record, broca_wal::WalRecord::RunStarted { .. }))
-        .unwrap()
-        .record
-        .clone();
-    let store = broca_core::FileWalStore::new(rig.state_root.join("wal"));
-    for (index, (first, sender, caller)) in [
-        (None, &owner, &foreign),
-        (None, &owner, &basal),
-        (None, &owner, &direct),
-        (
-            Some(broca_protocol::BindPrincipal::Direct),
-            &direct,
-            &foreign,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        // Seed a completed episode in a session whose actor has never opened. New work then
-        // enters through the real daemon; a later attested sender must not protect legacy
-        // history retroactively. Unique episode ids avoid collisions in durable run lookups.
-        let session = rig.session(&format!("legacy-{index}"));
-        let mut start = start.clone();
-        let broca_wal::WalRecord::RunStarted {
-            session: recorded_session,
-            principal,
-            run_id,
-            send_id,
-            request_identity_digest,
-            ..
-        } = &mut start
-        else {
-            unreachable!()
-        };
-        *recorded_session = session.clone();
-        *principal = first;
-        *run_id = broca_protocol::RunId(format!("legacy-origin-{index}"));
-        *send_id = None;
-        *request_identity_digest = None;
-        {
-            let mut wal = store.open(&session).unwrap();
-            wal.append(1, &start, true).unwrap();
-            wal.append(
-                1,
-                &broca_wal::WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    reason: broca_protocol::RunFinishReason::Cancelled,
-                    ts_ms: None,
-                    usage: broca_protocol::Usage::default(),
-                    error: None,
-                    retries_used: 0,
-                },
-                true,
-            )
-            .unwrap();
-        }
-        let sending = sender
-            .route_open_management("broca", &session)
-            .await
-            .unwrap();
-        let started = send(sender, &sending, "new-work").await.unwrap();
-        assert_eq!(started["result"]["state"], "active", "{started}");
-        model.wait_request().await;
-        let run_id = started["result"]["run_id"].as_str().unwrap();
-        let submission_id = pending_owner_send(sender, &sending, "queued").await;
-        let route = caller
-            .route_open_management("broca", &session)
-            .await
-            .unwrap();
-        let response = owner_op(
-            caller,
-            &route,
-            "session.retract",
-            serde_json::json!({"submission_id":submission_id}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            response["result"], "retracted",
-            "legacy {index}: {response}"
-        );
-        let response = owner_op(
-            caller,
-            &route,
-            "run.cancel",
-            serde_json::json!({"run_id":run_id}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response["result"], "ack", "legacy {index}: {response}");
-    }
 }

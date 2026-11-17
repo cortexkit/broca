@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
+use broca_core::{FileLeaseStore, OutputEvent};
 use broca_protocol::{BindIdentity, CallOptions, NormalizedEvent, RunId, StepId};
 use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
 use broca_provider::wire::{
@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use super::{request, IDLE};
 use crate::actor::{LineageStatus, SendKey, SendOutcome, WarmOutcome};
 use crate::cache::{CacheDeclaration, CacheDeclarer};
-use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
+use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
 use crate::registry::LineageRegistry;
 
 cipher_tests!(
@@ -142,13 +142,6 @@ impl RunExecutor for Loops {
             bust: 1.0,
         })
     }
-    async fn execute(
-        &self,
-        _job: RunJob,
-        _out: mpsc::Sender<OutputEvent>,
-    ) -> Result<RunSummary, RunError> {
-        unreachable!("a store session's runs come through execute_on_store")
-    }
 
     async fn execute_on_store(
         &self,
@@ -205,14 +198,12 @@ fn scratch() -> std::path::PathBuf {
 /// The module over the state root `dir`; its new storage creates sessions in mode `cipher`.
 async fn registry_at(
     dir: &std::path::Path,
-    store: bool,
     declares: bool,
     config: Option<&FrozenRenderConfig>,
     steps: Vec<Vec<NormalizedEvent>>,
     sent: &Arc<Mutex<Vec<Vec<u8>>>>,
     cipher: Cipher,
 ) -> LineageRegistry {
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let render_config = config.map(|config| serde_json::to_value(config).unwrap());
     let mut store_loop = super::executor(steps, None);
     store_loop.provider.render_config = render_config;
@@ -228,27 +219,18 @@ async fn registry_at(
     )
     .await
     .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal,
-        None,
-    );
+    let registry = LineageRegistry::new(Arc::new(
+        crate::opener::DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+        )
+        .with_idle_ttl(IDLE)
+        .with_store_runtime(Arc::new(runtime)),
+    ));
     if declares {
         registry.set_cache_declarer(Arc::new(FamilyDeclarer));
     }
-    if store {
-        registry.with_store_new_sessions()
-    } else {
-        registry
-    }
+    registry
 }
 
 /// A side whose session ran one send to its end. A store side's session is in mode `cipher`.
@@ -261,7 +243,7 @@ async fn side(
 ) -> Side {
     let dir = scratch();
     let sent = Arc::default();
-    let registry = registry_at(&dir, store, declares, config, steps, &sent, cipher).await;
+    let registry = registry_at(&dir, declares, config, steps, &sent, cipher).await;
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     let side = Side {
         dir,
@@ -347,7 +329,6 @@ async fn reboot_an_automatic_head(
     let registry = registry_at(
         &dir,
         true,
-        true,
         Some(&config),
         vec![attempted_step("a1", "hello", sent_at_ms)],
         &sent,
@@ -388,16 +369,7 @@ async fn reboot_an_automatic_head(
     })
     .await;
     assert!(registry.stop_and_seal().await);
-    let reboot = registry_at(
-        &dir,
-        true,
-        true,
-        Some(&config),
-        Vec::new(),
-        &sent,
-        Cipher::None,
-    )
-    .await;
+    let reboot = registry_at(&dir, true, Some(&config), Vec::new(), &sent, Cipher::None).await;
     assert!(reboot.slot_state(&key).is_none());
     assert!(!reboot.handle().has_idle_warm(&key));
     let sweep = reboot.recover_store_crash_orphans().await.unwrap();
@@ -551,7 +523,6 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
 
     let restarted = registry_at(
         &store.dir,
-        true,
         true,
         Some(&config),
         Vec::new(),
