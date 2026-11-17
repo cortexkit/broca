@@ -765,19 +765,27 @@ mod rename_tests {
     /// A plan written before a module's rename names its old id; the module sends under its new
     /// one afterwards, and keeps the plan's grants. A near name gets none.
     #[test]
-    fn a_plan_naming_a_modules_old_id_grants_its_new_one() {
-        let senders: Vec<PlanSender> = serde_json::from_value(serde_json::json!([
-            {"module": "prefrontal-core", "idle_start": true}
-        ]))
-        .unwrap();
-        let senders = super::canonical_senders(&senders);
-        let owner = Some("reserved:cingulate");
-        for caller in ["prefrontal", "prefrontal-core"] {
-            let caller = broca_protocol::canonical_module(caller);
-            assert_eq!(admit(caller, owner, &senders, &[Mode::IdleStart]), Ok(()));
+    fn a_plan_naming_either_id_of_a_renamed_module_grants_both() {
+        // Plans written before the rename name the old id; plans recomposed after it name the
+        // new one. Either plan admits a caller presenting either id.
+        for named in ["prefrontal-core", "prefrontal"] {
+            let senders: Vec<PlanSender> = serde_json::from_value(serde_json::json!([
+                {"module": named, "idle_start": true}
+            ]))
+            .unwrap();
+            let senders = super::canonical_senders(&senders);
+            let owner = Some("reserved:cingulate");
+            for caller in ["prefrontal", "prefrontal-core"] {
+                let caller = broca_protocol::canonical_module(caller);
+                assert_eq!(
+                    admit(caller, owner, &senders, &[Mode::IdleStart]),
+                    Ok(()),
+                    "plan names {named}"
+                );
+            }
+            let near = broca_protocol::canonical_module("prefrontal2");
+            assert!(admit(near, owner, &senders, &[Mode::IdleStart]).is_err());
         }
-        let near = broca_protocol::canonical_module("prefrontal2");
-        assert!(admit(near, owner, &senders, &[Mode::IdleStart]).is_err());
     }
 }
 
