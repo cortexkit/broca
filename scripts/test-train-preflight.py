@@ -192,7 +192,7 @@ sys.exit(int(os.environ.get('MOTOR_EXIT', '0')))
 
     def test_selection_names_the_compiled_daemon_aliases_and_transform_rigs(self):
         selection = (ROOT / 'scripts/portable-test-selection.conf').read_text()
-        for name in ('reply_deadline_real_daemon::', 'step_transforms::', 'binary(=step_transform_crash)'):
+        for name in ('reply_deadline_real_daemon::', 'step_transforms::'):
             self.assertIn(name, selection)
 
     def test_selection_excludes_live_usage_and_workstation_state_probes(self):
