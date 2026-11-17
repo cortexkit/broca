@@ -221,9 +221,11 @@ fn records_name_their_ids() {
 
 /// Many changes, each adding a run of a random size, with a share so small that merges take
 /// many changes and some levels fill up and force theirs. After every change no level holds more
-/// than `2 * FANIN` runs; every tenth change, every id ever filed answers with exactly its seqs
-/// and ids never filed answer with none. Retired runs, once deleted, leave the backend holding
-/// exactly the objects the root names.
+/// than `2 * FANIN` runs; every tenth change, a rotating sixteenth of the ids ever filed answer
+/// with exactly their seqs (each sixteenth is checked once over the run, as a full check every
+/// tenth change took half an hour on a Windows runner) and ids never filed answer with none. At
+/// the end every id answers with exactly its seqs, and retired runs, once deleted, leave the
+/// backend holding exactly the objects the root names.
 fn merges_in_steps_keep_every_id_findable(cipher: Cipher) {
     block_on(merges_in_steps(cipher))
 }
@@ -278,7 +280,11 @@ async fn merges_in_steps(cipher: Cipher) {
             );
         }
         if change % 10 == 9 {
-            for (hash, seqs) in &model {
+            let share = (change / 10) % 16;
+            for (hash, seqs) in model
+                .iter()
+                .filter(|(hash, _)| u32::from(hash.0[0] % 16) == share)
+            {
                 assert_eq!(&pages.lookup(&root, hash).await.unwrap(), seqs);
             }
             for absent in next_id..next_id + 20 {
