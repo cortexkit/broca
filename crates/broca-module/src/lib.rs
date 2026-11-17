@@ -70,6 +70,7 @@ pub mod store_read;
 pub mod store_reads;
 pub mod store_request_dump;
 pub mod store_run_events;
+pub mod store_send_states;
 pub mod store_status;
 pub mod store_tag_map;
 pub mod store_tool_calls;

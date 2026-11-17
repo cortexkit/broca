@@ -148,6 +148,7 @@ impl Rig {
                 import_roots: None,
                 billing: None,
                 run_events: None,
+                send_states: None,
             },
             backoff: Backoff::default(),
         }

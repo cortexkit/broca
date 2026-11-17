@@ -110,6 +110,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self
     }
 
+    /// Hands the send state notices of the session's durable records to `sink` from now on
+    /// (see [`crate::store_send_states`]).
+    pub fn with_send_states(
+        mut self,
+        sink: Arc<dyn crate::store_send_states::SendStateSink>,
+    ) -> Self {
+        crate::store_send_states::observe(&mut self.session, &self.key, sink);
+        self
+    }
+
     /// The actor serves finished runs' facts from `settled`, and keeps the ones it reads there,
     /// as the module's reads of a session no actor holds do.
     pub fn with_settled(mut self, settled: Arc<crate::store_status::SettledRuns>) -> Self {

@@ -89,6 +89,7 @@ async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Ci
         import_roots: None,
         billing,
         run_events: None,
+        send_states: None,
     };
     Module {
         dir,

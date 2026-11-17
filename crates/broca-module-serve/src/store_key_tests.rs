@@ -94,6 +94,7 @@ impl KeyRig {
                 import_roots: None,
                 billing: None,
                 run_events: None,
+                send_states: None,
             },
             backoff: broca_module_serve::store_key::Backoff {
                 first: Duration::from_millis(20),

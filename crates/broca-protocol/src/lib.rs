@@ -106,6 +106,7 @@ pub use session::{
 };
 pub use usage::Usage;
 pub mod run_events;
+pub mod send_states;
 
 #[cfg(all(feature = "test-attachments", not(debug_assertions)))]
 compile_error!("test-attachments is a non-shipping feature");

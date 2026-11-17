@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use broca_core::wal_writer::agent_session_ref;
 use broca_protocol::{
     run_events::{EncodeError, RunEvent, RunEventDetail, StructuredOutputStatus},
+    send_states::SendStateNotice,
     BindIdentity,
 };
 use broca_wal::{FramedRecord, WalRecord};
@@ -137,7 +138,17 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             published_ms INTEGER
          );
          CREATE INDEX IF NOT EXISTS compaction_notice_unpublished
-            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;",
+            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;
+         -- Send state notices (`event.broca.send_state.v1.{sender}`), one row per change of a
+         -- keyed send. The message id is the notice's own (`{session_ref}:{send_id}:{seq}`), so
+         -- recording a change twice adds nothing. Published after run events, in insertion order.
+         CREATE TABLE IF NOT EXISTS send_state_outbox (
+            message_id TEXT PRIMARY KEY, subject TEXT NOT NULL, session_ref TEXT NOT NULL,
+            send_id TEXT NOT NULL, seq INTEGER NOT NULL, body BLOB NOT NULL,
+            at_ms INTEGER NOT NULL, published_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS send_state_unpublished
+            ON send_state_outbox(at_ms) WHERE published_ms IS NULL;",
     )
 }
 
@@ -259,6 +270,13 @@ pub trait RunEventStore: Send + Sync {
         events: &mut [RunEvent],
         now_ms: u64,
     ) -> Result<bool, StoreError>;
+    /// Records send state notices, each with the module it is for, from records a barrier
+    /// made durable. `false`, recording nothing, while the machine account isn't known.
+    fn record_send_states(
+        &self,
+        changes: &[(String, SendStateNotice)],
+        now_ms: u64,
+    ) -> Result<bool, StoreError>;
 }
 
 /// Drain orchestration belongs to the publisher, not the object-safe storage port.
@@ -366,6 +384,13 @@ impl RunEventStore for SqliteStore {
     ) -> Result<bool, StoreError> {
         self.event_store()
             .record_run_events(session, epoch, events, now_ms)
+    }
+    fn record_send_states(
+        &self,
+        changes: &[(String, SendStateNotice)],
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        self.event_store().record_send_states(changes, now_ms)
     }
 }
 
@@ -1128,6 +1153,68 @@ impl EventStore<'_> {
         Ok(true)
     }
 
+    /// See [`RunEventStore::record_send_states`]. A notice over the size limit or whose sender
+    /// is no module id is refused with a warning and the rest are recorded.
+    pub fn record_send_states(
+        &self,
+        changes: &[(String, SendStateNotice)],
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
+            return Ok(false);
+        };
+        let refused = self.write(true, |tx| {
+            let mut refused = 0u64;
+            for (sender, notice) in changes {
+                let (Ok(subject), Ok(body)) = (notice.subject(&account, sender), notice.to_bytes())
+                else {
+                    refused += 1;
+                    continue;
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO send_state_outbox(message_id,subject,session_ref,send_id,seq,body,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![notice.message_id(), subject, notice.session_ref, notice.send_id, notice.seq, body, now_ms],
+                )?;
+            }
+            Ok(refused)
+        })?;
+        if refused > 0 {
+            self.bus_metrics()
+                .bus_events_oversize
+                .fetch_add(refused, Ordering::Relaxed);
+            tracing::warn!(target: "bus", refused, "refusing send state notices over the size limit or for a sender that is no module id");
+        }
+        Ok(true)
+    }
+
+    /// The oldest send state notice not yet published.
+    fn pending_send_state(&self) -> Result<Option<Publication>, StoreError> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT message_id,subject,session_ref,send_id,seq,body FROM send_state_outbox INDEXED BY send_state_unpublished WHERE published_ms IS NULL ORDER BY at_ms, rowid LIMIT 1",
+                [],
+                |r| {
+                    let headers = Headers::from([
+                        ("kind".into(), "send_state".into()),
+                        ("session_ref".into(), r.get(2)?),
+                        ("send_id".into(), r.get(3)?),
+                        ("seq".into(), r.get::<_, u64>(4)?.to_string()),
+                    ]);
+                    Ok(Publication {
+                        event_key: r.get(0)?,
+                        subject: r.get(1)?,
+                        headers,
+                        body: r.get(5)?,
+                        digest: None,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub fn get_bus_event(
         &self,
         event_key: &str,
@@ -1171,7 +1258,10 @@ impl EventStore<'_> {
                 Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None })
             },
         ).optional()?;
-        Ok(lifecycle)
+        match lifecycle {
+            Some(lifecycle) => Ok(Some(lifecycle)),
+            None => self.pending_send_state(),
+        }
     }
 
     /// The oldest compaction advance notice not yet published, once no run event is pending.
@@ -1325,7 +1415,7 @@ impl EventStore<'_> {
         _receipt: PublishReceipt,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let (lifecycle, lifecycle_updated, notices_updated) = self.write_with_locked_effect(false, |conn| {
+        let (lifecycle, lifecycle_updated, notices_updated, sends_updated) = self.write_with_locked_effect(false, |conn| {
         let lifecycle: Option<bool> = conn
             .query_row(
                 "SELECT best_effort=0 FROM bus_event_outbox WHERE event_key=?1 AND published_ms IS NULL",
@@ -1342,9 +1432,14 @@ impl EventStore<'_> {
                  WHERE message_id=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
         )? as u64;
-        Ok((lifecycle, lifecycle_updated, notices_updated))
-        }, |(_, _, notices_updated)| self.lower_notice_depth(*notices_updated))?;
-        let updated = lifecycle_updated + notices_updated;
+        // A send state notice keeps no gauge: it is counted only as published.
+        let sends_updated = conn.execute(
+            "UPDATE send_state_outbox SET published_ms=?2 WHERE message_id=?1 AND published_ms IS NULL",
+            params![event.event_key, now_ms],
+        )? as u64;
+        Ok((lifecycle, lifecycle_updated, notices_updated, sends_updated))
+        }, |(_, _, notices_updated, _)| self.lower_notice_depth(*notices_updated))?;
+        let updated = lifecycle_updated + notices_updated + sends_updated;
         self.bus_metrics()
             .bus_events_published
             .fetch_add(updated, Ordering::Relaxed);
@@ -1366,11 +1461,19 @@ impl EventStore<'_> {
             "SELECT count(*) FROM compaction_notice_outbox INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL AND at_ms<?1",
             [cutoff], |r| r.get(0),
         )?;
+        let sends_dropped: u64 = conn.query_row(
+            "SELECT count(*) FROM send_state_outbox INDEXED BY send_state_unpublished WHERE published_ms IS NULL AND at_ms<?1",
+            [cutoff], |r| r.get(0),
+        )?;
+        if sends_dropped > 0 {
+            tracing::warn!(target: "bus", dropped = sends_dropped, "dropping send state notices older than 24 hours without a publish acknowledgement");
+        }
         let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?
             + conn.execute(
                 "DELETE FROM compaction_notice_outbox WHERE at_ms<?1",
                 [cutoff],
-            )?;
+            )?
+            + conn.execute("DELETE FROM send_state_outbox WHERE at_ms<?1", [cutoff])?;
         Ok((deleted, dropped, notices_dropped))
         }, |(_, _, notices_dropped)| self.lower_notice_depth(*notices_dropped))?;
         if dropped > 0 {
@@ -2553,5 +2656,140 @@ mod tests {
         }
         assert!(store.pending_bus_event().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn send_state(send_id: &str, seq: u64, state: &'static str) -> SendStateNotice {
+        SendStateNotice {
+            v: 1,
+            session_ref: "ses_ref".into(),
+            send_id: send_id.into(),
+            seq,
+            state,
+        }
+    }
+
+    /// Send state notices wait for the account, then publish after any pending run event, on
+    /// the sender's subject under their own message id; recording one twice adds nothing, an
+    /// acknowledgement retires it, and a notice for no module id is refused alone.
+    #[test]
+    fn send_state_notices_publish_after_run_events_once_each() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let notice = send_state("send-1", 4, "pending");
+        assert!(!store
+            .record_send_states(&[("aft".into(), notice.clone())], 1000)
+            .unwrap());
+        store.enable_bus_events("box_test").unwrap();
+        store
+            .project_bus_events(&session(), "epoch", &[start()], 1000)
+            .unwrap();
+        assert!(store
+            .record_send_states(
+                &[
+                    ("aft".into(), notice.clone()),
+                    ("aft".into(), notice.clone()),
+                    ("not a module".into(), send_state("send-2", 5, "pending")),
+                ],
+                1000,
+            )
+            .unwrap());
+        let run_event = store.pending_bus_event().unwrap().unwrap();
+        assert!(run_event.subject.ends_with(".run.started.v1"));
+        store
+            .acknowledge_bus_event(&run_event, PublishReceipt::new(1, false), 1001)
+            .unwrap();
+        let published = store.pending_bus_event().unwrap().unwrap();
+        assert_eq!(published.event_key, "ses_ref:send-1:4");
+        assert!(
+            published
+                .subject
+                .ends_with(".event.broca.send_state.v1.aft"),
+            "{}",
+            published.subject
+        );
+        assert_eq!(published.body, notice.to_bytes().unwrap());
+        assert_eq!(published.headers["kind"], "send_state");
+        assert_eq!(published.headers["send_id"], "send-1");
+        store
+            .acknowledge_bus_event(&published, PublishReceipt::new(2, false), 1002)
+            .unwrap();
+        assert!(store.pending_bus_event().unwrap().is_none());
+        assert_eq!(
+            store
+                .bus_metrics()
+                .bus_events_oversize
+                .load(Ordering::Relaxed),
+            1
+        );
+        let rows: u64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM send_state_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        store.prune_bus_events(1000 + RETENTION_MS + 1).unwrap();
+        let rows: u64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM send_state_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a day-old notice is pruned");
+    }
+
+    /// Writes sample files of send state notices, for the modules that read them to check
+    /// their decoders against, when `BROCA_SEND_STATE_SAMPLES` names a folder: one file per state as the publisher sends it (subject, message id, headers and
+    /// the body's exact bytes), recorded and read back through the outbox.
+    #[test]
+    fn send_state_reader_samples() {
+        let Some(folder) = std::env::var_os("BROCA_SEND_STATE_SAMPLES") else {
+            return;
+        };
+        let folder = std::path::PathBuf::from(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.enable_bus_events("box_test").unwrap();
+        let reference = agent_session_ref(&session());
+        let cases: [(&str, &str, u64, &'static str); 8] = [
+            ("aft", "aft-notice-1", 41, "pending"),
+            ("aft", "aft-notice-1", 44, "active"),
+            ("aft", "aft-notice-2", 45, "superseded"),
+            ("aft", "aft-notice-3", 46, "expired"),
+            ("occipital", "app-send-7", 50, "pending"),
+            ("occipital", "app-send-7", 51, "active"),
+            ("occipital", "app-send-7", 60, "paused"),
+            ("occipital", "app-send-7", 72, "finished"),
+        ];
+        for (index, (sender, send_id, seq, state)) in cases.into_iter().enumerate() {
+            let notice = SendStateNotice {
+                v: 1,
+                session_ref: reference.clone(),
+                send_id: send_id.into(),
+                seq,
+                state,
+            };
+            store
+                .record_send_states(&[(sender.into(), notice)], 1000)
+                .unwrap();
+            let publication = store.pending_bus_event().unwrap().unwrap();
+            let sample = serde_json::json!({
+                "subject": publication.subject,
+                "nats_msg_id": publication.event_key,
+                "headers": publication.headers,
+                "body": String::from_utf8(publication.body.clone()).unwrap(),
+            });
+            std::fs::write(
+                folder.join(format!("{:02}-{sender}-{state}.json", index + 1)),
+                serde_json::to_vec_pretty(&sample).unwrap(),
+            )
+            .unwrap();
+            store
+                .acknowledge_bus_event(
+                    &publication,
+                    PublishReceipt::new(index as u64 + 1, false),
+                    1001,
+                )
+                .unwrap();
+        }
     }
 }

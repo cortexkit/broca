@@ -7,6 +7,7 @@ use broca_module::{
 };
 use broca_protocol::{
     run_events::{RunEvent, RunEventDetail},
+    send_states::SendStateNotice,
     BindIdentity,
 };
 use broca_store::{
@@ -160,6 +161,9 @@ impl Config {
 pub struct StoreRunEvents {
     store: Arc<dyn RunEventStore>,
     waiting: Mutex<VecDeque<WaitingEvents>>,
+    /// Send state notices (see [`broca_module::store_send_states`]) that wait for the account,
+    /// oldest first, each batch with the module each notice is for.
+    waiting_sends: Mutex<VecDeque<Vec<(String, SendStateNotice)>>>,
     /// Each session's epoch and the seq of its last durable record, which a `run.progress`
     /// beat carries as its `seq`.
     positions: Mutex<HashMap<BindIdentity, (String, u64)>>,
@@ -180,6 +184,7 @@ impl StoreRunEvents {
         Arc::new(Self {
             store,
             waiting: Mutex::default(),
+            waiting_sends: Mutex::default(),
             positions: Mutex::default(),
         })
     }
@@ -211,7 +216,20 @@ impl StoreRunEvents {
         LIVENESS
             .store_batches_waiting
             .store(waiting.len() as u64, Ordering::Relaxed);
-        waiting.is_empty()
+        let mut sends = self.waiting_sends.lock().unwrap();
+        while let Some(batch) = sends.front() {
+            match self.store.record_send_states(batch, now_ms) {
+                Ok(true) => {
+                    sends.pop_front();
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(target: "bus", %error, "could not record waiting send state notices; retrying on the next pass");
+                    break;
+                }
+            }
+        }
+        waiting.is_empty() && sends.is_empty()
     }
 
     /// The session's epoch and last durable seq, while its writer has told one.
@@ -225,6 +243,34 @@ impl StoreRunEvents {
             .lock()
             .unwrap()
             .retain(|session, _| active.contains(session));
+    }
+}
+
+impl broca_module::store_send_states::SendStateSink for StoreRunEvents {
+    fn durable(
+        &self,
+        _session: &BindIdentity,
+        changes: Vec<broca_module::store_send_states::SendStateChange>,
+    ) {
+        let changes: Vec<(String, SendStateNotice)> = changes
+            .into_iter()
+            .map(|change| (change.sender, change.notice))
+            .collect();
+        let mut waiting = self.waiting_sends.lock().unwrap();
+        if waiting.is_empty() {
+            match self.store.record_send_states(&changes, now_ms()) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(target: "bus", %error, "could not record send state notices; they wait for the publisher's next pass");
+                }
+            }
+        }
+        if waiting.len() >= STORE_EVENTS_WAITING_CAP {
+            waiting.pop_front();
+            tracing::warn!(target: "bus", "too many send state batches wait for the bus; dropping the oldest");
+        }
+        waiting.push_back(changes);
     }
 }
 

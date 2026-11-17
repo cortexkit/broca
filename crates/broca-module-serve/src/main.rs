@@ -726,6 +726,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         run_events: store_run_events
             .clone()
             .map(|events| events as Arc<dyn broca_module::store_run_events::RunEventSink>),
+        send_states: store_run_events
+            .clone()
+            .map(|events| events as Arc<dyn broca_module::store_send_states::SendStateSink>),
     };
     if let Err(error) = store_slot.open_without_key(&store_setup).await {
         // Plain sessions stay unserved until the key loads, which opens the runtime again.

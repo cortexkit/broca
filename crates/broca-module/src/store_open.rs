@@ -76,6 +76,9 @@ pub struct StoreRuntime {
     /// Where each session's run events go once their records are durable; none in tests and
     /// while run events are off.
     run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
+    /// Where each session's send state notices go once their records are durable; none in
+    /// tests and while run events are off.
+    send_states: Option<Arc<dyn crate::store_send_states::SendStateSink>>,
     /// Reads of a log's file, but for those of only its checkpoint frame, in tests.
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) log_reads: Arc<std::sync::atomic::AtomicUsize>,
@@ -162,6 +165,7 @@ impl StoreRuntime {
             idle_ttl,
             billing: None,
             run_events: None,
+            send_states: None,
             import_roots: Arc::new(crate::store_import::ImportRoots::with_default(
                 None,
                 Some(&crate::store_import::default_import_folder(state_root)),
@@ -317,6 +321,15 @@ impl StoreRuntime {
     /// Sessions opened from now on hand their run events to `sink`.
     pub fn with_run_events(mut self, sink: Arc<dyn crate::store_run_events::RunEventSink>) -> Self {
         self.run_events = Some(sink);
+        self
+    }
+
+    /// Sessions opened from now on hand their send state notices to `sink`.
+    pub fn with_send_states(
+        mut self,
+        sink: Arc<dyn crate::store_send_states::SendStateSink>,
+    ) -> Self {
+        self.send_states = Some(sink);
         self
     }
 
@@ -788,6 +801,9 @@ impl StoreRuntime {
         if let Some(sink) = &self.run_events {
             actor = actor.with_run_events(Arc::clone(sink));
         }
+        if let Some(sink) = &self.send_states {
+            actor = actor.with_send_states(Arc::clone(sink));
+        }
         let first_episode = actor
             .first_episode_handle(&registry)
             .map_err(OpenError::Open)?;
@@ -833,6 +849,8 @@ pub struct StoreRuntimeSetup {
     pub billing: Option<crate::store_billing::StoreBilling>,
     /// Where run events go (see [`StoreRuntime::with_run_events`]).
     pub run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
+    /// Where send state notices go (see [`StoreRuntime::with_send_states`]).
+    pub send_states: Option<Arc<dyn crate::store_send_states::SendStateSink>>,
 }
 
 impl StoreRuntimeSetup {
@@ -874,6 +892,9 @@ impl StoreRuntimeSetup {
         }
         if let Some(sink) = &self.run_events {
             runtime = runtime.with_run_events(Arc::clone(sink));
+        }
+        if let Some(sink) = &self.send_states {
+            runtime = runtime.with_send_states(Arc::clone(sink));
         }
         runtime
     }
