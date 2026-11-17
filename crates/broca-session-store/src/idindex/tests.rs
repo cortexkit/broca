@@ -480,3 +480,42 @@ fn an_open_run_start_reads_no_index_page() {
         assert!(session.find_run_start("missing").await.unwrap().is_none());
     });
 }
+
+/// A sealed run start found once is kept: asking again, as `run.admission` does on every call,
+/// reads no sealed object.
+#[test]
+fn a_sealed_run_start_found_once_is_read_again_from_memory() {
+    block_on(async {
+        let backend = MemoryBackend::default();
+        let addr = SessionAddr("0123456789abcdef".into());
+        let deployment = DeploymentKey::new(1, &[5; 32]);
+        let mut session = Session::create(&backend, addr, triple(), &deployment, false)
+            .await
+            .unwrap();
+        session
+            .append(&[start("sealed", None), end("sealed")], true)
+            .await
+            .unwrap();
+        session.seal(None, 1_000).await.unwrap();
+
+        let before = backend.object_reads();
+        let first = session.find_run_start("sealed").await.unwrap();
+        assert_eq!(
+            first.as_ref().map(|start| start.run_id.as_str()),
+            Some("sealed")
+        );
+        assert!(
+            backend.object_reads() > before,
+            "the first find reads the index"
+        );
+
+        let before = backend.object_reads();
+        let again = session.find_run_start("sealed").await.unwrap();
+        assert_eq!(again, first);
+        assert_eq!(
+            backend.object_reads(),
+            before,
+            "a kept sealed start fetched sealed objects again"
+        );
+    });
+}

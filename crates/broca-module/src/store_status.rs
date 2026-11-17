@@ -34,7 +34,7 @@
 //! here.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use broca_core::{ReconciledRunState, RunIndexState};
 use broca_protocol::{RunFinishReason, RunId, ToolCallId};
@@ -144,10 +144,23 @@ impl RunFacts {
 /// incarnation, which a session deleted and created again under the same id doesn't share.
 /// Bounded by [`SettledRuns::CAPACITY`] runs and [`SettledRuns::MAX_BYTES`] of their walked size:
 /// the oldest entry makes room for a new one.
+///
+/// It also keeps runs' admissions, which are settled when a run starts: `run.admission` answers
+/// from a run's start record and setup parts, neither of which ever changes, under the same key
+/// and at most [`SettledRuns::CAPACITY`] of them. Tool modules ask it about a run on every call,
+/// and without the cache each answer read the run's start and setup parts again.
 pub struct SettledRuns {
     inner: Mutex<SettledInner>,
+    admissions: Mutex<KeptAdmissions>,
     capacity: usize,
     max_bytes: usize,
+}
+
+/// Runs' `run.admission` answers, oldest first in `order`.
+#[derive(Default)]
+struct KeptAdmissions {
+    answers: HashMap<SettledKey, Arc<broca_wire::RunAdmissionResponse>>,
+    order: VecDeque<SettledKey>,
 }
 
 #[derive(Default)]
@@ -216,8 +229,28 @@ impl SettledRuns {
     pub fn with_bytes(capacity: usize, max_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(SettledInner::default()),
+            admissions: Mutex::new(KeptAdmissions::default()),
             capacity: capacity.max(1),
             max_bytes,
+        }
+    }
+
+    fn admission(&self, key: &SettledKey) -> Option<Arc<broca_wire::RunAdmissionResponse>> {
+        self.admissions.lock().ok()?.answers.get(key).cloned()
+    }
+
+    fn keep_admission(&self, key: SettledKey, answer: broca_wire::RunAdmissionResponse) {
+        let Ok(mut kept) = self.admissions.lock() else {
+            return;
+        };
+        if kept.answers.insert(key.clone(), Arc::new(answer)).is_none() {
+            kept.order.push_back(key);
+        }
+        while kept.order.len() > self.capacity {
+            let Some(oldest) = kept.order.pop_front() else {
+                break;
+            };
+            kept.answers.remove(&oldest);
         }
     }
 
@@ -261,12 +294,26 @@ impl SettledRuns {
             return broca_wire::MemoryCache::default();
         };
         let spare = inner.spare();
+        // The kept admissions are small and capped by count, so they count toward the estimate
+        // only, not against the byte cap the facts are kept under.
+        let admissions = self.admissions.lock().map_or(0, |kept| {
+            use broca_session_store::held::HeldBytes;
+            kept.answers
+                .iter()
+                .map(|((address, _, _, run_id), answer)| {
+                    2 * (address.heap_bytes() + run_id.heap_bytes())
+                        + std::mem::size_of::<(SettledKey, Arc<broca_wire::RunAdmissionResponse>)>()
+                        + std::mem::size_of::<broca_wire::RunAdmissionResponse>()
+                        + broca_session_store::held::serde_heap_bytes(&**answer)
+                })
+                .sum::<usize>()
+        });
         broca_wire::MemoryCache {
             entries: inner.facts.len() as u64,
             max_entries: self.capacity as u64,
             counted_bytes: Some(inner.bytes as u64),
             max_bytes: Some(self.max_bytes as u64),
-            estimated_bytes: (inner.bytes + spare) as u64,
+            estimated_bytes: (inner.bytes + spare + admissions) as u64,
             views_over_cap: None,
         }
     }
@@ -1352,6 +1399,20 @@ impl Reader<'_> {
         session: &Session<B>,
         run_id: &RunId,
     ) -> Result<Option<broca_wire::RunAdmissionResponse>, crate::serve::ServeError> {
+        let key = self.settled.map(|(cache, addr)| {
+            let key = (
+                addr.to_owned(),
+                session.head().incarnation.0,
+                session.head().history_version,
+                run_id.0.clone(),
+            );
+            (cache, key)
+        });
+        if let Some((cache, key)) = &key {
+            if let Some(answer) = cache.admission(key) {
+                return Ok(Some((*answer).clone()));
+            }
+        }
         let Some(start) = session
             .find_run_start(&run_id.0)
             .await
@@ -1361,7 +1422,7 @@ impl Reader<'_> {
         };
         let admission = broca_session_loop::run::admission_of_start(&start, self.parts)
             .map_err(|error| damaged(format!("the run's admission: {error:?}")))?;
-        crate::run_admission::response(
+        let answer = crate::run_admission::response(
             &start.run_id,
             start.session_class.clone(),
             start
@@ -1371,8 +1432,11 @@ impl Reader<'_> {
             admission.manifest.as_deref(),
             admission.send.principal.as_ref(),
             admission.send.scope.as_ref(),
-        )
-        .map(Some)
+        )?;
+        if let Some((cache, key)) = key {
+            cache.keep_admission(key, answer.clone());
+        }
+        Ok(Some(answer))
     }
 
     async fn facts<B: SessionBackend>(

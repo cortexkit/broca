@@ -919,23 +919,34 @@ impl LocalBackend {
     /// Every session this store holds a head for. A session folder without a head, such as one a
     /// creation or a move left before its head was written, holds no session.
     pub fn stored_sessions(&self) -> Result<Vec<SessionAddr>, BackendError> {
+        let mut sessions = Vec::new();
+        for name in self.session_folders()? {
+            if self.head_dir(&name).join("head").is_file() {
+                sessions.push(name);
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// The name of every session folder in this store, sorted, without checking each for a head:
+    /// a pass that reads only some of them finds a missing head when it reads one
+    /// ([`Self::read_stored_head`] answers `None`). Checking every folder costs a file lookup
+    /// each, 13 s for the 171,000 folders one store held, where listing them took 0.3 s.
+    pub fn session_folders(&self) -> Result<Vec<SessionAddr>, BackendError> {
         let entries = match std::fs::read_dir(self.root.join("heads")) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        let mut sessions = Vec::new();
+        let mut folders = Vec::new();
         for entry in entries {
             let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if entry.path().join("head").is_file() {
-                sessions.push(SessionAddr(name));
+            if let Some(name) = entry.file_name().to_str() {
+                folders.push(SessionAddr(name.to_owned()));
             }
         }
-        sessions.sort();
-        Ok(sessions)
+        folders.sort();
+        Ok(folders)
     }
 
     /// Cuts `log` of `s` back to `to` bytes, after keeping the bytes past `to` in a file beside

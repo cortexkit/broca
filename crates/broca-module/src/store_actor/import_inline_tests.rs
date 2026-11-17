@@ -265,13 +265,12 @@ async fn an_inline_import_read_error_leaves_an_active_run_serving_and_completing
     )
     .await;
 
-    assert!(matches!(
-        import(&commands, "seed").await,
-        ImportOutcome::Imported(outcome) if outcome.already_imported
-    ));
-    assert_eq!(import(&commands, "other").await, ImportOutcome::Busy);
+    // The failure is armed before a lookup that must read the store. An import looks up its run's
+    // start record, and the open session keeps a start record it has read from sealed history:
+    // the active run's admission already read the seed run's, so a lookup of the seed run never
+    // reaches the store. A run id the session has never found always does.
     backend.fail_next.store(true, Ordering::SeqCst);
-    let outcome = import(&commands, "seed").await;
+    let outcome = import(&commands, "other").await;
     assert!(
         matches!(
             outcome,
@@ -281,6 +280,11 @@ async fn an_inline_import_read_error_leaves_an_active_run_serving_and_completing
     );
     assert_eq!(backend.failures.load(Ordering::SeqCst), 1);
     assert!(!backend.fail_next.load(Ordering::SeqCst));
+    assert!(matches!(
+        import(&commands, "seed").await,
+        ImportOutcome::Imported(outcome) if outcome.already_imported
+    ));
+    assert_eq!(import(&commands, "other").await, ImportOutcome::Busy);
 
     let (reply, answer) = oneshot::channel();
     let live = if commands.send(LineageCmd::Status { reply }).is_ok() {

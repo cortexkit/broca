@@ -64,3 +64,45 @@ fn settled_run_facts_hold_no_more_than_their_byte_cap() {
     assert!(memory.counted_bytes.unwrap() <= CAP as u64);
     assert!(memory.entries > 1 && (memory.entries as usize) < RUNS);
 }
+
+/// A run's admission is kept under its session's incarnation and history version, so a revert
+/// or a session created again under the same id asks again, and only the newest
+/// [`SettledRuns::CAPACITY`] runs' admissions are kept.
+#[test]
+fn kept_admissions_answer_their_own_key_and_drop_the_oldest() {
+    let settled = SettledRuns::new(2);
+    let answer = |run: &str| broca_wire::RunAdmissionResponse {
+        run_id: run.to_owned(),
+        session_class: Some("head".into()),
+        started_at_ms: 1,
+        storage: broca_wire::RunAdmissionStorage::Store,
+        fetches: Vec::new(),
+        scope: None,
+    };
+    let key = |version: u64, run: &str| {
+        (
+            "b0d9e7b0d9e7b0d9".to_owned(),
+            [1; 16],
+            version,
+            run.to_owned(),
+        )
+    };
+    settled.keep_admission(key(0, "a"), answer("a"));
+    assert_eq!(
+        settled
+            .admission(&key(0, "a"))
+            .map(|kept| kept.run_id.clone()),
+        Some("a".to_owned())
+    );
+    assert!(
+        settled.admission(&key(1, "a")).is_none(),
+        "a moved history version asks again"
+    );
+    settled.keep_admission(key(0, "b"), answer("b"));
+    settled.keep_admission(key(0, "c"), answer("c"));
+    assert!(
+        settled.admission(&key(0, "a")).is_none(),
+        "the oldest is dropped"
+    );
+    assert!(settled.admission(&key(0, "c")).is_some());
+}

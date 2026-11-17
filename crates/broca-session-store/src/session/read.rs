@@ -144,7 +144,14 @@ struct KeptReads {
     /// page is never stale. A search walks the same few pages for every probe and each read
     /// takes them from here.
     pages: crate::directory::PageMemo,
+    /// The sealed run starts found before, by run id, at most [`RUN_STARTS_KEPT`], newest last.
+    /// `run.admission` asks for a run's start on every call, and a sealed start costs an id-index
+    /// lookup and a block read; a start never changes once sealed.
+    run_starts: Vec<(String, Arc<crate::record::RunStart>)>,
 }
+
+/// How many sealed run starts a session keeps while open: the few runs its callers ask about.
+const RUN_STARTS_KEPT: usize = 16;
 
 /// How many directory pages a session keeps while open: enough for the transcript and ledger
 /// directories' paths that one page read walks.
@@ -1106,13 +1113,41 @@ impl<B: SessionBackend> Session<B> {
         if self.head.id_index.is_none() {
             return Ok(None);
         }
-        Ok(Box::pin(self.sealed_found(IdKind::RunId, run_id))
+        if let Some(start) = self.sealed_run_start_kept(run_id) {
+            return Ok(Some((*start).clone()));
+        }
+        let found = Box::pin(self.sealed_found(IdKind::RunId, run_id))
             .await?
             .into_iter()
             .find_map(|(_, record)| match record {
                 Record::RunStart(start) => Some(*start),
                 _ => None,
-            }))
+            });
+        if let Some(start) = &found {
+            self.keep_sealed_run_start(start);
+        }
+        Ok(found)
+    }
+
+    /// The sealed start of run `run_id` an earlier [`Self::find_run_start`] kept, if any.
+    fn sealed_run_start_kept(&self, run_id: &str) -> Option<Arc<crate::record::RunStart>> {
+        self.sealed_caches().kept.as_ref().and_then(|kept| {
+            kept.run_starts
+                .iter()
+                .find(|(id, _)| id == run_id)
+                .map(|(_, start)| Arc::clone(start))
+        })
+    }
+
+    /// Keeps a sealed run start found for later finds, dropping the oldest past
+    /// [`RUN_STARTS_KEPT`].
+    fn keep_sealed_run_start(&self, start: &crate::record::RunStart) {
+        let mut caches = self.sealed_caches();
+        let kept = &mut caches.kept.get_or_insert_with(Box::default).run_starts;
+        if kept.len() == RUN_STARTS_KEPT {
+            kept.remove(0);
+        }
+        kept.push((start.run_id.clone(), Arc::new(start.clone())));
     }
 
     /// The ledger record with `seq`, by lookup, never a scan: a sealed one from the one block of

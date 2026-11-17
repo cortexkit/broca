@@ -234,11 +234,12 @@ impl StoreCollectSweep {
         pass
     }
 
-    /// Every session the new storage's roots hold a head for, ordered by class, then address.
+    /// Every session folder in the new storage's roots, ordered by class, then address. A pass
+    /// reads the heads of only some of them, and a folder without a head reads as nothing due.
     fn sessions(&self, pass: &mut SweepPass) -> Vec<(StorageClass, SessionAddr)> {
         let mut sessions = Vec::new();
         for class in StorageClass::ALL {
-            match LocalBackend::new(class.store_root(&self.state_root)).stored_sessions() {
+            match LocalBackend::new(class.store_root(&self.state_root)).session_folders() {
                 Ok(listed) => sessions.extend(listed.into_iter().map(|addr| (class, addr))),
                 Err(error) => {
                     pass.failed += 1;
@@ -270,7 +271,7 @@ impl StoreCollectSweep {
         let store = LocalBackend::new(class.store_root(&self.state_root));
         let bytes = match store.read_stored_head(addr) {
             Ok(Some((bytes, _))) => bytes,
-            // Deleted since the listing.
+            // A folder without a head: deleted since the listing, or one a creation or move left.
             Ok(None) => return Outcome::NothingDue,
             Err(error) => return Outcome::Failed(format!("its head couldn't be read: {error:?}")),
         };

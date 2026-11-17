@@ -186,14 +186,9 @@ fn read_opaque(raw: Raw<'_>) -> Result<String, DecodeError> {
     text.push_str(&after);
     // The writer splits the text around its longest base64 run when it has one, and only then,
     // so any other split is a second encoding of the same text.
-    let canonical = match (longest_base64_run(&text), run) {
-        (None, None) => after.is_empty(),
-        (Some(longest), Some(bytes)) => {
-            longest.alphabet == alphabet
-                && (longest.start, longest.end) == (run_start, run_end)
-                && longest.bytes == bytes.0
-        }
-        _ => false,
+    let canonical = match run {
+        None => after.is_empty() && longest_base64_run(&text).is_none(),
+        Some(_) => writer_splits_at(&text, (run_start, run_end), alphabet),
     };
     if !canonical {
         return Err(DecodeError::new(
@@ -228,6 +223,23 @@ impl Alphabet {
         }
     }
 
+    /// Whether `c` is one of this alphabet's 64 characters.
+    fn contains(self, c: u8) -> bool {
+        c.is_ascii_alphanumeric()
+            || match self {
+                Alphabet::Standard => c == b'+' || c == b'/',
+                Alphabet::UrlSafe => c == b'-' || c == b'_',
+            }
+    }
+
+    /// The alphabet a run is checked against besides this one.
+    fn other(self) -> Self {
+        match self {
+            Alphabet::Standard => Alphabet::UrlSafe,
+            Alphabet::UrlSafe => Alphabet::Standard,
+        }
+    }
+
     fn value(self, c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -259,8 +271,21 @@ fn longest_base64_run(text: &str) -> Option<Base64Run> {
 }
 
 fn longest_run_in(text: &str, alphabet: Alphabet) -> Option<Base64Run> {
+    let (start, end) = longest_run_bounds(text, alphabet)?;
+    canonical_base64(&text[start..end], alphabet).map(|bytes| Base64Run {
+        start,
+        end,
+        alphabet,
+        bytes,
+    })
+}
+
+/// Where [`longest_run_in`] looks for its run: the first longest run of `alphabet`'s characters
+/// (with up to two `=` after it), trimmed to a multiple of four, when at least
+/// [`MIN_BASE64_RUN`] long. Whether that run is canonical base64 is not checked here.
+fn longest_run_bounds(text: &str, alphabet: Alphabet) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
-    let in_alphabet = |c: u8| alphabet.value(c).is_some();
+    let in_alphabet = |c: u8| alphabet.contains(c);
     let mut best: Option<(usize, usize)> = None;
     let mut i = 0;
     while i < bytes.len() {
@@ -291,12 +316,27 @@ fn longest_run_in(text: &str, alphabet: Alphabet) -> Option<Base64Run> {
     if end - start < MIN_BASE64_RUN {
         return None;
     }
-    canonical_base64(&text[start..end], alphabet).map(|bytes| Base64Run {
-        start,
-        end,
-        alphabet,
-        bytes,
-    })
+    Some((start, end))
+}
+
+/// Whether the writer would split `text` at the base64 run `run` (in `alphabet`) and nowhere
+/// else: whether `longest_base64_run(text)` is that run. `run` is the encoding of bytes the
+/// reader holds, so it is canonical by construction, and only its place needs checking: it must
+/// be where `alphabet`'s scan finds its run, and the other alphabet's run must neither be longer
+/// nor win a tie (`longest_base64_run` takes the URL-safe run on a tie) while also being
+/// canonical. Checked this way, a long ciphertext is scanned once per alphabet and never decoded
+/// again; decoding it again on every read was the larger part of reading opaque text.
+fn writer_splits_at(text: &str, run: (usize, usize), alphabet: Alphabet) -> bool {
+    if longest_run_bounds(text, alphabet) != Some(run) {
+        return false;
+    }
+    let other = alphabet.other();
+    let Some((start, end)) = longest_run_bounds(text, other) else {
+        return true;
+    };
+    let (length, run_length) = (end - start, run.1 - run.0);
+    let beats = length > run_length || (length == run_length && other == Alphabet::UrlSafe);
+    !(beats && canonical_base64(&text[start..end], other).is_some())
 }
 
 fn base64_encode(bytes: &[u8], alphabet: Alphabet) -> String {

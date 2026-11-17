@@ -7,7 +7,10 @@ use broca_protocol::request::ModelHandle;
 use broca_protocol::usage::Usage;
 use proptest::prelude::*;
 
-use super::{base64_encode, canonical_base64, longest_base64_run, read_opaque, Alphabet};
+use super::{
+    base64_encode, canonical_base64, longest_base64_run, read_opaque, writer_splits_at, Alphabet,
+    MIN_BASE64_RUN,
+};
 use crate::codec::{put_req, ByteBuf, Raw};
 use crate::codec::{DecodeErrorKind, Message as CodecMessage};
 
@@ -316,4 +319,63 @@ proptest! {
         let _ = Message::decode(&bytes);
         let _ = ContentBlock::decode(&bytes);
     }
+}
+
+/// `writer_splits_at` accepts a stored split exactly when the writer's own choice
+/// (`longest_base64_run`) is that split, over texts built from runs of either alphabet's own
+/// characters, shared characters, padding and other text, for every canonical run in them.
+#[test]
+fn the_reader_accepts_exactly_the_splits_the_writer_makes() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let piece = |kind: usize, length: usize| -> String {
+        let chars: &[u8] = match kind {
+            0 => b"ABCxyz019+/",
+            1 => b"ABCxyz019-_",
+            2 => b"ABCDEFxyz0123",
+            3 => b"==",
+            _ => b" \":{}.",
+        };
+        (0..length)
+            .map(|i| chars[(i * 7 + length) % chars.len()] as char)
+            .collect()
+    };
+    let mut checked = 0;
+    for _ in 0..60 {
+        let mut text = String::new();
+        for _ in 0..1 + next(4) {
+            let kind = next(5);
+            let length = if kind >= 3 {
+                1 + next(3)
+            } else {
+                56 + next(20)
+            };
+            text.push_str(&piece(kind, length));
+        }
+        let writer = longest_base64_run(&text);
+        for alphabet in [Alphabet::Standard, Alphabet::UrlSafe] {
+            for start in 0..text.len() {
+                for end in (start + MIN_BASE64_RUN..=text.len()).step_by(4) {
+                    if canonical_base64(&text[start..end], alphabet).is_none() {
+                        continue;
+                    }
+                    let expected = writer.as_ref().is_some_and(|run| {
+                        (run.alphabet, run.start, run.end) == (alphabet, start, end)
+                    });
+                    assert_eq!(
+                        writer_splits_at(&text, (start, end), alphabet),
+                        expected,
+                        "{text:?} at {start}..{end} in {alphabet:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "only {checked} canonical runs were checked");
 }

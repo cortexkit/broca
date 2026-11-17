@@ -244,3 +244,27 @@ async fn a_pass_reads_its_bound_of_heads_and_the_next_goes_on_after_them() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A pass lists session folders without checking each for a head, so a folder a creation or a
+/// move left without one is read like any other and found to hold nothing due; it neither fails
+/// the pass nor stops it before the sessions after it.
+#[tokio::test]
+async fn a_session_folder_without_a_head_holds_nothing_due() {
+    let root = state_root("headless");
+    let key = key(&root, "z");
+    let replaced = finished(&root, StorageClass::Ordinary, &key, SEALED_AT).await;
+    std::fs::create_dir_all(
+        StorageClass::Ordinary
+            .store_root(&root)
+            .join("heads")
+            .join("0000000000000000"),
+    )
+    .unwrap();
+    let slot = slot(&root).await;
+    let leases = Arc::new(FileLeaseStore::new(root.join("leases")));
+    let sweep = sweep(&root, slot, leases, &[], SEALED_AT + GRACE_MS);
+    let pass = sweep.sweep_once(&CancellationToken::new());
+    assert_eq!((pass.read, pass.collected, pass.failed), (2, 1, 0));
+    assert!(!holds(&root, StorageClass::Ordinary, &key, &replaced));
+    let _ = std::fs::remove_dir_all(&root);
+}
