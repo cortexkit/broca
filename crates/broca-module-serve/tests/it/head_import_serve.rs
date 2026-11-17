@@ -1722,14 +1722,12 @@ async fn an_import_from_outside_the_import_folder_is_refused_through_serve() {
     );
 }
 
-/// On a session kept in the new storage, an op with no store implementation yet is refused by
-/// name before authorization reads anything, never with today's storage's advice to run a newer
-/// build. `run.tool_calls` and `session.baseline` are served from the store: a run the session
-/// never started is unknown, and the owner reads the baseline the import froze.
+/// On an imported session, `run.tool_calls` and `session.baseline` are served from the store: a
+/// run the session never started is unknown, and the owner reads the baseline the import froze.
 /// `role.describe` still answers on the session's route. Cancels are authorized from the
 /// stored owner: a stranger is refused as not the owner, and the owner's cancel is answered.
 #[tokio::test]
-async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_store() {
+async fn a_store_session_serves_its_ops_and_checks_owners_from_the_store() {
     let mut rig = Rig::start("gate", true).await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = rig.import_params("imp-1");
@@ -1737,11 +1735,6 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     rig.result(1, "session.import", params).await;
     let after = broca_core::clock::epoch_millis().unwrap();
 
-    assert_eq!(
-        rig.refused(1, "run.event.get", serde_json::json!({"run_id": "r1"}))
-            .await,
-        "not_served_on_new_storage"
-    );
     // The baseline is served from the store, to the owner.
     let baseline = rig
         .result(1, "session.baseline", serde_json::json!({}))

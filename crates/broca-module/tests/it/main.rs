@@ -7,3 +7,5 @@
 //! the suite slow to build and slow to start.
 
 mod open_failed_classes;
+#[cfg(feature = "test-clock")]
+mod test_clock;

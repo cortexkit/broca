@@ -714,7 +714,10 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
     for (index, body) in events.iter().enumerate() {
         let value: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(value["seq"], index as u64 + 1);
-        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&value["event"]).unwrap();
+        // The contract makes `event` optional: a unit with no lifecycle event carries none.
+        if !value["event"].is_null() {
+            cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&value["event"]).unwrap();
+        }
     }
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         let sample = format!("{}\n", events.join("\n"));
@@ -2209,7 +2212,10 @@ fn assert_stream_sequences(frames: &[Frame]) -> Vec<serde_json::Value> {
     assert!(!values.is_empty());
     for (index, value) in values.iter().enumerate() {
         assert_eq!(value["seq"], index as u64 + 1, "{value}");
-        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&value["event"]).unwrap();
+        // The contract makes `event` optional: a unit with no lifecycle event carries none.
+        if !value["event"].is_null() {
+            cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&value["event"]).unwrap();
+        }
     }
     values
 }
@@ -2489,7 +2495,10 @@ async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &s
     let mut lines = Vec::new();
     for (frame, value) in frames.iter().zip(&values) {
         let event = &value["event"];
-        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(event).unwrap();
+        // The contract makes `event` optional: a unit with no lifecycle event carries none.
+        if !event.is_null() {
+            cortexkit_role_llm_runner::live::LiveEvent::decode_strict(event).unwrap();
+        }
         if let (Some(mid), Some(part)) = (event["mid"].as_str(), event["part"].as_str()) {
             let entry = page
                 .messages

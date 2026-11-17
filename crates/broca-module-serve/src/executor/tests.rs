@@ -301,7 +301,7 @@ fn an_honoured_or_absent_cache_tail_declaration_stays_silent() {
 
 /// A mock launch must not read the developer's auth-methods config.
 ///
-/// CKTUI's shape: the rule lived in a comment inside `async fn main`, where nothing
+/// The rule once lived in a comment inside `async fn main`, where nothing
 /// could call it, so a refactor could drop the branch with every test still green. The
 /// loader here PANICS if reached, which is what makes the mock arm mean something -- a
 /// test that merely checked the returned config was empty would pass even if the file
@@ -1344,7 +1344,7 @@ async fn terminal_backoff_reports_with_attempt_status(
     attempt_status: Option<u16>,
 ) -> Vec<serde_json::Value> {
     use broca_module_serve::account_routing::{RoutingClient, RunReporter};
-    // A run on the new storage reports its attempts by record position alone.
+    // A run reports its attempts by record position alone.
     let lineage: Option<broca_wal::WalLineageId> = None;
     let routing = Arc::new(TerminalRouting {
         reports: Default::default(),
@@ -1355,7 +1355,7 @@ async fn terminal_backoff_reports_with_attempt_status(
         "admission_id": "adm-transient",
     }))
     .unwrap();
-    // A new-storage run names its reports by its session and record position. Only an
+    // A run names its reports by its session and record position. Only an
     // account routing chose is reported to routing at all.
     let Some(reporter) = RunReporter::start_for_decision(
         Arc::new(RoutingClient::new(routing.clone(), Default::default())),

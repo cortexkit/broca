@@ -5430,6 +5430,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .join(format!("broca-llm-conformance-{}", std::process::id()));
     broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
+    // Only the test-clock build attaches the notice bus, the one change made to the subject.
+    #[cfg_attr(not(feature = "test-clock"), allow(unused_mut))]
     let mut subject = BrocaSubject::new(&scratch).await;
     #[cfg(feature = "test-clock")]
     attach_notice_bus(&mut subject, &scratch).await;

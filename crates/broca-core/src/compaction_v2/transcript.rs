@@ -28,8 +28,8 @@ impl Transcript {
             .map(|(mid, fill)| (mid.as_str(), *fill))
     }
 
-    /// The id of the entry the signed floor names, which a projection that replayed every run
-    /// holds among its entries.
+    /// The id of the entry the signed floor names. A transcript built by replaying every run
+    /// holds that entry among its entries; one that didn't has no floor to name.
     pub fn floor_entry(&self) -> Option<&str> {
         super::host::floor_entry(self.signed_floor, &self.entries)
     }
