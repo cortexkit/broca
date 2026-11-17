@@ -156,7 +156,7 @@ fn install_entries<E: From<MoveRefusal>>(
         if to.is_dir() {
             migration::sync_dir(&to)
         } else {
-            std::fs::File::open(&to).and_then(|file| file.sync_all())
+            broca_session_store::durable::sync_file(&to)
         }
         .map_err(io_failed("a published entry couldn't be synced"))?;
         renamed()?;

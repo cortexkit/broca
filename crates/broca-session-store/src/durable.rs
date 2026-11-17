@@ -35,6 +35,12 @@ pub fn sync(file: &File) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Makes the file at `path` durable, through a handle opened for writing: Windows'
+/// `FlushFileBuffers` refuses a read-only handle with "Access is denied".
+pub fn sync_file(path: &Path) -> io::Result<()> {
+    sync(&std::fs::OpenOptions::new().write(true).open(path)?)
+}
+
 /// Makes the entries of folder `path` (names created, renamed or removed in it) durable. Windows
 /// has no folder sync; a rename there is durable once it returns.
 pub fn sync_dir(path: &Path) -> io::Result<()> {

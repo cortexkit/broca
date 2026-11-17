@@ -108,7 +108,11 @@ pub fn extract(db: &Path, session: &str, out_dir: &Path) -> Result<Extracted> {
         }
         transaction.commit()?;
         target.close().map_err(|(_, error)| error)?;
-        std::fs::File::open(&temp)?.sync_all()?;
+        // Opened for writing: Windows refuses to flush a read-only handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)?
+            .sync_all()?;
         let messages = connection.query_row(
             "SELECT COUNT(*) FROM message WHERE session_id=?1",
             [session],
