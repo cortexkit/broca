@@ -47,6 +47,12 @@ pub struct DeclaredMarker {
 /// the original marker placement and therefore the original rendered request bytes.
 /// A needed bridge replaces the system slot or uses a spare slot; it never evicts the tail
 /// or a declared message.
+///
+/// Version 2 is version 1 with one change: when the final message has no block that can carry
+/// a marker, the tail marker goes on the last message that has one. A turn-scoped system
+/// message renders with no content blocks, and version 1 sent every request it ends with
+/// without a conversation marker, so that request read only up to an earlier marker and wrote
+/// nothing. A request that ends with a block-bearing message plans as version 1 does.
 pub fn plan_markers(
     lookback_blocks: u32,
     max_breakpoints: u32,
@@ -56,7 +62,7 @@ pub fn plan_markers(
     version: Option<u32>,
     declared: &[DeclaredMarker],
 ) -> MarkerPlan {
-    if version != Some(1) {
+    if !matches!(version, Some(1 | 2)) {
         return plan_legacy_markers(
             lookback_blocks,
             max_breakpoints,
@@ -68,10 +74,16 @@ pub fn plan_markers(
     let legacy = plan_legacy_markers(lookback_blocks, 4, system_blocks, tail, messages);
     let mut candidates = Vec::new();
     if tail != Some(CacheTail::Volatile) {
-        if let Some(index) = messages.len().checked_sub(1) {
-            if messages[index].has_cacheable {
-                candidates.push(Some(marker_target(index, &messages[index])));
-            }
+        let tail_index = if version == Some(2) {
+            messages.iter().rposition(|message| message.has_cacheable)
+        } else {
+            messages
+                .len()
+                .checked_sub(1)
+                .filter(|index| messages[*index].has_cacheable)
+        };
+        if let Some(index) = tail_index {
+            candidates.push(Some(marker_target(index, &messages[index])));
         }
     }
     let mut ranked = declared.to_vec();
@@ -378,6 +390,40 @@ mod tests {
         let plan = super::plan_markers(20, 2, 1, None, &views, None, &[]);
         assert!(plan.system_tail);
         assert_eq!(plan.message_anchors, vec![target(0)]);
+    }
+
+    /// A request ending with a message that carries no block, such as a turn-scoped system
+    /// message, gets its tail marker on the last message that can carry one under version 2.
+    /// Version 1 left such a request with no conversation marker. Ending with a block-bearing
+    /// message, both versions plan alike.
+    #[test]
+    fn order_two_moves_the_tail_off_a_final_message_without_blocks() {
+        let mut views = marker_views(&[
+            user("m0"),
+            user("m1"),
+            msg(Role::Assistant, vec![tool_call("a")]),
+            msg(Role::Tool, vec![tool_result("a")]),
+        ]);
+        let ends_with_blocks: Vec<_> = [Some(1), Some(2)]
+            .map(|version| super::plan_markers(20, 4, 1, None, &views, version, &[]))
+            .into();
+        assert_eq!(ends_with_blocks[0], ends_with_blocks[1]);
+        assert_eq!(ends_with_blocks[1].message_anchors, vec![target(3)]);
+
+        views.push(MarkerViewMessage {
+            role: Role::User,
+            block_count: 0,
+            has_cacheable: false,
+            cache_prefix_blocks: None,
+        });
+        let one = super::plan_markers(20, 4, 1, None, &views, Some(1), &[]);
+        assert!(one.message_anchors.is_empty());
+        let two = super::plan_markers(20, 4, 1, None, &views, Some(2), &[]);
+        assert_eq!(two.message_anchors, vec![target(3)]);
+        assert!(two.system_tail);
+        let volatile =
+            super::plan_markers(20, 4, 1, Some(CacheTail::Volatile), &views, Some(2), &[]);
+        assert!(volatile.message_anchors.is_empty());
     }
 
     #[test]

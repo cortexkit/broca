@@ -70,8 +70,9 @@ pub use warming::{warm_count, warm_spend};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
 
-/// The cache-marker placement every new run freezes, as today's loop.
-pub const MARKER_ORDER_VERSION: u32 = 1;
+/// The cache-marker placement a session's first run freezes (see
+/// `broca_provider::cache_markers::plan_markers` and `admit::marker_order_for_next_run`).
+pub const MARKER_ORDER_VERSION: u32 = 2;
 
 /// What admission decided for a run. The loop freezes all of it into the run's start.
 #[derive(Debug, Clone)]
@@ -160,9 +161,8 @@ pub struct Admission {
     pub tools_were_omitted: bool,
     /// The cache marker order the run's requests are rendered with, frozen into its start. A
     /// session's first run takes the current order ([`MARKER_ORDER_VERSION`]). Every later run
-    /// takes the order the session's previous run froze, even when that run froze none (a run
-    /// written before the order existed), as today's loop does; a run read back from its start
-    /// takes what the start froze.
+    /// takes `admit::marker_order_for_next_run` of the order the session's previous run froze;
+    /// a run read back from its start takes what the start froze.
     pub marker_order_version: Option<u32>,
     /// What the send said about itself. None of it changes a request; all of it is recorded
     /// on the run's start, where status, retries and reads find it.

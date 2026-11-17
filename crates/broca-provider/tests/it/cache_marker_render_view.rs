@@ -292,7 +292,7 @@ fn anthropic_declared_markers_keep_declaration_order_for_equal_ranks() {
 
 #[test]
 fn anthropic_legacy_marker_order_ignores_declared_markers() {
-    for version in [None, Some(0), Some(2)] {
+    for version in [None, Some(0), Some(3)] {
         let mut opts = declared_marker_request();
         opts.marker_order_version = version;
         let baseline = anthropic_body_with_slots(&opts, 2);
@@ -685,4 +685,60 @@ fn bedrock_passthrough_cache_points_are_stripped_before_planned_markers() {
     assert!(body.to_string().contains("cachePoint"));
     assert!(!body.to_string().contains("cache_control"));
     assert!(!body.to_string().contains("cacheControl"));
+}
+
+/// A request that ends with a turn-scoped system message, which Anthropic receives as a message
+/// with no content blocks: marker order 2 puts the tail marker on the tool result before it.
+/// Order 1 sent it with no conversation marker, so the provider read only up to an earlier one
+/// and wrote nothing.
+#[test]
+fn anthropic_tail_marker_skips_a_final_turn_system_message_under_order_two() {
+    let call = ContentBlock::ToolCall(broca_protocol::content::ToolCall {
+        tool_call_id: broca_protocol::ToolCallId("call_1".into()),
+        tool_name: "bash".into(),
+        input: broca_protocol::json::Json::from_value(&json!({"command": "ls"})),
+        thought_signature: None,
+    });
+    let result = ContentBlock::ToolResult(broca_protocol::content::ToolResult {
+        tool_call_id: broca_protocol::ToolCallId("call_1".into()),
+        output: broca_protocol::content::ToolOutput::Text { text: "a b".into() },
+        is_error: false,
+    });
+    let mut nudge = msg(Role::System, vec![text("use the search tool")]);
+    nudge.turn_system = true;
+    let mut opts = CallOptions::new(vec![
+        msg(Role::System, vec![text("system")]),
+        msg(Role::User, vec![text("first")]),
+        msg(Role::Assistant, vec![text("second")]),
+        msg(Role::User, vec![text("run ls")]),
+        msg(Role::Assistant, vec![call]),
+        msg(Role::Tool, vec![result]),
+        nudge,
+    ]);
+    opts.target_model = Some(ModelHandle::new("anthropic", "claude-opus-4-8"));
+    let mut frozen = anthropic_frozen_config("claude-opus-4-8");
+    frozen.anthropic_turn_system = true;
+    frozen.cache = Some(CachePolicy {
+        version: 1,
+        class: CacheClass::Markers {
+            syntax: MarkerSyntax::AnthropicCacheControl,
+            ttl: CacheTtl::OneHour,
+            max_breakpoints: 4,
+            lookback_blocks: 20,
+            tail: None,
+            omit_ttl: false,
+        },
+    });
+    let marked = |version| {
+        let mut opts = opts.clone();
+        opts.marker_order_version = Some(version);
+        let body = AnthropicMessages.shape(&frozen, &opts);
+        assert_eq!(body["messages"][5]["role"], "system");
+        assert!(body["messages"][5]["content"].is_string());
+        (0..5)
+            .filter(|&index| anthropic_message_has_marker(&body, index))
+            .collect::<Vec<_>>()
+    };
+    assert!(!marked(1).contains(&4));
+    assert!(marked(2).contains(&4));
 }

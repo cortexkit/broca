@@ -84,10 +84,10 @@ pub fn admission<P: Provider>(
         context_management: req.context_management.clone(),
         directives: req.directives.clone(),
         tools_were_omitted: control.tools_were_omitted,
-        // The session's first run takes the current order; a later one keeps its previous
-        // run's, even none, as today's loop does.
+        // The session's first run takes the current order; a later one follows its previous
+        // run's (see `marker_order_for_next_run`).
         marker_order_version: match operations.run.as_ref().and_then(|run| run.start.as_ref()) {
-            Some(previous) => crate::run::frozen_marker_order(previous),
+            Some(previous) => marker_order_for_next_run(crate::run::frozen_marker_order(previous)),
             None => Some(crate::run::MARKER_ORDER_VERSION),
         },
         send: SendFacts {
@@ -111,4 +111,40 @@ pub fn admission<P: Provider>(
         applies_refresh: control.applies_refresh.clone(),
         head_turn: req.head_turn,
     })
+}
+
+/// The marker order a session's next run freezes, given the order its previous run froze.
+/// Version 2 plans as version 1 except when a request ends with a message that carries no
+/// block, where it adds the tail marker version 1 left out. A marker changes no prompt token, so
+/// moving a session from 1 to 2 between runs loses no cached prefix, and each run still renders
+/// every request under the one order it froze. A run frozen with no order (written before
+/// orders existed) keeps none: that legacy placement marks other messages than orders 1 and 2
+/// (see `plan_markers`), and a switch could leave the new markers beyond the provider's lookback
+/// from the prefix the session last wrote.
+pub(crate) fn marker_order_for_next_run(previous: Option<u32>) -> Option<u32> {
+    match previous {
+        Some(1) => Some(crate::run::MARKER_ORDER_VERSION),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod marker_order_tests {
+    use super::marker_order_for_next_run;
+    use crate::run::MARKER_ORDER_VERSION;
+
+    /// A session on order 1 moves to the current order at its next run; one on the current
+    /// order stays, and one written before orders existed keeps none.
+    #[test]
+    fn a_session_on_order_one_moves_to_the_current_order_at_its_next_run() {
+        assert_eq!(
+            marker_order_for_next_run(Some(1)),
+            Some(MARKER_ORDER_VERSION)
+        );
+        assert_eq!(
+            marker_order_for_next_run(Some(MARKER_ORDER_VERSION)),
+            Some(MARKER_ORDER_VERSION)
+        );
+        assert_eq!(marker_order_for_next_run(None), None);
+    }
 }

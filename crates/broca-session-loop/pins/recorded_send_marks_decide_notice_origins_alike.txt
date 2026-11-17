@@ -1,53 +1,53 @@
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:19efbb8ca6821670df8e49073255d4135b73e495228709d3a1480ab392163116 (4036 bytes)
+sha256:e66c05ef08a032367719d955f6a3e4f2466abfb1439481233bfa6002e5c5c7c8 (4036 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:19efbb8ca6821670df8e49073255d4135b73e495228709d3a1480ab392163116 (4036 bytes)
+sha256:e66c05ef08a032367719d955f6a3e4f2466abfb1439481233bfa6002e5c5c7c8 (4036 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:35ec827807eaea68c25dcc42bb2a197f68fb01c36f0dbe942f88dba4dc784c64 (4184 bytes)
+sha256:ea135a3c315248252abe99f4131b8048de2351f13400f3dd8f1bd4afe6b92f2b (4184 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:35ec827807eaea68c25dcc42bb2a197f68fb01c36f0dbe942f88dba4dc784c64 (4184 bytes)
+sha256:ea135a3c315248252abe99f4131b8048de2351f13400f3dd8f1bd4afe6b92f2b (4184 bytes)
 == tool calls
 []
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:e422cd3ffb15876267f10c1df6b06b31088786ae851d5dfe4f3ce220c0537907 (8998 bytes)
+sha256:a18a5e65adcdf5f6db484ab706437dd755b46aebc64ebad190ed80eea1aeefe2 (8998 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -65,13 +65,13 @@ sha256:e422cd3ffb15876267f10c1df6b06b31088786ae851d5dfe4f3ce220c0537907 (8998 by
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:e422cd3ffb15876267f10c1df6b06b31088786ae851d5dfe4f3ce220c0537907 (8998 bytes)
+sha256:a18a5e65adcdf5f6db484ab706437dd755b46aebc64ebad190ed80eea1aeefe2 (8998 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -89,39 +89,13 @@ sha256:e422cd3ffb15876267f10c1df6b06b31088786ae851d5dfe4f3ce220c0537907 (8998 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:ad063dbcaebc1da83e04988b6ae24994509d5453efd2c83bcb2f7234deddaa29 (9287 bytes)
-== tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== compaction entries
-sha256:4ddbb8d95ba9a053c898c83eeffcac04ea8e21f3d9621b5aead7cbcf361d7c38 (2075 bytes)
-== how each run reported
-[
-    (
-        Completed,
-        None,
-    ),
-]
-== request count
-2
-== request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
-== request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
-== record count
-25
-== records
-sha256:ad063dbcaebc1da83e04988b6ae24994509d5453efd2c83bcb2f7234deddaa29 (9287 bytes)
+sha256:95d56f3cccc1dc9fdc0aa68f05123995277fc88a6ae41545d33ddebc410c0636 (9287 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -139,55 +113,81 @@ sha256:4ddbb8d95ba9a053c898c83eeffcac04ea8e21f3d9621b5aead7cbcf361d7c38 (2075 by
     ),
 ]
 == request count
+2
+== request 0
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
+== request 1
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
+== record count
+25
+== records
+sha256:95d56f3cccc1dc9fdc0aa68f05123995277fc88a6ae41545d33ddebc410c0636 (9287 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== compaction entries
+sha256:4ddbb8d95ba9a053c898c83eeffcac04ea8e21f3d9621b5aead7cbcf361d7c38 (2075 bytes)
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:073d07b4d39489a4456969df191bd2e3ecb4fda2b1a253e979356d4e7f5fb2ef (4072 bytes)
+sha256:26e878decdf77ea751928a298009535c1775fd6b05c76cb940c39783ab12d45f (4072 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:073d07b4d39489a4456969df191bd2e3ecb4fda2b1a253e979356d4e7f5fb2ef (4072 bytes)
+sha256:26e878decdf77ea751928a298009535c1775fd6b05c76cb940c39783ab12d45f (4072 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:036b965ad2ab89927467201f46337056694564eddfc9a6c9da7c9b87bb65b099 (4180 bytes)
+sha256:a9025431cd219dadcfef0280b748b13819eeab465b995bda8d96c639ccf2e9f3 (4180 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:036b965ad2ab89927467201f46337056694564eddfc9a6c9da7c9b87bb65b099 (4180 bytes)
+sha256:a9025431cd219dadcfef0280b748b13819eeab465b995bda8d96c639ccf2e9f3 (4180 bytes)
 == tool calls
 []
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:63d95aa40a71a0d9e60e821d25cb774b59c84426854b7837dcc72a22f1f772c1 (9034 bytes)
+sha256:fcb62d5f2c62afbfce38450eb478972bad1841392f4a1558a96ac3717f238a56 (9034 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -205,13 +205,13 @@ sha256:63d95aa40a71a0d9e60e821d25cb774b59c84426854b7837dcc72a22f1f772c1 (9034 by
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:63d95aa40a71a0d9e60e821d25cb774b59c84426854b7837dcc72a22f1f772c1 (9034 bytes)
+sha256:fcb62d5f2c62afbfce38450eb478972bad1841392f4a1558a96ac3717f238a56 (9034 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -229,13 +229,13 @@ sha256:63d95aa40a71a0d9e60e821d25cb774b59c84426854b7837dcc72a22f1f772c1 (9034 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:ce380c879a28f6ebfbf21b0d9f6f2b28f4e07e92eea20e76ac2ce8facc4ecedb (9283 bytes)
+sha256:05701ef5c95771a5ffb67632d3797b8fd9c34e2a0134af10135b607a98799fba (9283 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -255,13 +255,13 @@ sha256:ccc70e28edc44dff0b17b6257142745e89b90741648ee43c7766930d7d7dc69b (2069 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:ce380c879a28f6ebfbf21b0d9f6f2b28f4e07e92eea20e76ac2ce8facc4ecedb (9283 bytes)
+sha256:05701ef5c95771a5ffb67632d3797b8fd9c34e2a0134af10135b607a98799fba (9283 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -281,53 +281,53 @@ sha256:ccc70e28edc44dff0b17b6257142745e89b90741648ee43c7766930d7d7dc69b (2069 by
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:06ac0376f875d8c7a06946a5b788dee18ed33673c582f6860eff4e2c16c287cf (4100 bytes)
+sha256:a5b2bafa8b9c0c7b533d0f1f499b25084f8bb0c714f5dccd7d6ed2526af3ed7c (4100 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:06ac0376f875d8c7a06946a5b788dee18ed33673c582f6860eff4e2c16c287cf (4100 bytes)
+sha256:a5b2bafa8b9c0c7b533d0f1f499b25084f8bb0c714f5dccd7d6ed2526af3ed7c (4100 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:bfd96ee080d212670f96b65f88e3fe49c5fde711b3b0b31ea5c751af828a51a6 (4248 bytes)
+sha256:4b2bed7ccbd74b3ffeccc7d0358f9acb2cc877f7f7a4c122c9844ee4ec60bed0 (4248 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:bfd96ee080d212670f96b65f88e3fe49c5fde711b3b0b31ea5c751af828a51a6 (4248 bytes)
+sha256:4b2bed7ccbd74b3ffeccc7d0358f9acb2cc877f7f7a4c122c9844ee4ec60bed0 (4248 bytes)
 == tool calls
 []
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:cfb58d34e2ac4ba17345e80779e6301c34eff84bb1ff4c30dfa71c95c1cd6c70 (9062 bytes)
+sha256:ed228c386ff2d6b1989962f7923715e8364e07b5fff502da015eac63995631c3 (9062 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -345,13 +345,13 @@ sha256:cfb58d34e2ac4ba17345e80779e6301c34eff84bb1ff4c30dfa71c95c1cd6c70 (9062 by
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:cfb58d34e2ac4ba17345e80779e6301c34eff84bb1ff4c30dfa71c95c1cd6c70 (9062 bytes)
+sha256:ed228c386ff2d6b1989962f7923715e8364e07b5fff502da015eac63995631c3 (9062 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -369,39 +369,13 @@ sha256:cfb58d34e2ac4ba17345e80779e6301c34eff84bb1ff4c30dfa71c95c1cd6c70 (9062 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:2cb4507a314d694fbd7df14da5fd2862eda24524cde6aee3ddf6c8fdcf169d32 (9351 bytes)
-== tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== compaction entries
-sha256:230caf7e4be9acbd3560f47f4bcd08208bf3017215f019b9a67f87c44c3943fd (2126 bytes)
-== how each run reported
-[
-    (
-        Completed,
-        None,
-    ),
-]
-== request count
-2
-== request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
-== request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
-== record count
-25
-== records
-sha256:2cb4507a314d694fbd7df14da5fd2862eda24524cde6aee3ddf6c8fdcf169d32 (9351 bytes)
+sha256:742f5894bd66c4ba5ed5ae9349cca2405b35336c013cf825849a27de4d180d42 (9351 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -419,55 +393,81 @@ sha256:230caf7e4be9acbd3560f47f4bcd08208bf3017215f019b9a67f87c44c3943fd (2126 by
     ),
 ]
 == request count
+2
+== request 0
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
+== request 1
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
+== record count
+25
+== records
+sha256:742f5894bd66c4ba5ed5ae9349cca2405b35336c013cf825849a27de4d180d42 (9351 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== compaction entries
+sha256:230caf7e4be9acbd3560f47f4bcd08208bf3017215f019b9a67f87c44c3943fd (2126 bytes)
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:31a6465fd482068d7706fe78c4704169b5488e08d05259e9cbed45c93a0fe519 (4106 bytes)
+sha256:172b320989f0af34153eacf4c025600157ea71f3adfb306a851ac048f5ed47f3 (4106 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:31a6465fd482068d7706fe78c4704169b5488e08d05259e9cbed45c93a0fe519 (4106 bytes)
+sha256:172b320989f0af34153eacf4c025600157ea71f3adfb306a851ac048f5ed47f3 (4106 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:2b76155f2622f77213c44a76c40aca317113611b389adc0fd2e63ab2efd680cf (4214 bytes)
+sha256:6257235e6faf2e3d9be9e9e6ca3f23e9e7a42b641ffd719cfef20d2c1b21d4a3 (4214 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:2b76155f2622f77213c44a76c40aca317113611b389adc0fd2e63ab2efd680cf (4214 bytes)
+sha256:6257235e6faf2e3d9be9e9e6ca3f23e9e7a42b641ffd719cfef20d2c1b21d4a3 (4214 bytes)
 == tool calls
 []
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:323d8e0edb40ea1af92f67226ed1807f056e3d52d4dd8992f340ae700c55b0d8 (9068 bytes)
+sha256:71e063bded2ebd0c0a03233bf39ab9e5494f96d3dc55da6c58f63ae9483c8426 (9068 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -485,13 +485,13 @@ sha256:323d8e0edb40ea1af92f67226ed1807f056e3d52d4dd8992f340ae700c55b0d8 (9068 by
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:323d8e0edb40ea1af92f67226ed1807f056e3d52d4dd8992f340ae700c55b0d8 (9068 bytes)
+sha256:71e063bded2ebd0c0a03233bf39ab9e5494f96d3dc55da6c58f63ae9483c8426 (9068 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -509,13 +509,13 @@ sha256:323d8e0edb40ea1af92f67226ed1807f056e3d52d4dd8992f340ae700c55b0d8 (9068 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:e4abfbfd3dd8a41f4f64fb250bd4f849445ae1f6b9c6ea6ef18d103e21377691 (9317 bytes)
+sha256:c791a868d819d1d4b9b8f22fb7588482da46b272b17f223ae9e43fb01acb3749 (9317 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -535,13 +535,13 @@ sha256:3d8464f8b8f813d60d3883d5c42c614e114cb4c6a92b636a36d0dccff6ad73ce (2094 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:e4abfbfd3dd8a41f4f64fb250bd4f849445ae1f6b9c6ea6ef18d103e21377691 (9317 bytes)
+sha256:c791a868d819d1d4b9b8f22fb7588482da46b272b17f223ae9e43fb01acb3749 (9317 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -561,53 +561,53 @@ sha256:3d8464f8b8f813d60d3883d5c42c614e114cb4c6a92b636a36d0dccff6ad73ce (2094 by
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:c77e56a0780adff208066f2cf1e03c90556ff05fd8a740f685dec17f25fb52d6 (4134 bytes)
+sha256:52cdcbea031175463f7e351a17ef29d86dbac4fd657115dd5125b5c884b8f03d (4134 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:c77e56a0780adff208066f2cf1e03c90556ff05fd8a740f685dec17f25fb52d6 (4134 bytes)
+sha256:52cdcbea031175463f7e351a17ef29d86dbac4fd657115dd5125b5c884b8f03d (4134 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:41569b0299ae98fd5c59120b8f28e373441354f357ffc61d8882cb214ba90006 (4282 bytes)
+sha256:3690b599d85ab6cf0bae1ace2b291739d12a81079e57ea070344bc3ac85660e4 (4282 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:41569b0299ae98fd5c59120b8f28e373441354f357ffc61d8882cb214ba90006 (4282 bytes)
+sha256:3690b599d85ab6cf0bae1ace2b291739d12a81079e57ea070344bc3ac85660e4 (4282 bytes)
 == tool calls
 []
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:40479e051cb3b741621f3ddbaeabd8470cb1c8049eedd85b5e1557ef201cb9fe (9096 bytes)
+sha256:e383776b8d422d54072892af815bd38376f08fde2ca144985cd7431349ab8daf (9096 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -625,13 +625,13 @@ sha256:40479e051cb3b741621f3ddbaeabd8470cb1c8049eedd85b5e1557ef201cb9fe (9096 by
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:40479e051cb3b741621f3ddbaeabd8470cb1c8049eedd85b5e1557ef201cb9fe (9096 bytes)
+sha256:e383776b8d422d54072892af815bd38376f08fde2ca144985cd7431349ab8daf (9096 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -649,39 +649,13 @@ sha256:40479e051cb3b741621f3ddbaeabd8470cb1c8049eedd85b5e1557ef201cb9fe (9096 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:785185bc641029a32a65e2914b08db62cf65427f9e2a094597b42e85ae8be33d (9385 bytes)
-== tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
-== compaction entries
-sha256:bc5dfebfdc34205078885c6462ef589f1923a91bdde1f08126999e405cdf6ad6 (2151 bytes)
-== how each run reported
-[
-    (
-        Completed,
-        None,
-    ),
-]
-== request count
-2
-== request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
-== request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
-== record count
-25
-== records
-sha256:785185bc641029a32a65e2914b08db62cf65427f9e2a094597b42e85ae8be33d (9385 bytes)
+sha256:a1a69bb74a240e173af88f0698ea38435f591f1d75d5d5e81766728f7970877e (9385 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -699,55 +673,81 @@ sha256:bc5dfebfdc34205078885c6462ef589f1923a91bdde1f08126999e405cdf6ad6 (2151 by
     ),
 ]
 == request count
+2
+== request 0
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
+== request 1
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
+== record count
+25
+== records
+sha256:a1a69bb74a240e173af88f0698ea38435f591f1d75d5d5e81766728f7970877e (9385 bytes)
+== tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
+== compaction entries
+sha256:bc5dfebfdc34205078885c6462ef589f1923a91bdde1f08126999e405cdf6ad6 (2151 bytes)
+== how each run reported
+[
+    (
+        Completed,
+        None,
+    ),
+]
+== request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:1da34a58bdf8d176bbe5f76687f79d2f81f8f3fa455dac780a5110c1aafb3acc (4014 bytes)
+sha256:d5a2cbb71aecdc9088f6493367d8ecd1437dee2a4ffefcccb28fec2def8faf1f (4014 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:e25f720646f4280ba65e5f86b5468c16b630dde0200bed1777b5577009deac48 (2216 bytes)
+sha256:a44f7095d9005007baf97d8c249b29b8d7a4a18b0f41d916f220e4ea51e46112 (2216 bytes)
 == record count
 9
 == records
-sha256:1da34a58bdf8d176bbe5f76687f79d2f81f8f3fa455dac780a5110c1aafb3acc (4014 bytes)
+sha256:d5a2cbb71aecdc9088f6493367d8ecd1437dee2a4ffefcccb28fec2def8faf1f (4014 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:19eb4218d9e1c66638754f43920c839c44efdbab7f679d02eea2e22101faa1df (4162 bytes)
+sha256:8f562e627fe0f6a11c53474c856be2bc292964c62c2c9df87e17641f8877f108 (4162 bytes)
 == tool calls
 []
 == request count
 1
 == request 0
-sha256:b6cc6309d76b9ad0eef63cfc16a6fc0585d2b38813fa2cf67793edb192ec1f2f (2216 bytes)
+sha256:ae3a292225219dab32e564d19281474cb64d5c01e3e32bc17542d3bd49617677 (2216 bytes)
 == record count
 9
 == records
-sha256:19eb4218d9e1c66638754f43920c839c44efdbab7f679d02eea2e22101faa1df (4162 bytes)
+sha256:8f562e627fe0f6a11c53474c856be2bc292964c62c2c9df87e17641f8877f108 (4162 bytes)
 == tool calls
 []
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:8d77743e13548fb7f21459972491cd9a35f78b9b18d96a547190aeec704dae51 (8976 bytes)
+sha256:120ccc2ac4d4715247a7450a2416de0a3150836309753929a651973756210af8 (8976 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -765,13 +765,13 @@ sha256:8d77743e13548fb7f21459972491cd9a35f78b9b18d96a547190aeec704dae51 (8976 by
 == request count
 2
 == request 0
-sha256:2350af9f553e3a9be6831c1c6d42d6c24dba7cabfd15a31ab1a6e2cde168b714 (3048 bytes)
+sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 bytes)
 == request 1
-sha256:335c7799f7397f5a208bc3e8f1555ec9fa24c43274bc4ed9bffc45614e7248ed (5748 bytes)
+sha256:3fb5fd8ef0c382bbc806e15e8e8998bc988e0f789be0b7941172d255ff325c96 (5748 bytes)
 == record count
 25
 == records
-sha256:8d77743e13548fb7f21459972491cd9a35f78b9b18d96a547190aeec704dae51 (8976 bytes)
+sha256:120ccc2ac4d4715247a7450a2416de0a3150836309753929a651973756210af8 (8976 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -789,13 +789,13 @@ sha256:8d77743e13548fb7f21459972491cd9a35f78b9b18d96a547190aeec704dae51 (8976 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:bd74e0f00c53c4aa766c8e918e5818b0de7560b1a171af8e907623a36fa79ac1 (9265 bytes)
+sha256:c3d74362131ef6051ad78420f89552c43ac1e18c500b91ef293cf6c54b78dde5 (9265 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",
@@ -815,13 +815,13 @@ sha256:4ddbb8d95ba9a053c898c83eeffcac04ea8e21f3d9621b5aead7cbcf361d7c38 (2075 by
 == request count
 2
 == request 0
-sha256:bcc8c47c70a28b9cb5cb103e50b2fee0ad054fb86e27468c032ca3a26c0a26b9 (3048 bytes)
+sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 bytes)
 == request 1
-sha256:101356efa9848ed43ef22393f8993bc466705df7725713a52f666b7f556d4305 (5750 bytes)
+sha256:b1d8be4c4d5d9c172f782ffbaceba79790db202de7e5384092eb6421bd7a2c92 (5750 bytes)
 == record count
 25
 == records
-sha256:bd74e0f00c53c4aa766c8e918e5818b0de7560b1a171af8e907623a36fa79ac1 (9265 bytes)
+sha256:c3d74362131ef6051ad78420f89552c43ac1e18c500b91ef293cf6c54b78dde5 (9265 bytes)
 == tool calls
 [
     "\"batch_started_guarded [\\\"c1\\\"]\"",

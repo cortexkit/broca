@@ -1,11 +1,11 @@
 == request count
 1
 == request 0
-sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
+sha256:4fa946df6b02151bc2c8646b1a261d7dea442fdc19fa3ab2e1d9ebec957e4352 (2828 bytes)
 == record count
 9
 == records
-sha256:b6e08757251f58683b5f4f48441d1dace6b8461022e3e632ba50dca67e411d77 (4974 bytes)
+sha256:dfe6cc0a9f39ea7cb3308ad42d78408d758fceebf863dfc95d9158f92125349f (4974 bytes)
 == tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":1},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
@@ -14,11 +14,11 @@ sha256:b6e08757251f58683b5f4f48441d1dace6b8461022e3e632ba50dca67e411d77 (4974 by
 == request count
 1
 == request 0
-sha256:2db34643288f69659c5e2f1e1a5adf4c1dcf08ea3f5a996004c6ead6ae5c78f2 (2828 bytes)
+sha256:4fa946df6b02151bc2c8646b1a261d7dea442fdc19fa3ab2e1d9ebec957e4352 (2828 bytes)
 == record count
 9
 == records
-sha256:b6e08757251f58683b5f4f48441d1dace6b8461022e3e632ba50dca67e411d77 (4974 bytes)
+sha256:dfe6cc0a9f39ea7cb3308ad42d78408d758fceebf863dfc95d9158f92125349f (4974 bytes)
 == tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":1},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
