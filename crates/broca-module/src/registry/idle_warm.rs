@@ -36,8 +36,14 @@ impl RegistryHandle {
         drop(stops);
         if let Some(scheduled) = scheduled {
             scheduled.cancel.cancel();
-            tracing::info!(target: "cache_warm", session = %broca_core::session_addr(key),
-                reason, next_due_ms = scheduled.due_ms, "idle cache warming stopped");
+            // A real run taking over is the ordinary end of idle warming, once per turn.
+            if reason == "real_run" {
+                tracing::debug!(target: "cache_warm", session = %broca_core::session_addr(key),
+                    reason, next_due_ms = scheduled.due_ms, "idle cache warming stopped");
+            } else {
+                tracing::info!(target: "cache_warm", session = %broca_core::session_addr(key),
+                    reason, next_due_ms = scheduled.due_ms, "idle cache warming stopped");
+            }
         }
     }
 
@@ -67,7 +73,7 @@ impl RegistryHandle {
         if let Some(previous) = previous {
             previous.cancel.cancel();
         }
-        tracing::info!(target: "cache_warm", session = %broca_core::session_addr(key),
+        tracing::debug!(target: "cache_warm", session = %broca_core::session_addr(key),
             reason = "cache_alive", next_due_ms = due_ms, "idle cache warming armed");
         let inner = std::sync::Arc::downgrade(&self.inner);
         let stopping = self.stopping_signal();

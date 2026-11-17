@@ -192,9 +192,11 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
         tokio::select! {
             biased;
             result = &mut tools => {
+                // The wait's ordinary ends, once per tool batch: debug, so they don't bury the stops
+                // that mean warming couldn't do its job (unsupported, missed, capped).
                 if !stopped {
                     let reason = if warm.cancel.is_some_and(CancellationToken::is_cancelled) { "cancelled" } else { "tools_done" };
-                    tracing::info!(target: "cache_warm", stop = reason, "keep_warm stopped");
+                    tracing::debug!(target: "cache_warm", stop = reason, "keep_warm stopped");
                 }
                 return result;
             }
@@ -202,7 +204,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                 tick = None;
                 next = None;
                 stopped = true;
-                tracing::info!(target: "cache_warm", stop = "cancelled", "keep_warm stopped");
+                tracing::debug!(target: "cache_warm", stop = "cancelled", "keep_warm stopped");
             }
             outcome = async { match tick.as_mut() { Some(future) => future.await, None => std::future::pending().await } } => {
                 tick = None;
