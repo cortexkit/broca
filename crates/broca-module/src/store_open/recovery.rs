@@ -334,7 +334,7 @@ impl crate::registry::LineageRegistry {
                     // nothing for an open to do. A registration only says a session might owe
                     // something; when it owes nothing the registration is retired here, without
                     // opening the session.
-                    let opened_for = match Session::view(
+                    let owed = match Session::view(
                         runtime.backend(class),
                         addr.clone(),
                         &triple,
@@ -345,28 +345,26 @@ impl crate::registry::LineageRegistry {
                         Ok(view) => {
                             let parts = runtime.parts_for(class, cipher)
                                 as &dyn broca_session_loop::parts::Parts;
-                            let owed = recovery_owed(
-                                &view.operations,
-                                runtime.billing.is_some(),
-                                Some(parts),
-                            )
-                            .or_else(|| {
-                                (warms_itself(&view.operations)
-                                    && self.idle_cache_live(&view.operations, parts, now_ms()))
-                                .then_some("warm_cache")
-                            });
-                            let Some(owed) = owed else {
-                                if registered.contains(&addr.0) {
-                                    super::recovery_index::remove(&root, &addr)
-                                        .map_err(|error| format!("retire recovery: {error}"))?;
-                                    sweep.retired += 1;
-                                }
-                                return Ok(());
-                            };
-                            owed
+                            recovery_owed(&view.operations, runtime.billing.is_some(), Some(parts))
+                                .or_else(|| {
+                                    (warms_itself(&view.operations)
+                                        && self.idle_cache_live(&view.operations, parts, now_ms()))
+                                    .then_some("warm_cache")
+                                })
                         }
-                        Err(SessionError::NeedsRecovery) => "needs_recovery",
+                        // The session lives on another machine now, which recovers it if anything
+                        // is owed; this machine can't open it.
+                        Err(SessionError::SessionMoved { .. }) => None,
+                        Err(SessionError::NeedsRecovery) => Some("needs_recovery"),
                         Err(error) => return Err(format!("read operational state: {error:?}")),
+                    };
+                    let Some(opened_for) = owed else {
+                        if registered.contains(&addr.0) {
+                            super::recovery_index::remove(&root, &addr)
+                                .map_err(|error| format!("retire recovery: {error}"))?;
+                            sweep.retired += 1;
+                        }
+                        return Ok(());
                     };
                     super::recovery_index::insert(&root, &addr)
                         .map_err(|error| format!("register recovery: {error}"))?;

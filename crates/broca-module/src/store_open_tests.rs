@@ -443,6 +443,45 @@ async fn raw_sender_pages_reuse_the_stored_position_with_or_without_an_actor() {
     let _ = root;
 }
 
+/// A registered session that moved to another machine owes this machine no recovery: the boot
+/// sweep retires its registration rather than failing on it at every restart.
+#[tokio::test]
+async fn a_moved_session_retires_its_recovery_candidate() {
+    use broca_session_store::backend::SessionBackend as _;
+    use broca_session_store::session::moves;
+    let root = state_root("moved-candidate");
+    let runtime = runtime(&root).await;
+    let (_, registry) = module(&root, runtime);
+    registry.recover_store_crash_orphans().await.unwrap();
+    let key = key(&root, "moved");
+    let class = StorageClass::Ordinary;
+    let addr = SessionAddr(broca_core::session_addr(&key));
+    crate::store_open::recovery::register_candidate(&class.store_root(&root), &addr).unwrap();
+    create_in(&root, class, &key).await;
+    let store = LocalBackend::new(class.store_root(&root));
+    let (_, version) = store.read_head(&addr).await.unwrap().unwrap();
+    moves::freeze(&store, &addr, version, "cut", &deployment())
+        .await
+        .unwrap();
+    moves::release(&store, &addr, "cut", "other-machine", &deployment())
+        .await
+        .unwrap();
+    let sweep = registry.recover_store_crash_orphans().await.unwrap();
+    assert!(sweep.failed.is_empty(), "{sweep:?}");
+    assert_eq!((sweep.recovered, sweep.retired), (0, 1), "{sweep:?}");
+    assert_eq!(registry.slot_state(&key), None, "the sweep opened no actor");
+    assert_eq!(
+        registry
+            .recover_store_crash_orphans()
+            .await
+            .unwrap()
+            .inspected,
+        0
+    );
+    assert!(registry.stop_and_seal().await);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A registered session whose stored state owes recovery nothing is retired by the boot sweep
 /// without being opened, and a later sweep has nothing left to inspect.
 #[tokio::test]
