@@ -22,9 +22,16 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 .account_ref
                 .as_deref()
                 .unwrap_or(&selection.credential_id);
+            // A router declaring `account_fork_of` places the fork on the head admission's own
+            // account, and on the account the head moved to if it moved. One that doesn't is
+            // asked for the frozen account by name, which it may not honour.
+            let fork_of = routing
+                .capability(cortexkit_role_routing::capabilities::ACCOUNT_FORK_OF)
+                .await
+                == broca_module_serve::routing_capabilities::CapabilitySupport::Declared;
             let outcome = routing
                 .account_for_pinned(
-                    fork_account_params(&job),
+                    fork_account_params(&job, fork_of),
                     tokio::time::Instant::now() + ADMISSION_BUDGET,
                 )
                 .await;
@@ -208,7 +215,14 @@ fn fork_is_routed(config: &broca_wal::RunConfig) -> bool {
         .is_some_and(|decision| decision.path == broca_wal::ACCOUNT_DECISION_ROUTED)
 }
 
-fn fork_account_params(job: &broca_module::executor::ForkCallJob) -> serde_json::Value {
+/// The fork's `route.account_for` admission. With `fork_of` (the router declares
+/// `account_fork_of`) and the head's admission id recorded, it names that admission instead of
+/// an account, so routing gives the fork the head's exact account and never another; the
+/// contract refuses `requested_account` beside it.
+fn fork_account_params(
+    job: &broca_module::executor::ForkCallJob,
+    fork_of: bool,
+) -> serde_json::Value {
     use broca_module_serve::account_routing::{
         account_for_params, AccountForRequest, AccountHoldCap, Candidates,
     };
@@ -240,10 +254,22 @@ fn fork_account_params(job: &broca_module::executor::ForkCallJob) -> serde_json:
         head_turn: false,
     });
     params.as_object_mut().unwrap().remove("candidates");
-    params["requested_account"] = serde_json::json!({
-        "account_id":selection.account_ref.as_deref().unwrap_or(&selection.credential_id),
-        "credential_id":selection.credential_id,
-    });
+    let head_admission = selection
+        .account_decision
+        .as_ref()
+        .and_then(|decision| decision.admission_id.as_deref())
+        .filter(|_| fork_of);
+    match head_admission {
+        Some(admission_id) => {
+            params["fork_of"] = serde_json::json!({ "admission_id": admission_id });
+        }
+        None => {
+            params["requested_account"] = serde_json::json!({
+                "account_id":selection.account_ref.as_deref().unwrap_or(&selection.credential_id),
+                "credential_id":selection.credential_id,
+            });
+        }
+    }
     params
 }
 

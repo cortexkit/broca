@@ -5,10 +5,23 @@ struct ForkRouting {
     requests: Mutex<Vec<serde_json::Value>>,
     reply: broca_module_serve::account_routing::RoutingReply,
     release_fails: bool,
+    /// Whether the router declares `account_fork_of`; otherwise its description is unknown.
+    fork_of: bool,
 }
 
 #[async_trait]
 impl broca_module_serve::account_routing::RoutingTransport for ForkRouting {
+    async fn capability(
+        &self,
+        name: &str,
+    ) -> broca_module_serve::routing_capabilities::CapabilitySupport {
+        use broca_module_serve::routing_capabilities::CapabilitySupport;
+        match (self.fork_of, name == cortexkit_role_routing::capabilities::ACCOUNT_FORK_OF) {
+            (true, true) => CapabilitySupport::Declared,
+            (true, false) => CapabilitySupport::NotDeclared,
+            (false, _) => CapabilitySupport::Unknown,
+        }
+    }
     async fn service_tier_supported(&self) -> Result<bool, String> {
         Ok(true)
     }
@@ -33,6 +46,7 @@ fn fork_routing(reply: broca_module_serve::account_routing::RoutingReply) -> Arc
         requests: Mutex::new(Vec::new()),
         reply,
         release_fails: false,
+        fork_of: false,
     })
 }
 
@@ -282,6 +296,7 @@ async fn fork_restart_release_only_routed_and_reports_delivery_failure() {
         requests: Mutex::new(Vec::new()),
         reply: Err("unused".into()),
         release_fails: true,
+        fork_of: false,
     });
     let executor = executor.with_routing(Arc::new(RoutingClient::new(
         failed.clone(),
@@ -392,6 +407,35 @@ async fn fork_finish_max_tokens() {
 #[tokio::test]
 async fn fork_finish_tool_call_refused_only_text_before_call() {
     fork_answer_fixture("tool", Some(FORK_TOOL_REPLY), "before", "tool_call_refused").await;
+}
+
+/// A router declaring `account_fork_of` is asked for the head admission's account by that
+/// admission's id, never for an account by name: the contract refuses `requested_account`
+/// beside `fork_of`, and only the admission tells routing which account the head moved to.
+#[tokio::test]
+async fn fork_names_the_head_admission_when_routing_declares_fork_of() {
+    let router = Arc::new(ForkRouting {
+        requests: Mutex::new(Vec::new()),
+        reply: fork_chosen("head-account", "apikey:anthropic", None),
+        release_fails: false,
+        fork_of: true,
+    });
+    let (root, _vault, executor, server) = fork_fixture("fork-of", router.clone()).await;
+    assert!(matches!(
+        executor.fork_call(fork_job(&root, &server.url)).await,
+        ForkCallOutcome::Answered { .. }
+    ));
+    let routing = router.requests.lock().unwrap();
+    let params = &routing[0]["params"];
+    assert_eq!(params["fork_of"], serde_json::json!({"admission_id": "head-admission"}));
+    assert!(params.get("requested_account").is_none(), "{params}");
+    assert_eq!(params["admission_id"], "fork-admission");
+    assert_eq!(params["mode"], "admit");
+    let checked = cortexkit_role_routing::account::parse_account_for_request_serving(
+        params,
+        &[cortexkit_role_routing::capabilities::ACCOUNT_FORK_OF.to_owned()],
+    );
+    assert!(checked.is_ok(), "routing's own parser refuses it: {checked:?}");
 }
 
 #[tokio::test]
