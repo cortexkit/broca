@@ -8532,6 +8532,54 @@ fn expected_delta(id: &str, text: &str) -> DisplayEvent {
     }
 }
 
+/// A call's input streamed as many fragments reaches the display lane joined: a few events
+/// carrying the whole input in order, not one event per fragment, so a reader of a lane that
+/// keeps only its newest events doesn't fall behind on one large input. Any other event first
+/// releases the joined input, so the text after it stays after it.
+#[tokio::test]
+async fn a_tool_input_streamed_in_fragments_reaches_the_display_lane_joined() {
+    let (out, mut events) = mpsc::channel(4096);
+    let input = json!({"path": "a", "content": "x".repeat(3000)});
+    let text = input.to_string();
+    let mut step: Vec<NormalizedEvent> = text
+        .as_bytes()
+        .chunks(4)
+        .map(|piece| {
+            NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                mid: None,
+                part: None,
+                tool_call_id: ToolCallId("c1".into()),
+                delta: String::from_utf8(piece.to_vec()).unwrap(),
+            })
+        })
+        .collect();
+    let fragments = step.len();
+    step.push(text_delta("a1", "after"));
+    step.extend(answer(
+        "a1",
+        vec![call("c1", "read", input)],
+        FinishReason::ToolCalls,
+    ));
+    DISPLAY_OUT
+        .scope(out, async {
+            new_loop(&single(vec![step, text_step("a2", "done")])).await;
+        })
+        .await;
+    let display = display_events(&mut events);
+    let joined: Vec<&str> = display
+        .iter()
+        .take_while(|event| matches!(event, DisplayEvent::ToolInputDelta { .. }))
+        .filter_map(DisplayEvent::delta)
+        .collect();
+    assert_eq!(joined.concat(), text, "the whole input, in order");
+    assert!(
+        joined.len() * 50 < fragments,
+        "{} events carried {fragments} fragments",
+        joined.len()
+    );
+    assert_eq!(display[joined.len()], expected_delta("a1", "after"));
+}
+
 #[tokio::test]
 async fn cancelled_stream_is_reset() {
     let (out, mut events) = mpsc::channel(64);

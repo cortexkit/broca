@@ -60,10 +60,12 @@ use crate::entries::{Placed, Tags};
 use crate::parts::{canonical, Parts};
 use crate::writer::Writer;
 
-mod pause;
-use pause::{pause, sign_in_at_start, sign_in_refused};
 mod attempt;
 use attempt::attempt_record;
+mod display;
+use display::restream;
+mod pause;
+use pause::{pause, sign_in_at_start, sign_in_refused};
 
 /// The cache-marker placement every new run freezes, as today's loop.
 pub const MARKER_ORDER_VERSION: u32 = 1;
@@ -2320,53 +2322,6 @@ where
     result
 }
 
-/// Resets the display lane and streams `message` on it again, each text, reasoning and tool-input
-/// block at its index in `message`, so a live view shows the answer as it will be stored.
-async fn restream(
-    out: Option<&mpsc::Sender<OutputEvent>>,
-    message: &AssistantMessage,
-    live: &mut bool,
-) {
-    use broca_protocol::content::ContentBlock;
-    use broca_protocol::DisplayEvent;
-    let Some(out) = out else {
-        return;
-    };
-    let _ = out
-        .send(OutputEvent::Display(DisplayEvent::DisplayReset))
-        .await;
-    *live = false;
-    for (index, part) in message.content.iter().enumerate() {
-        let mut event = match part {
-            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                DisplayEvent::TextDelta {
-                    mid: None,
-                    part: None,
-                    message_id: message.message_id.clone(),
-                    tool_call_id: None,
-                    delta: text.clone(),
-                }
-            }
-            ContentBlock::Reasoning { text, .. } => DisplayEvent::ReasoningDelta {
-                mid: None,
-                part: None,
-                message_id: message.message_id.clone(),
-                delta: text.clone(),
-            },
-            ContentBlock::ToolCall(call) => DisplayEvent::ToolInputDelta {
-                mid: None,
-                part: None,
-                tool_call_id: call.tool_call_id.clone(),
-                delta: call.input.to_string(),
-            },
-            _ => continue,
-        };
-        event.set_part(index as u64);
-        let _ = out.send(OutputEvent::Display(event)).await;
-        *live = true;
-    }
-}
-
 async fn reset_live_display(out: Option<&mpsc::Sender<OutputEvent>>, live: &mut bool) {
     if std::mem::take(live) {
         if let Some(out) = out {
@@ -4586,6 +4541,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     let mut step_usage = Usage::default();
     let mut served = Served::default();
     let mut cuts = Vec::new();
+    let mut join = display::ToolInputJoin::default();
     let outcome = loop {
         // Biased: the cancel is checked before each event, as broca-core's run loop checks it
         // before its step.
@@ -4594,6 +4550,12 @@ async fn model_step<W: Writer, P: Provider, T>(
             _ = seams.cancel.cancelled() => break Err(StepFailure::Cancelled),
             event = events.recv() => event,
         };
+        // A held tool-input delta goes out before anything else the step does.
+        if !matches!(event, Some(NormalizedEvent::Display(_))) {
+            if let (Some(out), Some(held)) = (seams.out, join.release()) {
+                let _ = out.send(OutputEvent::Display(held)).await;
+            }
+        }
         match event {
             Some(NormalizedEvent::Display(display)) => {
                 if matches!(display, broca_protocol::DisplayEvent::DisplayReset) {
@@ -4604,7 +4566,9 @@ async fn model_step<W: Writer, P: Provider, T>(
                     *live_display = true;
                 }
                 if let Some(out) = seams.out {
-                    let _ = out.send(OutputEvent::Display(display)).await;
+                    for display in join.take(display, tokio::time::Instant::now()) {
+                        let _ = out.send(OutputEvent::Display(display)).await;
+                    }
                 }
             }
             Some(NormalizedEvent::Control(ProviderControl::AssistantMessage { message: m })) => {
