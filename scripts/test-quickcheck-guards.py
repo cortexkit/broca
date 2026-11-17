@@ -137,7 +137,8 @@ class QuickcheckGuards(unittest.TestCase):
             test_attribute = re.compile(r"#\s*\[\s*(?:tokio::)?test\b[^\]]*\]")
             if not prior or not test_attribute.fullmatch(prior[-1]):
                 raise AssertionError(f"{FEATURE_TESTS}:{line_number}: {symbol} is no longer a test")
-            for feature in features.split(","):
+            # `-` runs a target that needs no feature, as quickcheck.sh reads it.
+            for feature in ([] if features == "-" else features.split(",")):
                 feature_package, _, feature_name = feature.partition("/")
                 feature_meta = cls.packages.get(feature_package)
                 if feature_meta is None or feature_name not in feature_meta["features"]:
