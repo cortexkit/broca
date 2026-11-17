@@ -730,6 +730,7 @@ fn tool_step(run: &str, step: u64, ordinal: &mut u64) -> Vec<Vec<Record>> {
                 step_id: step,
                 planned: vec![ToolCallId(call.clone())],
                 mid: None,
+                shown_tags: Vec::new(),
             }),
             Record::ToolIntent(ToolIntent {
                 run_id: run.into(),

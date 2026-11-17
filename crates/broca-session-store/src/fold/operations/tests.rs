@@ -82,6 +82,7 @@ fn batch(ids: &[&str]) -> Record {
         step_id: 1,
         planned: ids.iter().map(|id| ToolCallId((*id).into())).collect(),
         mid: None,
+        shown_tags: Vec::new(),
     })
 }
 

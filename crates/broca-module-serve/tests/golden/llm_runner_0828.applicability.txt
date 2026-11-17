@@ -20,13 +20,13 @@ N/A notice_yield_non_owner_plan_refused: runner does not declare notice_yield
 PASS notice_yield_undeclared_members_refused
 N/A notice_yield_notice_mark_admitted: runner does not declare notice_yield
 N/A notice_yield_second_send_never_reyields: runner does not declare notice_yield
-N/A tag_read_person: tag_read is not declared
-N/A tag_read_before_cut: tag_read is not declared
-N/A tag_read_before_undo: tag_read is not declared
-N/A tag_read_unknown_call: tag_read is not declared
-N/A tag_read_unknown_tag: tag_read is not declared
-N/A tag_read_non_owner: tag_read is not declared
-PASS tag_read_undeclared
+N/A tag_read_person: adapter cannot seed a person's tagged entry
+N/A tag_read_before_cut: adapter cannot seed a person's tagged entry
+N/A tag_read_before_undo: adapter cannot seed a person's tagged entry
+PASS tag_read_unknown_call
+N/A tag_read_unknown_tag: adapter cannot seed a tag assigned after a call
+PASS tag_read_non_owner
+N/A tag_read_undeclared: the subject declares every one of tag_read, so none is left to refuse
 N/A notice_keep_owner_served: notice_keep is not declared
 N/A notice_keep_requires_notice: notice_keep is not declared
 N/A notice_keep_owner_only: notice_keep is not declared

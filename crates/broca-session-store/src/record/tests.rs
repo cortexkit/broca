@@ -214,6 +214,7 @@ fn one_of_each() -> Vec<Record> {
             step_id: 1,
             planned: vec![ToolCallId("c1".into())],
             mid: Some("gabc.9".into()),
+            shown_tags: Vec::new(),
         }),
         Record::BatchEnd(BatchEnd {
             run_id: "run-1".into(),
@@ -421,4 +422,30 @@ fn a_body_decoded_as_another_kind_refuses_or_differs() {
     });
     let as_start = Record::decode(66, &end.encode_body());
     assert!(as_start.is_err() || as_start.unwrap() != end);
+}
+
+/// Part numbers fold into the fewest ranges, and a range set holds exactly the numbers it was
+/// made from, gaps included.
+#[test]
+fn tag_ranges_hold_exactly_their_numbers() {
+    let tags = [1, 2, 3, 5, 7, 8, 9, u64::MAX];
+    let ranges = TagRange::of_sorted(&tags);
+    assert_eq!(
+        ranges,
+        [
+            TagRange { first: 1, last: 3 },
+            TagRange { first: 5, last: 5 },
+            TagRange { first: 7, last: 9 },
+            TagRange {
+                first: u64::MAX,
+                last: u64::MAX
+            },
+        ]
+    );
+    for tag in 0..=12 {
+        assert_eq!(TagRange::holds(&ranges, tag), tags.contains(&tag), "{tag}");
+    }
+    assert!(TagRange::holds(&ranges, u64::MAX));
+    assert!(TagRange::of_sorted(&[]).is_empty());
+    assert!(!TagRange::holds(&[], 1));
 }

@@ -167,12 +167,20 @@ pub fn plan_for_render(
 pub struct RenderCache {
     kept: std::sync::Mutex<HashMap<u64, RenderedEntry>>,
     rendered: std::sync::atomic::AtomicU64,
+    shown: std::sync::Mutex<Vec<u64>>,
 }
 
 impl RenderCache {
     /// How many entries renders through this cache rendered rather than reused.
     pub fn rendered(&self) -> u64 {
         self.rendered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The part numbers the latest render through this cache showed the model, ascending: each
+    /// planned part whose number the render prefixes to its text or tool result. A step's last
+    /// render is the request it sends.
+    pub fn shown_tags(&self) -> Vec<u64> {
+        self.shown.lock().expect("shown part numbers").clone()
     }
 }
 
@@ -277,6 +285,22 @@ fn render_planned(
     let mut result_blocks: HashMap<usize, Vec<(usize, ContentBlock)>> = HashMap::new();
     let mut held_rides: HashMap<usize, Vec<(usize, String)>> = HashMap::new();
     let mut output = Vec::new();
+    if let Some(cache) = kept {
+        let mut shown: Vec<u64> = plan
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PlanItem::Entry { parts, .. } => Some(parts),
+                _ => None,
+            })
+            .flatten()
+            .filter(|part| part.prefix)
+            .filter_map(|part| part.tag)
+            .collect();
+        shown.sort_unstable();
+        shown.dedup();
+        *cache.shown.lock().expect("shown part numbers") = shown;
+    }
     for (order, item) in plan.items.into_iter().enumerate() {
         match item {
             PlanItem::Insert {

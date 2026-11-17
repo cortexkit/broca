@@ -73,6 +73,7 @@ pub mod store_run_events;
 pub mod store_send_states;
 pub mod store_status;
 pub mod store_tag_map;
+pub mod store_tag_read;
 pub mod store_tool_calls;
 mod uploads;
 pub mod wal_render;

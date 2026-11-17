@@ -32,6 +32,18 @@ fn noting_manifest() -> broca_wal::PlanManifest {
     manifest
 }
 
+/// The module the noted session's own sends come from, which owns it.
+pub(super) const OWNER: &str = "prefrontal-core";
+
+/// A send from [`OWNER`].
+fn owned(text: &str) -> SubmissionRequest {
+    let mut request = untooled(text);
+    request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: OWNER.into(),
+    });
+    request
+}
+
 /// A send from [`NOTER`].
 fn note(text: &str) -> SubmissionRequest {
     let mut request = untooled(text);
@@ -44,7 +56,7 @@ fn note(text: &str) -> SubmissionRequest {
 /// A store side whose session is on the compaction contract and renders part numbers, holding
 /// user text, a reply, a tool turn whose result carries a note [`NOTER`] sent while the session
 /// was idle, and the reply after it. `more` steps are scripted after those.
-async fn noted_session(more: Vec<Vec<NormalizedEvent>>) -> Side {
+pub(super) async fn noted_session(more: Vec<Vec<NormalizedEvent>>) -> Side {
     let mut steps = vec![
         text_step("a1", "Done."),
         tool_step("a2"),
@@ -55,7 +67,7 @@ async fn noted_session(more: Vec<Vec<NormalizedEvent>>) -> Side {
     let first = side
         .send_request(
             "r1",
-            untooled("first"),
+            owned("first"),
             Some(planned("plan-1", Some(noting_manifest()))),
         )
         .await;
@@ -72,7 +84,7 @@ async fn noted_session(more: Vec<Vec<NormalizedEvent>>) -> Side {
         .await;
     assert!(matches!(noted, SendOutcome::Pending { .. }), "{noted:?}");
     let second = side
-        .send_request("r2", untooled("read a"), Some(planned("plan-1", None)))
+        .send_request("r2", owned("read a"), Some(planned("plan-1", None)))
         .await;
     assert!(
         matches!(
@@ -134,7 +146,7 @@ async fn whole_map(side: &Side, limit: Option<u64>) -> (bool, Vec<Vec<TagMapRow>
 }
 
 /// Every row of the session's tag map, read in pages of the default size.
-async fn map_rows(side: &Side) -> Vec<TagMapRow> {
+pub(super) async fn map_rows(side: &Side) -> Vec<TagMapRow> {
     let (numbered, pages) = whole_map(side, None).await;
     assert!(numbered, "the session numbers its parts");
     pages.concat()
@@ -173,7 +185,7 @@ async fn entry_numbers(side: &Side) -> BTreeSet<(String, u64, u64)> {
 }
 
 /// Every part number a request shows: each `N` between two section signs in its text.
-fn shown_numbers(prompt: &Value) -> BTreeSet<u64> {
+pub(super) fn shown_numbers(prompt: &Value) -> BTreeSet<u64> {
     const SIGN: char = '\u{a7}';
     let text = prompt.to_string();
     let mut numbers = BTreeSet::new();
@@ -190,7 +202,7 @@ fn shown_numbers(prompt: &Value) -> BTreeSet<u64> {
 }
 
 /// The request the provider was sent at index `call`, as JSON.
-fn prompt_at(side: &Side, call: usize) -> Value {
+pub(super) fn prompt_at(side: &Side, call: usize) -> Value {
     serde_json::to_value(&side.provider.calls()[call].prompt).unwrap()
 }
 
@@ -287,7 +299,7 @@ async fn the_map_names_the_numbers_session_entries_serves_and_the_next_request_s
 }
 
 /// Waits until the session's actor has closed.
-async fn closed(side: &Side) {
+pub(super) async fn closed(side: &Side) {
     broca_test_support::wait_until("the session closes", || async {
         match side.registry.slot_state(&side.key) {
             None => Ok(()),
@@ -298,7 +310,7 @@ async fn closed(side: &Side) {
 }
 
 /// The session's writer, loaded as no actor holds it.
-async fn writer(side: &Side) -> Session<LocalBackend> {
+pub(super) async fn writer(side: &Side) -> Session<LocalBackend> {
     Session::load(
         LocalBackend::new(side.dir.join(broca_wal::SESSION_STORAGE_DIR)),
         SessionAddr(broca_core::session_addr(&side.key)),
@@ -314,7 +326,7 @@ async fn writer(side: &Side) -> Session<LocalBackend> {
 }
 
 /// The ordinal, id and entry facts' base of the window message whose text is `text`.
-async fn entry_of(session: &Session<LocalBackend>, text: &str) -> (u64, String, u64) {
+pub(super) async fn entry_of(session: &Session<LocalBackend>, text: &str) -> (u64, String, u64) {
     let window = session.conversation.window_start();
     session
         .entries(window, 200)

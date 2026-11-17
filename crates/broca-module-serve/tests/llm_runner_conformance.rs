@@ -2979,6 +2979,10 @@ impl LlmRunnerSubject for BrocaSubject {
             // role.describe declares plan_view. Its cases read session.plan_view through
             // ordinary routes and need nothing more from the subject.
             Capability::PlanView,
+            // role.describe declares tag_read. The adapter can't seed a person's numbered entry
+            // or observe the numbers a request showed, so the resolving cases report
+            // inapplicable by name; the refusal and owner cases run on ordinary routes.
+            Capability::TagRead,
         ]
         .into_iter()
         .collect();

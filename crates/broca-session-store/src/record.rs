@@ -839,6 +839,38 @@ message! {
 }
 
 message! {
+    /// Consecutive part numbers, both ends included.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub struct TagRange {
+        1 req first: u64,
+        2 req last: u64,
+    }
+}
+
+impl TagRange {
+    /// `tags`, ascending and without repeats, as the fewest ranges.
+    pub fn of_sorted(tags: &[u64]) -> Vec<TagRange> {
+        let mut ranges: Vec<TagRange> = Vec::new();
+        for &tag in tags {
+            match ranges.last_mut() {
+                Some(range) if range.last.checked_add(1) == Some(tag) => range.last = tag,
+                _ => ranges.push(TagRange {
+                    first: tag,
+                    last: tag,
+                }),
+            }
+        }
+        ranges
+    }
+
+    /// Whether `ranges`, as [`TagRange::of_sorted`] made them, hold `tag`.
+    pub fn holds(ranges: &[TagRange], tag: u64) -> bool {
+        let at = ranges.partition_point(|range| range.last < tag);
+        ranges.get(at).is_some_and(|range| range.first <= tag)
+    }
+}
+
+message! {
     /// A tool batch began: the calls planned for one step, in order.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct BatchStart {
@@ -849,6 +881,13 @@ message! {
         /// The id of the tool-results message this batch's replies make, decided here as
         /// `StepStart::mid` is for the step's assistant message, with the same rules.
         5 opt mid: String,
+        /// The part numbers the request whose answer planned these calls showed the model, as
+        /// sorted disjoint ranges: what a number one of the calls cites can name (llm-runner
+        /// `tag_read`). Empty when the request showed none, and on a batch recorded before
+        /// this was. Left out of the record's JSON form when empty, so a batch that shows no
+        /// numbers reads as it did before the field existed.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        6 rep shown_tags: TagRange,
     }
 }
 

@@ -314,6 +314,7 @@ pub(crate) fn batch_start(run: &str, step: u64, calls: &[&str]) -> Record {
         step_id: step,
         planned: calls.iter().map(|id| ToolCallId((*id).into())).collect(),
         mid: None,
+        shown_tags: Vec::new(),
     })
 }
 

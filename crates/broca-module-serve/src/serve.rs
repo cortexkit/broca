@@ -535,6 +535,8 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 #[cfg(test)]
 #[path = "serve_project_identity_tests.rs"]
 mod project_identity_tests;
+#[path = "serve_tag_read.rs"]
+mod serve_tag_read;
 
 /// What a `route.bind` said about its caller beyond the session identity. Both values are
 /// recorded on the `RunStarted` of every send or import made over the route, and neither keys
@@ -4410,14 +4412,9 @@ where
         }
         OP_READ => {
             if req.params.get("tag").is_some() {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some("tag".into()),
-                    "broca does not declare tag_read",
+                let params = &req.params;
+                return serve_tag_read::tag_read(
+                    writer, ver, channel, epoch, corr, session, bind, params, handler,
                 )
                 .await;
             }
@@ -5607,6 +5604,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
+        ServeError::TagReadRefused { code, .. } => (*code).into(),
         ServeError::NotServedOnNewStorage { .. } => NOT_SERVED_ON_NEW_STORAGE.into(),
         ServeError::MediaTooLarge(_) => cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE.into(),
         ServeError::TemplatePartGone { .. } => {
@@ -5985,6 +5983,7 @@ async fn send_serve_error(
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND,
         ServeError::UnknownSession => cortexkit_role_llm_runner::errors::UNKNOWN_SESSION,
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN,
+        ServeError::TagReadRefused { code, .. } => code,
         ServeError::ScopeRefused(_)
         | ServeError::ScopeFreezeBusy { .. }
         | ServeError::ReadAccessRefused => {

@@ -219,6 +219,7 @@ fn batch_start(run: &str, batch: &str, calls: &[&str]) -> Record {
         step_id: 1,
         planned: calls.iter().map(|id| ToolCallId((*id).into())).collect(),
         mid: None,
+        shown_tags: Vec::new(),
     })
 }
 

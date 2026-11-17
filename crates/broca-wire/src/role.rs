@@ -437,6 +437,9 @@ pub fn broca_role_describe_with_writers(
         // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
         cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
+        // A part number the model cites in a call resolves in the request that made the call
+        // (`session.read {tag, call_key}`), from the numbers each answered attempt recorded.
+        cortexkit_role_llm_runner::capabilities::TAG_READ,
         cortexkit_role_llm_runner::capabilities::SEND_IDS,
         cortexkit_role_llm_runner::capabilities::STEP_EVENTS,
     ]
@@ -1292,6 +1295,7 @@ mod pinned_reply_bytes {
                 checked.fork_idle_s,
                 broca_protocol::FORK_ANSWER_SERVED.then_some(broca_protocol::FORK_IDLE_S)
             );
+            assert!(checked.declares(cortexkit_role_llm_runner::capabilities::TAG_READ));
             // The person's steer hands calls back exactly when this build records notices.
             assert_eq!(
                 checked.declares(cortexkit_role_llm_runner::capabilities::CALL_YIELD),
@@ -1428,7 +1432,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "224da1bb9af15adb1f4105d38484f8f41e0f30442c20909d378b8ba2ebcd4ee3",
+            "9487def5151ade8c0961e656525cad3a12b48d6dcd007525d7265f60dcb29b14",
         );
     }
 
@@ -1625,7 +1629,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "d332c2bebee8776afc50ffd55f7e6739c9f39f440808a9c2a964c12cb5a4f381";
+        "e28fe5a24372c7079a66410a76435c87b29ba4a8d826c2120cf69327df998978";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -437,6 +437,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subc-protocol",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",

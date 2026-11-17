@@ -402,6 +402,7 @@ impl Writer {
             step_id,
             planned: tools.iter().map(|(id, ..)| id.clone()).collect(),
             mid: Some(Self::mid(results_ordinal)),
+            shown_tags: Vec::new(),
         })];
         let mut answers = Vec::new();
         let mut call_facts = Vec::new();

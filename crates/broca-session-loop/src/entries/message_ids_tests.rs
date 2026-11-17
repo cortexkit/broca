@@ -64,6 +64,7 @@ fn multi_message_batch() -> Vec<Record> {
             step_id: 4,
             planned: vec![ToolCallId("call".into())],
             mid: Some("results-id".into()),
+            shown_tags: Vec::new(),
         }),
         Record::ToolReply(ToolReply {
             run_id: "synthetic-run".into(),

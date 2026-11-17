@@ -157,6 +157,7 @@ fn dispatched(run: &str, id: &str) -> [Record; 2] {
             step_id: 1,
             planned: vec![ToolCallId(id.into())],
             mid: None,
+            shown_tags: Vec::new(),
         }),
         Record::ToolIntent(ToolIntent {
             run_id: run.into(),

@@ -2889,6 +2889,9 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
 /// `session.tag_map` over the sessions these scenarios build.
 mod tag_map_tests;
 
+/// `session.read {tag, call_key}` over the sessions these scenarios build.
+mod tag_read_tests;
+
 #[path = "entries_comparison/message_ids.rs"]
 mod message_ids;
 

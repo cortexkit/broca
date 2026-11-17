@@ -1749,6 +1749,13 @@ pub enum ServeError {
     TemplatePartGone {
         slot: String,
     },
+    /// A tag read (`session.read {tag, call_key}`) the session can't answer: `unknown_call` for
+    /// a call it holds no request for, `unknown_tag` for a number that request didn't show or
+    /// that names no part broca numbered.
+    TagReadRefused {
+        code: &'static str,
+        message: String,
+    },
     /// A deterministic send identity was reused with a different frozen request field.
     SendIdReuse {
         differing: String,
@@ -1901,6 +1908,7 @@ impl std::fmt::Display for ServeError {
                 f,
                 "the template's {slot} slot names a part the transcript does not show"
             ),
+            ServeError::TagReadRefused { message, .. } => f.write_str(message),
             ServeError::SendIdReuse { differing } => write!(
                 f,
                 "send_id was already used with different {differing}; retries must be byte-identical"
@@ -2199,6 +2207,21 @@ pub trait ServeHandler: Send + Sync {
         _session: &LineageKey,
         _params: &broca_wire::tag_map::TagMapParams,
     ) -> Result<Option<broca_wire::tag_map::TagMapResponse>, ServeError> {
+        Ok(None)
+    }
+
+    /// `session.read {tag, call_key}` (llm-runner `tag_read`): the message part the model saw as
+    /// part number `tag` in the request that produced call `call_key` (see `store_tag_read`),
+    /// for the session's owner alone. `principal` is the one the daemon attests opened the
+    /// route and `scope` the daemon's stamp on it. `None` for a handler without the new storage,
+    /// which keeps no request's part numbers.
+    async fn tag_read(
+        &self,
+        _session: &LineageKey,
+        _request: &cortexkit_role_llm_runner::tag_read::TagReadRequest,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+    ) -> Result<Option<cortexkit_role_llm_runner::tag_read::TagReadAnswer>, ServeError> {
         Ok(None)
     }
 
@@ -3508,6 +3531,54 @@ impl ServeHandler for crate::LineageRegistry {
                 .map(Some);
         }
         Ok(Some(broca_wire::tag_map::TagMapResponse::unnumbered()))
+    }
+
+    async fn tag_read(
+        &self,
+        session: &LineageKey,
+        request: &cortexkit_role_llm_runner::tag_read::TagReadRequest,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<Option<cortexkit_role_llm_runner::tag_read::TagReadAnswer>, ServeError> {
+        self.check_expired(session, None).await?;
+        let Some(store) = self.store_holding(session)? else {
+            return Ok(None);
+        };
+        crate::store_tag_read::check_owner(self, session, request, principal, scope).await?;
+        let Some(view) = store.current_view(session).await? else {
+            return Err(ServeError::TagReadRefused {
+                code: cortexkit_role_llm_runner::errors::UNKNOWN_CALL,
+                message: format!("no call has key {}", request.call_key),
+            });
+        };
+        let resolved =
+            crate::store_tag_read::resolve(&view, request.tag, &request.call_key).await?;
+        // The entry as `session.read` serves it, with display facts, as the contract asks.
+        let mut read = SessionReadRequest::new(session.clone(), Some(resolved.ordinal), Some(1));
+        read.include_display_facts = true;
+        let message = self
+            .read(read)
+            .await?
+            .messages
+            .into_iter()
+            .find(|message| message.ordinal == resolved.ordinal)
+            .ok_or_else(|| {
+                ServeError::Open(
+                    format!("message {} didn't read back", resolved.ordinal),
+                    Some(broca_protocol::ErrorClass::Permanent),
+                )
+            })?;
+        let entry = serde_json::to_value(&message)
+            .and_then(serde_json::from_value)
+            .map_err(|error| {
+                ServeError::Open(
+                    format!("message {} as a read entry: {error}", resolved.ordinal),
+                    Some(broca_protocol::ErrorClass::Permanent),
+                )
+            })?;
+        Ok(Some(
+            cortexkit_role_llm_runner::tag_read::TagReadAnswer::new(entry, resolved.part),
+        ))
     }
 
     async fn request_dump(

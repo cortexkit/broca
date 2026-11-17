@@ -804,8 +804,10 @@ mod records {
         batch_id,
         step_id,
         planned,
-        mid
+        mid,
+        shown_tags
     });
+    crate::fuzzing::gen::fields!(TagRange { first, last });
     crate::fuzzing::gen::fields!(BatchEnd { run_id, batch_id });
     crate::fuzzing::gen::fields!(ToolIntent {
         run_id,
