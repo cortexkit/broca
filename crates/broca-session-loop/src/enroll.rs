@@ -14,8 +14,6 @@
 
 use std::collections::HashMap;
 
-use broca_core::compaction_v2::metadata::numbered_parts;
-use broca_core::compaction_v2::systems::is_global;
 use broca_protocol::content::{Message, Role};
 use broca_protocol::request::EpisodeRenderInput;
 use broca_session_store::fold::conversation::Conversation;
@@ -87,7 +85,7 @@ pub fn carries_global_system(conversation: &Conversation) -> bool {
     conversation
         .messages
         .iter()
-        .any(|message| is_global(message))
+        .any(crate::window_shape::is_global)
 }
 
 /// The session-state rules an enrollment by a plan is checked against, in this order: the window
@@ -209,7 +207,7 @@ pub async fn decide<W: Writer>(writer: &W, tag_floor: u64) -> Result<Decided, Lo
         let own_time = facts
             .and_then(|facts| facts.written_at_ms)
             .filter(|at| *at != 0);
-        if is_global(message) {
+        if crate::window_shape::is_global(message) {
             entries.push(EnrolledEntry {
                 ordinal,
                 tag_base: high,
@@ -221,7 +219,7 @@ pub async fn decide<W: Writer>(writer: &W, tag_floor: u64) -> Result<Decided, Lo
         }
         let written_at_ms = own_time.or(time).unwrap_or(0);
         time = Some(written_at_ms);
-        let notice = match (message.role == Role::User, native, facts) {
+        let notice = match (message.role() == Role::User, native, facts) {
             (false, _, _) | (true, _, None) => None,
             (true, true, Some(_)) => Some(Notice {
                 sender: "broca".into(),
@@ -242,7 +240,7 @@ pub async fn decide<W: Writer>(writer: &W, tag_floor: u64) -> Result<Decided, Lo
             notice,
         });
         high = high
-            .checked_add(numbered_parts(message))
+            .checked_add(crate::window_shape::numbered_parts(message))
             .filter(|high| *high <= MAX_TAG)
             .ok_or(LoopError::Unsupported(
                 "part numbers past the numbering limit",
@@ -336,7 +334,7 @@ mod tests {
 
     use broca_protocol::content::{ContentBlock, Message, Role};
     use broca_protocol::request::EpisodeRenderInput;
-    use broca_session_store::fold::conversation::Conversation;
+    use broca_session_store::fold::conversation::{Conversation, WindowMessage};
     use broca_session_store::record::{EnrolledEntries, EnrolledEntry};
     use broca_session_store::session::EnrollmentOverlay;
 
@@ -371,15 +369,23 @@ mod tests {
         let mut conversation = Conversation::new(false);
         assert!(window_whole(&conversation));
         conversation.messages = vec![
-            std::sync::Arc::new(message(Role::System, "a note for this turn", true)),
-            std::sync::Arc::new(message(Role::User, "hi", false)),
+            WindowMessage::new(std::sync::Arc::new(message(
+                Role::System,
+                "a note for this turn",
+                true,
+            ))),
+            WindowMessage::new(std::sync::Arc::new(message(Role::User, "hi", false))),
         ];
         conversation.placed = 2;
         assert!(!carries_global_system(&conversation));
         assert_eq!(check(true, false, false), Ok(()));
         conversation.messages.insert(
             0,
-            std::sync::Arc::new(message(Role::System, "you are terse", false)),
+            WindowMessage::new(std::sync::Arc::new(message(
+                Role::System,
+                "you are terse",
+                false,
+            ))),
         );
         conversation.placed = 3;
         assert!(carries_global_system(&conversation));

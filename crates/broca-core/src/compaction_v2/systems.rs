@@ -4,7 +4,12 @@
 use broca_protocol::{CallOptions, ContentBlock, Message, Role};
 
 pub fn is_global(message: &Message) -> bool {
-    message.role == Role::System && !message.turn_system
+    is_global_role(message.role, message.turn_system)
+}
+
+/// [`is_global`] from a message's role and its turn-system flag.
+pub fn is_global_role(role: Role, turn_system: bool) -> bool {
+    role == Role::System && !turn_system
 }
 
 pub fn take_globals(input: &mut Vec<Message>) -> Vec<Message> {

@@ -691,7 +691,8 @@ mod tests {
     fn texts(writer: &impl Writer) -> Vec<String> {
         writer
             .conversation()
-            .messages
+            .held_messages()
+            .unwrap()
             .iter()
             .flat_map(|message| &message.content)
             .filter_map(|block| match block {
@@ -777,7 +778,8 @@ mod tests {
                 .append_with(
                     &mut |conversation, _, first_seq| {
                         seen = conversation
-                            .messages
+                            .held_messages()
+                            .unwrap()
                             .iter()
                             .flat_map(|message| &message.content)
                             .filter_map(|block| match block {

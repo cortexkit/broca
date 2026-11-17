@@ -405,7 +405,8 @@ fn the_estimates_of_a_projection_an_image_index_and_a_request_match_the_allocato
         Box::new(broca_protocol::request::CallOptions::new(
             session
                 .conversation
-                .messages
+                .held_messages()
+                .unwrap()
                 .iter()
                 .map(|message| broca_protocol::Message::clone(message))
                 .collect(),

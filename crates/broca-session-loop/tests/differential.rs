@@ -921,7 +921,7 @@ async fn photo(ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
 /// `photo` tool returns media. (A resumed run's earlier records come from a converted log, whose
 /// media the converter doesn't copy yet, so this runs on whole runs only.)
 async fn media_reads_back(session: &Session<&MemoryBackend>) {
-    for message in &session.conversation.messages {
+    for message in &session.conversation.held_messages().unwrap() {
         for block in &message.content {
             let ContentBlock::ToolResult(result) = block else {
                 continue;

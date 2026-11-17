@@ -870,7 +870,8 @@ pub(super) async fn idle(commands: &mpsc::UnboundedSender<LineageCmd>) {
 pub(super) fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
     session
         .conversation()
-        .messages
+        .held_messages()
+        .unwrap()
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {

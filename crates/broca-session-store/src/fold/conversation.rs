@@ -48,6 +48,9 @@ pub enum FoldError {
     FactsWithoutEntry(u64),
     /// A seal would keep more runs past the window than their declared cap.
     Bound(&'static str),
+    /// Delivered text would join a result whose content isn't held in memory: it must be read
+    /// back before the fold changes it.
+    ResultNotHeld(String),
 }
 
 crate::message! {
@@ -124,7 +127,7 @@ state! {
         /// checkpoint, so it holds the active window, never the whole history. Each message is
         /// shared with the record that placed it, where one did, and with every read and request
         /// that takes it.
-        1 rep pub messages: Arc<Message> => {
+        1 rep pub messages: WindowMessage => {
             owner: "run loop",
             reset: "never",
             bound: Bound::Window,
@@ -312,6 +315,7 @@ impl Conversation {
         let entries = self.entries.iter().chain(&self.open_entry);
         self.messages
             .iter()
+            .map(WindowMessage::allocation)
             .chain(self.open.as_ref().map(|turn| &turn.assistant))
             .map(|message| Arc::as_ptr(message) as usize)
             .chain(
@@ -474,7 +478,7 @@ impl Conversation {
         };
         self.messages
             .iter()
-            .rposition(|message| message.role == Role::Tool)
+            .rposition(|message| message.role() == Role::Tool)
             .is_some_and(|at| self.window_start() + at as u64 <= through)
     }
 
@@ -561,7 +565,7 @@ impl Conversation {
     }
 
     /// The window message with `ordinal` and its entry state.
-    pub fn window_entry(&self, ordinal: u64) -> Option<(&Arc<Message>, &EntryState)> {
+    pub fn window_entry(&self, ordinal: u64) -> Option<(&WindowMessage, &EntryState)> {
         let start = self.window_start();
         if ordinal < start {
             return None;
@@ -582,8 +586,42 @@ impl Conversation {
         self.placed - self.messages.len() as u64 + 1
     }
 
+    /// Every window message with all its content, or the first whose content isn't held.
+    pub fn held_messages(&self) -> Result<Vec<Arc<Message>>, NotHeld> {
+        let start = self.window_start();
+        (start..=self.placed)
+            .zip(&self.messages)
+            .map(|(ordinal, message)| message.held().cloned().ok_or(NotHeld { ordinal }))
+            .collect()
+    }
+
+    /// The window's messages of `role` with all their content, or the first whose content isn't
+    /// held.
+    pub fn held_messages_of(&self, role: Role) -> Result<Vec<Arc<Message>>, NotHeld> {
+        (self.window_start()..=self.placed)
+            .zip(&self.messages)
+            .filter(|(_, message)| message.role() == role)
+            .map(|(ordinal, message)| message.held().cloned().ok_or(NotHeld { ordinal }))
+            .collect()
+    }
+
+    /// The window's newest message, with all its content: the newest message is never released
+    /// from memory, so this is `None` only for an empty window.
+    pub fn newest(&self) -> Option<&Arc<Message>> {
+        self.messages.last().and_then(WindowMessage::held)
+    }
+
+    /// The window message with `ordinal` with all its content: `Ok(None)` when it isn't in the
+    /// window, `Err` when its content isn't held.
+    pub fn held_message(&self, ordinal: u64) -> Result<Option<&Arc<Message>>, NotHeld> {
+        match self.window_message(ordinal) {
+            None => Ok(None),
+            Some(message) => message.held().map(Some).ok_or(NotHeld { ordinal }),
+        }
+    }
+
     /// The window message with `ordinal`, if it's in the window.
-    pub fn window_message(&self, ordinal: u64) -> Option<&Arc<Message>> {
+    pub fn window_message(&self, ordinal: u64) -> Option<&WindowMessage> {
         let start = self.window_start();
         (ordinal >= start)
             .then(|| self.messages.get((ordinal - start) as usize))
@@ -591,7 +629,7 @@ impl Conversation {
     }
 
     fn place(&mut self, message: Arc<Message>, entry: EntryState) {
-        self.messages.push(message);
+        self.messages.push(WindowMessage::new(message));
         self.entries.push(entry);
         self.placed += 1;
     }
@@ -766,7 +804,7 @@ impl Conversation {
                         &mut self.messages,
                         &append.tool_call_id,
                         &append.text,
-                    ) {
+                    )? {
                         let ordinal = self.window_start() + at as u64;
                         self.changes.message(ordinal);
                     }
@@ -832,8 +870,9 @@ impl Conversation {
             .enumerate()
             .rev()
         {
-            let part = message.content.iter().position(|block| {
-                matches!(block, ContentBlock::ToolCall(call) if call.tool_call_id == append.tool_call_id)
+            let part = message.blocks().position(|block| {
+                block.kind() == BlockKind::ToolCall
+                    && block.tool_call_id() == Some(&append.tool_call_id)
             });
             if let Some(part) = part {
                 entry.delivered.push(Delivered {
@@ -850,6 +889,9 @@ impl Conversation {
     }
 }
 
+mod window_message;
+pub use window_message::{BlockKind, BlockRef, BlockShape, NotHeld, WindowMessage};
+
 #[cfg(test)]
 mod tests;
 
@@ -860,25 +902,32 @@ mod generate;
 /// says where that message is in `messages`. Delivered text is only ever attached to a result of
 /// the batch that just finished. The message is copied first only when another holder shares it.
 fn append_to_newest_result(
-    messages: &mut [Arc<Message>],
+    messages: &mut [WindowMessage],
     id: &ToolCallId,
     text: &str,
-) -> Option<usize> {
+) -> Result<Option<usize>, FoldError> {
     use broca_protocol::content::{ToolOutput, ToolOutputPart};
-    let at = messages.iter().rposition(|m| m.role == Role::Tool)?;
-    let block = messages[at].content.iter().position(
-        |block| matches!(block, ContentBlock::ToolResult(result) if &result.tool_call_id == id),
-    )?;
-    if let ContentBlock::ToolResult(result) = &messages[at].content[block] {
+    let Some(at) = messages.iter().rposition(|m| m.role() == Role::Tool) else {
+        return Ok(None);
+    };
+    let Some(block) = messages[at].blocks().position(|block| {
+        block.kind() == BlockKind::ToolResult && block.tool_call_id() == Some(id)
+    }) else {
+        return Ok(None);
+    };
+    let not_held = || FoldError::ResultNotHeld(id.0.clone());
+    if let ContentBlock::ToolResult(result) =
+        &messages[at].held().ok_or_else(not_held)?.content[block]
+    {
         if matches!(
             result.output,
             ToolOutput::Json { .. } | ToolOutput::Denied { .. }
         ) {
-            return None;
+            return Ok(None);
         }
     }
-    let ContentBlock::ToolResult(result) = &mut Arc::make_mut(&mut messages[at]).content[block]
-    else {
+    let held = messages[at].held_mut().ok_or_else(not_held)?;
+    let ContentBlock::ToolResult(result) = &mut held.content[block] else {
         unreachable!("found above");
     };
     match &mut result.output {
@@ -889,5 +938,5 @@ fn append_to_newest_result(
         }),
         ToolOutput::Json { .. } | ToolOutput::Denied { .. } => unreachable!("checked above"),
     }
-    Some(at)
+    Ok(Some(at))
 }

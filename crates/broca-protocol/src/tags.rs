@@ -510,6 +510,41 @@ pub fn exposed_model_text(clean: bool, text: &str) -> std::borrow::Cow<'_, str> 
     }
 }
 
+/// Whether [`part_kind`] cleans a message of `role` written under `rules`: only a model's replies
+/// are cleaned.
+pub fn cleans(rules: ComputedRules, role: Role) -> bool {
+    rules.clean && role == Role::Assistant
+}
+
+/// The number each block takes, numbered after `base` from its [`part_kind`] (`None` for a block
+/// that has none): a part counts when a run renders tags and llm-runner counts its kind, and
+/// counted parts take numbers in block order.
+pub fn number_kinds(
+    kinds: impl IntoIterator<Item = Option<PartKind>>,
+    render: bool,
+    base: u64,
+) -> Result<Vec<Option<u64>>, NumberingOverflow> {
+    let mut blocks = 0;
+    // The parts that count, with their block positions as their rendered order.
+    let counted: Vec<(usize, RenderedPart)> = kinds
+        .into_iter()
+        .enumerate()
+        .inspect(|_| blocks += 1)
+        .filter_map(|(index, kind)| {
+            let kind = kind?;
+            (render && cortexkit_role_llm_runner_v1::tags::counts(kind))
+                .then(|| (index, RenderedPart::new(kind, index as u64)))
+        })
+        .collect();
+    let rendered: Vec<RenderedPart> = counted.iter().map(|(_, part)| *part).collect();
+    let numbers = cortexkit_role_llm_runner_v1::tags::try_number_parts(base, &rendered)?;
+    let mut parts = vec![None; blocks];
+    for ((index, _), number) in counted.iter().zip(numbers) {
+        parts[*index] = number;
+    }
+    Ok(parts)
+}
+
 /// Number `message`, written under `rules`, after `high`, the highest number shown before it,
 /// and raise `high` past its counted parts. A part counts exactly when [`part_kind`] says it
 /// does; only a run that renders tags numbers anything. The parts are numbered in block order,
@@ -521,25 +556,13 @@ pub fn number_message(
     rules: ComputedRules,
     high: &mut u64,
 ) -> Result<(), NumberingOverflow> {
-    let clean = rules.clean && message.role == Role::Assistant;
+    let clean = cleans(rules, message.role);
     let base = *high;
-    // The parts that count, with their block positions as their rendered order.
-    let counted: Vec<(usize, RenderedPart)> = message
+    let kinds = message
         .content
         .iter()
-        .enumerate()
-        .filter_map(|(index, block)| {
-            let kind = part_kind(message.role, block, clean)?;
-            (rules.render && cortexkit_role_llm_runner_v1::tags::counts(kind))
-                .then(|| (index, RenderedPart::new(kind, index as u64)))
-        })
-        .collect();
-    let rendered: Vec<RenderedPart> = counted.iter().map(|(_, part)| *part).collect();
-    let numbers = cortexkit_role_llm_runner_v1::tags::try_number_parts(base, &rendered)?;
-    let mut parts = vec![None; message.content.len()];
-    for ((index, _), number) in counted.iter().zip(numbers) {
-        parts[*index] = number;
-    }
+        .map(|block| part_kind(message.role, block, clean));
+    let parts = number_kinds(kinds, rules.render, base)?;
     *high = parts.iter().flatten().copied().max().unwrap_or(base);
     message.set_tags(Some(Arc::new(PartTags {
         parts,

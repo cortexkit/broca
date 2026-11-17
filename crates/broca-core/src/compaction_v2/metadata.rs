@@ -226,41 +226,68 @@ pub fn step_usage(usage: Usage) -> Option<StepUsage> {
 /// Classification comes from the view library; host mapping only decides which
 /// native blocks represent text and calls. Results take their call's number.
 pub fn numbered_parts(message: &Message) -> u64 {
-    numbered_flags(message)
+    numbered_parts_of(message.role, message.content.iter().map(NumberingKind::of))
+}
+
+/// What the numbering reads of a block: whether it is text with something in it, or a tool
+/// call. A caller holding only a block's shape (its content released from memory) numbers it
+/// the same as the block itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberingKind {
+    /// Text that isn't empty.
+    Text,
+    ToolCall,
+    /// Empty text and every other kind of block, which take no number.
+    Other,
+}
+
+impl NumberingKind {
+    pub fn of(block: &ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
+                if !text.is_empty() =>
+            {
+                Self::Text
+            }
+            ContentBlock::ToolCall(_) => Self::ToolCall,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// [`numbered_parts`] over a message's role and its blocks' numbering kinds.
+pub fn numbered_parts_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKind>) -> u64 {
+    numbered_flags_of(role, kinds)
         .into_iter()
         .filter(|numbered| *numbered)
         .count() as u64
 }
 
 fn numbered_flags(message: &Message) -> Vec<bool> {
-    if message.role == HostRole::Tool {
-        return vec![false; message.content.len()];
-    }
-    let role = match message.role {
+    numbered_flags_of(message.role, message.content.iter().map(NumberingKind::of))
+}
+
+fn numbered_flags_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKind>) -> Vec<bool> {
+    let role = match role {
+        HostRole::Tool => return kinds.into_iter().map(|_| false).collect(),
         HostRole::User => Role::User,
         HostRole::Assistant => Role::Assistant,
         HostRole::System => Role::System,
-        HostRole::Tool => unreachable!(),
     };
-    message
-        .content
-        .iter()
-        .map(|block| {
-            let body = match block {
-                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
-                    if !text.is_empty() =>
-                {
-                    PartBody::Text {
-                        text: Default::default(),
-                    }
-                }
-                ContentBlock::ToolCall(_) => PartBody::Tool(ToolPart::new(
+    kinds
+        .into_iter()
+        .map(|kind| {
+            let body = match kind {
+                NumberingKind::Text => PartBody::Text {
+                    text: Default::default(),
+                },
+                NumberingKind::ToolCall => PartBody::Tool(ToolPart::new(
                     "",
                     "",
                     serde_json::Value::Null,
                     ToolStatus::Running,
                 )),
-                _ => return false,
+                NumberingKind::Other => return false,
             };
             cortexkit_compaction_view::tags::is_numbered(&role, &body)
         })

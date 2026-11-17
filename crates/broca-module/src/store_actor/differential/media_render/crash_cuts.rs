@@ -102,7 +102,8 @@ impl RunExecutor for CutExecutor {
                 .chain(
                     writer
                         .conversation()
-                        .messages
+                        .held_messages()
+                        .unwrap()
                         .iter()
                         .map(|message| &**message),
                 )
@@ -618,7 +619,8 @@ async fn images_held(dir: &Path, key: &BindIdentity, cipher: Cipher) -> usize {
     view(dir, key, cipher)
         .await
         .conversation
-        .messages
+        .held_messages()
+        .unwrap()
         .iter()
         .map(|message| broca_session_store::session::message_media(message).len())
         .sum()

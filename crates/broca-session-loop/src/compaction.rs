@@ -509,10 +509,12 @@ fn matches_full_projection(
     conversation: &broca_session_store::fold::conversation::Conversation,
     enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
 ) {
-    let window = broca_session_store::session::EnrollmentOverlay::serve(
-        enrollment,
-        broca_session_store::session::served_window(conversation),
-    );
+    // A window whose content is partly released can't be projected whole from memory; the
+    // kept transcript holds only the shapes of those parts, so there is nothing to compare.
+    let Ok(served) = broca_session_store::session::served_window(conversation) else {
+        return;
+    };
+    let window = broca_session_store::session::EnrollmentOverlay::serve(enrollment, served);
     let full: Vec<_> = window
         .iter()
         .map(|stored| crate::entries::project(stored).expect("the kept entries projected"))
@@ -815,13 +817,13 @@ fn spanning_repetition(
     // The run's window messages below the cut. When the run started before the window, its
     // earlier steps are counted in the counters the window kept.
     let from = run.start.max(window_start);
-    let below: Vec<_> = (from..first_kept)
-        .filter_map(|ordinal| {
-            conversation
-                .window_message(ordinal)
-                .map(|message| broca_protocol::Message::clone(message))
-        })
-        .collect();
+    // The counters read call inputs and results, so the messages must be held.
+    let mut below = Vec::new();
+    for ordinal in from..first_kept {
+        if let Some(message) = conversation.held_message(ordinal).map_err(not_held)? {
+            below.push(broca_protocol::Message::clone(message));
+        }
+    }
     let seed =
         match (run.start < window_start, &conversation.window_repetition) {
             (true, Some(seed)) => Some(serde_json::from_value(seed.clone()).map_err(|error| {
@@ -1358,3 +1360,10 @@ pub fn history(estimate: &Estimate) -> CompactionHistory {
 
 #[cfg(test)]
 mod tests;
+
+/// The run loop's error for a window message whose content it needed and didn't hold.
+pub(crate) fn not_held(not: broca_session_store::fold::conversation::NotHeld) -> LoopError {
+    LoopError::Session(broca_session_store::session::SessionError::NotHeld(
+        not.ordinal,
+    ))
+}

@@ -45,7 +45,10 @@ fn the_production_shape_has_the_measured_proportions() {
         "the latest run is a fraction of the log: {written:?}"
     );
     let session = block_on(Session::load(&backend, addr, &triple(), &deployment)).unwrap();
-    assert_eq!(session.conversation.messages.len(), written.messages);
+    assert_eq!(
+        session.conversation.held_messages().unwrap().len(),
+        written.messages
+    );
     assert_eq!(window_bytes(&session.conversation), w);
     // The latest run's records, and the `WriterOpened` this load appended.
     assert_eq!(session.kept_records(), written.latest_run_records + 1);

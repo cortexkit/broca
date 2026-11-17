@@ -795,9 +795,10 @@ async fn an_imported_image_is_a_persons_at_its_place_and_renders_with_its_bytes(
         broca_provider::spec::InputModalities::from_value(&serde_json::json!(["text", "image"])),
         Some(200_000),
     ));
-    let opts: broca_protocol::request::CallOptions =
-        serde_json::from_value(serde_json::json!({ "prompt": session.conversation.messages }))
-            .unwrap();
+    let opts: broca_protocol::request::CallOptions = serde_json::from_value(
+        serde_json::json!({ "prompt": session.conversation.held_messages().unwrap() }),
+    )
+    .unwrap();
     let body = index
         .for_run()
         .render(&serde_json::to_value(config).unwrap(), &opts, false, None)

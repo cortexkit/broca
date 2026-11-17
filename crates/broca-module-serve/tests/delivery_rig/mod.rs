@@ -665,7 +665,8 @@ impl RunExecutor for CoreExec {
                 .chain(
                     writer
                         .conversation()
-                        .messages
+                        .held_messages()
+                        .unwrap()
                         .iter()
                         .map(|message| &**message),
                 )

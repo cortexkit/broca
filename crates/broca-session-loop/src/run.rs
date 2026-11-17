@@ -453,9 +453,9 @@ where
         // Only the window's system messages are compared, so only they are copied out of it.
         let systems: Vec<Message> = writer
             .conversation()
-            .messages
+            .held_messages_of(Role::System)
+            .map_err(crate::compaction::not_held)?
             .iter()
-            .filter(|message| message.role == Role::System)
             .map(|message| Message::clone(message))
             .collect();
         broca_core::fresh_start::append_system_messages(
@@ -2614,7 +2614,7 @@ where
                             .iter()
                             .rev()
                             .find_map(|pending| pending.messages.last())
-                            .or(conversation.messages.last().map(|message| &**message))
+                            .or(conversation.newest().map(|message| &**message))
                             .cloned();
                         let last_user = queued.iter().rposition(|(_, send)| {
                             !send.order.expired_at(now)
@@ -3942,13 +3942,8 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
             .rev()
             .find(|(first, _, _)| *first <= index)
             .map_or((false, false), |(_, render, clean)| (*render, *clean));
-        let mut numbered = Message::clone(message);
-        broca_protocol::tags::number_message(
-            &mut numbered,
-            ComputedRules { render, clean },
-            &mut high,
-        )
-        .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
+        high = crate::window_shape::runner_high(message, ComputedRules { render, clean }, high)
+            .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
     }
     Ok(high.max(writer.retired_tag_floor().saturating_sub(1)))
 }
@@ -4117,7 +4112,8 @@ fn call_options<W: Writer>(
             // The request's one copy of the window, which the render inputs below are written into.
             let mut prompt: Vec<Message> = writer
                 .conversation()
-                .messages
+                .held_messages()
+                .map_err(crate::compaction::not_held)?
                 .iter()
                 .map(|message| Message::clone(message))
                 .collect();
@@ -4241,7 +4237,8 @@ fn call_options<W: Writer>(
     let conversation = writer.conversation();
     let entries = broca_session_store::session::EnrollmentOverlay::serve(
         enrollment,
-        broca_session_store::session::window_entries(conversation, 1, usize::MAX),
+        broca_session_store::session::window_entries(conversation, 1, usize::MAX)
+            .map_err(crate::compaction::not_held)?,
     )
     .iter()
     .map(crate::entries::project)
@@ -6266,9 +6263,8 @@ fn tool_batch_deliveries(
         let _ = placing.apply(record);
     }
     let results: Vec<&ToolResult> = placing
-        .messages
-        .last()
-        .or(conversation.messages.last())
+        .newest()
+        .or(conversation.newest())
         .filter(|message| message.role == Role::Tool)
         .map(|message| {
             message

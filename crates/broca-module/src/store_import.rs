@@ -448,7 +448,14 @@ pub(crate) fn newest_of_records(records: &[Record]) -> Result<ImportNewest, Impo
             )
         })?;
     }
+    // An import seed is folded whole, so its newest message is held.
     let entry = broca_session_store::session::window_entries(&conversation, conversation.placed, 1)
+        .map_err(|not| {
+            ImportRefusal::new(
+                "import_source_unmapped",
+                format!("the import seed's message {} isn't held", not.ordinal),
+            )
+        })?
         .pop()
         .ok_or_else(|| {
             ImportRefusal::new("import_empty", "the import seed placed no newest entry")

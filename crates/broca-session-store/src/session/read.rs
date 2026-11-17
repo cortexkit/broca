@@ -25,7 +25,7 @@ use broca_protocol::content::Message;
 
 use crate::backend::SessionBackend;
 use crate::directory::Pages;
-use crate::fold::conversation::{Conversation, EntryState};
+use crate::fold::conversation::{Conversation, EntryState, NotHeld};
 use crate::idindex::{self, IdKind, IndexPages, IndexRoot};
 use crate::record::Record;
 use crate::segment::{SegmentLayout, FOOTER, OPEN_PREFIX};
@@ -67,8 +67,8 @@ const ANNOUNCED_FACTS_READ: usize = 16;
 
 /// The window's entries as `session.entries` serves them: the placed messages, then the
 /// assistant message whose tool calls are still running, at the ordinal reserved for it.
-pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
-    let mut entries = window_entries(conversation, 1, usize::MAX);
+pub fn served_window(conversation: &Conversation) -> Result<Vec<StoredEntry>, NotHeld> {
+    let mut entries = window_entries(conversation, 1, usize::MAX)?;
     if let Some((ordinal, message, state)) = conversation.open_entry() {
         entries.push(StoredEntry {
             ordinal,
@@ -78,7 +78,7 @@ pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
             open: true,
         });
     }
-    entries
+    Ok(entries)
 }
 
 /// Whether `message` is an assistant message that called tools, whose results the tool message
@@ -91,27 +91,44 @@ fn called_tools(message: &broca_protocol::content::Message) -> bool {
             .any(|block| matches!(block, broca_protocol::content::ContentBlock::ToolCall(_)))
 }
 
+/// The session error for a window message whose content a read needed and didn't hold.
+fn not_held(not: NotHeld) -> SessionError {
+    SessionError::NotHeld(not.ordinal)
+}
+
 /// The entries of `conversation`'s window from `from` on, at most `limit` of them: one per
-/// window message, so a request's prompt and its entries line up.
-pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {
+/// window message, so a request's prompt and its entries line up. Each entry carries its
+/// message's content, so a message whose content isn't held refuses with [`NotHeld`].
+pub fn window_entries(
+    conversation: &Conversation,
+    from: u64,
+    limit: usize,
+) -> Result<Vec<StoredEntry>, NotHeld> {
     let start = conversation.window_start().max(from);
-    (start..=conversation.placed)
-        .take(limit)
-        .filter_map(|ordinal| {
-            let (message, state) = conversation.window_entry(ordinal)?;
-            let called = called_tools(message);
-            let next = conversation
-                .window_message(ordinal + 1)
-                .filter(|next| called && next.role == broca_protocol::content::Role::Tool);
-            Some(StoredEntry {
-                ordinal,
-                message: Arc::clone(message),
-                next: next.cloned(),
-                state: state.clone(),
-                open: false,
-            })
-        })
-        .collect()
+    let mut entries = Vec::new();
+    for ordinal in (start..=conversation.placed).take(limit) {
+        let Some((message, state)) = conversation.window_entry(ordinal) else {
+            continue;
+        };
+        let message = message.held().ok_or(NotHeld { ordinal })?;
+        let called = called_tools(message);
+        let next = match conversation.window_message(ordinal + 1) {
+            Some(next) if called && next.role() == broca_protocol::content::Role::Tool => {
+                Some(Arc::clone(next.held().ok_or(NotHeld {
+                    ordinal: ordinal + 1,
+                })?))
+            }
+            _ => None,
+        };
+        entries.push(StoredEntry {
+            ordinal,
+            message: Arc::clone(message),
+            next,
+            state: state.clone(),
+            open: false,
+        });
+    }
+    Ok(entries)
 }
 
 /// What a session keeps of its sealed history while it's open, with the history version it was
@@ -549,7 +566,8 @@ impl<B: SessionBackend> Session<B> {
                         .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
                 }
                 let wanted = limit - out.len();
-                let read = window_entries(&conversation, next, wanted);
+                // A conversation folded from one sealed block holds all its content.
+                let read = window_entries(&conversation, next, wanted).map_err(not_held)?;
                 if let Some(last) = read.last() {
                     next = last.ordinal + 1;
                 }
@@ -561,7 +579,9 @@ impl<B: SessionBackend> Session<B> {
             }
         }
         if out.len() < limit {
-            out.extend(window_entries(&self.conversation, next, limit - out.len()));
+            out.extend(
+                window_entries(&self.conversation, next, limit - out.len()).map_err(not_held)?,
+            );
         }
         if out.len() < limit {
             if let Some((ordinal, message, state)) = self.conversation.open_entry() {
@@ -646,7 +666,9 @@ impl<B: SessionBackend> Session<B> {
                 .and_then(|(_, state)| state.facts.as_ref())
                 .and_then(|facts| base(facts));
             if base.is_some_and(|base| base < tag) {
-                return Ok(window_entries(&self.conversation, ordinal, 1).pop());
+                return Ok(window_entries(&self.conversation, ordinal, 1)
+                    .map_err(not_held)?
+                    .pop());
             }
         }
         let key = self.key.frame_key();
@@ -781,7 +803,7 @@ impl<B: SessionBackend> Session<B> {
         Ok((
             first,
             last,
-            window_entries(&conversation, first, usize::MAX),
+            window_entries(&conversation, first, usize::MAX).map_err(not_held)?,
         ))
     }
 
@@ -901,7 +923,11 @@ impl<B: SessionBackend> Session<B> {
         if ordinal == 0 || ordinal > self.conversation.placed {
             return Ok(None);
         }
-        if let Some(message) = self.conversation.window_message(ordinal) {
+        if let Some(message) = self
+            .conversation
+            .held_message(ordinal)
+            .map_err(|not| SessionError::NotHeld(not.ordinal))?
+        {
             return Ok(Some(Arc::clone(message)));
         }
         self.storage_read()?;
@@ -940,8 +966,10 @@ impl<B: SessionBackend> Session<B> {
                 .apply(&record)
                 .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
         }
+        // A conversation folded from one sealed block holds all its content.
         conversation
-            .window_message(ordinal)
+            .held_message(ordinal)
+            .map_err(|not| SessionError::NotHeld(not.ordinal))?
             .cloned()
             .map(Some)
             .ok_or_else(damaged)

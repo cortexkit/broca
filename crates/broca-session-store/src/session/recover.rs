@@ -52,7 +52,7 @@ use crate::backend::{SessionAddr, SessionBackend};
 use crate::checkpoint::Checkpoint;
 use crate::codec::{hex, Digest, Id128, Message as _};
 use crate::damage::{self, Lost, Verdict};
-use crate::fold::conversation::Conversation;
+use crate::fold::conversation::{BlockKind, Conversation, WindowMessage};
 use crate::head::{self, PendingDeletion, Residence, SessionTriple};
 use crate::idindex::{self, OpenIds};
 use crate::keys::{random_id, DeploymentKey};
@@ -844,14 +844,29 @@ fn call_ids(message: &Message) -> Vec<ToolCallId> {
 
 /// Calls whose call part is on the kept transcript: in the window or the turn still open.
 fn transcript_calls(conversation: &Conversation) -> BTreeSet<String> {
-    conversation
+    let window = conversation
         .messages
         .iter()
-        .map(|message| &**message)
-        .chain(conversation.open_tool_turn())
+        .flat_map(window_ids(BlockKind::ToolCall));
+    conversation
+        .open_tool_turn()
+        .into_iter()
         .flat_map(call_ids)
+        .chain(window)
         .map(|id| id.0)
         .collect()
+}
+
+/// The ids of a window message's blocks of `kind`: a tool call's own id, or the call a result
+/// answers. Ids are kept when the content is released, so this reads any window message.
+fn window_ids(kind: BlockKind) -> impl Fn(&WindowMessage) -> Vec<ToolCallId> {
+    move |message| {
+        message
+            .blocks()
+            .filter(|block| block.kind() == kind)
+            .filter_map(|block| block.tool_call_id().cloned())
+            .collect()
+    }
 }
 
 /// Calls with a kept transcript result: in the window, or replied in the turn still open.
@@ -862,11 +877,8 @@ fn replied_calls(
     let mut replied: BTreeSet<String> = conversation
         .messages
         .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult(result) => Some(result.tool_call_id.0.clone()),
-            _ => None,
-        })
+        .flat_map(window_ids(BlockKind::ToolResult))
+        .map(|id| id.0)
         .collect();
     for (_, _, record) in transcript {
         if let Record::ToolReply(reply) = record {
@@ -1023,7 +1035,9 @@ fn first_changed_entry(conversation: &Conversation, first_dropped: Option<&Recor
         Some(Record::ResultAppend(append)) => conversation
             .messages
             .iter()
-            .rposition(|message| call_ids(message).contains(&append.tool_call_id))
+            .rposition(|message| {
+                window_ids(BlockKind::ToolCall)(message).contains(&append.tool_call_id)
+            })
             .map_or(next, |index| conversation.window_start() + index as u64),
         _ => next,
     }

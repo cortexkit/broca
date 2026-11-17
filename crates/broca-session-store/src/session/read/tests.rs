@@ -177,7 +177,7 @@ fn every_message_reads_back_by_ordinal_after_two_cuts(cipher: Cipher) {
                 }
             }
         }
-        let expected = session.conversation.messages.clone();
+        let expected = session.conversation.held_messages().unwrap().clone();
         assert_eq!(expected.len(), 120);
         assert_eq!(session.conversation.placed, 120);
         for cut in cuts {
@@ -189,7 +189,7 @@ fn every_message_reads_back_by_ordinal_after_two_cuts(cipher: Cipher) {
         let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
-        assert_eq!(loaded.conversation.messages.len(), 24);
+        assert_eq!(loaded.conversation.held_messages().unwrap().len(), 24);
         for (index, message) in expected.iter().enumerate() {
             let ordinal = index as u64 + 1;
             let read = loaded.message(ordinal).await.unwrap();
@@ -387,7 +387,7 @@ fn a_sealed_message_read_fetches_its_block_not_the_segment(cipher: Cipher) {
                 }
             }
         }
-        let expected = session.conversation.messages.clone();
+        let expected = session.conversation.held_messages().unwrap().clone();
         session.seal(Some(cut), 0).await.unwrap();
         session.close().await.unwrap();
         let segment = backend

@@ -19,7 +19,7 @@ fn an_empty_checkpoint_round_trips() {
     let decoded = Checkpoint::decode(&bytes).unwrap();
     assert_eq!(decoded.encode(), bytes);
     assert_eq!(decoded.next_seq, 1);
-    assert!(decoded.conversation.messages.is_empty());
+    assert!(decoded.conversation.held_messages().unwrap().is_empty());
     assert_eq!(decoded.activity_ms, None);
     assert!(
         !crate::codec::Fields::new(&bytes, "Checkpoint").any(|field| field.unwrap().number == 7)

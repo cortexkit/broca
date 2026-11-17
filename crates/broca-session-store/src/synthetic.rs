@@ -87,7 +87,11 @@ pub fn model() -> ModelHandle {
 
 /// The window's messages as compact JSON, the `W` the memory budgets are written in.
 pub fn window_bytes(conversation: &Conversation) -> usize {
-    serde_json::to_vec(&conversation.messages).map_or(0, |bytes| bytes.len())
+    // Synthetic sessions release nothing, so every message is held.
+    let messages = conversation
+        .held_messages()
+        .expect("a synthetic window is held");
+    serde_json::to_vec(&messages).map_or(0, |bytes| bytes.len())
 }
 
 /// Appends a session of `shape` to `session`, which holds no run yet, and syncs it.

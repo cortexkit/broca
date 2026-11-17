@@ -1250,7 +1250,8 @@ async fn reads_clean_replies_where_their_facts_say_their_run_cleans_them() {
             .unwrap();
         let stored: Vec<String> = session
             .conversation
-            .messages
+            .held_messages()
+            .unwrap()
             .iter()
             .filter(|message| message.role == broca_protocol::Role::Assistant)
             .flat_map(|message| &message.content)

@@ -117,7 +117,8 @@ pub(crate) fn contract_prompt(
     session: &str,
 ) -> Result<Vec<Message>, LoopError> {
     let mut prompt: Vec<Message> = conversation
-        .messages
+        .held_messages()
+        .map_err(crate::compaction::not_held)?
         .iter()
         .map(|message| Message::clone(message))
         .collect();
@@ -254,8 +255,14 @@ impl KeptPrompt {
                 })
                 .collect::<Vec<_>>()
         });
+        let start = conversation.window_start();
         for (index, placed) in conversation.messages.iter().enumerate().skip(from) {
-            let mut message = Message::clone(placed);
+            let placed = placed
+                .held()
+                .ok_or(broca_session_store::fold::conversation::NotHeld {
+                    ordinal: start + index as u64,
+                });
+            let mut message = Message::clone(placed.map_err(crate::compaction::not_held)?);
             kept.guide(
                 index,
                 &mut message,

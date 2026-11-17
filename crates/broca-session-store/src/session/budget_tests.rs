@@ -252,6 +252,7 @@ fn sealed_entries_read_by_id_hold_no_more_than_their_cap() {
     });
     let own = |message: &Arc<Message>| Arc::new(Message::clone(message));
     let entries: Vec<(String, StoredEntry)> = window_entries(&session.conversation, 1, usize::MAX)
+        .unwrap()
         .into_iter()
         .map(|entry| {
             let mid = entry.state.facts.as_ref().unwrap().mid.clone();

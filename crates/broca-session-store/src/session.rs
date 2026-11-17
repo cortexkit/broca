@@ -92,6 +92,9 @@ pub enum SessionError {
     /// A read made while reads come from memory only (see [`Session::in_memory`]) needs history
     /// kept in storage. Nothing was read.
     NotInMemory,
+    /// A read needs the original of a window message whose content was released from memory,
+    /// and this read path doesn't read it back.
+    NotHeld(u64),
     /// The session's head moved past the version a read was pinned at (see [`Session::view_at`]),
     /// or its open log is no longer the one pinned. Nothing was read; read it again.
     Moved,
@@ -347,7 +350,7 @@ pub fn check_announced_mid(
     let newest = (facts.ordinal == conversation.placed)
         .then(|| conversation.window_message(facts.ordinal))
         .flatten()
-        .map(|message| message.role);
+        .map(|message| message.role());
     let announced = match held.or(newest) {
         Some(Role::Assistant) => run.step_mid.as_ref(),
         Some(Role::Tool) => run

@@ -18,6 +18,7 @@ use broca_core::{
 use broca_protocol::content::Role;
 use broca_session_loop::parts::Parts;
 use broca_session_store::backend::SessionBackend;
+use broca_session_store::fold::conversation::BlockKind;
 use broca_session_store::fold::operations::Run;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError, StoredEntry};
@@ -73,13 +74,12 @@ pub fn results_await_close<B: SessionBackend>(session: &Session<B>) -> bool {
     conversation
         .window_message(conversation.placed)
         .is_some_and(|newest| {
-            newest.role == Role::Tool
-                && newest.content.iter().all(|block| match block {
-                    broca_protocol::ContentBlock::ToolResult(result) => batch
-                        .calls
-                        .iter()
-                        .any(|call| call.id == result.tool_call_id),
-                    _ => false,
+            newest.role() == Role::Tool
+                && newest.blocks().all(|block| {
+                    block.kind() == BlockKind::ToolResult
+                        && block
+                            .tool_call_id()
+                            .is_some_and(|id| batch.calls.iter().any(|call| &call.id == id))
                 })
         })
 }

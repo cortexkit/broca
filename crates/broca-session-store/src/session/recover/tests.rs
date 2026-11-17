@@ -320,7 +320,7 @@ fn a_lost_tool_result_closes_open_work_and_warns_the_model(cipher: Cipher) {
 
     let mut session = load(&backend, cipher).unwrap();
     assert!(session.head().next_seq > recovered.removed_through);
-    let window = texts(&session.conversation.messages);
+    let window = texts(&session.conversation.held_messages().unwrap());
     assert_eq!(&window[..3], ["ask a", "answer a", "ask b"]);
     assert!(window[3].contains("outcome_unknown"), "{window:?}");
     assert!(
@@ -375,7 +375,7 @@ fn a_kept_outcome_says_the_call_finished(cipher: Cipher) {
     assert!(recovered.unknown_calls.is_empty());
     assert_eq!(recovered.interrupted_runs, ["b"]);
     let session = load(&backend, cipher).unwrap();
-    let window = texts(&session.conversation.messages);
+    let window = texts(&session.conversation.held_messages().unwrap());
     assert!(
         window[3].contains("finished, but storage damage removed its output"),
         "{window:?}"
@@ -475,7 +475,7 @@ fn transcript_records_after_a_possible_loss_are_dropped(cipher: Cipher) {
     };
     assert_eq!(recovered.transcript_dropped, 1);
     let loaded = load(&backend, cipher).unwrap();
-    assert!(!texts(&loaded.conversation.messages)
+    assert!(!texts(&loaded.conversation.held_messages().unwrap())
         .iter()
         .any(|text| text == "after the loss"));
 }
@@ -512,7 +512,7 @@ fn a_crash_at_any_point_of_a_recovery_recovers_again(cipher: Cipher) {
         recover(&backend, 1_000, cipher).unwrap();
         let session = load(&backend, cipher).unwrap();
         (
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             session.operations.run.as_ref().unwrap().finished,
         )
     };
@@ -530,7 +530,7 @@ fn a_crash_at_any_point_of_a_recovery_recovers_again(cipher: Cipher) {
         recover(&backend, 1_000, cipher).unwrap();
         let session = load(&backend, cipher).unwrap();
         let got = (
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             session.operations.run.as_ref().unwrap().finished,
         );
         assert_eq!(got, expected, "crash {crash}");
@@ -596,7 +596,7 @@ fn finished_runs(
             .unwrap();
         session.append(&[end("b")], true).await.unwrap();
         (
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             session.operations.run.as_ref().unwrap().finished,
         )
     })
@@ -622,7 +622,7 @@ fn a_damaged_checkpoint_is_rebuilt_and_loses_nothing(cipher: Cipher) {
         assert_eq!(recovered.history_version, None, "seal {seal}");
         let session = load(&backend, cipher).unwrap();
         let got = (
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             session.operations.run.as_ref().unwrap().finished,
         );
         assert_eq!(got, expected, "seal {seal}");

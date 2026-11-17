@@ -244,13 +244,16 @@ fn a_cut_seals_below_it_and_the_session_loads_back_the_same(cipher: Cipher) {
     block_on(async {
         let (mut session, cut) = history(&backend, cipher).await;
         assert_eq!(
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             ["ask a", "a", "ask b", "b", "ask c", "c"]
         );
         let sealed = session.seal(Some(cut), 1_000).await.unwrap();
         assert_eq!(sealed.transcript_records, 4);
         assert_eq!(sealed.kept_records, 2);
-        assert_eq!(texts(&session.conversation.messages), ["ask c", "c"]);
+        assert_eq!(
+            texts(&session.conversation.held_messages().unwrap()),
+            ["ask c", "c"]
+        );
         // Run c's input and answer were appended as one batch, and the new log keeps them as
         // one: a crash can't leave one without the other there either.
         let (log, length) = session.open_log();
@@ -278,7 +281,10 @@ fn a_cut_seals_below_it_and_the_session_loads_back_the_same(cipher: Cipher) {
         let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
-        assert_eq!(texts(&loaded.conversation.messages), ["ask c", "c"]);
+        assert_eq!(
+            texts(&loaded.conversation.held_messages().unwrap()),
+            ["ask c", "c"]
+        );
         assert!(loaded.operations.run.as_ref().unwrap().finished.is_some());
         assert_ne!(state(&loaded), written, "run c ended after the seal");
         assert!(loaded.append(&[start("d")], true).await.unwrap() > next);
@@ -312,8 +318,7 @@ fn sealed_records_read_back_and_finished_runs_lose_their_opaque_reasoning(cipher
         }
         // Run c is still running, so its reasoning stays in the open log unpruned.
         let open = session
-            .conversation
-            .messages
+            .conversation.held_messages().unwrap()
             .iter()
             .flat_map(|m| &m.content)
             .any(|block| matches!(block, ContentBlock::RedactedReasoning { data, .. } if data == "opaque-c"));
@@ -335,7 +340,7 @@ fn a_ledger_seal_keeps_the_whole_transcript_open(cipher: Cipher) {
             .await
             .unwrap();
         assert_eq!(
-            texts(&loaded.conversation.messages),
+            texts(&loaded.conversation.held_messages().unwrap()),
             ["ask a", "a", "ask b", "b", "ask c", "c"]
         );
     });
@@ -620,7 +625,7 @@ fn a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it(cipher: Cipher) {
         let backend = MemoryBackend::default();
         let (before, after) = block_on(async {
             let (mut session, cut) = history(&backend, cipher).await;
-            let before = texts(&session.conversation.messages);
+            let before = texts(&session.conversation.held_messages().unwrap());
             backend.crash_after(Some(crash));
             let sealed = session.seal(Some(cut), 1_000).await;
             (before, sealed.is_ok())
@@ -630,7 +635,7 @@ fn a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it(cipher: Cipher) {
             let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
                 .await
                 .unwrap();
-            let window = texts(&loaded.conversation.messages);
+            let window = texts(&loaded.conversation.held_messages().unwrap());
             let objects = backend.object_names(&addr());
             if window == before {
                 assert!(!after, "crash {crash}: a committed seal must load sealed");
@@ -765,7 +770,10 @@ fn a_seal_at_an_entry_cuts_where_that_entry_is_placed(cipher: Cipher) {
             .unwrap()
             .expect("entry 5 lies above the window's start");
         assert_eq!(sealed.transcript_records, 4);
-        assert_eq!(texts(&session.conversation.messages), ["ask c", "c"]);
+        assert_eq!(
+            texts(&session.conversation.held_messages().unwrap()),
+            ["ask c", "c"]
+        );
         let (records, _, _) = session.read_open_log().await.unwrap();
         assert_eq!(records[0].0, cut);
         // The window now starts at entry 5, so sealing there again moves no message: nothing is

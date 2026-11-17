@@ -308,7 +308,7 @@ fn a_revert_in_the_open_log_keeps_the_messages_before_it(cipher: Cipher) {
         };
         assert_eq!((ordinal, history_version, window_pending), (5, 1, false));
         assert_eq!(
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             ["ask 0", "answer 0", "ask 1", "answer 1", "edited"]
         );
 
@@ -379,7 +379,10 @@ fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window(cipher: 
         };
         assert_eq!((ordinal, window_pending), (3, true));
         assert!(session.conversation.window_pending);
-        assert_eq!(texts(&session.conversation.messages), ["edited"]);
+        assert_eq!(
+            texts(&session.conversation.held_messages().unwrap()),
+            ["edited"]
+        );
         assert_eq!(session.conversation.window_start(), 3);
 
         async fn check(session: &Session<&MemoryBackend>, mids: &[String], mid: &str) {
@@ -589,7 +592,7 @@ fn a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it(cipher: Cipher) 
                     .await
                     .unwrap();
             let (mids, _) = runs(&mut session, 0, 3).await;
-            let before = texts(&session.conversation.messages);
+            let before = texts(&session.conversation.held_messages().unwrap());
             backend.crash_after(Some(crash));
             let _ = session
                 .revert(&mids[2], resend("r9", "s9", "edited"), None, 1_000)
@@ -601,7 +604,7 @@ fn a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it(cipher: Cipher) 
             let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
                 .await
                 .unwrap();
-            let window = texts(&loaded.conversation.messages);
+            let window = texts(&loaded.conversation.held_messages().unwrap());
             if window == before {
                 assert!(backend.object_names(&addr()).is_empty(), "crash {crash}");
                 assert_eq!(loaded.head().history_version, 0);

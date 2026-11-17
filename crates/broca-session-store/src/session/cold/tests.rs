@@ -193,16 +193,19 @@ fn a_finished_idle_session_goes_cold_with_its_reasoning_pruned(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
         let mut session = finished(&backend, 1_000, cipher).await;
-        assert_eq!(opaque(&session.conversation.messages).len(), 2);
+        assert_eq!(
+            opaque(&session.conversation.held_messages().unwrap()).len(),
+            2
+        );
         let now = 1_000 + IDLE + 1;
         let cold = session.cold(now, IDLE, &Carry::default()).await.unwrap();
         assert!(
             matches!(cold, Cold::Applied { pruned: true, .. }),
             "{cold:?}"
         );
-        assert!(opaque(&session.conversation.messages).is_empty());
+        assert!(opaque(&session.conversation.held_messages().unwrap()).is_empty());
         assert_eq!(
-            texts(&session.conversation.messages),
+            texts(&session.conversation.held_messages().unwrap()),
             ["ask a", "a", "ask b", "b"]
         );
         assert_eq!(session.head().cold_since_ms, Some(now));
@@ -284,12 +287,18 @@ fn an_unfinished_run_keeps_its_reasoning(cipher: Cipher) {
             matches!(cold, Cold::Applied { pruned: false, .. }),
             "{cold:?}"
         );
-        assert_eq!(opaque(&session.conversation.messages).len(), 3);
+        assert_eq!(
+            opaque(&session.conversation.held_messages().unwrap()).len(),
+            3
+        );
         session.close().await.unwrap();
         let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
-        assert_eq!(opaque(&loaded.conversation.messages).len(), 3);
+        assert_eq!(
+            opaque(&loaded.conversation.held_messages().unwrap()).len(),
+            3
+        );
     });
 }
 

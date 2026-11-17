@@ -1237,7 +1237,7 @@ fn newest_turn(conversation: &Conversation) -> Option<TurnFacts> {
         .iter()
         .zip(&conversation.entries)
         .rev()
-        .find(|(message, _)| message.role == Role::Assistant)
+        .find(|(message, _)| message.role() == Role::Assistant)
         .and_then(|(_, entry)| entry.turn.as_deref().cloned())
 }
 
@@ -1453,7 +1453,7 @@ fn restate_for_ride(
         Some(calls) => calls.to_vec(),
         None => conversation
             .window_message(ordinal.saturating_sub(1))
-            .map(|message| call_ids(message))
+            .map(crate::window_shape::call_ids)
             .unwrap_or_default(),
     };
     let Some(notice) = ride_notice(append, &calls) else {
@@ -1501,7 +1501,7 @@ fn newest_assistant_is(conversation: &Conversation, mid: &str) -> bool {
     (conversation.window_start()..=conversation.placed)
         .rev()
         .filter_map(|ordinal| conversation.window_entry(ordinal))
-        .find(|(message, _)| message.role == Role::Assistant)
+        .find(|(message, _)| message.role() == Role::Assistant)
         .is_some_and(|(_, state)| named(state.facts.as_deref()))
 }
 
@@ -1773,12 +1773,12 @@ fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
         .as_ref()
         .zip(conversation.open_tool_turn())
         .map(|(entry, message)| (message, entry));
-    let all: Vec<(&Message, &EntryState)> = conversation
+    let all: Vec<(Walked<'_>, &EntryState)> = conversation
         .messages
         .iter()
-        .map(|message| &**message)
+        .map(Walked::Window)
         .zip(conversation.entries.iter())
-        .chain(held)
+        .chain(held.map(|(message, entry)| (Walked::Open(message), entry)))
         .collect();
     fn facts(entry: &EntryState) -> Option<&EntryFacts> {
         entry.facts.as_deref()
@@ -1805,9 +1805,22 @@ fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
         },
     };
     for (message, _) in rest {
-        high = runner_high_after(message, runner.rules, high);
+        high = match message {
+            Walked::Window(message) => {
+                crate::window_shape::runner_high(message, runner.rules, high).unwrap_or(high)
+            }
+            Walked::Open(message) => runner_high_after(message, runner.rules, high),
+        };
     }
     high
+}
+
+/// A message the numbering walks: a window message, which may hold only its shape, or the
+/// assistant message held for its tool results, which is always whole.
+#[derive(Clone, Copy)]
+enum Walked<'a> {
+    Window(&'a broca_session_store::fold::conversation::WindowMessage),
+    Open(&'a Message),
 }
 
 /// The highest part number any message of the session has taken, in the projection's
@@ -1822,24 +1835,30 @@ pub fn lifetime_tag_high(
     conversation: &Conversation,
     operations: &Operations,
 ) -> Result<u64, String> {
+    // The newest message's ordinal, how many numbers it takes, and its entry.
     let newest = match (&conversation.open_entry, conversation.open_tool_turn()) {
-        (Some(entry), Some(message)) => Some((conversation.placed + 1, message, entry)),
+        (Some(entry), Some(message)) => {
+            Some((conversation.placed + 1, numbered_parts(message), entry))
+        }
         _ => conversation
             .messages
             .last()
             .zip(conversation.entries.last())
-            .map(|(message, entry)| (conversation.placed, &**message, entry)),
+            .map(|(message, entry)| {
+                let parts = crate::window_shape::numbered_parts(message);
+                (conversation.placed, parts, entry)
+            }),
     };
     let high = match (newest, operations.enrolled.as_ref()) {
         (Some((ordinal, _, _)), Some(enrolled)) if ordinal <= enrolled.through_ordinal => {
             enrolled.tag_high
         }
-        (Some((_, message, entry)), _) => {
+        (Some((_, parts, entry)), _) => {
             let facts = entry
                 .facts
                 .as_ref()
                 .ok_or("entry facts: the newest message has none")?;
-            facts.tag_base + numbered_parts(message)
+            facts.tag_base + parts
         }
         (None, _) => conversation
             .marker
@@ -2045,10 +2064,10 @@ pub fn render_rides(prompt: &mut [Message], conversation: &Conversation, after_r
             let Some(ride) = ride_metadata(delivered) else {
                 continue;
             };
-            let Some(ContentBlock::ToolCall(call)) = conversation
+            let Some(call_id) = conversation
                 .messages
                 .get(index)
-                .and_then(|message| message.content.get(delivered.part as usize))
+                .and_then(|message| crate::window_shape::call_at(message, delivered.part as usize))
             else {
                 continue;
             };
@@ -2066,9 +2085,7 @@ pub fn render_rides(prompt: &mut [Message], conversation: &Conversation, after_r
                 .enumerate()
                 .rev()
                 .find_map(|(at, block)| match block {
-                    ContentBlock::ToolResult(result)
-                        if result.tool_call_id == call.tool_call_id =>
-                    {
+                    ContentBlock::ToolResult(result) if &result.tool_call_id == call_id => {
                         Some((at, result))
                     }
                     _ => None,
@@ -2107,16 +2124,17 @@ mod lifetime_tag_high_tests {
     use broca_session_store::fold::operations::{Enrollment, Operations};
     use broca_session_store::record::{EnrollmentOverlayRef, EntryFacts};
 
-    use super::{lifetime_tag_high, numbered_parts};
+    use super::lifetime_tag_high;
 
     /// A session holding two messages, the newest numbered from `tag_base`.
     fn two_messages(tag_base: u64) -> Conversation {
         let mut conversation = Conversation::new(false);
         for (ordinal, text) in [(1, "first"), (2, "second")] {
-            conversation.messages.push(std::sync::Arc::new(Message::new(
-                Role::User,
-                vec![ContentBlock::Text { text: text.into() }],
-            )));
+            conversation.messages.push(
+                broca_session_store::fold::conversation::WindowMessage::new(std::sync::Arc::new(
+                    Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+                )),
+            );
             conversation.entries.push(EntryState {
                 facts: Some(std::sync::Arc::new(EntryFacts {
                     send_id: None,
@@ -2159,7 +2177,7 @@ mod lifetime_tag_high_tests {
     #[test]
     fn the_next_number_follows_the_highest_one_the_session_ever_gave() {
         let conversation = two_messages(5);
-        let newest = 5 + numbered_parts(conversation.messages.last().unwrap());
+        let newest = 5 + crate::window_shape::numbered_parts(conversation.messages.last().unwrap());
         assert_eq!(newest, 6);
         let mut operations = Operations::default();
         assert_eq!(lifetime_tag_high(&conversation, &operations), Ok(6));

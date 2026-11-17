@@ -307,7 +307,8 @@ impl RunExecutor for RenderExecutor {
                 .chain(
                     writer
                         .conversation()
-                        .messages
+                        .held_messages()
+                        .unwrap()
                         .iter()
                         .map(|message| &**message),
                 )

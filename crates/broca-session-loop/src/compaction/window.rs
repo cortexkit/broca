@@ -269,7 +269,10 @@ impl WindowTranscript {
         }
         kept.seen = conversation.changes.mark();
         let from = conversation.window_start() + kept.states.len() as u64;
-        for stored in broca_session_store::session::window_entries(conversation, from, usize::MAX) {
+        for stored in
+            broca_session_store::session::window_entries(conversation, from, usize::MAX)
+                .map_err(|not| format!("window message {} isn't held in memory", not.ordinal))?
+        {
             let state = stored.state.clone();
             let suppressed = enrollment.is_some_and(|overlay| overlay.suppressed(stored.ordinal));
             let stored = served(enrollment, stored);

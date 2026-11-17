@@ -185,7 +185,8 @@ async fn new_only(
             let raw = writer.records.clone();
             let messages: Vec<Message> = writer
                 .conversation()
-                .messages
+                .held_messages()
+                .unwrap()
                 .iter()
                 .map(|message| Message::clone(message))
                 .collect();

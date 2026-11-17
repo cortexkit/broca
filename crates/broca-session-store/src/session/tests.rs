@@ -225,7 +225,7 @@ fn unpublished_staging_has_byte_identical_final_artifacts() {
             )
             .await
             .unwrap();
-            assert_eq!(texts(&view.conversation.messages), ["look"]);
+            assert_eq!(texts(&view.conversation.held_messages().unwrap()), ["look"]);
         });
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -366,7 +366,10 @@ fn a_created_session_loads_back_with_the_same_state(cipher: Cipher) {
             .await
             .unwrap();
         assert_eq!(state(&session), written);
-        assert_eq!(texts(&session.conversation.messages), ["one", "two"]);
+        assert_eq!(
+            texts(&session.conversation.held_messages().unwrap()),
+            ["one", "two"]
+        );
         // Seqs continue: creation's WriterOpened took 1, the three batches 2 to 5, and this
         // load's WriterOpened 6.
         assert_eq!(session.append(&[input("three")], true).await.unwrap(), 7);
@@ -509,7 +512,10 @@ fn a_torn_tail_is_cut_on_load(cipher: Cipher) {
         let mut session = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
-        assert_eq!(texts(&session.conversation.messages), ["one"]);
+        assert_eq!(
+            texts(&session.conversation.held_messages().unwrap()),
+            ["one"]
+        );
         session.append(&[input("two")], true).await.unwrap();
     });
     let session = block_on(Session::load(
@@ -519,7 +525,10 @@ fn a_torn_tail_is_cut_on_load(cipher: Cipher) {
         &deployment(cipher),
     ))
     .unwrap();
-    assert_eq!(texts(&session.conversation.messages), ["one", "two"]);
+    assert_eq!(
+        texts(&session.conversation.held_messages().unwrap()),
+        ["one", "two"]
+    );
 }
 
 /// A flipped byte in the last batch is damage. No later frame claims that batch durable, so it is
@@ -592,7 +601,10 @@ fn a_view_reads_a_held_session_and_writes_nothing(cipher: Cipher) {
         let view = Session::view(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
-        assert_eq!(texts(&view.conversation.messages), ["one", "two"]);
+        assert_eq!(
+            texts(&view.conversation.held_messages().unwrap()),
+            ["one", "two"]
+        );
         assert_eq!(view.next_seq(), session.next_seq());
         session.open_log()
     });
@@ -608,7 +620,10 @@ fn a_view_reads_a_held_session_and_writes_nothing(cipher: Cipher) {
         &deployment(cipher),
     ))
     .unwrap();
-    assert_eq!(texts(&view.conversation.messages), ["one", "two"]);
+    assert_eq!(
+        texts(&view.conversation.held_messages().unwrap()),
+        ["one", "two"]
+    );
     drop(view);
     assert_eq!(
         block_on(backend.read_log(&addr(), &log, 0..synced + 40)).unwrap(),

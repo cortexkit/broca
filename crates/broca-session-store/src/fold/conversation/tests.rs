@@ -187,7 +187,7 @@ fn a_tool_turn_enters_once_every_call_is_answered_with_results_in_call_order() {
         conversation.apply(&record).unwrap();
     }
     assert_eq!(
-        conversation.messages.len(),
+        conversation.held_messages().unwrap().len(),
         1,
         "the turn waits for its second reply"
     );
@@ -195,9 +195,17 @@ fn a_tool_turn_enters_once_every_call_is_answered_with_results_in_call_order() {
 
     conversation.apply(&reply("a", "1")).unwrap();
     assert!(conversation.open_tool_turn().is_none());
-    let roles: Vec<Role> = conversation.messages.iter().map(|m| m.role).collect();
+    let roles: Vec<Role> = conversation
+        .held_messages()
+        .unwrap()
+        .iter()
+        .map(|m| m.role)
+        .collect();
     assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool]);
-    assert_eq!(result_ids(&conversation.messages[2]), ["a", "b"]);
+    assert_eq!(
+        result_ids(&conversation.held_messages().unwrap()[2]),
+        ["a", "b"]
+    );
 }
 
 #[test]
@@ -249,7 +257,12 @@ fn a_new_run_drops_a_turn_its_interrupted_run_left_unanswered() {
         false,
     )
     .unwrap();
-    let roles: Vec<Role> = conversation.messages.iter().map(|m| m.role).collect();
+    let roles: Vec<Role> = conversation
+        .held_messages()
+        .unwrap()
+        .iter()
+        .map(|m| m.role)
+        .collect();
     assert_eq!(roles, [Role::User, Role::User]);
     assert!(conversation.open_tool_turn().is_none());
 }
@@ -268,7 +281,7 @@ fn a_budget_finalize_step_enters_at_once_without_its_calls() {
     let conversation = fold(&[Record::Assistant(step)], false).unwrap();
     assert!(conversation.open_tool_turn().is_none());
     assert_eq!(
-        conversation.messages[0].content,
+        conversation.held_messages().unwrap()[0].content,
         [ContentBlock::Text {
             text: "summary".into()
         }]
@@ -287,13 +300,14 @@ fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
         ride: None,
     });
     let records = [assistant(&["a"]), reply("a", "out"), append];
-    let text = |conversation: &Conversation| match &conversation.messages[1].content[0] {
-        ContentBlock::ToolResult(ToolResult {
-            output: ToolOutput::Text { text },
-            ..
-        }) => text.clone(),
-        other => panic!("{other:?}"),
-    };
+    let text =
+        |conversation: &Conversation| match &conversation.held_messages().unwrap()[1].content[0] {
+            ContentBlock::ToolResult(ToolResult {
+                output: ToolOutput::Text { text },
+                ..
+            }) => text.clone(),
+            other => panic!("{other:?}"),
+        };
     assert_eq!(text(&fold(&records, true).unwrap()), "out +note");
     assert_eq!(text(&fold(&records, false).unwrap()), "out");
 }
@@ -322,7 +336,7 @@ fn a_ride_is_kept_beside_its_call_in_both_layouts() {
     let records = [assistant(&["a"]), reply("a", "out"), append];
     for appends in [true, false] {
         let conversation = fold(&records, appends).unwrap();
-        match &conversation.messages[1].content[0] {
+        match &conversation.held_messages().unwrap()[1].content[0] {
             ContentBlock::ToolResult(ToolResult {
                 output: ToolOutput::Text { text },
                 ..

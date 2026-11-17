@@ -1178,7 +1178,11 @@ async fn store_history(
         .find(|episode| episode.first_user.is_some());
     let (first_user, first_user_sealed) = match first_run.and_then(|episode| episode.first_user) {
         None => (None, false),
-        Some(ordinal) => match conversation.window_message(ordinal) {
+        Some(ordinal) => match conversation.held_message(ordinal).map_err(|not| {
+            broca_session_loop::LoopError::Session(
+                broca_session_store::session::SessionError::NotHeld(not.ordinal),
+            )
+        })? {
             Some(message) => (
                 Some(broca_protocol::content::Message::clone(message)),
                 false,
@@ -3271,14 +3275,12 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         let holds_media = req
             .input
             .iter()
-            .chain(
-                writer
-                    .conversation()
-                    .messages
-                    .iter()
-                    .map(|message| &**message),
-            )
-            .any(|message| !broca_session_store::session::message_media(message).is_empty());
+            .any(|message| !broca_session_store::session::message_media(message).is_empty())
+            || writer
+                .conversation()
+                .messages
+                .iter()
+                .any(|message| message.has_media());
         let mut model_call_ready = None;
         let mut media_renderer = None;
         if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty()) {

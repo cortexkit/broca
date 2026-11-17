@@ -32,7 +32,7 @@ pub(crate) fn first_answer(
         let Some((message, entry)) = conversation.window_entry(ordinal) else {
             continue;
         };
-        if message.role != broca_protocol::Role::Assistant {
+        if message.role() != broca_protocol::Role::Assistant {
             continue;
         }
         match entry.facts.as_ref() {

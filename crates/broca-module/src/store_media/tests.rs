@@ -250,7 +250,7 @@ impl Store {
     /// images.
     fn render(&self) -> Result<String, String> {
         let opts: broca_protocol::request::CallOptions = serde_json::from_value(json!({
-            "prompt": self.session.conversation.messages,
+            "prompt": self.session.conversation.held_messages().unwrap(),
         }))
         .unwrap();
         self.index

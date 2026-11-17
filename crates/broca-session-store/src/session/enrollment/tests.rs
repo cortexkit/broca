@@ -585,8 +585,8 @@ fn ride(run: &str, id: &str, text: &str) -> Record {
 /// The text of the tool result `id` in `conversation`, and the text delivered beside it, which
 /// the entry of the message that made the call keeps.
 fn result_and_rides(conversation: &Conversation, id: &str) -> (String, Vec<String>) {
-    let result = conversation
-        .messages
+    let messages = conversation.held_messages().unwrap();
+    let result = messages
         .iter()
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
@@ -598,7 +598,8 @@ fn result_and_rides(conversation: &Conversation, id: &str) -> (String, Vec<Strin
         panic!("a text result");
     };
     let rides = conversation
-        .messages
+        .held_messages()
+        .unwrap()
         .iter()
         .zip(&conversation.entries)
         .find(|(message, _)| {

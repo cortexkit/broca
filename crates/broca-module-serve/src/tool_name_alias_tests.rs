@@ -154,7 +154,8 @@ fn stored_call_names(
 ) -> Vec<String> {
     session
         .conversation
-        .messages
+        .held_messages()
+        .unwrap()
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
