@@ -117,6 +117,7 @@ pub fn assemble(
         setup_parts,
         closed_session_views,
         settled_runs,
+        setup_stores: Vec::new(),
     }
 }
 
@@ -146,14 +147,17 @@ impl crate::LineageRegistry {
                 Some(MemoryAnswer::Closing) | None => unanswered += 1,
             }
         }
-        let (views, settled) = match self.store_runtime() {
+        let (views, settled, setup_stores) = match self.store_runtime() {
             Some(store) => (
                 store.views().memory(|view| view.held_bytes().total()),
                 store.settled_runs().memory(),
+                store.setup_store_usage(),
             ),
             None => Default::default(),
         };
-        assemble(answers, legacy, unanswered, views, settled)
+        let mut report = assemble(answers, legacy, unanswered, views, settled);
+        report.setup_stores = setup_stores;
+        report
     }
 }
 

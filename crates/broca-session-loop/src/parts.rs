@@ -6,7 +6,8 @@
 //! alike.
 
 use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use broca_session_store::codec::Digest;
@@ -38,6 +39,31 @@ pub trait Parts: Send + Sync {
     fn decoded(&self) -> Option<DecodedParts> {
         None
     }
+
+    /// What this store holds and how it has been read since it was made, for the memory
+    /// report. `None` for a store that doesn't count.
+    fn usage(&self) -> Option<PartsUsage> {
+        None
+    }
+}
+
+/// What a deployment's parts store holds and how it has been read since the process started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartsUsage {
+    /// Stored parts held in memory, and their bytes.
+    pub held_parts: u64,
+    pub held_bytes: u64,
+    /// Bytes of parts put here and not stored yet.
+    pub unstored_bytes: u64,
+    /// Parts read from the setup store because memory didn't hold them, and their bytes.
+    pub store_reads: u64,
+    pub store_read_bytes: u64,
+    /// Of those reads, the ones of a part memory held until the held bytes' bound dropped it
+    /// recently: reads a larger bound would have saved.
+    pub reads_after_eviction: u64,
+    /// Parts decoded from their bytes into a JSON value, and the bytes decoded.
+    pub decodes: u64,
+    pub decoded_bytes: u64,
 }
 
 /// Parts held in memory, for tests and for runs whose parts the caller keeps elsewhere. It keeps
@@ -268,6 +294,10 @@ impl Parts for SharedParts {
         let held = self.lock().ok().and_then(|parts| parts.decoded());
         Some(held.unwrap_or_else(|| self.1.clone()))
     }
+
+    fn usage(&self) -> Option<PartsUsage> {
+        self.lock().ok().and_then(|parts| parts.usage())
+    }
 }
 
 /// Where a deployment's stored parts are read from once memory holds them no longer.
@@ -324,7 +354,22 @@ pub struct DeploymentParts {
     decoded: DecodedParts,
     /// Where stored parts are read from; none for a deployment that stores nothing.
     stored: Option<Arc<dyn StoredParts>>,
+    /// How its parts were read, for [`Parts::usage`].
+    counts: Arc<ReadCounts>,
 }
+
+#[derive(Default)]
+struct ReadCounts {
+    store_reads: AtomicU64,
+    store_read_bytes: AtomicU64,
+    reads_after_eviction: AtomicU64,
+    decodes: AtomicU64,
+    decoded_bytes: AtomicU64,
+}
+
+/// How many of the parts the held bytes' bound dropped last are remembered, so a store read of
+/// one of them counts as a read a larger bound would have saved.
+const EVICTIONS_REMEMBERED: usize = 4096;
 
 #[derive(Default)]
 struct DeploymentState {
@@ -342,6 +387,9 @@ struct HeldParts {
     order: BTreeMap<u64, Digest>,
     bytes: usize,
     clock: u64,
+    /// The digests the bound dropped last, oldest first, at most [`EVICTIONS_REMEMBERED`].
+    evicted: VecDeque<Digest>,
+    evicted_set: HashSet<Digest>,
 }
 
 impl HeldParts {
@@ -368,8 +416,29 @@ impl HeldParts {
             };
             if let Some((bytes, _)) = self.parts.remove(&oldest) {
                 self.bytes -= bytes.len();
+                self.remember_eviction(oldest);
             }
         }
+    }
+
+    fn remember_eviction(&mut self, digest: Digest) {
+        if self.evicted.len() == EVICTIONS_REMEMBERED {
+            if let Some(forgotten) = self.evicted.pop_front() {
+                self.evicted_set.remove(&forgotten);
+            }
+        }
+        if self.evicted_set.insert(digest) {
+            self.evicted.push_back(digest);
+        }
+    }
+
+    /// Whether the bound dropped `digest` recently; a part read back is no longer counted so.
+    fn take_eviction(&mut self, digest: &Digest) -> bool {
+        if !self.evicted_set.remove(digest) {
+            return false;
+        }
+        self.evicted.retain(|evicted| evicted != digest);
+        true
     }
 }
 
@@ -423,7 +492,17 @@ impl DeploymentParts {
         };
         let read = stored.read(digest)?;
         if let Some(bytes) = &read {
-            self.lock()?.held.hold(*digest, Arc::clone(bytes));
+            self.counts.store_reads.fetch_add(1, Ordering::Relaxed);
+            self.counts
+                .store_read_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            let mut state = self.lock()?;
+            if state.held.take_eviction(digest) {
+                self.counts
+                    .reads_after_eviction
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            state.held.hold(*digest, Arc::clone(bytes));
         }
         Ok(read)
     }
@@ -443,6 +522,10 @@ impl Parts for DeploymentParts {
         let bytes = self
             .bytes(&part.digest)?
             .ok_or_else(|| "setup part missing".to_string())?;
+        self.counts.decodes.fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .decoded_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         decode_bytes(&bytes)
     }
 
@@ -477,6 +560,25 @@ impl Parts for DeploymentParts {
 
     fn decoded(&self) -> Option<DecodedParts> {
         Some(self.decoded.clone())
+    }
+
+    fn usage(&self) -> Option<PartsUsage> {
+        let state = self.lock().ok()?;
+        let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        Some(PartsUsage {
+            held_parts: state.held.parts.len() as u64,
+            held_bytes: state.held.bytes as u64,
+            unstored_bytes: state
+                .unstored
+                .values()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum(),
+            store_reads: count(&self.counts.store_reads),
+            store_read_bytes: count(&self.counts.store_read_bytes),
+            reads_after_eviction: count(&self.counts.reads_after_eviction),
+            decodes: count(&self.counts.decodes),
+            decoded_bytes: count(&self.counts.decoded_bytes),
+        })
     }
 }
 

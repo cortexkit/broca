@@ -1482,6 +1482,28 @@ fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
             ));
         }
     }
+    if report
+        .setup_stores
+        .iter()
+        .any(|store| store.held_parts > 0 || store.store_reads > 0)
+    {
+        out.push_str(
+            "\nsetup store          held  held MiB  disk reads  read MiB  after drop  decodes  decoded MiB\n",
+        );
+        for store in &report.setup_stores {
+            out.push_str(&format!(
+                "{:<20} {:>4} {:>9} {:>11} {:>9} {:>11} {:>8} {:>12}\n",
+                format!("{} {}", store.class, store.mode),
+                store.held_parts,
+                mib(store.held_bytes),
+                store.store_reads,
+                mib(store.store_read_bytes),
+                store.reads_after_eviction,
+                store.decodes,
+                mib(store.decoded_bytes)
+            ));
+        }
+    }
     out.push_str(
         "\ncache                  entries  max entries  estimated MiB  counted MiB  max MiB  over cap\n",
     );
@@ -1500,6 +1522,15 @@ fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
             cache
                 .views_over_cap
                 .map_or_else(|| "-".into(), |count| count.to_string()),
+        ));
+    }
+    let views = &report.closed_session_views;
+    if let (Some(loads), Some(bytes)) = (views.loads, views.loaded_bytes) {
+        out.push_str(&format!(
+            "closed-session views loaded since start: {loads} ({} MiB), {} of them after a write \
+             moved the kept view's session\n",
+            mib(bytes),
+            views.reloads.unwrap_or(0)
         ));
     }
     out

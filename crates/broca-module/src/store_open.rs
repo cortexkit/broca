@@ -294,6 +294,36 @@ impl StoreRuntime {
         }
     }
 
+    /// Each class root's setup-part stores, encrypted and plain, with what they hold and how
+    /// they have been read, for `memory.report`.
+    pub fn setup_store_usage(&self) -> Vec<broca_wire::MemorySetupStore> {
+        use broca_session_loop::parts::Parts as _;
+        let mut stores = Vec::new();
+        for class in StorageClass::ALL {
+            for (mode, cipher) in [
+                ("encrypted", Cipher::XChaCha20Poly1305),
+                ("plain", Cipher::None),
+            ] {
+                let Some(usage) = self.parts_for(class, cipher).usage() else {
+                    continue;
+                };
+                stores.push(broca_wire::MemorySetupStore {
+                    class: class.to_string(),
+                    mode: mode.to_owned(),
+                    held_parts: usage.held_parts,
+                    held_bytes: usage.held_bytes,
+                    unstored_bytes: usage.unstored_bytes,
+                    store_reads: usage.store_reads,
+                    store_read_bytes: usage.store_read_bytes,
+                    reads_after_eviction: usage.reads_after_eviction,
+                    decodes: usage.decodes,
+                    decoded_bytes: usage.decoded_bytes,
+                });
+            }
+        }
+        stores
+    }
+
     /// The facts of runs that have ended, kept for `run.status` and `run.result`.
     pub fn settled_runs(&self) -> &crate::store_status::SettledRuns {
         &self.settled

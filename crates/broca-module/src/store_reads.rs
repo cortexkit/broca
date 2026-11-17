@@ -542,6 +542,12 @@ struct CacheInner<V> {
     clock: u64,
     /// Views loaded and not kept because each alone was larger than the byte cap.
     over_cap: u64,
+    /// Views loaded since the cache was made, and their walked bytes.
+    loads: u64,
+    loaded_bytes: u64,
+    /// Of those loads, the ones that replaced a view of the same session at an older position:
+    /// the session was written since its view loaded.
+    reloads: u64,
 }
 
 /// Views of closed sessions this process loaded and didn't keep because each alone was larger
@@ -561,6 +567,9 @@ impl<V> Default for CacheInner<V> {
             bytes: 0,
             clock: 0,
             over_cap: 0,
+            loads: 0,
+            loaded_bytes: 0,
+            reloads: 0,
         }
     }
 }
@@ -575,6 +584,8 @@ struct CacheEntry<V> {
     /// reads have kept since, as of the last time it was served.
     bytes: u64,
     used: u64,
+    /// Whether it replaced a view of its session at an older position.
+    replaced_older: bool,
 }
 
 /// What a kept view holds, as [`ViewCache`] counts it against its byte cap.
@@ -663,6 +674,7 @@ impl<V: CachedBytes> ViewCache<V> {
                     cell
                 }
                 _ => {
+                    let replaced_older = inner.entries.contains_key(addr);
                     let cell = Arc::new(tokio::sync::OnceCell::new());
                     let token_counts = inner
                         .entries
@@ -678,6 +690,7 @@ impl<V: CachedBytes> ViewCache<V> {
                             loaded: 0,
                             bytes: 0,
                             used: clock,
+                            replaced_older,
                         },
                     );
                     if let Some(replaced) = replaced {
@@ -698,7 +711,11 @@ impl<V: CachedBytes> ViewCache<V> {
                 // one byte, so a counted entry is never taken for an unloaded one.
                 entry.loaded = view.loaded_bytes().max(1);
                 entry.bytes = entry.loaded + view.grown_bytes();
+                let (loaded, reload) = (entry.loaded, entry.replaced_older);
                 inner.bytes += entry.bytes;
+                inner.loads += 1;
+                inner.loaded_bytes += loaded;
+                inner.reloads += u64::from(reload);
             }
         }
         for (addr, bytes) in inner.evict(self.max_entries, self.max_bytes) {
@@ -739,6 +756,9 @@ impl<V: CachedBytes> ViewCache<V> {
             max_bytes: Some(self.max_bytes),
             estimated_bytes: estimated as u64,
             views_over_cap: Some(inner.over_cap),
+            loads: Some(inner.loads),
+            loaded_bytes: Some(inner.loaded_bytes),
+            reloads: Some(inner.reloads),
         }
     }
 
@@ -884,6 +904,12 @@ mod tests {
         // A failed load keeps nothing, and the next reader loads.
         assert!(cache.view("s", at(3, 1), async { Err(()) }).await.is_err());
         assert_eq!(*cache.view("s", at(3, 1), load(4)).await.unwrap(), 4);
+        // The memory report counts each load that succeeded and its bytes, and the three that
+        // replaced a view of the session at an older position.
+        let memory = cache.memory(|view| *view as usize);
+        assert_eq!(memory.loads, Some(4));
+        assert_eq!(memory.loaded_bytes, Some(1 + 2 + 3 + 4));
+        assert_eq!(memory.reloads, Some(3));
     }
 
     /// The least recently used view goes first, by count and by estimated bytes.

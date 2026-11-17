@@ -314,7 +314,7 @@ impl SettledRuns {
             counted_bytes: Some(inner.bytes as u64),
             max_bytes: Some(self.max_bytes as u64),
             estimated_bytes: (inner.bytes + spare + admissions) as u64,
-            views_over_cap: None,
+            ..Default::default()
         }
     }
 

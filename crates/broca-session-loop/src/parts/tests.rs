@@ -252,4 +252,24 @@ fn held_parts_stay_within_their_bound_and_unstored_ones_are_kept() {
     assert_eq!(reads(), before, "the newest part is still held");
     assert_eq!(deployment.get(&parts[0]).unwrap(), text(0, size));
     assert_eq!(reads(), before + 1, "the oldest is read again");
+    // The usage the memory report shows counts that read as one the bound caused, and both
+    // gets as decodes.
+    let usage = deployment.usage().unwrap();
+    assert_eq!(usage.store_reads, 1);
+    assert_eq!(usage.reads_after_eviction, 1);
+    assert_eq!(usage.decodes, 2);
+    assert!(usage.held_bytes <= HELD_PART_BYTES as u64);
+    assert_eq!(usage.unstored_bytes, 0);
+    // A part never held before is read from the store without counting as dropped.
+    let (bytes, digest) = canonical(&text(99, 10)).unwrap();
+    store.parts.lock().unwrap().insert(digest, bytes.into());
+    deployment
+        .get(&PartRef {
+            kind: PartKind::SystemText,
+            digest,
+        })
+        .unwrap();
+    let usage = deployment.usage().unwrap();
+    assert_eq!(usage.store_reads, 2);
+    assert_eq!(usage.reads_after_eviction, 1);
 }
