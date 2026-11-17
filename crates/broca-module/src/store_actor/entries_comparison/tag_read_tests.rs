@@ -508,3 +508,109 @@ async fn anyone_but_the_owner_on_a_plain_route_is_refused() {
         );
     }
 }
+
+/// The module the person's app messages arrive through, which the plan lists as carrying the
+/// person's own words.
+const APP: &str = "occipital";
+
+/// A session the [`OWNER`] created, whose plan lists [`APP`] as a sender carrying the person's
+/// words, then a message the person typed in the app, sent through [`APP`] with its app message
+/// id `app-msg-1` and a send id, whose run's model called a tool and then answered.
+async fn app_message_session() -> Side {
+    let side = side(
+        vec![
+            text_step("a1", "Ready."),
+            tool_step("a2"),
+            text_step("a3", "It says file contents."),
+        ],
+        false,
+        true,
+    )
+    .await;
+    let mut manifest = compacting_manifest(true);
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({
+            "compaction_item": {"provider": "ck-mc", "preset": "default"},
+            "render_tags": true,
+            "senders": [{"module": APP, "person": true, "idle_start": true}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut first = untooled("first");
+    first.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: OWNER.into(),
+    });
+    let outcome = side
+        .send_request("r1", first, Some(planned("plan-1", Some(manifest))))
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    side.settled("r1").await;
+    side.assert_completed("r1").await;
+    let mut typed = untooled("please read a");
+    typed.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: APP.into(),
+    });
+    typed.client_message_id = Some("app-msg-1".into());
+    // Keyed by its send id, as the app's sends are: the key's identity record keeps the app
+    // message id.
+    let key = SendKey::SendId("app-send-1".into());
+    let outcome = side
+        .registry
+        .route_submission_with_order(
+            &side.key,
+            RunId("r2".into()),
+            side.caller.shape("r2", &key, typed),
+            RunKind::FreshOrResume,
+            key,
+            false,
+            broca_protocol::Delivery::Queue,
+            Some(planned("plan-1", None)),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("the session opens");
+    assert!(
+        matches!(
+            outcome,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{outcome:?}"
+    );
+    side.settled("r2").await;
+    side.assert_completed("r2").await;
+    side
+}
+
+/// A number on a message the person typed in the app resolves to that message with its app
+/// message id and the module that carried it, as `session.read` serves them, so a citation
+/// reader can tell the person's own words from a message a module wrote.
+#[tokio::test]
+async fn a_number_on_an_app_message_keeps_its_app_message_id() {
+    let side = app_message_session().await;
+    let (key, shown) = the_call(&side).await;
+    let rows = map_rows(&side).await;
+    let typed = rows
+        .iter()
+        .filter(|row| row.role == broca_protocol::content::Role::User && shown.contains(&row.tag))
+        .max_by_key(|row| row.ordinal)
+        .expect("the request showed the typed message's number");
+    let answer = tag_read(&side, typed.tag, &key).await.unwrap();
+    assert_eq!(answer.entry.client_message_id.as_deref(), Some("app-msg-1"));
+    assert_eq!(answer.entry.sender.as_deref(), Some(APP));
+    assert!(!answer.entry.notice);
+    assert!(answer.entry.message.to_string().contains("please read a"));
+    if let Some(folder) = std::env::var_os("BROCA_TAG_READ_SAMPLES") {
+        let body = serde_json::to_vec(&json!({ "result": answer })).unwrap();
+        std::fs::write(
+            std::path::Path::new(&folder).join("answer-app-user.json"),
+            body,
+        )
+        .unwrap();
+    }
+}
