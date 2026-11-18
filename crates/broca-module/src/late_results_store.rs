@@ -687,6 +687,9 @@ impl LateResultsStore {
         Ok(())
     }
 
+    /// Every withdrawal not done, with its state and attempts. A failure whose scope is gone
+    /// (`scope_not_live`, `scope_ended`) reads as state `scope_gone`, apart from other failures:
+    /// no route can carry its withdrawal any more.
     pub fn withdrawal_rows(&self) -> Result<Vec<(LateResultRegistration, String, u32)>, String> {
         let connection = self.lock()?;
         #[cfg(test)]
@@ -704,9 +707,11 @@ impl LateResultsStore {
         #[cfg(test)]
         boot_io::record(|counts| counts.reads += 1);
         let mut query = connection
-            .prepare(
-                "SELECT registration, state, attempts FROM held_withdrawals WHERE state != 'done'",
-            )
+            .prepare(&format!(
+                "SELECT registration, CASE WHEN state='failed' AND ({WITHDRAWAL_SCOPE_GONE}) \
+                 THEN 'scope_gone' ELSE state END, attempts FROM held_withdrawals \
+                 WHERE state != 'done'"
+            ))
             .map_err(|error| error.to_string())?;
         let rows = query
             .query_map([], |row| {

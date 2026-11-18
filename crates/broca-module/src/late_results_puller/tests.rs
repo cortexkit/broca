@@ -1499,6 +1499,57 @@ async fn held_withdrawal_cancel_seal_crash_cut_recovers_once_even_after_intake_p
     assert_eq!(service.health()["failed"], 0);
 }
 
+/// A withdrawal its provider refused stays failed, and keeps the module's health degraded, only
+/// until the provider answers it: the next start asks again with a fresh retry budget, and a
+/// provider that now withdraws the call settles it done.
+#[tokio::test]
+async fn a_failed_withdrawal_is_asked_again_at_the_next_start_and_settles() {
+    use crate::held_slots::HeldWithdrawal;
+    let bind = session("failed-then-withdrawn");
+    let mut records = held_records("lineage:4", "tools");
+    cancelled_held(&mut records, &["a"]);
+    let (root, runtime) = withdrawal_root("withdraw-failed-then-ok", &bind, &records).await;
+    let path = root.join("late-results.db");
+    let store = Arc::new(LateResultsStore::open(&path).unwrap());
+    store
+        .register_calls(&[registration("lineage:4", "tools", &bind)])
+        .unwrap();
+    let refusing = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "scope_not_carrier",
+    });
+    let service = withdrawals(store, &runtime, refusing.clone(), Default::default());
+    service.withdraw(&held_reply("lineage:4")).await.unwrap();
+    assert_eq!(service.health()["failed"], 1);
+    // A failed withdrawal is left alone while the process runs.
+    service.withdraw(&held_reply("lineage:4")).await.unwrap();
+    assert_eq!(refusing.seen.lock().unwrap().len(), 1);
+    drop(service);
+    // The next start finds the provider answering again.
+    let store = Arc::new(LateResultsStore::open(&path).unwrap());
+    store.recovery_snapshot().unwrap();
+    let answering = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(
+        store.clone(),
+        &runtime,
+        answering.clone(),
+        Default::default(),
+    );
+    service.recover().await.unwrap();
+    assert_eq!(*answering.seen.lock().unwrap(), ["lineage:4"]);
+    assert_eq!(
+        store.withdrawal_state("tools", "lineage:4").unwrap(),
+        Some(("done".into(), 1)),
+        "a fresh budget counts from one"
+    );
+    let health = service.health();
+    assert_eq!(health["failed"], 0, "{health}");
+    assert!(health.get("error").is_none(), "{health}");
+}
+
 #[tokio::test]
 async fn held_withdrawal_scope_gone_refusals_are_reported_without_failure_or_resend() {
     use crate::held_slots::HeldWithdrawal;
@@ -1545,10 +1596,12 @@ async fn held_withdrawal_scope_gone_refusals_are_reported_without_failure_or_res
         service.recover().await.unwrap();
         assert_eq!(service.health()["failed"], failed);
         assert_eq!(service.health()["scope_gone"], scope_gone);
+        // A start asks a failed withdrawal once more, since what made its provider refuse may be
+        // gone; a withdrawal whose scope is gone is never sent again.
         assert_eq!(
             route.seen.lock().unwrap().len(),
-            1,
-            "terminal refusals never resend"
+            1 + failed,
+            "{code}: only a failed withdrawal is sent again, once per start"
         );
         assert_eq!(
             rig_records(&runtime, &bind).await.len(),
@@ -1583,6 +1636,9 @@ async fn held_withdrawal_shutdown_and_restart_send_none() {
     assert!(route.seen.lock().unwrap().is_empty());
 }
 
+/// A failing withdrawal is tried a bounded number of times, and its failure is durable: after a
+/// restart it is asked again once with a fresh budget of the same size, never more, and nothing
+/// is written to the cancelled run.
 #[tokio::test]
 async fn held_withdrawal_failures_are_bounded_durable_and_do_not_change_cancel() {
     for (mode, expected) in [("offline", 3), ("refused", 1)] {
@@ -1615,7 +1671,8 @@ async fn held_withdrawal_failures_are_bounded_durable_and_do_not_change_cancel()
         let store = Arc::new(LateResultsStore::open(&path).unwrap());
         let service = withdrawals(store, &runtime, route.clone(), Default::default());
         service.recover().await.unwrap();
-        assert_eq!(route.seen.lock().unwrap().len(), expected);
+        assert_eq!(route.seen.lock().unwrap().len(), 2 * expected, "{mode}");
+        assert_eq!(service.health()["failed"], 1, "{mode}");
         assert_eq!(
             rig_records(&runtime, &bind).await.len(),
             seeded,

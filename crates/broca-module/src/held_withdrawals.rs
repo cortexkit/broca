@@ -1,5 +1,7 @@
 //! A cancellation seal is the durable withdrawal intent. The SQLite outbox retains its
-//! registration even after intake pruning, and bounds transport retries across restarts.
+//! registration even after intake pruning, and bounds transport retries: a withdrawal that keeps
+//! failing is tried at most `MAX_ATTEMPTS` times while the process runs, and once more, with the
+//! same budget, at each start.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -123,8 +125,12 @@ impl HeldWithdrawals {
         }
         let _sweep = SweepGuard(&self.sweep);
         let mut sessions: HashMap<_, Vec<_>> = HashMap::new();
+        // A failed withdrawal is asked again once per start, with a fresh retry budget: what made
+        // the provider refuse may be gone since (it restarted, was fixed, or its task ended), and
+        // until it answers the row keeps the module's health degraded with nothing to clear it.
+        // A withdrawal whose scope is gone never is: no route can carry it any more.
         for (call, state, attempts) in self.store.withdrawal_rows()? {
-            if state != "failed" {
+            if state != "scope_gone" {
                 sessions
                     .entry(call.bind.clone())
                     .or_default()
@@ -159,8 +165,13 @@ impl HeldWithdrawals {
                 .unwrap_or(false);
             if let (true, Some(runtime)) = (held, runtime) {
                 sessions_read += 1;
-                for (call, _, attempts) in &rows {
-                    match self.drive(call.clone(), *attempts).await {
+                for (call, state, attempts) in &rows {
+                    let attempts = if state == "failed" {
+                        None
+                    } else {
+                        Some(*attempts)
+                    };
+                    match self.drive(call.clone(), attempts).await {
                         Ok(sent) => withdrawals_sent += sent,
                         Err(error) => failure = Some(error),
                     }
@@ -219,7 +230,13 @@ impl HeldWithdrawals {
         Ok(())
     }
 
-    async fn drive(&self, call: LateResultRegistration, mut attempts: u32) -> Result<u32, String> {
+    /// Withdraw `call`, counting on from `attempts` sent before. `None` asks a failed withdrawal
+    /// again with a fresh budget; otherwise a failed or done withdrawal is left as it is.
+    async fn drive(
+        &self,
+        call: LateResultRegistration,
+        attempts: Option<u32>,
+    ) -> Result<u32, String> {
         let stopping = self
             .stopping
             .get()
@@ -245,10 +262,15 @@ impl HeldWithdrawals {
         else {
             return Ok(0);
         };
-        if state == "failed" || state == "done" {
+        let retry_failed = attempts.is_none() && state == "failed";
+        if state == "done" || (state == "failed" && !retry_failed) {
             return Ok(0);
         }
-        attempts = attempts.max(durable_attempts);
+        let mut attempts = match attempts {
+            Some(attempts) => attempts.max(durable_attempts),
+            None if retry_failed => 0,
+            None => durable_attempts,
+        };
         // Live callers arrive only after sync. Recovery reads the same sealed log: an open
         // hold, a shutdown pause, or an interrupted restart is never a withdrawal intent.
         let Some(session_identity) = self.cancellation_identity(&call).await? else {
@@ -368,7 +390,7 @@ impl Drop for Active<'_> {
 impl HeldWithdrawal for HeldWithdrawals {
     async fn withdraw(&self, reply: &ProviderHeldReply) -> Result<(), String> {
         if let Some(call) = self.store.withdrawal_call(&reply.module, &reply.call_key)? {
-            let result = self.drive(call, 0).await.map(|_| ());
+            let result = self.drive(call, Some(0)).await.map(|_| ());
             if let Err(error) = &result {
                 self.health.lock().expect("withdrawal health")["error"] = json!(error);
             }
