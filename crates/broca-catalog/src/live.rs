@@ -107,6 +107,9 @@ pub struct ResolveOptions<'a> {
     /// [`AuthMode::Secret`]; ChatGPT rebuilds its complete account and session header set.
     /// `None` keeps a 401 ending the step.
     pub secret_refresher: Option<SharedSecretRefresher>,
+    /// The hosts the credential's vault record lists. A request carrying the credential goes
+    /// only to one of them; the default lists none, so it goes nowhere.
+    pub credential_hosts: broca_provider::credential_hosts::CredentialHosts,
     /// Account identity frozen at run admission (including when resolving a resume).
     pub frozen_account_ref: Option<&'a str>,
     /// The module clock shared with every live provider for this run.
@@ -492,6 +495,7 @@ pub fn provider_for_recorded_config(
     model_id: &str,
     frozen: FrozenRenderConfig,
     auth: &AuthMode,
+    credential_hosts: &broca_provider::credential_hosts::CredentialHosts,
     auth_method: Option<AuthMethod>,
     frozen_account_ref: Option<&str>,
     served_account_ref: Option<&str>,
@@ -503,6 +507,7 @@ pub fn provider_for_recorded_config(
         model_id,
         frozen,
         auth,
+        credential_hosts,
         auth_method,
         frozen_account_ref,
         served_account_ref,
@@ -519,6 +524,7 @@ pub fn provider_for_recorded_config_with_quota_observer(
     model_id: &str,
     frozen: FrozenRenderConfig,
     auth: &AuthMode,
+    credential_hosts: &broca_provider::credential_hosts::CredentialHosts,
     auth_method: Option<AuthMethod>,
     frozen_account_ref: Option<&str>,
     served_account_ref: Option<&str>,
@@ -555,6 +561,7 @@ pub fn provider_for_recorded_config_with_quota_observer(
             frozen_account_ref: frozen_account_ref.map(str::to_owned),
             served_account_ref: served_account_ref.map(str::to_owned),
             clock: clock.clone(),
+            credential_hosts: credential_hosts.clone(),
         },
     )
     .map_err(|error| error.to_string())
@@ -2280,6 +2287,7 @@ fn resolved_live_provider(
             frozen_account_ref: opts.frozen_account_ref.map(str::to_owned),
             served_account_ref: opts.account_id.map(str::to_owned),
             clock: opts.clock.cloned().unwrap_or_default(),
+            credential_hosts: opts.credential_hosts.clone(),
         },
     )
     .map_err(|error| error.to_string())
@@ -3543,6 +3551,10 @@ mod tests {
                 "gpt-5.4-mini",
                 frozen.clone(),
                 &AuthMode::Secret(token.to_owned()),
+                &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                    "127.0.0.1".to_owned(),
+                    "localhost".to_owned(),
+                ])),
                 Some(AuthMethod::Chatgpt),
                 Some(account),
                 Some(account),
@@ -3586,6 +3598,10 @@ mod tests {
                 "claude-opus-5",
                 frozen.clone(),
                 &AuthMode::Secret(token.to_owned()),
+                &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                    "127.0.0.1".to_owned(),
+                    "localhost".to_owned(),
+                ])),
                 Some(AuthMethod::Oauth),
                 Some(account),
                 Some(account),
@@ -4367,6 +4383,10 @@ mod tests {
                 "grok-4.5",
                 frozen,
                 &auth,
+                &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                    "127.0.0.1".to_owned(),
+                    "localhost".to_owned(),
+                ])),
                 Some(method),
                 None,
                 None,
@@ -4513,6 +4533,10 @@ mod tests {
                 "gpt-5.4-mini",
                 frozen.clone(),
                 &auth,
+                &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                    "127.0.0.1".to_owned(),
+                    "localhost".to_owned(),
+                ])),
                 Some(AuthMethod::Chatgpt),
                 served_account,
                 served_account,
@@ -4663,6 +4687,10 @@ mod tests {
                 "gpt-5.4-mini",
                 frozen.clone(),
                 &auth,
+                &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                    "127.0.0.1".to_owned(),
+                    "localhost".to_owned(),
+                ])),
                 Some(AuthMethod::Chatgpt),
                 served_account,
                 served_account,

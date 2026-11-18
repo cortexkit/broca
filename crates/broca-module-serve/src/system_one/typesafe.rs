@@ -102,6 +102,9 @@ impl ClassifierProvider for TypeSafe {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
         if let Some(secret) = &secret {
+            if let Some(refused) = secret.refuse_endpoint(self.endpoint.as_str()) {
+                return ProviderReply::Credential(refused);
+            }
             request = request.bearer_auth(&secret.token);
         }
         let attempt = async {

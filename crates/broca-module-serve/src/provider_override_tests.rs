@@ -11,6 +11,7 @@ fn resolve_runtime_override(
 ) -> broca_catalog::live::ProviderResolution {
     let _catalog = install_test_catalog();
     let resolution = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Secret("test-api-key".into()),
         pause: None,
         selection: Some(broca_core::AuthSelection {
@@ -370,6 +371,7 @@ fn resolve_drift_revision(
     caller_max_tokens: Option<u32>,
 ) -> broca_catalog::live::ProviderResolution {
     let auth = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Bearer("test-oauth-token".into()),
         pause: None,
         selection: None,
@@ -728,6 +730,7 @@ fn resolve_tier_revision(
     requested: Option<broca_catalog::live::ServiceTier>,
 ) -> Result<broca_catalog::live::ProviderResolution, broca_catalog::live::ResolutionError> {
     let auth = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Bearer("test-key".into()),
         pause: None,
         selection: None,
@@ -877,6 +880,7 @@ async fn a_non_chat_catalog_model_is_refused_at_admission() {
     let _catalog = install_catalog(cache);
 
     let auth = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Bearer("test-key".into()),
         pause: None,
         selection: None,
@@ -942,6 +946,7 @@ fn resolve_variant_revision(
     requested: Option<&str>,
 ) -> Result<broca_catalog::live::ProviderResolution, broca_catalog::live::ResolutionError> {
     let auth = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Bearer("test-oauth-token".into()),
         pause: None,
         selection: None,
@@ -1209,6 +1214,7 @@ fn resolve_chatgpt_episode(
         ..Default::default()
     };
     let auth = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Secret("chatgpt-test-token".into()),
         pause: None,
         selection: None,
@@ -1452,6 +1458,7 @@ fn resolve_declared_route(
         ..Default::default()
     };
     let auth = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Secret("declared-test-token".into()),
         pause: None,
         selection: None,

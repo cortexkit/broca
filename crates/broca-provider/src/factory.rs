@@ -87,6 +87,9 @@ pub struct ProviderOptions {
     /// The resolved auth method token, not the HTTP authorization scheme: API keys and OAuth
     /// tokens can both use Bearer, but a subscription limit is not prepaid credit exhaustion.
     pub auth_method: Option<String>,
+    /// The hosts the credential's vault record lists; every request carrying the credential
+    /// must go to one (see [`crate::credential_hosts`]).
+    pub credential_hosts: crate::credential_hosts::CredentialHosts,
 }
 
 /// Build a live provider with the resolved credential's method and account context.
@@ -132,6 +135,7 @@ fn boxed_provider<F: WireFamily + 'static>(
         frozen_account_ref,
         served_account_ref,
         auth_method,
+        credential_hosts,
     } = options;
     let provider = match client {
         Some(client) => LiveProvider::with_client_and_clock(client, family, frozen, auth, clock),
@@ -141,6 +145,7 @@ fn boxed_provider<F: WireFamily + 'static>(
         .with_temperature_policy(temperature_policy)
         .with_quota_observer(quota_observer)
         .with_account_refs(frozen_account_ref, served_account_ref)
+        .with_credential_hosts(credential_hosts)
         .with_auth_method(auth_method.as_deref());
     match refresher {
         Some(refresher) => Box::new(provider.with_credential_refresher(refresher)),

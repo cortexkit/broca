@@ -417,6 +417,7 @@ fn resolve_for_test(
             "eyJhbGciOiJub25lIn0.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiAiYWNjdC10ZXN0In0.sig".into(),
         ),
         &broca_catalog::live::ResolveOptions {
+            credential_hosts: Default::default(),
             tool_name_aliases: None,
             media: false,
             media_profile: None,
@@ -450,6 +451,7 @@ fn resolve_for_test(
 fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
     let _catalog = install_test_catalog();
     let options = broca_catalog::live::ResolveOptions {
+        credential_hosts: Default::default(),
         tool_name_aliases: None,
         media: false,
         media_profile: None,
@@ -473,6 +475,7 @@ fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
         quota_observer: None,
     };
     let paused = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::None,
         pause: Some(ProviderError {
             provider_details: None,
@@ -524,6 +527,7 @@ fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
         ..options.clone()
     };
     let repaired = AuthResolution {
+        credential_hosts: Default::default(),
         mode: AuthMode::Secret("repaired-chatgpt-token".into()),
         pause: None,
         selection: paused.selection.clone(),
@@ -591,6 +595,7 @@ fn generic_methods_keep_catalog_family_render_bytes() {
 #[test]
 fn vault_success_proceeds_with_secret() {
     let token = VaultToken {
+        hosts: Some(vec!["127.0.0.1".into(), "localhost".into()]),
         token: "tok-123".into(),
         expires_at_ms: Some(1),
         record_version: 1,
@@ -690,6 +695,7 @@ fn an_unsatisfiable_ttl_demand_fails_admission_permanently() {
 
 fn cached_token(expires_at_ms: Option<i64>) -> VaultToken {
     VaultToken {
+        hosts: Some(vec!["127.0.0.1".into(), "localhost".into()]),
         token: "secret-token".into(),
         expires_at_ms,
         record_version: 7,
@@ -799,6 +805,7 @@ fn an_authoritative_negative_evicts_so_an_outage_cannot_resurrect_it() {
         cache.insert(
             "apikey:openai".to_string(),
             VaultToken {
+                hosts: Some(vec!["127.0.0.1".into(), "localhost".into()]),
                 token: "cached-key".into(),
                 // No expiry: an API key. Nothing times this out on its own.
                 expires_at_ms: None,
@@ -848,6 +855,7 @@ fn a_request_shaped_refusal_does_not_evict_a_good_token() {
         cache.insert(
             "apikey:openai".to_string(),
             VaultToken {
+                hosts: Some(vec!["127.0.0.1".into(), "localhost".into()]),
                 token: "cached-key".into(),
                 expires_at_ms: None,
                 record_version: 1,

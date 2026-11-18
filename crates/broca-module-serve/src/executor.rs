@@ -121,6 +121,9 @@ pub struct AuthResolution {
     /// How this run gets a fresh token for its credential after a mid-run 401. Present when
     /// the vault served a token; `None` keeps a 401 pausing the run straight away.
     pub in_run_refresh: Option<InRunRefresh>,
+    /// The hosts the vault listed with the credential. Every request carrying it must go to
+    /// one of them; empty (none listed, or no credential) admits no host for a credential.
+    pub credential_hosts: broca_provider::credential_hosts::CredentialHosts,
 }
 
 /// A run's in-step token refresh, plus the record_version of the token the run is using
@@ -297,6 +300,9 @@ impl SecretRefresher for VaultTokenRefresher {
                             reason: Some(broca_protocol::CredentialRefresh::REASON_REJECTED.into()),
                         },
                         account_ref: token.account_id,
+                        hosts: broca_provider::credential_hosts::CredentialHosts::from_record(
+                            token.hosts.as_deref(),
+                        ),
                         secret: token.token,
                     })
                 }
@@ -384,6 +390,9 @@ impl SecretRefresher for VaultTokenRefresher {
                             reason: Some(broca_protocol::CredentialRefresh::REASON_EXPIRING.into()),
                         },
                         account_ref: token.account_id,
+                        hosts: broca_provider::credential_hosts::CredentialHosts::from_record(
+                            token.hosts.as_deref(),
+                        ),
                         secret: token.token,
                     })
                 }
@@ -2490,6 +2499,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 account_id: None,
                 record_version: None,
                 in_run_refresh: None,
+                credential_hosts: Default::default(),
             }
         } else {
             let recorded_resolved_id = if fresh_episode {
@@ -2754,6 +2764,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 .in_run_refresh
                 .as_ref()
                 .map(|refresh| refresh.refresher.clone()),
+            credential_hosts: resolution.credential_hosts.clone(),
             structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
             // Off unless an operator turned it on; a resume keeps its recorded value.
             anthropic_server_side_fallback: self.anthropic_fallbacks.server_side,
@@ -3744,6 +3755,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 account_id: None,
                 record_version: None,
                 in_run_refresh: None,
+                credential_hosts: Default::default(),
             });
         }
         let vault = self.vault.as_ref().ok_or_else(|| {
@@ -3965,6 +3977,12 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         });
         // A scoped not_found keeps not_found's class (a permanent admission failure) but
         // says what it can mean; see `scoped_not_found_message`.
+        let credential_hosts = broca_provider::credential_hosts::CredentialHosts::from_record(
+            outcome
+                .as_ref()
+                .ok()
+                .and_then(|token| token.hosts.as_deref()),
+        );
         let decision = match &outcome {
             Err(VaultError::NotFound) => {
                 AuthDecision::FailAdmission(broca_module_serve::scoped_not_found_message(
@@ -3993,6 +4011,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 account_id,
                 record_version,
                 in_run_refresh: None,
+                credential_hosts: Default::default(),
             }),
             AuthDecision::Proceed(mode) => Ok(AuthResolution {
                 mode,
@@ -4003,6 +4022,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 account_id,
                 record_version,
                 in_run_refresh,
+                credential_hosts,
             }),
             AuthDecision::FailAdmission(msg) => Err(RunError::Config(msg)),
             AuthDecision::FailAdmissionTransient(msg) => Err(RunError::Transient(msg)),
@@ -4507,6 +4527,7 @@ impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
             &config.model.model_id,
             frozen,
             &resolution.mode,
+            &resolution.credential_hosts,
             resolution.method,
             selection.and_then(|selection| selection.account_ref.as_deref()),
             resolution.account_id.as_deref(),

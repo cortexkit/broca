@@ -449,6 +449,7 @@ fn credential(
         Refresh::Fresh => ("fresh-token", "account"),
     };
     Some(crate::credential_refresh::RefreshedCredential {
+        hosts: Default::default(),
         auth: auth(token, account),
         account_ref: Some(account.into()),
         evidence: CredentialRefresh {
@@ -527,6 +528,7 @@ pub(super) fn recovery(case: &Case) -> Option<StepAuthRecovery<'static>> {
                     pre_calls: AtomicUsize::new(0),
                 }),
                 current: Arc::new(std::sync::RwLock::new(ServedAuth {
+                    hosts: Default::default(),
                     definite_auth_failure: None,
                     auth_refreshed: false,
                     revision: 0,

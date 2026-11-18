@@ -254,6 +254,9 @@ pub struct VaultToken {
     pub account_id: Option<String>,
     /// The vault's independent witness of which credential the handle resolved to.
     pub resolved_credential_id: Option<String>,
+    /// The hosts the credential's record lists (exact host names); `None` when the record has
+    /// no host fact. A request carrying the token may go only to one of them.
+    pub hosts: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for VaultToken {
@@ -428,6 +431,10 @@ enum GetOutcome {
         // is available, not evidence of drift or a malformed reply.
         #[serde(default)]
         credential_id: Option<String>,
+        // The hosts this credential may be sent to, top-level on the same reply as the token.
+        // Absent when the record has no host fact, which admits no host.
+        #[serde(default)]
+        hosts: Option<Vec<String>>,
     },
     AppError {
         error: ReadError,
@@ -484,6 +491,7 @@ fn decode_get_reply(body: &serde_json::Value) -> Result<VaultToken, VaultError> 
             project_id,
             account_id,
             credential_id,
+            hosts,
         } => {
             let token = String::from_utf8(payload).map_err(|_| {
                 VaultError::Protocol("credential payload is not valid UTF-8".to_string())
@@ -500,6 +508,7 @@ fn decode_get_reply(body: &serde_json::Value) -> Result<VaultToken, VaultError> 
                 // Empty ids carry no witness either; preserve non-empty ids verbatim,
                 // but normalize empty spellings just like account_id above.
                 resolved_credential_id: credential_id.filter(|value| !value.trim().is_empty()),
+                hosts,
             })
         }
         GetOutcome::AppError { error } => Err(error.code.into_error()),
@@ -2441,6 +2450,7 @@ mod tests {
     fn vault_token_debug_redacts_secret() {
         let secret = "vault-secret-literal";
         let token = VaultToken {
+            hosts: None,
             token: secret.to_string(),
             expires_at_ms: Some(1234),
             record_version: 7,
@@ -2482,6 +2492,7 @@ mod tests {
         assert_eq!(
             got,
             VaultToken {
+                hosts: None,
                 token: "tok".to_string(),
                 expires_at_ms: Some(1234),
                 record_version: 7,

@@ -32,11 +32,15 @@ async fn source_warm_disables_server_fallback_without_changing_cached_prefix() {
             }],
         )]);
         let base = AnthropicMessages.render(&frozen, &opts);
+        // A credential whose record lists Anthropic's host, as a real vault login does.
         let provider = LiveProvider::new(
             AnthropicMessages,
             frozen.clone(),
             AuthHandle::Bearer("token".into()),
-        );
+        )
+        .with_credential_hosts(crate::credential_hosts::CredentialHosts::from_record(Some(
+            &["api.anthropic.com".to_owned()],
+        )));
         let (warm, _) = provider.prepare_warm_request(&base, None).unwrap();
         let base_fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
             serde_json::from_slice(&base).unwrap();

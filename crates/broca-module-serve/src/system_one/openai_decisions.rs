@@ -395,6 +395,9 @@ impl ClassifierProvider for OpenAiDecisions {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
         if let Some(secret) = &secret {
+            if let Some(refused) = secret.refuse_endpoint(self.endpoint.as_str()) {
+                return ProviderReply::Credential(refused);
+            }
             call = call.bearer_auth(&secret.token);
         }
         let attempt = async {

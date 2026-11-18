@@ -20,6 +20,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use broca_protocol::CredentialRefresh;
 
+use crate::credential_hosts::CredentialHosts;
 use crate::wire::AuthHandle;
 
 /// A rejected-token read must not confuse definite sign-in loss with an unavailable source.
@@ -80,6 +81,8 @@ pub struct RefreshedSecret {
     pub evidence: CredentialRefresh,
     /// Vault-parsed account belonging to this token; absent for accountless credentials.
     pub account_ref: Option<String>,
+    /// The hosts the vault listed with this token, which the next request must go to.
+    pub hosts: CredentialHosts,
 }
 
 /// A fresh, already-shaped credential for the run's frozen credential.
@@ -88,6 +91,8 @@ pub struct RefreshedCredential {
     pub evidence: CredentialRefresh,
     /// Vault-parsed account belonging to this token; absent for accountless credentials.
     pub account_ref: Option<String>,
+    /// The hosts the vault listed with this token, which the next request must go to.
+    pub hosts: CredentialHosts,
 }
 
 /// A credential source that can force-refresh the token of the ONE credential a run was
@@ -167,6 +172,7 @@ where
             auth: (self.shape)(refreshed.secret),
             evidence: refreshed.evidence,
             account_ref: refreshed.account_ref,
+            hosts: refreshed.hosts,
         }
     }
 }

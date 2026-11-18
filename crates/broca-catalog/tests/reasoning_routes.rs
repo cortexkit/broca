@@ -272,6 +272,10 @@ fn recorded_bedrock_and_meta_configs_rebuild_without_adopting_new_policy() {
             "model",
             frozen,
             &AuthMode::Secret("not-a-real-key".into()),
+            &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                "127.0.0.1".to_owned(),
+                "localhost".to_owned(),
+            ])),
             Some(AuthMethod::ApiKey),
             None,
             None,
@@ -348,6 +352,10 @@ fn old_chat_run_resumes_byte_identically() {
             model,
             recorded,
             &AuthMode::Secret("not-a-real-key".into()),
+            &broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+                "127.0.0.1".to_owned(),
+                "localhost".to_owned(),
+            ])),
             Some(AuthMethod::ApiKey),
             None,
             None,

@@ -581,6 +581,7 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "expires_at_ms": null,
                         "record_version": 1,
                         "credential_id": id,
+                        "hosts": ["127.0.0.1", "localhost"],
                     });
                     if let Some(account_id) = self.account_ids.lock().unwrap().get(id) {
                         reply["account_id"] = json!(account_id);

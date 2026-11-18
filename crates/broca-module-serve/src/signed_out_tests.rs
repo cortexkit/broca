@@ -99,7 +99,8 @@ fn needs_reauth() -> Value {
 
 fn token(account: &str, expiring: bool) -> Value {
     json!({"result":{"payload":stand_in_token(1).into_bytes(),"record_version":1,
-        "account_id":account,"expires_at_ms":expiring.then(|| now_ms() + 120_000)}})
+        "account_id":account,"expires_at_ms":expiring.then(|| now_ms() + 120_000),
+        "hosts":["127.0.0.1", "localhost"]}})
 }
 
 type StoreSession = Session<&'static MemoryBackend>;

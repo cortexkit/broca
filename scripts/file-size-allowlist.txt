@@ -2,7 +2,7 @@
 # each had when the limit began, which it may not grow past. scripts/check-file-sizes.sh reads
 # this file. Lower or drop an entry when its file shrinks.
 15626 crates/broca-core/src/run.rs the run loop of the WAL runner the session store replaced; deleted with the WAL code
-15109 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
+14890 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
 11241 crates/broca-module-serve/src/serve.rs every route's handler; split by op family
 5276 crates/broca-subc/src/connection.rs subc connection and tool calls; split route opens, calls and yields
 8411 crates/broca-core/src/wal_writer.rs the WAL's writer (the write-ahead log the session store replaced); deleted with the WAL code

@@ -18,6 +18,18 @@ pub struct ProviderSecret {
     pub account_id: Option<String>,
     /// The vault's resolved pin, when returned; never a bearer secret.
     pub auth_selection: Option<String>,
+    /// The hosts the vault listed with the token; a request carrying it goes only to one.
+    pub hosts: broca_provider::credential_hosts::CredentialHosts,
+}
+
+impl ProviderSecret {
+    /// The refusal message when `endpoint` is not a host this credential's record lists.
+    pub fn refuse_endpoint(&self, endpoint: &str) -> Option<String> {
+        self.hosts
+            .check_url(endpoint)
+            .err()
+            .map(|error| error.message)
+    }
 }
 
 impl std::fmt::Debug for ProviderSecret {
@@ -46,6 +58,7 @@ pub trait CredentialSource: Send + Sync {
             token,
             account_id: None,
             auth_selection: self.credential_id(),
+            hosts: Default::default(),
         }))
     }
 }
@@ -112,6 +125,9 @@ impl CredentialSource for VaultCredential {
                     auth_selection: token
                         .resolved_credential_id
                         .or_else(|| Some(vault_id.clone())),
+                    hosts: broca_provider::credential_hosts::CredentialHosts::from_record(
+                        token.hosts.as_deref(),
+                    ),
                 })
             })
             .map_err(|error| error.to_string())

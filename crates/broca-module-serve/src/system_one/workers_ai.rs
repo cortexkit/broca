@@ -202,9 +202,9 @@ impl ClassifierProvider for WorkersAi {
         };
         let auth_selection = secret.as_ref().and_then(|s| s.auth_selection.clone());
         let account_ref = secret.as_ref().and_then(|s| s.account_id.clone());
-        let (token, account_id) = match secret {
+        let (token, account_id, hosts) = match secret {
             Some(secret) => match secret.account_id {
-                Some(account_id) => (Some(secret.token), account_id),
+                Some(account_id) => (Some(secret.token), account_id, Some(secret.hosts)),
                 None => {
                     return ProviderReply::Credential(format!(
                         "the credential {} carries no Cloudflare account id",
@@ -214,12 +214,15 @@ impl ClassifierProvider for WorkersAi {
                     ))
                 }
             },
-            None => (None, NO_CREDENTIAL_ACCOUNT.to_owned()),
+            None => (None, NO_CREDENTIAL_ACCOUNT.to_owned(), None),
         };
         let endpoint = match self.endpoint_for(&account_id) {
             Ok(endpoint) => endpoint,
             Err(message) => return ProviderReply::Credential(message),
         };
+        if let Some(Err(refused)) = hosts.map(|hosts| hosts.check_url(endpoint.as_str())) {
+            return ProviderReply::Credential(refused.message);
+        }
         let mut request = self
             .http
             .post(endpoint)

@@ -930,6 +930,7 @@ mod gated {
             let next = self.replies.lock().unwrap().pop_front().flatten();
             Box::pin(async move {
                 next.map(|auth| RefreshedCredential {
+                    hosts: Default::default(),
                     account_ref: self.account_ref.clone(),
                     auth,
                     evidence: refresh_evidence(),
@@ -949,6 +950,7 @@ mod gated {
             let next = self.expiring.lock().unwrap().pop_front().flatten();
             Box::pin(async move {
                 next.map(|auth| RefreshedCredential {
+                    hosts: Default::default(),
                     account_ref: self.account_ref.clone(),
                     auth,
                     evidence: expiring_evidence(),

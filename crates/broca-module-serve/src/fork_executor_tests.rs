@@ -94,6 +94,7 @@ fn fork_job(root: &std::path::Path, url: &str) -> ForkCallJob {
         "claude-test",
         frozen,
         &AuthMode::Secret("stand-in-token".into()),
+        &Default::default(),
         Some(AuthMethod::ApiKey),
         Some("head-account"),
         None,

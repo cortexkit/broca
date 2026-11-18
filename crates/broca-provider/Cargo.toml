@@ -15,6 +15,10 @@ required-features = ["live"]
 test-attachments = ["broca-core/test-attachments"]
 # E2E-only virtual retry waits; keeps transport retry decisions real without waiting out backoff.
 test-harness = []
+# Real-daemon rigs only: a credential may also be sent to the local machine, where the rigs'
+# stand-in providers listen. A sign-in's vault record lists only its provider's real host, which
+# a rig can't change. Release builds never turn this on.
+test-loopback-credentials = []
 # Exhaustive in-process power-loss matrix. Linux preflight runs libtest on 16 cores;
 # native release lanes leave this feature off.
 portable-power-loss = ["live", "test-harness"]

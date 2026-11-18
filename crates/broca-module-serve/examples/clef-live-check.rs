@@ -209,6 +209,9 @@ async fn fetch_secret(args: &Args, handle: &str) -> Result<ProviderSecret, Strin
         token: token.token,
         account_id: token.account_id,
         auth_selection: token.resolved_credential_id,
+        hosts: broca_provider::credential_hosts::CredentialHosts::from_record(
+            token.hosts.as_deref(),
+        ),
     })
 }
 

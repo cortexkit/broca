@@ -460,7 +460,9 @@ async fn serve_capturing_vault(
                         "payload": secret.into_bytes(),
                         "expires_at_ms": expires_at_ms,
                         "record_version": version.max(1),
-                        "account_id": account_id
+                        "account_id": account_id,
+                        // The stand-in providers listen on the loopback.
+                        "hosts": ["127.0.0.1", "localhost"]
                     }})
                 };
                 let now_ms = std::time::SystemTime::now()
@@ -880,6 +882,7 @@ async fn a_refused_vault_route_served_from_cache_records_no_request() {
     vault.cache.insert(
         "apikey:deepseek".to_string(),
         VaultToken {
+            hosts: None,
             token: "cached-token".into(),
             expires_at_ms: None,
             record_version: 3,

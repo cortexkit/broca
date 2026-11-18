@@ -476,7 +476,7 @@ impl Vault {
                     .find(|row| row["id"] == request["params"]["credential_id"])
                     .ok_or_else(|| HarnessError::new("fixture credential not found"))?;
                 let mut reply = json!({"result":{"payload":credential_payload(row["id"].as_str().unwrap()),
-                    "expires_at_ms":null,"record_version":1,"credential_id":row["id"],"account_id":row["account_id"]}});
+                    "expires_at_ms":null,"record_version":1,"credential_id":row["id"],"account_id":row["account_id"],"hosts":["127.0.0.1", "localhost"]}});
                 // A Code Assist sign-in carries the Google Cloud project its requests name.
                 if row["auth_method"] == "antigravity" {
                     reply["result"]["project_id"] = json!("fixture-project");

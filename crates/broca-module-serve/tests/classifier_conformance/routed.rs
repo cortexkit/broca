@@ -546,7 +546,7 @@ impl Vault {
                     ACCOUNTS.contains(&id),
                     "vault asked for {id}; accounts {ACCOUNTS:?}"
                 );
-                json!({"payload":format!("synthetic-classifier-key-{id}").as_bytes(),"expires_at_ms":null,"record_version":1,"credential_id":id,"account_id":null})
+                json!({"payload":format!("synthetic-classifier-key-{id}").as_bytes(),"expires_at_ms":null,"record_version":1,"credential_id":id,"account_id":null,"hosts":["127.0.0.1", "localhost"]})
             }
             method => panic!("unsupported classifier vault method {method}"),
         }

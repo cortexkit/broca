@@ -22,6 +22,7 @@ pub mod chatgpt_wire;
 pub mod claude_code_persona;
 mod codex_retry_after;
 pub mod conformance;
+pub mod credential_hosts;
 pub mod credential_refresh;
 pub mod families;
 pub mod hash;

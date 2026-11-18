@@ -223,8 +223,18 @@ impl CredentialSource for Vaulted {
             token: TOKEN.to_owned(),
             account_id: self.account_id.clone(),
             auth_selection: Some(format!("{CREDENTIAL_ID}:resolved")),
+            hosts: loopback_hosts(),
         }))
     }
+}
+
+/// The stand-in Cloudflare server listens on the loopback, so the test credential's record
+/// lists it, as a real record lists the provider's own host.
+fn loopback_hosts() -> broca_provider::credential_hosts::CredentialHosts {
+    broca_provider::credential_hosts::CredentialHosts::from_record(Some(&[
+        "127.0.0.1".to_owned(),
+        "localhost".to_owned(),
+    ]))
 }
 
 struct Rows(HashMap<String, ModelBatchRow>);
@@ -691,6 +701,7 @@ async fn a_credential_without_a_usable_account_id_sends_nothing() {
         token: TOKEN.into(),
         account_id: Some(ACCOUNT.into()),
         auth_selection: Some(CREDENTIAL_ID.into()),
+        hosts: loopback_hosts(),
     };
     let shown = format!("{secret:?}");
     assert!(

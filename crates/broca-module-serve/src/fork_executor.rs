@@ -173,6 +173,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
             &config.model.model_id,
             frozen,
             &resolution.mode,
+            &resolution.credential_hosts,
             resolution.method,
             selection.and_then(|selection| selection.account_ref.as_deref()),
             resolution.account_id.as_deref(),

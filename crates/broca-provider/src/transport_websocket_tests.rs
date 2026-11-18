@@ -2308,6 +2308,7 @@ fn fresh_credential(
     reason: &str,
 ) -> crate::credential_refresh::RefreshedCredential {
     crate::credential_refresh::RefreshedCredential {
+        hosts: Default::default(),
         auth: AuthHandle::Headers(vec![
             ("authorization".into(), format!("Bearer {token}")),
             ("chatgpt-account-id".into(), account.into()),

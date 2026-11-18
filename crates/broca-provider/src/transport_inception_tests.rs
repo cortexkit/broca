@@ -47,7 +47,11 @@ async fn run_refusal(host: &str, status: u16, body: &'static str) -> RefusalRun 
         frozen,
         AuthHandle::Bearer("test-key".into()),
         broca_core::Clock::default(),
-    );
+    )
+    // The key's record lists the production host the request names.
+    .with_credential_hosts(crate::credential_hosts::CredentialHosts::from_record(Some(&[
+        host.to_owned(),
+    ])));
     provider.retry_clock.virtual_waits = Some(Arc::clone(&waits));
     let dir = broca_test_support::scratch_root().join(format!(
         "inception-refusal-{host}-{status}-{}",

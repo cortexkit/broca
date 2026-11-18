@@ -72,6 +72,7 @@ mod tests {
             project_id: None,
             account_id: account_id.map(str::to_owned),
             resolved_credential_id: Some("oauth:anthropic".into()),
+            hosts: None,
         }
     }
 
