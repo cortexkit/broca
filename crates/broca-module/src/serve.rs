@@ -49,6 +49,8 @@ pub struct SessionReadRequest {
     pub max_bytes: Option<u64>,
     /// `blocks` exposes stored media; `descriptors` serves payload refs and content identities.
     pub media: cortexkit_role_llm_runner::read::MediaMode,
+    /// `tool_media: "refs"` on a `media_refs` read: tool results with media keep their parts.
+    pub tool_media: bool,
 }
 
 impl SessionReadRequest {
@@ -68,6 +70,7 @@ impl SessionReadRequest {
             lineage_id: None,
             max_bytes: None,
             media: cortexkit_role_llm_runner::read::MediaMode::Inline,
+            tool_media: false,
         }
     }
 }
@@ -461,6 +464,7 @@ pub use broca_wire::{
 pub(crate) fn apply_media_mode(
     response: &mut SessionReadResponse,
     media: cortexkit_role_llm_runner::read::MediaMode,
+    tool_media: bool,
     session: &str,
 ) -> Result<(), ServeError> {
     if media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
@@ -470,7 +474,11 @@ pub(crate) fn apply_media_mode(
     }
     if media == cortexkit_role_llm_runner::read::MediaMode::MediaRefs {
         for entry in &mut response.messages {
-            entry.show_media_refs();
+            if tool_media {
+                entry.show_media_refs_with_tool_media();
+            } else {
+                entry.show_media_refs();
+            }
         }
     }
     if media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {

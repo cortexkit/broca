@@ -3213,6 +3213,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::MediaOnlySend,
             Capability::MessageMarks,
             Capability::MediaRefs,
+            Capability::ToolMediaRefs,
         ]);
         capabilities
     }

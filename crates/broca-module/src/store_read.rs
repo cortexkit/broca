@@ -610,7 +610,12 @@ fn finish(
     req: &crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
     let mut response = answer.response;
-    crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
+    crate::serve::apply_media_mode(
+        &mut response,
+        req.media,
+        req.tool_media,
+        &req.session.session,
+    )?;
     let cap = req
         .max_bytes
         .unwrap_or(broca_wire::READ_DEFAULT_MAX_BYTES)

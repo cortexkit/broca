@@ -1212,6 +1212,28 @@ pub struct ReadParams {
     /// value is refused naming `media`; a model-view read refuses `descriptors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<cortexkit_role_llm_runner::read::MediaMode>,
+    /// `refs` keeps a tool result's structured output on a `media_refs` read, each media part
+    /// served as a reference (see [`SessionReadMessage::show_media_refs_with_tool_media`]).
+    /// Valid only with `media: "media_refs"`; `null` or any other value is refused naming
+    /// `tool_media`, as is its use with another media mode.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "tool_media_refs"
+    )]
+    pub tool_media: Option<cortexkit_role_llm_runner::read::ToolMedia>,
+}
+
+/// `tool_media` as the contract spells it: the string `refs` only, never `null`.
+fn tool_media_refs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<cortexkit_role_llm_runner::read::ToolMedia>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(value) if value == "refs" => {
+            Ok(Some(cortexkit_role_llm_runner::read::ToolMedia::Refs))
+        }
+        _ => Err(serde::de::Error::custom("tool_media must be \"refs\"")),
+    }
 }
 
 /// Wire spelling for a subscribe attach point.
@@ -1514,8 +1536,8 @@ impl SessionReadMessage {
         }
     }
 
-    /// Replace top-level media only. Tool-result text keeps its inline bytes and markers:
-    /// the tool-output contract has no parts form for serving structured media references.
+    /// Replace top-level media only. Tool-result text keeps its inline bytes and markers, as
+    /// a read without `tool_media: "refs"` serves them (see [`Self::show_media_refs_with_tool_media`]).
     pub fn show_media_refs(&mut self) {
         if !self
             .message
@@ -1549,6 +1571,49 @@ impl SessionReadMessage {
             }
         }
         self.identify_content(&stored);
+        self.described = Some(served);
+    }
+
+    /// [`Self::show_media_refs`] for a read with `tool_media: "refs"`: a tool result whose
+    /// stored output holds media keeps its structured `parts` output, each media part served as
+    /// the reference `media: "blocks"` serves, never its bytes. Every other part is served as
+    /// `media_refs` serves it, and a message with no such result is unchanged.
+    pub fn show_media_refs_with_tool_media(&mut self) {
+        let results: Vec<usize> = self
+            .message
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| match part {
+                broca_protocol::ContentBlock::ToolResult(result) => match &result.output {
+                    broca_protocol::ToolOutput::Parts { parts } => parts
+                        .iter()
+                        .any(|part| matches!(part, broca_protocol::ToolOutputPart::Media { .. })),
+                    _ => false,
+                },
+                _ => false,
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.show_media_refs();
+        if results.is_empty() {
+            return;
+        }
+        let blocks = serde_json::to_value(CallerMessage(&self.message, true))
+            .expect("a stored message serializes");
+        let mut served = match self.described.take() {
+            Some(served) => served,
+            None => {
+                let stored =
+                    broca_protocol::caller_message::message_content_identity(&self.message).inline;
+                self.identify_content(&stored);
+                serde_json::to_value(CallerMessage(&self.message, false))
+                    .expect("a stored message serializes")
+            }
+        };
+        for index in results {
+            served["content"][index] = blocks["content"][index].clone();
+        }
         self.described = Some(served);
     }
 
@@ -2519,296 +2584,7 @@ pub enum RunStatusResponse {
 mod run_awaits_tests;
 
 #[cfg(test)]
-mod open_state_tests {
-    use super::{
-        decode_subscribe_event, AccountSelectionRefusedDetail, DisplayEvent, FlowPrincipalRefusal,
-        QueuedSendState, RunPaused, RunPausedDetail, RunStatusResponse, SendResult, SubscribeEvent,
-        UnrecognizedRunState,
-    };
-    use broca_protocol::{ControlUnit, OpenState, PauseReason, RunFinishReason, RunId};
-
-    #[test]
-    fn unknown_run_status_state_decodes_to_a_nonterminal_fallback() {
-        let status: RunStatusResponse =
-            serde_json::from_str(r#"{"state":"future_runner_state","extra":"future field"}"#)
-                .unwrap();
-        assert!(matches!(status, RunStatusResponse::Unknown));
-    }
-
-    #[test]
-    fn run_status_auth_selection_is_optional_and_round_trips() {
-        for state in [
-            "active",
-            "paused",
-            "interrupted",
-            "completed",
-            "max_steps",
-            "cancelled",
-            "error",
-            "transform_unavailable",
-        ] {
-            for selection in [None, Some("apikey:cline-pass")] {
-                let mut wire = serde_json::json!({"state": state});
-                if let Some(selection) = selection {
-                    wire["auth_selection"] = selection.into();
-                }
-                let status: RunStatusResponse = serde_json::from_value(wire).unwrap();
-                let encoded = serde_json::to_value(&status).unwrap();
-                assert_eq!(
-                    encoded.get("auth_selection").and_then(|v| v.as_str()),
-                    selection
-                );
-                assert_eq!(encoded.get("auth_selection").is_some(), selection.is_some());
-                assert_eq!(
-                    serde_json::from_value::<RunStatusResponse>(encoded).unwrap(),
-                    status
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn run_result_auth_selection_is_optional_and_round_trips() {
-        for selection in [None, Some("apikey:cline-pass")] {
-            let mut wire = serde_json::json!({"run_id": "run-1", "state": "error"});
-            if let Some(selection) = selection {
-                wire["auth_selection"] = selection.into();
-            }
-            let result: super::RunResultResponse = serde_json::from_value(wire).unwrap();
-            assert_eq!(result.auth_selection.as_deref(), selection);
-            let encoded = serde_json::to_value(&result).unwrap();
-            assert_eq!(encoded.get("auth_selection").is_some(), selection.is_some());
-            assert_eq!(
-                serde_json::from_value::<super::RunResultResponse>(encoded).unwrap(),
-                result
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_send_state_decodes_without_closing_the_wire_vocabulary() {
-        let result: SendResult = serde_json::from_str(r#"{"state":"future_send_state"}"#).unwrap();
-        assert!(matches!(result, SendResult::Unknown));
-    }
-
-    #[test]
-    fn unknown_queued_send_state_decodes_to_a_non_actionable_fallback() {
-        let state: QueuedSendState =
-            serde_json::from_str(r#"{"state":"future_queue_state"}"#).unwrap();
-        assert_eq!(state, QueuedSendState::Unknown);
-    }
-
-    #[test]
-    fn unknown_pause_and_finish_reasons_decode_as_explicit_unknown_states() {
-        let status: RunStatusResponse =
-            serde_json::from_str(r#"{"state":"paused","pause_reason":"future_pause"}"#).unwrap();
-        let RunStatusResponse::Paused { pause_reason, .. } = &status else {
-            panic!("expected a paused status, got {status:?}");
-        };
-        assert_eq!(
-            pause_reason,
-            &Some(OpenState::Unknown("future_pause".into()))
-        );
-
-        let paused: SendResult = serde_json::from_str(
-            r#"{"state":"paused","run_id":"run-1","pause_reason":"future_pause"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            paused,
-            SendResult::Paused {
-                run_id: "run-1".into(),
-                pause_reason: OpenState::Unknown("future_pause".into()),
-            }
-        );
-
-        let finished: SendResult = serde_json::from_str(
-            r#"{"state":"finished","run_id":"run-1","reason":"future_finish"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            finished,
-            SendResult::Finished {
-                run_id: "run-1".into(),
-                reason: OpenState::Unknown("future_finish".into()),
-            }
-        );
-
-        let refusal: RunPaused = serde_json::from_value(serde_json::json!({
-            "code": "run_paused",
-            "message": "paused",
-            "detail": {"kind": "run_paused", "run_id": "run-1", "reason": "future_pause"}
-        }))
-        .unwrap();
-        assert_eq!(
-            refusal.detail,
-            RunPausedDetail::RunPaused {
-                run_id: "run-1".into(),
-                reason: OpenState::Unknown("future_pause".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn known_pause_and_finish_reasons_keep_their_wire_bytes() {
-        let paused = SendResult::Paused {
-            run_id: "run-1".into(),
-            pause_reason: PauseReason::AuthRequired.into(),
-        };
-        let bytes = r#"{"state":"paused","run_id":"run-1","pause_reason":"auth_required"}"#;
-        assert_eq!(serde_json::to_string(&paused).unwrap(), bytes);
-        assert_eq!(serde_json::from_str::<SendResult>(bytes).unwrap(), paused);
-
-        let finished = SendResult::Finished {
-            run_id: "run-1".into(),
-            reason: RunFinishReason::Completed.into(),
-        };
-        let bytes = r#"{"state":"finished","run_id":"run-1","reason":"completed"}"#;
-        assert_eq!(serde_json::to_string(&finished).unwrap(), bytes);
-        assert_eq!(serde_json::from_str::<SendResult>(bytes).unwrap(), finished);
-
-        let refusal = RunPaused::new("run-1".into(), PauseReason::Restart);
-        let value = serde_json::to_value(&refusal).unwrap();
-        assert_eq!(
-            value["detail"],
-            serde_json::json!({"kind": "run_paused", "run_id": "run-1", "reason": "restart"})
-        );
-    }
-
-    #[test]
-    fn subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states() {
-        let paused: SubscribeEvent = serde_json::from_value(serde_json::json!({
-            "kind": "control",
-            "cursor": {"wal_seq": 7, "sub_index": 1},
-            "unit": {"type": "paused", "run_id": "run-1", "reason": "future_pause"}
-        }))
-        .unwrap();
-        assert_eq!(
-            paused,
-            SubscribeEvent::UnrecognizedRunState {
-                wal_seq: 7,
-                sub_index: 1,
-                state: UnrecognizedRunState::Paused {
-                    run_id: RunId("run-1".into()),
-                    reason: "future_pause".into(),
-                },
-            }
-        );
-
-        let body = br#"{"kind":"control","cursor":{"wal_seq":8,"sub_index":0},"unit":{"type":"run_finished","run_id":"run-1","reason":"future_finish","retries_used":0}}"#;
-        let finished = decode_subscribe_event(body).unwrap();
-        let SubscribeEvent::UnrecognizedRunState { state, .. } = &finished else {
-            panic!("expected an unrecognized run state, got {finished:?}");
-        };
-        assert_eq!(state.run_id(), Some(&RunId("run-1".into())));
-        assert_eq!(state.reason(), "future_finish");
-        assert!(matches!(state, UnrecognizedRunState::Finished { .. }));
-        assert_eq!(
-            serde_json::to_value(&finished).unwrap(),
-            serde_json::json!({
-                "kind": "control",
-                "cursor": {"wal_seq": 8, "sub_index": 0},
-                "unit": {"type": "run_finished", "run_id": "run-1", "reason": "future_finish"}
-            })
-        );
-
-        // A known reason still decodes as the ordinary control unit.
-        let known = decode_subscribe_event(
-            br#"{"kind":"control","cursor":{"wal_seq":9,"sub_index":0},"unit":{"type":"run_finished","run_id":"run-1","reason":"completed"}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            known,
-            SubscribeEvent::Control {
-                unit: ControlUnit::RunFinished {
-                    reason: RunFinishReason::Completed,
-                    ..
-                },
-                ..
-            }
-        ));
-
-        // A pause without the run id it must carry is refused even with an unknown reason, and
-        // a unit with a known reason that fails to decode for another cause is still refused.
-        let malformed = decode_subscribe_event(
-            br#"{"kind":"control","cursor":{"wal_seq":10,"sub_index":0},"unit":{"type":"paused","reason":"future_pause"}}"#,
-        );
-        assert!(malformed.is_err(), "{malformed:?}");
-        let malformed_known = decode_subscribe_event(
-            br#"{"kind":"control","cursor":{"wal_seq":11,"sub_index":0},"unit":{"type":"run_finished","reason":"completed","retries_used":"x"}}"#,
-        );
-        assert!(malformed_known.is_err(), "{malformed_known:?}");
-    }
-
-    #[test]
-    fn unknown_lanes_and_display_reset_while_unknown_control_units_are_named() {
-        let envelope: SubscribeEvent =
-            serde_json::from_str(r#"{"kind":"future_lane_event"}"#).unwrap();
-        assert_eq!(
-            envelope,
-            SubscribeEvent::Display(DisplayEvent::DisplayReset)
-        );
-
-        let display: SubscribeEvent = serde_json::from_value(serde_json::json!({
-            "kind": "display",
-            "event": {"type": "future_display_event", "payload": "ignored"}
-        }))
-        .unwrap();
-        assert_eq!(display, SubscribeEvent::Display(DisplayEvent::DisplayReset));
-
-        let control: SubscribeEvent = serde_json::from_value(serde_json::json!({
-            "kind": "control",
-            "cursor": {"wal_seq": 1, "sub_index": 0},
-            "unit": {"type": "future_control_unit", "payload": "ignored"}
-        }))
-        .unwrap();
-        assert!(matches!(
-            control,
-            SubscribeEvent::UnknownControlUnit {
-                wal_seq: 1,
-                sub_index: 0,
-                unit_type,
-                unit,
-            } if unit_type == "future_control_unit" && unit["payload"] == "ignored"
-        ));
-    }
-
-    #[test]
-    fn refusal_classes_are_open_when_consumers_decode_them() {
-        let mut principal =
-            serde_json::to_value(FlowPrincipalRefusal::new(true, "reserved:agent")).unwrap();
-        principal["class"] = serde_json::json!("future_class");
-        let principal: FlowPrincipalRefusal = serde_json::from_value(principal).unwrap();
-        assert_eq!(
-            serde_json::to_value(&principal).unwrap()["class"],
-            "future_class"
-        );
-
-        let account: AccountSelectionRefusedDetail = serde_json::from_value(serde_json::json!({
-            "routing_code": "account_pool_exhausted",
-            "class": "future_class"
-        }))
-        .unwrap();
-        assert_eq!(account.class.as_str(), "future_class");
-    }
-
-    #[test]
-    fn run_status_error_keeps_an_unrecognized_provider_class() {
-        let status: RunStatusResponse = serde_json::from_value(serde_json::json!({
-            "state": "error",
-            "error": {"class": "future_class", "message": "new provider outcome"}
-        }))
-        .unwrap();
-        let RunStatusResponse::Error {
-            error: Some(error), ..
-        } = status
-        else {
-            panic!("expected the error status")
-        };
-        assert_eq!(error.class_wire(), "future_class");
-        assert!(error.has_unknown_class());
-    }
-}
+mod open_state_tests;
 
 impl RunStatusResponse {
     /// The run's recorded title, when the reply carries one.
@@ -6508,6 +6284,35 @@ mod caller_message_tests {
             serde_json::to_vec(&media_tool_result).unwrap(),
             inline_bytes
         );
+        // With `tool_media: "refs"` the media-bearing result keeps its parts, its media served
+        // as blocks serves it; the text-only result and every other part are as media_refs.
+        let mut tool_refs = original.clone();
+        tool_refs.show_media_refs_with_tool_media();
+        assert_eq!(tool_refs.message, original.message);
+        let tool_refs = serde_json::to_value(tool_refs).unwrap();
+        let mut expected_tool = refs["message"].clone();
+        expected_tool["content"][3] = blocks["message"]["content"][3].clone();
+        assert_eq!(tool_refs["message"], expected_tool);
+        assert_eq!(
+            tool_refs["message"]["content"][3]["output"]["parts"][1]["media"],
+            json!({"kind":"image","mime":"image/png","byte_size":69,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640","width":1,"height":1}),
+            "{tool_refs}"
+        );
+        assert_eq!(tool_refs["digest"], blocks["digest"]);
+        assert_eq!(tool_refs["part_digests"], blocks["part_digests"]);
+        // A message whose only media is in a tool result is identified as well.
+        let mut lone = read_message(vec![original.message.content[3].clone()]);
+        lone.show_media_refs_with_tool_media();
+        let lone = serde_json::to_value(lone).unwrap();
+        let mut lone_blocks = read_message(vec![original.message.content[3].clone()]);
+        lone_blocks.show_media_blocks_with_identity();
+        let lone_blocks = serde_json::to_value(lone_blocks).unwrap();
+        assert_eq!(lone["message"], lone_blocks["message"]);
+        assert_eq!(lone["digest"], lone_blocks["digest"]);
+        // Without media in any tool result the bytes are media_refs' bytes.
+        let mut plain = read_message(vec![original.message.content[4].clone()]);
+        plain.show_media_refs_with_tool_media();
+        assert_eq!(serde_json::to_vec(&plain).unwrap(), default_bytes);
         let mut descriptors = original;
         descriptors.describe().unwrap();
         let descriptors = serde_json::to_value(descriptors).unwrap();

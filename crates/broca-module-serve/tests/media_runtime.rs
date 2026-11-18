@@ -306,9 +306,40 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         "{}",
         String::from_utf8_lossy(&refs_frame.body)
     );
+    // With `tool_media: "refs"` the tool result keeps its parts, its image served as the
+    // reference blocks serves, never its bytes.
+    let tool_refs_frame = call(
+        &mut rig,
+        "session.read",
+        json!({"media":"media_refs","tool_media":"refs"}),
+    )
+    .await;
+    let tool_refs = result(&tool_refs_frame);
+    assert_eq!(output(&tool_refs), output(&blocks), "{tool_refs}");
+    assert!(!tool_refs.to_string().contains(&STANDARD.encode(PNG)));
+    // The member rides only on a media_refs read, and only as `refs`.
+    for params in [
+        json!({"tool_media":"refs"}),
+        json!({"media":"blocks","tool_media":"refs"}),
+        json!({"media":"media_refs","tool_media":null}),
+        json!({"media":"media_refs","tool_media":"inline"}),
+    ] {
+        let refused = call(&mut rig, "session.read", params.clone()).await;
+        let body: Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(
+            (body["code"].as_str(), body["detail"]["field"].as_str()),
+            (Some("invalid_params"), Some("tool_media")),
+            "{params}: {body}"
+        );
+    }
     if accepts_images {
         sample("tool-image", "session-read-default", &[inline_frame]);
         sample("tool-image", "session-read-media-refs", &[refs_frame]);
+        sample(
+            "tool-image",
+            "session-read-tool-media-refs",
+            &[tool_refs_frame],
+        );
         sample("tool-image", "session-read-blocks", &[blocks_frame]);
         sample("tool-image", "session-media-read", &[media_frame]);
     }
