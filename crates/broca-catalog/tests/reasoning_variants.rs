@@ -351,6 +351,22 @@ mod gated {
         );
     }
 
+    /// A fresh run on OpenAI's own Responses API sends its system prompt as a leading developer
+    /// message, which GPT-6.2 caches; a ChatGPT run keeps its own Codex shape.
+    #[test]
+    fn a_fresh_openai_api_key_run_sends_its_system_prompt_as_a_developer_message() {
+        let frozen = resolved("openai/gpt-5.6-luna", AuthMethod::ApiKey, None);
+        assert_eq!(
+            frozen.system_prompt,
+            broca_provider::policy::SystemPromptPolicy::DeveloperMessage
+        );
+        let chatgpt = resolved("openai/gpt-5.6-luna", AuthMethod::Chatgpt, None);
+        assert_eq!(
+            chatgpt.system_prompt,
+            broca_provider::policy::SystemPromptPolicy::InstructionsField
+        );
+    }
+
     /// A run that names no variant sends the effort the catalog documents as the vendor's
     /// default (`capability.reasoning_default`), as if it had named it, on the OpenAI families.
     /// A named variant wins. A default the row's options don't offer sends nothing, and so does

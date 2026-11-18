@@ -1429,6 +1429,13 @@ fn resolve_provider_inner(
     if let Some(base_url) = catalog_base_url {
         frozen.base_url = Some(catalog_override_base_url(base_url, family));
     }
+    // GPT-6.2 never caches a Responses request's top-level `instructions`, so a fresh run on
+    // OpenAI's own API sends the system prompt as a leading developer message instead. Other
+    // providers on the Responses wire keep `instructions`: nobody has checked that they accept
+    // a developer message. A resumed run keeps the policy it froze.
+    if family == WireFamilyId::OpenAiResponses && provider_id == "openai" {
+        frozen.system_prompt = SystemPromptPolicy::DeveloperMessage;
+    }
     let auth_kind = provider_route_auth_kind(provider_id, family, &provider_spec.auth_kind);
     let (handle, auth_desc, auth_method) =
         resolve_auth(auth, &auth_kind, provider_id, opts.auth_method)?;
