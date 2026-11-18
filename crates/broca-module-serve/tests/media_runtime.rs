@@ -317,6 +317,26 @@ async fn tool_png_on_next_request(accepts_images: bool) {
     let tool_refs = result(&tool_refs_frame);
     assert_eq!(output(&tool_refs), output(&blocks), "{tool_refs}");
     assert!(!tool_refs.to_string().contains(&STANDARD.encode(PNG)));
+    // Only the tool outputs change: every other member of the page, the messages' content
+    // identities included, is the media_refs read's.
+    let without_outputs = |mut page: Value| {
+        for message in page["messages"].as_array_mut().into_iter().flatten() {
+            for part in message["message"]["content"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                if part["type"] == "tool_result" {
+                    part["output"] = Value::Null;
+                }
+            }
+        }
+        page
+    };
+    assert_eq!(
+        without_outputs(tool_refs.clone()),
+        without_outputs(result(&refs_frame))
+    );
     // The member rides only on a media_refs read, and only as `refs`.
     for params in [
         json!({"tool_media":"refs"}),

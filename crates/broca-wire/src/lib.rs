@@ -1576,8 +1576,9 @@ impl SessionReadMessage {
 
     /// [`Self::show_media_refs`] for a read with `tool_media: "refs"`: a tool result whose
     /// stored output holds media keeps its structured `parts` output, each media part served as
-    /// the reference `media: "blocks"` serves, never its bytes. Every other part is served as
-    /// `media_refs` serves it, and a message with no such result is unchanged.
+    /// the reference `media: "blocks"` serves, never its bytes. Everything outside those outputs,
+    /// the content identities included, is what `media_refs` serves without the opt-in, so a
+    /// message whose only media sits in tool results gets no identity it would otherwise lack.
     pub fn show_media_refs_with_tool_media(&mut self) {
         let results: Vec<usize> = self
             .message
@@ -1603,13 +1604,8 @@ impl SessionReadMessage {
             .expect("a stored message serializes");
         let mut served = match self.described.take() {
             Some(served) => served,
-            None => {
-                let stored =
-                    broca_protocol::caller_message::message_content_identity(&self.message).inline;
-                self.identify_content(&stored);
-                serde_json::to_value(CallerMessage(&self.message, false))
-                    .expect("a stored message serializes")
-            }
+            None => serde_json::to_value(CallerMessage(&self.message, false))
+                .expect("a stored message serializes"),
         };
         for index in results {
             served["content"][index] = blocks["content"][index].clone();
@@ -6300,7 +6296,8 @@ mod caller_message_tests {
         );
         assert_eq!(tool_refs["digest"], blocks["digest"]);
         assert_eq!(tool_refs["part_digests"], blocks["part_digests"]);
-        // A message whose only media is in a tool result is identified as well.
+        // A message whose only media is in a tool result serves its output as blocks would,
+        // and carries no identity a media_refs read without the opt-in leaves out.
         let mut lone = read_message(vec![original.message.content[3].clone()]);
         lone.show_media_refs_with_tool_media();
         let lone = serde_json::to_value(lone).unwrap();
@@ -6308,7 +6305,10 @@ mod caller_message_tests {
         lone_blocks.show_media_blocks_with_identity();
         let lone_blocks = serde_json::to_value(lone_blocks).unwrap();
         assert_eq!(lone["message"], lone_blocks["message"]);
-        assert_eq!(lone["digest"], lone_blocks["digest"]);
+        let lone_refs = serde_json::to_value(&media_tool_result).unwrap();
+        for member in ["digest", "part_digests"] {
+            assert_eq!(lone.get(member), lone_refs.get(member), "{member}: {lone}");
+        }
         // Without media in any tool result the bytes are media_refs' bytes.
         let mut plain = read_message(vec![original.message.content[4].clone()]);
         plain.show_media_refs_with_tool_media();
