@@ -1143,26 +1143,40 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
     );
     assert_eq!(error.message,
         "open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]");
-    // Every file of every session, compared whole: a refused send leaves nothing anywhere,
-    // whatever address it would have keyed. The two admitted sessions were read back from these
-    // same roots above, which proves the snapshot sees where sessions are written. A creating
-    // send opens its session to resolve the run, and a refused one deletes that session again,
-    // which can finish after the refusal is answered; so the files are compared once the store
-    // has settled, and a session that is never deleted fails here, showing what it left.
+    // Every file of every session: a refused send leaves no file anywhere, whatever address it
+    // would have keyed. The two admitted sessions were read back from these same roots above,
+    // which proves the snapshot sees where sessions are written. A creating send opens its
+    // session to resolve the run, and a refused one deletes that session again, which can finish
+    // after the refusal is answered; so the files are compared once the store has settled, and a
+    // session that is never deleted fails here, showing what it left. The admitted sessions'
+    // own logs may still grow meanwhile: each appends a `Billed` record once its run's spend is
+    // exported, after its run ended. Each session writes only its own log, so that growth is
+    // theirs, and a file the snapshot holds is checked only to still be there, never shorter.
     let state_root = daemon.broca_state_root();
+    let settled = |files: &std::collections::BTreeMap<std::path::PathBuf, u64>| {
+        files.len() == stored_before_refusal.len()
+            && stored_before_refusal
+                .iter()
+                .all(|(path, size)| files.get(path).is_some_and(|now| now >= size))
+    };
     broca_test_support::wait_for(
         "the refused send's session to be deleted",
         async {
-            while super::stored_log::stored_files(&state_root) != stored_before_refusal {
+            while !settled(&super::stored_log::stored_files(&state_root)) {
                 sleep(Duration::from_millis(50)).await;
             }
         },
         || {
+            let files = super::stored_log::stored_files(&state_root);
             format!(
-                "left behind: {:?}",
-                super::stored_log::stored_files(&state_root)
-                    .into_iter()
-                    .filter(|(path, size)| stored_before_refusal.get(path) != Some(size))
+                "left behind: {:?}; missing or shortened: {:?}",
+                files
+                    .iter()
+                    .filter(|(path, _)| !stored_before_refusal.contains_key(*path))
+                    .collect::<Vec<_>>(),
+                stored_before_refusal
+                    .iter()
+                    .filter(|(path, size)| files.get(*path).is_none_or(|now| now < *size))
                     .collect::<Vec<_>>()
             )
         },
