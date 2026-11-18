@@ -225,7 +225,7 @@ async fn queued_conversation_keys_and_key_reuse_are_served_alike() {
     super::super::tests::idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    broca_test_support::pin!("alike", texts(&session));
+    broca_test_support::pin!("alike", texts(&session).await);
 }
 
 async fn referencing(module: &Module) {

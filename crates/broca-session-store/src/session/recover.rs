@@ -333,7 +333,9 @@ impl<B: SessionBackend> Session<B> {
                     &conversation,
                     &operations,
                 );
-                conversation.apply(kept).map_err(fold_error)?;
+                conversation
+                    .apply_at(Some(kept_seq), kept)
+                    .map_err(fold_error)?;
                 activity.note(kept_seq, kept);
             }
             fold_media(
@@ -357,7 +359,7 @@ impl<B: SessionBackend> Session<B> {
                 &conversation,
                 &operations,
             );
-            conversation.apply(kept).map_err(fold_error)?;
+            conversation.apply_at(Some(seq), kept).map_err(fold_error)?;
             activity.note(seq, kept);
         }
 
@@ -661,7 +663,9 @@ impl<B: SessionBackend> Session<B> {
                     .map(|(seq, _, record)| (*seq, record))
                     .collect();
                 for (seq, record) in &kept {
-                    conversation.apply(record).map_err(fold_error)?;
+                    conversation
+                        .apply_at(Some(*seq), record)
+                        .map_err(fold_error)?;
                     window.note(*seq, record);
                 }
                 out.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
@@ -678,7 +682,9 @@ impl<B: SessionBackend> Session<B> {
             for (offset, record) in batch.iter().enumerate() {
                 window.note(first + offset as u64, record);
                 match record.stream() {
-                    Stream::Transcript => conversation.apply(record).map_err(fold_error)?,
+                    Stream::Transcript => conversation
+                        .apply_at(Some(first + offset as u64), record)
+                        .map_err(fold_error)?,
                     Stream::Ledger => operations.apply(record).map_err(fold_error)?,
                 }
             }
@@ -691,6 +697,8 @@ impl<B: SessionBackend> Session<B> {
             {
                 if record.stream() == Stream::Ledger {
                     open_ids.add(first + offset as u64, record, place);
+                } else {
+                    open_ids.place_transcript(first + offset as u64, record, place);
                 }
             }
             out.extend(encoded.into_written(&mut encoder));

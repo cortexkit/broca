@@ -1272,6 +1272,17 @@ impl Writer for Unsealed<'_> {
         Writer::run_start(&*self.0, run_id).await
     }
 
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        Writer::window_message_whole(&*self.0, ordinal).await
+    }
+
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        Writer::release(&mut *self.0, blocks).await
+    }
+
     async fn tool_intent(
         &self,
         call_key: &str,

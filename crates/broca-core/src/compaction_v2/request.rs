@@ -56,6 +56,12 @@ pub enum Prepared {
         prompt: Vec<Message>,
         applied: Option<AppliedView>,
         request_tokens: u64,
+        /// Stored messages the render read back whole, by position: content released from
+        /// memory that the applied view sends again. The caller holds them from now on.
+        restored: Vec<(usize, Message)>,
+        /// The blocks of the stored prompt, by position and block index, whose content the
+        /// request's render didn't read (`render::releasable`), for the caller to release.
+        releasable: Vec<(usize, Vec<usize>)>,
     },
     CompactionUnavailable,
     ContextCeiling {
@@ -85,15 +91,114 @@ pub async fn apply_boundary(
     Ok(())
 }
 
+/// Reads back whole the stored prompt's messages whose released content a render needs (see
+/// `render::released_but_read`).
+#[allow(async_fn_in_trait)]
+pub trait ReadBack {
+    /// The messages at `positions` of `stored`, each with its released blocks read back.
+    async fn read_back(
+        &self,
+        stored: &[Message],
+        positions: &[usize],
+    ) -> Result<Vec<Message>, String>;
+}
+
+/// A stored prompt that releases nothing, so nothing is ever read back.
+pub struct NothingReleased;
+
+impl ReadBack for NothingReleased {
+    async fn read_back(&self, _: &[Message], _: &[usize]) -> Result<Vec<Message>, String> {
+        Err("a stored message holds released content and nothing can read it back".into())
+    }
+}
+
+/// [`prepare_reading_back`] for a stored prompt that releases nothing.
 pub async fn prepare(
     state: &tokio::sync::Mutex<State>,
     runtime: &Runtime,
     journal: &impl Journal,
     plane: &dyn Plane,
     at: At<'_>,
+    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+    estimate: impl FnMut(&[Message]) -> Result<u64, String>,
+) -> Result<Prepared, String> {
+    prepare_reading_back(
+        state,
+        runtime,
+        journal,
+        plane,
+        at,
+        &NothingReleased,
+        image,
+        estimate,
+    )
+    .await
+}
+
+/// Renders `at.stored` under `view`, first reading back through `read_back` any stored message
+/// whose released content the view sends. `restored` collects what was read back, and a later
+/// render of the same step reuses it. Returns the prompt and the blocks it didn't read.
+async fn render_reading_back(
+    at: &At<'_>,
+    view: Option<&View>,
+    restored: &mut Vec<(usize, Message)>,
+    image: &mut impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+    read_back: &impl ReadBack,
+) -> Result<(Vec<Message>, Vec<(usize, Vec<usize>)>), String> {
+    let (edits, plan) = render::plan_for_render(
+        at.entries,
+        view,
+        &at.conditions.rules,
+        super::host::view_floor(at.conditions),
+    )?;
+    let mut stored = std::borrow::Cow::Borrowed(at.stored);
+    patch(&mut stored, restored);
+    let missing = render::released_but_read(&stored, at.entries, &plan);
+    if !missing.is_empty() {
+        let whole = read_back.read_back(&stored, &missing).await?;
+        if whole.len() != missing.len() {
+            return Err("a read back returned another number of messages than asked".into());
+        }
+        for (position, message) in missing.into_iter().zip(whole) {
+            restored.retain(|(at, _)| *at != position);
+            restored.push((position, message));
+        }
+        patch(&mut stored, restored);
+    }
+    let releasable = render::releasable(&stored, at.entries, &plan);
+    let prompt = render::prompt_planned(
+        &stored, at.entries, at.rides, &edits, plan, image, at.render,
+    )?;
+    Ok((prompt, releasable))
+}
+
+/// `stored` with each message `restored` names in its place.
+fn patch(stored: &mut std::borrow::Cow<'_, [Message]>, restored: &[(usize, Message)]) {
+    if restored.is_empty() {
+        return;
+    }
+    let stored = stored.to_mut();
+    for (position, message) in restored {
+        if let Some(slot) = stored.get_mut(*position) {
+            *slot = message.clone();
+        }
+    }
+}
+
+/// Prepares the step's request (see the module's notes), reading back through `read_back` the
+/// stored messages whose released content the applied view sends.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_reading_back(
+    state: &tokio::sync::Mutex<State>,
+    runtime: &Runtime,
+    journal: &impl Journal,
+    plane: &dyn Plane,
+    at: At<'_>,
+    read_back: &impl ReadBack,
     mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
     mut estimate: impl FnMut(&[Message]) -> Result<u64, String>,
 ) -> Result<Prepared, String> {
+    let mut restored = Vec::new();
     let (mut view, frozen) = {
         let mut state = state.lock().await;
         let frozen = state.step_is_frozen(at.step);
@@ -120,16 +225,8 @@ pub async fn prepare(
     let frozen = frozen && view.is_some();
     // Claimed only where the accepted Setup listed it.
     let cache_expired = at.cache_expired && runtime.detects_cache_expired().await;
-    let mut prompt = render::prompt_view_kept(
-        at.stored,
-        at.entries,
-        at.rides,
-        view.as_ref(),
-        &at.conditions.rules,
-        super::host::view_floor(at.conditions),
-        &mut image,
-        at.render,
-    )?;
+    let (mut prompt, mut releasable) =
+        render_reading_back(&at, view.as_ref(), &mut restored, &mut image, read_back).await?;
     let mut tokens = estimate(&prompt)?;
     let mut causes = if frozen {
         Vec::new()
@@ -167,16 +264,8 @@ pub async fn prepare(
         )
         .await?;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt = render::prompt_view_kept(
-            at.stored,
-            at.entries,
-            at.rides,
-            view.as_ref(),
-            &at.conditions.rules,
-            super::host::view_floor(at.conditions),
-            &mut image,
-            at.render,
-        )?;
+        (prompt, releasable) =
+            render_reading_back(&at, view.as_ref(), &mut restored, &mut image, read_back).await?;
         tokens = estimate(&prompt)?;
     }
     // A cache-rewrite ride can return a larger view. It still owes an over-limit
@@ -194,16 +283,8 @@ pub async fn prepare(
         .await?;
         rode_over_limit = true;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt = render::prompt_view_kept(
-            at.stored,
-            at.entries,
-            at.rides,
-            view.as_ref(),
-            &at.conditions.rules,
-            super::host::view_floor(at.conditions),
-            &mut image,
-            at.render,
-        )?;
+        (prompt, releasable) =
+            render_reading_back(&at, view.as_ref(), &mut restored, &mut image, read_back).await?;
         tokens = estimate(&prompt)?;
     }
     runtime
@@ -225,6 +306,8 @@ pub async fn prepare(
         prompt,
         applied: view.as_ref().map(View::applied),
         request_tokens: tokens,
+        restored,
+        releasable,
     })
 }
 

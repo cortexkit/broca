@@ -412,7 +412,7 @@ impl Pair {
             .map(|pending| pending.submission_id.clone())
             .collect();
         broca_test_support::pin!("the sends queued", queue);
-        broca_test_support::pin!("the conversation", store::texts(&session));
+        broca_test_support::pin!("the conversation", store::texts(&session).await);
         broca_test_support::pin!("the runs' starts", store_starts(&session).await);
         broca_test_support::pin!(
             "the messages each model call was sent",

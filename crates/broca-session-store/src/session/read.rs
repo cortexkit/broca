@@ -104,25 +104,41 @@ pub fn window_entries(
     from: u64,
     limit: usize,
 ) -> Result<Vec<StoredEntry>, NotHeld> {
+    window_entries_with(conversation, from, limit, |_| None)
+}
+
+/// [`window_entries`], taking the content of a window message that isn't held from `whole`,
+/// which gives the message at an ordinal read back whole, or `None` when it wasn't read.
+pub fn window_entries_with(
+    conversation: &Conversation,
+    from: u64,
+    limit: usize,
+    whole: impl Fn(u64) -> Option<Arc<Message>>,
+) -> Result<Vec<StoredEntry>, NotHeld> {
+    let held = |ordinal: u64, message: &crate::fold::conversation::WindowMessage| {
+        message
+            .held()
+            .cloned()
+            .or_else(|| whole(ordinal))
+            .ok_or(NotHeld { ordinal })
+    };
     let start = conversation.window_start().max(from);
     let mut entries = Vec::new();
     for ordinal in (start..=conversation.placed).take(limit) {
         let Some((message, state)) = conversation.window_entry(ordinal) else {
             continue;
         };
-        let message = message.held().ok_or(NotHeld { ordinal })?;
-        let called = called_tools(message);
+        let message = held(ordinal, message)?;
+        let called = called_tools(&message);
         let next = match conversation.window_message(ordinal + 1) {
             Some(next) if called && next.role() == broca_protocol::content::Role::Tool => {
-                Some(Arc::clone(next.held().ok_or(NotHeld {
-                    ordinal: ordinal + 1,
-                })?))
+                Some(held(ordinal + 1, next)?)
             }
             _ => None,
         };
         entries.push(StoredEntry {
             ordinal,
-            message: Arc::clone(message),
+            message,
             next,
             state: state.clone(),
             open: false,
@@ -579,9 +595,7 @@ impl<B: SessionBackend> Session<B> {
             }
         }
         if out.len() < limit {
-            out.extend(
-                window_entries(&self.conversation, next, limit - out.len()).map_err(not_held)?,
-            );
+            out.extend(self.window_entries_whole(next, limit - out.len()).await?);
         }
         if out.len() < limit {
             if let Some((ordinal, message, state)) = self.conversation.open_entry() {
@@ -666,9 +680,7 @@ impl<B: SessionBackend> Session<B> {
                 .and_then(|(_, state)| state.facts.as_ref())
                 .and_then(|facts| base(facts));
             if base.is_some_and(|base| base < tag) {
-                return Ok(window_entries(&self.conversation, ordinal, 1)
-                    .map_err(not_held)?
-                    .pop());
+                return Ok(self.window_entries_whole(ordinal, 1).await?.pop());
             }
         }
         let key = self.key.frame_key();
@@ -923,12 +935,9 @@ impl<B: SessionBackend> Session<B> {
         if ordinal == 0 || ordinal > self.conversation.placed {
             return Ok(None);
         }
-        if let Some(message) = self
-            .conversation
-            .held_message(ordinal)
-            .map_err(|not| SessionError::NotHeld(not.ordinal))?
-        {
-            return Ok(Some(Arc::clone(message)));
+        if ordinal >= self.conversation.window_start() {
+            // A window message whose content was released reads back from the open log.
+            return Box::pin(self.window_message_whole(ordinal)).await.map(Some);
         }
         self.storage_read()?;
         let key = self.key.frame_key();
@@ -1006,7 +1015,10 @@ impl<B: SessionBackend> Session<B> {
                 idindex::OpenRecord::At(place) => match self.kept.get(seq) {
                     Some(record) => record.clone(),
                     // A cold read, boxed so it adds nothing to every future that looks an id up.
-                    None => Box::pin(self.open_record(seq, place)).await?,
+                    None => {
+                        Box::pin(self.open_record(seq, place, crate::frame::FrameStream::Ledger))
+                            .await?
+                    }
                 },
                 _ => self.open_in_memory(seq, at)?.clone(),
             };
@@ -1036,13 +1048,14 @@ impl<B: SessionBackend> Session<B> {
         })
     }
 
-    /// The ledger record at `seq` of the open log, read back from where its frame lies: one
-    /// ranged read of the log. The writer appended it, so a frame that doesn't read back as that
-    /// record is damage.
+    /// The record of `stream` at `seq` of the open log, read back from where its frame lies:
+    /// one ranged read of the log. The writer appended it, so a frame that doesn't read back as
+    /// that record is damage.
     async fn open_record(
         &self,
         seq: u64,
         place: crate::log::FramePlace,
+        stream: crate::frame::FrameStream,
     ) -> Result<Record, SessionError> {
         self.storage_read()?;
         idindex::count_open_record_read();
@@ -1072,9 +1085,9 @@ impl<B: SessionBackend> Session<B> {
                     }))
                 }
             };
-        if header.seq != seq || header.stream != crate::frame::FrameStream::Ledger {
+        if header.seq != seq || header.stream != stream {
             return Err(SessionError::Fold(format!(
-                "the open log's frame at {} holds record {}, not ledger record {seq}",
+                "the open log's frame at {} holds record {}, not {stream:?} record {seq}",
                 place.at, header.seq
             )));
         }
@@ -1084,6 +1097,65 @@ impl<B: SessionBackend> Session<B> {
                 error,
             })
         })
+    }
+
+    /// The window message at `ordinal` with all its content. A message whose content was
+    /// released from memory is read back from its transcript records in the open log, one ranged
+    /// read each, and checked against what the window keeps of it.
+    /// The open window's entries from `from` on, at most `limit` of them ([`window_entries`]),
+    /// with each message whose content was released read back from the open log first.
+    pub async fn window_entries_whole(
+        &self,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEntry>, SessionError> {
+        let start = self.conversation.window_start().max(from);
+        // The entries look at `limit` ordinals from `start`, and at the tool message after the
+        // last of them.
+        let end = start.saturating_add(limit as u64);
+        let mut whole = std::collections::HashMap::new();
+        for ordinal in self.conversation.released_ordinals() {
+            if (start..=end).contains(&ordinal) {
+                whole.insert(ordinal, Box::pin(self.window_message_whole(ordinal)).await?);
+            }
+        }
+        window_entries_with(&self.conversation, from, limit, |ordinal| {
+            whole.get(&ordinal).cloned()
+        })
+        .map_err(not_held)
+    }
+
+    pub async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        let message = self
+            .conversation
+            .window_message(ordinal)
+            .ok_or_else(|| SessionError::Fold(format!("no message {ordinal} is in the window")))?;
+        if let Some(held) = message.held() {
+            return Ok(std::sync::Arc::clone(held));
+        }
+        let mut records = Vec::with_capacity(message.sources().len());
+        for &seq in message.sources() {
+            let place = self.open_ids.transcript_place(seq).ok_or_else(|| {
+                SessionError::Fold(format!(
+                    "window message {ordinal} was released, and its record {seq} isn't in the \
+                     open log"
+                ))
+            })?;
+            let record =
+                Box::pin(self.open_record(seq, place, crate::frame::FrameStream::Transcript))
+                    .await?;
+            records.push(record);
+        }
+        self.conversation
+            .read_back(ordinal, &records)
+            .map_err(|error| {
+                SessionError::Fold(format!(
+                    "window message {ordinal} didn't read back from its records: {error:?}"
+                ))
+            })
     }
 
     /// The sealed ledger records that name `id` as a `kind`, through the sealed id index.
@@ -1323,6 +1395,29 @@ impl<B: SessionBackend> Session<B> {
         first: u64,
         last: u64,
     ) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.records_between_kept_as(first, last, false).await
+    }
+
+    /// [`Self::records_between`], except that a kept record whose content was released from
+    /// memory comes in its released form (ids kept, content blocks released) rather than making
+    /// the read go to storage. For a reader that reads only ids, kinds and counts, such as the
+    /// walk of a run's status, so a poll of a long run stays in memory.
+    pub async fn records_between_released(
+        &self,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.records_between_kept_as(first, last, true).await
+    }
+
+    /// The records of `first` through `last`; with `released`, kept records whose content was
+    /// released come in their released form instead of sending the read to storage.
+    async fn records_between_kept_as(
+        &self,
+        first: u64,
+        last: u64,
+        released: bool,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
         let mut records = if self.place().sealed_reach(first) {
             self.storage_read()?;
             self.place().sealed_between(first, last).await?
@@ -1331,7 +1426,13 @@ impl<B: SessionBackend> Session<B> {
         };
         let kept = self
             .reads_kept()
-            .then(|| self.kept.between(first, last))
+            .then(|| {
+                if released {
+                    self.kept.between_released(first, last)
+                } else {
+                    self.kept.between(first, last)
+                }
+            })
             .flatten();
         let open = match kept {
             Some(kept) => kept,

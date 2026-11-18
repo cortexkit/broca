@@ -521,6 +521,8 @@ impl<B: SessionBackend> Session<B> {
         {
             if record.stream() == Stream::Ledger {
                 open_ids.add(first + offset as u64, record, place);
+            } else {
+                open_ids.place_transcript(first + offset as u64, record, place);
             }
         }
         bytes.extend(encoded.into_written(&mut encoder));

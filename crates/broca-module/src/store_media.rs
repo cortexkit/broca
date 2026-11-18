@@ -967,6 +967,17 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         broca_session_loop::Writer::run_start(&*self.session, run_id).await
     }
 
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        broca_session_loop::Writer::window_message_whole(&*self.session, ordinal).await
+    }
+
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        broca_session_loop::Writer::release(&mut *self.session, blocks).await
+    }
+
     async fn tool_intent(
         &self,
         call_key: &str,

@@ -921,7 +921,10 @@ async fn photo(ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
 /// `photo` tool returns media. (A resumed run's earlier records come from a converted log, whose
 /// media the converter doesn't copy yet, so this runs on whole runs only.)
 async fn media_reads_back(session: &Session<&MemoryBackend>) {
-    for message in &session.conversation.held_messages().unwrap() {
+    let whole = broca_session_loop::writer::whole_conversation(session)
+        .await
+        .expect("the window reads back");
+    for message in &whole.held_messages().unwrap() {
         for block in &message.content {
             let ContentBlock::ToolResult(result) = block else {
                 continue;
@@ -2006,6 +2009,12 @@ impl broca_core::CompactionPlane for CompactionSpy {
 }
 
 tokio::task_local! {
+    /// When set, the new loop's run leaves here each window message whose content it released,
+    /// by ordinal, read back whole.
+    static RELEASED: std::cell::RefCell<Vec<(u64, Arc<Message>)>>;
+}
+
+tokio::task_local! {
     /// The layout a comparison's session starts under: the current compaction contract (a plan
     /// version), or the established layout (`None`). Every comparison runs once in each.
     static LAYOUT: Option<u32>;
@@ -2074,9 +2083,28 @@ macro_rules! through {
             // The run's copy of the folds must end equal to the session's own: requests and
             // records alone can match while the copy has drifted, for instance keeping a window
             // that a seal shortened.
+            // Both copies release the same content, and compare whole, read back. The actor is
+            // no longer served here, so the run's copy reads back through the session itself.
             assert_eq!(
-                client.conversation().encode(),
-                recording.session.conversation.encode(),
+                client.conversation().released_ordinals(),
+                recording.session.conversation.released_ordinals(),
+                "the run's copy released other content than the session's"
+            );
+            let mut copy = client.conversation().clone();
+            for ordinal in copy.released_ordinals() {
+                let whole = recording
+                    .session
+                    .window_message_whole(ordinal)
+                    .await
+                    .expect("the session reads back");
+                assert!(copy.restore(ordinal, whole), "the run's copy restores {ordinal}");
+            }
+            assert_eq!(
+                copy.encode(),
+                broca_session_loop::writer::whole_conversation(&*recording.session)
+                    .await
+                    .expect("the session reads back")
+                    .encode(),
                 "the run's copy of the conversation drifted from the session's"
             );
             assert_eq!(
@@ -2428,6 +2456,17 @@ impl Writer for Recording<'_, '_> {
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
         Writer::run_start(&*self.session, run_id).await
+    }
+
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        Writer::window_message_whole(&*self.session, ordinal).await
+    }
+
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        Writer::release(&mut *self.session, blocks).await
     }
 
     async fn tool_intent(
@@ -2853,6 +2892,18 @@ async fn new_source(
     }
     result.expect("the new loop runs");
     let records = writer.records.clone();
+    if RELEASED.try_with(|_| ()).is_ok() {
+        let mut whole = Vec::new();
+        for ordinal in writer.conversation().released_ordinals() {
+            let message = writer
+                .session
+                .window_message_whole(ordinal)
+                .await
+                .expect("a released message reads back");
+            whole.push((ordinal, message));
+        }
+        RELEASED.with(|seen| *seen.borrow_mut() = whole);
+    }
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
     turns_have_facts(writer.session).await;
@@ -3011,9 +3062,14 @@ async fn reloads_with_its_views(
     )
     .await
     .expect("the sealed session loads");
+    // The live session may have released content its requests no longer send, so the
+    // assertion compares the loaded conversation with the live one read back whole.
     assert_eq!(
         Writer::conversation(&loaded).encode(),
-        Writer::conversation(session).encode()
+        broca_session_loop::writer::whole_conversation(session)
+            .await
+            .expect("the live session reads back")
+            .encode()
     );
     assert_eq!(
         Writer::operations(&loaded).encode(),
@@ -10928,5 +10984,63 @@ async fn a_handed_back_call_is_closed_by_its_interim_content_and_names_its_provi
             .any(|record| record.get("ToolHeld").is_some()),
         "a handed-back call is never held: {:?}",
         outcome.records
+    );
+}
+
+/// A step whose view replaces a tool output leaves that output out of its request, so the run
+/// releases it from memory once a step renders it as replaced and it is no longer the window's
+/// newest message: here the third step, after the view the compaction provider sent at the
+/// second step (which went over the context limit) replaced the first call's output. The tool message's content is released in the session's window, and reads back from
+/// the open log whole.
+#[tokio::test]
+async fn a_replaced_tool_output_is_released_and_reads_back_whole() {
+    let scenario = compacted_scenario(vec![
+        answer(
+            "a1",
+            vec![call("c1", "big", json!({}))],
+            FinishReason::ToolCalls,
+        ),
+        answer(
+            "a2",
+            vec![call("c2", "read", json!({"path": "b"}))],
+            FinishReason::ToolCalls,
+        ),
+        text_step("a3", "done"),
+    ]);
+    let released = RELEASED
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            LAYOUT
+                .scope(
+                    Some(cortexkit_compaction_view::PLAN_VERSION),
+                    COMPACTION.scope(
+                        Some(Arc::new(CompactionScript {
+                            context_limit: 1_200,
+                            rides: vec![Ride::Trim(2)],
+                        })),
+                        Box::pin(new_loop(&scenario)),
+                    ),
+                )
+                .await;
+            RELEASED.with(|seen| seen.take())
+        })
+        .await;
+    let ordinals: Vec<u64> = released.iter().map(|(ordinal, _)| *ordinal).collect();
+    assert_eq!(
+        ordinals,
+        [3],
+        "the tool message, and nothing else, is released"
+    );
+    let ContentBlock::ToolResult(result) = &released[0].1.content[0] else {
+        panic!(
+            "the released message is the tool result: {:?}",
+            released[0].1
+        );
+    };
+    assert_eq!(
+        result.output,
+        ToolOutput::Text {
+            text: "x".repeat(8_000).into()
+        },
+        "the output reads back whole"
     );
 }

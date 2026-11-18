@@ -126,6 +126,8 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::AcceptedSend { .. } => "accepted send",
         Request::CachePredecessor { .. } => "cache predecessor",
         Request::RunStart { .. } => "run start",
+        Request::WindowMessageWhole { .. } => "window message whole",
+        Request::Release { .. } => "release",
         Request::ToolIntent { .. } => "tool intent",
         Request::EntryByMid { .. } => "entry by mid",
         Request::EntryAt { .. } => "entry at",

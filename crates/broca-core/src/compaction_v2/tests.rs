@@ -2830,6 +2830,7 @@ async fn compaction_v2_request_ride_view_applies_to_that_request_before_sending(
         prompt,
         applied,
         request_tokens,
+        ..
     } = outcome
     else {
         panic!("ride did not free the request")
@@ -2984,4 +2985,223 @@ async fn an_applied_view_records_whether_it_kept_the_conversations_head() {
             .unwrap();
     }
     assert_eq!(*journal.heads.lock().unwrap(), [true, false, true]);
+}
+
+/// Each block `released` names, in a copy of `messages`, in its released form.
+fn with_released(messages: &[Message], released: &[(usize, Vec<usize>)]) -> Vec<Message> {
+    let mut copy = messages.to_vec();
+    for (position, blocks) in released {
+        for &index in blocks {
+            let block = &mut copy[*position].content[index];
+            *block = block.released().expect("named blocks hold content");
+        }
+    }
+    copy
+}
+
+/// The plan rendering `edits` over `entries` makes, as `render::prompt` makes it.
+fn plan_of(
+    entries: &[cortexkit_role_compaction::read::Entry],
+    edits: &[Edit],
+) -> cortexkit_compaction_view::render::RenderPlan {
+    let edits = cortexkit_compaction_view::render::edits_for_transcript(entries, edits);
+    cortexkit_compaction_view::render::plan(entries, &edits).unwrap()
+}
+
+/// The blocks a plan never reads are released, and the request renders the same bytes from
+/// the released prompt: a dropped call and its result, a result whose output the view
+/// replaced, a text the view replaced. The newest message is never released.
+#[test]
+fn compaction_v2_blocks_a_plan_never_reads_release_and_render_the_same() {
+    let mut messages = vec![
+        text(Role::Assistant, "first answer"),
+        call(),
+        result(ToolOutput::Text {
+            text: "a long tool output".into(),
+        }),
+        text(Role::User, "next question"),
+    ];
+    // A signed call's output can't be replaced; an unsigned one's can.
+    if let ContentBlock::ToolCall(call) = &mut messages[1].content[1] {
+        call.thought_signature = None;
+    }
+    let entries = project(&messages, &facts(4), &Deliveries::new(), true);
+    let drop_call = Edit::new(
+        1,
+        EditOp::Drop {
+            mid: entries[1].mid.clone(),
+            part: Some("1".into()),
+        },
+    );
+    let replace_output = Edit::new(
+        1,
+        EditOp::Replace {
+            mid: entries[1].mid.clone(),
+            part: "1".into(),
+            field: "output".into(),
+            value: json!("smaller"),
+            expect: entries[1].parts[1].digest.clone(),
+        },
+    );
+    let replace_text = Edit::new(
+        1,
+        EditOp::Replace {
+            mid: entries[0].mid.clone(),
+            part: "0".into(),
+            field: "text".into(),
+            value: json!("summary"),
+            expect: entries[0].parts[0].digest.clone(),
+        },
+    );
+    for (edits, expected) in [
+        (vec![drop_call], vec![(1, vec![1]), (2, vec![0])]),
+        (vec![replace_output], vec![(2, vec![0])]),
+        (vec![replace_text], vec![(0, vec![0])]),
+        (Vec::new(), Vec::new()),
+    ] {
+        let plan = plan_of(&entries, &edits);
+        let released = render::releasable(&messages, &entries, &plan);
+        assert_eq!(released, expected, "{edits:?}");
+        let copy = with_released(&messages, &released);
+        assert!(render::released_but_read(&copy, &entries, &plan).is_empty());
+        let whole = render::prompt(&messages, &entries, &edits, |_| panic!("no image")).unwrap();
+        let from_released =
+            render::prompt(&copy, &entries, &edits, |_| panic!("no image")).unwrap();
+        assert_eq!(from_released, whole, "{edits:?}");
+    }
+}
+
+/// A released block the plan sends is named for reading back, and a render that reaches it
+/// anyway refuses rather than send the released placeholder.
+#[test]
+fn compaction_v2_a_released_block_the_plan_sends_must_be_read_back() {
+    let messages = vec![
+        text(Role::Assistant, "first answer"),
+        call(),
+        result(ToolOutput::Text {
+            text: "a long tool output".into(),
+        }),
+        text(Role::User, "next question"),
+    ];
+    let entries = project(&messages, &facts(4), &Deliveries::new(), true);
+    let plan = plan_of(&entries, &[]);
+    for released in [vec![(0, vec![0])], vec![(1, vec![1])], vec![(2, vec![0])]] {
+        let copy = with_released(&messages, &released);
+        let positions: Vec<usize> = released.iter().map(|(position, _)| *position).collect();
+        assert_eq!(render::released_but_read(&copy, &entries, &plan), positions);
+        let refused = render::prompt(&copy, &entries, &[], |_| panic!("no image")).unwrap_err();
+        assert!(refused.contains("released from memory"), "{refused}");
+    }
+}
+
+/// Answers a read back with the messages a session's window holds whole, and records which
+/// positions it was asked for.
+#[derive(Default)]
+struct WholeWindow {
+    whole: Vec<Message>,
+    asked: std::sync::Mutex<Vec<Vec<usize>>>,
+}
+
+impl super::request::ReadBack for WholeWindow {
+    async fn read_back(&self, _: &[Message], positions: &[usize]) -> Result<Vec<Message>, String> {
+        self.asked.lock().unwrap().push(positions.to_vec());
+        Ok(positions
+            .iter()
+            .map(|&position| self.whole[position].clone())
+            .collect())
+    }
+}
+
+/// A stored message whose released content the request sends is read back before the render,
+/// and the request is the one an unreleased prompt renders. With nothing to read it back, the
+/// step refuses rather than send the released placeholder.
+#[tokio::test]
+async fn compaction_v2_a_released_block_the_request_sends_is_read_back_first() {
+    let messages = vec![
+        text(Role::User, "question"),
+        call(),
+        result(ToolOutput::Text {
+            text: "a long tool output".into(),
+        }),
+        text(Role::User, "next question"),
+    ];
+    let entries = project(&messages, &facts(4), &Deliveries::new(), true);
+    let conditions = conditions();
+    let current = send_context();
+    let prepare = |stored: Vec<Message>, read_back: Option<WholeWindow>| {
+        let (entries, conditions, current) = (&entries, &conditions, &current);
+        async move {
+            let plane = RecordingPlane::default();
+            plane
+                .answers
+                .lock()
+                .unwrap()
+                .push_back(json!({"answer": "ready"}));
+            let state = tokio::sync::Mutex::new(state::State::default());
+            let at = request_at(&stored, entries, conditions, current);
+            let prepared = match &read_back {
+                Some(read_back) => {
+                    super::request::prepare_reading_back(
+                        &state,
+                        &runtime::Runtime::default(),
+                        &MemoryJournal::default(),
+                        &plane,
+                        at,
+                        read_back,
+                        |_| panic!("no image"),
+                        text_estimate,
+                    )
+                    .await
+                }
+                None => {
+                    super::request::prepare(
+                        &state,
+                        &runtime::Runtime::default(),
+                        &MemoryJournal::default(),
+                        &plane,
+                        at,
+                        |_| panic!("no image"),
+                        text_estimate,
+                    )
+                    .await
+                }
+            };
+            (prepared, read_back)
+        }
+    };
+    let (whole, _) = prepare(messages.clone(), None).await;
+    let Ok(super::request::Prepared::Ready {
+        prompt: whole_prompt,
+        restored,
+        ..
+    }) = whole
+    else {
+        panic!("an unreleased prompt renders: {whole:?}");
+    };
+    assert!(restored.is_empty());
+
+    let mut released = messages.clone();
+    released[2].content[0] = released[2].content[0].released().unwrap();
+    let window = WholeWindow {
+        whole: messages.clone(),
+        ..Default::default()
+    };
+    let (read, window) = prepare(released.clone(), Some(window)).await;
+    let Ok(super::request::Prepared::Ready {
+        prompt, restored, ..
+    }) = read
+    else {
+        panic!("a released prompt renders after reading back: {read:?}");
+    };
+    assert_eq!(prompt, whole_prompt);
+    assert_eq!(restored, vec![(2, messages[2].clone())]);
+    assert_eq!(*window.unwrap().asked.lock().unwrap(), vec![vec![2]]);
+
+    let (refused, _) = prepare(released, None).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.contains("released")),
+        "{refused:?}"
+    );
 }

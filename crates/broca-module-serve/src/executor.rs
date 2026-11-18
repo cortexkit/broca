@@ -1180,17 +1180,18 @@ async fn store_history(
         .find(|episode| episode.first_user.is_some());
     let (first_user, first_user_sealed) = match first_run.and_then(|episode| episode.first_user) {
         None => (None, false),
-        Some(ordinal) => match conversation.held_message(ordinal).map_err(|not| {
-            broca_session_loop::LoopError::Session(
-                broca_session_store::session::SessionError::NotHeld(not.ordinal),
-            )
-        })? {
-            Some(message) => (
-                Some(broca_protocol::content::Message::clone(message)),
+        // In the window, read back whole if its content was released.
+        Some(ordinal) if ordinal >= conversation.window_start() => {
+            let message = writer
+                .window_message_whole(ordinal)
+                .await
+                .map_err(broca_session_loop::LoopError::Session)?;
+            (
+                Some(broca_protocol::content::Message::clone(&message)),
                 false,
-            ),
-            None => (None, true),
-        },
+            )
+        }
+        Some(_) => (None, true),
     };
     Ok(StoreHistory {
         prior_run,

@@ -56,6 +56,25 @@ impl Text {
 /// parts, empty replies), and an `Arc<str>` allocates its counts even for no bytes.
 static EMPTY: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
 
+/// The one text every released block holds in place of its own (see [`Text::released`]).
+static RELEASED: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("[content released from memory]"));
+
+impl Text {
+    /// The text a block holds in place of its own once that text has left memory: the block is
+    /// kept for its kind and its ids, and for whether its text is empty, which the part numberings
+    /// read, and the released text is never empty. It is one allocation for the whole process,
+    /// recognised by identity ([`Text::is_released`]), so no text a message really holds is ever
+    /// taken for it, whatever its bytes.
+    pub fn released() -> Self {
+        Self(Arc::clone(&RELEASED))
+    }
+
+    /// Whether this is the released text ([`Text::released`]).
+    pub fn is_released(&self) -> bool {
+        Arc::ptr_eq(&self.0, &RELEASED)
+    }
+}
+
 impl Text {
     fn new(text: &str) -> Self {
         if text.is_empty() {

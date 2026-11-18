@@ -23,6 +23,7 @@ cipher_tests!(
     an_append_without_a_barrier_is_told_durable_once_synced,
     a_discarded_session_reads_as_never_created,
     a_deleted_session_keeps_no_file_and_a_moved_head_refuses,
+    a_released_message_reads_back_from_the_open_log,
 );
 
 fn triple() -> SessionTriple {
@@ -817,4 +818,35 @@ fn the_mode_is_chosen_at_creation_and_kept() {
         )),
         Err(SessionError::Head(crate::head::HeadError::NotLoaded))
     ));
+}
+
+/// A window message whose content was released from memory reads back whole from its records
+/// in the open log, both on the writer that appended them and on one that loaded the log.
+fn a_released_message_reads_back_from_the_open_log(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session
+            .append(&[input("one"), input("two"), input("three")], true)
+            .await
+            .unwrap();
+        let first = session.conversation.window_start();
+        assert!(session.conversation.release(first, &[0]));
+        assert!(session.conversation.held_messages().is_err());
+        let read = session.window_message_whole(first).await.unwrap();
+        assert_eq!(texts(&[read]), ["one"]);
+        session.close().await.unwrap();
+
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        let first = loaded.conversation.window_start();
+        assert!(loaded.conversation.release(first + 1, &[0]));
+        let read = loaded.window_message_whole(first + 1).await.unwrap();
+        assert_eq!(texts(&[read]), ["two"]);
+        // The newest message is never released: a later record may still change it.
+        assert!(!loaded.conversation.release(first + 2, &[0]));
+    });
 }

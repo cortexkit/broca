@@ -54,6 +54,11 @@ pub(crate) struct KeptRecords {
     /// [`Self::view_checkpoint_for`]) without holding the checkpoint a second time: its state is
     /// already folded into the view.
     checkpoint: Option<CheckpointFrame>,
+    /// The seqs, ascending, of the kept records whose message content left memory with the
+    /// window message they placed (see [`Self::release`]). Such a record is kept in its released
+    /// form, which holds its ids but not its content, so a read of records that needs content
+    /// reads it from storage instead ([`Self::between`]).
+    released: Vec<u64>,
 }
 
 impl KeptRecords {
@@ -67,6 +72,7 @@ impl KeptRecords {
             latest_start: None,
             per_run: true,
             checkpoint: None,
+            released: Vec::new(),
         }
     }
 
@@ -82,6 +88,7 @@ impl KeptRecords {
             latest_start: None,
             per_run,
             checkpoint: None,
+            released: Vec::new(),
         }
     }
 
@@ -111,6 +118,7 @@ impl KeptRecords {
                 for (seq, record) in self.records.drain(..) {
                     dropped(seq, record);
                 }
+                self.released.clear();
             }
             _ if self.latest_start.is_some() => {}
             _ => {
@@ -144,6 +152,7 @@ impl KeptRecords {
                 self.whole &= self.records.is_empty() && self.from == seq;
                 // The buffer goes with them: one sized for a long run must not outlive it.
                 dropped = std::mem::take(&mut self.records);
+                self.released = Vec::new();
                 self.from = seq;
             }
             self.latest_start = Some((seq, start.run_id.clone()));
@@ -163,8 +172,11 @@ impl KeptRecords {
         self.records.push((seq, record));
     }
 
-    /// The kept record at `seq`, if one is kept.
+    /// The kept record at `seq`, if one is kept whole.
     pub(crate) fn get(&self, seq: u64) -> Option<&Record> {
+        if self.released.binary_search(&seq).is_ok() {
+            return None;
+        }
         self.records
             .binary_search_by_key(&seq, |(kept, _)| *kept)
             .ok()
@@ -172,8 +184,19 @@ impl KeptRecords {
     }
 
     /// Every kept record from `first` through `last`, or `None` when records from `first` on
-    /// aren't all kept.
+    /// aren't all kept whole.
     pub(crate) fn between(&self, first: u64, last: u64) -> Option<Vec<(u64, Record)>> {
+        let start = self.released.partition_point(|seq| *seq < first);
+        if self.released.get(start).is_some_and(|seq| *seq <= last) {
+            return None;
+        }
+        self.between_released(first, last)
+    }
+
+    /// [`Self::between`], with each released record in its released form: its ids, and its
+    /// content blocks in their released form (`ContentBlock::released`). For a reader that
+    /// reads only what such a record keeps.
+    pub(crate) fn between_released(&self, first: u64, last: u64) -> Option<Vec<(u64, Record)>> {
         if first < self.from && !self.whole {
             return None;
         }
@@ -187,9 +210,30 @@ impl KeptRecords {
         )
     }
 
-    /// Every record of the open log, when they are all kept.
+    /// Every record of the open log, when they are all kept whole.
     pub(crate) fn whole(&self) -> Option<&[(u64, Record)]> {
-        self.whole.then_some(self.records.as_slice())
+        (self.whole && self.released.is_empty()).then_some(self.records.as_slice())
+    }
+
+    /// The kept record at `seq`, whole or released, if one is kept.
+    pub(crate) fn get_any(&self, seq: u64) -> Option<&Record> {
+        self.records
+            .binary_search_by_key(&seq, |(kept, _)| *kept)
+            .ok()
+            .map(|at| &self.records[at].1)
+    }
+
+    /// Keeps `released` in place of the record at `seq`: the same record, its message content
+    /// left in memory only as its released form. The window message it placed released the
+    /// same content, so no holder in the session keeps it.
+    pub(crate) fn release(&mut self, seq: u64, released: Record) {
+        let Ok(at) = self.records.binary_search_by_key(&seq, |(kept, _)| *kept) else {
+            return;
+        };
+        self.records[at].1 = released;
+        if let Err(at) = self.released.binary_search(&seq) {
+            self.released.insert(at, seq);
+        }
     }
 
     /// Records where a view's open log keeps its checkpoint: in its first frame, `len` bytes
@@ -213,13 +257,18 @@ impl KeptRecords {
             .map(|checkpoint| checkpoint.len.get())
     }
 
-    /// The kept records through seq `last`.
+    /// The kept records through seq `last`. A view keeps them; only a writer releases any.
     pub(crate) fn through(&self, last: u64) -> Vec<(u64, Record)> {
+        debug_assert!(
+            self.released.is_empty(),
+            "a view's records are never released"
+        );
         let end = self.records.partition_point(|(seq, _)| *seq <= last);
         self.records[..end].to_vec()
     }
 
-    /// The retained suffix, without cloning the rest of the run for a tail lookup.
+    /// The retained suffix, without cloning the rest of the run for a tail lookup. Its ledger
+    /// records are whole: only transcript records are ever released.
     pub(super) fn tail(&self) -> (&[(u64, Record)], bool) {
         (&self.records, self.whole)
     }

@@ -257,6 +257,27 @@ state! {
             reset: "a copy, or a read from storage",
             bound: Bound::Capped(RESTATED_CAP),
         },
+        /// The seqs of the records the held assistant message and its replies so far came from,
+        /// which both messages of its turn take as their sources once it is placed (see
+        /// `WindowMessage::sources`). Empty when the turn was read from a checkpoint.
+        open_sources: OpenSources => {
+            owner: "run loop",
+            reset: "a read from storage",
+            bound: Bound::OpenWork("one assistant message's tool calls"),
+        },
+    }
+}
+
+/// The seqs the held tool turn's records so far were folded at (see `Conversation::open_sources`):
+/// `None` when one of them isn't known.
+#[derive(Debug, Clone, Default)]
+pub struct OpenSources(Option<Vec<u64>>);
+
+impl crate::held::HeldBytes for OpenSources {
+    fn heap_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .map_or(0, |seqs| seqs.capacity() * size_of::<u64>())
     }
 }
 
@@ -316,8 +337,11 @@ impl Conversation {
         self.messages
             .iter()
             .map(WindowMessage::allocation)
-            .chain(self.open.as_ref().map(|turn| &turn.assistant))
-            .map(|message| Arc::as_ptr(message) as usize)
+            .chain(
+                self.open
+                    .as_ref()
+                    .map(|turn| Arc::as_ptr(&turn.assistant) as usize),
+            )
             .chain(
                 entries
                     .clone()
@@ -451,6 +475,7 @@ impl Conversation {
             human_prompts: 0,
             joined_through: None,
             changes: WindowChanges::default(),
+            open_sources: OpenSources::default(),
         }
     }
 
@@ -504,6 +529,7 @@ impl Conversation {
             human_prompts: self.human_prompts,
             joined_through: self.joined_through,
             changes: WindowChanges::default(),
+            open_sources: self.open_sources.clone(),
         }
     }
 
@@ -628,8 +654,9 @@ impl Conversation {
             .flatten()
     }
 
-    fn place(&mut self, message: Arc<Message>, entry: EntryState) {
-        self.messages.push(WindowMessage::new(message));
+    fn place(&mut self, message: Arc<Message>, entry: EntryState, sources: Arc<[u64]>) {
+        self.messages
+            .push(WindowMessage::from_records(message, sources));
         self.entries.push(entry);
         self.placed += 1;
     }
@@ -692,7 +719,16 @@ impl Conversation {
         Some(before)
     }
 
+    /// Folds `record` without knowing its seq: the messages it places can't be released from
+    /// memory, since nothing could read them back (see `WindowMessage::sources`).
     pub fn apply(&mut self, record: &Record) -> Result<(), FoldError> {
+        self.apply_at(None, record)
+    }
+
+    /// Folds `record`, at `seq` in the open log when it is known.
+    pub fn apply_at(&mut self, seq: Option<u64>, record: &Record) -> Result<(), FoldError> {
+        let sources =
+            || -> Arc<[u64]> { seq.map_or_else(|| Arc::from([]), |seq| Arc::from([seq])) };
         if record.stream() != Stream::Transcript {
             return Err(FoldError::LedgerRecord(record.name()));
         }
@@ -711,7 +747,7 @@ impl Conversation {
                 if input.placement == Placement::RunInput {
                     self.note_run_input(input);
                 }
-                self.place(Arc::clone(&input.message), EntryState::default());
+                self.place(Arc::clone(&input.message), EntryState::default(), sources());
             }
             Record::Assistant(assistant) => {
                 if let Some(episode) = self
@@ -741,9 +777,13 @@ impl Conversation {
                     message
                         .content
                         .retain(|block| !matches!(block, ContentBlock::ToolCall(_)));
-                    self.place(Arc::new(message), EntryState::default());
+                    self.place(Arc::new(message), EntryState::default(), sources());
                 } else if calls.is_empty() {
-                    self.place(Arc::clone(&assistant.message), EntryState::default());
+                    self.place(
+                        Arc::clone(&assistant.message),
+                        EntryState::default(),
+                        sources(),
+                    );
                 } else {
                     self.open = Some(ToolTurn {
                         assistant: Arc::clone(&assistant.message),
@@ -751,6 +791,7 @@ impl Conversation {
                         replies: Vec::new(),
                     });
                     self.open_entry = Some(EntryState::default());
+                    self.open_sources = OpenSources(seq.map(|seq| vec![seq]));
                 }
             }
             Record::ToolReply(reply) => {
@@ -770,6 +811,15 @@ impl Conversation {
                     return Err(FoldError::SecondReply(id.0.clone()));
                 }
                 turn.replies.push(reply.result.clone());
+                // A reply whose seq isn't known, or a turn read from a checkpoint, leaves the turn's
+                // messages without sources.
+                self.open_sources.0 = match (self.open_sources.0.take(), seq) {
+                    (Some(mut known), Some(seq)) => {
+                        known.push(seq);
+                        Some(known)
+                    }
+                    _ => None,
+                };
                 if turn.replies.len() == turn.calls.len() {
                     let mut turn = self.open.take().expect("checked above");
                     let results = turn
@@ -785,10 +835,18 @@ impl Conversation {
                         })
                         .collect();
                     let entry = self.open_entry.take().unwrap_or_default();
-                    self.place(turn.assistant, entry);
+                    // Both messages of the turn come back from the same records: the assistant's
+                    // record and its replies, folded again in order.
+                    let turn_sources: Arc<[u64]> = self
+                        .open_sources
+                        .0
+                        .take()
+                        .map_or_else(|| Arc::from([]), Arc::from);
+                    self.place(turn.assistant, entry, Arc::clone(&turn_sources));
                     self.place(
                         Arc::new(Message::new(Role::Tool, results)),
                         EntryState::default(),
+                        turn_sources,
                     );
                 }
             }
@@ -807,6 +865,17 @@ impl Conversation {
                     )? {
                         let ordinal = self.window_start() + at as u64;
                         self.changes.message(ordinal);
+                        match seq {
+                            Some(seq) => self.messages[at].add_source(seq),
+                            // Its content changed by a record nothing can read back: it stays
+                            // held for good.
+                            None => {
+                                let held = Arc::clone(
+                                    self.messages[at].held().expect("just changed in place"),
+                                );
+                                self.messages[at] = WindowMessage::new(held);
+                            }
+                        }
                     }
                 } else {
                     self.attach_delivery(append);
@@ -890,7 +959,118 @@ impl Conversation {
 }
 
 mod window_message;
-pub use window_message::{BlockKind, BlockRef, BlockShape, NotHeld, WindowMessage};
+pub use window_message::{BlockKind, BlockRef, BlockShape, Blocks, NotHeld, WindowMessage};
+
+/// Why a window message couldn't be read back (see [`Conversation::read_back`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadBackError {
+    /// No message with that ordinal is in the window.
+    NotInWindow(u64),
+    /// The records didn't fold.
+    Fold(FoldError),
+    /// The records folded to a message other than the one the window holds.
+    Mismatch(u64),
+}
+
+impl Conversation {
+    /// The window message at `ordinal` with all its content: the message itself while it is
+    /// held, or else folded again from `records`, the records at its sources in order
+    /// (`WindowMessage::sources`), and checked against what the window keeps of it.
+    pub fn read_back(
+        &self,
+        ordinal: u64,
+        records: &[Record],
+    ) -> Result<Arc<Message>, ReadBackError> {
+        let message = self
+            .window_message(ordinal)
+            .ok_or(ReadBackError::NotInWindow(ordinal))?;
+        if let Some(held) = message.held() {
+            return Ok(Arc::clone(held));
+        }
+        // A tool turn's records place its assistant message, then its results message, so the
+        // results message's records start one place before it.
+        let turn = matches!(
+            records.first(),
+            Some(Record::Assistant(assistant))
+                if assistant.message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                    && assistant.budget_finalize != Some(true)
+        );
+        let first = if turn && message.role() == Role::Tool {
+            ordinal - 1
+        } else {
+            ordinal
+        };
+        let mut scratch = Conversation::new(self.appends_in_conversation);
+        scratch.joined_through = self.joined_through;
+        scratch.placed = first - 1;
+        for record in records {
+            scratch.apply(record).map_err(ReadBackError::Fold)?;
+        }
+        let read = scratch
+            .held_message(ordinal)
+            .ok()
+            .flatten()
+            .ok_or(ReadBackError::Mismatch(ordinal))?;
+        if !message.stands_for(read) {
+            return Err(ReadBackError::Mismatch(ordinal));
+        }
+        Ok(Arc::clone(read))
+    }
+
+    /// Releases the blocks at `blocks` (indexes into its blocks) of the window message at
+    /// `ordinal` from memory, unless it is the window's newest message, which the fold may still
+    /// change, or its sources aren't known. Whether anything was released.
+    pub fn release(&mut self, ordinal: u64, blocks: &[usize]) -> bool {
+        if ordinal >= self.placed {
+            return false;
+        }
+        let start = self.window_start();
+        let Some(at) = ordinal.checked_sub(start).map(|at| at as usize) else {
+            return false;
+        };
+        let Some(released) = self
+            .messages
+            .get(at)
+            .and_then(|message| message.releasing(blocks))
+        else {
+            return false;
+        };
+        let changed = released != self.messages[at];
+        self.messages[at] = released;
+        changed
+    }
+
+    /// The ordinals of the window's messages whose content was released, ascending.
+    pub fn released_ordinals(&self) -> Vec<u64> {
+        let start = self.window_start();
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.is_released())
+            .map(|(at, _)| start + at as u64)
+            .collect()
+    }
+
+    /// Holds the window message at `ordinal` whole again: `whole` is that message read back
+    /// (see [`Conversation::read_back`]), checked against what the window keeps of it. Whether
+    /// it was taken: a message not in the window, or one `whole` doesn't stand for, is left as it
+    /// is.
+    pub fn restore(&mut self, ordinal: u64, whole: Arc<Message>) -> bool {
+        let start = self.window_start();
+        let Some(at) = ordinal.checked_sub(start).map(|at| at as usize) else {
+            return false;
+        };
+        let Some(message) = self.messages.get_mut(at) else {
+            return false;
+        };
+        if message.held().is_some() || !message.stands_for(&whole) {
+            return false;
+        }
+        let sources: Arc<[u64]> = message.sources().into();
+        *message = WindowMessage::from_records(whole, sources);
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests;

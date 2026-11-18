@@ -42,9 +42,11 @@ const KEPT_RECORDS: u64 = 296;
 /// The kept records' buffer beyond its records. Today: 0.023. Target: none, a buffer sized for
 /// the latest run.
 const KEPT_SPARE: u64 = 26;
-/// The id index. Today: 0.012. Target: positions only, a few bytes per id. Rounded up to the
-/// next thousandth.
-const ID_INDEX: u64 = 14;
+/// The id index. Today: 0.033: 0.012 for the ids, and 0.021 for the place of each transcript
+/// record in the open log (24 bytes each), which is what lets a window message's content leave
+/// memory and be read back from its records. Target: positions only, a few bytes per id and per
+/// record. Measure plus 10%, rounded up to the next thousandth.
+const ID_INDEX: u64 = 37;
 /// Everything else, the session's interned values included. Today: 0.008 (39 KB). Target: a
 /// small share of the idle budget. Rounded up to the next thousandth.
 const REST: u64 = 10;

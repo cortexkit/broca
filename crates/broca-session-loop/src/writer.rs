@@ -204,6 +204,19 @@ pub trait Writer {
         None
     }
 
+    /// The window message at `ordinal` with all its content: the message itself while it is held,
+    /// or else read back from the session's open log (see `Session::window_message_whole`).
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError>;
+
+    /// Releases from memory the content of the blocks `blocks` names, each by its message's
+    /// window ordinal and its block indexes, in every copy of the window this writer reaches (see
+    /// `Conversation::release`). A block that can't be released stays held: the window's newest
+    /// message, or one whose records aren't known.
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError>;
+
     /// Hands the session's owner a weak handle on the transcript a run keeps, once, when the run
     /// starts, so the owner's memory report can size it while the run holds it. A writer whose
     /// owner reports nothing ignores it.
@@ -390,6 +403,18 @@ impl<B: SessionBackend> Writer for Session<B> {
         self.find_run_start(run_id).await
     }
 
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        Session::window_message_whole(self, ordinal).await
+    }
+
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        Session::release(self, blocks);
+        Ok(())
+    }
+
     async fn tool_intent(
         &self,
         call_key: &str,
@@ -403,6 +428,23 @@ impl<B: SessionBackend> Writer for Session<B> {
                 _ => None,
             }))
     }
+}
+
+/// A copy of `writer`'s conversation with every window message held whole: each one whose
+/// content was released from memory is read back (`Writer::window_message_whole`). For a reader
+/// that renders the whole window offline, such as a rebuild of a recorded request; it holds the
+/// window's full content only while the copy lives.
+pub async fn whole_conversation<W: Writer>(writer: &W) -> Result<Conversation, SessionError> {
+    let mut conversation = writer.conversation().clone();
+    for ordinal in conversation.released_ordinals() {
+        let whole = writer.window_message_whole(ordinal).await?;
+        if !conversation.restore(ordinal, whole) {
+            return Err(SessionError::Fold(format!(
+                "window message {ordinal} didn't read back as the message the window keeps"
+            )));
+        }
+    }
+    Ok(conversation)
 }
 
 /// Whether `records` end or pause the run, so their batch must be durable when appended.

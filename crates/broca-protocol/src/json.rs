@@ -50,6 +50,20 @@ impl Json {
         rest.is_empty().then(|| Self(Arc::from(text)))
     }
 
+    /// The JSON a released tool call holds in place of its input, an empty object: like
+    /// [`crate::text::Text::released`], one allocation for the whole process, recognised by
+    /// identity ([`Json::is_released`]), never by its text.
+    pub fn released() -> Self {
+        static RELEASED: std::sync::LazyLock<Arc<str>> =
+            std::sync::LazyLock::new(|| Arc::from("{}"));
+        Self(Arc::clone(&RELEASED))
+    }
+
+    /// Whether this is the released JSON ([`Json::released`]).
+    pub fn is_released(&self) -> bool {
+        Arc::ptr_eq(&self.0, &Self::released().0)
+    }
+
     /// JSON `null`.
     pub fn null() -> Self {
         Self(Arc::from("null"))

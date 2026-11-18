@@ -119,6 +119,14 @@ pub enum Request {
         entries: broca_session_store::record::EnrolledEntries,
         reply: Reply<broca_session_store::record::EnrollmentOverlayRef>,
     },
+    WindowMessageWhole {
+        ordinal: u64,
+        reply: Reply<Arc<broca_protocol::Message>>,
+    },
+    Release {
+        blocks: Vec<(u64, Vec<usize>)>,
+        reply: Reply<()>,
+    },
     Seal {
         /// `Some` for a cut before the entry with this ordinal, `None` for a ledger seal.
         ordinal: Option<u64>,
@@ -414,6 +422,34 @@ impl Writer for ActorWriter {
         .await
     }
 
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<Arc<broca_protocol::Message>, SessionError> {
+        if let Some(held) = self
+            .conversation
+            .window_message(ordinal)
+            .and_then(|message| message.held())
+        {
+            return Ok(Arc::clone(held));
+        }
+        self.ask(|reply| Request::WindowMessageWhole { ordinal, reply })
+            .await
+    }
+
+    /// Releases the blocks in the run's copy of the window and in the session's, which share
+    /// their content: either alone frees nothing.
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        for (ordinal, indexes) in blocks {
+            self.conversation.release(*ordinal, indexes);
+        }
+        self.ask(|reply| Request::Release {
+            blocks: blocks.to_vec(),
+            reply,
+        })
+        .await
+    }
+
     async fn enrollment(
         &self,
     ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
@@ -581,6 +617,12 @@ impl RunLink {
                 let _ = reply.send(Err(
                     "the session owner does not rebuild recorded requests".into()
                 ));
+            }
+            Request::WindowMessageWhole { ordinal, reply } => {
+                let _ = reply.send(session.window_message_whole(ordinal).await);
+            }
+            Request::Release { blocks, reply } => {
+                let _ = reply.send(session.release(&blocks).await);
             }
             Request::RunStart { run_id, reply } => {
                 let _ = reply.send(session.run_start(&run_id).await);

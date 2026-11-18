@@ -1,4 +1,8 @@
+use broca_protocol::content::Message;
+use broca_protocol::request::EpisodeRenderInput;
 use broca_session_store::fold::conversation::Conversation;
+
+use crate::run::LoopError;
 
 pub(crate) fn after_input(config: &serde_json::Value) -> bool {
     config
@@ -57,4 +61,69 @@ pub(crate) fn first_answer(
         return missing.or(Some(conversation.window_start() as usize - 1));
     }
     None
+}
+
+/// Adds today's repetition guidance to the copies of tool results the request sends, never to
+/// what's stored: each run's model steps (from its first answer up to the next run's input) are
+/// folded with fresh counters, as today's loop counts within one run.
+/// Adds each run's repetition warnings to its window messages. `prompt` holds the window, whose
+/// first message has session position `first`, while each run's place is a session position. A
+/// run that started before the window counts on from `spanning`, the counters the latest cut kept
+/// for its sealed steps; without them none of its steps were sealed.
+pub(crate) fn repetition_guidance(
+    prompt: &mut [Message],
+    episodes: &[EpisodeRenderInput],
+    first: u64,
+    spanning: Option<&serde_json::Value>,
+    corrected: Option<(
+        &broca_session_store::fold::conversation::Conversation,
+        String,
+    )>,
+) -> Result<(), LoopError> {
+    let len = prompt.len();
+    let index = |position: usize| position.saturating_sub(first as usize).min(len);
+    for (at, episode) in episodes.iter().enumerate() {
+        let start = index(episode.prompt_start);
+        let end = index(
+            episodes
+                .get(at + 1)
+                .map_or(usize::MAX, |next| next.prompt_start),
+        );
+        if start >= end {
+            continue;
+        }
+        let corrected_start = match &corrected {
+            Some((conversation, session)) => {
+                match first_answer(conversation, episode.prompt_start, session) {
+                    Some(position) => Some(index(position)),
+                    None => continue,
+                }
+            }
+            None => None,
+        };
+        if episode.prompt_start < first as usize {
+            if let Some(seed) = spanning {
+                let seed = serde_json::from_value(seed.clone()).map_err(|error| {
+                    LoopError::Parts(format!("stored repetition counters: {error}"))
+                })?;
+                if !broca_core::repetition::restore_repetition_guidance_seeded(
+                    &mut prompt[start..end],
+                    &seed,
+                ) {
+                    return Err(LoopError::Parts(
+                        "stored repetition counters were taken under other warning rules".into(),
+                    ));
+                }
+                continue;
+            }
+        }
+        let first_step = corrected_start.or_else(|| {
+            (start..end)
+                .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant)
+        });
+        if let Some(first_step) = first_step {
+            broca_core::repetition::restore_repetition_guidance(&mut prompt[first_step..end]);
+        }
+    }
+    Ok(())
 }

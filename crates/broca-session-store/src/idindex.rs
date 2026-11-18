@@ -849,6 +849,9 @@ struct Filed {
     in_kept: Vec<u64>,
     /// Where the frame of each other record that names an id lies in the open log, in seq order.
     places: Vec<(u64, FramePlace)>,
+    /// Where the frame of each transcript record lies in the open log, in seq order, so a window
+    /// message whose content was released from memory is read back from its records alone.
+    transcript: Vec<(u64, FramePlace)>,
 }
 
 /// Where a record a lookup found is (see [`OpenIds::find`]).
@@ -874,6 +877,7 @@ impl OpenIds {
             held: BTreeMap::new(),
             in_kept: Vec::new(),
             places: Vec::new(),
+            transcript: Vec::new(),
         }))
     }
 
@@ -885,9 +889,30 @@ impl OpenIds {
     /// Files the ids `record`, at `seq` with its frame at `place`, names, holding a copy of the
     /// record when a lookup takes it from memory: for a record the kept records don't hold.
     pub fn add(&mut self, seq: u64, record: &Record, place: FramePlace) {
+        self.place_transcript(seq, record, place);
         if self.file(seq, record, place) {
             self.hold(seq, record.clone());
         }
+    }
+
+    /// Notes where the frame of `record`, at `seq`, lies, when it is a transcript record.
+    /// Records come in seq order; one already noted keeps its place.
+    pub(crate) fn place_transcript(&mut self, seq: u64, record: &Record, place: FramePlace) {
+        if record.stream() != crate::record::Stream::Transcript {
+            return;
+        }
+        if self.0.transcript.last().is_none_or(|(last, _)| *last < seq) {
+            self.0.transcript.push((seq, place));
+        }
+    }
+
+    /// Where the frame of the transcript record at `seq` lies in the open log, if it is there.
+    pub fn transcript_place(&self, seq: u64) -> Option<FramePlace> {
+        let transcript = &self.0.transcript;
+        transcript
+            .binary_search_by_key(&seq, |(at, _)| *at)
+            .ok()
+            .map(|at| transcript[at].1)
     }
 
     /// Files the ids `record`, at `seq` with its frame at `place`, names. Returns whether a
@@ -1005,13 +1030,14 @@ mod tests;
 impl crate::held::HeldBytes for OpenIds {
     fn heap_bytes(&self) -> usize {
         // The box, then what it holds: the ids filed, the records held in memory, the log
-        // sequence numbers the kept records hold for the index, and the places of the records
-        // found by place.
+        // sequence numbers the kept records hold for the index, the places of the records
+        // found by place, and the places of the transcript records.
         let filed = &self.0;
         std::mem::size_of::<Filed>()
             + filed.ids.heap_bytes()
             + filed.held.heap_bytes()
             + filed.in_kept.heap_bytes()
-            + filed.places.capacity() * std::mem::size_of::<(u64, FramePlace)>()
+            + (filed.places.capacity() + filed.transcript.capacity())
+                * std::mem::size_of::<(u64, FramePlace)>()
     }
 }

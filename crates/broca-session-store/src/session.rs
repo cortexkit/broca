@@ -187,6 +187,7 @@ impl Folds {
         self.media
             .note(seq, &record, &self.conversation, &self.operations);
         let ledger = record.stream() == Stream::Ledger;
+        self.open_ids.place_transcript(seq, &record, place);
         let mut from_memory = false;
         if !(ledger && seq <= self.covers_through) {
             if ledger {
@@ -304,7 +305,7 @@ pub fn apply(
         Stream::Transcript => {
             conversation.enrolled(operations.enrolled_through());
             conversation
-                .apply(record)
+                .apply_at(Some(seq), record)
                 .map_err(|e| format!("conversation: {e:?}"))
         }
         Stream::Ledger => {
@@ -1078,6 +1079,7 @@ impl<B: SessionBackend> Session<B> {
             for (seq, record) in dropped {
                 self.open_ids.adopt(seq, record);
             }
+            self.open_ids.place_transcript(seq, record, place);
             if record.stream() == Stream::Ledger && self.open_ids.file(seq, record, place) {
                 self.open_ids.kept_holds(seq);
             }
@@ -1369,6 +1371,7 @@ impl<B: SessionBackend> Session<B> {
 
 mod kept;
 mod model_fallback;
+mod release;
 pub use model_fallback::ReplyModelFallback;
 pub mod moves;
 pub use kept::InMemory;
@@ -1396,7 +1399,9 @@ pub use enrollment::EnrollmentOverlay;
 
 mod read;
 mod tail;
-pub use read::{served_window, window_entries, StoredEntry, SEALED_ENTRIES_MAX_BYTES};
+pub use read::{
+    served_window, window_entries, window_entries_with, StoredEntry, SEALED_ENTRIES_MAX_BYTES,
+};
 mod stored;
 pub use stored::{LogFrom, StoredRecords};
 mod cold;

@@ -207,7 +207,7 @@ async fn compare_with_render(
     streams::pin(&streams::store(&commands).await);
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
-    broca_test_support::pin!("the conversation", texts(&session));
+    broca_test_support::pin!("the conversation", texts(&session).await);
     broca_test_support::pin!(
         "what each run's start recorded",
         store_starts(&session).await

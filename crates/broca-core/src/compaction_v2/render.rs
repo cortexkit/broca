@@ -18,6 +18,14 @@ use cortexkit_role_compaction::{
     view::{Edit, EditOp, InsertAt, InsertedImage, View},
 };
 
+mod release;
+pub use release::{releasable, released_but_read};
+
+/// Why a render refuses a part whose block left memory: the caller reads it back first
+/// ([`released_but_read`]), so reaching this is a bug, and a refusal is safer than a request
+/// with the released placeholder in it.
+const RELEASED_READ: &str = "a part the view sends was released from memory and not read back";
+
 /// Rebuild a request offline for a log whose first run froze a compaction plan version.
 /// Boundary options must already contain restored tool-output decorations. Image capture belongs
 /// to the live boundary; offline rendering only recreates content-addressed image references.
@@ -125,6 +133,21 @@ pub fn prompt_view_kept(
 ) -> Result<Vec<Message>, String> {
     let (edits, plan) = plan_for_render(entries, view, rules, floor)?;
     render_planned(stored, entries, rides, &edits, plan, image, kept)
+}
+
+/// Renders `plan`, which [`plan_for_render`] made with `edits`, over `stored`, as
+/// [`prompt_view_kept`] does after planning: for a caller that reads the plan first (see
+/// [`released_but_read`]).
+pub fn prompt_planned(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
+    edits: &[Edit],
+    plan: render::RenderPlan,
+    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+    kept: Option<&RenderCache>,
+) -> Result<Vec<Message>, String> {
+    render_planned(stored, entries, rides, edits, plan, image, kept)
 }
 
 /// What rendering `view` over `entries` keeps of them, before any message is rendered: the
@@ -508,6 +531,13 @@ fn render_entry(
             .content
             .get(index)
             .ok_or("compaction part id exceeds native block count")?;
+        let replaced_text = matches!(
+            source,
+            ContentBlock::Text { .. } | ContentBlock::TextWithState { .. }
+        ) && part.replace.iter().any(|field| field.field == "text");
+        if source.holds_released() && !replaced_text {
+            return Err(RELEASED_READ.into());
+        }
         let neutral = entry
             .parts
             .iter()
@@ -553,6 +583,10 @@ fn render_entry(
                     else {
                         unreachable!()
                     };
+                    let output_replaced = part.replace.iter().any(|field| field.field == "output");
+                    if result.output.holds_released() && !output_replaced {
+                        return Err(RELEASED_READ.into());
+                    }
                     for text in render_result(&mut result.output, tool, &part, mid, rides) {
                         held.push((result_index, text));
                     }

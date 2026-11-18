@@ -196,6 +196,50 @@ impl<'w, W: Writer> StoreJournal<'w, W> {
     }
 }
 
+/// Reads a stored prompt message's released blocks back from its window message, through the
+/// step's journal, which holds the writer while the request is prepared. The stored prompt has
+/// `front` sealed messages in front of the window's, whose first message has ordinal
+/// `window_start`.
+struct StoredReadBack<'j, 'w, W> {
+    journal: &'j StoreJournal<'w, W>,
+    front: usize,
+    window_start: u64,
+}
+
+impl<W: Writer> v2::request::ReadBack for StoredReadBack<'_, '_, W> {
+    async fn read_back(
+        &self,
+        stored: &[broca_protocol::Message],
+        positions: &[usize],
+    ) -> Result<Vec<broca_protocol::Message>, String> {
+        let mut out = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let at = position
+                .checked_sub(self.front)
+                .ok_or("a sealed message in front of the window holds released content")?;
+            let ordinal = self.window_start + at as u64;
+            let whole = self
+                .journal
+                .writer
+                .lock()
+                .await
+                .window_message_whole(ordinal)
+                .await
+                .map_err(|error| format!("reading back window message {ordinal}: {error:?}"))?;
+            let mut message = stored[position].clone();
+            for (index, block) in message.content.iter_mut().enumerate() {
+                if block.holds_released() {
+                    *block = whole.content.get(index).cloned().ok_or_else(|| {
+                        format!("window message {ordinal} read back with fewer blocks")
+                    })?;
+                }
+            }
+            out.push(message);
+        }
+        Ok(out)
+    }
+}
+
 impl<W: Writer> Journal for StoreJournal<'_, W> {
     /// A view a run's step accepted, which no provider handed over through
     /// `session.apply_view`, so it names none, as today's loop journal records none.
@@ -364,8 +408,23 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
     // A session that enrolled serves its earlier messages as its enrollment decided, the global
     // system messages it suppressed as entries with no parts, which render nothing.
     let enrollment = writer.enrollment().await?;
+    // Projecting a message reads its content, so the released ones it projects are read back.
+    let from = ctx
+        .window
+        .projects_from(writer.session_id(), conversation, enrollment.as_ref());
+    let mut whole = std::collections::HashMap::new();
+    for ordinal in conversation.released_ordinals() {
+        if ordinal >= from {
+            whole.insert(ordinal, writer.window_message_whole(ordinal).await?);
+        }
+    }
     ctx.window
-        .update(writer.session_id(), conversation, enrollment.as_ref())
+        .update(
+            writer.session_id(),
+            conversation,
+            enrollment.as_ref(),
+            |ordinal| whole.get(&ordinal).cloned(),
+        )
         .map_err(LoopError::Parts)?;
     let window_start = conversation.window_start();
     if window_start <= 1 {
@@ -611,8 +670,16 @@ pub async fn seal_at_cut<W: Writer, P, T>(
     }
     let carry = carried_views(&*ctx.session.state.lock().await, writer.operations())?;
     let first_kept_ordinal = turn_start(writer.conversation(), first_kept_ordinal);
+    // The counters read the calls and results below the cut, so released content is read back.
+    let whole;
+    let conversation = if writer.conversation().released_ordinals().is_empty() {
+        writer.conversation()
+    } else {
+        whole = crate::writer::whole_conversation(writer).await?;
+        &whole
+    };
     let window_repetition = spanning_repetition(
-        writer.conversation(),
+        conversation,
         first_kept_ordinal,
         after_input.then_some(writer.session_id()).as_deref(),
     )?;
@@ -1113,13 +1180,16 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     ctx: &Ctx,
     step: u64,
     opts: broca_protocol::request::CallOptions,
-    stored: &mut prompt::KeptPrompt,
+    kept: &mut prompt::KeptPrompt,
     rendered: &v2::render::RenderCache,
     moved_from: Option<&Admission>,
     overflow: Option<v2::request::Overflow>,
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
-    let stored = stored.stored(&transcript.sealed);
+    // The stored prompt puts the sealed messages the transcript names in front of the window's.
+    let front = transcript.sealed.len();
+    let window_start = writer.conversation().window_start();
+    let stored = kept.stored(&transcript.sealed);
     let entries = transcript.entries;
     let transcript_rides = transcript.rides;
     let now = (seams.now_ms)();
@@ -1152,7 +1222,12 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .configure(&frozen(admission), admission.manifest.as_deref());
-    let prepared = v2::request::prepare(
+    let read_back = StoredReadBack {
+        journal: &journal,
+        front,
+        window_start,
+    };
+    let prepared = v2::request::prepare_reading_back(
         &ctx.session.state,
         &ctx.session.runtime,
         &journal,
@@ -1181,6 +1256,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             render: Some(rendered),
             overflow,
         },
+        &read_back,
         // A view's inserted image isn't a medium the session captured, so the request shows
         // its provenance marker in its place, as today's storage renders it; only its reference
         // is needed, checked as the view was when accepted.
@@ -1198,8 +1274,13 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         .with(|count| count.set(count.get() + (rendered.rendered() - rendered_before) as usize));
     match prepared {
         v2::request::Prepared::Ready {
-            prompt, applied, ..
+            prompt,
+            applied,
+            restored,
+            releasable,
+            ..
         } => {
+            release_unread(writer, kept, &restored, &releasable, window_start).await?;
             seams
                 .provider
                 .set_cache_evidence_view(applied.map(|view| view.version));
@@ -1221,6 +1302,38 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         .map(Send::Ceiling)
         .map_err(|error| LoopError::Parts(error.to_string())),
     }
+}
+
+/// After a step's request is rendered: the stored prompt holds `restored`, the messages the
+/// render read back, whole again, and the content the render didn't read, `releasable`, leaves
+/// memory, in the stored prompt and in every copy of the window the writer reaches. A released
+/// block stays in the session's open log, and any later reader that needs it reads it back.
+/// The window's first message has ordinal `window_start`.
+async fn release_unread<W: Writer>(
+    writer: &mut W,
+    kept: &mut prompt::KeptPrompt,
+    restored: &[(usize, broca_protocol::Message)],
+    releasable: &[(usize, Vec<usize>)],
+    window_start: u64,
+) -> Result<(), LoopError> {
+    for (position, message) in restored {
+        kept.restore(*position, message)?;
+    }
+    if releasable.is_empty() {
+        return Ok(());
+    }
+    let conversation = writer.conversation();
+    let released = kept.release(releasable, window_start, |ordinal, index, block| {
+        use broca_session_store::fold::conversation::BlockRef;
+        conversation
+            .window_message(ordinal)
+            .and_then(|message| message.blocks().nth(index))
+            .is_some_and(|held| matches!(held, BlockRef::Held(held) if held == block))
+    });
+    if !released.is_empty() {
+        writer.release(&released).await?;
+    }
+    Ok(())
 }
 
 /// Tells the compaction provider about entries written since its last notice, as today's loop

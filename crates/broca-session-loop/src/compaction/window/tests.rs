@@ -387,7 +387,7 @@ fn a_kept_transcripts_estimate_matches_the_allocator_and_its_handle_keeps_nothin
     let (window, built) = measure(|| {
         let window = super::WindowTranscript::default();
         window
-            .update(session.session_id(), &session.conversation, None)
+            .update(session.session_id(), &session.conversation, None, |_| None)
             .unwrap();
         window
     });

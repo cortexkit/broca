@@ -2047,6 +2047,7 @@ async fn offline_request_for<W: Writer>(
         defer_media_tags,
         enrollment.as_ref(),
         None,
+        None,
     )?;
     finalize_tool_choice(writer, &mut opts);
     if !compacted {
@@ -2603,6 +2604,20 @@ where
             run_tag_rules(writer, &episodes, &mut tag_rules).await?
         };
         let enrollment = writer.enrollment().await?;
+        // Deriving the stored prompt again reads every window message's content, so content
+        // the window released is read back first, for this step only.
+        let whole = if compaction.is_some()
+            && !writer.conversation().released_ordinals().is_empty()
+            && kept_prompt.rederives(
+                writer,
+                &episodes,
+                enrollment.as_ref(),
+                crate::repetition::after_input(&admission.render_config),
+            ) {
+            Some(crate::writer::whole_conversation(writer).await?)
+        } else {
+            None
+        };
         let mut opts = call_options(
             writer,
             admission,
@@ -2615,7 +2630,9 @@ where
             defer_media_tags,
             enrollment.as_ref(),
             compaction.map(|_| &mut kept_prompt),
+            whole.as_ref(),
         )?;
+        drop(whole);
         // The step names the account routing gives the run now, as today's does.
         if let Some(context) = opts.step_context.as_mut() {
             let selection = run_selection(seams, admission);
@@ -3973,6 +3990,7 @@ fn call_options<W: Writer>(
     defer_media_tags: bool,
     enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
     kept: Option<&mut crate::compaction::prompt::KeptPrompt>,
+    whole: Option<&broca_session_store::fold::conversation::Conversation>,
 ) -> Result<CallOptions, LoopError> {
     let contract = admission.compaction_plan_version.is_some();
     let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
@@ -3984,6 +4002,7 @@ fn call_options<W: Writer>(
                 episodes,
                 enrollment,
                 crate::repetition::after_input(&admission.render_config),
+                whole,
             )?;
             Vec::new()
         }
@@ -4015,7 +4034,7 @@ fn call_options<W: Writer>(
                 writer.conversation(),
                 rides_after_results(admission),
             );
-            repetition_guidance(
+            crate::repetition::repetition_guidance(
                 &mut prompt,
                 episodes,
                 writer.conversation().window_start() - 1,
@@ -4151,71 +4170,6 @@ fn call_options<W: Writer>(
             .map_err(LoopError::Parts)?
             .unwrap_or(opts),
     )
-}
-
-/// Adds today's repetition guidance to the copies of tool results the request sends, never to
-/// what's stored: each run's model steps (from its first answer up to the next run's input) are
-/// folded with fresh counters, as today's loop counts within one run.
-/// Adds each run's repetition warnings to its window messages. `prompt` holds the window, whose
-/// first message has session position `first`, while each run's place is a session position. A
-/// run that started before the window counts on from `spanning`, the counters the latest cut kept
-/// for its sealed steps; without them none of its steps were sealed.
-pub(crate) fn repetition_guidance(
-    prompt: &mut [Message],
-    episodes: &[EpisodeRenderInput],
-    first: u64,
-    spanning: Option<&serde_json::Value>,
-    corrected: Option<(
-        &broca_session_store::fold::conversation::Conversation,
-        String,
-    )>,
-) -> Result<(), LoopError> {
-    let len = prompt.len();
-    let index = |position: usize| position.saturating_sub(first as usize).min(len);
-    for (at, episode) in episodes.iter().enumerate() {
-        let start = index(episode.prompt_start);
-        let end = index(
-            episodes
-                .get(at + 1)
-                .map_or(usize::MAX, |next| next.prompt_start),
-        );
-        if start >= end {
-            continue;
-        }
-        let corrected_start = match &corrected {
-            Some((conversation, session)) => {
-                match crate::repetition::first_answer(conversation, episode.prompt_start, session) {
-                    Some(position) => Some(index(position)),
-                    None => continue,
-                }
-            }
-            None => None,
-        };
-        if episode.prompt_start < first as usize {
-            if let Some(seed) = spanning {
-                let seed = serde_json::from_value(seed.clone()).map_err(|error| {
-                    LoopError::Parts(format!("stored repetition counters: {error}"))
-                })?;
-                if !broca_core::repetition::restore_repetition_guidance_seeded(
-                    &mut prompt[start..end],
-                    &seed,
-                ) {
-                    return Err(LoopError::Parts(
-                        "stored repetition counters were taken under other warning rules".into(),
-                    ));
-                }
-                continue;
-            }
-        }
-        let first_step = corrected_start.or_else(|| {
-            (start..end)
-                .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant)
-        });
-        if let Some(first_step) = first_step {
-            broca_core::repetition::restore_repetition_guidance(&mut prompt[first_step..end]);
-        }
-    }
-    Ok(())
 }
 
 struct Step {

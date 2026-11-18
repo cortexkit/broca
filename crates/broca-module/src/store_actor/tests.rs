@@ -867,18 +867,21 @@ pub(super) async fn idle(commands: &mpsc::UnboundedSender<LineageCmd>) {
     panic!("the session never went idle");
 }
 
-pub(super) fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
-    session
-        .conversation()
-        .held_messages()
-        .unwrap()
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
+/// The text blocks of the session's window, in order, with released content read back.
+pub(super) async fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
+    let conversation = session.conversation();
+    let mut texts = Vec::new();
+    for ordinal in conversation.window_start()..=conversation.placed {
+        if conversation.window_message(ordinal).is_none() {
+            continue;
+        }
+        let message = session.window_message_whole(ordinal).await.unwrap();
+        texts.extend(message.content.iter().filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.to_string()),
             _ => None,
-        })
-        .collect()
+        }));
+    }
+    texts
 }
 
 #[cfg(feature = "test-clock")]
@@ -1054,7 +1057,7 @@ async fn a_send_on_an_idle_session_runs_through_the_actor() {
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "second", "again"]);
     let run = session.operations().run.as_ref().expect("the session ran");
     assert_eq!(run.start.as_ref().unwrap().run_id, "r2");
     assert_eq!(
@@ -1333,7 +1336,11 @@ async fn a_keyed_retry_is_answered_from_the_run_it_started() {
             None,
         ))
     );
-    assert_eq!(texts(&session), ["first", "hello"], "the retry ran nothing");
+    assert_eq!(
+        texts(&session).await,
+        ["first", "hello"],
+        "the retry ran nothing"
+    );
     assert_eq!(starts(&session).await, 1);
 }
 
@@ -1353,7 +1360,7 @@ async fn a_retry_with_another_payload_is_refused_naming_what_differs() {
     );
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello"]);
+    assert_eq!(texts(&session).await, ["first", "hello"]);
     assert_eq!(
         starts(&session).await,
         1,
@@ -1381,7 +1388,7 @@ async fn a_retry_of_the_running_run_is_active_until_it_ends() {
     idle(&commands).await;
     assert_eq!(keyed(&commands, "k1", "first").await, finished("r-k1"));
     drop(commands);
-    assert_eq!(texts(&served.await.unwrap()), ["first", "hello"]);
+    assert_eq!(texts(&served.await.unwrap()).await, ["first", "hello"]);
 }
 
 /// A retry of a run that is no longer the session's latest is answered from that run's own end,
@@ -1406,7 +1413,7 @@ async fn a_retry_of_an_earlier_run_is_answered_from_its_end() {
     assert_eq!(keyed(&commands, "k1", "first").await, finished("r-k1"));
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "second", "again"]);
 }
 
 /// A run paused for sign-in owns the session: a new send is refused naming it and starts
@@ -1448,7 +1455,7 @@ async fn a_sign_in_pause_resumes_on_its_retry() {
         run.finished,
         Some(broca_protocol::RunFinishReason::Completed)
     );
-    assert_eq!(texts(&session), ["first", "hello"]);
+    assert_eq!(texts(&session).await, ["first", "hello"]);
     assert_eq!(
         starts(&session).await,
         1,
@@ -1481,7 +1488,7 @@ async fn a_running_runs_routing_decision_is_fixed() {
     gate.notify_one();
     idle(&commands).await;
     drop(commands);
-    assert_eq!(texts(&served.await.unwrap()), ["first", "hello"]);
+    assert_eq!(texts(&served.await.unwrap()).await, ["first", "hello"]);
 }
 
 /// A send while a run runs is queued durably, answered `pending`, and starts when that run ends,
@@ -1510,7 +1517,7 @@ async fn a_queued_send_runs_when_the_run_before_it_ends() {
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "second", "again"]);
     let start = session
         .operations()
         .run
@@ -1551,7 +1558,7 @@ async fn a_refused_queued_send_ends_and_the_next_one_runs() {
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "third", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "third", "again"]);
     let records = session.open_log_records().await.unwrap();
     let failure = records
         .iter()
@@ -1599,7 +1606,10 @@ async fn a_steer_joins_the_running_run() {
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "steered", "again"]);
+    assert_eq!(
+        texts(&session).await,
+        ["first", "hello", "steered", "again"]
+    );
     assert_eq!(starts(&session).await, 1, "the steer joined the run");
     let run = session.operations().run.as_ref().unwrap();
     assert_eq!(run.completed_steps, 2);
@@ -1636,7 +1646,7 @@ async fn a_steer_with_another_model_is_refused_naming_it() {
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello"]);
+    assert_eq!(texts(&session).await, ["first", "hello"]);
     assert!(!session
         .open_log_records()
         .await
@@ -1698,7 +1708,7 @@ async fn a_queued_send_is_retracted_before_it_runs() {
     );
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "third", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "third", "again"]);
     let records = session.open_log_records().await.unwrap();
     assert!(records.iter().any(|(_, record)| matches!(
         record,
@@ -1748,7 +1758,7 @@ async fn a_retraction_waits_for_a_drained_runs_start() {
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
-    assert_eq!(texts(&session), ["first", "hello", "queued", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "queued", "again"]);
 }
 
 /// A process that crashed while `r1` ran (its first model call in flight) and with `r2` queued
@@ -1815,7 +1825,7 @@ async fn a_crashed_run_ends_interrupted_on_open_and_the_queue_drains() {
         1,
         "only r2 called the model"
     );
-    assert_eq!(texts(&session), ["first", "second", "again"]);
+    assert_eq!(texts(&session).await, ["first", "second", "again"]);
 }
 
 /// A run left running with a boundary cancel pending resumes when the session opens, so the
@@ -1906,7 +1916,7 @@ async fn a_sign_in_pause_stays_paused_on_open() {
         session.operations().run.as_ref().unwrap().finished,
         Some(broca_protocol::RunFinishReason::Completed)
     );
-    assert_eq!(texts(&session), ["first", "hello"]);
+    assert_eq!(texts(&session).await, ["first", "hello"]);
 }
 
 /// A process that crashed after `r1` ended, while the drain was starting the run of `r2`,
@@ -1944,7 +1954,7 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
         Some(broca_protocol::RunFinishReason::Completed)
     );
     assert!(session.operations().queue.is_empty());
-    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+    assert_eq!(texts(&session).await, ["first", "hello", "second", "again"]);
 }
 
 /// A fetch plan's manifest for these tests, with `plan` as the plan the caller sent: the tools
@@ -2151,7 +2161,7 @@ async fn a_later_send_with_another_plan_is_refused() {
     assert_eq!(starts(&session).await, 2, "the refused send started no run");
     // The first run opens with the manifest's system text, as its input recorded it.
     assert_eq!(
-        texts(&session),
+        texts(&session).await,
         ["you are a worker", "first", "hello", "third", "again"]
     );
 }

@@ -241,21 +241,40 @@ impl WindowTranscript {
         WeakWindow(Arc::downgrade(&self.0))
     }
 
+    /// The first window ordinal [`WindowTranscript::update`] would project, when brought up to
+    /// `conversation` read through session `session` under `enrollment`: a caller reads back the
+    /// released messages from there on first.
+    pub(super) fn projects_from(
+        &self,
+        session: String,
+        conversation: &Conversation,
+        enrollment: Option<&EnrollmentOverlay>,
+    ) -> u64 {
+        let kept = self.0.lock().expect("window transcript");
+        let key = window_key(session, conversation, enrollment);
+        let from =
+            if kept.key.as_ref() != Some(&key) || kept.states.len() > conversation.entries.len() {
+                0
+            } else {
+                kept.first_changed(conversation)
+                    .map_or(kept.states.len(), |changed| changed.min(kept.states.len()))
+            };
+        conversation.window_start() + from as u64
+    }
+
     /// Brings the window's entries up to `conversation`, read through session `session` under
     /// `enrollment`: projects the messages placed since the last read, and again any whose entry
-    /// changed (see the module's notes).
+    /// changed (see the module's notes). `whole` gives a window message whose content was
+    /// released, read back, for each one from [`WindowTranscript::projects_from`] on.
     pub(super) fn update(
         &self,
         session: String,
         conversation: &Conversation,
         enrollment: Option<&EnrollmentOverlay>,
+        whole: impl Fn(u64) -> Option<Arc<Message>>,
     ) -> Result<(), String> {
         let mut kept = self.0.lock().expect("window transcript");
-        let key = WindowKey {
-            session,
-            window_start: conversation.window_start(),
-            enrolled_through: enrollment.map(EnrollmentOverlay::through_ordinal),
-        };
+        let key = window_key(session, conversation, enrollment);
         if kept.key.as_ref() != Some(&key) || kept.states.len() > conversation.entries.len() {
             kept.reset_window(key);
         }
@@ -270,7 +289,7 @@ impl WindowTranscript {
         kept.seen = conversation.changes.mark();
         let from = conversation.window_start() + kept.states.len() as u64;
         for stored in
-            broca_session_store::session::window_entries(conversation, from, usize::MAX)
+            broca_session_store::session::window_entries_with(conversation, from, usize::MAX, whole)
                 .map_err(|not| format!("window message {} isn't held in memory", not.ordinal))?
         {
             let state = stored.state.clone();
@@ -383,3 +402,16 @@ impl WindowTranscript {
 
 #[cfg(test)]
 mod tests;
+
+/// What the window's kept entries were projected under (see [`WindowTranscript::update`]).
+fn window_key(
+    session: String,
+    conversation: &Conversation,
+    enrollment: Option<&EnrollmentOverlay>,
+) -> WindowKey {
+    WindowKey {
+        session,
+        window_start: conversation.window_start(),
+        enrolled_through: enrollment.map(EnrollmentOverlay::through_ordinal),
+    }
+}

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use broca_core::repetition::RepetitionGuidance;
 use broca_core::tags::TagNumbering;
-use broca_protocol::content::{Message, Role};
+use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::request::{EpisodeRenderInput, RenderHistory};
 use broca_protocol::tags::ComputedRules;
 use broca_session_store::fold::conversation::{ChangeMark, Conversation};
@@ -123,7 +123,7 @@ pub(crate) fn contract_prompt(
         .map(|message| Message::clone(message))
         .collect();
     let first = conversation.window_start() - 1;
-    crate::run::repetition_guidance(
+    crate::repetition::repetition_guidance(
         &mut prompt,
         episodes,
         first,
@@ -203,29 +203,67 @@ impl KeptPrompt {
         list
     }
 
+    /// Whether bringing the kept prompt up to `writer`'s window ([`KeptPrompt::update`]) would
+    /// derive it again from the whole window rather than take in only the newest messages. A
+    /// caller whose window has released content reads it back first then (see
+    /// [`crate::writer::whole_conversation`]): deriving reads every message's content.
+    pub(crate) fn rederives<W: Writer>(
+        &self,
+        writer: &W,
+        episodes: &Arc<RenderHistory>,
+        enrollment: Option<&EnrollmentOverlay>,
+        after_input: bool,
+    ) -> bool {
+        let key = Self::key(
+            writer,
+            writer.conversation(),
+            episodes,
+            enrollment,
+            after_input,
+        );
+        !self.keeps(&key, writer.conversation())
+    }
+
+    fn key<W: Writer>(
+        writer: &W,
+        conversation: &Conversation,
+        episodes: &Arc<RenderHistory>,
+        enrollment: Option<&EnrollmentOverlay>,
+        after_input: bool,
+    ) -> Key {
+        Key {
+            session: writer.session_id(),
+            window_start: conversation.window_start(),
+            enrolled_through: enrollment.map(EnrollmentOverlay::through_ordinal),
+            episodes: Arc::clone(episodes),
+            after_input,
+        }
+    }
+
+    fn keeps(&self, key: &Key, conversation: &Conversation) -> bool {
+        self.0.as_ref().is_some_and(|kept| {
+            kept.key == *key
+                && kept.taken <= conversation.messages.len()
+                && conversation.changes.messages_since(kept.seen).is_none()
+        })
+    }
+
     /// Brings the kept prompt up to `writer`'s window, read under `enrollment` with the window's
     /// runs `episodes`: takes in the messages placed since the last step, or derives it again
-    /// (see the module's notes).
+    /// (see the module's notes). `whole` is the window with every message held, which a caller
+    /// reads back when [`KeptPrompt::rederives`] says so and some content was released; the
+    /// writer's own window serves otherwise.
     pub(crate) fn update<W: Writer>(
         &mut self,
         writer: &W,
         episodes: &Arc<RenderHistory>,
         enrollment: Option<&EnrollmentOverlay>,
         after_input: bool,
+        whole: Option<&Conversation>,
     ) -> Result<(), LoopError> {
-        let conversation = writer.conversation();
-        let key = Key {
-            session: writer.session_id(),
-            window_start: conversation.window_start(),
-            enrolled_through: enrollment.map(EnrollmentOverlay::through_ordinal),
-            episodes: Arc::clone(episodes),
-            after_input,
-        };
-        let keeps = self.0.as_ref().is_some_and(|kept| {
-            kept.key == key
-                && kept.taken <= conversation.messages.len()
-                && conversation.changes.messages_since(kept.seen).is_none()
-        });
+        let conversation = whole.unwrap_or_else(|| writer.conversation());
+        let key = Self::key(writer, conversation, episodes, enrollment, after_input);
+        let keeps = self.keeps(&key, conversation);
         if !keeps {
             self.0 = Some(Kept {
                 key,
@@ -284,18 +322,91 @@ impl KeptPrompt {
         kept.numbering
             .number_new(&mut kept.prompt[front..])
             .map_err(overflow)?;
+        // Once content is released the kept prompt holds released blocks and the window can't
+        // be derived without reading back, so the check compares only while all is held.
         #[cfg(debug_assertions)]
-        assert!(
-            kept.prompt[front..]
-                == contract_prompt(
-                    conversation,
-                    episodes,
-                    enrollment,
-                    after_input,
-                    &writer.session_id()
-                )?[..],
-            "the kept stored prompt differs from the window's derived whole"
-        );
+        if conversation.released_ordinals().is_empty()
+            && !kept.prompt[front..]
+                .iter()
+                .any(|message| message.content.iter().any(ContentBlock::holds_released))
+        {
+            assert!(
+                kept.prompt[front..]
+                    == contract_prompt(
+                        conversation,
+                        episodes,
+                        enrollment,
+                        after_input,
+                        &writer.session_id()
+                    )?[..],
+                "the kept stored prompt differs from the window's derived whole"
+            );
+        }
+        Ok(())
+    }
+
+    /// Releases from the kept prompt the blocks `blocks` names, by their position in the stored
+    /// prompt (the sealed messages in front included) and block index: each becomes its released
+    /// form (`ContentBlock::released`). Only a block equal to the window message's own block is
+    /// released, so reading the window message back restores it exactly; a block the kept prompt
+    /// changed (a repetition warning added to a result) stays held. `window_holds` says whether
+    /// the window message at an ordinal holds exactly this block at this index, which a block it
+    /// released earlier doesn't. Returns the released blocks by window ordinal, for the writer to
+    /// release in the window too.
+    pub(crate) fn release(
+        &mut self,
+        blocks: &[(usize, Vec<usize>)],
+        window_start: u64,
+        mut window_holds: impl FnMut(u64, usize, &ContentBlock) -> bool,
+    ) -> Vec<(u64, Vec<usize>)> {
+        let Some(kept) = self.0.as_mut() else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        for (position, indexes) in blocks {
+            let Some(at) = position.checked_sub(kept.front) else {
+                continue;
+            };
+            let ordinal = window_start + at as u64;
+            let Some(message) = kept.prompt.get_mut(*position) else {
+                continue;
+            };
+            for &index in indexes {
+                let Some(block) = message.content.get_mut(index) else {
+                    continue;
+                };
+                if window_holds(ordinal, index, block) {
+                    if let Some(form) = block.released() {
+                        *block = form;
+                    }
+                }
+            }
+            released.push((ordinal, indexes.clone()));
+        }
+        released
+    }
+
+    /// Fills in the released blocks of the stored prompt's message at `position` from `whole`,
+    /// its window message read back, block by block at the same indexes.
+    pub(crate) fn restore(&mut self, position: usize, whole: &Message) -> Result<(), LoopError> {
+        let Some(message) = self
+            .0
+            .as_mut()
+            .and_then(|kept| kept.prompt.get_mut(position))
+        else {
+            return Ok(());
+        };
+        for (index, block) in message.content.iter_mut().enumerate() {
+            if block.holds_released() {
+                *block = whole
+                    .content
+                    .get(index)
+                    .cloned()
+                    .ok_or(LoopError::Parts(format!(
+                        "stored prompt message {position} read back with fewer blocks"
+                    )))?;
+            }
+        }
         Ok(())
     }
 
@@ -331,7 +442,7 @@ impl KeptPrompt {
 
 impl Kept {
     /// Adds to `message`, the window message at `index`, the repetition warnings its run's
-    /// counters give it, as `run::repetition_guidance` adds them run by run: a run's counters
+    /// counters give it, as `repetition::repetition_guidance` adds them run by run: a run's counters
     /// start at its first assistant message, or, for the run a cut split (it starts before the
     /// window's first message `first`), from the counters the cut kept for its sealed steps,
     /// `spanning`, when there are any.

@@ -603,3 +603,140 @@ fn delivered_text_attaches_to_the_call_that_made_it() {
     let (_, results) = conversation.window_entry(2).unwrap();
     assert!(results.delivered.is_empty());
 }
+
+/// `records` folded at seqs 1, 2, ... in order.
+fn fold_at(records: &[Record]) -> Conversation {
+    let mut conversation = Conversation::new(false);
+    for (seq, record) in (1..).zip(records) {
+        conversation.apply_at(Some(seq), record).unwrap();
+    }
+    conversation
+}
+
+fn turn_records() -> Vec<Record> {
+    vec![
+        input("hello", Placement::RunInput),
+        assistant(&["a", "b"]),
+        reply("a", "first result"),
+        reply("b", "second result"),
+        assistant(&[]),
+    ]
+}
+
+/// Each window message knows the seqs of the records its content came from; both messages of a
+/// tool turn come from the assistant's record and its replies.
+#[test]
+fn a_message_folded_at_known_seqs_knows_its_sources() {
+    let conversation = fold_at(&turn_records());
+    let sources: Vec<&[u64]> = conversation
+        .messages
+        .iter()
+        .map(|message| message.sources())
+        .collect();
+    assert_eq!(sources, [&[1][..], &[2, 3, 4], &[2, 3, 4], &[5]]);
+    // A fold that isn't told the seqs knows none.
+    let unknown = fold(&turn_records(), false).unwrap();
+    assert!(unknown
+        .messages
+        .iter()
+        .all(|message| message.sources().is_empty()));
+}
+
+/// A released block keeps its shape (kind, call id, both runner part kinds), its message stops
+/// offering its content, and reading it back from its records gives the original.
+#[test]
+fn a_released_block_keeps_its_shape_and_reads_back_whole() {
+    let records = turn_records();
+    let mut conversation = fold_at(&records);
+    let original = std::sync::Arc::clone(conversation.held_message(3).unwrap().unwrap());
+    let shape_before: Vec<_> = conversation
+        .window_message(3)
+        .unwrap()
+        .blocks()
+        .map(|block| {
+            (
+                block.kind(),
+                block.tool_call_id().cloned(),
+                block.runner_kind(Role::Tool, false),
+                block.runner_kind(Role::Tool, true),
+                block.text_empty(),
+            )
+        })
+        .collect();
+    assert!(conversation.release(3, &[0]));
+    let released = conversation.window_message(3).unwrap();
+    assert!(released.is_released());
+    assert!(released.held().is_none());
+    assert_eq!(
+        conversation.held_message(3),
+        Err(super::NotHeld { ordinal: 3 })
+    );
+    let shape_after: Vec<_> = released
+        .blocks()
+        .map(|block| {
+            (
+                block.kind(),
+                block.tool_call_id().cloned(),
+                block.runner_kind(Role::Tool, false),
+                block.runner_kind(Role::Tool, true),
+                block.text_empty(),
+            )
+        })
+        .collect();
+    assert_eq!(shape_before, shape_after);
+    assert!(matches!(
+        released.blocks().next(),
+        Some(super::BlockRef::Released(_))
+    ));
+    assert!(matches!(
+        released.blocks().nth(1),
+        Some(super::BlockRef::Held(_))
+    ));
+    let read = conversation
+        .read_back(3, &records[1..4])
+        .expect("the turn's records give the message back");
+    assert_eq!(*read, *original);
+    // Releasing again what is already released changes nothing.
+    assert!(!conversation.release(3, &[0]));
+}
+
+/// The assistant message of a turn reads back from the same records as its results message.
+#[test]
+fn a_released_assistant_message_reads_back_from_its_turn() {
+    let records = turn_records();
+    let mut conversation = fold_at(&records);
+    let original = std::sync::Arc::clone(conversation.held_message(2).unwrap().unwrap());
+    assert!(conversation.release(2, &[0, 1]));
+    let read = conversation.read_back(2, &records[1..4]).unwrap();
+    assert_eq!(*read, *original);
+}
+
+/// The newest message stays held, since the fold may still change it, and so does a message
+/// whose records aren't known, since nothing could read it back.
+#[test]
+fn the_newest_message_and_one_without_sources_are_never_released() {
+    let mut conversation = fold_at(&turn_records());
+    assert!(!conversation.release(4, &[0]));
+    assert!(conversation.window_message(4).unwrap().held().is_some());
+    let mut unknown = fold(&turn_records(), false).unwrap();
+    assert!(!unknown.release(3, &[0]));
+    assert!(unknown.window_message(3).unwrap().held().is_some());
+}
+
+/// Records that fold to another message than the one the window keeps are refused, never
+/// served as the original.
+#[test]
+fn a_read_back_that_folds_to_another_message_is_refused() {
+    let records = turn_records();
+    let mut conversation = fold_at(&records);
+    assert!(conversation.release(3, &[0]));
+    let wrong = [
+        records[1].clone(),
+        reply("a", "another result"),
+        records[3].clone(),
+    ];
+    assert_eq!(
+        conversation.read_back(3, &wrong),
+        Err(super::ReadBackError::Mismatch(3))
+    );
+}

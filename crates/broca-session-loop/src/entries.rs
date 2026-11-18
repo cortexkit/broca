@@ -420,6 +420,17 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.run_start(run_id).await
     }
 
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        self.inner.window_message_whole(ordinal).await
+    }
+
+    async fn release(&mut self, blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        self.inner.release(blocks).await
+    }
+
     async fn tool_intent(&self, call_key: &str) -> Result<Option<ToolIntent>, SessionError> {
         self.inner.tool_intent(call_key).await
     }

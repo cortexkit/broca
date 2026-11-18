@@ -116,7 +116,12 @@ async fn rebuild<W: Writer>(
         )?;
         &folded
     } else {
-        writer.conversation()
+        // Content the session released from memory is read back: the rebuild renders the whole
+        // window, as the step did.
+        folded = broca_session_loop::writer::whole_conversation(writer)
+            .await
+            .map_err(|error| format!("the session's window: {error:?}"))?;
+        &folded
     };
     let ordinal = conversation
         .open_entry()
@@ -359,7 +364,9 @@ async fn predecessor<W: Writer>(
     operations.run = prefix.run;
     let snapshot = Before {
         writer,
-        conversation: writer.conversation().clone(),
+        conversation: broca_session_loop::writer::whole_conversation(writer)
+            .await
+            .map_err(|error| format!("the session's window: {error:?}"))?,
         operations,
         ledger: None,
     };
@@ -506,6 +513,18 @@ impl<W: Writer> Writer for Before<'_, W> {
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
         self.writer.run_start(run_id).await
+    }
+
+    async fn window_message_whole(
+        &self,
+        ordinal: u64,
+    ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        self.writer.window_message_whole(ordinal).await
+    }
+
+    /// A rebuild only reads the session as it stood, so it releases nothing.
+    async fn release(&mut self, _blocks: &[(u64, Vec<usize>)]) -> Result<(), SessionError> {
+        Ok(())
     }
     async fn tool_intent(
         &self,

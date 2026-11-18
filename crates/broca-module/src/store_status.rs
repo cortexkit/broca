@@ -952,7 +952,8 @@ pub async fn run_facts<B: SessionBackend>(
                 .find_id(IdKind::SubmissionId, &format!("sub-{run_id}"))
                 .await?
         }
-        (Some(first), Some(_)) => session.records_from(first).await?,
+        // The walk reads ids, kinds and counts, so content released from memory stays out.
+        (Some(first), Some(_)) => session.records_between_released(first, u64::MAX).await?,
         (Some(first), None) => {
             let last = named
                 .iter()
@@ -964,7 +965,7 @@ pub async fn run_facts<B: SessionBackend>(
                         "the run {run_id} has no end, yet a later run started"
                     ))
                 })?;
-            session.records_between(first, last).await?
+            session.records_between_released(first, last).await?
         }
     };
     let mut walk = Walk::new(run_id, parts);

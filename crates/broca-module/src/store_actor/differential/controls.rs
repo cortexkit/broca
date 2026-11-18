@@ -669,7 +669,7 @@ impl Ended {
     /// Pins the session's conversation, the compaction, tool and hook facts its runs' starts
     /// record, the messages each model call was sent, and reads with each opt-in.
     async fn pin(&self) {
-        broca_test_support::pin!("the conversation", store::texts(&self.session));
+        broca_test_support::pin!("the conversation", store::texts(&self.session).await);
         broca_test_support::pin!("the runs' starts", self.store_starts().await);
         broca_test_support::pin!("the messages each model call was sent", self.prompts());
         super::display_reads(&self.session, &self.parts).await;
@@ -770,9 +770,11 @@ async fn a_steers_input_is_transformed_alike() {
         "{hooks:?}"
     );
     assert!(
-        store::texts(&ended.session).contains(&"[noted] more".to_owned()),
-        "{:?}",
         store::texts(&ended.session)
+            .await
+            .contains(&"[noted] more".to_owned()),
+        "{:?}",
+        store::texts(&ended.session).await
     );
 }
 
