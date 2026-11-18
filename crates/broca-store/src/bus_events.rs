@@ -93,6 +93,17 @@ pub(crate) struct State {
     before_write_unlock: Mutex<Option<WriteObserver>>,
 }
 
+/// Adds a run event's `session` header: the plain session name of the session's bind triple,
+/// which a module that sees only its own route's session name (no project root, so it can't
+/// compute `session_ref`) can match on. A NATS header holds printable ASCII only, so a name
+/// with any other character is left out rather than failing the publish.
+fn with_session_header(mut headers: Headers, session: &str) -> Headers {
+    if !session.is_empty() && session.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+        headers.insert("session".into(), session.into());
+    }
+    headers
+}
+
 #[cfg(test)]
 type WriteObserver = Box<dyn Fn(&Connection) + Send + Sync>;
 
@@ -774,13 +785,16 @@ impl EventStore<'_> {
             subject: event
                 .subject(&account)
                 .map_err(|e| StoreError::BusEvent(e.to_string()))?,
-            headers: Headers::from([
-                ("kind".into(), event.detail.name().into()),
-                ("run_id".into(), event.run_id.clone()),
-                ("session_ref".into(), event.session_ref.clone()),
-                ("epoch".into(), epoch.into()),
-                ("seq".into(), event.seq.to_string()),
-            ]),
+            headers: with_session_header(
+                Headers::from([
+                    ("kind".into(), event.detail.name().into()),
+                    ("run_id".into(), event.run_id.clone()),
+                    ("session_ref".into(), event.session_ref.clone()),
+                    ("epoch".into(), epoch.into()),
+                    ("seq".into(), event.seq.to_string()),
+                ]),
+                &session.session,
+            ),
             body: bytes,
             digest: None,
         }))
@@ -1262,6 +1276,10 @@ impl EventStore<'_> {
                 // A skip marker spans runs, so it names none.
                 if headers.get("run_id").is_some_and(String::is_empty) {
                     headers.remove("run_id");
+                }
+                let session: String = r.get(5)?;
+                if let Ok(session) = serde_json::from_str::<BindIdentity>(&session) {
+                    headers = with_session_header(headers, &session.session);
                 }
                 Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None, inline: false })
             },
@@ -1798,6 +1816,36 @@ mod tests {
         let queued = store.pending_bus_event().unwrap().unwrap();
         assert_eq!(queued.body, minted);
         assert_eq!(queued.headers["session_ref"], old);
+    }
+
+    /// A run event names its session in a `session` header, unless the name has a character a
+    /// NATS header can't hold; the event is published either way.
+    #[test]
+    fn run_events_carry_the_plain_session_name_when_a_header_can_hold_it() {
+        for (name, expected) in [
+            ("alfonso:head:agent_1", Some("alfonso:head:agent_1")),
+            ("tab\tin", None),
+            ("çay", None),
+        ] {
+            let store = enabled();
+            let mut session = session();
+            session.session = name.into();
+            store
+                .project_bus_events(
+                    &session,
+                    "epoch",
+                    &[start(), finish(2, RunFinishReason::Completed)],
+                    2000,
+                )
+                .unwrap();
+            let event = store.pending_bus_event().unwrap().unwrap();
+            assert_eq!(
+                event.headers.get("session").map(String::as_str),
+                expected,
+                "{name}"
+            );
+            assert_eq!(event.headers["kind"], "run.started");
+        }
     }
     type OutboxRow = (String, u64, String, Vec<u8>, Option<u64>);
     fn rows(store: &SqliteStore) -> Vec<OutboxRow> {

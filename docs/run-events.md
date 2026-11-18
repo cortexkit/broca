@@ -108,9 +108,13 @@ Pinned byte vectors live in `crates/broca-wire/tests/golden/bus_event.*.json`.
 
 ## Publish and fetch
 
-`Stream::publish(subject, event_key, SHA256(jcs), headers)` uses exactly these
-routing headers: `kind` (for example `run.ended`), `run_id`, `session_ref`, `epoch`
-(the WAL lineage UUID), and decimal `seq`. The event key is lowercase SHA-256 of
+`Stream::publish(subject, event_key, SHA256(jcs), headers)` uses these routing
+headers: `kind` (for example `run.ended`), `run_id`, `session_ref`, `epoch` (the
+WAL lineage UUID), decimal `seq`, and `session`. `session` is the plain session name
+of the session's bind triple, for a module that knows only its own route's session
+name and so can't compute `session_ref`. It is left out when the name holds a
+character outside printable ASCII, which a NATS header can't carry; such an event is
+still published. The event key is lowercase SHA-256 of
 the JCS tuple `[epoch,run_id,seq,subject,null]`; progress substitutes its `at_ms`
 for `null`. A recreated WAL therefore cannot collide with an old sequence.
 
