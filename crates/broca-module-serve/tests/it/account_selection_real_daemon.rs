@@ -1292,7 +1292,25 @@ impl Rig {
         })
     }
 
+    /// Broca refuses a send with the retryable `transient` until it has loaded the vault's
+    /// credential listing, and that refusal starts no run, so it is sent again, as [`send`] does.
     async fn raw_send(&self, name: &str, send_id: &str, extra: Value) -> Result<Value, Value> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.raw_send_once(name, send_id, extra.clone()).await {
+                Err(refused)
+                    if refused["code"] == "transient"
+                        && refused["detail"]["cause"] == "credentials_unavailable"
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                answer => return answer,
+            }
+        }
+    }
+
+    async fn raw_send_once(&self, name: &str, send_id: &str, extra: Value) -> Result<Value, Value> {
         let _client = self.client(name).await;
         let conn = SubcConnection::connect(&self.connection_file)
             .await
