@@ -241,31 +241,6 @@ async fn marker_only_parts_validate_before_publication() {
 }
 
 #[tokio::test]
-async fn over_profile_item_limit_but_under_store_maximum_is_captured() {
-    let (_root, ctx, store) = capture_ctx("large");
-    let mut pdf = b"%PDF-1.7\n".to_vec();
-    pdf.resize(4_500_001, b' ');
-    pdf.extend_from_slice(b"%%EOF");
-    let raw = json!({"content":[{"type":"resource","resource":{"uri":"file:///large.pdf","mimeType":"application/pdf","blob":STANDARD.encode(&pdf)}}]});
-    let (_, _, _, result) = dispatch_reply(&ctx, raw).await;
-    let media = reference(&parts(&result)[0]);
-    let profile = broca_provider::media_profile::select_media_profile(
-        broca_provider::spec::WireFamilyId::BedrockConverse,
-        None,
-        "anthropic.claude",
-        Default::default(),
-        None,
-    );
-    assert!(!profile
-        .kind(MediaKind::Document)
-        .max_item_bytes
-        .unwrap()
-        .admits(media.byte_size));
-    assert!(media.byte_size < broca_core::media_validation::store_max_bytes(MediaKind::Document));
-    assert_eq!(store.read_verified(media).unwrap(), pdf);
-}
-
-#[tokio::test]
 async fn late_context_captures_through_the_same_handle() {
     let (_root, mut ctx, store) = capture_ctx("late:approval-key");
     ctx.batch_id = BatchId("late:approval-key".into());
@@ -353,12 +328,58 @@ async fn missing_capture_handle_marks_an_explicit_capture_request_store_failed()
     assert_eq!(parts(&result)[0], ToolOutputPart::Text { text: "[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=store_failed]".into() });
 }
 
+/// Capture a reply's media straight from its mapping, past intake. Intake discards a reply this
+/// large before capture (over 64 KiB counted on a legacy route, over 3 MiB serialized on a
+/// `tool-result/v1` one), so capture's own limits are only reachable this way, and they still
+/// guard every other path into it.
+async fn capture_past_intake(ctx: &BatchCtx, raw: serde_json::Value) -> ToolResult {
+    let (result, captures) = map_call_tool_result(&ToolCallId("capture-call".into()), &raw);
+    tool_capture::capture(ctx, result, captures).await
+}
+
+fn media_dirs_are_empty(root: &std::path::Path) {
+    for dir in ["media/objects", "media/refs"] {
+        assert_eq!(
+            std::fs::read_dir(root.join(dir))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "{dir}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn over_profile_item_limit_but_under_store_maximum_is_captured() {
+    let (_root, ctx, store) = capture_ctx("large");
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    pdf.resize(4_500_001, b' ');
+    pdf.extend_from_slice(b"%%EOF");
+    let raw = json!({"content":[{"type":"resource","resource":{"uri":"file:///large.pdf","mimeType":"application/pdf","blob":STANDARD.encode(&pdf)}}]});
+    let result = capture_past_intake(&ctx, raw).await;
+    let media = reference(&parts(&result)[0]);
+    let profile = broca_provider::media_profile::select_media_profile(
+        broca_provider::spec::WireFamilyId::BedrockConverse,
+        None,
+        "anthropic.claude",
+        Default::default(),
+        None,
+    );
+    assert!(!profile
+        .kind(MediaKind::Document)
+        .max_item_bytes
+        .unwrap()
+        .admits(media.byte_size));
+    assert!(media.byte_size < broca_core::media_validation::store_max_bytes(MediaKind::Document));
+    assert_eq!(store.read_verified(media).unwrap(), pdf);
+}
+
 #[tokio::test]
 async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
     let (root, ctx, _) = capture_ctx("too-large");
     let mut bytes = png();
     bytes.resize(33_554_433, 0);
-    let (_, _, _, result) = dispatch_reply(
+    let result = capture_past_intake(
         &ctx,
         json!({"content":[media_block("image", "image/png", &bytes)]}),
     )
@@ -366,14 +387,26 @@ async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
     assert!(
         matches!(&parts(&result)[0], ToolOutputPart::Text { text } if text.ends_with("reason=too_large]"))
     );
-    assert_eq!(
-        std::fs::read_dir(root.join("media/objects"))
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_eq!(
-        std::fs::read_dir(root.join("media/refs")).unwrap().count(),
-        0
-    );
+    media_dirs_are_empty(&root);
+}
+
+/// A reply on a route that doesn't read `tool-result/v1` counts its whole JSON body, media data
+/// included, toward the 64 KiB limit (the tool-provider contract's legacy rule). Over it, the
+/// whole output is discarded at intake, before any media is captured.
+#[tokio::test]
+async fn an_oversized_legacy_reply_is_discarded_before_capture() {
+    let (root, ctx, _) = capture_ctx("legacy-too-large");
+    let mut bytes = png();
+    bytes.resize(70_000, 0);
+    let (_, _, _, result) = dispatch_reply(
+        &ctx,
+        json!({"content":[media_block("image", "image/png", &bytes)]}),
+    )
+    .await;
+    assert!(result.is_error);
+    let ToolOutput::Error { code, .. } = &result.output else {
+        panic!("an oversized legacy reply must be a size error: {result:?}")
+    };
+    assert_eq!(code.as_deref(), Some("tool_result_too_large"));
+    media_dirs_are_empty(&root);
 }

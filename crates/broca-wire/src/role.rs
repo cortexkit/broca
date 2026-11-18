@@ -1134,6 +1134,17 @@ mod pinned_reply_bytes {
             if role.baseline.is_some() {
                 continue;
             }
+            // A reply naming both a run and a submission is a hosted runner's: its send owns a
+            // run before the host takes the turn. Broca never answers one: a queued send has a
+            // submission and no run yet, and a send that starts or joins a run names only the run.
+            if role.run_id.is_some() && role.submission_id.is_some() {
+                continue;
+            }
+            // Broca never answers `not_delivered` either: a send it can't deliver, a routing
+            // refusal included, is refused with an error, and broca hands nothing to a host.
+            if role.state == cortexkit_role_llm_runner::send::states::NOT_DELIVERED {
+                continue;
+            }
             let delivered = match &role.delivered {
                 None => None,
                 Some(d) if d.r#ref.is_some() && d.is_delivered() => Some(d.clone()),
