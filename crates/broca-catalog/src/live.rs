@@ -1648,6 +1648,7 @@ fn validate_recorded_fallback_auth(
             SystemPromptPolicy::SystemMessage => "system_message",
             SystemPromptPolicy::SystemInstructionField => "system_instruction_field",
             SystemPromptPolicy::InstructionsField => "instructions_field",
+            SystemPromptPolicy::DeveloperMessage => "developer_message",
         };
         return Err(format!(
             "frozen_fallback_auth_mismatch: recorded Anthropic fallback settings require OAuth \

@@ -293,7 +293,10 @@ fn render_prepared_body<'a>(
         &opts.prompt,
         &frozen.tool_name_aliases,
     );
-    let input = convert_input_items_with_provenance(
+    let instructions = instructions_from_policy(&opts.prompt, frozen.system_prompt.clone());
+    let developer_message = frozen.system_prompt == SystemPromptPolicy::DeveloperMessage;
+    let mut provenance = provenance;
+    let mut input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),
         &name_map,
@@ -305,7 +308,7 @@ fn render_prepared_body<'a>(
             stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
         },
         media,
-        provenance,
+        provenance.as_deref_mut(),
     );
 
     let mut body = json!({
@@ -313,9 +316,21 @@ fn render_prepared_body<'a>(
         "stream": true,
     });
     body[frozen.token_limit_field.key()] = json!(frozen.max_output_tokens);
-    if let Some(instructions) = instructions_from_policy(&opts.prompt, frozen.system_prompt.clone())
-    {
-        body["instructions"] = Value::String(instructions);
+    match instructions {
+        Some(text) if developer_message => {
+            input.insert(
+                0,
+                Node::value(json!({
+                    "type": "message", "role": "developer",
+                    "content": [{"type": "input_text", "text": text}],
+                })),
+            );
+            if let Some(sink) = provenance {
+                sink.prepend_synthetic_message();
+            }
+        }
+        Some(text) => body["instructions"] = Value::String(text),
+        None => {}
     }
 
     if let ReasoningPolicy::OpenAiResponsesReasoning { effort, summary } = &frozen.reasoning {
@@ -400,8 +415,15 @@ fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
     }
 }
 
+/// The system text a Responses request carries outside its conversation items: as the
+/// top-level `instructions` string, or as one leading `developer` message (see
+/// [`SystemPromptPolicy::DeveloperMessage`]). Either way it is every non-turn system message's
+/// text, joined by newlines.
 fn instructions_from_policy(prompt: &[Message], policy: SystemPromptPolicy) -> Option<String> {
-    if !matches!(policy, SystemPromptPolicy::InstructionsField) {
+    if !matches!(
+        policy,
+        SystemPromptPolicy::InstructionsField | SystemPromptPolicy::DeveloperMessage
+    ) {
         return None;
     }
     let mut parts = Vec::new();
@@ -470,7 +492,10 @@ fn convert_input_items_with_provenance<'a>(
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Vec<Node<'a>> {
-    let skip_system = matches!(system_policy, SystemPromptPolicy::InstructionsField);
+    let skip_system = matches!(
+        system_policy,
+        SystemPromptPolicy::InstructionsField | SystemPromptPolicy::DeveloperMessage
+    );
     let mut out = Vec::new();
     let mut updates = updates.iter().peekable();
     let has_ordinals = prompt.iter().any(|message| message.ordinal.is_some());
@@ -2014,6 +2039,35 @@ mod tests {
     /// The ChatGPT/Codex stream-failure codes, in the `response.failed` shape and both bare
     /// `error` shapes: the plan-allowance codes end the step, the throttle and overload codes
     /// retry, and only `code` is read, so a `type` naming the same value changes nothing.
+    #[test]
+    fn developer_message_policy_moves_the_system_text_into_input_and_changes_nothing_else() {
+        let opts: CallOptions = serde_json::from_value(json!({"prompt":[
+            {"role":"system","content":[{"type":"text","text":"rules"}]},
+            {"role":"system","content":[{"type":"text","text":"more rules"}]},
+            {"role":"user","content":[{"type":"text","text":"hi"}]}
+        ]}))
+        .unwrap();
+        let instructions = crate::families::openai_responses_frozen_config("gpt-6.2-sol");
+        assert_eq!(
+            instructions.system_prompt,
+            SystemPromptPolicy::InstructionsField
+        );
+        let mut developer = instructions.clone();
+        developer.system_prompt = SystemPromptPolicy::DeveloperMessage;
+        let mut before = OpenAiResponses.shape(&instructions, &opts);
+        let mut after = OpenAiResponses.shape(&developer, &opts);
+        assert_eq!(before["instructions"], "rules\nmore rules");
+        assert!(after.get("instructions").is_none());
+        let input = after["input"].as_array_mut().unwrap();
+        assert_eq!(
+            input.remove(0),
+            json!({"type":"message","role":"developer",
+                   "content":[{"type":"input_text","text":"rules\nmore rules"}]})
+        );
+        before.as_object_mut().unwrap().remove("instructions");
+        assert_eq!(before, after, "only the system text moves");
+    }
+
     #[test]
     fn chatgpt_stream_failure_codes_keep_their_classes() {
         for (code, class) in [

@@ -258,6 +258,11 @@ pub enum SystemPromptPolicy {
     /// OpenAI Responses: system/developer text is merged into the top-level
     /// `instructions` string (not an `input` message item).
     InstructionsField,
+    /// OpenAI Responses: the same merged text as `InstructionsField`, sent instead as one
+    /// leading `developer` message in `input`. GPT-6.2 never caches top-level `instructions`,
+    /// so every step would pay the whole system prompt uncached; the same text as an input
+    /// message is cached like the rest of the prefix.
+    DeveloperMessage,
 }
 
 /// How to read token usage off this provider's wire response into canonical usage.
