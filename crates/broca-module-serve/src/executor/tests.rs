@@ -39,6 +39,7 @@ include!("../store_run_cancel_tests.rs");
 include!("../tool_name_alias_tests.rs");
 include!("../queued_service_tier_tests.rs");
 include!("../service_tier_writer_tests.rs");
+include!("../default_effort_head_tests.rs");
 include!("../auth_hint_writer_tests.rs");
 include!("../vault_request_tests.rs");
 include!("../store_key_tests.rs");

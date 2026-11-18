@@ -136,7 +136,8 @@ pub struct HeadFacts {
     pub interrupt_reason: Option<String>,
     /// The model the session's plan chose for its runs, which takes the place of the run's.
     pub selection: Option<PlanModel>,
-    /// The latest run's model, with the variant its send named.
+    /// The latest run's model, with the variant its send named, or else the effort it sends by
+    /// default.
     pub run_model: Option<HeadModel>,
     /// The Rich UI stamp of the latest run's plan.
     pub rich_ui: Option<broca_protocol::RichUiStamp>,
@@ -205,6 +206,13 @@ pub fn head_reply(facts: HeadFacts) -> broca_wire::HeadResponse {
         Some(selection) => {
             let mut model = HeadModel::new(&selection.provider, &selection.model);
             model.variant = selection.variant;
+            // The effort the latest run sent with no variant is what the next send of that same
+            // model sends. Another model's default isn't known until a run uses it.
+            if model.variant.is_none() {
+                model.default_variant = run_model
+                    .filter(|run| run.provider == model.provider && run.model == model.model)
+                    .and_then(|run| run.default_variant);
+            }
             Some(model)
         }
         None => run_model,
@@ -306,12 +314,19 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         .open_log_activity_ms()
         .or_else(|| latest_start.and_then(|start| start.written_at_ms.or(start.ts_ms)))
         .ok_or(StoreHeadError::NoTime)?;
+    let mut latest_model = latest_start.map(run_model);
+    if let (Some(model), Some(run), Some(start)) = (&mut latest_model, latest, latest_start) {
+        if model.variant.is_none() {
+            model.default_variant =
+                read_render_config(run, start, parts, default_effort)?.flatten();
+        }
+    }
     let mut reply = head_reply(HeadFacts {
         lineage_state: state,
         prompt_len: page.prompt_len,
         interrupt_reason,
         selection,
-        run_model: latest_start.map(run_model),
+        run_model: latest_model,
         rich_ui: latest_manifest.and_then(|manifest| manifest.rich_ui.clone()),
         usage: crate::store_read::session_usage(operations.session_usage.as_ref()),
         title: operations.title.clone(),
@@ -471,18 +486,25 @@ fn run_model(start: &RunStart) -> HeadModel {
     model
 }
 
-/// The `media` member of the render config the latest run renders with: the one a resume
-/// refroze, else the one its start froze.
+/// The `media` member of the render config the latest run renders with.
 fn frozen_media(
     run: &broca_session_store::fold::operations::Run,
     start: &RunStart,
     parts: &dyn Parts,
 ) -> Result<Option<serde_json::Value>, StoreHeadError> {
+    Ok(read_render_config(run, start, parts, |config| config.get("media").cloned())?.flatten())
+}
+
+/// `read` of the render config the latest run renders with: the one a resume refroze, else the
+/// one its start froze. `None` when the run froze none.
+fn read_render_config<T>(
+    run: &broca_session_store::fold::operations::Run,
+    start: &RunStart,
+    parts: &dyn Parts,
+    read: impl FnOnce(&serde_json::Value) -> T,
+) -> Result<Option<T>, StoreHeadError> {
     if let Some(refrozen) = &run.refrozen_render {
-        return Ok(refrozen
-            .get("render_config")
-            .and_then(|config| config.get("media"))
-            .cloned());
+        return Ok(refrozen.get("render_config").map(read));
     }
     let Some(part) = start
         .setup
@@ -493,7 +515,20 @@ fn frozen_media(
     };
     let config = broca_session_loop::parts::shared::<serde_json::Value, _>(parts, part)
         .map_err(|error| StoreHeadError::Setup(format!("run {}: {error}", start.run_id)))?;
-    Ok(config.get("media").cloned())
+    Ok(Some(read(&config)))
+}
+
+/// The effort a run sends when its send named no variant, read from its frozen render config:
+/// the model's documented default, recorded there as a variant (only on the OpenAI families, see
+/// `broca_catalog`'s `apply_default_effort`), else an effort the model itself froze, such as a
+/// ChatGPT pro model's. `None` when the run sends no effort, as a Claude or Gemini run that named
+/// none: the vendor then applies its own default, which broca can't vouch for.
+fn default_effort(config: &serde_json::Value) -> Option<String> {
+    config
+        .pointer("/variant/name")
+        .or_else(|| config.get("reasoning_effort"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// The reason the end of the run `run_id` recorded for interrupting it, read through the id
@@ -519,3 +554,7 @@ async fn recorded_interrupt_reason<B: SessionBackend>(
         })
         .flatten())
 }
+
+#[cfg(test)]
+#[path = "store_head_tests.rs"]
+mod tests;
