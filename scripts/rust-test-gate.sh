@@ -39,11 +39,14 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]] && ! command -v cargo-nextest >/dev/null 2>
   exit 127
 fi
 
+# test-loopback-credentials: the real-daemon rigs send real vault sign-ins to a stand-in provider
+# on the local machine, which a sign-in's record doesn't list (see broca-provider's feature).
 cargo_feature_args=(
   -F broca-provider/live
   -F broca-provider/test-harness
   -F broca-catalog/live
   -F broca-module-serve/test-clock
+  -F broca-module-serve/test-loopback-credentials
 )
 
 # Integration-test binaries that drive real provider APIs and so stay out of the gate. `live` is

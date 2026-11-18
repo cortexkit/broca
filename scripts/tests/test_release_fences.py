@@ -14,6 +14,7 @@ CLOCK_MARKER = "BROCA_TEST_CLOCK_RETENTION_CLOCK_OVERRIDE_V1"
 RETRY_MARKER = "BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1"
 ATTACHMENTS_MARKER = "broca-nonshipping-attachments-v1"
 FS_OVERRIDE_MARKER = "BROCA_TEST_FS_OVERRIDE_V1"
+LOOPBACK_MARKER = "BROCA_TEST_LOOPBACK_CREDENTIALS_V1"
 
 spec = importlib.util.spec_from_file_location("placement_fixture", ROOT / "scripts/test-place-release-gate.py")
 placement = importlib.util.module_from_spec(spec)
@@ -78,6 +79,11 @@ class RetryMarkerStaging(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("artifact contains the fs-override override marker", result.stderr)
 
+    def test_loopback_credentials_marker_refuses_artifact(self):
+        result = self.probe(b"ordinary control\0" + LOOPBACK_MARKER.encode() + b"\0")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("artifact contains the test-loopback-credentials override marker", result.stderr)
+
     def test_normal_artifact_passes_both_marker_checks(self):
         result = self.probe(b"ordinary production artifact\0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -85,6 +91,7 @@ class RetryMarkerStaging(unittest.TestCase):
         self.assertIn("test-harness absent (planted strings control reads 1)", result.stdout)
         self.assertIn("test-attachments absent (planted strings control reads 1)", result.stdout)
         self.assertIn("fs-override absent (planted strings control reads 1)", result.stdout)
+        self.assertIn("test-loopback-credentials absent (planted strings control reads 1)", result.stdout)
 
     def test_retry_path_carries_the_marker(self):
         for armed in (False, True):
@@ -183,6 +190,7 @@ class ReleaseMarkerPlacement(placement.GateBase):
         self.assertIn("test-harness absent (planted strings control reads 1)", result.stdout)
         self.assertIn("test-attachments absent (planted strings control reads 1)", result.stdout)
         self.assertIn("fs-override absent (planted strings control reads 1)", result.stdout)
+        self.assertIn("test-loopback-credentials absent (planted strings control reads 1)", result.stdout)
         self.assertNotEqual(self.dest.read_bytes(), self.before)
 
 

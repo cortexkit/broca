@@ -1,7 +1,12 @@
+// The fixture listens on the local machine, which a rig build lets through for any record
+// (`test-loopback-credentials`), so these tests run only in builds without that feature.
+#[cfg(not(feature = "test-loopback-credentials"))]
 use super::*;
+#[cfg(not(feature = "test-loopback-credentials"))]
 use crate::credential_hosts::{CredentialHosts, CREDENTIAL_HOST_NOT_ALLOWED};
 
 /// Run one step of an Anthropic request to `server` with a key, and return the step's error.
+#[cfg(not(feature = "test-loopback-credentials"))]
 async fn step_error(server: &ScriptedServer, hosts: CredentialHosts) -> ProviderError {
     let mut frozen = crate::families::anthropic_frozen_config("m");
     frozen.base_url = Some(server.url.clone());
@@ -28,6 +33,7 @@ async fn step_error(server: &ScriptedServer, hosts: CredentialHosts) -> Provider
     panic!("the step ended without an error")
 }
 
+#[cfg(not(feature = "test-loopback-credentials"))]
 fn listed(hosts: &[&str]) -> CredentialHosts {
     let hosts: Vec<String> = hosts.iter().map(|host| (*host).to_owned()).collect();
     CredentialHosts::from_record(Some(&hosts))
@@ -36,6 +42,7 @@ fn listed(hosts: &[&str]) -> CredentialHosts {
 /// A key goes only to a host its vault record lists. A step whose URL names another host ends
 /// with a permanent `credential_host_not_allowed` error before anything is sent; a listed host
 /// gets the request.
+#[cfg(not(feature = "test-loopback-credentials"))]
 #[tokio::test]
 async fn a_key_reaches_only_a_host_its_record_lists() {
     for (hosts, admitted) in [

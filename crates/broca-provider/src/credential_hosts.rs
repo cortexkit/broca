@@ -66,9 +66,7 @@ impl CredentialHosts {
             if self.0.iter().any(|listed| listed == host) {
                 return Ok(());
             }
-            if cfg!(feature = "test-loopback-credentials")
-                && Self::default().0.iter().any(|local| local == host)
-            {
+            if rig_allows(host) {
                 return Ok(());
             }
         }
@@ -104,6 +102,24 @@ fn host_refused(message: String) -> ProviderError {
         affordable_max_tokens: None,
         account_continue: None,
     }
+}
+
+/// Whether a real-daemon test rig may send a credential to `host` though its vault record
+/// doesn't list it: the local machine, where the rig's stand-in provider listens. A sign-in's
+/// record lists only its provider's real host, which a rig can't change. Built only with
+/// `test-loopback-credentials`; release staging refuses a binary carrying this marker.
+#[cfg(feature = "test-loopback-credentials")]
+fn rig_allows(host: &str) -> bool {
+    std::hint::black_box("BROCA_TEST_LOOPBACK_CREDENTIALS_V1");
+    CredentialHosts::default()
+        .0
+        .iter()
+        .any(|local| local == host)
+}
+
+#[cfg(not(feature = "test-loopback-credentials"))]
+fn rig_allows(_host: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -154,6 +170,8 @@ mod tests {
             "{}",
             error.message
         );
+        // A rig build lets loopback through for any record (see `rig_allows`).
+        #[cfg(not(feature = "test-loopback-credentials"))]
         assert!(CredentialHosts::from_record(None)
             .check(&key(), "http://127.0.0.1:4010/v1/messages")
             .is_err());
