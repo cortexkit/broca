@@ -76,6 +76,7 @@ fn move_residences_roundtrip_and_older_readers_refuse_by_name() {
                 Residence::Moved(MoveResidence {
                     holder: "receiver".into(),
                     cut_id: "cut".into(),
+                    holder_box: None,
                 }),
             ),
         ] {

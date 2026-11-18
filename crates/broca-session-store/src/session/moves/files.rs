@@ -234,6 +234,7 @@ pub async fn release(
     addr: &SessionAddr,
     cut_id: &str,
     holder: &str,
+    holder_box: Option<&str>,
     deployment: &DeploymentKey,
 ) -> Result<(), Error> {
     let (bytes, at) = store
@@ -242,7 +243,11 @@ pub async fn release(
         .ok_or_else(|| invalid("source head missing"))?;
     let (mut head, key) = head::open(&bytes, deployment).map_err(invalid)?;
     match &head.residence {
-        Residence::Moved(moved) if moved.cut_id == cut_id && moved.holder == holder => {
+        Residence::Moved(moved)
+            if moved.cut_id == cut_id
+                && moved.holder == holder
+                && moved.holder_box.as_deref() == holder_box =>
+        {
             return Ok(())
         }
         Residence::Moving(held) if held == cut_id => {}
@@ -251,6 +256,7 @@ pub async fn release(
     head.residence = Residence::Moved(MoveResidence {
         cut_id: cut_id.into(),
         holder: holder.into(),
+        holder_box: holder_box.map(str::to_owned),
     });
     store
         .write_head(addr, &head::seal(&head, &key), Some(at), at + 1)

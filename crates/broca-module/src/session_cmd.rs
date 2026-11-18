@@ -266,7 +266,7 @@ pub enum LineageCmd {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportOutcome {
     SessionMoving { cut_id: String },
-    SessionMoved { holder: String },
+    SessionMoved { holder: Option<String> },
     Imported(broca_core::ImportOutcome),
     Busy,
     Reopen,
@@ -291,7 +291,7 @@ pub enum SendOutcome {
         cut_id: String,
     },
     SessionMoved {
-        holder: String,
+        holder: Option<String>,
     },
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
@@ -451,7 +451,7 @@ pub enum WarmOutcome {
         cut_id: String,
     },
     SessionMoved {
-        holder: String,
+        holder: Option<String>,
     },
     /// The provider answered the warm; its record is in the WAL.
     Warmed(broca_wire::WarmReply),
@@ -470,7 +470,7 @@ pub enum CancelOutcome {
     ScopeRefused(broca_core::ScopeRefusal),
     Error(String),
     SessionMoving { cut_id: String },
-    SessionMoved { holder: String },
+    SessionMoved { holder: Option<String> },
     Ack,
     NotActive,
     Reopen,
@@ -488,7 +488,7 @@ pub enum RetractOutcome {
         cut_id: String,
     },
     SessionMoved {
-        holder: String,
+        holder: Option<String>,
     },
     /// The submission was pending and is now retracted (a durable tombstone was written).
     Retracted,

@@ -394,14 +394,39 @@ impl StoreRuntime {
             .join("session-store-moves/fences")
             .join(broca_core::session_addr(key));
         let read = |error: std::io::Error| OpenError::Open(error.to_string());
-        if let Some(moved) = broca_wal::migration::read_json::<broca_wal::migration::Moved>(
+        // The session's head, when a root keeps it.
+        let head = || -> Result<Option<broca_session_store::head::Head>, OpenError> {
+            let Some(class) = self.class_of(key)? else {
+                return Ok(None);
+            };
+            let Some((stored, _)) = self
+                .backend(class)
+                .read_stored_head(&SessionAddr(broca_core::session_addr(key)))
+                .map_err(|error| OpenError::Open(format!("{error:?}")))?
+            else {
+                return Ok(None);
+            };
+            let (head, _) = broca_session_store::head::open(&stored, self.deployment())
+                .map_err(|error| open_error(SessionError::Head(error), false))?;
+            Ok(Some(head))
+        };
+        if broca_wal::migration::read_json::<broca_wal::migration::Moved>(
             &sidecar.with_extension("moved"),
         )
         .map_err(read)?
+        .is_some()
         {
-            return Err(OpenError::SessionMoved {
-                holder: moved.holder,
-            });
+            // The fence names the new computer only by its backup author id, which a caller is
+            // never told. The head names its box id when the release gave one; a head that
+            // can't be read yet still leaves the session refused, naming no computer.
+            let holder = match head() {
+                Ok(Some(head)) => match head.residence {
+                    broca_session_store::head::Residence::Moved(moved) => moved.holder_box,
+                    _ => None,
+                },
+                _ => None,
+            };
+            return Err(OpenError::SessionMoved { holder });
         }
         if write {
             if let Some(freeze) = broca_wal::migration::read_json::<broca_wal::migration::Freeze>(
@@ -420,24 +445,15 @@ impl StoreRuntime {
                 return Err(OpenError::SessionMoving { cut_id });
             }
         }
-        let Some(class) = self.class_of(key)? else {
+        let Some(head) = head()? else {
             return Ok(());
         };
-        let backend = self.backend(class);
-        let Some((stored, _)) = backend
-            .read_stored_head(&SessionAddr(broca_core::session_addr(key)))
-            .map_err(|error| OpenError::Open(format!("{error:?}")))?
-        else {
-            return Ok(());
-        };
-        let (head, _) = broca_session_store::head::open(&stored, self.deployment())
-            .map_err(|error| open_error(SessionError::Head(error), false))?;
         match head.residence {
             broca_session_store::head::Residence::Moving(cut_id) if write => {
                 Err(OpenError::SessionMoving { cut_id })
             }
             broca_session_store::head::Residence::Moved(moved) => Err(OpenError::SessionMoved {
-                holder: moved.holder,
+                holder: moved.holder_box,
             }),
             _ => Ok(()),
         }

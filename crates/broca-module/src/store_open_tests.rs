@@ -463,7 +463,7 @@ async fn a_moved_session_retires_its_recovery_candidate() {
     moves::freeze(&store, &addr, version, "cut", &deployment())
         .await
         .unwrap();
-    moves::release(&store, &addr, "cut", "other-machine", &deployment())
+    moves::release(&store, &addr, "cut", "other-machine", None, &deployment())
         .await
         .unwrap();
     let sweep = registry.recover_store_crash_orphans().await.unwrap();

@@ -5950,12 +5950,12 @@ async fn send_serve_error(
                 .with_detail(serde_json::json!({"cutId":cut_id}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
-        ServeError::SessionMoved { .. } => {
-            // The contract's `holder` is the receiving computer's box id. The release request
-            // names the new holder only by its backup author id, which is a different value and
-            // not an address, so the detail leaves `holder` out, as the contract allows.
-            let detail =
+        ServeError::SessionMoved { holder } => {
+            // `holder` is the receiving computer's box id (the release's `holderBox`), left out
+            // when the release named none; the backup author id is not an address.
+            let mut detail =
                 cortexkit_role_llm_runner::session_retention::SessionHeldElsewhereDetail::new();
+            detail.holder = holder.clone();
             let body = ErrorBody::new(
                 cortexkit_role_llm_runner::errors::SESSION_HELD_ELSEWHERE,
                 err.to_string(),

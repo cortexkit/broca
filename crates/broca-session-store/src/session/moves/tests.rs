@@ -319,19 +319,27 @@ fn frozen_reads_work_writers_refuse_release_fences_both_and_abort_is_cut_owned()
                 .set_modified(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap();
         }
-        release(&store, &addr(), "cut2", "receiver", &deployment)
+        const BOX: &str = "0123456789abcdef0123456789abcdef";
+        release(&store, &addr(), "cut2", "receiver", Some(BOX), &deployment)
             .await
             .unwrap();
         assert!(store.read_head_version(&addr(), version).unwrap().is_some());
-        release(&store, &addr(), "cut2", "receiver", &deployment)
+        release(&store, &addr(), "cut2", "receiver", Some(BOX), &deployment)
             .await
             .unwrap();
-        abort(&store, &addr(), "cut2", &deployment).await.unwrap();
+        // A repeat that drops or changes the box id is another release, which the move refuses.
         assert!(
-            matches!(Session::view(&store, addr(), &triple(), &deployment).await, Err(SessionError::SessionMoved { holder }) if holder == "receiver")
+            release(&store, &addr(), "cut2", "receiver", None, &deployment)
+                .await
+                .is_err()
+        );
+        abort(&store, &addr(), "cut2", &deployment).await.unwrap();
+        // A refused caller is told the receiving computer's box id, never the backup author id.
+        assert!(
+            matches!(Session::view(&store, addr(), &triple(), &deployment).await, Err(SessionError::SessionMoved { holder }) if holder.as_deref() == Some(BOX))
         );
         assert!(
-            matches!(Session::load(&store, addr(), &triple(), &deployment).await, Err(SessionError::SessionMoved { holder }) if holder == "receiver")
+            matches!(Session::load(&store, addr(), &triple(), &deployment).await, Err(SessionError::SessionMoved { holder }) if holder.as_deref() == Some(BOX))
         );
     });
 }

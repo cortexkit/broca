@@ -118,8 +118,14 @@ crate::message! {
     /// The completed move that fences a retained source copy.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct MoveResidence {
+        /// The receiving computer as the release named it for the move's own records (agent-data
+        /// `holder`, a backup author id): it tells a repeated release from a changed one, and is
+        /// never shown to a caller.
         1 req holder: String,
         2 req cut_id: String,
+        /// The receiving computer's box id (agent-data `holderBox`), when the release named it:
+        /// the computer a refused caller is told the session is held on.
+        3 opt holder_box: String,
     }
 }
 

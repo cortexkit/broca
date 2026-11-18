@@ -102,9 +102,10 @@ pub enum SessionError {
     SessionMoving {
         cut_id: String,
     },
-    /// The retained copy is fenced because another computer holds the session.
+    /// The retained copy is fenced because another computer holds the session. `holder` is
+    /// that computer's box id, when the release named one: the only name a caller is told.
     SessionMoved {
-        holder: String,
+        holder: Option<String>,
     },
 }
 
@@ -738,7 +739,7 @@ impl<B: SessionBackend> Session<B> {
             return match head.residence {
                 Residence::Recovering(_) => Err(SessionError::NeedsRecovery),
                 Residence::Moved(moved) => Err(SessionError::SessionMoved {
-                    holder: moved.holder,
+                    holder: moved.holder_box,
                 }),
                 _ => Ok(None),
             };
@@ -807,7 +808,7 @@ impl<B: SessionBackend> Session<B> {
         }
         if let Residence::Moved(moved) = &head.residence {
             return Err(SessionError::SessionMoved {
-                holder: moved.holder.clone(),
+                holder: moved.holder_box.clone(),
             });
         }
         if let Residence::Creating(log) = head.residence {

@@ -1081,11 +1081,24 @@ async fn contract_ref_set_vectors_are_checked_before_artifacts() {
 }
 #[tokio::test]
 async fn session_ref_vectors_are_resolved_by_the_serve_participant() {
-    let mut cases = vectors("session-refs.json")["cases"]
-        .as_array()
-        .unwrap()
-        .clone();
-    cases.push(json!({"harness":"broca","project_root":"/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/c0c39eea197fcc68/pool-952","session":"alfonso:bg_de298dcca128a1e1","sessionRef":"cc8f376395c1f915b357326b6741ddcb"}));
+    // The contract's vectors pin the shared derivation for any runner. broca derives its
+    // sessions' refs as runner `broca`, so the vectors check the derivation, and a broca session
+    // is resolved through the participant.
+    for case in vectors("session-refs.json")["cases"].as_array().unwrap() {
+        let identity = cortexkit_role_llm_runner::SessionIdentity {
+            runner: case["runner"].as_str().unwrap(),
+            harness: case["harness"].as_str().unwrap(),
+            session: case["session"].as_str().unwrap(),
+        };
+        assert_eq!(
+            cortexkit_role_llm_runner::session_ref(&identity),
+            case["sessionRef"].as_str().unwrap(),
+            "{case}"
+        );
+    }
+    let cases = [
+        json!({"harness":"broca","project_root":"/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/c0c39eea197fcc68/pool-952","session":"alfonso:bg_de298dcca128a1e1","sessionRef":"cc8f376395c1f915b357326b6741ddcb"}),
+    ];
     for case in cases {
         let session = BindIdentity::new(
             case["project_root"].as_str().unwrap(),
@@ -1464,27 +1477,33 @@ async fn contract_op_refusal_vectors_bound_served_decode_refusals() {
             .iter()
             .map(|c| c.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        let additions = vectors("digest-mismatch.json");
         let mut vector = case["codes"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|c| c.as_str().unwrap())
+            .map(|c| c.as_str().unwrap().to_owned())
             .collect::<std::collections::BTreeSet<_>>();
-        for addition in additions["op_additions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|a| a["op"] == case["op"])
-        {
-            vector.extend(
-                addition["codes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|code| code.as_str().unwrap()),
-            );
+        // Codes added after the base table, each with its own vector file.
+        for additions in ["digest-mismatch.json", "participant-failed.json"] {
+            for addition in vectors(additions)["op_additions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|a| a["op"] == case["op"])
+            {
+                vector.extend(
+                    addition["codes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|code| code.as_str().unwrap().to_owned()),
+                );
+            }
         }
+        let declared = declared
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(declared, vector);
         let rig = Rig::new("op-refusal-vector", Arc::new(FakeDoor::default()));
         let mut wire = Wire::new(&rig, entorhinal(), true).await;

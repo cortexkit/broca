@@ -296,14 +296,18 @@ async fn store_move_plain_and_encrypted_roundtrip_release_and_move_back() {
         door.seal(CUT);
         to.call("import", params.clone()).await.unwrap();
         to.call("activate", params.clone()).await.unwrap();
-        from.call(
-            "release",
-            json!({"cutId":CUT,"refs":params["refs"],"holder":"receiver"}),
-        )
-        .await
-        .unwrap();
+        // The encrypted round's release names the receiving computer's box id (agent-data
+        // 0.3.3 `holderBox`); the plain round's names only its backup author id, as older
+        // drivers send.
+        const BOX: &str = "0123456789abcdef0123456789abcdef";
+        let holder_box = (cipher == Cipher::XChaCha20Poly1305).then_some(BOX);
+        let mut release = json!({"cutId":CUT,"refs":params["refs"],"holder":"receiver"});
+        if let Some(holder_box) = holder_box {
+            release["holderBox"] = json!(holder_box);
+        }
+        from.call("release", release).await.unwrap();
         assert!(
-            matches!(source.registry.check_move(&session, false), Err(OpenError::SessionMoved { holder }) if holder == "receiver")
+            matches!(source.registry.check_move(&session, false), Err(OpenError::SessionMoved { holder }) if holder.as_deref() == holder_box)
         );
         let refused_read = assert_code(
             reader.management("session.read", json!({})).await,
@@ -318,17 +322,31 @@ async fn store_move_plain_and_encrypted_roundtrip_release_and_move_back() {
                 .await,
             "session_held_elsewhere",
         );
-        // The release named its holder by backup author id, which is not the box id the
-        // contract's `holder` carries, so the refusal names no holder at all.
-        assert_eq!(refused["detail"], json!({}), "{refused}");
+        // The refusal names the box id when the release gave one. The backup author id is not
+        // the box id the contract's `holder` carries, so it is never named.
+        match holder_box {
+            Some(holder_box) => {
+                assert_eq!(
+                    refused["detail"],
+                    json!({"holder": holder_box}),
+                    "{refused}"
+                )
+            }
+            None => assert_eq!(refused["detail"], json!({}), "{refused}"),
+        }
         assert!(!refused.to_string().contains("receiver"), "{refused}");
         // Reader samples: the exact refusal bodies a reader of a moved session gets.
         if let Some(dir) = std::env::var_os("BROCA_HELD_ELSEWHERE_SAMPLES") {
             let dir = std::path::PathBuf::from(dir);
             std::fs::create_dir_all(&dir).unwrap();
+            let suffix = if holder_box.is_some() {
+                "-holder-box"
+            } else {
+                ""
+            };
             for (name, body) in [("read", &refused_read), ("send", &refused)] {
                 std::fs::write(
-                    dir.join(format!("{name}-refused.json")),
+                    dir.join(format!("{name}-refused{suffix}.json")),
                     serde_json::to_vec_pretty(body).unwrap(),
                 )
                 .unwrap();

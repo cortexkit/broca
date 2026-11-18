@@ -95,7 +95,7 @@ pub enum OpenError {
         cut_id: String,
     },
     SessionMoved {
-        holder: String,
+        holder: Option<String>,
     },
     Expired {
         expired_at_ms: u64,
@@ -173,9 +173,9 @@ impl OpenError {
             broca_wal::WalError::SessionMoving { cut_id } => Self::SessionMoving {
                 cut_id: cut_id.clone(),
             },
-            broca_wal::WalError::SessionMoved { holder } => Self::SessionMoved {
-                holder: holder.clone(),
-            },
+            // A move of the old storage names the new computer only by its backup author id,
+            // which a caller is never told.
+            broca_wal::WalError::SessionMoved { .. } => Self::SessionMoved { holder: None },
             broca_wal::WalError::NewerWriter { missing, .. } => OpenError::NewerWriter {
                 missing: missing.clone(),
                 reason,
@@ -197,7 +197,10 @@ impl std::fmt::Display for OpenError {
             Self::HistoryRewriting => f.write_str("history is being rewritten; retry after its writer finishes recovery"),
             Self::HistoryChanged => f.write_str("history changed while the page was read; read the newest page"),
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
-            Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
+            Self::SessionMoved { holder: Some(holder) } => {
+                write!(f, "session_moved {{holder: {holder}}}")
+            }
+            Self::SessionMoved { holder: None } => f.write_str("session_moved"),
             OpenError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
             OpenError::SessionClassInvalid(message) => f.write_str(message),

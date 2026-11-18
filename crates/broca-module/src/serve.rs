@@ -1687,7 +1687,7 @@ pub enum ServeError {
         cut_id: String,
     },
     SessionMoved {
-        holder: String,
+        holder: Option<String>,
     },
     Expired {
         expired_at_ms: u64,

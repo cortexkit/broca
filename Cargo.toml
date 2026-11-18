@@ -99,7 +99,7 @@ jsonschema = { version = "=0.58.6", default-features = false }
 # Time zones for keep-warm windows (`plan.cache.hours.tz`). The bundled IANA database, never the
 # host's, so a zone one machine accepts is accepted on every machine a session can move to.
 jiff = { version = "=0.2.39", default-features = false, features = ["std", "tzdb-bundle-always"] }
-cortexkit-role-agent-data = "=0.2.2"
+cortexkit-role-agent-data = "=0.3.3"
 cortexkit-role-step-transform-provider = "=0.5.0"
 cortexkit-role-compaction-provider = "=0.7.14"
 cortexkit-role-compaction = "=0.4.0"

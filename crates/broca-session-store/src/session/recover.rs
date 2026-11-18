@@ -194,7 +194,7 @@ impl<B: SessionBackend> Session<B> {
             Residence::Moving(cut_id) => return Err(SessionError::SessionMoving { cut_id }),
             Residence::Moved(moved) => {
                 return Err(SessionError::SessionMoved {
-                    holder: moved.holder,
+                    holder: moved.holder_box,
                 })
             }
         };

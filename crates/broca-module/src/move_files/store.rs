@@ -100,6 +100,8 @@ impl FileCutArtifacts {
                     if op == Op::Release
                         && moved.cut_id == cut
                         && request.params()["holder"] == moved.holder
+                        && request.params().get("holderBox").and_then(Value::as_str)
+                            == moved.holder_box.as_deref()
                     {
                         return Ok(());
                     }
@@ -259,13 +261,23 @@ impl FileCutArtifacts {
                     .map_err(failure)?;
             }
             Op::Release => {
-                let holder = request.params()["holder"]
+                let params = request.params();
+                let holder = params["holder"]
                     .as_str()
                     .ok_or_else(|| unavailable("release holder missing"))?
                     .to_owned();
-                moves::release(&backend, &addr, cut, &holder, runtime.deployment())
-                    .await
-                    .map_err(failure)?;
+                // The receiving computer's box id, which the contract's decoder has checked.
+                let holder_box = params.get("holderBox").and_then(Value::as_str);
+                moves::release(
+                    &backend,
+                    &addr,
+                    cut,
+                    &holder,
+                    holder_box,
+                    runtime.deployment(),
+                )
+                .await
+                .map_err(failure)?;
                 migration::release(&self.state_root, &sidecar, cut, &holder)
                     .map_err(unavailable)?
                     .map_err(unavailable)?;

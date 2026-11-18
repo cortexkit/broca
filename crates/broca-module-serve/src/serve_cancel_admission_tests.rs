@@ -36,7 +36,7 @@ impl ServeHandler for CancelAdmissionProbe {
             })
         } else {
             Err(ServeError::SessionMoved {
-                holder: "remote".into(),
+                holder: Some("0123456789abcdef0123456789abcdef".into()),
             })
         }
     }
