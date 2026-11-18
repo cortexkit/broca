@@ -148,6 +148,7 @@ pub(super) async fn pause_for_sign_in<W: Writer, P, T>(
         PauseReason::AuthRequired,
         Some(error),
         None,
+        None,
     )
     .await
 }
@@ -155,6 +156,12 @@ pub(super) async fn pause_for_sign_in<W: Writer, P, T>(
 /// Pauses the run at a boundary, durably, before the run reports it. A caller's cancel wins
 /// until the pause is durable: the run then ends cancelled instead, so nobody is left with a
 /// paused run they already abandoned. Messages steered in stay unplaced, for the resume.
+///
+/// A run that pauses on calls a provider holds (`held`, the batch they belong to) has its batch
+/// open. When the cancel wins, that batch closes in the same durable write as the run's end, as
+/// cancelling a parked run closes it: each held call gets its close result and each call still
+/// in flight the unknown-outcome result. A run that ended with its batch open would leave its
+/// tool turn without results, and the session's next run could not number its messages.
 pub(super) async fn pause<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -162,17 +169,19 @@ pub(super) async fn pause<W: Writer, P, T>(
     reason: PauseReason,
     error: Option<ProviderError>,
     account_limit: Option<Box<broca_wal::AccountLimitPause>>,
+    held: Option<&BatchCtx>,
 ) -> Result<Finished, LoopError> {
     let error = error
         .map(|error| serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string())))
         .transpose()?;
     let cancelled_now = seams.cancel.is_cancelled();
-    let mut cancelled_end = Some(run_end(
-        writer,
-        run_id,
-        RunFinishReason::Cancelled,
-        (seams.now_ms)(),
-    ));
+    let now = (seams.now_ms)();
+    // Only the run writes its batch's records, so the close-out read here still holds when the
+    // write below decides.
+    let (close_out, withdrawn) =
+        open_batch_close_out(writer, run_id, now, RunFinishReason::Cancelled);
+    let mut close_out = Some(close_out);
+    let mut cancelled_end = Some(run_end(writer, run_id, RunFinishReason::Cancelled, now));
     let mut pause = Some(Record::Pause(Pause {
         run_id: run_id.into(),
         reason,
@@ -194,7 +203,8 @@ pub(super) async fn pause<W: Writer, P, T>(
             &mut |_, operations, _| {
                 let run = operations.run.as_ref().expect("a run is active");
                 if cancelled_now || run.cancel.is_some() {
-                    let mut batch = placed_copies(operations, &owned_run_id);
+                    let mut batch = close_out.take().unwrap_or_default();
+                    batch.extend(placed_copies(operations, &owned_run_id));
                     batch.extend(cancelled_end.take());
                     batch
                 } else {
@@ -205,6 +215,12 @@ pub(super) async fn pause<W: Writer, P, T>(
         )
         .await?;
     if matches!(decision(&batch), Some(Record::RunEnd(_))) {
+        if let (Some(lifecycle), Some(ctx)) = (seams.held, held) {
+            for reply in &withdrawn {
+                lifecycle.terminal_synced(ctx, &reply.tool_call_id).await;
+            }
+        }
+        withdraw(seams, &withdrawn).await;
         return Ok(finished(writer, RunFinishReason::Cancelled));
     }
     let mut paused = finished(writer, RunFinishReason::Interrupted);

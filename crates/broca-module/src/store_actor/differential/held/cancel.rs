@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 cipher_tests!(
     a_parked_held_run_cancels_alike,
     other_parked_pauses_cancel_alike,
-    a_parked_cancel_request_survives_restart
+    a_parked_cancel_request_survives_restart,
+    a_boundary_cancel_before_a_held_call_closes_it_and_leaves_the_session_usable
 );
 
 #[derive(Default)]
@@ -330,4 +331,94 @@ async fn a_parked_cancel_request_survives_restart(cipher: Cipher) {
         assert!(source.registry.stop_and_seal().await);
         assert!(recovered.registry.stop_and_seal().await);
     }
+}
+
+/// A caller's step-boundary cancel that lands while the model step is in flight, whose answer
+/// then calls a tool the provider holds: the cancel wins over the pause on that call. The run
+/// ends cancelled with the held call closed in the same write, its provider is asked to withdraw
+/// it, and the session stays usable: every stored message keeps the per-message record reads
+/// and part numbering use (its entry facts), and the next send runs to its end.
+async fn a_boundary_cancel_before_a_held_call_closes_it_and_leaves_the_session_usable(
+    cipher: Cipher,
+) {
+    let gate = Arc::new(Notify::new());
+    let dir = scratch_dir();
+    let key = BindIdentity::new(dir.join("project"), "held-comparison", "s1");
+    let side = Side::at(
+        dir,
+        key,
+        true,
+        cipher,
+        vec![
+            super::super::super::tests::read_step("m1"),
+            super::super::super::tests::text_step("m2", "again"),
+        ],
+        Arc::default(),
+        Some(Arc::clone(&gate)),
+    )
+    .await;
+    side.send().await;
+    let reply = side
+        .registry
+        .route_cancel_at(&side.key, RunId("r1".into()), RunCancelAt::StepBoundary)
+        .await
+        .unwrap();
+    assert_eq!(reply, CancelOutcome::Ack);
+    gate.notify_one();
+    cancelled(&side).await;
+    let (end, calls) = terminal(&side).await;
+    assert_eq!(end, "cancelled");
+    assert_eq!(
+        calls,
+        [json!({"outcome": "interrupted", "reason": "provider_held_cancelled"})]
+    );
+    // A later send carries no tools: the session's creating send froze them.
+    let mut again = request("again");
+    again.tools = None;
+    let next = side
+        .registry
+        .route_submission_with_order(
+            &side.key,
+            RunId("r2".into()),
+            again,
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(next, SendOutcome::Active { .. }), "{next:?}");
+    gate.notify_one();
+    side.idle().await;
+    let status = serde_json::to_value(
+        side.registry
+            .run_status(&side.key, RunId("r2".into()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["state"], "completed", "{status}");
+    let view = side
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap();
+    for (ordinal, entry) in view.conversation().entries.iter().enumerate() {
+        assert!(
+            entry.facts.is_some(),
+            "message {ordinal} has no entry facts"
+        );
+    }
+    assert!(side.registry.stop_and_seal().await);
 }
