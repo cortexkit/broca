@@ -20,6 +20,8 @@ const MAX_ATTEMPTS: u32 = 3;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(25);
 const RECOVERY_SESSIONS_PER_BATCH: usize = 4;
 const RECOVERY_BATCH_INTERVAL: Duration = Duration::from_secs(3);
+/// How often a sweep waiting for the deployment key checks whether it has loaded.
+const KEY_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[async_trait]
 pub trait WithdrawTransport: Send + Sync {
@@ -40,6 +42,15 @@ pub struct HeldWithdrawals {
     stopping: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
     sweep: Mutex<SweepProgress>,
     store_runtime: std::sync::OnceLock<std::sync::Weak<crate::store_open::StoreRuntime>>,
+}
+
+/// What one recovery sweep did, for its closing log line, and the last failure it met.
+#[derive(Default)]
+struct SweepTally {
+    sessions_read: usize,
+    rows_settled: usize,
+    withdrawals_sent: u32,
+    failure: Option<String>,
 }
 
 #[derive(Default)]
@@ -142,10 +153,10 @@ impl HeldWithdrawals {
         self.sweep.lock().expect("withdrawal sweep").rows_remaining =
             sessions.iter().map(|(_, rows)| rows.len()).sum();
         let started = std::time::Instant::now();
-        let mut sessions_read = 0;
-        let mut rows_settled = 0;
-        let mut withdrawals_sent = 0;
-        let mut failure = None;
+        let mut tally = SweepTally::default();
+        // An encrypted session can't be read until the deployment key loads, which a start often
+        // reaches the sweep before: such a session waits for the key rather than failing.
+        let mut waiting = Vec::new();
         for (index, (bind, rows)) in sessions.into_iter().enumerate() {
             if stopping.is_cancelled() {
                 break;
@@ -158,77 +169,40 @@ impl HeldWithdrawals {
                 }
             }
             let runtime = self.store_runtime.get().and_then(std::sync::Weak::upgrade);
-            let held = runtime
-                .as_ref()
-                .map(|runtime| runtime.holds(&bind).map_err(|error| error.to_string()))
-                .transpose()?
-                .unwrap_or(false);
-            if let (true, Some(runtime)) = (held, runtime) {
-                sessions_read += 1;
-                for (call, state, attempts) in &rows {
-                    let attempts = if state == "failed" {
-                        None
-                    } else {
-                        Some(*attempts)
-                    };
-                    match self.drive(call.clone(), attempts).await {
-                        Ok(sent) => withdrawals_sent += sent,
-                        // Named, so a failure the sweep reports can be traced to its session.
-                        Err(error) => {
-                            failure = Some(format!(
-                                "{} (session {}, call {} of {})",
-                                error,
-                                broca_core::session_addr(&bind),
-                                call.call_key,
-                                call.module
-                            ));
-                        }
-                    }
-                }
-                // Every registered call gets a watch, and a call answered without a hold, or
-                // whose run ended, never needs one. Retiring those here keeps the outbox from
-                // growing with every call. A watch a withdrawal above already attempted stays.
-                // A call answered inline gives up its registration too; a held one keeps it for
-                // intake, since its provider may still send the result.
-                let keys: Vec<String> = rows
-                    .iter()
-                    .map(|(call, _, _)| call.call_key.clone())
-                    .collect();
-                if let Some(settled) =
-                    crate::late_results_puller::settled_watches(&runtime, &bind, &keys).await
-                {
-                    let module = |key: &str| {
-                        rows.iter()
-                            .find(|(call, _, _)| call.call_key == key)
-                            .map(|(call, _, _)| (call.module.clone(), key.to_owned()))
-                    };
-                    let (inline, held): (Vec<_>, Vec<_>) =
-                        settled.into_iter().partition(|watch| watch.inline);
-                    let inline: Vec<_> =
-                        inline.iter().filter_map(|w| module(&w.call_key)).collect();
-                    let held: Vec<_> = held.iter().filter_map(|w| module(&w.call_key)).collect();
-                    match self
-                        .store
-                        .remove_spent_calls(&inline)
-                        .and_then(|inline| Ok(inline + self.store.retire_watches(&held)?))
-                    {
-                        Ok(removed) => rows_settled += removed,
-                        Err(error) => failure = Some(error),
-                    }
-                }
-                self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
-                tokio::task::yield_now().await;
+            // A head that can't be checked is left to the read below, which reports it.
+            let wait = runtime.as_ref().is_some_and(|runtime| {
+                runtime.holds(&bind).unwrap_or(false)
+                    && !runtime.readable_now(&bind).unwrap_or(true)
+            });
+            if wait {
+                waiting.push((bind, rows));
                 continue;
             }
-            // The store doesn't hold the session, or isn't installed yet: its cancellations
-            // can't be read, so the rows stay for a later sweep.
-            failure = Some(format!(
-                "held withdrawals wait: no session store holds {}",
-                broca_core::session_addr(&bind)
-            ));
-            self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
-            tokio::task::yield_now().await;
+            self.sweep_session(runtime, bind, rows, &mut tally).await;
         }
+        let runtime = self.store_runtime.get().and_then(std::sync::Weak::upgrade);
+        if let (false, Some(runtime)) = (waiting.is_empty(), runtime) {
+            while !runtime.key_loaded() && !stopping.is_cancelled() {
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => {}
+                    _ = tokio::time::sleep(KEY_WAIT_INTERVAL) => {}
+                }
+            }
+            for (bind, rows) in waiting {
+                if stopping.is_cancelled() {
+                    break;
+                }
+                self.sweep_session(Some(runtime.clone()), bind, rows, &mut tally)
+                    .await;
+            }
+        }
+        let SweepTally {
+            sessions_read,
+            rows_settled,
+            withdrawals_sent,
+            failure,
+        } = tally;
         self.refresh_health();
         tracing::info!(target: "late_results", sessions_read, rows_settled, withdrawals_sent,
             elapsed_ms = started.elapsed().as_millis() as u64, "provider-held withdrawal recovery sweep finished");
@@ -237,6 +211,88 @@ impl HeldWithdrawals {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Withdraws the owed calls of one session and retires the watches it no longer needs,
+    /// adding what it did to `tally`. A session the store doesn't hold keeps its rows for a later
+    /// sweep.
+    async fn sweep_session(
+        &self,
+        runtime: Option<Arc<crate::store_open::StoreRuntime>>,
+        bind: broca_protocol::BindIdentity,
+        rows: Vec<(LateResultRegistration, String, u32)>,
+        tally: &mut SweepTally,
+    ) {
+        let held = match runtime.as_ref().map(|runtime| runtime.holds(&bind)) {
+            Some(Ok(held)) => held,
+            Some(Err(error)) => {
+                tally.failure = Some(error.to_string());
+                false
+            }
+            None => false,
+        };
+        if let (true, Some(runtime)) = (held, runtime) {
+            tally.sessions_read += 1;
+            for (call, state, attempts) in &rows {
+                let attempts = if state == "failed" {
+                    None
+                } else {
+                    Some(*attempts)
+                };
+                match self.drive(call.clone(), attempts).await {
+                    Ok(sent) => tally.withdrawals_sent += sent,
+                    // Named, so a failure the sweep reports can be traced to its session.
+                    Err(error) => {
+                        tally.failure = Some(format!(
+                            "{} (session {}, call {} of {})",
+                            error,
+                            broca_core::session_addr(&bind),
+                            call.call_key,
+                            call.module
+                        ));
+                    }
+                }
+            }
+            // Every registered call gets a watch, and a call answered without a hold, or whose
+            // run ended, never needs one. Retiring those here keeps the outbox from growing with
+            // every call. A watch a withdrawal above already attempted stays. A call answered
+            // inline gives up its registration too; a held one keeps it for intake, since its
+            // provider may still send the result.
+            let keys: Vec<String> = rows
+                .iter()
+                .map(|(call, _, _)| call.call_key.clone())
+                .collect();
+            if let Some(settled) =
+                crate::late_results_puller::settled_watches(&runtime, &bind, &keys).await
+            {
+                let module = |key: &str| {
+                    rows.iter()
+                        .find(|(call, _, _)| call.call_key == key)
+                        .map(|(call, _, _)| (call.module.clone(), key.to_owned()))
+                };
+                let (inline, held): (Vec<_>, Vec<_>) =
+                    settled.into_iter().partition(|watch| watch.inline);
+                let inline: Vec<_> = inline.iter().filter_map(|w| module(&w.call_key)).collect();
+                let held: Vec<_> = held.iter().filter_map(|w| module(&w.call_key)).collect();
+                match self
+                    .store
+                    .remove_spent_calls(&inline)
+                    .and_then(|inline| Ok(inline + self.store.retire_watches(&held)?))
+                {
+                    Ok(removed) => tally.rows_settled += removed,
+                    Err(error) => tally.failure = Some(error),
+                }
+            }
+        } else {
+            // The store doesn't hold the session, or isn't installed yet: its cancellations
+            // can't be read, so the rows stay for a later sweep.
+            tally.failure = Some(format!(
+                "held withdrawals wait: no session store holds {}",
+                broca_core::session_addr(&bind)
+            ));
+        }
+        self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
+        tokio::task::yield_now().await;
     }
 
     /// Withdraw `call`, counting on from `attempts` sent before. `None` asks a failed withdrawal

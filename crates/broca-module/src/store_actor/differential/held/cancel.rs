@@ -16,7 +16,8 @@ cipher_tests!(
     a_parked_held_run_cancels_alike,
     other_parked_pauses_cancel_alike,
     a_parked_cancel_request_survives_restart,
-    a_boundary_cancel_before_a_held_call_closes_it_and_leaves_the_session_usable
+    a_boundary_cancel_before_a_held_call_closes_it_and_leaves_the_session_usable,
+    withdrawal_recovery_reads_an_encrypted_session_once_the_key_loads
 );
 
 #[derive(Default)]
@@ -219,6 +220,82 @@ async fn a_parked_held_run_cancels_alike(cipher: Cipher) {
         }
         broca_test_support::pin!("alike", observations[0]);
     }
+}
+
+/// Withdrawal recovery runs at each start, often before the deployment key has loaded. A plain
+/// session's withdrawal goes out at once; an encrypted one's waits for the key and goes out then,
+/// rather than the sweep failing on a session it can't read yet.
+async fn withdrawal_recovery_reads_an_encrypted_session_once_the_key_loads(cipher: Cipher) {
+    let side = Side::new(
+        true,
+        cipher,
+        vec![super::super::super::tests::read_step("m1")],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    let status = side.status().await;
+    let key = status["held_calls"][0]["call_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let db = Arc::new(LateResultsStore::open(&side.dir.join("late-results.db")).unwrap());
+    let call = LateResultRegistration {
+        lineage: key.rsplit_once(':').unwrap().0.into(),
+        call_key: key.clone(),
+        module: "tools".into(),
+        bind: side.key.clone(),
+        scope: None,
+    };
+    db.register_calls(std::slice::from_ref(&call)).unwrap();
+    let reply = side
+        .registry
+        .route_cancel_at(&side.key, RunId("r1".into()), RunCancelAt::StepBoundary)
+        .await
+        .unwrap();
+    assert_eq!(reply, CancelOutcome::Ack);
+    cancelled(&side).await;
+    // The same storage, read by a runtime the deployment key hasn't loaded into yet.
+    let unkeyed = Arc::new(
+        crate::store_open::StoreRuntime::open_without_key(
+            &side.dir,
+            1,
+            cipher,
+            side.executor.clone(),
+            IDLE,
+        )
+        .await
+        .unwrap(),
+    );
+    let transport = Arc::new(Withdrawals::default());
+    let withdrawals = HeldWithdrawals::new(db.clone(), transport.clone());
+    withdrawals.bind_stopping_signal(CancellationToken::new());
+    withdrawals.with_store_runtime(unkeyed.clone());
+    let sweep = tokio::spawn({
+        let withdrawals = withdrawals.clone();
+        async move { withdrawals.recover().await }
+    });
+    if cipher == Cipher::XChaCha20Poly1305 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            transport.0.lock().unwrap().is_empty() && !sweep.is_finished(),
+            "the sweep waits for the key: {}",
+            withdrawals.health()
+        );
+        unkeyed
+            .load_key_for_test(DeploymentKey::new(1, &[7; 32]))
+            .unwrap();
+    }
+    sweep.await.unwrap().unwrap();
+    assert_eq!(
+        transport.0.lock().unwrap().as_slice(),
+        [(key.clone(), false)]
+    );
+    assert_eq!(
+        db.withdrawal_state("tools", &key).unwrap(),
+        Some(("done".into(), 1))
+    );
+    assert!(side.registry.stop_and_seal().await);
 }
 
 async fn other_parked_pauses_cancel_alike(cipher: Cipher) {

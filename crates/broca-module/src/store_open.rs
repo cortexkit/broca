@@ -236,6 +236,14 @@ impl StoreRuntime {
         self.deployment.get().is_some()
     }
 
+    /// Installs `deployment` into a runtime opened without it, as the module's key loader does
+    /// once the vault answers.
+    #[cfg(test)]
+    pub(crate) fn load_key_for_test(&self, deployment: DeploymentKey) -> Result<(), String> {
+        let parts = self.encrypted_parts(&deployment)?;
+        self.install_key(deployment, parts)
+    }
+
     /// The mode of the sessions this runtime creates.
     pub fn new_sessions(&self) -> Cipher {
         self.new_sessions
@@ -439,6 +447,18 @@ impl StoreRuntime {
     /// Errors as [`holds`](Self::holds).
     pub fn class_of(&self, key: &BindIdentity) -> Result<Option<StorageClass>, OpenError> {
         head_class(&self.state_root, key)
+    }
+
+    /// Whether the session `key`, kept here, can be read now: every session once the deployment
+    /// key has loaded, and a plain one before. `false` for a session no root holds.
+    pub fn readable_now(&self, key: &BindIdentity) -> Result<bool, OpenError> {
+        if self.key_loaded() {
+            return Ok(true);
+        }
+        match self.class_of(key)? {
+            Some(class) => Ok(stored_cipher(&self.state_root, class, key)? == Cipher::None),
+            None => Ok(false),
+        }
     }
 
     /// The store of the root of `class`.
