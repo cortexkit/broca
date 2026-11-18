@@ -235,3 +235,70 @@ fn earlier_request_prefix_is_unchanged_on_anthropic_responses_and_gemini() {
         }
     }
 }
+
+/// A template stored after a tool result can still reach a request right after a model reply,
+/// when a compaction view drops the messages between them. Anthropic refuses a system message
+/// there, so the renderer sends it as a user note. A template right after a user or tool message
+/// keeps its system role and bytes, and so does the stored history.
+#[test]
+fn anthropic_template_after_a_model_reply_renders_as_a_user_note() {
+    let (family, frozen, _) = route("anthropic_messages", true);
+    let call = || ToolCall {
+        tool_call_id: ToolCallId("call_1".into()),
+        tool_name: "read".into(),
+        input: json!({"path": "a"}).into(),
+        thought_signature: None,
+    };
+    let mut result = Message::new(
+        Role::Tool,
+        vec![ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId("call_1".into()),
+            output: ToolOutput::Text { text: "a".into() },
+            is_error: false,
+        })],
+    );
+    result.ordinal = None;
+    let prompt = vec![
+        text(Role::System, "Fixed instructions."),
+        system("At the start."),
+        text(Role::User, "First turn."),
+        Message::new(Role::Assistant, vec![ContentBlock::ToolCall(call())]),
+        result,
+        system("After a tool result."),
+        system("Right after another template."),
+        text(Role::Assistant, "A reply."),
+        system("After a model reply."),
+        text(Role::User, "Next turn."),
+    ];
+    let opts = CallOptions::new(prompt.clone());
+    let body: Value = serde_json::from_slice(&family.render(&frozen, &opts)).unwrap();
+    let rendered: Vec<(String, String)> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| {
+            let content = message["content"].as_str()?;
+            Some((
+                message["role"].as_str().unwrap().to_owned(),
+                content.to_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        [
+            ("user", "<context-note>At the start.</context-note>"),
+            ("system", "After a tool result."),
+            (
+                "user",
+                "<context-note>Right after another template.</context-note>"
+            ),
+            ("user", "<context-note>After a model reply.</context-note>"),
+        ]
+        .map(|(role, text)| (role.to_owned(), text.to_owned()))
+    );
+    assert_eq!(
+        opts.prompt, prompt,
+        "rendering must not mutate stored history"
+    );
+}

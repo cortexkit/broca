@@ -662,6 +662,8 @@ fn with_request_body<R>(
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
+    let placed = crate::turn_system::place(frozen, opts);
+    let opts = placed.as_ref();
     let marker_policy = anthropic_marker_policy(frozen);
 
     // System: a required identity may lead (an OAuth requirement), then any system

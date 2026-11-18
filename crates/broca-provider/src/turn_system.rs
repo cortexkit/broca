@@ -75,6 +75,54 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
     Cow::Owned(rendered)
 }
 
+/// Anthropic accepts a system message in the conversation only right after a user message (a
+/// tool result included). Delivery checks that place against the history it sees, but the
+/// request a later step renders can differ: a compaction view may drop or reorder the messages
+/// before the template. A template whose rendered predecessor is not a user message (or is
+/// another template) goes out as a user note instead, so the request stays one the API accepts.
+/// Only the rendered copy changes, and a template in a place the API accepts keeps its bytes.
+/// System messages that render at the top of the request are skipped when finding a
+/// predecessor, as the request body leaves them out of the conversation.
+pub fn place<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a, CallOptions> {
+    if frozen.family_id != WireFamilyId::AnthropicMessages || !supported(frozen) {
+        return Cow::Borrowed(opts);
+    }
+    // Whether the message rendered last is a user message: a tool result, a person's message,
+    // or a template already turned into a user note. A template that stays a system message
+    // is not one, so a second template right after it becomes a note too.
+    let mut after_user = false;
+    let mut misplaced = Vec::new();
+    for (index, message) in opts.prompt.iter().enumerate() {
+        if message.role == Role::System && !message.turn_system {
+            continue;
+        }
+        if message.turn_system && message.role == Role::System {
+            if after_user {
+                after_user = false;
+            } else {
+                misplaced.push(index);
+                after_user = true;
+            }
+            continue;
+        }
+        after_user = matches!(message.role, Role::User | Role::Tool);
+    }
+    if misplaced.is_empty() {
+        return Cow::Borrowed(opts);
+    }
+    let mut rendered = opts.clone();
+    for index in misplaced {
+        // The same user note an unsupported route renders (`prepare`).
+        let message = &mut rendered.prompt[index];
+        let text = text(message);
+        message.role = Role::User;
+        message.content = vec![ContentBlock::Text {
+            text: format!("<context-note>{text}</context-note>").into(),
+        }];
+    }
+    Cow::Owned(rendered)
+}
+
 pub(crate) fn text(message: &broca_protocol::Message) -> String {
     message
         .content
