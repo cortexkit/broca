@@ -1060,6 +1060,7 @@ fn resolve_provider_inner(
             None,
             None,
             None,
+            None,
         )?;
         // The override endpoint is opaque, so broca has no tier bytes for it: any requested
         // tier is refused as unmapped.
@@ -1280,6 +1281,9 @@ fn resolve_provider_inner(
             }),
             options_spec.as_ref().map(|spec| &spec.reasoning_options),
             catalog.output_limit(provider_id, catalog_model_id),
+            options_spec
+                .as_ref()
+                .and_then(|spec| spec.reasoning_default_effort.as_deref()),
         )?;
         // Priced against the same catalog row the variant resolves against.
         apply_service_tier(
@@ -1468,6 +1472,7 @@ fn resolve_provider_inner(
         None,
         Some(&model_spec.reasoning_options),
         model_spec.limits.max_output,
+        model_spec.reasoning_default_effort.as_deref(),
     )?;
     apply_service_tier(
         &mut frozen,
@@ -1823,6 +1828,7 @@ fn freeze_refusal_fallback(
             None,
             Some(&model_spec.reasoning_options),
             model_spec.limits.max_output,
+            model_spec.reasoning_default_effort.as_deref(),
         )
         .is_ok()
         {
@@ -1921,6 +1927,7 @@ fn apply_structured_output(
 /// model accepts still comes from its catalog row, but a level is sent by switching the backend
 /// model id to that level's tier (`high` on `antigravity-gemini-3.8-flash` sends
 /// `gemini-3.8-flash-high` with that tier's thinking settings). See [`apply_code_assist_variant`].
+#[allow(clippy::too_many_arguments)]
 fn apply_variant(
     frozen: &mut FrozenRenderConfig,
     restored: Option<&FrozenVariant>,
@@ -1929,12 +1936,14 @@ fn apply_variant(
     route: Option<CodeAssistRoute<'_>>,
     options: Option<&ReasoningOptions>,
     output_limit: Option<u64>,
+    default_effort: Option<&str>,
 ) -> Result<(), ResolutionError> {
     let code_assist = frozen.family_id == WireFamilyId::GoogleCodeAssist;
     if let Some(restored) = restored {
         return freeze_variant(frozen, restored.clone()).map_err(ResolutionError::Config);
     }
     let Some(requested) = requested else {
+        apply_default_effort(frozen, catalog_model, options, output_limit, default_effort);
         return Ok(());
     };
     if code_assist {
@@ -1960,6 +1969,48 @@ fn apply_variant(
     )
     .map_err(ResolutionError::VariantUnsupported)?;
     freeze_variant(frozen, variant).map_err(ResolutionError::Config)
+}
+
+/// A fresh episode that names no variant sends the effort its vendor documents as the model's
+/// default (`default_effort`), explicitly, so the effort a run used is known rather than left to
+/// the provider. Only where a variant of that effort sends the effort and nothing else: the
+/// OpenAI families. An Anthropic or Google effort variant also turns thinking on, which a run
+/// that named no variant didn't ask for, so those keep sending nothing. A run that already
+/// freezes an effort of its own (a ChatGPT `reasoning_effort`) keeps it, and a default the
+/// family can't send is dropped, never refused: the run asked for nothing.
+fn apply_default_effort(
+    frozen: &mut FrozenRenderConfig,
+    catalog_model: &str,
+    options: Option<&ReasoningOptions>,
+    output_limit: Option<u64>,
+    default_effort: Option<&str>,
+) {
+    let (Some(default), Some(options)) = (default_effort, options) else {
+        return;
+    };
+    if frozen.reasoning_effort.is_some() {
+        return;
+    }
+    let Ok(variant) = resolve_variant(
+        frozen.family_id,
+        catalog_model,
+        &frozen.wire_model_id,
+        options,
+        output_limit,
+        default,
+    ) else {
+        return;
+    };
+    if matches!(
+        variant.request,
+        broca_provider::variant::VariantRequest::OpenAiResponses { .. }
+            | broca_provider::variant::VariantRequest::OpenAiChat { .. }
+    ) {
+        let mut with_default = frozen.clone();
+        if freeze_variant(&mut with_default, variant).is_ok() {
+            *frozen = with_default;
+        }
+    }
 }
 
 /// Freeze the episode's service tier into its render config.

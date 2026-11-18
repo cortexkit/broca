@@ -20,6 +20,9 @@ use crate::family::{resolve_provider_family, FamilyResolution};
 use crate::Catalog;
 use crate::{CatalogError, OVERLAY};
 
+mod reasoning_facts;
+use reasoning_facts::{reasoning_default_effort_fact, reasoning_fact, reasoning_options_fact};
+
 // Snapshot replacement bypasses refresh validation and must not be available to shipping code.
 #[cfg(all(feature = "test-support", not(debug_assertions)))]
 compile_error!("catalog test-support cannot be enabled in a release build");
@@ -330,6 +333,8 @@ struct ServingModel {
     /// `capability.reasoning_options`: null, `[]` and a populated array stay distinct. A catalog
     /// from before fusiform served the fact reads as unstated, which defines no variant.
     reasoning_options: ReasoningOptions,
+    /// `capability.reasoning_default`, when it is an effort its own options offer.
+    reasoning_default_effort: Option<String>,
     /// `capability.server_side_fallback`: whether the runtime accepts a request that asks it to
     /// hand a refusal to another model itself. Absent and null both read as `None`, which callers
     /// treat as false: the fact is served on current reads only, so an older catalog or a
@@ -366,6 +371,7 @@ impl Default for ServingModel {
             tool_call: CapabilityFlag::Absent,
             structured_output: CapabilityFlag::Absent,
             reasoning_options: ReasoningOptions::Unstated,
+            reasoning_default_effort: None,
             server_side_fallback: None,
             mid_conversation_system: None,
             priced_modes: Vec::new(),
@@ -406,6 +412,7 @@ impl ServingModel {
             tool_call: model.capabilities.tool_call,
             structured_output: model.capabilities.structured_output,
             reasoning_options: model.reasoning_options.clone(),
+            reasoning_default_effort: model.reasoning_default_effort.clone(),
             server_side_fallback: model.server_side_fallback,
             mid_conversation_system: model.mid_conversation_system,
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
@@ -444,6 +451,7 @@ impl ServingModel {
             },
             cost: self.cost.clone(),
             reasoning_options: self.reasoning_options.clone(),
+            reasoning_default_effort: self.reasoning_default_effort.clone(),
             server_side_fallback: self.server_side_fallback,
             mid_conversation_system: self.mid_conversation_system,
             release_date: None,
@@ -1556,6 +1564,7 @@ fn serving_model_from_facts(
             "capability.structured_output",
         )?,
         reasoning_options: reasoning_options_fact(identity, facts)?,
+        reasoning_default_effort: reasoning_default_effort_fact(identity, facts),
         server_side_fallback: server_side_fallback_fact(identity, facts),
         mid_conversation_system: facts
             .get(MID_CONVERSATION_SYSTEM_FACT)
@@ -1679,51 +1688,6 @@ fn server_side_fallback_fact(identity: &str, facts: &BTreeMap<String, Value>) ->
                  still serves"
             );
             None
-        }
-    }
-}
-
-/// `capability.reasoning`: an omitted fact reads as [`CapabilityFlag::Unknown`], exactly like
-/// an explicit null, never as `Absent`.
-///
-/// The difference matters because `CapabilityFlag::admit` (called by `resolve_frozen`) admits
-/// `Absent` as `false` and freezes `ReasoningPolicy::None`. A reasoning model whose flag
-/// fusiform stopped serving would then run without reasoning and nothing would report it:
-/// "could not tell" would have become a known `false`. As `Unknown`, a send that would reason
-/// (the family's reasoning policy is not `None`) is refused at admission, as it is for null,
-/// and a send that would not reason admits.
-///
-/// The mapping lives here rather than in `admit` because `Absent` as `false` is still the
-/// documented reading for the vendored snapshot catalog. Excluding the row instead would also
-/// lose rows that are servable as they are: the curated decision models (clef, clairic, jev)
-/// state no reasoning flag and are served on families that never reason.
-fn reasoning_fact(
-    identity: &str,
-    facts: &BTreeMap<String, Value>,
-) -> Result<CapabilityFlag, CatalogError> {
-    Ok(
-        match optional_capability_fact(identity, facts, "capability.reasoning")? {
-            CapabilityFlag::Absent => CapabilityFlag::Unknown,
-            stated => stated,
-        },
-    )
-}
-
-/// `capability.reasoning_options`, served verbatim from models.dev. Unlike the capability flags
-/// this fact is optional: a fusiform from before it existed does not serve it, and that reads
-/// as unstated (no variants) rather than refusing the whole catalog.
-fn reasoning_options_fact(
-    identity: &str,
-    facts: &BTreeMap<String, Value>,
-) -> Result<ReasoningOptions, CatalogError> {
-    match facts.get("capability.reasoning_options") {
-        None => Ok(ReasoningOptions::Unstated),
-        Some(value) => {
-            ReasoningOptions::from_value(value).ok_or_else(|| CatalogError::FusiformFact {
-                model: identity.to_string(),
-                fact: "capability.reasoning_options".to_string(),
-                reason: format!("expected array or null, found {}", value_kind(value)),
-            })
         }
     }
 }

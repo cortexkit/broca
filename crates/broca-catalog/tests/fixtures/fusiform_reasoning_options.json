@@ -447,6 +447,108 @@
       "existence": "present",
       "limit.context": 1000000,
       "limit.output": 128000
+    },
+    "openai/gpt-5.6-default": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      },
+      "wire.api": {
+        "value": "https://api.openai.com/v1",
+        "from": "provider"
+      },
+      "capability.reasoning_default": {
+        "type": "effort",
+        "value": "medium"
+      }
+    },
+    "openai/gpt-5.6-default-unoffered": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      },
+      "wire.api": {
+        "value": "https://api.openai.com/v1",
+        "from": "provider"
+      },
+      "capability.reasoning_default": {
+        "type": "effort",
+        "value": "ultra"
+      }
+    },
+    "anthropic/claude-opus-4-6-default": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "max": 127999,
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      },
+      "wire.api": {
+        "value": "https://api.anthropic.com",
+        "from": "provider"
+      },
+      "capability.reasoning_default": {
+        "type": "effort",
+        "value": "medium"
+      }
     }
   },
   "resolved_at_ms": 1,

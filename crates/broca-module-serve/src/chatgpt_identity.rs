@@ -62,6 +62,9 @@ pub fn fresh(
         installation_id: ChatgptWire::scoped_id("chatgpt-installation", install_id),
         turn_id: turn_id.to_string(),
         turn_started_at_unix_ms: admitted_at_ms,
+        // Every ChatGPT run asks for a reasoning summary, so the reasoning its model does shows
+        // as text; without one the backend returns only the encrypted reasoning item.
+        reasoning_summary: Some("auto".into()),
     })
 }
 
@@ -179,12 +182,28 @@ mod tests {
         assert_eq!(first.turn_started_at_unix_ms, 123);
         assert_eq!(first.window_id, format!("{}:0", first.thread_id));
         assert_eq!(first.profile, ChatgptWireProfile::Codex0163);
+        // A new run asks for a reasoning summary; a run recorded before the field existed keeps
+        // asking for none when it resumes, so its request bytes don't change.
+        assert_eq!(first.reasoning_summary.as_deref(), Some("auto"));
         let changed_host = || Err("host discovery must not run on resume".into());
         let config = serde_json::json!({"chatgpt_wire": first});
         assert_eq!(
             for_episode(None, Some(&config), changed_host).unwrap(),
-            Some(first)
+            Some(first.clone())
         );
+        let mut recorded_before = serde_json::to_value(&first).unwrap();
+        recorded_before
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_summary");
+        let resumed = for_episode(
+            None,
+            Some(&serde_json::json!({"chatgpt_wire": recorded_before})),
+            changed_host,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed.reasoning_summary, None);
         for legacy in [
             serde_json::json!({}),
             serde_json::json!({"chatgpt_wire":null}),

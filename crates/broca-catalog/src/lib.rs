@@ -804,6 +804,9 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             .get("reasoning_options")
             .and_then(ReasoningOptions::from_value)
             .unwrap_or_default(),
+        // models.dev publishes no default effort; only fusiform's curated
+        // `capability.reasoning_default` carries one.
+        reasoning_default_effort: None,
         // The snapshot spelling of fusiform's `capability.server_side_fallback`. The vendored
         // copy states none, but a test catalog can, so both read paths agree. A value that is
         // not a boolean reads as unstated, like the fusiform reader's.

@@ -1403,6 +1403,7 @@ mod tests {
             window_id: "fixture-window".into(),
             turn_id: "fixture-turn".into(),
             turn_started_at_unix_ms: 1,
+            reasoning_summary: None,
         });
         let provider = broca_provider::live_provider_with_options(
             Some(broca_provider::build_provider_http_client()),

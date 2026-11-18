@@ -104,6 +104,7 @@ fn openai_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        reasoning_default_effort: None,
         server_side_fallback: None,
         mid_conversation_system: None,
         input_modalities: Default::default(),

@@ -351,6 +351,39 @@ mod gated {
         );
     }
 
+    /// A run that names no variant sends the effort the catalog documents as the vendor's
+    /// default (`capability.reasoning_default`), as if it had named it, on the OpenAI families.
+    /// A named variant wins. A default the row's options don't offer sends nothing, and so does
+    /// an Anthropic default, whose variant would also turn thinking on.
+    #[test]
+    fn a_documented_default_effort_is_sent_when_no_variant_is_named() {
+        for method in [AuthMethod::ApiKey, AuthMethod::Chatgpt] {
+            let frozen = resolved("openai/gpt-5.6-default", method, None);
+            assert_eq!(
+                frozen.variant.as_ref().map(|variant| variant.name.as_str()),
+                Some("medium"),
+                "{method:?}"
+            );
+            assert_eq!(body(&frozen)["reasoning"]["effort"], "medium", "{method:?}");
+            let named = resolved("openai/gpt-5.6-default", method, Some("high"));
+            assert_eq!(body(&named)["reasoning"]["effort"], "high", "{method:?}");
+            // A row stating no default is unchanged.
+            let plain = resolved("openai/gpt-5.6-luna", method, None);
+            assert!(plain.variant.is_none(), "{method:?}");
+        }
+        let unoffered = resolved("openai/gpt-5.6-default-unoffered", AuthMethod::ApiKey, None);
+        assert!(unoffered.variant.is_none());
+        assert!(body(&unoffered).get("reasoning").is_none());
+        let anthropic = resolved(
+            "anthropic/claude-opus-4-6-default",
+            AuthMethod::ApiKey,
+            None,
+        );
+        assert!(anthropic.variant.is_none());
+        assert!(body(&anthropic).get("thinking").is_none());
+        assert!(body(&anthropic).get("output_config").is_none());
+    }
+
     /// Gemini: effort values become `thinkingLevel`; toggle + budget give `none`, `high`, `max`.
     #[test]
     fn gemini_variants_render_thinking_config() {

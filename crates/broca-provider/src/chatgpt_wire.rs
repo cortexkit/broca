@@ -23,6 +23,10 @@ pub struct ChatgptWire {
     pub window_id: String,
     pub turn_id: String,
     pub turn_started_at_unix_ms: u64,
+    /// The reasoning summary to ask for when the request names none, as Codex asks for `auto`.
+    /// Frozen at admission, so a run admitted before this field existed keeps its request bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<String>,
 }
 
 impl ChatgptWire {
@@ -122,9 +126,15 @@ impl ChatgptWire {
             );
             crate::families::openai_responses::convert_tool_choice(&opts.tool_choice, &names)
         });
-        // The catalog has no authoritative summary/default effort/verbosity facts. Keep
-        // explicit caller choices, including schema output, instead of guessing defaults.
-        object.entry("reasoning").or_insert_with(|| json!({}));
+        // Explicit caller choices stay as they are, schema output included. A summary the run
+        // froze is asked for only where the request names none, so the model's reasoning comes
+        // back as text the apps can show.
+        let reasoning = object.entry("reasoning").or_insert_with(|| json!({}));
+        if let (Some(summary), Some(reasoning)) =
+            (&self.reasoning_summary, reasoning.as_object_mut())
+        {
+            reasoning.entry("summary").or_insert_with(|| json!(summary));
+        }
         body["client_metadata"] = json!({
             "x-codex-installation-id":self.installation_id,
             "session_id":self.session_id, "thread_id":self.thread_id,
@@ -382,6 +392,28 @@ mod tests {
         let body = body();
         assert_eq!(body["reasoning"], json!({}));
         assert!(body.get("text").is_none());
+    }
+    /// A run that froze a summary asks for it beside whatever effort it sends, and a summary
+    /// the request already names stays as it is.
+    #[test]
+    fn a_frozen_summary_is_asked_for_where_the_request_names_none() {
+        let (mut frozen, opts) = fixture();
+        frozen.chatgpt_wire.as_mut().unwrap().reasoning_summary = Some("auto".into());
+        let body = OpenAiResponsesChatgpt.shape(&frozen, &opts);
+        assert_eq!(body["reasoning"], json!({"summary":"auto"}));
+        frozen.reasoning_effort = Some("high".into());
+        let body = OpenAiResponsesChatgpt.shape(&frozen, &opts);
+        assert_eq!(body["reasoning"], json!({"effort":"high","summary":"auto"}));
+        frozen.reasoning_effort = None;
+        frozen.reasoning = crate::policy::ReasoningPolicy::OpenAiResponsesReasoning {
+            effort: "low".into(),
+            summary: Some("detailed".into()),
+        };
+        let body = OpenAiResponsesChatgpt.shape(&frozen, &opts);
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort":"low","summary":"detailed"})
+        );
     }
     #[test]
     fn caller_controls_win() {

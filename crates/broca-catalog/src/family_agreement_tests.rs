@@ -19,6 +19,15 @@ const TOKENS: [(&str, WireFamilyId); 7] = [
     ("aws.bedrock_converse", WireFamilyId::BedrockConverse),
 ];
 
+/// Wire families fusiform names that broca deliberately has no renderer for: a non-chat API
+/// `session.send` never serves. A row naming one must have no broca family either; a token in
+/// neither list still fails, so a new chat family can't go unnoticed.
+const UNSERVED_TOKENS: [&str; 3] = [
+    "elevenlabs.text_to_speech",
+    "google.interactions",
+    "openai.images",
+];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
@@ -67,7 +76,11 @@ struct Agreement {
 
 impl Agreement {
     fn check(&mut self, context: &str, row: &Row) {
-        let fusiform = row.family.as_deref().map(|token| {
+        let unserved = row
+            .family
+            .as_deref()
+            .is_some_and(|token| UNSERVED_TOKENS.contains(&token));
+        let fusiform = row.family.as_deref().filter(|_| !unserved).map(|token| {
             TOKENS
                 .iter()
                 .find(|(known, _)| *known == token)
@@ -84,6 +97,12 @@ impl Agreement {
             "{context}: {}: Fusiform={:?}, Broca={broca:?}; rule={rule}",
             row.model_id, row.family
         );
+        if unserved {
+            if broca.is_some() {
+                self.mismatches.push(detail);
+            }
+            return;
+        }
         match (fusiform, broca) {
             (Some(expected), Some(actual)) => {
                 *self
