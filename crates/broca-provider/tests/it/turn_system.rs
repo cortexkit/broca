@@ -236,39 +236,59 @@ fn earlier_request_prefix_is_unchanged_on_anthropic_responses_and_gemini() {
     }
 }
 
-/// A template stored after a tool result can still reach a request right after a model reply,
-/// when a compaction view drops the messages between them. Anthropic refuses a system message
-/// there, so the renderer sends it as a user note. A template right after a user or tool message
-/// keeps its system role and bytes, and so does the stored history.
+/// Anthropic accepts a system message in the conversation only between a user message (a tool
+/// result included) and an assistant message, or at the end. A template stored in such a place
+/// can still reach a request elsewhere when a compaction view drops the messages around it: after
+/// a model reply, before a user message, or next to another template. The renderer sends each of
+/// those as a user note. A template in a place the API accepts keeps its system role and bytes,
+/// and the stored history keeps its own.
 #[test]
-fn anthropic_template_after_a_model_reply_renders_as_a_user_note() {
+fn anthropic_template_outside_a_user_to_reply_gap_renders_as_a_user_note() {
     let (family, frozen, _) = route("anthropic_messages", true);
-    let call = || ToolCall {
-        tool_call_id: ToolCallId("call_1".into()),
-        tool_name: "read".into(),
-        input: json!({"path": "a"}).into(),
-        thought_signature: None,
+    let call = |id: &str| {
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId(id.into()),
+                tool_name: "read".into(),
+                input: json!({"path": id}).into(),
+                thought_signature: None,
+            })],
+        )
     };
-    let mut result = Message::new(
-        Role::Tool,
-        vec![ContentBlock::ToolResult(ToolResult {
-            tool_call_id: ToolCallId("call_1".into()),
-            output: ToolOutput::Text { text: "a".into() },
-            is_error: false,
-        })],
-    );
-    result.ordinal = None;
+    let result = |id: &str| {
+        let mut result = Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId(id.into()),
+                output: ToolOutput::Text { text: "a".into() },
+                is_error: false,
+            })],
+        );
+        result.ordinal = None;
+        result
+    };
     let prompt = vec![
         text(Role::System, "Fixed instructions."),
         system("At the start."),
         text(Role::User, "First turn."),
-        Message::new(Role::Assistant, vec![ContentBlock::ToolCall(call())]),
-        result,
-        system("After a tool result."),
-        system("Right after another template."),
+        call("call_1"),
+        result("call_1"),
+        system("Before another template."),
+        system("After a note, before a reply."),
         text(Role::Assistant, "A reply."),
         system("After a model reply."),
         text(Role::User, "Next turn."),
+        call("call_2"),
+        result("call_2"),
+        system("Before a user message."),
+        text(Role::User, "Third turn."),
+        call("call_3"),
+        result("call_3"),
+        system("Between a tool result and a reply."),
+        call("call_4"),
+        result("call_4"),
+        system("At the end."),
     ];
     let opts = CallOptions::new(prompt.clone());
     let body: Value = serde_json::from_slice(&family.render(&frozen, &opts)).unwrap();
@@ -288,12 +308,18 @@ fn anthropic_template_after_a_model_reply_renders_as_a_user_note() {
         rendered,
         [
             ("user", "<context-note>At the start.</context-note>"),
-            ("system", "After a tool result."),
             (
                 "user",
-                "<context-note>Right after another template.</context-note>"
+                "<context-note>Before another template.</context-note>"
             ),
+            ("system", "After a note, before a reply."),
             ("user", "<context-note>After a model reply.</context-note>"),
+            (
+                "user",
+                "<context-note>Before a user message.</context-note>"
+            ),
+            ("system", "Between a tool result and a reply."),
+            ("system", "At the end."),
         ]
         .map(|(role, text)| (role.to_owned(), text.to_owned()))
     );

@@ -76,36 +76,49 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
 }
 
 /// Anthropic accepts a system message in the conversation only right after a user message (a
-/// tool result included). Delivery checks that place against the history it sees, but the
-/// request a later step renders can differ: a compaction view may drop or reorder the messages
-/// before the template. A template whose rendered predecessor is not a user message (or is
-/// another template) goes out as a user note instead, so the request stays one the API accepts.
-/// Only the rendered copy changes, and a template in a place the API accepts keeps its bytes.
-/// System messages that render at the top of the request are skipped when finding a
-/// predecessor, as the request body leaves them out of the conversation.
+/// tool result included), and only right before an assistant message or at the end of the
+/// request. Delivery checks that place against the history it sees, but the request a later
+/// step renders can differ: a compaction view may drop the messages around the template, which
+/// can leave it after a model reply, before a user message, or next to another template. Such a
+/// template goes out as a user note instead, so the request stays one the API accepts. Only the
+/// rendered copy changes, and a template in a place the API accepts keeps its bytes. System
+/// messages that render at the top of the request are skipped, as the request body leaves them
+/// out of the conversation.
 pub fn place<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a, CallOptions> {
     if frozen.family_id != WireFamilyId::AnthropicMessages || !supported(frozen) {
         return Cow::Borrowed(opts);
     }
+    let is_template =
+        |message: &broca_protocol::Message| message.turn_system && message.role == Role::System;
+    let conversation: Vec<usize> = (0..opts.prompt.len())
+        .filter(|&index| {
+            let message = &opts.prompt[index];
+            message.role != Role::System || message.turn_system
+        })
+        .collect();
     // Whether the message rendered last is a user message: a tool result, a person's message,
     // or a template already turned into a user note. A template that stays a system message
-    // is not one, so a second template right after it becomes a note too.
+    // is not one.
     let mut after_user = false;
     let mut misplaced = Vec::new();
-    for (index, message) in opts.prompt.iter().enumerate() {
-        if message.role == Role::System && !message.turn_system {
+    for (position, &index) in conversation.iter().enumerate() {
+        let message = &opts.prompt[index];
+        if !is_template(message) {
+            after_user = matches!(message.role, Role::User | Role::Tool);
             continue;
         }
-        if message.turn_system && message.role == Role::System {
-            if after_user {
-                after_user = false;
-            } else {
-                misplaced.push(index);
-                after_user = true;
-            }
-            continue;
+        // The next message as it will render: a template there never renders as an assistant
+        // message, whichever way it goes out.
+        let before_reply = conversation.get(position + 1).is_none_or(|&next| {
+            let next = &opts.prompt[next];
+            next.role == Role::Assistant && !is_template(next)
+        });
+        if after_user && before_reply {
+            after_user = false;
+        } else {
+            misplaced.push(index);
+            after_user = true;
         }
-        after_user = matches!(message.role, Role::User | Role::Tool);
     }
     if misplaced.is_empty() {
         return Cow::Borrowed(opts);
