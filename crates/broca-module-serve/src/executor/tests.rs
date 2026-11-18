@@ -1,5 +1,36 @@
 use super::*;
 use std::time::Duration;
+
+/// The catalog the resolver reads is one process-wide slot, and libtest runs this binary's tests
+/// on parallel threads. A test that installs its own catalog holds the catalog test lock for as
+/// long as it keeps this guard, so another test's install can't replace that catalog between
+/// the install and the lookups it answers. A test that installs again, a second revision, takes
+/// the lock only once.
+#[must_use = "the installed catalog is this test's only while the guard lives"]
+struct TestCatalog {
+    _gate: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+thread_local! {
+    static CATALOGS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn install_catalog(cache: Arc<broca_catalog::CatalogCache>) -> TestCatalog {
+    let gate = (CATALOGS_HELD.get() == 0).then(|| {
+        broca_catalog::runtime::test_catalog_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    CATALOGS_HELD.set(CATALOGS_HELD.get() + 1);
+    broca_catalog::install_global_catalog_cache(cache);
+    TestCatalog { _gate: gate }
+}
+
+impl Drop for TestCatalog {
+    fn drop(&mut self) {
+        CATALOGS_HELD.set(CATALOGS_HELD.get() - 1);
+    }
+}
 include!("../provider_override_tests.rs");
 include!("../recorded_resume_tests.rs");
 include!("../store_run_tests.rs");
@@ -361,7 +392,7 @@ fn unknown_caller_auth_method_is_a_typed_config_refusal() {
     ));
 }
 
-fn install_test_catalog() {
+fn install_test_catalog() -> TestCatalog {
     let catalog = broca_catalog::Catalog::from_json_str(
         include_str!("../../../broca-catalog/data/models.dev.json"),
         include_str!("../../../broca-catalog/data/overlay.json"),
@@ -369,7 +400,7 @@ fn install_test_catalog() {
     .expect("legacy test snapshot is well formed");
     let cache = Arc::new(broca_catalog::CatalogCache::empty());
     cache.install_parsed_for_test(&catalog, 0, broca_catalog::CatalogSource::Fusiform);
-    broca_catalog::install_global_catalog_cache(cache);
+    install_catalog(cache)
 }
 
 fn resolve_for_test(
@@ -377,7 +408,7 @@ fn resolve_for_test(
     method: Option<AuthMethod>,
     family_override: Option<WireFamilyId>,
 ) -> broca_catalog::live::ProviderResolution {
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let result = broca_catalog::live::resolve_provider(
         model,
         None,
@@ -417,7 +448,7 @@ fn resolve_for_test(
 
 #[test]
 fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let options = broca_catalog::live::ResolveOptions {
         tool_name_aliases: None,
         media: false,

@@ -109,7 +109,7 @@ fn alias_submit_request(root: &std::path::Path) -> broca_core::RunRequest {
     req
 }
 
-fn install_alias_catalog() {
+fn install_alias_catalog() -> TestCatalog {
     let catalog = broca_catalog::Catalog::from_json_str(
         &serde_json::json!({"deepseek":{
             "npm":"@ai-sdk/openai-compatible",
@@ -123,7 +123,7 @@ fn install_alias_catalog() {
     .unwrap();
     let cache = Arc::new(broca_catalog::CatalogCache::empty());
     cache.install_parsed_for_test(&catalog, 0, broca_catalog::CatalogSource::Fusiform);
-    broca_catalog::install_global_catalog_cache(cache);
+    install_catalog(cache)
 }
 
 async fn execute_alias_job(
@@ -219,7 +219,7 @@ async fn tool_name_aliases_prefix_all_submit_tool_round_trip() {
     if !run_catalog_drift_child("tool_name_aliases_prefix_all_submit_tool_round_trip") {
         return;
     }
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     assert_submit_alias_round_trip(
         serde_json::json!({"prefix_all":"client_"}),
         "client_bash",
@@ -233,7 +233,7 @@ async fn tool_name_aliases_names_submit_tool_round_trip() {
     if !run_catalog_drift_child("tool_name_aliases_names_submit_tool_round_trip") {
         return;
     }
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     assert_submit_alias_round_trip(
         serde_json::json!({"names":{"submit_result":"client_submit_result"}}),
         "bash",
@@ -247,7 +247,7 @@ async fn tool_name_aliases_unconfigured_submit_tool_keeps_legacy_bytes() {
     if !run_catalog_drift_child("tool_name_aliases_unconfigured_submit_tool_keeps_legacy_bytes") {
         return;
     }
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     let bytes =
         assert_submit_alias_round_trip(serde_json::Value::Null, "bash", "submit_result").await;
     // These are the complete request bytes without operator aliases, not a re-rendered expectation.
@@ -260,7 +260,7 @@ async fn tool_name_aliases_invalid_admissions_write_nothing() {
     if !run_catalog_drift_child("tool_name_aliases_invalid_admissions_write_nothing") {
         return;
     }
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     for (index, form, colliding_tool) in [
         (0, serde_json::json!({"names":{"bash":"bad.name"}}), false),
         (1, serde_json::json!({"names":{"bash":"read_file"}}), false),

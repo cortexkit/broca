@@ -130,7 +130,7 @@ async fn a_pool_key_run_borrows_anthropic_rows_and_renders_the_same_request() {
     if !run_catalog_drift_child("a_pool_key_run_borrows_anthropic_rows_and_renders_the_same_request") {
         return;
     }
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let pool = {
         let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
         cache.store(broca_subc::vault::ScopedList { credentials: vec![serde_json::from_value(
@@ -171,7 +171,7 @@ async fn a_pool_key_run_sends_the_variant_it_was_asked_for() {
     if !run_catalog_drift_child("a_pool_key_run_sends_the_variant_it_was_asked_for") {
         return;
     }
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let pool = {
         let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
         cache.store(broca_subc::vault::ScopedList { credentials: vec![serde_json::from_value(

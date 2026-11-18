@@ -1140,7 +1140,7 @@ async fn a_sealed_routed_run_reports_its_end_to_routing() {
 /// `chatgpt:openai`, on a session that moved here when `moved_here`. The `route.account_for`
 /// params it asked routing (which declares every capability) with.
 async fn a_fresh_run_after_chatgpt_a(label: &str, moved_here: bool) -> serde_json::Value {
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let root = fresh_vault_root(label);
     let daemon = CapturingVaultDaemon::start_expiring(
         &root,

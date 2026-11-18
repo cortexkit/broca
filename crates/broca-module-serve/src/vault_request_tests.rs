@@ -1970,7 +1970,7 @@ async fn chatgpt_refresh_run_rejecting(
             socket.write_all(response.as_bytes()).await.unwrap();
         }
     });
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let mut executor = executor_with_capturing_vault(&root, &daemon).await;
     executor.provider_overrides = broca_module_serve::provider_overrides::ProviderOverrides::parse(
         &serde_json::json!({"providers": {"openai": {"base_url": url}}}).to_string(),
@@ -2336,7 +2336,7 @@ async fn a_provider_outside_the_catalog_borrows_the_rows_its_credentials_serve()
     if !run_catalog_drift_child("a_provider_outside_the_catalog_borrows_the_rows_its_credentials_serve") {
         return;
     }
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let root = fresh_vault_root("served-provider");
     let daemon = CapturingVaultDaemon::start(&root).await;
     let other = serde_json::json!({"id": "apikey:corp:gw", "type": "apikey", "categories": ["llm"],

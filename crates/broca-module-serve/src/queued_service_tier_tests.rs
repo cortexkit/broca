@@ -1,4 +1,4 @@
-fn install_queued_ultrafast_catalog() {
+fn install_queued_ultrafast_catalog() -> TestCatalog {
     let rate = |units: u64| {
         serde_json::json!({
             "currency": "USD", "exponent": 9, "state": "priced", "units": units
@@ -29,6 +29,6 @@ fn install_queued_ultrafast_catalog() {
     cache
         .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
         .unwrap();
-    broca_catalog::install_global_catalog_cache(cache);
+    install_catalog(cache)
 }
 

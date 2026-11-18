@@ -8,7 +8,7 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
 
     let server = resume_http_fixture().await;
     let root = fresh_vault_root("store-parked-cancel");
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     let daemon = CapturingVaultDaemon::start_refusing_scoped_reads(&root).await;
     let executor = executor_with_capturing_vault(&root, &daemon)
         .await
@@ -149,7 +149,7 @@ async fn a_store_run_starts_paused_for_sign_in_and_resumes_after_vault_repair() 
     use broca_session_store::record::Record;
     let server = resume_http_fixture().await;
     let root = fresh_vault_root("store-sign-in");
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     let daemon =
         CapturingVaultDaemon::start_handling_reports(&root, ReportScript::NeedsReauth).await;
     daemon.record.lock().unwrap().reported = true;

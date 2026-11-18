@@ -194,7 +194,7 @@ async fn a_store_session_runs_through_the_production_executor() {
     std::fs::create_dir_all(&root).unwrap();
     // The provider resolves as production resolves it: from the catalog, its endpoint moved
     // to the fixture by the operator's provider override, its API key from the vault.
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     let daemon = CapturingVaultDaemon::start(&root).await;
     let executor = executor_with_capturing_vault(&root, &daemon)
         .await
@@ -278,7 +278,7 @@ async fn a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed() {
         .join(format!("store-run-borrowed-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let daemon = CapturingVaultDaemon::start(&root).await;
     let pool = Arc::new(broca_module_serve::account_routing::ListingCache::default());
     pool.store(broca_subc::vault::ScopedList {
@@ -377,7 +377,7 @@ async fn a_fresh_trial_folder_run_ignores_the_retired_selection_file() {
             .as_bytes(),
         )
         .unwrap();
-    install_drift_revision(false, 4096);
+    let _catalog = install_drift_revision(false, 4096);
     let daemon = CapturingVaultDaemon::start(&root).await;
     let executor = executor_with_capturing_vault(&root, &daemon)
         .await
@@ -444,7 +444,7 @@ async fn a_store_run_refused_by_routing_starts_then_ends_with_the_refusal() {
         .join(format!("store-run-routing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    install_alias_catalog();
+    let _catalog = install_alias_catalog();
     let daemon = CapturingVaultDaemon::start(&root).await;
     let mut executor = executor_with_capturing_vault(&root, &daemon)
         .await

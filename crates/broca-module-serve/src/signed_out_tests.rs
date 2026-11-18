@@ -126,7 +126,7 @@ impl SignedOutRig {
         missing: Option<&'static str>,
         replies: Vec<broca_module_serve::account_routing::RoutingReply>,
     ) -> Self {
-        install_test_catalog();
+        let _catalog = install_test_catalog();
         let root = fresh_vault_root(label);
         let daemon = CapturingVaultDaemon::start(&root).await;
         daemon.record.lock().unwrap().credential_replies.extend([

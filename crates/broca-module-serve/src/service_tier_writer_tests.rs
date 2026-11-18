@@ -244,7 +244,7 @@ async fn head_selection_reader_samples() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("head-selection-readers");
     let http = resume_http_fixture().await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
@@ -350,7 +350,7 @@ async fn head_selection_creating_send_plan_drives_first_run() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("selection-create");
     let http = resume_http_fixture().await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
@@ -375,7 +375,7 @@ async fn head_selection_refreshed_model_is_used_by_next_run() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("selection-refresh-run");
     let http = resume_http_fixture().await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
@@ -416,7 +416,7 @@ async fn head_selection_send_model_overrides_plan_model() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("selection-send-model");
     let http = resume_http_fixture().await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
@@ -451,7 +451,7 @@ async fn head_selection_refresh_does_not_change_running_tier() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("selection-running-tier");
     let release = Arc::new(tokio::sync::Notify::new());
     let http = tier_http_fixture(vec![None, None], false, Some(release.clone())).await;
@@ -514,7 +514,7 @@ async fn head_selection_refuses_malformed_model_without_write() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     selection_refusal(serde_json::json!({"provider":"openai","model":"test-ultrafast","unknown":true}),
         serde_json::json!({"field":"plan.model"})).await;
 }
@@ -525,7 +525,7 @@ async fn head_selection_refuses_unsupported_model_without_write() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     selection_refusal(serde_json::json!({"provider":"openai","model":"missing-model"}),
         serde_json::json!({"field":"plan.model","reason":"unsupported_model"})).await;
 }
@@ -536,7 +536,7 @@ async fn head_selection_missing_sign_in_is_unsupported_model_without_write() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("selection-no-sign-in");
     let (mut live, subc) = stand_in_executor(&root).await;
     live.provider_base_url = None;
@@ -555,7 +555,7 @@ async fn head_selection_refuses_unsupported_tier_without_write() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     for tier in ["unknown-tier", "fast"] {
         selection_refusal(serde_json::json!({"provider":"openai","model":"test-standard-only","service_tier":tier}),
             serde_json::json!({"field":"plan.model.service_tier","reason":"unsupported_tier"})).await;
@@ -568,7 +568,7 @@ async fn head_selection_creating_refusals_do_not_create_a_session() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     for (model, detail) in [
         (serde_json::json!({"provider":"openai"}), serde_json::json!({"field":"plan.model"})),
         (serde_json::json!({"provider":"openai","model":"missing-model"}), serde_json::json!({"field":"plan.model","reason":"unsupported_model"})),
@@ -668,7 +668,7 @@ async fn service_tier_usage_reports_standard_absence_and_conflict_after_reopen()
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     for (name, reports, expected) in [
         ("stated", vec![Some("default")], Some("standard")),
         (
@@ -729,7 +729,7 @@ async fn service_tier_fixed_run_and_its_queued_send_keep_the_runs_tier() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("tier-fixed-queue");
     let release = Arc::new(tokio::sync::Notify::new());
     let http = tier_http_fixture(vec![None, None], false, Some(release.clone())).await;
@@ -961,7 +961,7 @@ async fn service_tier_writer_admits_maps_refuses_and_describes_through_serve() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("tier-writer-serve");
     let http = resume_http_fixture().await;
     let mut rig = TierServeRig::start(&root, &http.url).await;
@@ -1121,7 +1121,7 @@ async fn a_session_admits_and_sends_service_tiers() {
         return;
     }
     broca_protocol::configure_service_tier(true).unwrap();
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let story = tier_story().await;
     assert_eq!(
         story[0]["sent"],

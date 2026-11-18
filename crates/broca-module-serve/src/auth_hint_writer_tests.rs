@@ -30,7 +30,7 @@ async fn auth_hint_executor(root: &std::path::Path, daemon: &CapturingVaultDaemo
 #[tokio::test]
 async fn routed_auth_pool_and_credential_preference_reach_account_for() {
     if !run_catalog_drift_child("routed_auth_pool_and_credential_preference_reach_account_for") { return; }
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("auth-hint-send");
     let daemon = CapturingVaultDaemon::start(&root).await;
     let http = resume_http_fixture().await;
@@ -58,7 +58,7 @@ async fn routed_auth_pool_and_credential_preference_reach_account_for() {
 #[tokio::test]
 async fn account_route_admission_uses_routing_names_and_keeps_auth_hints() {
     if !run_catalog_drift_child("account_route_admission_uses_routing_names_and_keeps_auth_hints") { return; }
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     let root = fresh_vault_root("account-route-send");
     let daemon = CapturingVaultDaemon::start(&root).await;
     let http = resume_http_fixture().await;
@@ -116,14 +116,14 @@ async fn refuse_mixed_auth_hint(hint: &str) {
 #[tokio::test]
 async fn routed_auth_pin_cannot_be_combined_with_pool() {
     if !run_catalog_drift_child("routed_auth_pin_cannot_be_combined_with_pool") { return; }
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     refuse_mixed_auth_hint("pool").await;
 }
 
 #[tokio::test]
 async fn routed_auth_pin_cannot_be_combined_with_credential_preference() {
     if !run_catalog_drift_child("routed_auth_pin_cannot_be_combined_with_credential_preference") { return; }
-    install_queued_ultrafast_catalog();
+    let _catalog = install_queued_ultrafast_catalog();
     refuse_mixed_auth_hint("credential_id").await;
 }
 

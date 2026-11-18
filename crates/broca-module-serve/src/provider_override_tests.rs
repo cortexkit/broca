@@ -9,7 +9,7 @@ fn resolve_runtime_override(
     overrides: &broca_module_serve::provider_overrides::ProviderOverrides,
     frozen: Option<&serde_json::Value>,
 ) -> broca_catalog::live::ProviderResolution {
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let resolution = AuthResolution {
         mode: AuthMode::Secret("test-api-key".into()),
         pause: None,
@@ -93,7 +93,7 @@ fn runtime_override_moves_only_host() {
 /// `None` when resolution fails (no usable credential) or no request arrives.
 async fn read_vault_authorization(auth: &AuthResolution) -> Option<String> {
     use tokio::io::AsyncReadExt;
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
     let resolved = resolve_provider_for_episode(
@@ -205,7 +205,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
             .0,
         broca_core::ChargeBasis::MeteredApi
     );
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let mut req = broca_core::RunRequest { route_decision_id: None, account_route: None,
     input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
@@ -348,7 +348,7 @@ fn run_catalog_drift_child(test_name: &str) -> bool {
 }
 
 /// Install a one-model catalog whose render-relevant facts are the parameters.
-fn install_drift_revision(reasoning: bool, output: u64) {
+fn install_drift_revision(reasoning: bool, output: u64) -> TestCatalog {
     let json = serde_json::json!({"anthropic": {
         "npm": "@ai-sdk/anthropic",
         "models": {"resume-drift": {
@@ -359,7 +359,7 @@ fn install_drift_revision(reasoning: bool, output: u64) {
     let catalog = broca_catalog::Catalog::from_json_str(&json.to_string(), "{}").unwrap();
     let cache = Arc::new(broca_catalog::CatalogCache::empty());
     cache.install_parsed_for_test(&catalog, 0, broca_catalog::CatalogSource::Fusiform);
-    broca_catalog::install_global_catalog_cache(cache);
+    install_catalog(cache)
 }
 
 /// Resolve the drift model the way the executor does. `recorded` is the prior episode's
@@ -610,10 +610,10 @@ async fn runtime_override_catalog_drift_resumes_recorded_bytes() {
     }
     let root = broca_test_support::scratch_root()
         .join(format!("broca-catalog-drift-{}", std::process::id()));
-    install_drift_revision(true, 8192);
+    let _catalog = install_drift_revision(true, 8192);
     let started = resolve_drift_revision(None, None);
     let recorded = drift_run_config(&drift_request(&root), &started);
-    install_drift_revision(false, 8192);
+    let _catalog = install_drift_revision(false, 8192);
     assert_ne!(resolve_drift_revision(None, None).provider.render_config_blob(), started.provider.render_config_blob(), "the new catalog changes fresh admissions");
     let resumed = resolve_drift_revision(Some(&recorded), None);
     assert_eq!(resumed.provider.render_config_blob(), started.provider.render_config_blob());
@@ -645,7 +645,7 @@ async fn moved_catalog_output_limit_resumes_with_the_frozen_default() {
     const MOVED: u64 = 16384;
     let root = broca_test_support::scratch_root()
         .join(format!("broca-output-drift-{}", std::process::id()));
-    install_drift_revision(true, FROZEN);
+    let _catalog = install_drift_revision(true, FROZEN);
     let started = resolve_drift_revision(None, None);
     assert_eq!(
         started.provider.render_config_blob()["max_output_tokens"],
@@ -653,7 +653,7 @@ async fn moved_catalog_output_limit_resumes_with_the_frozen_default() {
         "an omitted cap freezes the model's catalog limit"
     );
     let recorded = drift_run_config(&drift_request(&root), &started);
-    install_drift_revision(true, MOVED);
+    let _catalog = install_drift_revision(true, MOVED);
     // Non-vacuity: a fresh episode on the moved catalog DOES pick up B, so the equality below
     // is the restore at work rather than a catalog move that never took effect.
     assert_eq!(
@@ -684,7 +684,7 @@ async fn moved_catalog_output_limit_resumes_with_the_frozen_default() {
 
 /// Install a one-model fusiform catalog for `anthropic/resume-tier`, with or without priced
 /// fast-mode rates (`rate.input.mode.fast` / `rate.output.mode.fast`).
-fn install_tier_revision(fast_mode_priced: bool) {
+fn install_tier_revision(fast_mode_priced: bool) -> TestCatalog {
     let rate = |units: u64| {
         serde_json::json!({"currency": "USD", "exponent": 9, "state": "priced", "units": units})
     };
@@ -717,7 +717,7 @@ fn install_tier_revision(fast_mode_priced: bool) {
     cache
         .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
         .unwrap();
-    broca_catalog::install_global_catalog_cache(cache);
+    install_catalog(cache)
 }
 
 /// Resolve the tier model as the executor does: a fresh episode checks `requested`; a resume
@@ -781,14 +781,14 @@ async fn withdrawn_mode_rate_resumes_with_the_frozen_service_tier() {
     use broca_catalog::live::ServiceTier;
     let root = broca_test_support::scratch_root()
         .join(format!("broca-tier-drift-{}", std::process::id()));
-    install_tier_revision(true);
+    let _catalog = install_tier_revision(true);
     let started =
         resolve_tier_revision(None, Some(ServiceTier::Priority)).expect("priority admitted");
     let mut recorded = drift_run_config(&drift_request(&root), &started);
     recorded.service_tier = Some(ServiceTier::Priority);
     assert_eq!(recorded.frozen_render_config["speed"], "fast");
 
-    install_tier_revision(false);
+    let _catalog = install_tier_revision(false);
     // Once the catalog stops pricing fast mode, a fresh priority send is refused ...
     let refused = resolve_tier_revision(None, Some(ServiceTier::Priority))
         .err()
@@ -874,7 +874,7 @@ async fn a_non_chat_catalog_model_is_refused_at_admission() {
     cache
         .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
         .unwrap();
-    broca_catalog::install_global_catalog_cache(cache);
+    let _catalog = install_catalog(cache);
 
     let auth = AuthResolution {
         mode: AuthMode::Bearer("test-key".into()),
@@ -920,7 +920,7 @@ async fn a_non_chat_catalog_model_is_refused_at_admission() {
 }
 
 /// Install a one-model catalog whose only varying fact is its models.dev `reasoning_options`.
-fn install_variant_revision(reasoning_options: serde_json::Value) {
+fn install_variant_revision(reasoning_options: serde_json::Value) -> TestCatalog {
     let json = serde_json::json!({"anthropic": {
         "npm": "@ai-sdk/anthropic",
         "models": {"resume-drift": {
@@ -932,7 +932,7 @@ fn install_variant_revision(reasoning_options: serde_json::Value) {
     let catalog = broca_catalog::Catalog::from_json_str(&json.to_string(), "{}").unwrap();
     let cache = Arc::new(broca_catalog::CatalogCache::empty());
     cache.install_parsed_for_test(&catalog, 0, broca_catalog::CatalogSource::Fusiform);
-    broca_catalog::install_global_catalog_cache(cache);
+    install_catalog(cache)
 }
 
 /// Resolve the drift model as the executor does for a variant send: a fresh episode resolves
@@ -995,13 +995,13 @@ async fn withdrawn_reasoning_options_resume_with_the_frozen_variant() {
     }
     let root = broca_test_support::scratch_root()
         .join(format!("broca-variant-drift-{}", std::process::id()));
-    install_variant_revision(serde_json::json!([{"min": 1024, "type": "budget_tokens"}]));
+    let _catalog = install_variant_revision(serde_json::json!([{"min": 1024, "type": "budget_tokens"}]));
     let started = resolve_variant_revision(None, Some("high")).expect("variant admitted");
     let mut recorded = drift_run_config(&drift_request(&root), &started);
     recorded.variant = Some("high".into());
     assert_eq!(recorded.frozen_render_config["variant"]["name"], "high");
 
-    install_variant_revision(serde_json::json!([]));
+    let _catalog = install_variant_revision(serde_json::json!([]));
     // Non-vacuity: on the moved catalog a fresh send of the same variant is refused.
     let refused = resolve_variant_revision(None, Some("high"))
         .err()
@@ -1200,7 +1200,7 @@ fn resolve_chatgpt_episode(
     recorded: Option<&broca_wal::RunConfig>,
     restore_text_state: bool,
 ) -> broca_catalog::live::ProviderResolution {
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let options = broca_catalog::live::ResolveOptions {
         auth_method: Some(AuthMethod::Chatgpt),
         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -1442,7 +1442,7 @@ fn resolve_declared_route(
     route: &DeclaredRoute,
     render: broca_catalog::live::EpisodeRenderConfig<'_>,
 ) -> broca_catalog::live::ProviderResolution {
-    install_test_catalog();
+    let _catalog = install_test_catalog();
     let options = broca_catalog::live::ResolveOptions {
         auth_method: Some(route.method),
         family_override: route.family_override,
