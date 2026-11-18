@@ -4813,10 +4813,10 @@ where
                     .await;
                 }
             };
-            // Broca declares no `fork_effort`: a fork renders at the head's own effort, so an
-            // effort hint is refused as an unknown member, as the contract asks of a runner that
-            // doesn't declare the group.
-            if let Err(field) = request.check_effort::<&str>(&[]) {
+            // Broca declares neither `fork_effort` nor `fork_tools` (a fork renders at its source
+            // session's effort, with no tools): an effort hint, tool list or framing is unknown.
+            let undeclared = request.check_effort::<&str>(&[]);
+            if let Err(field) = undeclared.and_then(|()| request.check_tools::<&str>(&[])) {
                 return send_invalid_params(
                     writer,
                     ver,
@@ -4824,7 +4824,7 @@ where
                     epoch,
                     corr,
                     Some(field.to_owned()),
-                    "this runner takes no effort hint on session.fork_ask (fork_effort undeclared)",
+                    "this runner takes no effort hint, tools or framing on session.fork_ask",
                 )
                 .await;
             }

@@ -891,6 +891,22 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
             "{effort}"
         );
     }
+    // Nor `fork_tools`: a tool list or framing, even an empty list, is an unknown member, so the
+    // fork never runs a tool it wasn't built for.
+    for (member, value) in [
+        ("allowed_tools", json!(["read"])),
+        ("allowed_tools", json!([])),
+        ("framing", json!("Answer briefly.")),
+    ] {
+        let mut ask = json!({"fork_id": fork, "ask_id": "t", "question": "q"});
+        ask[member] = value.clone();
+        let error = rig.call(1, "session.fork_ask", ask).await.unwrap_err();
+        assert_eq!(
+            (code(&error), error["detail"]["field"].as_str()),
+            ("invalid_params", Some(member)),
+            "{member}: {value}"
+        );
+    }
     for (ask_id, question, field) in [
         (String::new(), "q", "ask_id"),
         ("界".repeat(257), "q", "ask_id"),
