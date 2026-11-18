@@ -154,7 +154,8 @@ mod request_gzip_tests;
 /// Anthropic's first-party API gets Claude Code's `accept-encoding` and a client that decodes
 /// what comes back; every other host gets a client without decoding, so its requests go out
 /// exactly as they did before decoding existed. Journaled model requests use separate pools
-/// with redirects disabled: a redirect must not re-POST under the original reservation.
+/// that never retry, so those pools never send a request a second time on their own. No pool
+/// follows a redirect (see `provider_client_builder`).
 #[derive(Clone, Debug)]
 pub struct ProviderHttpClient {
     // A run-local clone also sends prompt-cache warm requests reconstructed from a saved
@@ -270,20 +271,17 @@ impl ProviderHttpClient {
         if !journaled {
             return self.for_host(anthropic_api_host);
         }
-        // Legacy sends never initialize the no-redirect pools, even when using the
-        // HTTP/1.1 fallback client after a transient transport failure.
+        // Sends without an attempt journal never initialize the no-retry pools, even when using
+        // the HTTP/1.1 fallback client after a transient transport failure. Every pool already refuses
+        // redirects (see `provider_client_builder`).
         let (identity, decoding) = self.journaled.clients.get_or_init(|| {
             (
                 build_http_pool(
-                    (self.journaled.builder)()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .retry(reqwest::retry::never()),
+                    (self.journaled.builder)().retry(reqwest::retry::never()),
                     false,
                 ),
                 build_http_pool(
-                    (self.journaled.builder)()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .retry(reqwest::retry::never()),
+                    (self.journaled.builder)().retry(reqwest::retry::never()),
                     true,
                 ),
             )
@@ -967,18 +965,20 @@ pub fn build_provider_http_client() -> ProviderHttpClient {
 /// would spend uncounted requests, so each explicit send must be a single attempt.
 pub fn build_single_attempt_http_client() -> ProviderHttpClient {
     ProviderHttpClient::build(
-        || {
-            provider_client_builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-        },
+        || provider_client_builder().retry(reqwest::retry::never()),
         request_gzip::RequestGzipPolicy::from_env(),
     )
 }
 
 /// The connection settings both of a provider client's reqwest clients share.
+///
+/// No provider connection follows a redirect. A request carries its credential in a header,
+/// and reqwest drops only `Authorization` and cookies when a redirect changes host, never a key
+/// header such as `x-api-key`, so following one could hand a key to a host nobody approved.
 fn provider_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+    reqwest::Client::builder()
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 impl<F: WireFamily + 'static> LiveProvider<F> {
@@ -7731,8 +7731,9 @@ mod tests {
         (url, task)
     }
 
+    /// Every send stops at a redirect, journaled or not: the target never gets a second POST.
     #[tokio::test]
-    async fn journaled_redirects_stop_before_second_post() {
+    async fn redirects_stop_before_second_post() {
         for status in [307, 308] {
             for journaled in [false, true] {
                 let target = ScriptedServer::start(vec![ScriptResponse::Http {
@@ -7766,15 +7767,12 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    response.status().as_u16(),
-                    if journaled { status } else { 400 }
-                );
+                assert_eq!(response.status().as_u16(), status, "journaled {journaled}");
                 assert_eq!(source.await.unwrap(), b"model request");
-                assert_eq!(target.request_bodies().len(), usize::from(!journaled));
-                if !journaled {
-                    assert_eq!(target.request_bodies()[0], b"model request");
-                }
+                assert!(
+                    target.request_bodies().is_empty(),
+                    "journaled {journaled}: a redirect was followed"
+                );
             }
         }
     }
