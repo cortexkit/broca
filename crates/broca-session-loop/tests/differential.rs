@@ -8591,11 +8591,14 @@ fn expected_delta(id: &str, text: &str) -> DisplayEvent {
 /// A call's input streamed as many fragments reaches the display lane joined: a few events
 /// carrying the whole input in order, not one event per fragment, so a reader of a lane that
 /// keeps only its newest events doesn't fall behind on one large input. Any other event first
-/// releases the joined input, so the text after it stays after it.
+/// releases the joined input, so the text after it stays after it. The provider names the tool
+/// on every fragment, and only the first event of the call keeps the name. With
+/// `BROCA_TOOL_NAME_SAMPLES_DIR` set, the call's display events are written there as reader
+/// samples.
 #[tokio::test]
 async fn a_tool_input_streamed_in_fragments_reaches_the_display_lane_joined() {
     let (out, mut events) = mpsc::channel(4096);
-    let input = json!({"path": "a", "content": "x".repeat(3000)});
+    let input = json!({"path": "a", "content": "x".repeat(9000)});
     let text = input.to_string();
     let mut step: Vec<NormalizedEvent> = text
         .as_bytes()
@@ -8605,6 +8608,7 @@ async fn a_tool_input_streamed_in_fragments_reaches_the_display_lane_joined() {
                 mid: None,
                 part: None,
                 tool_call_id: ToolCallId("c1".into()),
+                tool_name: Some("read".into()),
                 delta: String::from_utf8(piece.to_vec()).unwrap(),
             })
         })
@@ -8634,6 +8638,28 @@ async fn a_tool_input_streamed_in_fragments_reaches_the_display_lane_joined() {
         joined.len()
     );
     assert_eq!(display[joined.len()], expected_delta("a1", "after"));
+    let names: Vec<Option<&str>> = display[..joined.len()]
+        .iter()
+        .map(|event| match event {
+            DisplayEvent::ToolInputDelta { tool_name, .. } => tool_name.as_deref(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert!(names.len() > 1, "the input spans several events: {names:?}");
+    assert_eq!(names[0], Some("read"));
+    assert!(names[1..].iter().all(Option::is_none), "{names:?}");
+    if let Some(dir) = std::env::var_os("BROCA_TOOL_NAME_SAMPLES_DIR") {
+        let lines: Vec<String> = display[..joined.len()]
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("tool_input_delta.fragments.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
 }
 
 /// A provider that pauses mid-input doesn't hold back what it already streamed: a joined
@@ -8646,6 +8672,7 @@ async fn a_tool_input_fragment_goes_out_while_its_provider_pauses() {
         mid: None,
         part: None,
         tool_call_id: ToolCallId("c1".into()),
+        tool_name: None,
         delta: r#"{"path":"#.into(),
     };
     let scenario = single(vec![vec![NormalizedEvent::Display(fragment.clone())]]);
@@ -8867,6 +8894,7 @@ async fn a_finalize_step_that_drops_a_call_restreams_the_stored_answer() {
         mid: None,
         part: None,
         tool_call_id: ToolCallId("cz".into()),
+        tool_name: None,
         delta: r#"{"path":"z"}"#.into(),
     };
     last.insert(0, text_delta("z", "final answer"));

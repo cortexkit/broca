@@ -244,9 +244,23 @@ impl ToolNameMap {
             .unwrap_or(wire)
     }
 
-    /// Restore canonical tool names in an inbound assembled assistant event.
+    /// Restore canonical tool names in an inbound event: an assembled assistant message, and
+    /// the name a live tool-input delta carries.
     pub fn restore_event(&self, event: NormalizedEvent) -> NormalizedEvent {
         match event {
+            NormalizedEvent::Display(crate::DisplayEvent::ToolInputDelta {
+                mid,
+                part,
+                tool_call_id,
+                tool_name,
+                delta,
+            }) => NormalizedEvent::Display(crate::DisplayEvent::ToolInputDelta {
+                mid,
+                part,
+                tool_call_id,
+                tool_name: tool_name.map(|name| self.canonical_name(&name).to_owned()),
+                delta,
+            }),
             NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { mut cut }) => {
                 cut.tool_name = self.canonical_name(&cut.tool_name).to_owned();
                 NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { cut })

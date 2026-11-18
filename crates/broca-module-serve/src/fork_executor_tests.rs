@@ -635,6 +635,7 @@ fn a_refused_tool_call_answers_with_the_text_streamed_before_it() {
         mid: None,
         part: None,
         tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+        tool_name: None,
         delta: "{}".into(),
     };
     // OpenAI Chat assembles every text of the reply into one block ahead of its calls.

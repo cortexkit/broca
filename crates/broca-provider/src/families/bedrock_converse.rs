@@ -1497,6 +1497,7 @@ impl BedrockStreamNormalizer {
                     mid: None,
                     part: Some(part_index),
                     tool_call_id: ToolCallId(id.clone()),
+                    tool_name: crate::normalize::known_name(name),
                     delta: input_delta.to_owned(),
                 }));
             }

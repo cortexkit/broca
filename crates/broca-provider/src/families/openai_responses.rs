@@ -1366,6 +1366,7 @@ impl OpenAiResponsesNormalizer {
                             mid: None,
                             part: None,
                             tool_call_id: ToolCallId(buf.call_id.clone()),
+                            tool_name: crate::normalize::known_name(&buf.name),
                             delta: delta.to_owned(),
                         },
                         "openai_responses",

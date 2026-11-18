@@ -970,6 +970,7 @@ impl OpenAiChatNormalizer {
                                 mid: None,
                                 part: None,
                                 tool_call_id: tcid,
+                                tool_name: crate::normalize::known_name(&buf.name),
                                 delta: args.to_owned(),
                             },
                             "openai_chat",

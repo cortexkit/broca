@@ -3,7 +3,7 @@
 {"kind":"control","cursor":{"wal_seq":5,"sub_index":1,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"unit":{"type":"message_boundary","mid":"g@GENERATION@.5"},"seq":3,"event":{"type":"message_finished","mid":"g@GENERATION@.5"}}
 {"kind":"control","cursor":{"wal_seq":6,"sub_index":0,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"unit":{"type":"step_started","step_id":1},"seq":4,"event":{"type":"message_started","mid":"g@GENERATION@.6"}}
 {"kind":"display","event":{"type":"display_reset"},"seq":5}
-{"kind":"display","event":{"type":"tool_input_delta","mid":"g@GENERATION@.6","part":"0","tool_call_id":"sample-call","delta":"{}"},"seq":6}
+{"kind":"display","event":{"type":"tool_input_delta","mid":"g@GENERATION@.6","part":"0","tool_call_id":"sample-call","tool_name":"work","delta":"{}"},"seq":6}
 {"kind":"control","cursor":{"wal_seq":9,"sub_index":0,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"unit":{"type":"assistant_message","message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"sample-call","tool_name":"work","input":{}}]}},"seq":7,"event":{"type":"message_finished","mid":"g@GENERATION@.6"}}
 {"kind":"control","cursor":{"wal_seq":9,"sub_index":1,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"unit":{"type":"tool_call","call":{"tool_call_id":"sample-call","tool_name":"work","input":{}}},"seq":8}
 {"kind":"control","cursor":{"wal_seq":9,"sub_index":2,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"unit":{"type":"step_finished","step_id":1,"usage":{},"finish_reason":"tool_calls"},"seq":9}

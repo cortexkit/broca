@@ -127,6 +127,7 @@ impl Step {
                         mid: None,
                         part: None,
                         tool_call_id: call.tool_call_id.clone(),
+                        tool_name: Some(call.tool_name.clone()),
                         delta: call.input.to_string(),
                     },
                     _ => continue,

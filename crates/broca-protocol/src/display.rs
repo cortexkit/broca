@@ -54,6 +54,12 @@ pub enum DisplayEvent {
         #[serde(default, skip_serializing_if = "Option::is_none", with = "part_key")]
         part: Option<u64>,
         tool_call_id: ToolCallId,
+        /// The called tool's name, so a live view can show which tool a call is before it
+        /// finishes. The wire carries it only on the chunk that begins a call's input after a
+        /// display reset (llm-runner's `tool_input_delta.tool_name`): providers name every
+        /// fragment they know the name for, and the run loop drops it from each later chunk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         delta: String,
     },
     /// Backpressure marker: `dropped` display frames were coalesced/dropped
@@ -161,12 +167,14 @@ impl DisplayEvent {
             Self::ToolInputDelta {
                 mid,
                 tool_call_id,
+                tool_name,
                 delta,
                 ..
             } => mid
                 .as_ref()
                 .map_or(0, String::len)
                 .saturating_add(tool_call_id.0.len())
+                .saturating_add(tool_name.as_ref().map_or(0, String::len))
                 .saturating_add(delta.len()),
             _ => 0,
         }

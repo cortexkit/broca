@@ -1132,6 +1132,7 @@ impl GeminiNormalizer {
                     .to_owned();
                 let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                 let display_delta = args.to_string();
+                let tool_name = crate::normalize::known_name(&name);
                 let part_index = self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
                     index,
                     name,
@@ -1143,6 +1144,7 @@ impl GeminiNormalizer {
                     mid: None,
                     part: Some(part_index),
                     tool_call_id: ToolCallId(tcid),
+                    tool_name,
                     delta: display_delta,
                 }));
                 continue;

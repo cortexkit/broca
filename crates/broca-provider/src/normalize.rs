@@ -536,7 +536,7 @@ impl AnthropicNormalizer {
                             .and_then(|d| d.get("partial_json"))
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let tcid = match self.blocks.get_mut(&idx) {
+                        let (tcid, tool_name) = match self.blocks.get_mut(&idx) {
                             Some(BlockBuf::ToolUse {
                                 input_json,
                                 id,
@@ -546,7 +546,7 @@ impl AnthropicNormalizer {
                                 input_json.push_str(p);
                                 self.arguments_guard
                                     .stream(idx as u64, id, name, input_json, p);
-                                ToolCallId(id.clone())
+                                (ToolCallId(id.clone()), known_name(name))
                             }
                             _ => return Ok(out),
                         };
@@ -554,6 +554,7 @@ impl AnthropicNormalizer {
                             mid: None,
                             part: Some(part),
                             tool_call_id: tcid,
+                            tool_name,
                             delta: p.to_owned(),
                         }));
                     }
@@ -945,6 +946,12 @@ fn is_fallback_wire_model(model: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+/// The name a live tool-input delta carries: the call's tool name once the stream has named it.
+/// The run loop keeps it only on the chunk that begins the call's input.
+pub(crate) fn known_name(name: &str) -> Option<String> {
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn block_index(v: &Value) -> usize {
     v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize
 }
@@ -1333,6 +1340,30 @@ mod tests {
             } => assert_eq!(data, blob),
             other => panic!("expected RedactedReasoning, got {other:?}"),
         }
+    }
+
+    /// Each fragment of a tool call's streamed input names the call's tool.
+    #[test]
+    fn tool_input_fragments_name_the_tool() {
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_t","usage":{"input_tokens":5}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"say","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"text\":"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"hi\"}"}}"#,
+        ];
+        let mut n = AnthropicNormalizer::new(StepId(1));
+        let mut names = Vec::new();
+        for e in events {
+            for event in n.push_json(e).expect("push") {
+                if let NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                    tool_name, ..
+                }) = event
+                {
+                    names.push(tool_name);
+                }
+            }
+        }
+        assert_eq!(names, [Some("say".to_owned()), Some("say".to_owned())]);
     }
 
     /// A refusal after a completed tool call: text block 0 and tool block 1 completed, text

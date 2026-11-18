@@ -558,6 +558,7 @@ async fn live_reply_deltas_follow_the_writing_runs_clean_flag() {
             mid: None,
             part: Some(2),
             tool_call_id: broca_protocol::ToolCallId("call".into()),
+            tool_name: None,
             delta: "{\"text\":\"§9§ args\"}".into(),
         };
         let mut script = vec![NormalizedEvent::Display(reasoning.clone())];

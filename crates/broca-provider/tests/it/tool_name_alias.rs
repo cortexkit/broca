@@ -220,6 +220,41 @@ fn operator_aliases_restore_responses_stream_items_arguments_and_final_message()
     }
 }
 
+/// A live tool-input fragment names the call's tool, as the caller named it: the provider echoes
+/// the alias, and the restore maps it back.
+#[test]
+fn operator_aliases_restore_the_name_on_live_tool_input_fragments() {
+    use broca_protocol::{provider::NormalizedEvent, DisplayEvent, StepId};
+    let opts = operator_options();
+    let mut frozen = openai_responses_frozen_config("synthetic");
+    frozen
+        .tool_name_aliases
+        .insert("bash".into(), "client_bash".into());
+    let map = ToolNameMap::build_with_aliases(&opts.tools, &opts.prompt, &frozen.tool_name_aliases);
+    let mut normalizer = OpenAiResponses.normalizer(&frozen, StepId(1));
+    let frames = [
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call-1","name":"client_bash","arguments":""}}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"cmd\":"}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"ls\"}"}),
+    ];
+    let mut names = Vec::new();
+    for frame in frames {
+        let bytes = format!(
+            "event: {}\ndata: {}\n\n",
+            frame["type"].as_str().unwrap(),
+            frame
+        );
+        for event in normalizer.push(bytes.as_bytes()).unwrap() {
+            if let NormalizedEvent::Display(DisplayEvent::ToolInputDelta { tool_name, .. }) =
+                map.restore_event(event)
+            {
+                names.push(tool_name);
+            }
+        }
+    }
+    assert_eq!(names, [Some("bash".to_owned()), Some("bash".to_owned())]);
+}
+
 #[test]
 fn operator_aliases_empty_map_is_omitted_and_composes_with_grammar_aliases() {
     let frozen = openai_responses_frozen_config("synthetic");

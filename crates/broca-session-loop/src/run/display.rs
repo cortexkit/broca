@@ -10,10 +10,14 @@
 //! keeps such a burst to a few events. A joined event is held at most [`HOLD`] or until it
 //! reaches [`MAX_BYTES`], and goes out before any other event, so a reader still sees the input
 //! grow, and in order with everything around it.
+//!
+//! The join also names each call's tool on one chunk only: providers put the tool's name on every
+//! fragment they know it for, and the join keeps it on the first chunk of each call since the
+//! last display reset, as llm-runner's `tool_input_delta.tool_name` asks.
 
 use broca_core::output_events::OutputEvent;
 use broca_protocol::content::AssistantMessage;
-use broca_protocol::DisplayEvent;
+use broca_protocol::{DisplayEvent, ToolCallId};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
@@ -27,18 +31,34 @@ const MAX_BYTES: usize = 4096;
 #[derive(Default)]
 pub(super) struct ToolInputJoin {
     held: Option<(DisplayEvent, Instant)>,
+    /// The calls whose input has begun on the display lane since its last reset; a later chunk
+    /// of one of them goes out without the tool's name.
+    begun: Vec<ToolCallId>,
 }
 
 impl ToolInputJoin {
     /// Takes `event`, arriving at `now`, and returns the events to send now, in order. A
     /// fragment of the held call's input is added to it; any other event first releases the
     /// held one.
-    pub(super) fn take(&mut self, event: DisplayEvent, now: Instant) -> Vec<DisplayEvent> {
+    pub(super) fn take(&mut self, mut event: DisplayEvent, now: Instant) -> Vec<DisplayEvent> {
         let mut out = Vec::new();
-        if !matches!(event, DisplayEvent::ToolInputDelta { .. }) {
+        let DisplayEvent::ToolInputDelta {
+            tool_call_id,
+            tool_name,
+            ..
+        } = &mut event
+        else {
+            if matches!(event, DisplayEvent::DisplayReset) {
+                self.begun.clear();
+            }
             out.extend(self.release());
             out.push(event);
             return out;
+        };
+        if self.begun.contains(tool_call_id) {
+            *tool_name = None;
+        } else {
+            self.begun.push(tool_call_id.clone());
         }
         match &mut self.held {
             Some((held, _)) if same_call(held, &event) => {
@@ -132,6 +152,7 @@ pub(super) async fn restream(
                 mid: None,
                 part: None,
                 tool_call_id: call.tool_call_id.clone(),
+                tool_name: Some(call.tool_name.clone()),
                 delta: call.input.to_string(),
             },
             _ => continue,
@@ -166,15 +187,47 @@ fn same_call(held: &DisplayEvent, next: &DisplayEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_protocol::ToolCallId;
 
     fn fragment(call: &str, text: &str) -> DisplayEvent {
         DisplayEvent::ToolInputDelta {
             mid: None,
             part: None,
             tool_call_id: ToolCallId(call.into()),
+            tool_name: None,
             delta: text.into(),
         }
+    }
+
+    fn named(call: &str, text: &str) -> DisplayEvent {
+        let mut event = fragment(call, text);
+        if let DisplayEvent::ToolInputDelta { tool_name, .. } = &mut event {
+            *tool_name = Some("say".into());
+        }
+        event
+    }
+
+    /// Each call's tool is named on the first chunk of its input only, though the provider names
+    /// every fragment, and named again on its first chunk after a display reset.
+    #[test]
+    fn a_call_is_named_on_its_first_chunk_since_a_reset() {
+        let start = Instant::now();
+        let mut join = ToolInputJoin::default();
+        join.take(named("c1", "{\"te"), start);
+        assert_eq!(
+            join.take(named("c1", "xt\""), start + HOLD),
+            [named("c1", "{\"text\"")]
+        );
+        join.take(named("c2", "{"), start + HOLD);
+        assert_eq!(
+            join.take(named("c1", ": 1}"), start + HOLD),
+            [named("c2", "{")]
+        );
+        assert_eq!(
+            join.take(DisplayEvent::DisplayReset, start + HOLD),
+            [fragment("c1", ": 1}"), DisplayEvent::DisplayReset]
+        );
+        join.take(named("c1", "{"), start + HOLD);
+        assert_eq!(join.release(), Some(named("c1", "{")));
     }
 
     fn text(delta: &str) -> DisplayEvent {
