@@ -55,7 +55,7 @@ lineage fence. File length is only a probe prefilter, never the history proof; o
 content-bearing logs take no additional content read. The refusal names the session and
 `store-maintenance repair-session-root`; it never guesses an address from the
 route's current folder. Expired reads keep `expired`; move fences keep
-`session_moving` and `session_moved`. A send after completed expiry can still
+`session_moving` and `session_held_elsewhere`. A send after completed expiry can still
 start a fresh lineage.
 
 The `SessionAddressResolver` must implement this log-state check;

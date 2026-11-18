@@ -1884,7 +1884,9 @@ impl std::fmt::Display for ServeError {
             Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
-            ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
+            ServeError::SessionMoved { .. } => {
+                write!(f, "this session moved to another computer and is held there")
+            }
             ServeError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),

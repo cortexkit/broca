@@ -305,19 +305,35 @@ async fn store_move_plain_and_encrypted_roundtrip_release_and_move_back() {
         assert!(
             matches!(source.registry.check_move(&session, false), Err(OpenError::SessionMoved { holder }) if holder == "receiver")
         );
-        assert_code(
+        let refused_read = assert_code(
             reader.management("session.read", json!({})).await,
-            "session_moved",
+            "session_held_elsewhere",
         );
-        assert_code(
+        let refused = assert_code(
             reader
                 .management(
                     "session.send",
                     json!({"prompt":"hi", "model":{"provider":"stub","model":"m"}}),
                 )
                 .await,
-            "session_moved",
+            "session_held_elsewhere",
         );
+        // The release named its holder by backup author id, which is not the box id the
+        // contract's `holder` carries, so the refusal names no holder at all.
+        assert_eq!(refused["detail"], json!({}), "{refused}");
+        assert!(!refused.to_string().contains("receiver"), "{refused}");
+        // Reader samples: the exact refusal bodies a reader of a moved session gets.
+        if let Some(dir) = std::env::var_os("BROCA_HELD_ELSEWHERE_SAMPLES") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, body) in [("read", &refused_read), ("send", &refused)] {
+                std::fs::write(
+                    dir.join(format!("{name}-refused.json")),
+                    serde_json::to_vec_pretty(body).unwrap(),
+                )
+                .unwrap();
+            }
+        }
         let runtime = receiver.registry.store_runtime().unwrap();
         let backend = LocalBackend::new(StorageClass::Durable.store_root(&receiver.root));
         let addr = SessionAddr(broca_core::session_addr(&session));
