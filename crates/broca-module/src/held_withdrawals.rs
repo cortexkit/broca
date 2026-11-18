@@ -173,7 +173,16 @@ impl HeldWithdrawals {
                     };
                     match self.drive(call.clone(), attempts).await {
                         Ok(sent) => withdrawals_sent += sent,
-                        Err(error) => failure = Some(error),
+                        // Named, so a failure the sweep reports can be traced to its session.
+                        Err(error) => {
+                            failure = Some(format!(
+                                "{} (session {}, call {} of {})",
+                                error,
+                                broca_core::session_addr(&bind),
+                                call.call_key,
+                                call.module
+                            ));
+                        }
                     }
                 }
                 // Every registered call gets a watch, and a call answered without a hold, or
