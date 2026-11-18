@@ -575,6 +575,8 @@ async fn the_executor_refuses_an_offer_whose_token_names_another_account() {
 struct AnswersAdmission {
     reply: Result<serde_json::Value, serde_json::Value>,
     asked: std::sync::atomic::AtomicUsize,
+    /// The params of each `route.account_for` asked.
+    params: std::sync::Mutex<Vec<serde_json::Value>>,
 }
 
 #[async_trait::async_trait]
@@ -591,6 +593,7 @@ impl broca_module_serve::account_routing::RoutingTransport for AnswersAdmission 
             return Ok(Ok(serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap()));
         }
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.params.lock().unwrap().push(request["params"].clone());
         Ok(match &self.reply {
             Ok(body) => Ok(serde_json::to_vec(body).unwrap()),
             Err(body) => Err(serde_json::to_vec(body).unwrap()),
@@ -683,6 +686,7 @@ async fn admit_chatgpt_resume(
     let routing = Arc::new(AnswersAdmission {
         reply,
         asked: Default::default(),
+        params: Default::default(),
     });
     executor.routing = Some(Arc::new(
         broca_module_serve::account_routing::RoutingClient::new(
@@ -749,6 +753,7 @@ async fn admit_chatgpt_resume(
                 clock: None,
                 continue_offer: None,
                 routing_serves_continuation: true,
+                moved_here: false,
             },
             &history,
         )
@@ -1129,4 +1134,126 @@ async fn a_sealed_routed_run_reports_its_end_to_routing() {
     assert_eq!(finished[0]["params"]["run_id"], "sealed-run");
     drop(executor);
     drop(daemon);
+}
+
+/// Through the executor's admission: a session's next run after its idle run on
+/// `chatgpt:openai`, on a session that moved here when `moved_here`. The `route.account_for`
+/// params it asked routing (which declares every capability) with.
+async fn a_fresh_run_after_chatgpt_a(label: &str, moved_here: bool) -> serde_json::Value {
+    install_test_catalog();
+    let root = fresh_vault_root(label);
+    let daemon = CapturingVaultDaemon::start_expiring(
+        &root,
+        ExpiryScript {
+            account_id: Some("chatgpt-a"),
+            ..ExpiryScript::default()
+        },
+    )
+    .await;
+    let mut executor = executor_with_capturing_vault(&root, &daemon).await;
+    let listing = serde_json::from_value(serde_json::json!({
+        "credentials": [
+            {"id": "chatgpt:openai", "type": "chatgpt", "categories": ["openai"], "serves": ["openai"],
+             "state": "active", "record_version": 1, "operations": ["read"], "account_id": "chatgpt-a",
+             "auth_method": "chatgpt", "provider_ids": ["openai"]},
+            {"id": "chatgpt:openai:second", "type": "chatgpt", "categories": ["openai"], "serves": ["openai"],
+             "state": "active", "record_version": 1, "operations": ["read"], "account_id": "chatgpt-b",
+             "auth_method": "chatgpt", "provider_ids": ["openai"]},
+        ],
+        "grants": 1, "grant_tuples": [], "view": "moved-here",
+    }))
+    .unwrap();
+    executor.vault.as_ref().unwrap().listing.store(listing);
+    let routing = Arc::new(AnswersAdmission {
+        reply: Ok(chosen("chatgpt-a", "chatgpt:openai")),
+        asked: Default::default(),
+        params: Default::default(),
+    });
+    executor.routing = Some(Arc::new(
+        broca_module_serve::account_routing::RoutingClient::new(
+            routing.clone(),
+            broca_module_serve::account_routing::AccountSelectionConfig::default(),
+        ),
+    ));
+    let mut req = drift_request(&root);
+    req.run_id = broca_protocol::RunId("next-run".into());
+    req.model = broca_protocol::request::ModelHandle {
+        provider_module_id: "openai".into(),
+        model_id: "gpt-5.6-sol".into(),
+    };
+    let frozen = broca_provider::families::openai_responses_chatgpt_frozen_config("gpt-5.6-sol");
+    let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+        "model": req.model,
+        "tools": [],
+        "tool_choice": broca_protocol::request::ToolChoice::default(),
+        "generation": req.generation,
+        "response_format": broca_protocol::request::ResponseFormat::default(),
+        "context_epoch": 0,
+        "renderer_version": frozen.renderer_version,
+        "frozen_render_config": frozen,
+        "auth_selection": {
+            "credential_id": "chatgpt:openai",
+            "account_ref": "chatgpt-a",
+            "resolved_credential_id": "chatgpt:openai",
+            "auth_method": "chatgpt",
+            "account_decision": {
+                "path": "routed",
+                "admission_id": "earlier-run",
+                "decision_id": "decision-a",
+                "conversation_key": "broca-session:chatgpt",
+            },
+        },
+    }))
+    .unwrap();
+    let history = EpisodeHistory {
+        prior_run: Some(PriorRunView {
+            run_id: broca_protocol::RunId("earlier-run".into()),
+            config: config.clone(),
+            idle: true,
+            moved: false,
+            records_account_change: false,
+        }),
+        last_config: Some(&config),
+        head_seq: 1,
+        persona: PersonaHistory {
+            first_user: None,
+            first_user_sealed: false,
+            human_prompts: 0,
+        },
+    };
+    let mut queued_service_tier = None;
+    executor
+        .admit_episode(
+            EpisodeJob {
+                req: &req,
+                kind: RunKind::FreshOrResume,
+                auth: &None,
+                conversation_key: &None,
+                queued_service_tier: &mut queued_service_tier,
+                media_profile: &None,
+                clock: None,
+                continue_offer: None,
+                routing_serves_continuation: true,
+                moved_here,
+            },
+            &history,
+        )
+        .await
+        .map_err(|error| format!("{error}"))
+        .unwrap();
+    drop(executor);
+    daemon.assert_healthy();
+    let params = routing.params.lock().unwrap().clone();
+    assert_eq!(params.len(), 1, "{params:?}");
+    params[0].clone()
+}
+
+/// A session that moved here names the credential its last run used when its next run asks
+/// routing for an account; a session that didn't move doesn't.
+#[tokio::test]
+async fn a_moved_sessions_next_run_names_the_credential_its_last_run_used() {
+    let moved = a_fresh_run_after_chatgpt_a("moved-here-warm", true).await;
+    assert_eq!(moved["warm_credential"], "chatgpt:openai", "{moved}");
+    let stayed = a_fresh_run_after_chatgpt_a("not-moved-warm", false).await;
+    assert!(stayed.get("warm_credential").is_none(), "{stayed}");
 }

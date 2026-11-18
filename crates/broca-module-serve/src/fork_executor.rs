@@ -252,6 +252,7 @@ fn fork_account_params(
         },
         // A fork's question isn't the head's turn: the head's run is the turn.
         head_turn: false,
+        warm_credential: None,
     });
     params.as_object_mut().unwrap().remove("candidates");
     let head_admission = selection

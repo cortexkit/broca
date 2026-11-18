@@ -338,6 +338,7 @@ async fn choose(
             run_id: "run-1",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async move { listing },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -457,6 +458,7 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
             candidates: &candidates,
             hold_cap: cap,
             head_turn: false,
+            warm_credential: None,
         });
         let mut expected = legacy.clone();
         expected["hold_wait_max_s"] = json!(seconds);
@@ -502,6 +504,7 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero() {
                 run_id: "run-1",
                 initial_input_bytes: 42,
                 head_turn: false,
+                warm_credential: None,
             },
             async { Some(two_accounts()) },
             tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -624,6 +627,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
             run_id: "run-1",
             initial_input_bytes: 0,
             head_turn: false,
+            warm_credential: None,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + budget,
@@ -684,6 +688,7 @@ async fn a_slow_listing_shares_the_admission_budget_and_is_refused_as_unreachabl
             run_id: "run-1",
             initial_input_bytes: 0,
             head_turn: false,
+            warm_credential: None,
         },
         std::future::pending::<Option<Arc<ScopedList>>>(),
         tokio::time::Instant::now() + Duration::from_millis(200),
@@ -802,6 +807,7 @@ async fn choose_api_key_with_decision(
             run_id: "run-1",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async { rows },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -861,6 +867,7 @@ async fn an_account_route_offers_the_keys_of_the_provider_it_names() {
             run_id: "run-1",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async { Some(rows) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1107,6 +1114,7 @@ async fn apikey_unhinted_asks_routing_and_pinned_keeps_the_exact_vault_record() 
                 run_id: "run-1",
                 initial_input_bytes: 42,
                 head_turn: false,
+                warm_credential: None,
             },
             async { Some(api_keys()) },
             tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1250,6 +1258,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
             run_id: "run-1",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1665,6 +1674,7 @@ async fn refusal_log_names_send_and_routing_decision() {
             run_id: "run-refused",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3319,6 +3329,7 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_its_admission_is_rep
             run_id: "run-caller",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3367,6 +3378,7 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
             run_id: "run-caller",
             initial_input_bytes: 42,
             head_turn: false,
+            warm_credential: None,
         },
         async { Some(listing(vec![anthropic("oauth:anthropic", "acct-a")])) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -3404,6 +3416,7 @@ async fn choose_with_auth_hints(
             initial_input_bytes: 1,
             hold_cap: Default::default(),
             head_turn: false,
+            warm_credential: None,
         },
         async { view },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -4265,6 +4278,7 @@ fn head_turn_params(head_turn: bool) -> Value {
         candidates: &candidates,
         hold_cap: AccountHoldCap::default(),
         head_turn,
+        warm_credential: None,
     })
 }
 
@@ -4418,4 +4432,137 @@ async fn a_heads_continue_is_marked_only_for_a_router_that_declares_it() {
         assert_eq!(requests.len(), 1, "{head_turn_declared}");
         assert_eq!(&requests[0]["params"], expected, "{head_turn_declared}");
     }
+}
+
+/// Writes a `route.account_for` request a moved session's first run sent, for routing's
+/// readers, when `BROCA_WARM_CREDENTIAL_SAMPLE_DIR` names a folder.
+fn warm_credential_sample(name: &str, bytes: &[u8]) {
+    if let Some(directory) = std::env::var_os("BROCA_WARM_CREDENTIAL_SAMPLE_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(std::path::PathBuf::from(directory).join(name), bytes).unwrap();
+    }
+}
+
+/// The params a run sends to a router declaring `declared`, given the moved session's last
+/// credential `warm` and, when `pinned`, an account the caller named.
+async fn warm_credential_request(
+    declared: Option<Vec<&'static str>>,
+    warm: Option<&str>,
+    pinned: bool,
+    sample: Option<&str>,
+) -> Value {
+    let chosen = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
+    let routing = Arc::new(FakeRouting {
+        reply: Mutex::new(chosen.reply.lock().unwrap().clone()),
+        declared,
+        ..FakeRouting::default()
+    });
+    let static_credential = CredentialId::parse(if pinned {
+        "oauth:anthropic:acct-b"
+    } else {
+        "oauth:anthropic"
+    })
+    .unwrap();
+    choose_account(
+        &client(&routing),
+        ChoiceInputs {
+            catalog_serves: &|_: &str| true,
+            account_route: None,
+            pool: None,
+            credential_id: None,
+            service_tier: None,
+            decision_id: None,
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &static_credential,
+            caller_named_account: pinned,
+            model: "claude-opus-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 42,
+            head_turn: false,
+            warm_credential: warm,
+        },
+        async { Some(two_accounts()) },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    )
+    .await
+    .unwrap();
+    if let Some(name) = sample {
+        warm_credential_sample(name, &routing.request_bytes.lock().unwrap()[0]);
+    }
+    let requests = routing.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    requests[0]["params"].clone()
+}
+
+/// A moved session's first run here names the credential it last ran on, and routing's own
+/// parser reads it back from a router that declares `account_warm_credential`. Nothing else in
+/// the request changes.
+#[tokio::test]
+async fn a_moved_sessions_first_run_names_its_last_credential() {
+    use cortexkit_role_routing::account::parse_account_for_request_serving;
+    use cortexkit_role_routing::capabilities::ACCOUNT_WARM_CREDENTIAL;
+    let declared = Some(vec![ACCOUNT_WARM_CREDENTIAL]);
+    let warm = warm_credential_request(
+        declared.clone(),
+        Some("oauth:anthropic:acct-b"),
+        false,
+        Some("moved-session-first-run.account_for.json"),
+    )
+    .await;
+    assert_eq!(warm["warm_credential"], json!("oauth:anthropic:acct-b"));
+    let parsed = parse_account_for_request_serving(&warm, &[ACCOUNT_WARM_CREDENTIAL]).unwrap();
+    assert_eq!(
+        parsed.warm_credential.as_deref(),
+        Some("oauth:anthropic:acct-b")
+    );
+    let mut plain =
+        warm_credential_request(declared, None, false, Some("session-run.account_for.json")).await;
+    assert!(plain.get("warm_credential").is_none(), "{plain}");
+    plain["warm_credential"] = json!("oauth:anthropic:acct-b");
+    assert_eq!(plain, warm, "the credential is the only difference");
+}
+
+/// A router that doesn't declare `account_warm_credential`, or whose description can't be
+/// read, refuses the member, so it is asked as for any other run.
+#[tokio::test]
+async fn the_last_credential_goes_only_to_a_router_that_declares_it() {
+    for declared in [Some(vec![]), None] {
+        let params = warm_credential_request(
+            declared.clone(),
+            Some("oauth:anthropic:acct-b"),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            params.get("warm_credential").is_none(),
+            "{declared:?}: {params}"
+        );
+    }
+}
+
+/// The last credential isn't sent when routing could never pick it, because this computer
+/// doesn't offer it, or when the caller named the account, which routing follows instead.
+#[tokio::test]
+async fn the_last_credential_is_sent_only_when_routing_could_pick_it() {
+    use cortexkit_role_routing::capabilities::ACCOUNT_WARM_CREDENTIAL;
+    let declared = Some(vec![ACCOUNT_WARM_CREDENTIAL]);
+    let not_offered = warm_credential_request(
+        declared.clone(),
+        Some("oauth:anthropic:acct-gone"),
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        not_offered.get("warm_credential").is_none(),
+        "{not_offered}"
+    );
+    let pinned =
+        warm_credential_request(declared, Some("oauth:anthropic:acct-b"), true, None).await;
+    assert!(pinned.get("warm_credential").is_none(), "{pinned}");
 }

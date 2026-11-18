@@ -950,6 +950,7 @@ mod tests {
                 initial_input_bytes: 14,
                 hold_cap: Default::default(),
                 head_turn: false,
+                warm_credential: None,
             },
             async { Some(Arc::new(listing)) },
             Instant::now() + Duration::from_secs(5),

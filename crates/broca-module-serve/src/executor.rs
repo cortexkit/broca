@@ -893,6 +893,8 @@ struct EpisodeJob<'a> {
     continue_offer: Option<&'a AccountChoice>,
     /// Whether routing serves continuation (see `resume_asks_routing`).
     routing_serves_continuation: bool,
+    /// The session's first run since it moved here (see `RunControl::moved_here`).
+    moved_here: bool,
 }
 
 /// What a run's admission reads from the session's history.
@@ -1637,6 +1639,7 @@ impl<W: ExecutorWalStore + 'static>
                     // The offer is the account: the moved config already names it, so
                     // the resume rule that would ask routing again doesn't apply.
                     routing_serves_continuation: false,
+                    moved_here: false,
                 },
                 &history,
             )
@@ -2110,6 +2113,9 @@ struct EpisodeAccountPreference<'a> {
     pin: (Option<AuthMethod>, Option<&'a str>),
     pool: Option<&'a str>,
     credential_id: Option<&'a str>,
+    /// On a moved session's first run here, the credential its last run used (see
+    /// `RunControl::moved_here`).
+    warm_credential: Option<&'a str>,
 }
 
 /// Drives the real agentic loop for each run: resolves the provider from the catalog
@@ -2414,6 +2420,12 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                             .auth
                             .as_ref()
                             .and_then(|auth| auth.credential_id.as_deref()),
+                        // A moved session's first run here names the credential it last ran on.
+                        // A resume keeps its run's account, so only a fresh episode sends it.
+                        warm_credential: (job.moved_here && fresh_episode)
+                            .then(|| history.last_config?.auth_selection.as_ref())
+                            .flatten()
+                            .map(|selection| selection.credential_id.as_str()),
                     },
                     (job.conversation_key.as_deref(), inherited_key),
                     broca_module_serve::account_routing::account_hold_cap(
@@ -3252,6 +3264,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                     clock: control.clock.as_ref(),
                     continue_offer: None,
                     routing_serves_continuation,
+                    moved_here: control.moved_here,
                 },
                 &history,
             )
@@ -3543,6 +3556,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 initial_input_bytes,
                 hold_cap,
                 head_turn: req.head_turn,
+                warm_credential: preference.warm_credential,
             },
             async { Some(listing) },
             deadline,

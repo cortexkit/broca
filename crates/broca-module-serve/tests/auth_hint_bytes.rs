@@ -66,6 +66,7 @@ fn pin_values() -> [(&'static str, Vec<u8>, &'static str); 4] {
             candidates: &candidates,
             hold_cap: Default::default(),
             head_turn: false,
+            warm_credential: None,
         },
     );
     [

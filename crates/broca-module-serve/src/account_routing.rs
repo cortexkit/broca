@@ -1164,6 +1164,10 @@ pub struct AccountForRequest<'a> {
     /// The run is a head's turn (see `RunRequest::head_turn`). Sent only to a router that
     /// declares `account_head_turn`; [`RoutingClient::account_for`] drops it otherwise.
     pub head_turn: bool,
+    /// The credential a session that moved here last ran on, on its first run here (see
+    /// [`ChoiceInputs::warm_credential`]). Sent only to a router that declares
+    /// `account_warm_credential`; [`RoutingClient::account_for`] drops it otherwise.
+    pub warm_credential: Option<&'a str>,
 }
 
 static HOLD_CAP_UNKNOWN: AtomicU64 = AtomicU64::new(0);
@@ -1304,6 +1308,9 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
     }
     if request.head_turn {
         params["head_turn"] = true.into();
+    }
+    if let Some(credential_id) = request.warm_credential {
+        params["warm_credential"] = credential_id.into();
     }
     params
 }
@@ -1525,6 +1532,26 @@ impl RoutingClient {
                     .as_object_mut()
                     .expect("account_for params are an object")
                     .remove("head_turn");
+            }
+        }
+        // Likewise `warm_credential`: without it routing picks the moved session's account as it
+        // would a new session's, which only costs the prompt cache the old account held.
+        if params.get("warm_credential").is_some() {
+            let declared = match tokio::time::timeout_at(
+                deadline,
+                self.transport
+                    .capability(cortexkit_role_routing::capabilities::ACCOUNT_WARM_CREDENTIAL),
+            )
+            .await
+            {
+                Ok(support) => support == crate::routing_capabilities::CapabilitySupport::Declared,
+                Err(_) => return AccountForOutcome::NoDecisionWithinBudget,
+            };
+            if !declared {
+                params
+                    .as_object_mut()
+                    .expect("account_for params are an object")
+                    .remove("warm_credential");
             }
         }
         let body = match serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": params }))
@@ -1771,6 +1798,12 @@ pub struct ChoiceInputs<'a> {
     pub hold_cap: AccountHoldCap,
     /// The run is a head's turn (see `RunRequest::head_turn`).
     pub head_turn: bool,
+    /// On a session's first run after it moved here from another computer: the credential its
+    /// last run there used. Routing keeps a conversation on one account, but that affinity is
+    /// kept per computer and doesn't move, so without this the first run here is a fresh pick
+    /// and loses the prompt cache the old account holds. Routing honours it only for a
+    /// conversation it has no affinity for, and skips it when that account can't take the run.
+    pub warm_credential: Option<&'a str>,
 }
 
 fn decision(
@@ -1808,6 +1841,32 @@ impl From<ChoiceRefusal> for broca_core::RunError {
             }
         }
     }
+}
+
+/// The `warm_credential` a run sends: the moved session's last credential, unless the run names
+/// its account some other way (a pinned account, a pool, a credential or an account route,
+/// which routing follows instead) or this computer doesn't offer that credential, so routing
+/// could never pick it.
+fn warm_credential<'a>(
+    inputs: &ChoiceInputs<'a>,
+    hinted: bool,
+    candidates: &Candidates,
+) -> Option<&'a str> {
+    let credential = inputs.warm_credential?;
+    if inputs.caller_named_account || hinted {
+        return None;
+    }
+    let offered = candidates
+        .accounts
+        .iter()
+        .any(|candidate| candidate.credential_id == credential);
+    if !offered {
+        tracing::info!(
+            credential,
+            "account choice: the moved session's last credential isn't offered here; routing picks afresh"
+        );
+    }
+    offered.then_some(credential)
 }
 
 /// Decide how a fresh run's account is chosen, asking routing when there is a choice to make.
@@ -1920,6 +1979,7 @@ where
         candidates: &candidates,
         hold_cap: inputs.hold_cap,
         head_turn: inputs.head_turn,
+        warm_credential: warm_credential(&inputs, hinted, &candidates),
     });
     if inputs.hold_cap.evidence_unknown {
         HOLD_CAP_UNKNOWN.fetch_add(1, Ordering::Relaxed);

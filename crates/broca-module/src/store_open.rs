@@ -1197,6 +1197,7 @@ fn open_error(error: SessionError, create: bool) -> OpenError {
     ))
 }
 
+pub(crate) mod moved_here;
 pub mod recovery;
 pub(crate) mod recovery_index;
 

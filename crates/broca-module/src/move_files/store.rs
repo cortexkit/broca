@@ -329,6 +329,9 @@ impl FileCutArtifacts {
                     &addr,
                 )
                 .map_err(unavailable)?;
+                // Its first run here asks routing to keep the account it last ran on.
+                crate::store_open::moved_here::mark(&class.store_root(&self.state_root), &addr)
+                    .map_err(unavailable)?;
                 // A later move finds the session by its ref in the session-ref index alone, so
                 // its row is written before the session is published. If the index can't take
                 // it, the guard leaves the index marked incomplete until a census repairs it, so

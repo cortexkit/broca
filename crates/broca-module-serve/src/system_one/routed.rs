@@ -540,6 +540,7 @@ async fn prepare_admission(
         candidates: &candidates,
         hold_cap: Default::default(),
         head_turn: false,
+        warm_credential: None,
     });
     params
         .as_object_mut()

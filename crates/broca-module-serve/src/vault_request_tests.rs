@@ -1721,6 +1721,7 @@ async fn routed_chatgpt_choice() -> AccountChoice {
     send_id: None,
     run_id: "chatgpt-run", initial_input_bytes: 42,
     head_turn: false,
+    warm_credential: None,
     }, async { Some(listing) }, tokio::time::Instant::now() + ADMISSION_BUDGET).await.unwrap();
     let requests = routing.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);

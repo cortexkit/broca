@@ -2201,6 +2201,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             person_steers: Some(broca_core::tool_plane::PersonSteers(person_steers_seen)),
             clock: self.retention_clock.clone(),
             conversation_key,
+            moved_here: self.moved_here(),
             cancel: Some(cancel.clone()),
             stop_requested: self
                 .registry
@@ -3389,6 +3390,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(active) = self.run.take() else {
             return;
         };
+        self.settle_moved_here(&active.run_id);
         // Whatever the run's start stored of its send's media is the session's now; a run that
         // never wrote its start leaves nothing for the next one.
         self.held.clear();
@@ -4872,6 +4874,7 @@ mod import;
 mod inline_import;
 mod keep_warm;
 mod memory;
+mod moved_here;
 mod ordered;
 mod pauses;
 pub(crate) mod recorded_warm;
@@ -4911,6 +4914,8 @@ mod loop_error_tests;
 mod media_wait_tests;
 #[cfg(test)]
 mod memory_tests;
+#[cfg(test)]
+mod moved_here_tests;
 #[cfg(test)]
 mod new_heads_tests;
 #[cfg(test)]
