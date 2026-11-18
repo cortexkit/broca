@@ -239,7 +239,8 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
             .unwrap()
             .unwrap();
         assert_eq!(delivery.message.id, event.event_key);
-        assert_eq!(delivery.message.headers.len(), 5);
+        assert_eq!(delivery.message.headers.len(), 6);
+        assert_eq!(delivery.message.headers["session"], session.session);
         assert_eq!(delivery.message.headers["seq"], seq.to_string());
         assert_eq!(delivery.message.headers["kind"], kind);
         assert_eq!(delivery.message.headers["run_id"], "bus-run");
