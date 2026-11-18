@@ -367,7 +367,7 @@ mod gated {
             assert_eq!(body(&frozen)["reasoning"]["effort"], "medium", "{method:?}");
             let named = resolved("openai/gpt-5.6-default", method, Some("high"));
             assert_eq!(body(&named)["reasoning"]["effort"], "high", "{method:?}");
-            // A row stating no default is unchanged.
+            // A row with no documented default gets no variant.
             let plain = resolved("openai/gpt-5.6-luna", method, None);
             assert!(plain.variant.is_none(), "{method:?}");
         }

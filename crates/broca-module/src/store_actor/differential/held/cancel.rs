@@ -336,8 +336,8 @@ async fn a_parked_cancel_request_survives_restart(cipher: Cipher) {
 /// A caller's step-boundary cancel that lands while the model step is in flight, whose answer
 /// then calls a tool the provider holds: the cancel wins over the pause on that call. The run
 /// ends cancelled with the held call closed in the same write, its provider is asked to withdraw
-/// it, and the session stays usable: every stored message keeps the per-message record reads
-/// and part numbering use (its entry facts), and the next send runs to its end.
+/// it, and the session stays usable: every stored message keeps the record that reads and part
+/// numbering use for that message, and the next send runs to its end.
 async fn a_boundary_cancel_before_a_held_call_closes_it_and_leaves_the_session_usable(
     cipher: Cipher,
 ) {

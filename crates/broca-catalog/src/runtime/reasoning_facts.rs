@@ -57,7 +57,7 @@ pub(super) fn reasoning_options_fact(
 /// `capability.reasoning_default`: `{type, value}`, one entry's type and one of its values. Only
 /// an `effort` default is read, and only when the row's own `effort` option offers its value; any
 /// other default, an absent one or a malformed one reads as `None` and the row still serves, so
-/// a run that names no variant then sends no effort, as before.
+/// a run that names no variant then sends no effort.
 pub(super) fn reasoning_default_effort_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
