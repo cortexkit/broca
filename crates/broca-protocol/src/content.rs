@@ -712,6 +712,37 @@ impl ToolOutput {
     }
 }
 
+impl ToolOutput {
+    /// The text a model reads for this output where its family carries no media: the runner
+    /// contract's `owned-broca` conversion (`serializer_profile::owned_broca::tool_output`),
+    /// with each media part, which that conversion lists apart, standing in its place as a
+    /// marker. Every family renders an output's text from here, so they all agree with the
+    /// text a reader works out from the stored output.
+    pub fn model_text(&self) -> String {
+        match self {
+            ToolOutput::Text { text } => text.to_string(),
+            ToolOutput::Json { value } => value.to_string(),
+            ToolOutput::Parts { parts } => media_parts_text(parts, MediaMarkerReason::Carrier),
+            ToolOutput::Denied { reason } => format!("denied: {reason}"),
+            ToolOutput::Error {
+                message,
+                module,
+                code,
+                detail,
+                nothing_sent,
+                retry,
+            } => ToolOutput::error_model_text(
+                message,
+                module.as_deref(),
+                code.as_deref(),
+                detail.as_deref(),
+                *nothing_sent,
+                retry.as_deref(),
+            ),
+        }
+    }
+}
+
 /// Text-only rendering in source order, also used by readers that did not request media.
 pub fn media_parts_text(parts: &[ToolOutputPart], reason: MediaMarkerReason) -> String {
     parts

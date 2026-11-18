@@ -404,7 +404,7 @@ fn tool_output_with_media<'a>(
         return match &result.output {
             ToolOutput::Text { text } => Node::str(text),
             ToolOutput::Json { value } => Node::str(value.text()),
-            output => Node::string(tool_output_text(output)),
+            output => Node::string(output.model_text()),
         };
     };
     let grammar = super::openai_media::Grammar::Chat;
@@ -702,33 +702,6 @@ fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolN
         ToolChoice::Tool { name } => {
             json!({ "type": "function", "function": { "name": name_map.wire_name(name) } })
         }
-    }
-}
-
-fn tool_output_text(out: &ToolOutput) -> String {
-    match out {
-        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
-            parts,
-            broca_protocol::MediaMarkerReason::Carrier,
-        ),
-        ToolOutput::Text { text } => text.to_string(),
-        ToolOutput::Json { value } => value.to_string(),
-        ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-        } => ToolOutput::error_model_text(
-            message,
-            module.as_deref(),
-            code.as_deref(),
-            detail.as_deref(),
-            *nothing_sent,
-            retry.as_deref(),
-        ),
     }
 }
 

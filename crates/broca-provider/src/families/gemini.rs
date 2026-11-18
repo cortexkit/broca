@@ -704,33 +704,16 @@ fn media_part(reference: &MediaRef, tool: bool, media: Option<&MediaRender<'_>>)
 /// not copied.
 fn function_response_payload(out: &ToolOutput) -> Node<'_> {
     Node::value(match out {
-        ToolOutput::Parts { parts } => {
-            json!({"result": broca_protocol::content::media_parts_text(parts, broca_protocol::MediaMarkerReason::Carrier)})
-        }
+        ToolOutput::Parts { .. } => json!({"result": out.model_text()}),
         ToolOutput::Text { text } => return Node::object([("result", Node::str(text))]),
         // Gemini models FunctionResponse.response as a protobuf Struct, so it must be a JSON
         // object. Keep objects unchanged and give every other JSON value the same `result`
         // envelope used for text output.
         ToolOutput::Json { value } if value.is_object() => return Node::Json(value),
         ToolOutput::Json { value } => return Node::object([("result", Node::Json(value))]),
-        ToolOutput::Denied { reason } => json!({ "error": format!("denied: {reason}") }),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-        } => json!({
-            "error": ToolOutput::error_model_text(
-                message,
-                module.as_deref(),
-                code.as_deref(),
-                detail.as_deref(),
-                *nothing_sent,
-                retry.as_deref(),
-            )
-        }),
+        ToolOutput::Denied { .. } | ToolOutput::Error { .. } => {
+            json!({ "error": out.model_text() })
+        }
     })
 }
 

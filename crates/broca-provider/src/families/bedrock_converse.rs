@@ -702,11 +702,8 @@ fn convert_tool_result<'a>(
 
 fn convert_tool_output(output: &ToolOutput) -> Vec<Node<'_>> {
     let block = match output {
-        ToolOutput::Parts { parts } => {
-            let text = broca_protocol::content::media_parts_text(
-                parts,
-                broca_protocol::MediaMarkerReason::Carrier,
-            );
+        ToolOutput::Parts { .. } => {
+            let text = output.model_text();
             if text.is_empty() {
                 Node::object([("json", Node::string(text))])
             } else {
@@ -718,25 +715,11 @@ fn convert_tool_output(output: &ToolOutput) -> Vec<Node<'_>> {
         ToolOutput::Text { text } if text.is_empty() => Node::object([("json", Node::str(text))]),
         ToolOutput::Text { text } => text_block(Node::str(text)),
         ToolOutput::Json { value } => Node::object([("json", Node::Json(value))]),
-        ToolOutput::Denied { reason } => text_block(Node::string(format!("denied: {reason}"))),
+        ToolOutput::Denied { .. } => text_block(Node::string(output.model_text())),
         ToolOutput::Error { message, .. } if message.is_empty() => {
             Node::object([("json", Node::str(message))])
         }
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-        } => text_block(Node::string(ToolOutput::error_model_text(
-            message,
-            module.as_deref(),
-            code.as_deref(),
-            detail.as_deref(),
-            *nothing_sent,
-            retry.as_deref(),
-        ))),
+        ToolOutput::Error { .. } => text_block(Node::string(output.model_text())),
     };
     vec![block]
 }

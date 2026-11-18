@@ -1353,35 +1353,6 @@ fn convert_content<'a>(
         .collect()
 }
 
-/// A tool output as the text a `tool_result` carries, when it is not one of the outputs
-/// written from the message itself (text and JSON).
-fn tool_output_text(out: &ToolOutput) -> String {
-    match out {
-        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
-            parts,
-            broca_protocol::MediaMarkerReason::Carrier,
-        ),
-        ToolOutput::Text { text } => text.to_string(),
-        ToolOutput::Json { value } => value.to_string(),
-        ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-        } => ToolOutput::error_model_text(
-            message,
-            module.as_deref(),
-            code.as_deref(),
-            detail.as_deref(),
-            *nothing_sent,
-            retry.as_deref(),
-        ),
-    }
-}
-
 fn tool_output_content<'a>(
     out: &'a ToolOutput,
     media: Option<&'a crate::media_render::MediaRender<'_>>,
@@ -1405,7 +1376,7 @@ fn tool_output_content<'a>(
         // copied.
         (ToolOutput::Text { text }, _) => Node::str(text),
         (ToolOutput::Json { value }, _) => Node::str(value.text()),
-        _ => Node::string(tool_output_text(out)),
+        _ => Node::string(out.model_text()),
     }
 }
 
@@ -1463,11 +1434,12 @@ mod tests {
     /// and the retry guidance; a plain error renders as its message alone.
     #[test]
     fn attributed_outage_error_renders_attribution_for_the_model() {
-        let text = tool_output_text(&ToolOutput::module_unavailable(
+        let text = ToolOutput::module_unavailable(
             "aft",
             "target_unavailable",
             "supervised_not_registered",
-        ));
+        )
+        .model_text();
         assert!(text.starts_with("tool plane unavailable\n"), "{text}");
         for line in [
             "module: aft",
@@ -1477,7 +1449,7 @@ mod tests {
         ] {
             assert!(text.contains(line), "{text}");
         }
-        assert_eq!(tool_output_text(&ToolOutput::error("boom")), "boom");
+        assert_eq!(ToolOutput::error("boom").model_text(), "boom");
     }
 
     fn persona_frozen() -> FrozenRenderConfig {

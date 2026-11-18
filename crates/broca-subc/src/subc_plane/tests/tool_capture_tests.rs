@@ -306,6 +306,7 @@ async fn reference_only_reply_is_a_provenance_marker_even_when_object_exists() {
                 &reference,
                 broca_protocol::MediaMarkerReason::Provenance
             )
+            .into()
         }
     );
 }

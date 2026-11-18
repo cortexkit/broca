@@ -2982,12 +2982,14 @@ async fn tool_reference_provenance_is_enforced_before_hook_payloads_are_stored()
                         &foreign,
                         MediaMarkerReason::Provenance
                     )
+                    .into()
                 },
                 ToolOutputPart::Text {
                     text: broca_protocol::content::media_not_shown_marker(
                         &altered,
                         MediaMarkerReason::Provenance
                     )
+                    .into()
                 },
             ]
         }

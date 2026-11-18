@@ -213,31 +213,7 @@ pub fn transformed_tool_result(
 /// (provenance permits only captured references). Never called for a JSON result, which stays
 /// hookless.
 pub fn post_tool_text(result: &ToolResult) -> String {
-    match &result.output {
-        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
-            parts,
-            broca_protocol::MediaMarkerReason::Carrier,
-        ),
-        ToolOutput::Text { text } => text.to_string(),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-            ..
-        } => ToolOutput::error_model_text(
-            message,
-            module.as_deref(),
-            code.as_deref(),
-            detail.as_deref(),
-            *nothing_sent,
-            retry.as_deref(),
-        ),
-        ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Json { .. } => unreachable!("a JSON result has no post-tool hooks"),
-    }
+    result.output.model_text()
 }
 
 #[cfg(test)]
