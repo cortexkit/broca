@@ -745,6 +745,24 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
     assert_eq!(body["code"], "unknown_method");
     assert_eq!(body["message"], "unknown method 'usage.export'");
 
+    // A contract op of a group broca doesn't declare is known, so it is refused `unsupported`:
+    // promotion needs `send_promote`, which broca doesn't declare.
+    write_req_epoch(
+        &mut cwriter,
+        7,
+        2,
+        12,
+        serde_json::json!({
+            "method": "session.promote",
+            "params": {"send_id": "missing", "request_id": "unsupported"},
+        }),
+    )
+    .await;
+    let promote = read_one(&mut creader).await;
+    assert_eq!(promote.header.ty, FrameType::Error);
+    let promote: serde_json::Value = serde_json::from_slice(&promote.body).unwrap();
+    assert_eq!(promote["code"], "unsupported", "{promote}");
+
     // A broca without the vault still answers vault.audit, and says it could not check,
     // rather than failing the request or answering an empty (clean-looking) audit.
     write_req_epoch(

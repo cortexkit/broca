@@ -870,6 +870,27 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         assert_eq!(code(&error), "invalid_params", "{method}");
         assert_eq!(error["detail"]["field"], "unexpected", "{method}");
     }
+    // Broca declares no `fork_effort`, so an effort hint, valid or not, is an unknown member.
+    for effort in [
+        json!("low"),
+        json!("medium"),
+        json!("high"),
+        json!("minimal"),
+    ] {
+        let error = rig
+            .call(
+                1,
+                "session.fork_ask",
+                json!({"fork_id": fork, "ask_id": "e", "question": "q", "effort": effort}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (code(&error), error["detail"]["field"].as_str()),
+            ("invalid_params", Some("effort")),
+            "{effort}"
+        );
+    }
     for (ask_id, question, field) in [
         (String::new(), "q", "ask_id"),
         ("界".repeat(257), "q", "ask_id"),
