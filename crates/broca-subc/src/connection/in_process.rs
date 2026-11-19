@@ -60,6 +60,7 @@ impl SubcConnection {
             shared: Arc::new(ConnectionShared {
                 aft_harness_answer: Mutex::new(None),
                 person_yields: Mutex::default(),
+                catalog: Default::default(),
                 #[cfg(test)]
                 late_goodbye_handoff: Mutex::new(None),
                 route_closer: std::sync::OnceLock::new(),

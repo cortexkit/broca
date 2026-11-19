@@ -422,6 +422,7 @@ async fn dispatch_result_capability_is_independent_of_held_and_role_routes_stay_
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
+use subc_control::CatalogEntry;
 use tokio::net::TcpStream;
 
 async fn read_capabilities_concurrently(
@@ -559,7 +560,7 @@ fn bind_relay_grace_covers_the_daemon_relay_window() {
 /// A connection with no socket whose route.open replies the test delivers by hand, at a
 /// time it chooses. Returns the connection, the queue of frames it wrote, and its pending
 /// map (where a reply is delivered).
-fn route_open_test_connection() -> (SubcConnection, mpsc::Receiver<Frame>, PendingMap) {
+pub(super) fn route_open_test_connection() -> (SubcConnection, mpsc::Receiver<Frame>, PendingMap) {
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::new()));
     let (write_tx, write_rx) = mpsc::channel(64);
@@ -1235,6 +1236,7 @@ fn test_connection(
         shared: Arc::new(ConnectionShared {
             aft_harness_answer: Mutex::new(None),
             person_yields: Mutex::default(),
+            catalog: Default::default(),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),
@@ -3164,6 +3166,7 @@ async fn unreachable_reconnect_attempts_back_off_instead_of_spinning() {
     let shared = Arc::new(ConnectionShared {
         aft_harness_answer: Mutex::new(None),
         person_yields: Mutex::default(),
+        catalog: Default::default(),
         #[cfg(test)]
         late_goodbye_handoff: Mutex::new(None),
         route_closer: std::sync::OnceLock::new(),

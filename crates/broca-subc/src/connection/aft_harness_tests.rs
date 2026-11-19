@@ -1,4 +1,5 @@
 use super::*;
+use subc_control::CatalogEntry;
 use crate::provider_catalog::ProviderCatalog;
 
 pub(super) fn catalog(accepts_broca: bool) -> ProviderCatalog {

@@ -290,9 +290,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // connection). The LLM provider is NOT subc — it's a direct HTTP/SSE call the executor
     // makes. One SHARED consumer connection carries per-session tool routes; the executor
     // frees a session's route on close (so the shared connection doesn't leak channels).
-    let tool_conn = SubcConnection::connect(&conn_path)
-        .await
-        .map_err(|e| ServeIoError(format!("tool-plane consumer connect: {e}")))?;
+    // Every long-lived consumer connection follows the daemon's catalog generation, so the
+    // catalog is read again only when it changed (`SubcConnection::follow_catalog`).
+    let tool_conn = Arc::new(
+        SubcConnection::connect(&conn_path)
+            .await
+            .map_err(|e| ServeIoError(format!("tool-plane consumer connect: {e}")))?,
+    );
+    tool_conn.follow_catalog();
     // Whether the daemon admits routes under scopes (`scopes/v1`) decides how an unstamped
     // send into a scoped session is refused. When the question cannot be asked, serve falls
     // back to the same list in its own connection's HELLO_ACK.
@@ -356,6 +361,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| ServeIoError(format!("late-results consumer connect: {e}")))?,
     );
+    feed_conn.follow_catalog();
     let held_resumer = Arc::new(broca_module_serve::held_runtime::LateBoundResumer::default());
     let held_routes = Arc::new(broca_module_serve::held_runtime::FeedRoutes::new(
         Arc::clone(&feed_conn),
@@ -422,6 +428,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| ServeIoError(format!("catalog consumer connect: {e}")))?,
     );
+    catalog_conn.follow_catalog();
     let catalog_identity = broca_protocol::BindIdentity::new(
         state_root.to_string_lossy().to_string(),
         "broca",
@@ -452,6 +459,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| ServeIoError(format!("fetch-plan consumer connect: {e}")))?,
     );
+    plan_conn.follow_catalog();
     let tool_route_health_plane = Arc::clone(&plane);
     let executor_impl =
         executor::LiveLoopExecutor::new(wal_store.clone(), plane, provider_base_url);
@@ -530,6 +538,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|e| ServeIoError(format!("vault consumer connect: {e}")))?,
         );
+        vault_conn.follow_catalog();
         vault_gauge = broca_module_serve::serve::VaultGauge::disconnected();
         // A detached catalog watch keeps health truthful without delaying this module's own
         // HELLO: it polls until the credentials module is catalog-live, stamps the gauge, and

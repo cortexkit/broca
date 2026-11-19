@@ -19,7 +19,7 @@ use std::{
 };
 
 use broca_protocol::BindIdentity;
-use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
+use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     tool_call::ToolCallRequest, BindIdentity as SubcBindIdentity, Flags, Frame, FrameType,
     Priority, RouteTarget,
@@ -904,6 +904,8 @@ struct ConnectionShared {
     /// Keys of calls whose provider accepted a hand-back for the person's steer
     /// (`person_message`), until the plane takes each one with the call's terminal frame.
     person_yields: Mutex<std::collections::HashSet<String>>,
+    /// The last catalog and the generation the daemon pushed (see [`catalog_watch`]).
+    catalog: catalog_watch::CatalogMemo,
     #[cfg(test)]
     late_goodbye_handoff: Mutex<Option<LateGoodbyeHandoffHook>>,
     route_closer: std::sync::OnceLock<Arc<crate::route_close::RouteCloser>>,
@@ -1076,6 +1078,7 @@ impl SubcConnection {
         let shared = Arc::new(ConnectionShared {
             aft_harness_answer: Mutex::new(None),
             person_yields: Mutex::default(),
+            catalog: Default::default(),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),
@@ -1370,20 +1373,6 @@ impl SubcConnection {
             })
             .await
             .cloned()
-    }
-
-    /// `catalog.list` — registered providers + their tools.
-    pub async fn catalog_list(&self) -> ConnResult<Vec<CatalogEntry>> {
-        let body = serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None })
-            .map_err(|e| ConnError::Transport(e.to_string()))?;
-        let frame = self.control_rpc(body).await?;
-        match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
-            Ok(ClientControlResponse::CatalogList { modules, .. }) => Ok(modules),
-            Ok(other) => Err(ConnError::Protocol(format!(
-                "unexpected catalog.list reply: {other:?}"
-            ))),
-            Err(e) => Err(ConnError::Protocol(format!("decode catalog.list: {e}"))),
-        }
     }
 
     /// Ask the supervisor to run one module `health.check` probe and return its in-memory
@@ -5064,6 +5053,8 @@ fn to_subc_bind(
     // may be a legacy folder or the unscoped namespace; neither belongs in a wire bind.
     SubcBindIdentity::new(harness, identity.session.clone())
 }
+
+mod catalog_watch;
 
 /// The far end of an in-process connection with no socket, for tests OUTSIDE this module that
 /// need the real request/terminal path (framing, pending waiters, reply deadlines) behind a

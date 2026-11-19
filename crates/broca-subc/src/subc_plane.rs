@@ -1084,8 +1084,10 @@ impl SubcToolPlane {
         }
     }
 
-    pub fn new(conn: SubcConnection, module_id: impl Into<String>) -> Self {
-        Self::with_connection(Arc::new(conn), module_id)
+    /// A plane on `conn`, owned here or shared with other users of the connection.
+    pub fn new(conn: impl Into<Arc<SubcConnection>>, module_id: impl Into<String>) -> Self {
+        let conn: Arc<SubcConnection> = conn.into();
+        Self::with_connection(conn, module_id)
     }
 
     /// Route a standalone Direct caller's tool calls under an owner's carrier grant.
