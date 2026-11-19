@@ -26,6 +26,7 @@
 //! segment ordinal and in its fact id, and a store seq never repeats within a session, so warm
 //! fact ids stay unique.
 
+use broca_core::billing::attempt::AttemptEvidence;
 use broca_protocol::BindIdentity;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
@@ -175,6 +176,43 @@ pub async fn run_records<B: SessionBackend>(
 ) -> Result<Vec<FramedRecord>, String> {
     let records = session_records(session, run_id).await?;
     today_records(&records, run_id, bind, parts)
+}
+
+/// What the usage export needs to bill `run_id`: today's records the builder reads, and the
+/// run's model attempts in seq order, each with its usage fact
+/// ([`broca_core::billing::attempt`]).
+pub async fn run_billing_inputs<B: SessionBackend>(
+    session: &Session<B>,
+    run_id: &str,
+    bind: &BindIdentity,
+    parts: &dyn Parts,
+) -> Result<(Vec<FramedRecord>, Vec<AttemptEvidence>), String> {
+    let records = session_records(session, run_id).await?;
+    let attempts = attempt_evidence(&records, run_id);
+    Ok((today_records(&records, run_id, bind, parts)?, attempts))
+}
+
+/// The attempt records of `run_id` among `records`, as the attempt facts read them.
+pub fn attempt_evidence(records: &[(u64, Record)], run_id: &str) -> Vec<AttemptEvidence> {
+    records
+        .iter()
+        .filter_map(|(seq, record)| match record {
+            Record::Attempt(attempt) if attempt.run_id == run_id => Some(AttemptEvidence {
+                seq: *seq,
+                step_id: attempt.step_id,
+                attempt: attempt.attempt,
+                attempt_id: attempt.attempt_id.clone(),
+                outcome: attempt.outcome.clone(),
+                http_status: attempt.http_status,
+                response_bytes: attempt.response_body_len,
+                content_received: attempt.first_content_at_ms.is_some(),
+                sent_at_ms: attempt.sent_at_ms,
+                recorded_at_ms: attempt.ts_ms,
+                served_account_ref: attempt.served_account_ref.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

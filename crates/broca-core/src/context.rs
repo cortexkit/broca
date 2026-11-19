@@ -1532,6 +1532,20 @@ pub trait ExportIndex: Send + Sync {
         resolver: &dyn ChargeBasisResolver,
     ) -> Result<(), ExportError>;
 
+    /// [`Self::emit_run`], with a usage fact for each of the run's model attempts in `attempts`
+    /// (its attempt records in seq order), and the run's segments marked as counted in them
+    /// ([`crate::SpendSegment::usage_in_attempts`]). An index that writes no attempt facts
+    /// writes the segments unmarked, as `emit_run` does.
+    fn emit_run_with_attempts(
+        &self,
+        records: &[FramedRecord],
+        run_id: &RunId,
+        _attempts: &[crate::billing::attempt::AttemptEvidence],
+        resolver: &dyn ChargeBasisResolver,
+    ) -> Result<(), ExportError> {
+        self.emit_run(records, run_id, resolver)
+    }
+
     fn read_page(&self, since: Option<ExportCursor>, limit: u64)
         -> Result<ExportPage, ExportError>;
 

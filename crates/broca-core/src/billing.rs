@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod attempt;
 mod fact_session;
 
 /// When installing a session WAL received from another machine, select its
@@ -265,6 +266,43 @@ pub struct SpendSegment {
     /// a failure can still carry provider-reported billable usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_outcome: Option<broca_wal::record::BillingAttemptOutcome>,
+    /// `true` when the run's usage is also exported one fact per model attempt
+    /// ([`crate::attempt_facts::AttemptFact`]), each share of which names its segment. A reader
+    /// prices the attempts and records a segment marked this way without pricing it, so no usage
+    /// is counted twice. Absent on a run without attempt facts, whose segments price as before;
+    /// a reader must not infer the rule from finding attempts, which it may read before or after
+    /// their segment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_in_attempts: bool,
+}
+
+/// One model's share of one step's billed usage, as a segment counted it: the unit an attempt
+/// fact carries. A step answered by one model has one share; a step a provider handed on inside
+/// one request has one per model, in the order the segment counted them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelShare {
+    /// The seq of the record the usage came from: the step's end, or its refusal.
+    pub seq: u64,
+    pub step_id: u64,
+    /// Whether the usage came from the step's refusal, which the run's own model was billed for
+    /// before the step went to its refusal-fallback model.
+    pub refused: bool,
+    pub provider: String,
+    pub model: String,
+    pub usage: Usage,
+    /// The service tier the provider reported for this share; absent when it reported none.
+    pub served_service_tier: Option<String>,
+    /// The ordinary segment the usage was counted in.
+    pub segment_ordinal: u64,
+    pub segment_fact_id: String,
+}
+
+/// A run's segments and the shares they counted, from [`compute_run_billing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBilling {
+    pub segments: Vec<SpendSegment>,
+    /// The run's step shares in record order. Warms are not shares: each warm is its own fact.
+    pub shares: Vec<ModelShare>,
 }
 
 #[derive(Debug)]
@@ -290,6 +328,8 @@ struct OpenRun {
     serving: Option<ModelHandle>,
     /// Model calls folded into the open segment.
     segment_calls: u32,
+    /// Every share counted so far, in record order.
+    shares: Vec<ModelShare>,
 }
 
 impl OpenRun {
@@ -318,6 +358,7 @@ impl OpenRun {
             segment_open: true,
             serving: None,
             segment_calls: 0,
+            shares: Vec::new(),
         }
     }
 
@@ -326,6 +367,7 @@ impl OpenRun {
     fn record_usage<R: ChargeBasisResolver>(
         &mut self,
         resolver: &R,
+        seq: u64,
         record: &WalRecord,
         at_ms: Option<u64>,
         retries_used: u32,
@@ -343,6 +385,13 @@ impl OpenRun {
         let mut closed_retries = 0u32;
         for (index, (provider, model, _, usage)) in entries.iter().enumerate() {
             let model = ModelHandle::new(*provider, *model);
+            // Named as the segment names it: the run's own model under the provider it bills as.
+            let share_provider = if model == self.config.model {
+                self.config.billed_provider().to_owned()
+            } else {
+                model.provider_module_id.to_string()
+            };
+            let share_model = model.model_id.clone();
             let serving = (model != self.config.model).then_some(model);
             closed_retries =
                 closed_retries.saturating_add(self.bill_under(resolver, serving, at_ms));
@@ -354,6 +403,28 @@ impl OpenRun {
                 .and_then(|entries| entries[index].other.get("service_tier"))
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| last.then_some(service_tier).flatten());
+            let (step_id, refused) = match record {
+                WalRecord::ModelStepFinished { step_id, .. } => (step_id.0, false),
+                WalRecord::ModelStepRefused { step_id, .. } => (step_id.0, true),
+                _ => (0, false),
+            };
+            let segment_ordinal = self.segments.len() as u64;
+            self.shares.push(ModelShare {
+                seq,
+                step_id,
+                refused,
+                provider: share_provider,
+                model: share_model,
+                usage: *usage,
+                served_service_tier: tier.map(str::to_owned),
+                segment_ordinal,
+                segment_fact_id: fact_id(
+                    &self.source_instance_id,
+                    &self.session,
+                    &self.run_id,
+                    segment_ordinal,
+                ),
+            });
             if let Some(tier) = tier {
                 *self
                     .usage_by_service_tier
@@ -478,6 +549,7 @@ impl OpenRun {
                 .then_some(self.terminal_reason.unwrap_or(RunFinishReason::Interrupted)),
             warm: false,
             warm_outcome: None,
+            usage_in_attempts: false,
         });
         self.usage = Usage::default();
         self.usage_by_service_tier.clear();
@@ -487,7 +559,13 @@ impl OpenRun {
         self.segment_calls = 0;
     }
 
-    fn finish<R: ChargeBasisResolver>(mut self, resolver: &R) -> Vec<SpendSegment> {
+    /// Closes the run's open segment and returns its segments, moving its shares to `shares`.
+    fn finish<R: ChargeBasisResolver>(
+        mut self,
+        resolver: &R,
+        shares: &mut Vec<ModelShare>,
+    ) -> Vec<SpendSegment> {
+        shares.append(&mut self.shares);
         if self.segment_open {
             self.close_segment(resolver, self.terminal_reason.is_some());
         }
@@ -515,7 +593,7 @@ pub fn compute_segments<R: ChargeBasisResolver>(
     source_instance_id: &str,
     resolver: &R,
 ) -> Vec<SpendSegment> {
-    compute_segments_matching(records, None, source_instance_id, resolver)
+    compute_segments_matching(records, None, source_instance_id, resolver, &mut Vec::new())
 }
 
 /// Compute billing-homogeneous segments for one target run without constructing
@@ -526,7 +604,31 @@ pub fn compute_segments_for_run<R: ChargeBasisResolver>(
     source_instance_id: &str,
     resolver: &R,
 ) -> Vec<SpendSegment> {
-    compute_segments_matching(records, Some(run_id), source_instance_id, resolver)
+    compute_segments_matching(
+        records,
+        Some(run_id),
+        source_instance_id,
+        resolver,
+        &mut Vec::new(),
+    )
+}
+
+/// [`compute_segments_for_run`], with the step shares its segments counted.
+pub fn compute_run_billing<R: ChargeBasisResolver>(
+    records: &[FramedRecord],
+    run_id: &RunId,
+    source_instance_id: &str,
+    resolver: &R,
+) -> RunBilling {
+    let mut shares = Vec::new();
+    let segments = compute_segments_matching(
+        records,
+        Some(run_id),
+        source_instance_id,
+        resolver,
+        &mut shares,
+    );
+    RunBilling { segments, shares }
 }
 
 fn compute_segments_matching<R: ChargeBasisResolver>(
@@ -534,6 +636,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
     target_run: Option<&RunId>,
     source_instance_id: &str,
     resolver: &R,
+    shares: &mut Vec<ModelShare>,
 ) -> Vec<SpendSegment> {
     let mut output = Vec::new();
     let mut open: Option<OpenRun> = None;
@@ -572,7 +675,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 );
                 latest_run = Some(run_id.clone());
                 if let Some(previous) = open.take() {
-                    output.extend(previous.finish(resolver));
+                    output.extend(previous.finish(resolver, shares));
                 }
                 closed_retries_used = 0;
                 if target_run.is_none_or(|target| target == run_id) {
@@ -640,6 +743,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     current.pause_candidate = None;
                     closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
                         resolver,
+                        framed.seq,
                         &framed.record,
                         *written_at_ms,
                         *retries_used,
@@ -653,6 +757,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     current.pause_candidate = None;
                     closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
                         resolver,
+                        framed.seq,
                         &framed.record,
                         *ts_ms,
                         0,
@@ -675,7 +780,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     current.retries_used = current.retries_used.saturating_add(residue);
                     current.terminal_ts_ms = *ts_ms;
                     current.terminal_reason = Some(*reason);
-                    output.extend(current.finish(resolver));
+                    output.extend(current.finish(resolver, shares));
                 }
             }
             WalRecord::RunPaused { ts_ms, .. } => {
@@ -747,9 +852,12 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
             current.terminal_ts_ms = ts_ms;
             current.terminal_reason = Some(RunFinishReason::Interrupted);
         }
-        output.extend(current.finish(resolver));
+        output.extend(current.finish(resolver, shares));
     }
 
+    for share in shares.iter_mut() {
+        share.usage = share.usage.with_complete_cache_write_lifetimes();
+    }
     for segment in &mut output {
         segment.usage = segment.usage.with_complete_cache_write_lifetimes();
         if let Some(tiers) = &mut segment.usage_by_service_tier {
@@ -886,6 +994,7 @@ fn warm_segment<R: ChargeBasisResolver>(
         terminal_reason: None,
         warm: true,
         warm_outcome: outcome,
+        usage_in_attempts: false,
     }
 }
 
@@ -930,7 +1039,7 @@ mod tests {
     use broca_wal::{AuthSelection, RunConfig, RunOrigin};
     use serde_json::json;
 
-    fn resolver(provider: &str, method: &str) -> (ChargeBasis, u32) {
+    pub(super) fn resolver(provider: &str, method: &str) -> (ChargeBasis, u32) {
         match (provider, method) {
             ("anthropic", "apikey") => (ChargeBasis::MeteredApi, 1),
             ("anthropic", "oauth") => (ChargeBasis::SubscriptionIncluded, 1),
@@ -938,7 +1047,7 @@ mod tests {
         }
     }
 
-    fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
+    pub(super) fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
         RunConfig {
             global_system: None,
             account_route: None,
@@ -978,7 +1087,7 @@ mod tests {
         }
     }
 
-    fn frame(seq: u64, record: WalRecord) -> FramedRecord {
+    pub(super) fn frame(seq: u64, record: WalRecord) -> FramedRecord {
         FramedRecord {
             seq,
             fence: 1,
@@ -986,7 +1095,7 @@ mod tests {
         }
     }
 
-    fn started(seq: u64, run_id: &str, ts_ms: Option<u64>) -> FramedRecord {
+    pub(super) fn started(seq: u64, run_id: &str, ts_ms: Option<u64>) -> FramedRecord {
         frame(
             seq,
             WalRecord::RunStarted {
@@ -1025,7 +1134,7 @@ mod tests {
         )
     }
 
-    fn step(seq: u64, id: u64, usage: Usage, retries_used: u32) -> FramedRecord {
+    pub(super) fn step(seq: u64, id: u64, usage: Usage, retries_used: u32) -> FramedRecord {
         frame(
             seq,
             WalRecord::ModelStepFinished {
@@ -1049,7 +1158,7 @@ mod tests {
         )
     }
 
-    fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
+    pub(super) fn usage(input_tokens: u64, output_tokens: u64) -> Usage {
         Usage {
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
@@ -1057,7 +1166,10 @@ mod tests {
         }
     }
 
-    fn synthetic_iteration_records(models: [&str; 2], retries: u32) -> Vec<FramedRecord> {
+    pub(super) fn synthetic_iteration_records(
+        models: [&str; 2],
+        retries: u32,
+    ) -> Vec<FramedRecord> {
         let mut start = started(1, "synthetic-run", Some(100));
         if let WalRecord::RunStarted {
             session,
@@ -2005,7 +2117,7 @@ mod tests {
         )
     }
 
-    fn terminal(seq: u64, ts_ms: Option<u64>, usage: Usage) -> FramedRecord {
+    pub(super) fn terminal(seq: u64, ts_ms: Option<u64>, usage: Usage) -> FramedRecord {
         frame(
             seq,
             WalRecord::RunFinished {

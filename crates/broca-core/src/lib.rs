@@ -100,9 +100,9 @@ pub use admission::{
     BUDGET_REPLAY_STATE_VERSION,
 };
 pub use billing::{
-    charge_basis_overrides_digest, compute_segments, compute_segments_for_run, imported_run_ids,
-    ChargeBasis, ChargeBasisResolver, SpendSegment, TimestampPrecision, NO_CHARGE_BASIS_OVERRIDES,
-    USAGE_POLICY_VERSION,
+    charge_basis_overrides_digest, compute_run_billing, compute_segments, compute_segments_for_run,
+    imported_run_ids, ChargeBasis, ChargeBasisResolver, ModelShare, RunBilling, SpendSegment,
+    TimestampPrecision, NO_CHARGE_BASIS_OVERRIDES, USAGE_POLICY_VERSION,
 };
 pub use capability::{
     AllowAll, ApprovalPolicy, CapabilityViolation, DenyAll, ScriptedApproval, ToolManifest,

@@ -154,10 +154,11 @@ async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: 
     );
     let warm_fact = first_facts
         .iter()
+        // A run's model attempts have their own facts beside its segments; the warm's is a segment.
         .find(|fact| {
-            serde_json::to_value(fact.segment.as_session().unwrap()).unwrap()["usage"]
-                ["cached_input_tokens"]
-                == 1000
+            fact.segment.as_session().is_some_and(|segment| {
+                serde_json::to_value(segment).unwrap()["usage"]["cached_input_tokens"] == 1000
+            })
         })
         .expect("the warm's measured cache reads are billed");
     assert_eq!(

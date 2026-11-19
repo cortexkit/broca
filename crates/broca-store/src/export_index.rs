@@ -15,7 +15,7 @@ use std::{
 
 use broca_core::{
     compute_segments_for_run, ChargeBasisResolver, ExportCursor, ExportError, ExportFact,
-    ExportIndex, ExportPage, MissingExportRun,
+    ExportIndex, ExportPage, MissingExportRun, SpendSegment,
 };
 use broca_protocol::RunId;
 use broca_wal::FramedRecord;
@@ -331,6 +331,75 @@ impl ExportStore {
         })
     }
 
+    /// [`Self::emit_export_run`], with a fact for each of the run's model attempts in `attempts`
+    /// (its attempt records in seq order) and the run's segments marked as counted in them.
+    ///
+    /// When a segment of the run is already stored unmarked, an older build billed the run and
+    /// its segments price its usage: then no attempt fact is written and the segments stay
+    /// unmarked, so the run is never priced twice.
+    pub fn emit_export_run_with_attempts(
+        &self,
+        records: &[FramedRecord],
+        run_id: &RunId,
+        attempts: &[broca_core::billing::attempt::AttemptEvidence],
+        resolver: &dyn ChargeBasisResolver,
+    ) -> Result<(), ExportError> {
+        let source_instance_id = self.source_instance_id();
+        let resolver = ResolverRef(resolver);
+        let broca_core::billing::attempt::RunAttemptFacts {
+            mut segments,
+            mut attempts,
+        } = broca_core::billing::attempt::compute_attempt_facts(
+            records,
+            run_id,
+            attempts,
+            source_instance_id,
+            &resolver,
+        );
+        if segments.is_empty() && attempts.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| storage("store mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let mut billed_before = false;
+        for segment in segments.iter().filter(|segment| segment.usage_in_attempts) {
+            billed_before |= stored_unmarked(&tx, &segment.fact_id)?;
+        }
+        if billed_before {
+            attempts.clear();
+            for segment in &mut segments {
+                segment.usage_in_attempts = false;
+            }
+        }
+        for segment in &segments {
+            insert_segment(&tx, segment)?;
+        }
+        for attempt in &attempts {
+            insert_attempt(&tx, attempt)?;
+        }
+        let high_water = tx
+            .query_row(
+                "SELECT COALESCE(MAX(export_seq), 0) FROM export_facts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage)?;
+        tx.execute(
+            "UPDATE export_meta SET high_water=?1 WHERE id=1",
+            [high_water],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        self.export_high_water
+            .fetch_max(i64_to_u64(high_water, "high_water")?, Ordering::Release);
+        Ok(())
+    }
+
     /// Compute and append only the segments belonging to `run_id`.  The input
     /// is the complete session WAL so refreeze boundaries and terminal metadata
     /// are interpreted by the same pure billing function used elsewhere.
@@ -357,82 +426,7 @@ impl ExportStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
         for segment in segments {
-            let session_json = serde_json::to_string(&segment.session).map_err(storage)?;
-            let imported: bool = tx
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM export_imported_runs
-                                    WHERE session=?1 AND run_id=?2)",
-                    rusqlite::params![session_json, segment.run_id.0],
-                    |row| row.get(0),
-                )
-                .map_err(storage)?;
-            if imported {
-                continue;
-            }
-            let segment_json = serde_json::to_string(&segment).map_err(storage)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO export_facts
-                    (fact_id, run_id, segment_json) VALUES (?1, ?2, ?3)",
-                rusqlite::params![segment.fact_id, segment.run_id.0, segment_json],
-            )
-            .map_err(storage)?;
-
-            let stored = tx
-                .query_row(
-                    "SELECT segment_json FROM export_facts WHERE fact_id=?1",
-                    [&segment.fact_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(storage)?;
-            // A DISAGREEMENT HAS TWO CAUSES AND ONLY ONE OF THEM NEEDS ANYONE.
-            //
-            // A shipped fact is immutable, so re-deriving one always produces today's segment
-            // shape against yesterday's stored bytes. Every additive field since that fact was
-            // written -- `usage_policy_version`, `account_ref`, `resolved_credential_id` -- makes
-            // the comparison differ FOR A REASON THAT REQUIRES NO ACTION, and it differs again on
-            // every reopen, forever. Measured: 5 log lines over 2 distinct facts, one of them 4
-            // times, both predating fields that now exist, on a session that reopens.
-            //
-            // That is the shape that teaches a reader to skip the words HARD WARNING. The value
-            // difference is the one worth keeping loud: same identity, same field, different
-            // answer, which means a derivation changed under a fact that cannot change.
-            match classify_collision(&stored, &segment_json) {
-                CollisionKind::Identical => {}
-                CollisionKind::SchemaEvolution => tracing::info!(
-                    target: "store",
-                    "immutable usage fact {} predates a field the current segment adds; \
-                     keeping shipped fact (expected after any additive segment change)",
-                    segment.fact_id
-                ),
-                CollisionKind::EquivalentBytes => tracing::info!(
-                    target: "store",
-                    "immutable usage fact {} re-derives to the same data in different bytes; \
-                     keeping shipped fact (a serialization change, not a schema change)",
-                    segment.fact_id
-                ),
-                CollisionKind::DerivationVersionChange { stamps, added } => tracing::info!(
-                    target: "store",
-                    "immutable usage fact {} re-derives with moved derivation stamp(s) {}{}; \
-                     keeping shipped fact (expected after the shipped value for those moved)",
-                    segment.fact_id,
-                    stamps.join(", "),
-                    if added.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" and added field(s) {}", added.join(", "))
-                    }
-                ),
-                CollisionKind::ValueDisagreement { fields } => tracing::warn!(
-                    target: "store",
-                    "HARD WARNING: immutable usage fact {} disagrees on {}; keeping \
-                     shipped fact. Same identity and a different answer means a derivation \
-                     moved under a fact that cannot -- this is NOT the expected \
-                     added-field case. EVERY differing key is listed, so a derivation stamp \
-                     appearing beside a real field is incidental rather than the whole story",
-                    segment.fact_id,
-                    fields.join(", ")
-                ),
-            }
+            insert_segment(&tx, &segment)?;
         }
 
         let high_water = tx
@@ -453,6 +447,147 @@ impl ExportStore {
             .fetch_max(high_water, Ordering::Release);
         Ok(())
     }
+}
+
+/// Inserts `segment` unless its run was imported or a fact is already stored under its id, which
+/// stays as shipped.
+fn insert_segment(
+    tx: &rusqlite::Transaction<'_>,
+    segment: &SpendSegment,
+) -> Result<(), ExportError> {
+    if imported_run(tx, &segment.session, &segment.run_id)? {
+        return Ok(());
+    }
+    let segment_json = serde_json::to_string(&segment).map_err(storage)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO export_facts
+                (fact_id, run_id, segment_json) VALUES (?1, ?2, ?3)",
+        rusqlite::params![segment.fact_id, segment.run_id.0, segment_json],
+    )
+    .map_err(storage)?;
+
+    let stored = tx
+        .query_row(
+            "SELECT segment_json FROM export_facts WHERE fact_id=?1",
+            [&segment.fact_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(storage)?;
+    // A DISAGREEMENT HAS TWO CAUSES AND ONLY ONE OF THEM NEEDS ANYONE.
+    //
+    // A shipped fact is immutable, so re-deriving one always produces today's segment
+    // shape against yesterday's stored bytes. Every additive field since that fact was
+    // written -- `usage_policy_version`, `account_ref`, `resolved_credential_id` -- makes
+    // the comparison differ FOR A REASON THAT REQUIRES NO ACTION, and it differs again
+    // each time the run's facts are derived again.
+    //
+    // That is the shape that teaches a reader to skip the words HARD WARNING. The value
+    // difference is the one worth keeping loud: same identity, same field, different
+    // answer, which means a derivation changed under a fact that cannot change.
+    match classify_collision(&stored, &segment_json) {
+        CollisionKind::Identical => {}
+        CollisionKind::SchemaEvolution => tracing::info!(
+            target: "store",
+            "immutable usage fact {} predates a field the current segment adds; \
+             keeping shipped fact (expected after any additive segment change)",
+            segment.fact_id
+        ),
+        CollisionKind::EquivalentBytes => tracing::info!(
+            target: "store",
+            "immutable usage fact {} re-derives to the same data in different bytes; \
+             keeping shipped fact (a serialization change, not a schema change)",
+            segment.fact_id
+        ),
+        CollisionKind::DerivationVersionChange { stamps, added } => tracing::info!(
+            target: "store",
+            "immutable usage fact {} re-derives with moved derivation stamp(s) {}{}; \
+             keeping shipped fact (expected after the shipped value for those moved)",
+            segment.fact_id,
+            stamps.join(", "),
+            if added.is_empty() {
+                String::new()
+            } else {
+                format!(" and added field(s) {}", added.join(", "))
+            }
+        ),
+        CollisionKind::ValueDisagreement { fields } => tracing::warn!(
+            target: "store",
+            "HARD WARNING: immutable usage fact {} disagrees on {}; keeping \
+             shipped fact. Same identity and a different answer means a derivation \
+             moved under a fact that cannot -- this is NOT the expected \
+             added-field case. EVERY differing key is listed, so a derivation stamp \
+             appearing beside a real field is incidental rather than the whole story",
+            segment.fact_id,
+            fields.join(", ")
+        ),
+    }
+    Ok(())
+}
+
+/// Inserts `fact` unless its run was imported or a fact is already stored under its id, which
+/// stays as shipped.
+fn insert_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    fact: &broca_core::billing::attempt::AttemptFact,
+) -> Result<(), ExportError> {
+    if imported_run(tx, &fact.session, &fact.run_id)? {
+        return Ok(());
+    }
+    let json = serde_json::to_string(fact).map_err(storage)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO export_facts (fact_id, run_id, segment_json) VALUES (?1, ?2, ?3)",
+        rusqlite::params![fact.fact_id, fact.run_id.0, json],
+    )
+    .map_err(storage)?;
+    let stored: String = tx
+        .query_row(
+            "SELECT segment_json FROM export_facts WHERE fact_id=?1",
+            [&fact.fact_id],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if stored != json {
+        tracing::warn!(
+            target: "store",
+            "immutable attempt fact {} re-derives to different bytes; keeping shipped fact",
+            fact.fact_id
+        );
+    }
+    Ok(())
+}
+
+/// Whether a segment is already stored under `fact_id` without
+/// [`SpendSegment::usage_in_attempts`]: one an older build wrote, which prices the run's usage
+/// itself.
+fn stored_unmarked(tx: &rusqlite::Transaction<'_>, fact_id: &str) -> Result<bool, ExportError> {
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT segment_json FROM export_facts WHERE fact_id=?1",
+            [fact_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    let value: serde_json::Value = serde_json::from_str(&stored).map_err(storage)?;
+    Ok(value.get("usage_in_attempts") != Some(&serde_json::Value::Bool(true)))
+}
+
+/// Whether the run of `segment` was billed on another machine and is not billed here.
+fn imported_run(
+    tx: &rusqlite::Transaction<'_>,
+    session: &broca_protocol::BindIdentity,
+    run_id: &RunId,
+) -> Result<bool, ExportError> {
+    let session_json = serde_json::to_string(session).map_err(storage)?;
+    tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM export_imported_runs WHERE session=?1 AND run_id=?2)",
+        rusqlite::params![session_json, run_id.0],
+        |row| row.get(0),
+    )
+    .map_err(storage)
 }
 
 /// Why a re-derived segment differs from the one already shipped under its `fact_id`.
@@ -747,6 +882,16 @@ impl ExportIndex for SqliteStore {
         self.emit_export_run(records, run_id, resolver)
     }
 
+    fn emit_run_with_attempts(
+        &self,
+        records: &[FramedRecord],
+        run_id: &RunId,
+        attempts: &[broca_core::billing::attempt::AttemptEvidence],
+        resolver: &dyn ChargeBasisResolver,
+    ) -> Result<(), ExportError> {
+        self.emit_export_run_with_attempts(records, run_id, attempts, resolver)
+    }
+
     fn read_page(
         &self,
         since: Option<ExportCursor>,
@@ -804,6 +949,17 @@ impl SqliteStore {
         resolver: &dyn ChargeBasisResolver,
     ) -> Result<(), ExportError> {
         self.export.emit_export_run(records, run_id, resolver)
+    }
+
+    pub fn emit_export_run_with_attempts(
+        &self,
+        records: &[FramedRecord],
+        run_id: &RunId,
+        attempts: &[broca_core::billing::attempt::AttemptEvidence],
+        resolver: &dyn ChargeBasisResolver,
+    ) -> Result<(), ExportError> {
+        self.export
+            .emit_export_run_with_attempts(records, run_id, attempts, resolver)
     }
 }
 
@@ -960,6 +1116,102 @@ pub(crate) mod tests {
             stop_when: Vec::new(),
             context_management: None,
         }
+    }
+
+    /// `records(run_id, 2)`, with gaps in its seqs for an attempt before each step.
+    fn records_with_attempts(
+        run_id: &str,
+    ) -> (
+        Vec<FramedRecord>,
+        Vec<broca_core::billing::attempt::AttemptEvidence>,
+    ) {
+        let mut frames = records(run_id, 2);
+        for framed in &mut frames {
+            framed.seq *= 10;
+        }
+        let attempts = frames
+            .iter()
+            .filter_map(|framed| match &framed.record {
+                WalRecord::ModelStepFinished { step_id, .. } => {
+                    Some(broca_core::billing::attempt::AttemptEvidence {
+                        seq: framed.seq - 1,
+                        step_id: step_id.0,
+                        attempt: 1,
+                        attempt_id: Some(format!("att-{}", framed.seq)),
+                        outcome: "complete".into(),
+                        http_status: Some(200),
+                        response_bytes: 100,
+                        content_received: true,
+                        sent_at_ms: Some(150),
+                        recorded_at_ms: 160,
+                        served_account_ref: None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        (frames, attempts)
+    }
+
+    /// The run's export facts as (kind, marked) pairs, in export order.
+    fn exported(store: &SqliteStore, run_id: &str) -> Vec<(&'static str, bool)> {
+        use broca_core::system_one_fact::UsageExportSegment;
+        store
+            .read_export_page(None, 100)
+            .unwrap()
+            .facts
+            .into_iter()
+            .filter_map(|fact| match fact.segment {
+                UsageExportSegment::Session(segment) if segment.run_id.0 == run_id => {
+                    Some(("segment", segment.usage_in_attempts))
+                }
+                UsageExportSegment::Attempt(attempt) if attempt.run_id.0 == run_id => {
+                    Some(("attempt", false))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attempt_facts_land_with_marked_segments_and_never_beside_an_unmarked_one() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (frames, attempts) = records_with_attempts("fresh");
+        let run = RunId("fresh".into());
+        store
+            .emit_export_run_with_attempts(&frames, &run, &attempts, &resolver)
+            .unwrap();
+        let facts = exported(&store, "fresh");
+        assert_eq!(
+            facts,
+            vec![
+                ("segment", true),
+                ("segment", true),
+                ("attempt", false),
+                ("attempt", false)
+            ]
+        );
+        store
+            .emit_export_run_with_attempts(&frames, &run, &attempts, &resolver)
+            .unwrap();
+        assert_eq!(
+            exported(&store, "fresh"),
+            facts,
+            "billing again writes nothing new"
+        );
+
+        // A run an older build billed before the crash that kept it unsettled: its segments
+        // price its usage, so attempt facts beside them would bill it twice.
+        let (frames, attempts) = records_with_attempts("older");
+        let run = RunId("older".into());
+        store.emit_export_run(&frames, &run, &resolver).unwrap();
+        store
+            .emit_export_run_with_attempts(&frames, &run, &attempts, &resolver)
+            .unwrap();
+        assert_eq!(
+            exported(&store, "older"),
+            vec![("segment", false), ("segment", false)]
+        );
     }
 
     fn records(run_id: &str, segments: usize) -> Vec<FramedRecord> {

@@ -61,14 +61,54 @@ impl Export {
             .unwrap()
             .facts
             .iter()
-            .map(|fact| {
-                let segment = fact.segment.as_session().expect("a session's fact");
-                (
+            .filter_map(|fact| {
+                let segment = fact.segment.as_session()?;
+                Some((
                     segment.run_id.0.clone(),
                     serde_json::to_string(segment).unwrap(),
-                )
+                ))
             })
             .collect()
+    }
+
+    /// Every stored attempt fact.
+    fn attempts(&self) -> Vec<broca_core::billing::attempt::AttemptFact> {
+        self.store
+            .read_export_page(None, 1_000)
+            .unwrap()
+            .facts
+            .into_iter()
+            .filter_map(|fact| match fact.segment {
+                broca_core::system_one_fact::UsageExportSegment::Attempt(attempt) => Some(*attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs `insert` as the next scripted step says.
+    fn scripted(
+        &self,
+        insert: impl FnOnce() -> Result<(), ExportError>,
+    ) -> Result<(), ExportError> {
+        let step = self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Insert::Commit);
+        match step {
+            Insert::Commit => insert(),
+            Insert::Fail => Err(ExportError::Storage("disk full".into())),
+            Insert::CrashBefore => {
+                self.backend.crash_after(Some(0));
+                Err(ExportError::Storage("the process died".into()))
+            }
+            Insert::CrashAfter => {
+                let inserted = insert();
+                self.backend.crash_after(Some(0));
+                inserted
+            }
+        }
     }
 }
 
@@ -83,25 +123,20 @@ impl ExportIndex for Export {
         run_id: &RunId,
         resolver: &dyn broca_core::ChargeBasisResolver,
     ) -> Result<(), ExportError> {
-        let step = self
-            .script
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(Insert::Commit);
-        match step {
-            Insert::Commit => self.store.emit_export_run(records, run_id, resolver),
-            Insert::Fail => Err(ExportError::Storage("disk full".into())),
-            Insert::CrashBefore => {
-                self.backend.crash_after(Some(0));
-                Err(ExportError::Storage("the process died".into()))
-            }
-            Insert::CrashAfter => {
-                let inserted = self.store.emit_export_run(records, run_id, resolver);
-                self.backend.crash_after(Some(0));
-                inserted
-            }
-        }
+        self.scripted(|| self.store.emit_export_run(records, run_id, resolver))
+    }
+
+    fn emit_run_with_attempts(
+        &self,
+        records: &[broca_wal::FramedRecord],
+        run_id: &RunId,
+        attempts: &[broca_core::billing::attempt::AttemptEvidence],
+        resolver: &dyn broca_core::ChargeBasisResolver,
+    ) -> Result<(), ExportError> {
+        self.scripted(|| {
+            self.store
+                .emit_export_run_with_attempts(records, run_id, attempts, resolver)
+        })
     }
 
     fn read_page(
@@ -231,6 +266,51 @@ async fn a_runs_facts_are_written_at_its_end_and_it_is_billed() {
         let bill = at(&|r| matches!(r, Record::Billed(billed) if billed.run_id == run));
         assert!(end < bill, "{run}: billed after its end");
     }
+}
+
+/// The provider's evidence of one try of a step.
+fn attempt(number: u32, outcome: &str) -> broca_protocol::NormalizedEvent {
+    broca_protocol::NormalizedEvent::Control(broca_protocol::ProviderControl::AttemptFinished {
+        attempt: serde_json::from_value(serde_json::json!({
+            "attempt": number, "request_body_len": 10, "request_body_sha256": "0".repeat(64),
+            "http_status": if outcome == "http_error" { 503 } else { 200 },
+            "response_body_len": 20, "response_body_sha256": "1".repeat(64),
+            "outcome": outcome, "ts_ms": 1100 + number * 100, "sent_at_ms": 1000 + number * 100,
+        }))
+        .unwrap(),
+    })
+}
+
+/// A run's model attempts each get a usage fact beside its segment, which is marked as counted
+/// in them. The step's usage belongs to the try that answered it; the try before it failed and
+/// carries none.
+#[tokio::test]
+async fn each_model_attempt_of_a_run_gets_its_own_usage_fact() {
+    let backend = leaked();
+    let export = Export::new(backend, &[]);
+    let mut step = text_step("a1", "hello");
+    step.splice(0..0, [attempt(1, "http_error"), attempt(2, "complete")]);
+    let (commands, served) =
+        open_billed(backend, executor(vec![step], None), &parts(), &export, true).await;
+    ran(&commands, "r1", "first").await;
+    drop(commands);
+    served.await.unwrap();
+    let attempts = export.attempts();
+    assert_eq!(attempts.len(), 2, "the step's two tries");
+    assert_eq!(attempts[0].outcome, "http_error");
+    assert_eq!(attempts[0].usage_by_model, None);
+    let facts = export.facts();
+    let segment: serde_json::Value = serde_json::from_str(&facts[0].1).unwrap();
+    assert_eq!(segment["usage_in_attempts"], true);
+    let shares = attempts[1]
+        .usage_by_model
+        .as_ref()
+        .expect("the step's usage");
+    assert_eq!(shares.len(), 1);
+    assert_eq!(shares[0].segment_fact_id, segment["fact_id"]);
+    assert_eq!(shares[0].usage.input_tokens, Some(100));
+    assert_eq!(shares[0].usage.output_tokens, Some(20));
+    assert_eq!(attempts[1].outcome, "complete");
 }
 
 /// A process that dies after the insert commits and before `Billed` is written leaves the run

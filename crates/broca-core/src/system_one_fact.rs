@@ -39,19 +39,21 @@ pub struct SystemOneUsage {
     pub output_tokens: Option<u64>,
 }
 
-/// The on-disk shape of session facts is unchanged: only sessionless facts carry `kind`.
+/// The on-disk shape of session facts is unchanged: only sessionless facts and model attempts
+/// carry `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum UsageExportSegment {
     Session(Box<SpendSegment>),
     SystemOne(Box<SystemOneFact>),
+    Attempt(Box<crate::billing::attempt::AttemptFact>),
 }
 
 impl UsageExportSegment {
     pub fn as_session(&self) -> Option<&SpendSegment> {
         match self {
             Self::Session(segment) => Some(segment),
-            Self::SystemOne(_) => None,
+            Self::SystemOne(_) | Self::Attempt(_) => None,
         }
     }
 }
@@ -62,6 +64,9 @@ impl<'de> Deserialize<'de> for UsageExportSegment {
         match value.get("kind").and_then(serde_json::Value::as_str) {
             Some("system_one") => {
                 serde_json::from_value(value).map(|fact| Self::SystemOne(Box::new(fact)))
+            }
+            Some("model_attempt") => {
+                serde_json::from_value(value).map(|fact| Self::Attempt(Box::new(fact)))
             }
             None => serde_json::from_value(value).map(|segment| Self::Session(Box::new(segment))),
             Some(kind) => {
