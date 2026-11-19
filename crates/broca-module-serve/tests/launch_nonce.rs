@@ -469,7 +469,7 @@ fn no_shipped_code_reads_a_launch_nonce_variable_directly() {
         .collect();
     for expected in [
         "broca-module-serve/src/main.rs",
-        "broca-module-serve/src/serve.rs",
+        "broca-module-serve/src/serve_hello.rs",
         "broca-module-serve/src/manifest.rs",
         "broca-subc/src/connection.rs",
     ] {

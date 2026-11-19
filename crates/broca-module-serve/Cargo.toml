@@ -160,3 +160,7 @@ test-clock = ["broca-module/test-clock", "broca-core/test-clock"]
 # Real-daemon rigs only (the native release suites turn it on): credentials may also reach the
 # local machine, where the rigs' stand-in providers listen. See broca-provider's feature.
 test-loopback-credentials = ["broca-provider/test-loopback-credentials"]
+# broca takes its settings from the daemon's managed settings when the daemon offers them,
+# instead of reading broca.jsonc (src/settings/gate.rs). Off until the daemon converts old
+# broca.jsonc files itself.
+settings-gate = []

@@ -76,3 +76,144 @@ fn a_valid_view_passes_with_its_sources() {
         |(path, layer)| path.starts_with("/service_tier") && *layer == subc_config::Layer::User
     ));
 }
+
+mod requests {
+    use serde_json::{json, Value};
+    use subc_config::{ApplyKind, Layer};
+    use subc_protocol::config::{
+        ConfigLayer, ConfigLayerSnapshot, ConfigReviewRequest, ConfigStatus, ConfigView,
+    };
+
+    use super::super::review_request;
+    use super::schema;
+
+    fn user_file(text: Option<&str>) -> ConfigLayerSnapshot {
+        ConfigLayerSnapshot::file(
+            "broca",
+            ConfigLayer::User,
+            "/synthetic/broca.jsonc",
+            text.map(|text| text.as_bytes().to_vec()),
+        )
+    }
+
+    /// The view approved from `user`, as the daemon would supply it as a review's base.
+    fn approved(user: Value) -> ConfigView {
+        let tuple = super::super::review(&schema(), &user).unwrap();
+        ConfigView::new(
+            1,
+            tuple.effective,
+            tuple.sources,
+            Vec::new(),
+            ConfigStatus::Active,
+        )
+    }
+
+    fn changed_paths(reply: &subc_protocol::config::ConfigReviewReply) -> Vec<&str> {
+        reply
+            .fields
+            .iter()
+            .map(|field| field.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_edit_reports_the_fields_it_changes_with_their_apply_kind_and_sources() {
+        let base = approved(json!({}));
+        let request = ConfigReviewRequest::new(
+            1,
+            vec![user_file(Some(
+                "{\n  // outage switch\n  \"chatgpt_force_https\": true,\n  \"service_tier\": {\"enabled\": true},\n}\n",
+            ))],
+            Some(base),
+        );
+        let reply = review_request(&schema(), &request);
+        assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
+        let mut paths = changed_paths(&reply);
+        paths.sort_unstable();
+        assert_eq!(paths, ["/chatgpt_force_https", "/service_tier/enabled"]);
+        for field in &reply.fields {
+            assert_eq!(field.old_source, Layer::Default);
+            assert_eq!(field.new_source, Layer::User);
+            let expected = match field.path.as_str() {
+                "/chatgpt_force_https" => ApplyKind::Live,
+                _ => ApplyKind::ModuleRestart,
+            };
+            assert_eq!(field.apply, expected, "{}", field.path);
+        }
+    }
+
+    #[test]
+    fn the_approved_file_again_changes_nothing() {
+        let user = json!({"service_tier": {"enabled": true}});
+        let request = ConfigReviewRequest::new(
+            1,
+            vec![user_file(Some(&user.to_string()))],
+            Some(approved(user)),
+        );
+        let reply = review_request(&schema(), &request);
+        assert!(
+            reply.fields.is_empty() && reply.refusals.is_empty(),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_base_every_field_is_new_from_null() {
+        let reply = review_request(
+            &schema(),
+            &ConfigReviewRequest::new(0, vec![user_file(None)], None),
+        );
+        assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
+        assert!(!reply.fields.is_empty());
+        for field in &reply.fields {
+            assert_eq!(
+                serde_json::to_value(&field.old).unwrap(),
+                serde_json::to_value(subc_config::RecordedValue::new(Value::Null)).unwrap(),
+                "{}",
+                field.path
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_in_an_older_shape_is_refused_not_converted() {
+        let request = ConfigReviewRequest::new(
+            1,
+            vec![user_file(Some(r#"{"max_same_account_wait": 30}"#))],
+            Some(approved(json!({}))),
+        );
+        let reply = review_request(&schema(), &request);
+        assert!(reply.fields.is_empty());
+        assert_eq!(reply.refusals.len(), 1, "{reply:?}");
+    }
+
+    #[test]
+    fn a_reader_refusal_names_its_key() {
+        let request = ConfigReviewRequest::new(
+            1,
+            vec![user_file(Some(
+                r#"{"account_selection": {"routing_module": "   "}}"#,
+            ))],
+            None,
+        );
+        let reply = review_request(&schema(), &request);
+        assert_eq!(reply.refusals[0].code, "value_invalid");
+        assert_eq!(reply.refusals[0].paths, ["/account_selection"]);
+    }
+
+    #[test]
+    fn unreadable_bytes_and_other_layers_are_refused() {
+        let unreadable = ConfigReviewRequest::new(1, vec![user_file(Some("{not json"))], None);
+        assert_eq!(
+            review_request(&schema(), &unreadable).refusals[0].code,
+            "value_invalid"
+        );
+        let mut project = user_file(Some("{}"));
+        project.layer = ConfigLayer::Project;
+        let other = ConfigReviewRequest::new(1, vec![project], None);
+        assert_eq!(
+            review_request(&schema(), &other).refusals[0].code,
+            "layer_forbidden"
+        );
+    }
+}

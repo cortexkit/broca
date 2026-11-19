@@ -13,6 +13,7 @@
 use serde_json::{Map, Value};
 
 pub mod convert;
+pub mod gate;
 pub mod review;
 
 use crate::config_home::ConfigHome;
@@ -157,14 +158,28 @@ impl Settings {
     }
 }
 
-/// The schema broca's settings will be declared with to the daemon's managed settings. It is
-/// not declared yet: several keys take a new shape or meaning in it (`max_same_account_wait`,
-/// `tool_name_aliases`, `cache.provider_ttl`, `billing.charge_basis`, `context_management`,
-/// `import.roots`, `account_selection.routing_module`),
-/// and declaring it would refuse every `broca.jsonc` written in today's shapes until the
-/// daemon can convert an old file.
-#[cfg(test)]
+/// The schema broca declares to the daemon's managed settings ([`gate`]). Only builds with the
+/// `settings-gate` switch declare it: several keys take a new shape or meaning in it
+/// (`max_same_account_wait`, `tool_name_aliases`, `cache.provider_ttl`, `billing.charge_basis`,
+/// `context_management`, `import.roots`, `account_selection.routing_module`), and declaring it
+/// would refuse every `broca.jsonc` written in today's shapes until the daemon can convert an
+/// old file.
 const SCHEMA: &str = include_str!("schema.json");
+
+/// broca's settings schema, as `config.declare` proposes it to the daemon.
+pub(crate) fn schema_document() -> &'static Value {
+    static DOCUMENT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DOCUMENT.get_or_init(|| serde_json::from_str(SCHEMA).expect("broca's settings schema is JSON"))
+}
+
+/// broca's settings schema, checked. Its tests prove the shipped schema is valid.
+pub fn schema() -> &'static subc_config::Schema {
+    static SCHEMA_CHECKED: std::sync::OnceLock<subc_config::Schema> = std::sync::OnceLock::new();
+    SCHEMA_CHECKED.get_or_init(|| {
+        subc_config::Schema::new(schema_document().clone())
+            .expect("broca's settings schema is valid")
+    })
+}
 
 #[cfg(test)]
 mod schema_tests;

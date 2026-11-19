@@ -30,10 +30,24 @@ pub fn validate_default() -> Result<(), String> {
     }
 }
 
+/// The value the daemon's settings give `chatgpt_force_https`, once broca runs on them
+/// (`settings::gate`). Unset, each attempt reads the file instead.
+static MANAGED: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+/// Records `force_https` from the daemon's settings, for every attempt from now on.
+pub fn set_managed(force_https: bool) {
+    MANAGED
+        .get_or_init(|| std::sync::atomic::AtomicBool::new(force_https))
+        .store(force_https, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Invalid edits made after boot fail safe to HTTPS without altering any rendered bytes.
 pub fn default_policy() -> Arc<dyn Fn() -> bool + Send + Sync> {
     let resolved = crate::CacheTtlTable::default_path();
     Arc::new(move || {
+        if let Some(managed) = MANAGED.get() {
+            return managed.load(std::sync::atomic::Ordering::Relaxed);
+        }
         match &resolved {
         crate::config_home::ConfigHome::Resolved { path, .. } => load(path).unwrap_or_else(|error| {
             tracing::warn!(target: "provider", %error, "invalid runtime transport policy; forcing ChatGPT HTTPS");

@@ -532,11 +532,15 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
     }
 }
 
+#[path = "serve_hello.rs"]
+mod hello;
 #[cfg(test)]
 #[path = "serve_project_identity_tests.rs"]
 mod project_identity_tests;
 #[path = "serve_tag_read.rs"]
 mod serve_tag_read;
+use hello::{expect_hello_ack, send_hello};
+pub use hello::{hello_manifest, register_unready};
 
 /// What a `route.bind` said about its caller beyond the session identity. Both values are
 /// recorded on the `RunStarted` of every send or import made over the route, and neither keys
@@ -654,6 +658,8 @@ fn to_bind_principal(principal: &subc_protocol::Principal) -> broca_protocol::Bi
 /// cancel for a live subscribe stream on that channel (cancelled on the route's GOODBYE so
 /// an explicit unsubscribe tears the forward task down promptly).
 struct Routes {
+    /// The settings gate, when broca registered through it (`settings::gate`).
+    gate: Option<Arc<crate::settings::gate::Gate>>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     /// System One, when this build serves it; a classifier bind is refused without it.
     system_one: Option<Arc<crate::system_one::SystemOne>>,
@@ -677,6 +683,7 @@ struct Routes {
 impl Routes {
     fn new(daemon_scopes: bool) -> Self {
         Self {
+            gate: None,
             agent_data: None,
             system_one: None,
             llm_tools: None,
@@ -1075,6 +1082,7 @@ where
         agent_data,
         system_one,
         None,
+        None,
     )
     .await
 }
@@ -1096,6 +1104,7 @@ pub async fn serve_connection_with_llm_tools<R, W, H>(
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
     llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
+    registered: Option<GatedRegistration>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -1132,6 +1141,7 @@ where
             agent_data,
             system_one,
             llm_tools,
+            registered,
         ),
     );
     let mut writer_finished = false;
@@ -1187,23 +1197,22 @@ async fn run_frame_loop<R, H>(
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
     llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
+    registered: Option<GatedRegistration>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
     H: ServeHandler + 'static,
 {
-    send_hello(
-        &writer,
-        module_id,
-        consumer_routes,
-        system_one
-            .as_ref()
-            .is_some_and(|system| system.image_references()),
-    )
-    .await?;
-    let ack = {
-        let _phase = stall::enter(Phase::AwaitFrame).await;
-        expect_hello_ack(read_half).await?
+    let image_references = system_one
+        .as_ref()
+        .is_some_and(|system| system.image_references());
+    let (ack, gate) = match registered {
+        None => {
+            send_hello(&writer, module_id, consumer_routes, image_references).await?;
+            let _phase = stall::enter(Phase::AwaitFrame).await;
+            (expect_hello_ack(read_half).await?, None)
+        }
+        Some(registered) => (registered.ack, Some(registered.gate)),
     };
     // Registered: from here the daemon answers this connection's `scope.describe`.
     if let Some(describer) = scope_describer {
@@ -1216,11 +1225,19 @@ where
         .any(|capability| capability == subc_protocol::scope::CAP_SCOPES_V1);
 
     let mut routes = Routes::new(daemon_scopes);
+    routes.gate = gate;
     routes.agent_data = agent_data;
     routes.system_one = system_one;
     routes.llm_tools = llm_tools;
     let request_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTE_REQUESTS));
     let mut request_tasks = JoinSet::new();
+    if let Some(gate) = routes.gate.clone() {
+        // The daemon's answers reach the gate through this loop, so it runs beside it. A refused
+        // readiness ends the loop, and broca restarts.
+        let provides = hello_manifest(module_id, consumer_routes, image_references).provides;
+        let writer = writer.clone();
+        request_tasks.spawn(async move { gate.finish_start(writer, provides).await });
+    }
 
     // ONE READ STAYS IN FLIGHT ACROSS SELECT TURNS. `read_frame` is not cancellation-safe: it
     // reads the header and then the body in separate steps, and dropping it part-way loses the
@@ -1294,7 +1311,8 @@ where
                 );
                 // A reply to the describer's own request is its alone; every other frame is
                 // handled as before.
-                let describe_reply = scope_describer.is_some_and(|describer| describer.on_frame(&frame));
+                let describe_reply = scope_describer.is_some_and(|describer| describer.on_frame(&frame))
+                    || routes.gate.as_ref().is_some_and(|gate| gate.on_frame(&frame));
                 if !describe_reply && !handle_frame(
                     frame,
                     &writer,
@@ -1323,6 +1341,13 @@ where
     request_tasks.abort_all();
     while request_tasks.join_next().await.is_some() {}
     loop_result
+}
+
+/// A module connection that already registered unready through the settings gate: its HELLO
+/// acknowledgement, and the gate that makes it ready once the serve loop runs.
+pub struct GatedRegistration {
+    pub ack: ModuleHelloAckBody,
+    pub gate: Arc<crate::settings::gate::Gate>,
 }
 
 /// Read one frame and hand the reader back with it, so the frame loop can keep a single read
@@ -1414,6 +1439,10 @@ where
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Push if frame.header.channel == 0 => {
+            if let Some(gate) = routes.gate.clone().filter(|gate| gate.is_changed(&frame)) {
+                request_tasks.spawn(async move { gate.on_changed(&frame.body).await });
+                return Ok(true);
+            }
             match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
                 Ok(ModuleControlCommand::Draining {
                     reason,
@@ -1439,6 +1468,10 @@ where
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
+            if let Some(answer) = routes.gate.as_ref().and_then(|gate| gate.review(&frame)) {
+                send(writer, answer?).await?;
+                return Ok(true);
+            }
             handle_control_request(
                 frame,
                 writer,
@@ -5455,76 +5488,6 @@ async fn send_subscribe_error_body(
     send_error_bytes(writer, ver, channel, epoch, corr, body).await
 }
 
-async fn send_hello(
-    writer: &EgressSender<Frame>,
-    module_id: &str,
-    consumer_routes: &crate::consumer_routes::ConsumerRoutes,
-    image_references: bool,
-) -> Result<(), ServeIoError> {
-    let mut manifest = crate::manifest::manifest_configured(module_id, consumer_routes);
-    if image_references {
-        for role in &mut manifest.provides {
-            if let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = role {
-                for tool in tools {
-                    if tool.name == crate::llm_tools::CLASSIFY_TOOL_NAME {
-                        tool.schema =
-                            cortexkit_llm_tools::classify::input_schema_with_image_references();
-                    }
-                }
-            }
-        }
-    }
-    let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest,
-        protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        launch_nonce: hello_launch_nonce()?,
-    })
-    .map_err(|e| ServeIoError(e.to_string()))?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
-        .map_err(|e| ServeIoError(e.to_string()))?;
-    send(writer, frame).await
-}
-
-/// The launch nonce HELLO presents, from the process's one nonce accessor.
-///
-/// `main` has already made the first read, so this returns the cached value and never touches
-/// the descriptor again. A named descriptor that could not be read fails HELLO with the
-/// accessor's own message; it never falls back to the environment copy, because that would hide
-/// a broken handoff and let a process that inherited only the variable register as broca.
-fn hello_launch_nonce() -> Result<Option<String>, ServeIoError> {
-    match subc_os::launch_nonce() {
-        Ok(nonce) => Ok(nonce.map(|nonce| nonce.value().to_string())),
-        Err(error) => Err(ServeIoError(format!("launch nonce: {error}"))),
-    }
-}
-
-async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, ServeIoError>
-where
-    R: AsyncRead + Unpin,
-{
-    let frame = read_frame(reader)
-        .await
-        .map_err(|e| ServeIoError(e.to_string()))?
-        .ok_or_else(|| ServeIoError("connection closed before HELLO_ACK".into()))?;
-    match frame.header.ty {
-        FrameType::HelloAck => {
-            serde_json::from_slice(&frame.body).map_err(|e| ServeIoError(e.to_string()))
-        }
-        FrameType::Error => {
-            let body: ErrorBody =
-                serde_json::from_slice(&frame.body).map_err(|e| ServeIoError(e.to_string()))?;
-            Err(ServeIoError(format!(
-                "subc rejected HELLO: {} — {}",
-                body.code, body.message
-            )))
-        }
-        ty => Err(ServeIoError(format!(
-            "unexpected frame {ty:?} awaiting HELLO_ACK"
-        ))),
-    }
-}
-
 #[derive(serde::Serialize)]
 struct ResultEnvelope<'a, T: serde::Serialize> {
     result: &'a T,
@@ -7031,7 +6994,7 @@ fn control_flags() -> Flags {
 /// first turns a clean stop into exit 1 and a recorded crash. Both OS errors map to
 /// ConnectionReset. A torn frame (FrameIoError::UnexpectedEof) is not listed: that could be a
 /// protocol fault and stays an error.
-fn peer_went_away(kind: std::io::ErrorKind) -> bool {
+pub(crate) fn peer_went_away(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
         std::io::ErrorKind::ConnectionReset
@@ -9846,6 +9809,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -10208,6 +10172,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -10380,6 +10345,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -10535,6 +10501,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -10636,6 +10603,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -10781,6 +10749,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
