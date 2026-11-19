@@ -2252,6 +2252,7 @@ pub trait ServeHandler: Send + Sync {
     async fn delete_session(
         &self,
         _session: &LineageKey,
+        _paused_run: bool,
     ) -> Result<Option<broca_wire::session_delete::DeleteResponse>, ServeError> {
         Ok(None)
     }
@@ -3605,6 +3606,7 @@ impl ServeHandler for crate::LineageRegistry {
     async fn delete_session(
         &self,
         session: &LineageKey,
+        paused_run: bool,
     ) -> Result<Option<broca_wire::session_delete::DeleteResponse>, ServeError> {
         use crate::retention::store::OperatorDeletion;
         let Some(store) = self.store_holding(session)? else {
@@ -3618,7 +3620,7 @@ impl ServeHandler for crate::LineageRegistry {
         })?;
         let now_ms = retention.clock.now_ms();
         match retention
-            .delete_store_session_for_operator(&store, session, now_ms)
+            .delete_store_session_for_operator(&store, session, now_ms, paused_run)
             .await
             .map_err(|error| ServeError::Open(error, None))?
         {

@@ -223,9 +223,13 @@ fn store_steered(retention: Option<u64>, ts: u64) -> Record {
 }
 
 fn store_paused(run: &str, ts: u64) -> Record {
+    store_paused_for(run, ts, PauseReason::ToolHeld)
+}
+
+fn store_paused_for(run: &str, ts: u64, reason: PauseReason) -> Record {
     Record::Pause(Pause {
         run_id: run.into(),
-        reason: PauseReason::ToolHeld,
+        reason,
         ts_ms: Some(ts),
         error: None,
         account_limit: None,
@@ -520,6 +524,7 @@ async fn the_operator_deletes_a_session_that_holds_no_work() {
     let ephemeral = rig.key("ephemeral");
     let running = rig.key("running");
     let paused = rig.key("paused");
+    let signed_out = rig.key("signed-out");
     let queued = rig.key("queued");
     let open = rig.key("open");
     rig.seed_in(StorageClass::Durable, &durable, &finished, true)
@@ -538,6 +543,16 @@ async fn the_operator_deletes_a_session_that_holds_no_work() {
         &[
             store_start("r1", None, STARTED_MS),
             store_paused("r1", ENDED_MS),
+        ],
+        false,
+    )
+    .await;
+    rig.seed_in(
+        StorageClass::Durable,
+        &signed_out,
+        &[
+            store_start("r1", None, STARTED_MS),
+            store_paused_for("r1", ENDED_MS, PauseReason::AuthRequired),
         ],
         false,
     )
@@ -569,15 +584,16 @@ async fn the_operator_deletes_a_session_that_holds_no_work() {
     let leases = FileLeaseStore::new(rig.root.join("leases"));
     let _lease =
         broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&open)).unwrap();
-    let delete = |key: BindIdentity| {
+    let delete_with = |key: BindIdentity, paused_run: bool| {
         let (service, runtime) = (rig.service.clone(), rig.runtime.clone());
         async move {
             service
-                .delete_store_session_for_operator(&runtime, &key, DEADLINE_MS)
+                .delete_store_session_for_operator(&runtime, &key, DEADLINE_MS, paused_run)
                 .await
                 .unwrap()
         }
     };
+    let delete = |key: BindIdentity| delete_with(key, false);
     let durable_folders: Vec<PathBuf> = ["heads", "logs", "objects"]
         .into_iter()
         .map(|folder| {
@@ -624,6 +640,34 @@ async fn the_operator_deletes_a_session_that_holds_no_work() {
     assert_eq!(
         delete(paused.clone()).await,
         OperatorDeletion::Busy("a run is active or paused")
+    );
+    assert_eq!(
+        delete(signed_out.clone()).await,
+        OperatorDeletion::Busy("a run is active or paused")
+    );
+    // Asked to delete a paused run, the operator deletion still keeps a running run and one
+    // waiting on calls a provider holds: broca owes that provider a `tool.withdraw` for each
+    // call, which deleting the session would lose.
+    assert_eq!(
+        delete_with(running.clone(), true).await,
+        OperatorDeletion::Busy("a run is active or paused")
+    );
+    assert_eq!(
+        delete_with(paused.clone(), true).await,
+        OperatorDeletion::Busy("a run is active or paused")
+    );
+    assert_eq!(
+        delete_with(signed_out.clone(), true).await,
+        OperatorDeletion::Deleted
+    );
+    assert!(rig.runtime.class_of(&signed_out).unwrap().is_none());
+    assert_eq!(
+        rig.runtime
+            .expired_at(&signed_out, Some("r1"), DEADLINE_MS)
+            .await
+            .unwrap(),
+        Some(DEADLINE_MS),
+        "a read of the deleted paused run answers expired"
     );
     assert_eq!(
         delete(queued.clone()).await,

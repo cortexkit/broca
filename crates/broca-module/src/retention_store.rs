@@ -405,7 +405,10 @@ impl RetentionService {
     }
 
     /// Deletes the session `key` at `addr` for the operator, when it holds no work a deletion
-    /// would lose: no run active or paused, no queued send, no spend still to export. It may be
+    /// would lose: no run active or paused, no queued send, no spend still to export. With
+    /// `paused_run`, a paused run is deleted too, unless it waits on calls a provider holds.
+    /// broca still owes such a provider a `tool.withdraw` telling it to stop each call, and
+    /// deleting the session would lose that duty. It may be
     /// kept in either storage class, with or without a retention policy. Deletion is
     /// retention's: the expiry marker first (dated `now_ms`), so reads of its runs answer expired
     /// and a session created at the address later carries its counter floors, then what a move
@@ -416,6 +419,7 @@ impl RetentionService {
         runtime: &StoreRuntime,
         key: &BindIdentity,
         now_ms: u64,
+        paused_run: bool,
     ) -> Result<OperatorDeletion, String> {
         let state_root = runtime.state_root();
         let addr = SessionAddr(broca_core::session_addr(key));
@@ -447,12 +451,14 @@ impl RetentionService {
             .await
             .map_err(described)?;
         let operations = &view.operations;
-        if operations
-            .run
-            .as_ref()
-            .is_some_and(|run| run.finished.is_none())
-        {
-            return Ok(OperatorDeletion::Busy("a run is active or paused"));
+        if let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) {
+            let deletable = paused_run
+                && run
+                    .paused
+                    .is_some_and(|reason| reason != broca_protocol::PauseReason::ToolHeld);
+            if !deletable {
+                return Ok(OperatorDeletion::Busy("a run is active or paused"));
+            }
         }
         if !operations.queue.is_empty() {
             return Ok(OperatorDeletion::Busy("sends are queued"));

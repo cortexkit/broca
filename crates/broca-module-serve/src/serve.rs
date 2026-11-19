@@ -4026,21 +4026,17 @@ where
                 )
                 .await;
             }
-            if let Err(error) =
-                serde_json::from_value::<broca_wire::session_delete::DeleteParams>(req.params)
-            {
-                return send_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "invalid_params",
-                    &error.to_string(),
-                )
-                .await;
-            }
-            match handler.delete_session(session).await {
+            let paused_run = match serde_json::from_value::<broca_wire::session_delete::DeleteParams>(
+                req.params,
+            ) {
+                Ok(params) => params.paused_run,
+                Err(error) => {
+                    let message = error.to_string();
+                    let code = "invalid_params";
+                    return send_error(writer, ver, channel, epoch, corr, code, &message).await;
+                }
+            };
+            match handler.delete_session(session, paused_run).await {
                 Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Ok(None) => {
                     send_error(

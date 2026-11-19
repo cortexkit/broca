@@ -194,7 +194,12 @@ enum Cmd {
     /// `session.delete`: delete this session from the new storage, when it holds no run, queued
     /// send or unexported spend. Operator only. Stdout is the reply (`{"result":{"deleted":…}}`)
     /// or the refusal as the daemon sent it, which exits 1.
-    Delete,
+    Delete {
+        /// Delete it even though its latest run is paused (not waiting on calls a provider
+        /// holds), for a paused run nobody will continue.
+        #[arg(long)]
+        paused_run: bool,
+    },
     /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
     ComposePlan {
         /// JSON with tool_items and empty system_text_items/step_transform_items; omit
@@ -699,7 +704,7 @@ async fn run(args: Args) -> Result<i32, String> {
             | Cmd::EventGet { .. }
             | Cmd::TagMap { .. }
             | Cmd::RequestDump { .. }
-            | Cmd::Delete
+            | Cmd::Delete { .. }
     );
     if !raw_output {
         emit(
@@ -982,12 +987,13 @@ async fn run(args: Args) -> Result<i32, String> {
             )?;
             Ok(exit)
         }
-        Cmd::Delete => {
+        Cmd::Delete { paused_run } => {
             // Reading the session to check it holds no work loads its open log.
+            let params = broca_wire::session_delete::DeleteParams { paused_run };
             let reply = client
                 .management_raw_with_deadline(
                     broca_wire::session_delete::OP_SESSION_DELETE,
-                    &serde_json::json!({}),
+                    &serde_json::to_value(&params).expect("delete params encode"),
                     std::time::Duration::from_secs(120),
                 )
                 .await
