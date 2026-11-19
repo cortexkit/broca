@@ -741,7 +741,7 @@ fn obsolete_media_does_not_refuse_boot_before_connecting() {
             .collect::<String>();
         assert_eq!(
             log_text
-                .matches("key 'media' is obsolete and ignored")
+                .matches("broca.jsonc in an older shape: removed media:")
                 .count(),
             1,
             "{log_text}"

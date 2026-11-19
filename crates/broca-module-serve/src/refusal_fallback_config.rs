@@ -37,8 +37,6 @@
 //! when a refusal happened and nothing switched.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
-use std::path::Path;
 
 use broca_catalog::CatalogSnapshot;
 
@@ -146,26 +144,6 @@ impl RefusalFallbackConfig {
             return None;
         }
         self.mappings.get(model).map(String::as_str)
-    }
-
-    /// Load from the config-home `broca.jsonc`, through the same ladder as its other sections.
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
-    }
-
-    /// A missing file keeps the shipped defaults; an unreadable or malformed one refuses boot.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(format!("read broca config {}: {error}", path.display())),
-        };
-        Self::parse(&text)
-            .map_err(|error| format!("parse broca config {}: {error}", path.display()))
     }
 
     /// Read the client-side policy through the single fallback block parser so every loader

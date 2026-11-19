@@ -10,22 +10,9 @@ pub struct ClassifierRoutingConfig {
 }
 
 impl ClassifierRoutingConfig {
-    pub fn load_default() -> Result<Self, String> {
-        match crate::CacheTtlTable::default_path() {
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-            crate::config_home::ConfigHome::Resolved { path, .. } => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => Self::parse(&text),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(Self::default())
-                    }
-                    Err(error) => Err(format!(
-                        "read classifier_routing from {}: {error}",
-                        path.display()
-                    )),
-                }
-            }
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -84,23 +71,9 @@ pub struct StorageSyncConfig {
 }
 
 impl StorageSyncConfig {
-    pub fn load_default() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => Self::parse(&text),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(Self::default())
-                    }
-                    Err(error) => Err(format!(
-                        "read storage_sync from {}: {error}",
-                        path.display()
-                    )),
-                }
-            }
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -150,49 +123,32 @@ mod storage_sync_config_tests {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolNameAliasesConfig(pub std::collections::BTreeMap<String, ToolAliasRoute>);
 
+/// The tool names one credential route sends: each listed tool under its alias, or every tool
+/// under one prefix.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolAliasRoute {
     Names {
         names: std::collections::BTreeMap<String, String>,
     },
-    Prefix {
-        prefix_all: String,
+    PrefixAll {
+        prefix: String,
     },
 }
 
 impl ToolNameAliasesConfig {
-    pub fn load_default() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-            crate::config_home::ConfigHome::Resolved { path, .. } => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => Self::parse(&text),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(Self::default())
-                    }
-                    Err(error) => Err(format!(
-                        "read tool_name_aliases from {}: {error}",
-                        path.display()
-                    )),
-                }
-            }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        match settings.get("tool_name_aliases") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value.clone())
+                .map(Self)
+                .map_err(|error| format!("tool_name_aliases: {error}")),
         }
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
-            .map_err(|error| format!("parse tool_name_aliases: {error}"))?;
-        match file.remove("tool_name_aliases") {
-            None => Ok(Self::default()),
-            Some(value) => serde_json::from_value(value)
-                .map(Self)
-                .map_err(|error| format!("tool_name_aliases: {error}")),
-        }
+        Self::from_settings(&crate::settings::Settings::parse(text)?)
     }
 
     pub fn for_tools(
@@ -206,8 +162,8 @@ impl ToolNameAliasesConfig {
                 ToolAliasRoute::Names { names } => names
                     .get(&tool.name)
                     .map(|alias| (tool.name.clone(), alias.clone())),
-                ToolAliasRoute::Prefix { prefix_all } => {
-                    Some((tool.name.clone(), format!("{prefix_all}{}", tool.name)))
+                ToolAliasRoute::PrefixAll { prefix } => {
+                    Some((tool.name.clone(), format!("{prefix}{}", tool.name)))
                 }
             })
             .collect()
@@ -252,22 +208,9 @@ pub struct ServiceTierConfig {
 }
 
 impl ServiceTierConfig {
-    pub fn load_default() -> Result<Self, String> {
-        match crate::CacheTtlTable::default_path() {
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-            crate::config_home::ConfigHome::Resolved { path, .. } => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => Self::parse(&text),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(Self::default())
-                    }
-                    Err(error) => Err(format!(
-                        "read service_tier from {}: {error}",
-                        path.display()
-                    )),
-                }
-            }
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -334,28 +277,12 @@ impl Default for LlmToolsConfig {
 }
 
 impl LlmToolsConfig {
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => Self::load(&path),
-            ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
-    pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
-            }
-            Err(error) => {
-                return Err(format!(
-                    "read model-tool config {}: {error}",
-                    path.display()
-                ))
-            }
-        };
+    pub fn parse(text: &str) -> Result<Self, String> {
         #[derive(Default, serde::Deserialize)]
         #[serde(default, deny_unknown_fields)]
         struct Tags {
@@ -369,10 +296,10 @@ impl LlmToolsConfig {
             private_content_providers: Option<Vec<String>>,
         }
         let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(&text),
+            &crate::cache_routing::strip_jsonc_comments(text),
         );
         let file: File = serde_json::from_str(&text)
-            .map_err(|error| format!("parse model-tool config {}: {error}", path.display()))?;
+            .map_err(|error| format!("parse model-tool config: {error}"))?;
         let config = Self {
             advertise_tags: file.llm_tools.advertise_tags,
             image_references: file.llm_tools.image_references,
@@ -408,20 +335,9 @@ impl Default for CompactionSignalsConfig {
 }
 
 impl CompactionSignalsConfig {
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
-                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                Err(e) => Err(format!(
-                    "read compaction_signals from {}: {e}",
-                    path.display()
-                )),
-            },
-            ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -469,90 +385,6 @@ mod compaction_signals_config_tests {
     }
 }
 
-/// Top-level `broca.jsonc` keys that no longer do anything, each with what an operator should
-/// know about it. Read only to tell the operator, never parsed: a leftover setting must not
-/// stop broca from starting, and must not sit in the file looking as if it were in force.
-const OBSOLETE_KEYS: &[(&str, &str)] = &[
-    (
-        "media",
-        "media input follows the frozen model's capabilities",
-    ),
-    (
-        "wal_archive_idle_retention_days",
-        "sessions keep no logs to archive; the new storage seals history itself",
-    ),
-    (
-        "session_conversion",
-        "every session is in the new storage, so nothing is left to convert",
-    ),
-];
-
-/// Warn, once per key, about each obsolete key the operator's `broca.jsonc` still sets.
-pub fn warn_obsolete_keys() -> Result<(), String> {
-    if let crate::config_home::ConfigHome::Resolved { path, .. } =
-        crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-    {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                for (key, why) in
-                    obsolete_keys(&text).map_err(|error| format!("{}: {error}", path.display()))?
-                {
-                    tracing::warn!(target: "config", "broca.jsonc key '{key}' is obsolete and ignored; {why}");
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("read config {}: {error}", path.display())),
-        }
-    }
-    Ok(())
-}
-
-/// The obsolete keys `text` sets, with what to say about each.
-fn obsolete_keys(text: &str) -> Result<Vec<(&'static str, &'static str)>, String> {
-    let text = crate::cache_routing::strip_trailing_commas(
-        &crate::cache_routing::strip_jsonc_comments(text),
-    );
-    let file: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&text).map_err(|error| format!("parse broca config: {error}"))?;
-    Ok(OBSOLETE_KEYS
-        .iter()
-        .filter(|(key, _)| file.contains_key(*key))
-        .copied()
-        .collect())
-}
-
-#[cfg(test)]
-mod obsolete_key_tests {
-    use super::obsolete_keys;
-
-    #[test]
-    fn obsolete_keys_are_accepted_without_parsing_their_values() {
-        assert!(obsolete_keys("{}").unwrap().is_empty());
-        for (text, key) in [
-            (r#"{"media":{"enabled":false}}"#, "media"),
-            (r#"{"media":{"enabled":true,},}"#, "media"),
-            (r#"{"media":{"enabeld":true}}"#, "media"),
-            (r#"{"media":{"enabled":"yes"}}"#, "media"),
-            (r#"{"media":null}"#, "media"),
-            (r#"{"media":[]}"#, "media"),
-            (
-                r#"{"wal_archive_idle_retention_days":30}"#,
-                "wal_archive_idle_retention_days",
-            ),
-            (
-                r#"{"wal_archive_idle_retention_days":"thirty"}"#,
-                "wal_archive_idle_retention_days",
-            ),
-        ] {
-            let found = obsolete_keys(text).unwrap();
-            assert_eq!(found.len(), 1, "{text}");
-            assert_eq!(found[0].0, key, "{text}");
-            // Other boot loaders must not reject a retired top-level key either.
-            crate::account_routing::AccountSelectionConfig::parse(text).unwrap();
-        }
-    }
-}
-
 /// Physical recovery policy for overhaul logs. Legacy log policy is unaffected.
 pub struct WalRecoveryConfig;
 
@@ -572,22 +404,11 @@ impl WalRecoveryConfig {
             )),
         }
     }
-    pub fn load_default() -> Result<broca_wal::recovery::RecoveryPolicy, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Unresolvable => {
-                Ok(broca_wal::recovery::RecoveryPolicy::Repair)
-            }
-            crate::config_home::ConfigHome::Resolved { path, .. } => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(broca_wal::recovery::RecoveryPolicy::Repair)
-                    }
-                    Err(e) => Err(format!("read wal_recovery from {}: {e}", path.display())),
-                }
-            }
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(
+        settings: &crate::settings::Settings,
+    ) -> Result<broca_wal::recovery::RecoveryPolicy, String> {
+        Self::parse(settings.text())
     }
 }
 
@@ -644,24 +465,9 @@ pub struct AnthropicFallbackConfig {
 }
 
 impl AnthropicFallbackConfig {
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => Self::load(&path),
-            ConfigHome::Unresolvable => Ok(Self::default()),
-        }
-    }
-
-    pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text).map_err(|error| format!("{}: {error}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(format!(
-                "read anthropic_fallbacks from {}: {error}",
-                path.display()
-            )),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     /// Parse the switches out of a whole `broca.jsonc`. The key is strict about its shape: an
@@ -857,51 +663,34 @@ mod anthropic_fallback_config_tests {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountLimitPauseConfig {
     pub max_same_account_wait: broca_core::SameAccountWait,
-    pub obsolete_account_limit_pause: bool,
 }
 
 impl AccountLimitPauseConfig {
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    Self::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                Err(error) => Err(format!(
-                    "read max_same_account_wait from {}: {error}",
-                    path.display()
-                )),
-            },
-            ConfigHome::Unresolvable => Ok(Self::default()),
+    /// Its section of broca's settings: `{"kind": "minutes", "minutes": n}` or
+    /// `{"kind": "max"}`.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wait {
+            Minutes { minutes: u64 },
+            Max,
         }
+        let max_same_account_wait = match settings.get("max_same_account_wait") {
+            None => broca_core::SameAccountWait::default(),
+            Some(value) => match serde_json::from_value(value.clone())
+                .map_err(|error| format!("max_same_account_wait: {error}"))?
+            {
+                Wait::Minutes { minutes } => broca_core::SameAccountWait::Minutes(minutes),
+                Wait::Max => broca_core::SameAccountWait::Max,
+            },
+        };
+        Ok(Self {
+            max_same_account_wait,
+        })
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
-            .map_err(|error| format!("parse max_same_account_wait: {error}"))?;
-        let setting = match file.get("max_same_account_wait") {
-            None => broca_core::SameAccountWait::default(),
-            Some(serde_json::Value::String(value)) if value == "max" => {
-                broca_core::SameAccountWait::Max
-            }
-            Some(value) if value.as_u64().is_some() => {
-                broca_core::SameAccountWait::Minutes(value.as_u64().unwrap())
-            }
-            Some(_) => return Err(
-                "max_same_account_wait must be a non-negative integer number of minutes or \"max\""
-                    .into(),
-            ),
-        };
-        Ok(Self {
-            max_same_account_wait: setting,
-            obsolete_account_limit_pause: file.contains_key("account_limit_pause"),
-        })
+        Self::from_settings(&crate::settings::Settings::parse(text)?)
     }
 }
 
@@ -947,27 +736,16 @@ mod account_limit_pause_config_tests {
     }
 
     #[test]
-    fn obsolete_account_limit_pause_is_ignored_without_parsing_its_value() {
-        assert!(
-            !AccountLimitPauseConfig::parse("{}")
-                .unwrap()
-                .obsolete_account_limit_pause
-        );
+    fn the_removed_account_limit_pause_key_is_dropped_without_parsing_its_value() {
         for value in ["true", "false", "null", "1", "{}", "[]", "\"bad\""] {
             let config =
                 AccountLimitPauseConfig::parse(&format!(r#"{{"account_limit_pause":{value}}}"#))
                     .unwrap();
-            assert!(config.obsolete_account_limit_pause);
             assert_eq!(
                 config.max_same_account_wait,
                 broca_core::SameAccountWait::Minutes(15)
             );
         }
-        let config = AccountLimitPauseConfig::parse(
-            r#"{"account_limit_pause":true,"max_same_account_wait":0}"#,
-        )
-        .unwrap();
-        assert!(!config.max_same_account_wait.enabled());
     }
 }
 
@@ -982,17 +760,9 @@ pub struct ImportConfig {
 }
 
 impl ImportConfig {
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
-                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                Err(e) => Err(format!("read import from {}: {e}", path.display())),
-            },
-            ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -1011,7 +781,11 @@ impl ImportConfig {
             &crate::cache_routing::strip_jsonc_comments(text),
         );
         let file = serde_json::from_str::<File>(&text).map_err(|e| format!("parse import: {e}"))?;
-        let roots = file.import.and_then(|section| section.roots);
+        // An empty list, the settings' default, means broca's own import folder, as no list does.
+        let roots = file
+            .import
+            .and_then(|section| section.roots)
+            .filter(|roots| !roots.is_empty());
         if let Some(root) = roots.iter().flatten().find(|root| !root.is_absolute()) {
             return Err(format!(
                 "import.roots holds {}, which is not an absolute folder",
@@ -1066,17 +840,9 @@ impl SessionStorageConfig {
         }
     }
 
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
-                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                Err(e) => Err(format!("read session_storage from {}: {e}", path.display())),
-            },
-            ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {

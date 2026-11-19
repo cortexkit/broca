@@ -508,6 +508,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "subc-client-rs",
+ "subc-config",
  "subc-control",
  "subc-os",
  "subc-protocol 0.37.5",

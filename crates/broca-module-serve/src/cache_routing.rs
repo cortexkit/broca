@@ -53,11 +53,19 @@ struct CacheConfig {
     provider_ttl: HashMap<String, RawProviderCacheRow>,
 }
 
+/// One provider's row in `cache.provider_ttl`: marker lifetimes, or a retention hint (empty
+/// sends none).
 #[derive(Debug, Deserialize)]
-struct RawProviderCacheRow {
-    primary: Option<String>,
-    ephemeral: Option<String>,
-    retention: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RawProviderCacheRow {
+    Markers {
+        primary: String,
+        ephemeral: String,
+    },
+    Retention {
+        #[serde(default)]
+        retention: String,
+    },
 }
 
 impl CacheTtlTable {
@@ -138,12 +146,6 @@ impl CacheTtlTable {
         crate::config_home::config_file(CONFIG_PATH_ENV, "broca.jsonc")
     }
 
-    /// Load the cache table from the default config path. A missing file keeps shipped
-    /// defaults; a present-but-malformed file is a boot-time configuration error.
-    pub fn load_default_path() -> Result<Self, String> {
-        Self::load_resolved(Self::default_path())
-    }
-
     /// Missing cache configuration keeps shipped defaults. The daemon refuses to boot on a
     /// missing explicit path before this runs (`config_home::require_explicit_file`).
     pub fn load_resolved(resolved: crate::config_home::ConfigHome) -> Result<Self, String> {
@@ -153,21 +155,17 @@ impl CacheTtlTable {
         }
     }
 
+    /// The table broca's settings in the file at `path` give.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        Self::from_settings(&crate::settings::Settings::read(path)?)
+    }
+
     /// Load and merge a config file. Missing file = shipped defaults; present malformed
     /// JSONC or unsupported values = error.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::shipped_defaults())
-            }
-            Err(e) => return Err(format!("read broca config {}: {e}", path.display())),
-        };
-        let text = String::from_utf8(bytes)
-            .map_err(|e| format!("read broca config {} as utf-8: {e}", path.display()))?;
-        let stripped = strip_trailing_commas(&strip_jsonc_comments(&text));
-        let parsed: ConfigFile = serde_json::from_str(&stripped)
-            .map_err(|e| format!("parse broca config {}: {e}", path.display()))?;
+    /// Its rows in broca's settings, over the shipped table.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        let path = Path::new(settings.source());
+        let parsed: ConfigFile = settings.whole()?;
         let mut table = Self::shipped_defaults();
         for (provider, raw) in parsed.cache.provider_ttl {
             let row = parse_provider_row(path, &provider, raw)?;
@@ -251,8 +249,8 @@ fn parse_provider_row(
     provider: &str,
     raw: RawProviderCacheRow,
 ) -> Result<ProviderCacheRow, String> {
-    match (raw.primary, raw.ephemeral, raw.retention) {
-        (Some(primary), Some(ephemeral), None) => Ok(ProviderCacheRow::Markers {
+    match raw {
+        RawProviderCacheRow::Markers { primary, ephemeral } => Ok(ProviderCacheRow::Markers {
             primary: parse_ttl(&primary).map_err(|e| {
                 format!(
                     "broca config {}: provider '{provider}' primary {e}",
@@ -267,12 +265,9 @@ fn parse_provider_row(
             })?,
             also_allowed: None,
         }),
-        (None, None, retention) => Ok(ProviderCacheRow::Hints { retention }),
-        _ => Err(format!(
-            "broca config {}: provider '{provider}' cache row must be either \
-             {{primary, ephemeral}} or {{retention}}",
-            path.display()
-        )),
+        RawProviderCacheRow::Retention { retention } => Ok(ProviderCacheRow::Hints {
+            retention: (!retention.is_empty()).then_some(retention),
+        }),
     }
 }
 

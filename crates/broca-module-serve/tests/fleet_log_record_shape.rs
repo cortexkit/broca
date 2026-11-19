@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// The site under test: a `broca.jsonc` that still sets an obsolete key warns, on
-/// `broca.config`, while broca starts.
+/// The site under test: while broca starts, a `broca.jsonc` that still sets a removed key
+/// logs a warning whose logger is `broca.config` (the module, then the component that wrote it).
 const OBSOLETE_KEY_CONFIG: &str = r#"{"wal_archive_idle_retention_days": 7}"#;
 
 fn rig_dir() -> PathBuf {
@@ -46,16 +46,14 @@ fn a_production_warning_carries_the_module_id_and_the_component_it_declared() {
     let path = write_config(&dir);
     // The only test in this binary, so no other thread reads the variable.
     std::env::set_var("BROCA_CONFIG_PATH", &path);
-    broca_module_serve::config::warn_obsolete_keys()
-        .expect("an obsolete key is a warning, not a refusal");
+    let settings = broca_module_serve::settings::Settings::read_file().expect("read the config");
+    settings.log_conversion();
 
     let rendered = std::fs::read_to_string(handle.path()).expect("read the log segment");
     let line = rendered
         .lines()
-        .find(|line| line.contains("is obsolete and ignored"))
-        .unwrap_or_else(|| {
-            panic!("the obsolete-key warning never reached the segment:\n{rendered}")
-        });
+        .find(|line| line.contains("in an older shape"))
+        .unwrap_or_else(|| panic!("the conversion warning never reached the segment:\n{rendered}"));
 
     let record = cortexkit_log::parse_line(line).unwrap_or_else(|error| {
         panic!("the record is not a readable fleet log line: {error}: {line}")
@@ -80,7 +78,7 @@ fn a_production_warning_carries_the_module_id_and_the_component_it_declared() {
     assert!(
         record
             .body
-            .starts_with("broca.jsonc key 'wal_archive_idle_retention_days' is obsolete"),
+            .starts_with("broca.jsonc in an older shape: removed wal_archive_idle_retention_days"),
         "the message begins with its own words: the attribution now lives in the logger name, \
          and a surviving `broca:` prefix would repeat it: {line}"
     );

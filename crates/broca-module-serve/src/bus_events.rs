@@ -119,19 +119,10 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-            crate::config_home::ConfigHome::Resolved { path, .. } => {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => Self::parse(&text)
-                        .map_err(|e| format!("bus events config {}: {e}", path.display())),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                    Err(e) => Err(format!("read bus events config {}: {e}", path.display())),
-                }
-            }
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
+            .map_err(|error| format!("bus events config {}: {error}", settings.source()))
     }
     fn parse(text: &str) -> Result<Self, String> {
         let text = crate::cache_routing::strip_trailing_commas(

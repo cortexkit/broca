@@ -15,7 +15,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth_routing::AuthMethod;
-use crate::cache_routing::{strip_jsonc_comments, strip_trailing_commas, CONFIG_PATH_ENV};
 
 /// Version carried with the shipped provider/method rows.
 ///
@@ -49,36 +48,21 @@ pub struct ChargeBasisTable {
     overrides: Vec<(String, String, ChargeBasis)>,
     /// `"none"` or the digest of `overrides`; stamped on every fact.
     overrides_digest: String,
-    /// The version key a config file still carries, if any. It no longer has an effect and is
-    /// kept only so startup can say so once.
-    ignored_version: Option<u32>,
 }
 
+/// The part of broca's settings this table reads: `billing.charge_basis`, each provider's rows
+/// keyed by sign-in method.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
     billing: BillingConfig,
-    /// Accepted as a convenience for config files that keep routing tables at
-    /// the document root; the documented shape remains `billing.charge_basis`.
-    #[serde(default)]
-    charge_basis: HashMap<String, Value>,
-    #[serde(default)]
-    charge_basis_mapping_version: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BillingConfig {
-    /// No longer has any effect: facts record the shipped version and the override rows
-    /// separately. Still accepted, with its aliases, so a config that booted before keeps
-    /// booting; startup logs that it can be removed.
-    #[serde(
-        default,
-        alias = "charge_basis_mapping_version",
-        alias = "charge_basis_version"
-    )]
-    version: Option<u32>,
-    #[serde(default, alias = "charge_basis_mapping")]
-    charge_basis: HashMap<String, Value>,
+    #[serde(default)]
+    charge_basis: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl ChargeBasisTable {
@@ -90,7 +74,6 @@ impl ChargeBasisTable {
             version: CHARGE_BASIS_MAPPING_VERSION,
             overrides: Vec::new(),
             overrides_digest: NO_CHARGE_BASIS_OVERRIDES.to_string(),
-            ignored_version: None,
         }
     }
 
@@ -155,18 +138,6 @@ impl ChargeBasisTable {
     /// How many local override rows are in effect.
     pub fn override_row_count(&self) -> usize {
         self.overrides.len()
-    }
-
-    /// A startup notice when the config still carries the retired version key.
-    pub fn ignored_version_notice(&self) -> Option<String> {
-        self.ignored_version.map(|version| {
-            format!(
-                "broca config sets a charge-basis mapping version ({version}); that key no \
-                 longer has an effect and can be removed. Facts record the shipped version \
-                 ({CHARGE_BASIS_MAPPING_VERSION}) and the override rows (charge_basis_overrides) \
-                 separately"
-            )
-        })
     }
 
     /// One startup warning describing the local override rows, or None when there are none.
@@ -240,28 +211,6 @@ impl ChargeBasisTable {
             .unwrap_or((ChargeBasis::Unknown, self.version))
     }
 
-    /// The charge-basis rows live in the same file as the cache rows, so this resolves the same
-    /// path through the same ladder (`crate::config_home`).
-    ///
-    /// THIS WAS THE FOURTH RESOLVER AND I REPORTED THREE. It used to re-check `CONFIG_PATH_ENV`
-    /// itself and then delegate to `CacheTtlTable::default_path()`, which checks the same
-    /// variable again — so it was CORRECT BY DELEGATION rather than by design, and it inherited
-    /// the XDG_CONFIG_HOME fix for free. That is the luckier outcome, not the safer one: a
-    /// duplicated first arm in front of a delegated second is exactly the shape that drifts
-    /// when someone adds a rung to only one of them.
-    ///
-    /// Found 2026-09-06 by CKTUI's sweep — every path a process resolves from the environment,
-    /// including the ones that feel private — after I had audited the three I already knew
-    /// about and told the fleet that was all of them.
-    pub fn default_path() -> crate::config_home::ConfigHome {
-        crate::config_home::config_file(CONFIG_PATH_ENV, "broca.jsonc")
-    }
-
-    /// Load shipped rows plus the optional override at the default config path.
-    pub fn load_default_path() -> Result<Self, String> {
-        Self::load_resolved(Self::default_path())
-    }
-
     /// Missing billing configuration keeps shipped defaults, including explicit paths.
     pub fn load_resolved(resolved: crate::config_home::ConfigHome) -> Result<Self, String> {
         match resolved {
@@ -270,39 +219,33 @@ impl ChargeBasisTable {
         }
     }
 
+    /// The table broca's settings in the file at `path` give.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        Self::from_settings(&crate::settings::Settings::read(path)?)
+    }
+
     /// Load shipped rows plus billing overrides from a JSONC config file.
     /// Missing files use the shipped table; malformed present files fail loud.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::shipped_defaults())
-            }
-            Err(error) => return Err(format!("read broca config {}: {error}", path.display())),
-        };
-        let text = String::from_utf8(bytes)
-            .map_err(|error| format!("read broca config {} as utf-8: {error}", path.display()))?;
-        let stripped = strip_trailing_commas(&strip_jsonc_comments(&text));
-        let parsed: ConfigFile = serde_json::from_str(&stripped)
-            .map_err(|error| format!("parse broca config {}: {error}", path.display()))?;
+    /// Its rows in broca's settings, over the shipped table.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        let path = Path::new(settings.source());
+        let parsed: ConfigFile = settings.whole()?;
 
         let mut table = Self::shipped_defaults();
-        // Applied in key order, so when two spellings name the same row the later key wins
-        // deterministically rather than by hash-map iteration order. As before, a root-level
-        // row replaces a `billing` row with the identical key.
-        let mut overrides: BTreeMap<String, Value> = BTreeMap::new();
-        overrides.extend(parsed.billing.charge_basis);
-        overrides.extend(parsed.charge_basis);
-        // Read and deliberately ignored. The version recorded on facts is always the shipped
-        // one, so a config can neither raise it nor be refused for naming an older one:
-        // refusing here would stop broca, and every module's LLM work with it, during an
-        // unrelated upgrade.
-        table.ignored_version = parsed
-            .billing
-            .version
-            .or(parsed.charge_basis_mapping_version);
-        for (key, value) in overrides {
-            parse_override(&mut table, path, &key, value)?;
+        for (provider, methods) in parsed.billing.charge_basis {
+            for (method, basis) in methods {
+                // Named as the documented key form, method first.
+                let row = format!("{method}:{provider}");
+                let basis = parse_basis(path, &row, &basis)?;
+                let method = AuthMethod::from_token(&method).ok_or_else(|| {
+                    format!(
+                        "broca config {}: unknown auth method '{method}' in charge-basis row \
+                         '{provider}'",
+                        path.display()
+                    )
+                })?;
+                table.insert_override(&provider, method.as_token(), basis);
+            }
         }
         table.overrides_digest = charge_basis_overrides_digest(&table.overrides);
         Ok(table)
@@ -356,37 +299,6 @@ pub fn published_overrides() -> Option<&'static PublishedOverrides> {
     PUBLISHED_OVERRIDES.get()
 }
 
-fn parse_override(
-    table: &mut ChargeBasisTable,
-    path: &Path,
-    key: &str,
-    value: Value,
-) -> Result<(), String> {
-    if let Some(rows) = value.as_object() {
-        for (method, basis) in rows {
-            let basis = parse_basis(path, &format!("{key}:{method}"), basis)?;
-            let method = AuthMethod::from_token(method).ok_or_else(|| {
-                format!(
-                    "broca config {}: unknown auth method '{method}' in charge-basis row '{key}'",
-                    path.display()
-                )
-            })?;
-            table.insert_override(key, method.as_token(), basis);
-        }
-        return Ok(());
-    }
-
-    let (provider, method) = split_pair(key).ok_or_else(|| {
-        format!(
-            "broca config {}: charge-basis key '{key}' must be '<method>:<provider>' or '<provider>:<method>'",
-            path.display()
-        )
-    })?;
-    let basis = parse_basis(path, key, &value)?;
-    table.insert_override(provider, method, basis);
-    Ok(())
-}
-
 fn parse_basis(path: &Path, key: &str, value: &Value) -> Result<ChargeBasis, String> {
     serde_json::from_value(value.clone()).map_err(|error| {
         format!(
@@ -394,20 +306,6 @@ fn parse_basis(path: &Path, key: &str, value: &Value) -> Result<ChargeBasis, Str
             path.display()
         )
     })
-}
-
-fn split_pair(key: &str) -> Option<(&str, &str)> {
-    let (first, second) = key.split_once(':')?;
-    if first.is_empty() || second.is_empty() {
-        return None;
-    }
-    if AuthMethod::from_token(first).is_some() {
-        Some((second, first))
-    } else if AuthMethod::from_token(second).is_some() {
-        Some((first, second))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -426,29 +324,6 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write test config");
         path
-    }
-
-    /// The cache rows and the charge-basis rows live in the SAME FILE, so their two resolvers
-    /// must return the same path.
-    ///
-    /// They agreed before `config_home` existed — but BY DELEGATION: this resolver re-checked
-    /// the env var and then called the cache one, inheriting whatever that ladder did. Correct,
-    /// and one edit away from not being.
-    ///
-    /// This calls BOTH REAL RESOLVERS against the real process environment. It cannot inject,
-    /// so it does not test the ladder — `config_home`'s own tests do that. What it tests is the
-    /// property that was previously true only by accident: that two functions answering "where
-    /// is broca.jsonc" cannot drift apart. My first attempt asserted
-    /// `config_file_with(..) == config_file_with(..)` with IDENTICAL arguments, which proves the
-    /// function is deterministic and nothing else — the vacuity this fleet spent two days
-    /// finding, written while fixing an instance of it.
-    #[test]
-    fn the_charge_basis_and_cache_views_of_one_file_resolve_together() {
-        assert_eq!(
-            ChargeBasisTable::default_path(),
-            crate::cache_routing::CacheTtlTable::default_path(),
-            "charge-basis rows and cache rows share broca.jsonc; their resolvers must agree"
-        );
     }
 
     #[test]
@@ -761,10 +636,6 @@ mod tests {
             recorded.overrides.as_deref(),
             Some(table.overrides_digest())
         );
-        assert!(table
-            .ignored_version_notice()
-            .expect("the retired key is reported once at startup")
-            .contains("no longer has an effect"));
     }
 
     /// Every spelling of the retired version key is accepted, at any value, with or without
@@ -786,14 +657,11 @@ mod tests {
             let table = load_str(&contents)
                 .unwrap_or_else(|error| panic!("{contents} must load, got {error}"));
             assert_eq!(table.version(), shipped, "{contents}");
-            assert!(table.ignored_version_notice().is_some(), "{contents}");
         }
-        // Override rows with no version key at all used to be refused; now they load, and
-        // there is nothing retired to report.
+        // Override rows with no version key at all used to be refused; now they load.
         let table = load_str(r#"{"billing":{"charge_basis":{"apikey:example":"unknown"}}}"#)
             .expect("override rows need no version");
         assert_eq!(table.version(), shipped);
-        assert_eq!(table.ignored_version_notice(), None);
     }
 
     /// A malformed override row is still a startup refusal: loading around it would stamp a

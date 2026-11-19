@@ -1,5 +1,4 @@
 //! Boot configuration for backup placement. Existing WAL locations remain authoritative.
-use std::{io, path::Path};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BackupClasses(pub Vec<String>);
@@ -9,23 +8,10 @@ impl Default for BackupClasses {
     }
 }
 impl BackupClasses {
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
-    }
-    fn load(path: &Path) -> Result<Self, String> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text)
-                .map_err(|error| format!("backup_classes in {}: {error}", path.display())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(format!(
-                "read backup_classes from {}: {error}",
-                path.display()
-            )),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
+            .map_err(|error| format!("backup_classes in {}: {error}", settings.source()))
     }
     fn parse(text: &str) -> Result<Self, String> {
         let text = crate::cache_routing::strip_trailing_commas(

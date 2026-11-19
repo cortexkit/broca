@@ -142,27 +142,31 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    broca_module_serve::config::warn_obsolete_keys().map_err(ServeIoError)?;
-    let service_tier =
-        broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
-    let classifier_routing = broca_module_serve::config::ClassifierRoutingConfig::load_default()
+    // broca.jsonc, read once: every component it shapes reads its own section from here.
+    let settings = broca_module_serve::settings::Settings::read_file().map_err(ServeIoError)?;
+    settings.log_conversion();
+    let service_tier = broca_module_serve::config::ServiceTierConfig::from_settings(&settings)
         .map_err(ServeIoError)?;
+    let classifier_routing =
+        broca_module_serve::config::ClassifierRoutingConfig::from_settings(&settings)
+            .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
     // Before any session opens: every sync the new storage makes follows it.
     broca_session_store::durable::configure_full_flush(
-        broca_module_serve::config::StorageSyncConfig::load_default()
+        broca_module_serve::config::StorageSyncConfig::from_settings(&settings)
             .map_err(ServeIoError)?
             .full_flush,
     );
     let bus_event_config =
-        broca_module_serve::bus_events::Config::load_default_path().map_err(ServeIoError)?;
-    let compaction_signals = broca_module_serve::config::CompactionSignalsConfig::load_default()
-        .map_err(ServeIoError)?;
-    let backup_classes = broca_module_serve::session_class::BackupClasses::load_default_path()
+        broca_module_serve::bus_events::Config::from_settings(&settings).map_err(ServeIoError)?;
+    let compaction_signals =
+        broca_module_serve::config::CompactionSignalsConfig::from_settings(&settings)
+            .map_err(ServeIoError)?;
+    let backup_classes = broca_module_serve::session_class::BackupClasses::from_settings(&settings)
         .map_err(ServeIoError)?;
     let provider_overrides =
-        broca_module_serve::provider_overrides::ProviderOverrides::load_default_path()
+        broca_module_serve::provider_overrides::ProviderOverrides::from_settings(&settings)
             .map_err(ServeIoError)?;
     // System One's provider endpoints honour the same boot override a chat
     // provider does.
@@ -173,8 +177,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let workers_ai_base_url = provider_overrides
         .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
         .map(str::to_owned);
-    let wal_recovery =
-        broca_module_serve::config::WalRecoveryConfig::load_default().map_err(ServeIoError)?;
+    let wal_recovery = broca_module_serve::config::WalRecoveryConfig::from_settings(&settings)
+        .map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -225,35 +229,35 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // the provider overrides: a default that silently fell back to "none" would let sessions
     // reach the window their operator believed was managed.
     let context_management =
-        broca_module_serve::context_management::ContextManagementConfig::load_default_path()
+        broca_module_serve::context_management::ContextManagementConfig::from_settings(&settings)
             .map_err(ServeIoError)?;
     // The `account_selection` section: which routing module new runs ask for their provider
     // account, and the switch that bypasses it. A malformed section refuses boot by name.
     let account_selection =
-        broca_module_serve::account_routing::AccountSelectionConfig::load_default_path()
+        broca_module_serve::account_routing::AccountSelectionConfig::from_settings(&settings)
             .map_err(ServeIoError)?;
     // The operator switches for content-filter fallback, both layers under one key. A malformed
     // block refuses boot by name, like the sections above; without one, both stay off.
-    let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
-        .map_err(ServeIoError)?;
+    let anthropic_fallbacks =
+        broca_module_serve::config::AnthropicFallbackConfig::from_settings(&settings)
+            .map_err(ServeIoError)?;
     let tool_name_aliases =
-        broca_module_serve::config::ToolNameAliasesConfig::load_default().map_err(ServeIoError)?;
+        broca_module_serve::config::ToolNameAliasesConfig::from_settings(&settings)
+            .map_err(ServeIoError)?;
     for (route, aliases) in &tool_name_aliases.0 {
         match aliases {
             broca_module_serve::config::ToolAliasRoute::Names { names } if !names.is_empty() => {
                 tracing::info!(credential_route = %route, alias_count = names.len(), "tool name aliases configured");
             }
-            broca_module_serve::config::ToolAliasRoute::Prefix { prefix_all } => {
-                tracing::info!(credential_route = %route, alias_count = "all", prefix = %prefix_all, "tool name aliases configured; concrete count resolved at admission");
+            broca_module_serve::config::ToolAliasRoute::PrefixAll { prefix } => {
+                tracing::info!(credential_route = %route, alias_count = "all", prefix = %prefix, "tool name aliases configured; concrete count resolved at admission");
             }
             _ => {}
         }
     }
-    let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
-        .map_err(ServeIoError)?;
-    if account_limit_pause.obsolete_account_limit_pause {
-        tracing::warn!(target: "config", "broca.jsonc key 'account_limit_pause' is obsolete and ignored; use 'max_same_account_wait' instead");
-    }
+    let account_limit_pause =
+        broca_module_serve::config::AccountLimitPauseConfig::from_settings(&settings)
+            .map_err(ServeIoError)?;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -432,7 +436,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let _catalog_poll = spawn_catalog_poll(Arc::new(catalog_poller));
 
-    broca_module_serve::vault_config::warn_obsolete_vault_config().map_err(ServeIoError)?;
     // The retired method file is only checked for presence, never opened.
     let _obsolete_methods = method_config_for_launch(mock_provider_path, || {
         broca_module_serve::MethodConfig::load_resolved(
@@ -472,7 +475,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let cache_table =
-        broca_module_serve::CacheTtlTable::load_default_path().map_err(ServeIoError)?;
+        broca_module_serve::CacheTtlTable::from_settings(&settings).map_err(ServeIoError)?;
     executor_impl = executor_impl.with_cache_table(cache_table);
     // Both content-filter fallback switches, read above with the other early config so the
     // refusal mapping can take its own switch from the same block.
@@ -480,10 +483,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     executor_impl = executor_impl.with_tool_name_aliases(tool_name_aliases);
     executor_impl =
         executor_impl.with_max_same_account_wait(account_limit_pause.max_same_account_wait);
-    let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
-    if let Some(notice) = charge_basis_table.ignored_version_notice() {
-        tracing::warn!(target: "billing", "{notice}");
-    }
+    let charge_basis_table =
+        Arc::new(ChargeBasisTable::from_settings(&settings).map_err(ServeIoError)?);
     // Local override rows no longer stop startup; they are named here once and recorded on
     // every fact as charge_basis_overrides. Silent when there are none.
     if let Some(warning) = charge_basis_table.override_warning() {
@@ -694,7 +695,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // the start; encrypted sessions are served once the key has loaded from the vault (see
     // `store_key`). `session_storage.encryption` chooses the mode of the sessions it creates.
     let session_storage =
-        broca_module_serve::config::SessionStorageConfig::load_default().map_err(ServeIoError)?;
+        broca_module_serve::config::SessionStorageConfig::from_settings(&settings)
+            .map_err(ServeIoError)?;
     let store_slot = Arc::new(
         broca_module::store_open::StoreSlot::awaiting_key(
             &state_root,
@@ -712,7 +714,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         state_root: state_root.clone(),
         executor: executor.clone(),
         idle_ttl: idle_ttl.unwrap_or(broca_module::actor::IDLE_TTL),
-        import_roots: broca_module_serve::config::ImportConfig::load_default()
+        import_roots: broca_module_serve::config::ImportConfig::from_settings(&settings)
             .map_err(ServeIoError)?
             .roots,
         // A run that ends on a session kept in the new storage is billed into the usage export
@@ -792,8 +794,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
     // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
-    let llm_tools_config =
-        broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?;
+    let llm_tools_config = broca_module_serve::config::LlmToolsConfig::from_settings(&settings)
+        .map_err(ServeIoError)?;
     let llm_tools_identity = broca_protocol::BindIdentity::new(
         state_root.to_string_lossy().to_string(),
         "broca",

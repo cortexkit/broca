@@ -143,14 +143,10 @@ struct BrocaConfigAccountView {
 }
 
 impl AccountSelectionConfig {
-    /// Read from the config-home `broca.jsonc` (or `$BROCA_CONFIG_PATH`). A missing file, or no
-    /// config home, means the defaults.
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
+            .map_err(|error| format!("parse broca config {}: {error}", settings.source()))
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
@@ -174,7 +170,9 @@ impl AccountSelectionConfig {
         let Some(section) = view.account_selection else {
             return Ok(Self::default());
         };
+        // Empty, the settings' default, finds the one routing provider, as no name does.
         let routing_module = match section.routing_module {
+            Some(module) if module.is_empty() => None,
             Some(module) if module.trim().is_empty() => {
                 return Err("account_selection.routing_module must not be empty".into())
             }

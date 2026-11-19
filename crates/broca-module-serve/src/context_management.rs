@@ -29,7 +29,6 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::io;
 use std::path::Path;
 
 use broca_core::RunError;
@@ -47,9 +46,28 @@ pub struct ContextManagementConfig {
 #[serde(deny_unknown_fields)]
 struct Section {
     #[serde(default)]
-    default: Option<ContextManagement>,
+    default: Option<Configured>,
     #[serde(default)]
-    projects: BTreeMap<String, ContextManagement>,
+    projects: BTreeMap<String, Configured>,
+}
+
+/// A context management value as broca's settings write it.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum Configured {
+    None,
+    Transform { provider: String },
+    Compaction,
+}
+
+impl From<Configured> for ContextManagement {
+    fn from(value: Configured) -> Self {
+        match value {
+            Configured::None => Self::None,
+            Configured::Transform { provider } => Self::Transform(provider),
+            Configured::Compaction => Self::Compaction,
+        }
+    }
 }
 
 /// What the session's durable history says about its context management, as admission sees it.
@@ -120,40 +138,37 @@ impl ContextManagementConfig {
         })
     }
 
-    /// Load from the config-home `broca.jsonc`, through the same ladder as its other sections.
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings. Inside the section every key and value is strict.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        let Some(section) = settings.get("context_management") else {
+            return Ok(Self::default());
+        };
+        let section: Section = serde_json::from_value(section.clone()).map_err(|error| {
+            format!(
+                "parse broca config {}: context_management {section}: {error}",
+                settings.source()
+            )
+        })?;
+        Self::new(
+            section.default.map(Into::into),
+            section
+                .projects
+                .into_iter()
+                .map(|(root, value)| (root, value.into()))
+                .collect(),
+        )
+        .map_err(|error| format!("parse broca config {}: {error}", settings.source()))
     }
 
     /// A missing file means no configured defaults; an unreadable or malformed one refuses boot.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(format!("read broca config {}: {error}", path.display())),
-        };
-        Self::parse(&text)
-            .map_err(|error| format!("parse broca config {}: {error}", path.display()))
+        Self::from_settings(&crate::settings::Settings::read(path)?)
     }
 
-    /// Parse the `context_management` section of a `broca.jsonc` text. Other root keys belong
-    /// to other loaders and are ignored; inside this section every key and value is strict.
+    /// The `context_management` section of a `broca.jsonc` text. Other root keys belong to
+    /// other readers and are ignored.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let stripped = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let object: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&stripped).map_err(|error| error.to_string())?;
-        let Some(section) = object.get("context_management") else {
-            return Ok(Self::default());
-        };
-        let section: Section = serde_json::from_value(section.clone())
-            .map_err(|error| format!("context_management {section}: {error}"))?;
-        Self::new(section.default, section.projects)
+        Self::from_settings(&crate::settings::Settings::parse(text)?)
     }
 
     /// The value a NEW session in `project_root` gets when its first send names none.

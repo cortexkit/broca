@@ -21,12 +21,10 @@ struct ProviderOverride {
 }
 
 impl ProviderOverrides {
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
+    /// Its section of broca's settings.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
+        Self::parse(settings.text())
+            .map_err(|error| format!("parse broca config {}: {error}", settings.source()))
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {

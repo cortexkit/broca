@@ -317,33 +317,6 @@ fn load_devtools_handle_with(
         })
 }
 
-/// Warn once at boot without interpreting the obsolete section or any of its values.
-pub fn warn_obsolete_vault_config() -> Result<(), String> {
-    let crate::config_home::ConfigHome::Resolved { path, .. } =
-        crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-    else {
-        return Ok(());
-    };
-    warn_obsolete_vault_config_at(&path)
-}
-
-pub fn warn_obsolete_vault_config_at(path: &Path) -> Result<(), String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("read broca config {}: {error}", path.display())),
-    };
-    let stripped = crate::cache_routing::strip_trailing_commas(
-        &crate::cache_routing::strip_jsonc_comments(&text),
-    );
-    let value: serde_json::Value =
-        serde_json::from_str(&stripped).map_err(|error| error.to_string())?;
-    if value.get("vault").is_some() {
-        tracing::warn!("broca.jsonc vault section is no longer read and can be deleted");
-    }
-    Ok(())
-}
-
 /// Row-based addressing shares the same cached listing as default-method selection and routing.
 #[derive(Clone, Default)]
 pub struct VaultAddressing {
@@ -759,19 +732,13 @@ mod obsolete_credential_config_tests {
     }
 
     #[test]
-    fn obsolete_files_boot_normally_with_one_warning_each_and_no_values_loaded() {
+    fn an_obsolete_methods_file_boots_normally_with_one_warning_and_no_values_loaded() {
         let root = broca_test_support::scratch_root()
             .join(format!("obsolete-credentials-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let methods = root.join("auth-methods.json");
-        let config = root.join("broca.jsonc");
-        // Invalid method bytes and an arbitrary vault value must not be deserialized as maps.
+        // Invalid method bytes must not be deserialized as a map.
         std::fs::write(&methods, b"not-json-and-not-readable-as-methods").unwrap();
-        std::fs::write(
-            &config,
-            r#"{"vault":{"credential_ids":false,"unknown":"ignored"}}"#,
-        )
-        .unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let log = Log(bytes.clone());
         let subscriber = tracing_subscriber::fmt()
@@ -783,18 +750,11 @@ mod obsolete_credential_config_tests {
         tracing::subscriber::with_default(subscriber, || {
             let defaults = crate::MethodConfig::load(&methods).unwrap();
             assert_eq!(defaults.method_for("openai"), None);
-            super::warn_obsolete_vault_config_at(&config).unwrap();
         });
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        assert_eq!(text.matches("WARN").count(), 2, "{text}");
+        assert_eq!(text.matches("WARN").count(), 1, "{text}");
         assert_eq!(
             text.matches("auth-methods.json is no longer read and can be deleted")
-                .count(),
-            1,
-            "{text}"
-        );
-        assert_eq!(
-            text.matches("broca.jsonc vault section is no longer read and can be deleted")
                 .count(),
             1,
             "{text}"

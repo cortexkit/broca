@@ -1,0 +1,733 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "broca",
+  "description": "Settings for broca, the module that runs agent sessions.",
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "classifier_routing": {
+      "type": "object",
+      "description": "Routed decision models.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Let routing choose the decision model for classify requests.",
+          "default": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "storage_sync": {
+      "type": "object",
+      "description": "How session storage makes its writes durable.",
+      "properties": {
+        "full_flush": {
+          "type": "boolean",
+          "description": "Flush the drive's own cache on every sync (macOS F_FULLFSYNC), for a machine that can lose power. About 4 ms per sync.",
+          "default": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "service_tier": {
+      "type": "object",
+      "description": "Faster service tiers.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Accept a send's service_tier and offer the tiers a model has.",
+          "default": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "compaction_signals": {
+      "type": "boolean",
+      "description": "Send the compaction provider notice prices and cache-chain resets.",
+      "default": true,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "bus_run_events_enabled": {
+      "type": "boolean",
+      "description": "Publish run starts and ends on the message bus.",
+      "default": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "chatgpt_force_https": {
+      "type": "boolean",
+      "description": "Send ChatGPT requests over HTTPS instead of the WebSocket. Read on every request.",
+      "default": false,
+      "x-ck-apply": "live",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "backup_classes": {
+      "type": "array",
+      "description": "Session classes whose sessions are kept in backed-up storage.",
+      "default": [
+        "head"
+      ],
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]{1,32}$",
+        "description": "A session class.",
+        "x-ck-required": true
+      }
+    },
+    "private_content_providers": {
+      "type": "array",
+      "description": "Providers a run holding private browser content may be sent to without asking.",
+      "default": [
+        "anthropic",
+        "anthropic-platform"
+      ],
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ],
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9-]{1,64}$",
+        "description": "A provider id.",
+        "x-ck-required": true
+      },
+      "maxItems": 16
+    },
+    "llm_tools": {
+      "type": "object",
+      "description": "The model tools broca serves.",
+      "properties": {
+        "advertise_tags": {
+          "type": "boolean",
+          "description": "List chat tags in the tool descriptions.",
+          "default": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        },
+        "image_references": {
+          "type": "boolean",
+          "description": "Accept image references as tool input.",
+          "default": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "session_storage": {
+      "type": "object",
+      "description": "Session storage.",
+      "properties": {
+        "deployment_key_id": {
+          "type": "integer",
+          "description": "The id of the storage key in the vault.",
+          "default": 1,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ],
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "encryption": {
+          "type": "string",
+          "description": "Whether new sessions are encrypted.",
+          "default": "on",
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ],
+          "enum": [
+            "on",
+            "off"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "account_selection": {
+      "type": "object",
+      "description": "How runs choose a provider account.",
+      "properties": {
+        "routing_module": {
+          "type": "string",
+          "description": "The routing module to ask. Empty finds the one routing provider.",
+          "default": "",
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "import": {
+      "type": "object",
+      "description": "Session imports from files.",
+      "properties": {
+        "roots": {
+          "type": "array",
+          "description": "Folders an import may read from. Empty means broca's own import folder.",
+          "default": [],
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ],
+          "items": {
+            "type": "string",
+            "description": "An absolute folder.",
+            "x-ck-kind": "path",
+            "x-ck-required": true
+          }
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "max_same_account_wait": {
+      "description": "How long a run may wait for its own account's usage limit to reset.",
+      "default": {
+        "kind": "minutes",
+        "minutes": 15
+      },
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ],
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "minutes",
+              "description": "Which form this is.",
+              "x-ck-required": true,
+              "type": "string"
+            },
+            "minutes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Minutes to wait.",
+              "default": 15
+            }
+          },
+          "required": [
+            "kind",
+            "minutes"
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "max",
+              "description": "Which form this is.",
+              "x-ck-required": true,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+    "providers": {
+      "type": "object",
+      "description": "Provider endpoint overrides, by provider id.",
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9._-]{0,63}$": {
+          "type": "object",
+          "description": "One provider's override.",
+          "properties": {
+            "base_url": {
+              "type": "string",
+              "description": "An absolute HTTP(S) URL.",
+              "x-ck-required": true
+            }
+          },
+          "required": [
+            "base_url"
+          ],
+          "unevaluatedProperties": false
+        }
+      },
+      "unevaluatedProperties": false,
+      "default": {},
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "tool_name_aliases": {
+      "type": "object",
+      "description": "Tool names sent to a provider, by credential route.",
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9:._-]{0,127}$": {
+          "description": "The names for one route.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "names",
+                  "description": "Which form this is.",
+                  "x-ck-required": true,
+                  "type": "string"
+                },
+                "names": {
+                  "type": "object",
+                  "description": "Tool name to the name sent.",
+                  "patternProperties": {
+                    "^[A-Za-z0-9_.-]{1,128}$": {
+                      "type": "string",
+                      "description": "The name sent.",
+                      "x-ck-required": true
+                    }
+                  },
+                  "unevaluatedProperties": false,
+                  "default": {}
+                }
+              },
+              "required": [
+                "kind",
+                "names"
+              ],
+              "unevaluatedProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "prefix_all",
+                  "description": "Which form this is.",
+                  "x-ck-required": true,
+                  "type": "string"
+                },
+                "prefix": {
+                  "type": "string",
+                  "description": "A prefix every tool name gets.",
+                  "x-ck-required": true
+                }
+              },
+              "required": [
+                "kind",
+                "prefix"
+              ],
+              "unevaluatedProperties": false
+            }
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "default": {},
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "anthropic_fallbacks": {
+      "type": "object",
+      "description": "Fallbacks when an Anthropic model refuses a turn.",
+      "properties": {
+        "server_side": {
+          "type": "boolean",
+          "description": "Ask Anthropic to hand a refused turn to another model itself.",
+          "default": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        },
+        "refusal_resend": {
+          "type": "object",
+          "description": "Send a refused turn again to another model.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Turn the resend on.",
+              "default": false,
+              "x-ck-apply": "module_restart",
+              "x-ck-layers": [
+                "user"
+              ]
+            },
+            "models": {
+              "type": "object",
+              "description": "Refusing model to the model the turn is sent to.",
+              "patternProperties": {
+                "^[a-z0-9][a-z0-9.-]{0,127}$": {
+                  "type": "string",
+                  "description": "The fallback model.",
+                  "x-ck-required": true
+                }
+              },
+              "unevaluatedProperties": false,
+              "default": {
+                "claude-opus-5-5": "claude-opus-4-8",
+                "claude-opus-5": "claude-opus-4-8",
+                "claude-fable-5": "claude-opus-4-8",
+                "claude-fable-5-1": "claude-opus-4-8"
+              },
+              "x-ck-apply": "module_restart",
+              "x-ck-layers": [
+                "user"
+              ]
+            }
+          },
+          "unevaluatedProperties": false,
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "cache": {
+      "type": "object",
+      "description": "Prompt cache lifetimes.",
+      "properties": {
+        "provider_ttl": {
+          "type": "object",
+          "description": "Cache rows by provider id.",
+          "patternProperties": {
+            "^[a-z0-9][a-z0-9._-]{0,63}$": {
+              "description": "One provider's cache row.",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "markers",
+                      "description": "Which form this is.",
+                      "x-ck-required": true,
+                      "type": "string"
+                    },
+                    "primary": {
+                      "type": "string",
+                      "enum": [
+                        "5m",
+                        "1h"
+                      ],
+                      "description": "The lifetime of the main markers.",
+                      "x-ck-required": true
+                    },
+                    "ephemeral": {
+                      "type": "string",
+                      "enum": [
+                        "5m",
+                        "1h"
+                      ],
+                      "description": "The lifetime of the short markers.",
+                      "x-ck-required": true
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "primary",
+                    "ephemeral"
+                  ],
+                  "unevaluatedProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "retention",
+                      "description": "Which form this is.",
+                      "x-ck-required": true,
+                      "type": "string"
+                    },
+                    "retention": {
+                      "type": "string",
+                      "description": "The retention hint sent. Empty sends none.",
+                      "default": ""
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "unevaluatedProperties": false
+                }
+              ]
+            }
+          },
+          "unevaluatedProperties": false,
+          "default": {},
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "billing": {
+      "type": "object",
+      "description": "How usage is charged.",
+      "properties": {
+        "charge_basis": {
+          "type": "object",
+          "description": "Charge basis by provider id, then by sign-in method.",
+          "patternProperties": {
+            "^[a-z0-9][a-z0-9._-]{0,63}$": {
+              "type": "object",
+              "description": "One provider's rows.",
+              "patternProperties": {
+                "^[a-z][a-z0-9_-]{0,31}$": {
+                  "type": "string",
+                  "description": "How a run on this method is charged.",
+                  "enum": [
+                    "metered_api",
+                    "subscription_included",
+                    "unknown"
+                  ],
+                  "x-ck-required": true
+                }
+              },
+              "unevaluatedProperties": false
+            }
+          },
+          "unevaluatedProperties": false,
+          "default": {},
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    },
+    "wal_recovery": {
+      "type": "string",
+      "description": "What to do with a damaged session log: repair it, or refuse to open it.",
+      "default": "repair",
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ],
+      "enum": [
+        "repair",
+        "refuse"
+      ]
+    },
+    "context_management": {
+      "type": "object",
+      "description": "How a session's prompt is kept inside the model's context window.",
+      "properties": {
+        "default": {
+          "description": "The choice for every project not listed.",
+          "default": {
+            "kind": "none"
+          },
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ],
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "none",
+                  "description": "Which form this is.",
+                  "x-ck-required": true,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "unevaluatedProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "transform",
+                  "description": "Which form this is.",
+                  "x-ck-required": true,
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string",
+                  "description": "The module that edits the prompt.",
+                  "x-ck-required": true
+                }
+              },
+              "required": [
+                "kind",
+                "provider"
+              ],
+              "unevaluatedProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "compaction",
+                  "description": "Which form this is.",
+                  "x-ck-required": true,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "unevaluatedProperties": false
+            }
+          ]
+        },
+        "projects": {
+          "type": "object",
+          "description": "The choice by project folder.",
+          "patternProperties": {
+            "^/.*$": {
+              "description": "The choice for this project.",
+              "default": {
+                "kind": "none"
+              },
+              "x-ck-apply": "module_restart",
+              "x-ck-layers": [
+                "user"
+              ],
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "none",
+                      "description": "Which form this is.",
+                      "x-ck-required": true,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "unevaluatedProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "transform",
+                      "description": "Which form this is.",
+                      "x-ck-required": true,
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string",
+                      "description": "The module that edits the prompt.",
+                      "x-ck-required": true
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "provider"
+                  ],
+                  "unevaluatedProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "compaction",
+                      "description": "Which form this is.",
+                      "x-ck-required": true,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "unevaluatedProperties": false
+                }
+              ]
+            }
+          },
+          "unevaluatedProperties": false,
+          "default": {},
+          "x-ck-apply": "module_restart",
+          "x-ck-layers": [
+            "user"
+          ]
+        }
+      },
+      "unevaluatedProperties": false,
+      "x-ck-apply": "module_restart",
+      "x-ck-layers": [
+        "user"
+      ]
+    }
+  }
+}
