@@ -81,6 +81,23 @@ sha256:651e3c4f39b5d569ef383bbdca55334dcdbb17205f8b32bffadf54be49c1c300 (7489 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 11 of 21: tool calls
 []
+== cut after record 15 of 21: request count
+2
+== cut after record 15 of 21: request 0
+sha256:291dc289d7a0137c3c3ea5b510225b7eeda18301b12100b0aad6d0ffa1a6aa0c (5519 bytes)
+== cut after record 15 of 21: request 1
+sha256:f497b0d72d8f938b12d0600ae1c2f5f366cd4ceb8c21bc007e67a294b3c4c10d (8385 bytes)
+== cut after record 15 of 21: record count
+18
+== cut after record 15 of 21: records
+sha256:3751e9ec27a1ee18b684a30053ec2da66fb4f23349016537a43a744b0b547fe7 (5717 bytes)
+== cut after record 15 of 21: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
 == cut after record 16 of 21: request count
 2
 == cut after record 16 of 21: request 0
@@ -207,6 +224,23 @@ sha256:651e3c4f39b5d569ef383bbdca55334dcdbb17205f8b32bffadf54be49c1c300 (7489 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 11 of 21: tool calls
 []
+== cut after record 15 of 21: request count
+2
+== cut after record 15 of 21: request 0
+sha256:291dc289d7a0137c3c3ea5b510225b7eeda18301b12100b0aad6d0ffa1a6aa0c (5519 bytes)
+== cut after record 15 of 21: request 1
+sha256:f497b0d72d8f938b12d0600ae1c2f5f366cd4ceb8c21bc007e67a294b3c4c10d (8385 bytes)
+== cut after record 15 of 21: record count
+18
+== cut after record 15 of 21: records
+sha256:3751e9ec27a1ee18b684a30053ec2da66fb4f23349016537a43a744b0b547fe7 (5717 bytes)
+== cut after record 15 of 21: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
 == cut after record 16 of 21: request count
 2
 == cut after record 16 of 21: request 0
@@ -333,6 +367,23 @@ sha256:9b34077a274e8535de597464ef9f035dbcbe001e885ca6a6cae9b40437ed47ae (7711 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 11 of 21: tool calls
 []
+== cut after record 15 of 21: request count
+2
+== cut after record 15 of 21: request 0
+sha256:cea2f5a8fe6619295cdad7ec61602a4b07584136beadc6253a7cfcfb398f3d1c (5521 bytes)
+== cut after record 15 of 21: request 1
+sha256:b85b6ebc559a7f3b219c804da8c91e0639caff8aed531a2b6d12953447fa1d9d (8389 bytes)
+== cut after record 15 of 21: record count
+18
+== cut after record 15 of 21: records
+sha256:9bcc89567dc201988bfab62da1333e128df5ab4a6f6f86992fc3bea181d0ac21 (5939 bytes)
+== cut after record 15 of 21: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
 == cut after record 16 of 21: request count
 2
 == cut after record 16 of 21: request 0
@@ -459,6 +510,23 @@ sha256:9b34077a274e8535de597464ef9f035dbcbe001e885ca6a6cae9b40437ed47ae (7711 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 11 of 21: tool calls
 []
+== cut after record 15 of 21: request count
+2
+== cut after record 15 of 21: request 0
+sha256:cea2f5a8fe6619295cdad7ec61602a4b07584136beadc6253a7cfcfb398f3d1c (5521 bytes)
+== cut after record 15 of 21: request 1
+sha256:b85b6ebc559a7f3b219c804da8c91e0639caff8aed531a2b6d12953447fa1d9d (8389 bytes)
+== cut after record 15 of 21: record count
+18
+== cut after record 15 of 21: records
+sha256:9bcc89567dc201988bfab62da1333e128df5ab4a6f6f86992fc3bea181d0ac21 (5939 bytes)
+== cut after record 15 of 21: tool calls
+[
+    "\"batch_started_guarded [\\\"c1\\\"]\"",
+    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
+    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
+    "\"batch_finished\"",
+]
 == cut after record 16 of 21: request count
 2
 == cut after record 16 of 21: request 0

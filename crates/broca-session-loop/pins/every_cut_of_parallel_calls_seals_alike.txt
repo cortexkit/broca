@@ -16,6 +16,16 @@ sha256:15d27c79cd4ded330b23e72b7623e09942a2b70b5b2e0d554e66611b381e3c1d (2847 by
 9
 == seal after record 11 of 23: records
 sha256:3963f1d767e77c3b0005aa6628877f74dfdfe099ed928e9bc8008680f370fd32 (2892 bytes)
+== seal after record 13 of 23: record count
+7
+== seal after record 13 of 23: records
+sha256:e054f6e1b7a5ab2125028d02a835598c54314abec7dd89fcd66784b9e2bf23c5 (2208 bytes)
+== seal after record 17 of 23: record count
+3
+== seal after record 17 of 23: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == seal after record 18 of 23: record count
 2
 == seal after record 18 of 23: records
@@ -44,6 +54,16 @@ sha256:0c7e3eabd3fb356183e30203cd43bb95a4029ae8e9b1dad3bedc29637bc50684 (2847 by
 9
 == seal after record 11 of 23: records
 sha256:adf24e98a1782da6dc473fa3a25040edb18ceb5620970dc34128c8a784c9d594 (2892 bytes)
+== seal after record 13 of 23: record count
+7
+== seal after record 13 of 23: records
+sha256:0cecd805baa4be6d9831e00bfd9ec8273715525d2d07dcd0699fecf5a60f172c (2208 bytes)
+== seal after record 17 of 23: record count
+3
+== seal after record 17 of 23: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":{"class":"transient","message":"the previous broca process ended without sealing this run: host crash, kill, or power loss","provider_code":"previous_process_ended_unsealed"},"interrupt_reason":"runner_crash","kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == seal after record 18 of 23: record count
 2
 == seal after record 18 of 23: records

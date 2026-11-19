@@ -67,6 +67,18 @@ sha256:16f8293841060baa8720fe4bfb4ae120e538a2d27f858fae482aaf5532f9ff0e (3829 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 22: tool calls
 []
+== cut after record 14 of 22: request count
+2
+== cut after record 14 of 22: request 0
+sha256:0be26217ac6e9137744fe6a7c8d436e10d33d6ef2a9b77abfe0cbd709a794cc9 (5618 bytes)
+== cut after record 14 of 22: request 1
+sha256:0be26217ac6e9137744fe6a7c8d436e10d33d6ef2a9b77abfe0cbd709a794cc9 (5618 bytes)
+== cut after record 14 of 22: record count
+9
+== cut after record 14 of 22: records
+sha256:bff7378a674732969e8bbf5b6995e5d895824ab1d59affbb86d1358c9b092981 (2057 bytes)
+== cut after record 14 of 22: tool calls
+[]
 == cut after record 15 of 22: request count
 2
 == cut after record 15 of 22: request 0
@@ -199,6 +211,18 @@ sha256:16f8293841060baa8720fe4bfb4ae120e538a2d27f858fae482aaf5532f9ff0e (3829 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 22: tool calls
 []
+== cut after record 14 of 22: request count
+2
+== cut after record 14 of 22: request 0
+sha256:0be26217ac6e9137744fe6a7c8d436e10d33d6ef2a9b77abfe0cbd709a794cc9 (5618 bytes)
+== cut after record 14 of 22: request 1
+sha256:0be26217ac6e9137744fe6a7c8d436e10d33d6ef2a9b77abfe0cbd709a794cc9 (5618 bytes)
+== cut after record 14 of 22: record count
+9
+== cut after record 14 of 22: records
+sha256:bff7378a674732969e8bbf5b6995e5d895824ab1d59affbb86d1358c9b092981 (2057 bytes)
+== cut after record 14 of 22: tool calls
+[]
 == cut after record 15 of 22: request count
 2
 == cut after record 15 of 22: request 0
@@ -331,6 +355,18 @@ sha256:6f7ad4aad95f3d17b3b90ffa48a05c289a8742d6329e24fb4bb5ba0258948681 (3940 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 22: tool calls
 []
+== cut after record 14 of 22: request count
+2
+== cut after record 14 of 22: request 0
+sha256:7ed1eddd481cfc89ca462915319b82d2c39dcfa75f16fd97a51a4242c8c916ca (5620 bytes)
+== cut after record 14 of 22: request 1
+sha256:7ed1eddd481cfc89ca462915319b82d2c39dcfa75f16fd97a51a4242c8c916ca (5620 bytes)
+== cut after record 14 of 22: record count
+9
+== cut after record 14 of 22: records
+sha256:31cf0090af4095c04426f624d34388822b5835b660e882bd099db166bd4f1b4a (2168 bytes)
+== cut after record 14 of 22: tool calls
+[]
 == cut after record 15 of 22: request count
 2
 == cut after record 15 of 22: request 0
@@ -442,6 +478,18 @@ sha256:6f7ad4aad95f3d17b3b90ffa48a05c289a8742d6329e24fb4bb5ba0258948681 (3940 by
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 22: tool calls
+[]
+== cut after record 14 of 22: request count
+2
+== cut after record 14 of 22: request 0
+sha256:7ed1eddd481cfc89ca462915319b82d2c39dcfa75f16fd97a51a4242c8c916ca (5620 bytes)
+== cut after record 14 of 22: request 1
+sha256:7ed1eddd481cfc89ca462915319b82d2c39dcfa75f16fd97a51a4242c8c916ca (5620 bytes)
+== cut after record 14 of 22: record count
+9
+== cut after record 14 of 22: records
+sha256:31cf0090af4095c04426f624d34388822b5835b660e882bd099db166bd4f1b4a (2168 bytes)
+== cut after record 14 of 22: tool calls
 []
 == cut after record 15 of 22: request count
 2

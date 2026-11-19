@@ -4836,26 +4836,12 @@ where
     let mut unknown = false;
     for plan in &plans {
         match plan {
+            // Its answer was appended when it arrived.
             CallPlan::Dispatch(_) => {
                 let Some(answer) = answers.next().flatten() else {
                     continue;
                 };
                 unknown |= answer.outcome == CallOutcome::Unknown;
-                if !answer.durable {
-                    let now = (seams.now_ms)();
-                    terminal_with_reason(
-                        &mut records,
-                        run_id,
-                        &batch_id,
-                        answer.result,
-                        answer.outcome,
-                        answer.reason,
-                        Some(now),
-                    );
-                    if let Some(Record::ToolOutcome(outcome)) = records.last_mut() {
-                        outcome.hooks = (answer.hooks).map(Into::into);
-                    }
-                }
             }
             CallPlan::Synthetic { result, reason } => terminal_with_reason(
                 &mut records,
@@ -6182,17 +6168,9 @@ impl From<(ToolResult, CallOutcome)> for Resolved {
     }
 }
 
-/// One call's answer.
+/// One call's answer, once it is appended. The batch's end needs only how the call ended.
 struct Answer {
-    result: ToolResult,
     outcome: CallOutcome,
-    /// The code its outcome records: a held call a cancel closed, or a result a post-tool hook
-    /// withheld.
-    reason: Option<String>,
-    /// What its post-tool hooks did, recorded on its outcome.
-    hooks: Option<Value>,
-    /// Already appended: a held call's answer is durable as soon as it arrives.
-    durable: bool,
 }
 
 /// How a batch's dispatch ended. Answers are in call order; `None` for a call still waiting.
@@ -6211,8 +6189,9 @@ enum Dispatched {
 /// answers, matching today's held-batch scheduling:
 /// - each call carries its key and the batch's held-reply recorder; a held reply is appended,
 ///   durably, while the other calls keep running;
-/// - a held call's answer is appended, durably, as soon as it arrives, before any call queued
-///   behind it is sent, and the plane is then told it's durable;
+/// - every call's answer is appended as soon as it arrives, so a reader sees it while the
+///   batch's other calls still run; a held or handed-back call's answer durably, before any call
+///   queued behind it is sent, and the plane is then told it's durable;
 /// - after a call whose outcome is unknown, no later call is sent: each gets the interrupted
 ///   result;
 /// - when every call still running is held, the dispatch stops and the run pauses.
@@ -6270,13 +6249,7 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                     lifecycle.terminal_synced(plan.ctx, &id).await;
                 }
                 closed.push(held_reply_of(writer, plan, &id));
-                answers[index] = Some(Answer {
-                    result,
-                    outcome,
-                    reason: Some(code.into()),
-                    hooks: None,
-                    durable: true,
-                });
+                answers[index] = Some(Answer { outcome });
             }
         }
         while next < calls.len() && (!plan.sequential || jobs.is_empty()) {
@@ -6433,13 +6406,13 @@ async fn settle<W: Writer, P, T: ToolPlane>(
                 &mut records,
                 plan.run_id,
                 plan.batch_id,
-                result.clone(),
+                result,
                 outcome,
-                reason.clone(),
+                reason,
                 Some((seams.now_ms)()),
             );
             if let Some(Record::ToolOutcome(record)) = records.last_mut() {
-                record.hooks = hooks.clone().map(Into::into);
+                record.hooks = hooks.map(Into::into);
                 record.yielded_by = yielded_by.clone();
             }
         } else {
@@ -6447,7 +6420,7 @@ async fn settle<W: Writer, P, T: ToolPlane>(
                 &mut records,
                 plan.run_id,
                 plan.batch_id,
-                result.clone(),
+                result,
                 outcome,
                 (seams.now_ms)(),
             );
@@ -6466,14 +6439,26 @@ async fn settle<W: Writer, P, T: ToolPlane>(
                 None => lifecycle.terminal_synced(plan.ctx, &id).await,
             }
         }
+    } else {
+        // Written now, unsynced, so a reader sees it while the batch's other calls run (a `say`
+        // beside a long `bash`). The batch's end syncs it with the batch's last records. The
+        // next request still lists the batch's results in the order its calls were planned.
+        let mut records = Vec::new();
+        terminal_with_reason(
+            &mut records,
+            plan.run_id,
+            plan.batch_id,
+            result,
+            outcome,
+            reason,
+            Some((seams.now_ms)()),
+        );
+        if let Some(Record::ToolOutcome(record)) = records.last_mut() {
+            record.hooks = hooks.map(Into::into);
+        }
+        writer.append(&records, false).await?;
     }
-    answers[index] = Some(Answer {
-        result,
-        outcome,
-        reason,
-        hooks,
-        durable,
-    });
+    answers[index] = Some(Answer { outcome });
     Ok(())
 }
 

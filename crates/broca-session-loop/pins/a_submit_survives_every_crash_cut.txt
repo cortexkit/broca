@@ -61,6 +61,16 @@ sha256:5289304e7f04dd37ea37d39059e548c928bf9fe21a4540c8f78ac9608f31ffd9 (5423 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 27: tool calls
 []
+== cut after record 14 of 27: request count
+1
+== cut after record 14 of 27: request 0
+sha256:85a0b865b4c079e1cee901350077776afd295a310ecd62e66423e69334e9f13f (5692 bytes)
+== cut after record 14 of 27: record count
+14
+== cut after record 14 of 27: records
+sha256:74eb44c3740e81c402cd7fc7e3f75e30739846731e78a150206a23cee24a4a3b (3651 bytes)
+== cut after record 14 of 27: tool calls
+[]
 == cut after record 15 of 27: request count
 1
 == cut after record 15 of 27: request 0
@@ -152,6 +162,16 @@ sha256:5289304e7f04dd37ea37d39059e548c928bf9fe21a4540c8f78ac9608f31ffd9 (5423 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 27: tool calls
 []
+== cut after record 14 of 27: request count
+1
+== cut after record 14 of 27: request 0
+sha256:85a0b865b4c079e1cee901350077776afd295a310ecd62e66423e69334e9f13f (5692 bytes)
+== cut after record 14 of 27: record count
+14
+== cut after record 14 of 27: records
+sha256:74eb44c3740e81c402cd7fc7e3f75e30739846731e78a150206a23cee24a4a3b (3651 bytes)
+== cut after record 14 of 27: tool calls
+[]
 == cut after record 15 of 27: request count
 1
 == cut after record 15 of 27: request 0
@@ -243,6 +263,16 @@ sha256:87d1559f38181b691e6ca91d89d95a7116c99c3e68033723572c1891d92d8819 (5534 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 27: tool calls
 []
+== cut after record 14 of 27: request count
+1
+== cut after record 14 of 27: request 0
+sha256:7c8e4dd9e6a794cf208a8f9443976a3184b5188b9c70d8d5ba433d6f76b91556 (5694 bytes)
+== cut after record 14 of 27: record count
+14
+== cut after record 14 of 27: records
+sha256:065b16854efe369727337cad8ed7d05635bbc43a5e7291100991418681f08731 (3762 bytes)
+== cut after record 14 of 27: tool calls
+[]
 == cut after record 15 of 27: request count
 1
 == cut after record 15 of 27: request 0
@@ -333,6 +363,16 @@ sha256:87d1559f38181b691e6ca91d89d95a7116c99c3e68033723572c1891d92d8819 (5534 by
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 27: tool calls
+[]
+== cut after record 14 of 27: request count
+1
+== cut after record 14 of 27: request 0
+sha256:7c8e4dd9e6a794cf208a8f9443976a3184b5188b9c70d8d5ba433d6f76b91556 (5694 bytes)
+== cut after record 14 of 27: record count
+14
+== cut after record 14 of 27: records
+sha256:065b16854efe369727337cad8ed7d05635bbc43a5e7291100991418681f08731 (3762 bytes)
+== cut after record 14 of 27: tool calls
 []
 == cut after record 15 of 27: request count
 1

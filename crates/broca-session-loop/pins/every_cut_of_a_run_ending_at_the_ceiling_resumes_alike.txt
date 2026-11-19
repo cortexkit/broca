@@ -59,6 +59,25 @@ sha256:f0e3b9fdabcc3d6dca20fb592993b57e95f1bf71efbc4f3640a2e26d1b64937e (10364 b
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 18: tool calls
 []
+== cut after record 14 of 18: request count
+2
+== cut after record 14 of 18: request 0
+sha256:2534883e9fd1e7fe808cdd86a8adb8b2afbde70c823788401ad39f539e4361d4 (12544 bytes)
+== cut after record 14 of 18: request 1
+sha256:2534883e9fd1e7fe808cdd86a8adb8b2afbde70c823788401ad39f539e4361d4 (12544 bytes)
+== cut after record 14 of 18: record count
+5
+== cut after record 14 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"CeilingDecided":{"detail":{"cause":"over_window","size":4377,"window":1200},"kind":"CeilingDecided","step_id":2}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 14 of 18: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+]
 == cut after record 15 of 18: request count
 2
 == cut after record 15 of 18: request 0
@@ -174,6 +193,25 @@ sha256:f0e3b9fdabcc3d6dca20fb592993b57e95f1bf71efbc4f3640a2e26d1b64937e (10364 b
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 18: tool calls
 []
+== cut after record 14 of 18: request count
+2
+== cut after record 14 of 18: request 0
+sha256:2534883e9fd1e7fe808cdd86a8adb8b2afbde70c823788401ad39f539e4361d4 (12544 bytes)
+== cut after record 14 of 18: request 1
+sha256:2534883e9fd1e7fe808cdd86a8adb8b2afbde70c823788401ad39f539e4361d4 (12544 bytes)
+== cut after record 14 of 18: record count
+5
+== cut after record 14 of 18: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"CeilingDecided":{"detail":{"cause":"over_window","size":4377,"window":1200},"kind":"CeilingDecided","step_id":2}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"context_ceiling","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 14 of 18: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+]
 == cut after record 15 of 18: request count
 2
 == cut after record 15 of 18: request 0

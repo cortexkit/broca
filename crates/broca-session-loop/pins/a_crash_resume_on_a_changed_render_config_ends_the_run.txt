@@ -39,6 +39,15 @@
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 20: tool calls
 []
+== cut after record 14 of 20: request count
+0
+== cut after record 14 of 20: record count
+2
+== cut after record 14 of 20: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 14 of 20: tool calls
+[]
 == cut after record 15 of 20: request count
 0
 == cut after record 15 of 20: record count
@@ -107,6 +116,15 @@
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 20: tool calls
 []
+== cut after record 14 of 20: request count
+0
+== cut after record 14 of 20: record count
+2
+== cut after record 14 of 20: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 14 of 20: tool calls
+[]
 == cut after record 15 of 20: request count
 0
 == cut after record 15 of 20: record count
@@ -175,6 +193,15 @@
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 20: tool calls
 []
+== cut after record 14 of 20: request count
+0
+== cut after record 14 of 20: record count
+2
+== cut after record 14 of 20: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 14 of 20: tool calls
+[]
 == cut after record 15 of 20: request count
 0
 == cut after record 15 of 20: record count
@@ -242,6 +269,15 @@
 {"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 10 of 20: tool calls
+[]
+== cut after record 14 of 20: request count
+0
+== cut after record 14 of 20: record count
+2
+== cut after record 14 of 20: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"RunEnd":{"error":{"class":"permanent","message":"resume refused: the provider frozen render config differs from the config recorded at run start","provider_code":"frozen_render_config_drift"},"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
+== cut after record 14 of 20: tool calls
 []
 == cut after record 15 of 20: request count
 0

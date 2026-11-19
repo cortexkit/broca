@@ -66,6 +66,26 @@ sha256:8031342e92652422940b2ec2a19dc90babc9f7e6f6670300cbedb26f703d7691 (3672 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 11 of 21: tool calls
 []
+== cut after record 15 of 21: request count
+1
+== cut after record 15 of 21: request 0
+sha256:6ee43b837cb0faeeb726fe1d9efeb8e0cdb9a3c27405d79bc06623a955de73c0 (5979 bytes)
+== cut after record 15 of 21: record count
+7
+== cut after record 15 of 21: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 15 of 21: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
 == cut after record 16 of 21: request count
 1
 == cut after record 16 of 21: request 0
@@ -181,6 +201,26 @@ sha256:8031342e92652422940b2ec2a19dc90babc9f7e6f6670300cbedb26f703d7691 (3672 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"interrupted","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 11 of 21: tool calls
 []
+== cut after record 15 of 21: request count
+1
+== cut after record 15 of 21: request 0
+sha256:6ee43b837cb0faeeb726fe1d9efeb8e0cdb9a3c27405d79bc06623a955de73c0 (5979 bytes)
+== cut after record 15 of 21: record count
+7
+== cut after record 15 of 21: records
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":1}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"StepStart":{"kind":"StepStart","mid":"mid#3","run_id":"r1","step_id":2}}
+{"Assistant":{"budget_finalize":null,"kind":"Assistant","last_content_at_ms":null,"message":{"content":[{"text":"done","type":"text"}],"origin":{"model_id":"m","provider_module_id":"anthropic"},"role":"assistant"},"provider_message_id":"a2","pruned":[],"run_id":"r1","step_id":2,"tags_v1":null,"usage":{"input_tokens":100,"output_tokens":20},"written_at_ms":"<normalized>"}}
+{"StepEnd":{"budget_finalize":null,"by_model":[{"model":"m","provider":"anthropic","usage":{"input_tokens":100,"output_tokens":20},"variant":null}],"call_count":0,"fallback":null,"finish_reason":"stop","hooks":null,"kind":"StepEnd","limiting_stop_met":null,"retries_used":0,"run_id":"r1","service_tier_used":null,"speed_used":null,"step_id":2,"stop_met":null,"total_usage":null,"usage":{"input_tokens":100,"output_tokens":20}}}
+{"EntryFacts":{"clean_reply":true,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#3","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":4,"reasoning_summaries":[],"render_tags":true,"rich_ui":null,"run_id":"r1","runner_tag_base":2,"send_id":null,"sender":null,"tag_base":2,"usage":{"cache_read_tokens":null,"cache_write_tokens":null,"output_tokens":20,"prompt_tokens":100,"reasoning_tokens":null},"written_at_ms":"<normalized>"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
+== cut after record 15 of 21: tool calls
+[
+    "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"cache_expired\",\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":2048,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}}",
+    "compaction.ride {\"causes\":[\"cache_expired\"],\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":30000}",
+    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":100000,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"anthropic\",\"service_tier\":\"standard\"},\"output_reserve\":2048,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#4>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#2>\",\"mid\":\"<mid#3>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+]
 == cut after record 16 of 21: request count
 1
 == cut after record 16 of 21: request 0
