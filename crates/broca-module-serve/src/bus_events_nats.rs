@@ -732,6 +732,19 @@ impl crate::step_events::StepEventPublisher for NatsConnector {
     }
 }
 #[async_trait]
+impl crate::route_facts::RouteFactPublisher for NatsConnector {
+    async fn publish_route_fact(
+        &self,
+        op: &str,
+        params: &serde_json::Value,
+        fact_id: &str,
+    ) -> Result<(), String> {
+        let publisher = self.shared_publisher().await?;
+        crate::route_facts::publish(publisher.as_ref(), &publisher.account, op, params, fact_id)
+            .await
+    }
+}
+#[async_trait]
 impl BusConnector for NatsConnector {
     async fn connect(&self) -> Result<BusConnection, String> {
         let credential = self.holder.current().await.map_err(|e| e.to_string())?;

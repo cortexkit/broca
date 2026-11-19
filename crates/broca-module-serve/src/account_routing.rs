@@ -95,6 +95,9 @@ pub const CONTINUE_BUDGET: Duration = Duration::from_secs(10);
 /// The most one report waits for routing's reply. Reports are sent from a task of their own,
 /// so this bounds how far a stuck routing module can delay the NEXT report, never a run.
 pub const OBSERVE_BUDGET: Duration = Duration::from_secs(5);
+/// The most one route fact waits for the bus to acknowledge it, apart from [`OBSERVE_BUDGET`]:
+/// a bus that is slow or down must leave the direct call its whole budget.
+pub const ROUTE_FACT_PUBLISH_BUDGET: Duration = Duration::from_secs(2);
 /// How often a pending attempt report checks whether its record has become durable.
 const DURABILITY_POLL: Duration = Duration::from_millis(20);
 /// How long an attempt report waits for its record to become durable before giving up. An
@@ -214,6 +217,8 @@ const REPORTED_COUNTERS: &[&str] = &[
     "observe_sent",
     "observe_disabled",
     "observe_failed",
+    "route_fact_published",
+    "route_fact_unpublished",
 ];
 
 impl Counters {
@@ -1324,6 +1329,8 @@ pub struct RoutingClient {
     transport: Arc<dyn RoutingTransport>,
     counters: Arc<Counters>,
     config: AccountSelectionConfig,
+    /// Where observations are also published as route facts, once the bus link is set up.
+    route_facts: std::sync::OnceLock<Arc<dyn crate::route_facts::RouteFactPublisher>>,
 }
 
 /// An answered refusal is distinct from an unavailable route. Classifier admission must
@@ -1451,7 +1458,13 @@ impl RoutingClient {
             transport,
             counters: Arc::new(Counters::default()),
             config,
+            route_facts: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Also publish each observation as a route fact through `publisher` (see `route_facts`).
+    pub fn set_route_facts(&self, publisher: Arc<dyn crate::route_facts::RouteFactPublisher>) {
+        let _ = self.route_facts.set(publisher);
     }
 
     pub fn counters(&self) -> Arc<Counters> {
@@ -1664,6 +1677,55 @@ impl RoutingClient {
                 }
             }
         }
+        // Routing 0.7.36 §8.1: every observation also goes on the bus as a route fact. While
+        // routing reads route facts from the bus, an acknowledged publish is the whole delivery;
+        // otherwise the direct call below delivers it and the publish is extra.
+        let streamed = self.route_facts.get().is_some()
+            && tokio::time::timeout_at(
+                deadline,
+                self.capability(cortexkit_role_routing::capabilities::ROUTE_FACT_STREAM),
+            )
+            .await
+                == Ok(crate::routing_capabilities::CapabilitySupport::Declared);
+        if streamed && self.publish_route_fact(ACCOUNT_OBSERVE_OP, &params).await {
+            self.counters.bump("observe_sent");
+            return;
+        }
+        self.observe_directly(&params, deadline).await;
+        if !streamed {
+            self.publish_route_fact(ACCOUNT_OBSERVE_OP, &params).await;
+        }
+    }
+
+    /// Publish one observation as a route fact, and say whether the bus acknowledged it. A fact
+    /// with no `event_id`, or with no bus link set up, isn't published.
+    async fn publish_route_fact(&self, op: &str, params: &Value) -> bool {
+        let (Some(publisher), Some(fact_id)) = (
+            self.route_facts.get(),
+            params.get("event_id").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        match tokio::time::timeout(
+            ROUTE_FACT_PUBLISH_BUDGET,
+            publisher.publish_route_fact(op, params, fact_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.counters.bump("route_fact_published");
+                true
+            }
+            failed => {
+                self.counters.bump("route_fact_unpublished");
+                tracing::debug!(target: "accounts", fact_id, ?failed, "a route fact was not published");
+                false
+            }
+        }
+    }
+
+    /// Send one observation as the direct `route.account_observe` call.
+    async fn observe_directly(&self, params: &Value, deadline: tokio::time::Instant) {
         let body =
             match serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": params })) {
                 Ok(body) => body,

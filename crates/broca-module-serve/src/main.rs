@@ -746,6 +746,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let step_events = Arc::new(broca_module_serve::step_events::StepEvents::start_on_bus(
         bus_connector.clone(),
     ));
+    // Account observations also go on the bus as route facts (routing 0.7.36 §8.1).
+    if let Some(routing) = &classifier_router {
+        routing.client.set_route_facts(bus_connector.clone());
+    }
     let mut opener_builder = broca_module::DefaultOpener::new(lease_store, executor)
         .with_backup_classes(backup_class_names)
         .with_charge_basis_resolver(charge_basis_table.clone())
