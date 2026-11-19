@@ -1,7 +1,12 @@
 //! A cancellation seal is the durable withdrawal intent. The SQLite outbox retains its
-//! registration even after intake pruning, and bounds transport retries: a withdrawal that keeps
-//! failing is tried at most `MAX_ATTEMPTS` times while the process runs, and once more, with the
-//! same budget, at each start.
+//! registration even after intake pruning, and bounds transport retries: a withdrawal whose route
+//! keeps refusing is tried at most `MAX_ATTEMPTS` times while the process runs, and once more,
+//! with the same budget, at each start. A provider answering `withdraw_pending` has accepted the
+//! withdrawal but can't yet confirm the call stopped, so that withdrawal stays owed and is asked
+//! again, with no attempt limit, until the provider answers it.
+//!
+//! Each `drive` sends one attempt and returns; a retry waits in a task of its own, so neither a
+//! run's end nor a recovery sweep waits out a retry delay.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -35,9 +40,13 @@ pub trait WithdrawTransport: Send + Sync {
 }
 
 pub struct HeldWithdrawals {
+    /// This service, for the tasks that send a later retry.
+    this: std::sync::Weak<HeldWithdrawals>,
     store: Arc<LateResultsStore>,
     transport: Arc<dyn WithdrawTransport>,
     active: Mutex<HashSet<(String, String)>>,
+    /// Withdrawals waiting out a retry delay in their own task.
+    waiting: Mutex<HashSet<(String, String)>>,
     health: Mutex<Value>,
     stopping: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
     sweep: Mutex<SweepProgress>,
@@ -61,10 +70,12 @@ struct SweepProgress {
 
 impl HeldWithdrawals {
     pub fn new(store: Arc<LateResultsStore>, transport: Arc<dyn WithdrawTransport>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
             store,
             transport,
             active: Mutex::default(),
+            waiting: Mutex::default(),
             health: Mutex::new(json!({"failed": 0, "pending": 0, "scope_gone": 0})),
             stopping: std::sync::OnceLock::new(),
             sweep: Mutex::default(),
@@ -295,8 +306,10 @@ impl HeldWithdrawals {
         tokio::task::yield_now().await;
     }
 
-    /// Withdraw `call`, counting on from `attempts` sent before. `None` asks a failed withdrawal
-    /// again with a fresh budget; otherwise a failed or done withdrawal is left as it is.
+    /// Send one attempt to withdraw `call`, counting on from `attempts` sent before, and return
+    /// how many were sent. A retryable answer schedules the next attempt. `None` asks a failed
+    /// withdrawal again with a fresh budget; otherwise a failed or done withdrawal is left as it
+    /// is.
     async fn drive(
         &self,
         call: LateResultRegistration,
@@ -310,6 +323,14 @@ impl HeldWithdrawals {
             return Ok(0);
         }
         let key = (call.module.clone(), call.call_key.clone());
+        if self
+            .waiting
+            .lock()
+            .expect("withdrawal waiting")
+            .contains(&key)
+        {
+            return Ok(0);
+        }
         if !self
             .active
             .lock()
@@ -331,7 +352,7 @@ impl HeldWithdrawals {
         if state == "done" || (state == "failed" && !retry_failed) {
             return Ok(0);
         }
-        let mut attempts = match attempts {
+        let attempts = match attempts {
             Some(attempts) => attempts.max(durable_attempts),
             None if retry_failed => 0,
             None => durable_attempts,
@@ -341,72 +362,108 @@ impl HeldWithdrawals {
         let Some(session_identity) = self.cancellation_identity(&call).await? else {
             return Ok(0);
         };
-        let mut sent = 0;
-        while attempts < MAX_ATTEMPTS {
-            if stopping.is_cancelled() {
-                return Ok(sent);
-            }
-            attempts += 1;
-            self.store.record_withdrawal(
-                &call,
-                "pending",
-                attempts,
-                &json!({"attempt": attempts}),
-            )?;
-            self.refresh_health();
-            // tool-provider 0.13.2 CONTRACT.md §5: stored answers are byte-identical for
-            // every repeat. A crash after send but before recording its reply is safe.
-            let reply = tokio::select! {
-                biased;
-                _ = stopping.cancelled() => return Ok(sent),
-                reply = tokio::time::timeout(ATTEMPT_TIMEOUT, self.transport.withdraw(&call, session_identity)) => reply,
-            };
-            sent += 1;
-            let (verdict, raw) = match reply {
-                Ok(result) => result,
-                Err(_) => (
+        if stopping.is_cancelled() {
+            return Ok(0);
+        }
+        let attempts = attempts + 1;
+        self.store
+            .record_withdrawal(&call, "pending", attempts, &json!({"attempt": attempts}))?;
+        self.refresh_health();
+        // tool-provider 0.13.2 CONTRACT.md §5: stored answers are byte-identical for every
+        // repeat. A crash after send but before recording its reply is safe.
+        let reply = tokio::select! {
+            biased;
+            _ = stopping.cancelled() => return Ok(0),
+            reply = tokio::time::timeout(ATTEMPT_TIMEOUT, self.transport.withdraw(&call, session_identity)) => reply,
+        };
+        let (verdict, raw) = match reply {
+            Ok(result) => result,
+            Err(_) => {
+                let raw = json!({"code": "module_timeout", "message": "tool.withdraw timed out"});
+                (
                     WithdrawVerdict::Retry(
-                        serde_json::from_value(
-                            json!({"code": "module_timeout", "message": "tool.withdraw timed out"}),
-                        )
-                        .expect("route error decodes"),
+                        serde_json::from_value(raw.clone()).expect("route error decodes"),
                     ),
-                    json!({"code": "module_timeout", "message": "tool.withdraw timed out"}),
-                ),
-            };
-            let retry = verdict.retries();
-            let failed = matches!(
-                verdict,
-                WithdrawVerdict::Terminal(_)
-                    | WithdrawVerdict::Retry(_)
-                    | WithdrawVerdict::Unclassified(_)
-            ) || raw.get("answer").and_then(Value::as_str) == Some("refused");
-            let state = if retry && attempts < MAX_ATTEMPTS {
-                "pending"
-            } else if failed {
-                "failed"
-            } else {
-                "done"
-            };
-            self.store.record_withdrawal(&call, state, attempts, &raw)?;
-            self.refresh_health();
-            if !retry || attempts == MAX_ATTEMPTS {
-                return Ok(sent);
+                    raw,
+                )
             }
+        };
+        let retry = match &verdict {
+            // The provider still owes this withdrawal an answer (tool-provider 0.15.12 §5), so
+            // it is asked again however many times it took.
+            WithdrawVerdict::Retry(error)
+                if error.code == cortexkit_role_tool_provider::errors::WITHDRAW_PENDING =>
+            {
+                Some(error)
+            }
+            WithdrawVerdict::Retry(error) if attempts < MAX_ATTEMPTS => Some(error),
+            _ => None,
+        };
+        if let Some(error) = retry {
+            self.store
+                .record_withdrawal(&call, "pending", attempts, &raw)?;
+            self.refresh_health();
+            // The provider's delay hint, or a doubling backoff, within the contract's 1 to 60
+            // second bounds.
+            let backoff_ms = 1_000u64.saturating_mul(1 << (attempts - 1).min(6));
+            let delay = Duration::from_millis(
+                cortexkit_role_tool_provider::errors::withdraw_retry_delay_ms(error, backoff_ms),
+            );
+            self.retry_later(call, attempts, delay, stopping.clone());
+            return Ok(1);
+        }
+        let failed = matches!(
+            verdict,
+            WithdrawVerdict::Terminal(_)
+                | WithdrawVerdict::Retry(_)
+                | WithdrawVerdict::Unclassified(_)
+        ) || raw.get("answer").and_then(Value::as_str) == Some("refused");
+        let state = if failed { "failed" } else { "done" };
+        self.store.record_withdrawal(&call, state, attempts, &raw)?;
+        self.refresh_health();
+        Ok(1)
+    }
+
+    /// Asks `call` again after `delay`, counting on from `attempts`, unless the module stops
+    /// first. The call stays claimed while it waits, so nothing else sends it meanwhile.
+    fn retry_later(
+        &self,
+        call: LateResultRegistration,
+        attempts: u32,
+        delay: Duration,
+        stopping: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(this) = self.this.upgrade() else {
+            return;
+        };
+        let key = (call.module.clone(), call.call_key.clone());
+        this.waiting
+            .lock()
+            .expect("withdrawal waiting")
+            .insert(key.clone());
+        tokio::spawn(async move {
             tokio::select! {
                 biased;
-                _ = stopping.cancelled() => return Ok(sent),
-                _ = tokio::time::sleep(Duration::from_millis(100 * u64::from(attempts))) => {}
+                _ = stopping.cancelled() => {}
+                _ = tokio::time::sleep(delay) => {}
             }
-        }
-        self.store.record_withdrawal(
-            &call,
-            "failed",
-            attempts,
-            &json!({"code": "withdrawal_retry_exhausted", "message": "withdrawal retry budget exhausted"}),
-        )?;
-        self.refresh_health();
-        Ok(sent)
+            this.waiting
+                .lock()
+                .expect("withdrawal waiting")
+                .remove(&key);
+            if !stopping.is_cancelled() {
+                if let Err(error) = this.drive(call, Some(attempts)).await {
+                    this.health.lock().expect("withdrawal health")["error"] = json!(error);
+                }
+            }
+        });
+    }
+
+    /// Whether a withdrawal is being sent or waits to be asked again.
+    #[cfg(test)]
+    pub(crate) fn busy(&self) -> bool {
+        !self.active.lock().expect("withdrawal active").is_empty()
+            || !self.waiting.lock().expect("withdrawal waiting").is_empty()
     }
 
     /// Whether `call` was cancelled while held, and if so whether its withdrawal names the

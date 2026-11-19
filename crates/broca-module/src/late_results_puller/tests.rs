@@ -1636,10 +1636,17 @@ async fn held_withdrawal_shutdown_and_restart_send_none() {
     assert!(route.seen.lock().unwrap().is_empty());
 }
 
+/// Waits until `service` sends nothing more: no withdrawal is in flight or waits to be retried.
+async fn withdrawals_settled(service: &crate::held_withdrawals::HeldWithdrawals) {
+    while service.busy() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// A failing withdrawal is tried a bounded number of times, and its failure is durable: after a
 /// restart it is asked again once with a fresh budget of the same size, never more, and nothing
 /// is written to the cancelled run.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn held_withdrawal_failures_are_bounded_durable_and_do_not_change_cancel() {
     for (mode, expected) in [("offline", 3), ("refused", 1)] {
         let bind = session(mode);
@@ -1665,12 +1672,14 @@ async fn held_withdrawal_failures_are_bounded_durable_and_do_not_change_cancel()
         )
         .await
         .unwrap();
+        withdrawals_settled(&service).await;
         assert_eq!(service.health()["failed"], 1);
         drop(slots);
         drop(service);
         let store = Arc::new(LateResultsStore::open(&path).unwrap());
         let service = withdrawals(store, &runtime, route.clone(), Default::default());
         service.recover().await.unwrap();
+        withdrawals_settled(&service).await;
         assert_eq!(route.seen.lock().unwrap().len(), 2 * expected, "{mode}");
         assert_eq!(service.health()["failed"], 1, "{mode}");
         assert_eq!(
@@ -2285,4 +2294,145 @@ async fn a_handed_back_calls_terminal_is_delivered_as_a_notice() {
         "no batch waits for it"
     );
     assert_eq!(rig.feed.acks(), vec![cursor(1)]);
+}
+
+/// A provider that answers `withdraw_pending` for each of `pending` attempts, then withdraws the
+/// call, recording when each attempt arrived.
+struct PendingWithdrawalRoute {
+    hint_ms: Option<u64>,
+    pending: usize,
+    seen: Mutex<Vec<tokio::time::Instant>>,
+}
+
+#[async_trait]
+impl crate::held_withdrawals::WithdrawTransport for PendingWithdrawalRoute {
+    async fn withdraw(
+        &self,
+        _: &LateResultRegistration,
+        _: bool,
+    ) -> (
+        cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+        Value,
+    ) {
+        use cortexkit_role_tool_provider::withdraw::caller_verdict;
+        let mut seen = self.seen.lock().unwrap();
+        seen.push(tokio::time::Instant::now());
+        if seen.len() <= self.pending {
+            let error = cortexkit_role_tool_provider::errors::withdraw_pending(self.hint_ms);
+            (
+                caller_verdict(Err(&error)),
+                serde_json::to_value(error).unwrap(),
+            )
+        } else {
+            let raw = json!({"answer": "withdrawn"});
+            (caller_verdict(Ok(&raw)), raw)
+        }
+    }
+}
+
+/// `withdraw_pending` means the provider accepted the withdrawal but can't yet confirm the call
+/// stopped (tool-provider 0.15.12 §5). The withdrawal stays owed, never failed, however many
+/// attempts it takes: each retry waits the provider's hint clamped to 1 to 60 seconds, or a
+/// backoff in the same bounds, and the run's end doesn't wait for any of them.
+#[tokio::test(start_paused = true)]
+async fn a_pending_withdrawal_stays_owed_and_is_asked_again_within_the_contract_delays() {
+    use crate::held_slots::HeldWithdrawal;
+    // (hint, the shortest and longest gap between two attempts)
+    for (hint_ms, shortest, longest) in [
+        (None, 1_000, 60_000),
+        (Some(200), 1_000, 1_000),
+        (Some(5_000), 5_000, 5_000),
+        (Some(600_000), 60_000, 60_000),
+    ] {
+        let name = format!(
+            "pending-{}",
+            hint_ms.map_or("none".into(), |ms: u64| ms.to_string())
+        );
+        let bind = session(&name);
+        let mut records = held_records("lineage:4", "tools");
+        cancelled_held(&mut records, &["a"]);
+        let (root, runtime) = withdrawal_root(&format!("withdraw-{name}"), &bind, &records).await;
+        let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
+        store
+            .register_calls(&[registration("lineage:4", "tools", &bind)])
+            .unwrap();
+        // More pending answers than the route-refusal budget allows.
+        let route = Arc::new(PendingWithdrawalRoute {
+            hint_ms,
+            pending: 5,
+            seen: Mutex::default(),
+        });
+        let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+        service.withdraw(&held_reply("lineage:4")).await.unwrap();
+        assert_eq!(
+            route.seen.lock().unwrap().len(),
+            1,
+            "the caller waits for one attempt only"
+        );
+        let health = service.health();
+        assert_eq!(
+            (&health["pending"], &health["failed"]),
+            (&json!(1), &json!(0)),
+            "{health}"
+        );
+        withdrawals_settled(&service).await;
+        let seen = route.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            6,
+            "{hint_ms:?}: asked until the provider answered"
+        );
+        let gaps: Vec<u128> = seen.windows(2).map(|w| (w[1] - w[0]).as_millis()).collect();
+        assert!(
+            gaps.iter().all(|gap| (shortest..=longest).contains(gap)),
+            "{hint_ms:?}: gaps {gaps:?}"
+        );
+        assert_eq!(
+            store.withdrawal_state("tools", "lineage:4").unwrap(),
+            Some(("done".into(), 6))
+        );
+        assert_eq!(service.health()["failed"], 0);
+    }
+}
+
+/// A withdrawal still pending when the module stops is asked again at the next start, and a
+/// stopping module sends no further retry.
+#[tokio::test(start_paused = true)]
+async fn a_pending_withdrawal_left_at_a_stop_is_asked_again_at_the_next_start() {
+    use crate::held_slots::HeldWithdrawal;
+    let bind = session("pending-across-stop");
+    let mut records = held_records("lineage:4", "tools");
+    cancelled_held(&mut records, &["a"]);
+    let (root, runtime) = withdrawal_root("withdraw-pending-stop", &bind, &records).await;
+    let path = root.join("late-results.db");
+    let store = Arc::new(LateResultsStore::open(&path).unwrap());
+    store
+        .register_calls(&[registration("lineage:4", "tools", &bind)])
+        .unwrap();
+    let route = Arc::new(PendingWithdrawalRoute {
+        hint_ms: Some(30_000),
+        pending: 1,
+        seen: Mutex::default(),
+    });
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let service = withdrawals(store, &runtime, route.clone(), stopping.clone());
+    service.withdraw(&held_reply("lineage:4")).await.unwrap();
+    stopping.cancel();
+    withdrawals_settled(&service).await;
+    assert_eq!(
+        route.seen.lock().unwrap().len(),
+        1,
+        "a stopping module retries nothing"
+    );
+    drop(service);
+    let store = Arc::new(LateResultsStore::open(&path).unwrap());
+    store.recovery_snapshot().unwrap();
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    service.recover().await.unwrap();
+    withdrawals_settled(&service).await;
+    assert_eq!(route.seen.lock().unwrap().len(), 2);
+    assert_eq!(
+        store.withdrawal_state("tools", "lineage:4").unwrap(),
+        Some(("done".into(), 2))
+    );
 }
