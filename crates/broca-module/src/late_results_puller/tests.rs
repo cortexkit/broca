@@ -849,6 +849,41 @@ async fn an_entry_for_a_held_call_is_delivered_then_acked_through_the_providers_
     );
 }
 
+/// prefrontal was renamed from `prefrontal-core`. A call dispatched or held under either name
+/// takes an answer its feed delivers under the other: both are one module.
+#[tokio::test]
+async fn a_held_call_takes_its_answer_under_its_modules_other_name() {
+    for (case, intent_module, held_module, feed_module) in [
+        ("new", "prefrontal", "prefrontal", "prefrontal-core"),
+        ("old", "prefrontal-core", "prefrontal-core", "prefrontal"),
+        ("mixed", "prefrontal-core", "prefrontal", "prefrontal-core"),
+    ] {
+        let call_key = "lineage:5";
+        let bind = session(&format!("renamed-{case}"));
+        let rig = Rig::new(
+            &format!("renamed-{case}"),
+            None,
+            vec![registration(call_key, held_module, &bind)],
+        )
+        .await;
+        let mut records = held_records(call_key, held_module);
+        records[2] = intent("run", "b", "a", intent_module, Some(call_key));
+        rig.seed(&bind, &records).await;
+        let _puller = rig.puller(feed_module);
+        rig.feed.replies(vec![reply(
+            vec![entry(kinds::RESULT, call_key, "ev-1")],
+            1,
+            false,
+        )]);
+        rig.intake.tick(feed_module).await.unwrap();
+        assert_eq!(
+            rig.delivery.delivered.lock().unwrap().clone(),
+            vec![(call_key.to_owned(), "ev-1".to_owned())],
+            "{case}"
+        );
+    }
+}
+
 /// A session's earlier run was cancelled while a provider held one of its calls. A later
 /// run of the same session dispatches a new held call, and its answer must still be
 /// delivered: a cancel only closes the episode it belongs to.

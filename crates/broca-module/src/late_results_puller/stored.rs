@@ -153,7 +153,7 @@ async fn rebuild_registrations(
                 .intent
                 .module_id
                 .as_ref()
-                .is_some_and(|target| target != module)
+                .is_some_and(|target| !broca_protocol::same_module(target, module))
         {
             return Err("held call module differs from its intent".into());
         }
@@ -390,7 +390,7 @@ impl StoredLineage {
         if let Some(carrier) = call.yielded_by {
             return if call.noticed {
                 settled_without_delivery(module, entry, "already_noticed")
-            } else if carrier != module {
+            } else if !broca_protocol::same_module(carrier, module) {
                 settled_without_delivery(module, entry, "dispatched_elsewhere")
             } else {
                 Classified::Delivered
@@ -406,7 +406,7 @@ impl StoredLineage {
             .intent
             .module_id
             .as_deref()
-            .is_some_and(|target| target != module)
+            .is_some_and(|target| !broca_protocol::same_module(target, module))
         {
             return settled_without_delivery(module, entry, "dispatched_elsewhere");
         }
