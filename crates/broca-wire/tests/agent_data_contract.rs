@@ -200,6 +200,27 @@ fn shared_refusal_vectors_preserve_codes_details_and_retryability() {
             known.insert(body.code.as_str().to_owned());
         }
     }
+    // `participant_failed` (agent-data 0.3.3) has its own vector file: a permanent fault, never
+    // retried, whose detail round-trips.
+    for case in vectors("participant-failed.json")["refusals"]
+        .as_array()
+        .unwrap()
+    {
+        let body: ErrorBody = serde_json::from_value(case["body"].clone()).unwrap();
+        assert_eq!(body.code.as_str(), case["body"]["code"], "{}", case["name"]);
+        assert!(
+            body.code.is_known() && !body.code.retryable(),
+            "{}",
+            case["name"]
+        );
+        let encoded = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            encoded["detail"], case["body"]["detail"],
+            "{}",
+            case["name"]
+        );
+        known.insert(body.code.as_str().to_owned());
+    }
     assert_eq!(
         known,
         agent_data::errors::codes::ALL
@@ -207,7 +228,10 @@ fn shared_refusal_vectors_preserve_codes_details_and_retryability() {
             .map(|s| s.to_string())
             .collect()
     );
-    assert_eq!(RefusalCode::KNOWN.len(), 14);
+    assert_eq!(
+        RefusalCode::KNOWN.len(),
+        agent_data::errors::codes::ALL.len()
+    );
 }
 
 #[test]
