@@ -328,3 +328,61 @@ fn anthropic_template_outside_a_user_to_reply_gap_renders_as_a_user_note() {
         "rendering must not mutate stored history"
     );
 }
+
+/// A message whose content renders empty, such as a reply whose every block a view dropped, is
+/// left out of the request. A template's neighbours are then the messages that do render: a
+/// template before such a reply sits before the next user message, and one after an empty user
+/// message sits after the reply before it. Both go out as user notes.
+#[test]
+fn anthropic_template_beside_a_message_that_renders_empty_renders_as_a_user_note() {
+    let (family, frozen, _) = route("anthropic_messages", true);
+    let prompt = vec![
+        text(Role::System, "Fixed instructions."),
+        text(Role::User, "First turn."),
+        system("Before an empty reply."),
+        Message::new(Role::Assistant, vec![]),
+        text(Role::User, "Second turn."),
+        text(Role::Assistant, "A reply."),
+        Message::new(Role::User, vec![]),
+        system("After an empty user message."),
+        text(Role::Assistant, "Another reply."),
+        text(Role::User, "Third turn."),
+        system("Before a reply."),
+        text(Role::Assistant, "Last reply."),
+    ];
+    let body: Value =
+        serde_json::from_slice(&family.render(&frozen, &CallOptions::new(prompt))).unwrap();
+    let rendered: Vec<(String, String)> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            let content = match &message["content"] {
+                Value::String(text) => text.clone(),
+                blocks => blocks[0]["text"].as_str().unwrap_or_default().to_owned(),
+            };
+            (message["role"].as_str().unwrap().to_owned(), content)
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        [
+            ("user", "First turn."),
+            (
+                "user",
+                "<context-note>Before an empty reply.</context-note>"
+            ),
+            ("user", "Second turn."),
+            ("assistant", "A reply."),
+            (
+                "user",
+                "<context-note>After an empty user message.</context-note>"
+            ),
+            ("assistant", "Another reply."),
+            ("user", "Third turn."),
+            ("system", "Before a reply."),
+            ("assistant", "Last reply."),
+        ]
+        .map(|(role, text)| (role.to_owned(), text.to_owned()))
+    );
+}

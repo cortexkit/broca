@@ -84,7 +84,16 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
 /// rendered copy changes, and a template in a place the API accepts keeps its bytes. System
 /// messages that render at the top of the request are skipped, as the request body leaves them
 /// out of the conversation.
-pub fn place<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a, CallOptions> {
+///
+/// `renders` says whether the prompt message at an index reaches the request at all. The
+/// renderer leaves out a message whose content renders empty, such as a reply whose every block
+/// a view dropped, so a template's neighbour in the prompt need not be its neighbour in the
+/// request.
+pub fn place<'a>(
+    frozen: &FrozenRenderConfig,
+    opts: &'a CallOptions,
+    renders: impl Fn(usize) -> bool,
+) -> Cow<'a, CallOptions> {
     if frozen.family_id != WireFamilyId::AnthropicMessages || !supported(frozen) {
         return Cow::Borrowed(opts);
     }
@@ -93,7 +102,7 @@ pub fn place<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a, 
     let conversation: Vec<usize> = (0..opts.prompt.len())
         .filter(|&index| {
             let message = &opts.prompt[index];
-            message.role != Role::System || message.turn_system
+            (message.role != Role::System || message.turn_system) && renders(index)
         })
         .collect();
     // Whether the message rendered last is a user message: a tool result, a person's message,

@@ -651,7 +651,7 @@ fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
-    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     use_body: impl FnOnce(&Node<'_>) -> R,
 ) -> R {
     // A run with structured output adds its submit tool or schema instructions here; a run
@@ -662,8 +662,21 @@ fn with_request_body<R>(
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
-    let placed = crate::turn_system::place(frozen, opts);
-    let opts = placed.as_ref();
+    let placed = crate::turn_system::place(frozen, opts, |_| true);
+    render_placed(frozen, placed.as_ref(), media, provenance, use_body)
+}
+
+/// The rest of [`with_request_body`], for a prompt whose templates were placed. When leaving out
+/// the messages that render empty moves a template next to something Anthropic refuses beside
+/// it, the template is placed again against the messages that do render, and the request is
+/// rendered from that.
+fn render_placed<R>(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
     let marker_policy = anthropic_marker_policy(frozen);
 
     // System: a required identity may lead (an OAuth requirement), then any system
@@ -746,6 +759,17 @@ fn with_request_body<R>(
             |(message, _, _)| !matches!(content_of(message), Some(content) if content.is_empty()),
         )
         .collect();
+    let mut renders = vec![false; opts.prompt.len()];
+    for (_, _, prompt_index) in &rendered_messages {
+        renders[*prompt_index] = true;
+    }
+    if let std::borrow::Cow::Owned(replaced) =
+        crate::turn_system::place(frozen, opts, |index| renders[index])
+    {
+        // Each pass turns at least one more template into a user note, so this ends.
+        drop(rendered_messages);
+        return render_placed(frozen, &replaced, media, provenance, use_body);
+    }
     // Keep only surviving message identities. System messages are coalesced into the
     // separate system field, and an empty rendered message has no wire-message index.
     let mut rendered_indices = vec![None; opts.prompt.len()];
