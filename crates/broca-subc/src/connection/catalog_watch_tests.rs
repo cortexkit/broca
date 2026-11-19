@@ -188,3 +188,22 @@ async fn an_unfollowed_connection_reads_every_time() {
         );
     }
 }
+
+/// A watch stays registered for the connection's whole life, so it must not count as work the
+/// daemon is busy with: if it did, a liveness probe would wait for it forever and a socket that
+/// went silent would never be detected or replaced.
+#[tokio::test]
+async fn an_open_watch_never_holds_back_a_liveness_probe() {
+    let (conn, mut write_rx, pending) = route_open_test_connection();
+    let conn = Arc::new(conn);
+    conn.follow_catalog();
+    let (watch, op) = next_request(&mut write_rx).await;
+    assert_eq!(op, "catalog.watch");
+    push(&pending, &watch, 3);
+    recorded(&conn, 3).await;
+    let runtime = Arc::clone(&conn.shared.current.lock().unwrap().runtime);
+    assert!(
+        super::super::channel_zero_probe_blocker(&runtime, std::time::Instant::now()).is_none(),
+        "the open watch held back the liveness probe"
+    );
+}

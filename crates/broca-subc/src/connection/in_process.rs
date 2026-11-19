@@ -101,6 +101,7 @@ impl InProcessModuleEnd {
                 PendingEntry::Live {
                     sender: PendingSender::Unary(sender),
                     route_open: false,
+                    blocks_probe: true,
                 },
             );
         }

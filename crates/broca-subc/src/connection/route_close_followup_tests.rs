@@ -3,9 +3,9 @@ async fn followup_congested_reader_cleanup(cleanup: u8) {
     let pending: PendingMap = Arc::default();
     let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
     let (_live, mut reply_rx) =
-        PendingRegistration::new(Arc::clone(&pending), (0, 0, 2), false, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (0, 0, 2), false, true, None).unwrap();
     let (mut abandoned, open_rx) =
-        PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, true, None).unwrap();
     drop(open_rx);
     if cleanup == 1 {
         abandoned.arm_late_route_open_cleanup();
@@ -103,7 +103,7 @@ async fn review_reader_full_handoff_cannot_reenter_retired_generation() {
     let pending: PendingMap = Arc::default();
     let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::new()));
     let (mut registration, rx) =
-        PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, true, None).unwrap();
     drop(rx);
     registration.arm_late_route_open_cleanup();
     drop(registration);

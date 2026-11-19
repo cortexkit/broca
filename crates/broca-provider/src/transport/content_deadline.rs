@@ -43,3 +43,41 @@ pub(super) fn content_timeout_error(limit: Duration) -> ProviderError {
         account_continue: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::wire::{NormalizeError, StreamNormalizer};
+    use broca_protocol::NormalizedEvent;
+
+    /// A family that sets its own content limit.
+    struct OwnLimit;
+
+    impl StreamNormalizer for OwnLimit {
+        fn push(&mut self, _: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
+            Ok(Vec::new())
+        }
+
+        fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
+            Ok(Vec::new())
+        }
+
+        fn content_deadline(&self) -> Option<Duration> {
+            Some(Duration::from_secs(600))
+        }
+    }
+
+    /// Every live attempt reads its stream through the tool-name wrapper, so a family's own
+    /// content limit (ChatGPT's 600 s) only applies if the wrapper passes it on.
+    #[test]
+    fn the_live_wrapper_keeps_the_family_content_limit() {
+        let wrapped = super::super::ToolNameRestoringNormalizer {
+            inner: Box::new(OwnLimit),
+            names: Arc::default(),
+            live_progress: None,
+        };
+        assert_eq!(wrapped.content_deadline(), Some(Duration::from_secs(600)));
+    }
+}

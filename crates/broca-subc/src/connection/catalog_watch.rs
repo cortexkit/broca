@@ -138,7 +138,7 @@ impl SubcConnection {
         let body = serde_json::to_vec(&CatalogWatchRequest::new())
             .map_err(|e| ConnError::Transport(e.to_string()))?;
         let corr = self.next_corr();
-        let (runtime, _registration, mut rx) = self.register_control((0, 0, corr), false)?;
+        let (runtime, _registration, mut rx) = self.register_subscription((0, 0, corr))?;
         let on = runtime.conn;
         let flags = Flags(Flags::new(false, Priority::Passive, false).0 | FLAG_SUBSCRIPTION);
         let frame = Frame::build(FrameType::Request, flags, 0, 0, corr, body)

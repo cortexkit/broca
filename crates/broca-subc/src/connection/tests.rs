@@ -2177,7 +2177,7 @@ async fn local_route_close_wakes_sibling_calls_only_in_its_epoch() {
     let (_, _first, mut first_rx) = conn.register_route(&route, (7, 2, 5)).unwrap();
     let (_, _sibling, mut sibling_rx) = conn.register_route(&route, (7, 2, 6)).unwrap();
     let (_old, mut old_rx) =
-        PendingRegistration::new(Arc::clone(&pending), (7, 1, 5), false, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (7, 1, 5), false, true, None).unwrap();
     let (_, _other, mut other_rx) = conn
         .register_route(&RouteHandle::new(8, 3, ConnToken(1)), (8, 3, 5))
         .unwrap();
@@ -2212,7 +2212,7 @@ async fn route_gone_goodbye_fans_out_only_within_its_epoch() {
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
     let (_registration, mut rx) =
-        PendingRegistration::new(Arc::clone(&pending), (7, 2, 5), false, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (7, 2, 5), false, true, None).unwrap();
     let (write_tx, _write_rx) = mpsc::channel(4);
     let (mut client, server) = tokio::io::duplex(1024);
     let reader = tokio::spawn(reader_task(
@@ -2244,7 +2244,7 @@ async fn stale_epoch_ingress_does_not_settle_a_live_waiter() {
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
     let (_registration, mut rx) =
-        PendingRegistration::new(Arc::clone(&pending), (7, 2, 11), false, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (7, 2, 11), false, true, None).unwrap();
     let (write_tx, _write_rx) = mpsc::channel(4);
     let (mut client, server) = tokio::io::duplex(1024);
     let reader = tokio::spawn(reader_task(
@@ -2542,9 +2542,9 @@ async fn congested_egress_does_not_stop_ingress(cleanup: u8) {
     let pending: PendingMap = Arc::default();
     let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 2)])));
     let (_live, mut reply_rx) =
-        PendingRegistration::new(Arc::clone(&pending), (0, 0, 2), false, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (0, 0, 2), false, true, None).unwrap();
     let (mut abandoned, open_rx) =
-        PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, None).unwrap();
+        PendingRegistration::new(Arc::clone(&pending), (0, 0, 1), true, true, None).unwrap();
     drop(open_rx);
     if cleanup == 1 {
         abandoned.arm_late_route_open_cleanup();
@@ -2642,6 +2642,7 @@ async fn pending_waiter_limit_returns_a_typed_transport_error() {
             PendingEntry::Live {
                 sender: PendingSender::Unary(sender),
                 route_open: false,
+                blocks_probe: true,
             },
         );
     }

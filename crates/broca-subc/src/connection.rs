@@ -490,6 +490,11 @@ enum PendingEntry {
     Live {
         sender: PendingSender,
         route_open: bool,
+        /// Whether this request keeps the daemon busy until it answers, so a Ping queued behind
+        /// it would go unanswered (see [`channel_zero_probe_blocker`]). False for a subscription
+        /// such as `catalog.watch`: the daemon answers it and then only pushes when something
+        /// changes, so it may stay registered for the connection's whole life.
+        blocks_probe: bool,
     },
     LateRouteOpen {
         blocks_probe_until: Instant,
@@ -607,10 +612,17 @@ impl PendingRegistration {
         pending: PendingMap,
         key: PendingKey,
         route_open: bool,
+        blocks_probe: bool,
         probe_observer: Option<PendingProbeObserver>,
     ) -> ConnResult<(Self, mpsc::UnboundedReceiver<Frame>)> {
         let (sender, rx) = mpsc::unbounded_channel();
-        insert_pending(&pending, key, PendingSender::Unary(sender), route_open)?;
+        insert_pending(
+            &pending,
+            key,
+            PendingSender::Unary(sender),
+            route_open,
+            blocks_probe,
+        )?;
         Ok((
             Self {
                 pending,
@@ -637,6 +649,7 @@ impl PendingRegistration {
                 lagged: Arc::clone(&lagged),
             },
             false,
+            true,
         )?;
         Ok((
             Self {
@@ -691,6 +704,7 @@ fn insert_pending(
     key: PendingKey,
     sender: PendingSender,
     route_open: bool,
+    blocks_probe: bool,
 ) -> ConnResult<()> {
     let mut waiters = pending.lock().unwrap();
     if waiters.len() >= MAX_PENDING_REQUESTS {
@@ -698,7 +712,14 @@ fn insert_pending(
             "connection has reached the {MAX_PENDING_REQUESTS} in-flight request limit"
         )));
     }
-    waiters.insert(key, PendingEntry::Live { sender, route_open });
+    waiters.insert(
+        key,
+        PendingEntry::Live {
+            sender,
+            route_open,
+            blocks_probe,
+        },
+    );
     Ok(())
 }
 
@@ -1129,6 +1150,33 @@ impl SubcConnection {
         PendingRegistration,
         mpsc::UnboundedReceiver<Frame>,
     )> {
+        self.register_control_with(key, route_open, true)
+    }
+
+    /// [`Self::register_control`] for a subscription the daemon answers once and then only
+    /// pushes to. It never holds back a liveness probe: a watch lives as long as the
+    /// connection, and if it blocked probes a silent socket would never be detected.
+    fn register_subscription(
+        &self,
+        key: PendingKey,
+    ) -> ConnResult<(
+        Arc<ConnectionRuntime>,
+        PendingRegistration,
+        mpsc::UnboundedReceiver<Frame>,
+    )> {
+        self.register_control_with(key, false, false)
+    }
+
+    fn register_control_with(
+        &self,
+        key: PendingKey,
+        route_open: bool,
+        blocks_probe: bool,
+    ) -> ConnResult<(
+        Arc<ConnectionRuntime>,
+        PendingRegistration,
+        mpsc::UnboundedReceiver<Frame>,
+    )> {
         let mut state = self.shared.current.lock().unwrap();
         if !state.active {
             return Err(ConnError::Transport("connection is recovering".into()));
@@ -1144,6 +1192,7 @@ impl SubcConnection {
             Arc::clone(&runtime.pending),
             key,
             route_open,
+            blocks_probe,
             Some(observer),
         )?;
         state.control_watermark = state.control_watermark.wrapping_add(1);
@@ -1171,7 +1220,7 @@ impl SubcConnection {
             return Err(ConnError::StaleRouteHandle(*handle));
         }
         let (registration, rx) =
-            PendingRegistration::new(Arc::clone(&runtime.pending), key, false, None)?;
+            PendingRegistration::new(Arc::clone(&runtime.pending), key, false, true, None)?;
         drop(routes);
         Ok((runtime, registration, rx))
     }
@@ -3092,132 +3141,6 @@ fn spawn_generation_tasks(
     ));
 }
 
-enum ChannelZeroProbeBlocker {
-    Live,
-    TombstoneUntil(Instant),
-}
-
-/// Distinguishes live channel-0 traffic from retained route.open cleanup state. A live request
-/// suppresses both probe writes and conviction because the daemon's connection-scoped FIFO cannot
-/// answer a Ping while servicing that request. This is load-bearing for route.open: its bind relay
-/// can park the loop longer than the ordinary response deadline, and probing behind that healthy
-/// work would falsely convict every route on the socket.
-///
-/// A retained route.open tombstone serves a different purpose: it lets the reader close a route
-/// the daemon committed after the caller left. Treating that cleanup identity as live forever also
-/// suppresses recovery forever on a dead socket. Tombstones therefore block only through the
-/// bounded bind-relay remainder; after that deadline they remain available for cleanup but are no
-/// longer evidence that the daemon is busy.
-fn channel_zero_probe_blocker(
-    runtime: &ConnectionRuntime,
-    now: Instant,
-) -> Option<ChannelZeroProbeBlocker> {
-    let waiters = runtime.pending.lock().unwrap();
-    let mut latest_tombstone = None;
-    for (key, entry) in waiters.iter() {
-        if key.0 != 0 {
-            continue;
-        }
-        match entry {
-            PendingEntry::Live { .. } => return Some(ChannelZeroProbeBlocker::Live),
-            PendingEntry::LateRouteOpen { blocks_probe_until } if *blocks_probe_until > now => {
-                latest_tombstone = Some(
-                    latest_tombstone.map_or(*blocks_probe_until, |current: Instant| {
-                        current.max(*blocks_probe_until)
-                    }),
-                );
-            }
-            PendingEntry::LateRouteOpen { .. } => {}
-        }
-    }
-    latest_tombstone.map(ChannelZeroProbeBlocker::TombstoneUntil)
-}
-
-enum ProbeRequestAction {
-    None,
-    WakeAt(Instant),
-    Start {
-        runtime: Arc<ConnectionRuntime>,
-        corr: u64,
-    },
-}
-
-/// Start a probe now or remember it until channel-zero traffic stops blocking it. A timeout is a
-/// durable request for a health decision: live control work postpones that decision instead of
-/// discarding it, while a tombstone supplies the bounded wake-up time.
-fn request_liveness_probe(shared: &Arc<ConnectionShared>, runtime: &Arc<ConnectionRuntime>) {
-    let action = {
-        let mut state = shared.current.lock().unwrap();
-        if !state.active || state.runtime.conn != runtime.conn {
-            ProbeRequestAction::None
-        } else if state.probe_in_flight {
-            if channel_zero_probe_blocker(runtime, Instant::now()).is_some() {
-                // Channel-zero activity will acquit the current probe. Remember this timeout so
-                // that acquittal cannot consume the only health decision for the newer silence.
-                state.probe_deferred = true;
-            }
-            ProbeRequestAction::None
-        } else {
-            match channel_zero_probe_blocker(runtime, Instant::now()) {
-                Some(ChannelZeroProbeBlocker::Live) => {
-                    state.probe_deferred = true;
-                    state.deferred_probe_wake = None;
-                    ProbeRequestAction::None
-                }
-                Some(ChannelZeroProbeBlocker::TombstoneUntil(deadline)) => {
-                    state.probe_deferred = true;
-                    if state.deferred_probe_wake == Some(deadline) {
-                        ProbeRequestAction::None
-                    } else {
-                        state.deferred_probe_wake = Some(deadline);
-                        ProbeRequestAction::WakeAt(deadline)
-                    }
-                }
-                None => {
-                    state.probe_deferred = false;
-                    state.deferred_probe_wake = None;
-                    state.probe_in_flight = true;
-                    ProbeRequestAction::Start {
-                        runtime: Arc::clone(runtime),
-                        corr: shared.corr.fetch_add(1, Ordering::Relaxed),
-                    }
-                }
-            }
-        }
-    };
-
-    match action {
-        ProbeRequestAction::None => {}
-        ProbeRequestAction::WakeAt(deadline) => {
-            let owner = Arc::downgrade(shared);
-            let conn = runtime.conn;
-            tokio::spawn(async move {
-                time::sleep_until(time::Instant::from_std(deadline)).await;
-                let Some(owner) = owner.upgrade() else {
-                    return;
-                };
-                let runtime = {
-                    let mut state = owner.current.lock().unwrap();
-                    if !state.active
-                        || state.runtime.conn != conn
-                        || !state.probe_deferred
-                        || state.deferred_probe_wake != Some(deadline)
-                    {
-                        return;
-                    }
-                    state.deferred_probe_wake = None;
-                    Arc::clone(&state.runtime)
-                };
-                request_liveness_probe(&owner, &runtime);
-            });
-        }
-        ProbeRequestAction::Start { runtime, corr } => {
-            let owner = Arc::downgrade(shared);
-            tokio::spawn(async move { run_liveness_probe(owner, runtime, corr).await });
-        }
-    }
-}
-
 fn pending_registration_changed(shared: &Weak<ConnectionShared>, conn: ConnToken) {
     let Some(owner) = shared.upgrade() else {
         return;
@@ -3576,9 +3499,9 @@ async fn reader_task<R>(
                 }
             } else {
                 match waiters.get(&key) {
-                    Some(PendingEntry::Live { sender, route_open }) => {
-                        Some((Some(sender.clone()), *route_open, false))
-                    }
+                    Some(PendingEntry::Live {
+                        sender, route_open, ..
+                    }) => Some((Some(sender.clone()), *route_open, false)),
                     Some(PendingEntry::LateRouteOpen { .. }) => Some((None, true, true)),
                     None => None,
                 }
@@ -5055,6 +4978,8 @@ fn to_subc_bind(
 }
 
 mod catalog_watch;
+mod probe;
+use probe::{channel_zero_probe_blocker, request_liveness_probe};
 
 /// The far end of an in-process connection with no socket, for tests OUTSIDE this module that
 /// need the real request/terminal path (framing, pending waiters, reply deadlines) behind a

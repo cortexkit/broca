@@ -137,7 +137,7 @@ mod call_keepalive {
         assert_ne!(second.header.corr, request.header.corr);
         live_wakes.0.store(0, Ordering::SeqCst);
         let (_barrier, mut barrier) =
-            PendingRegistration::new(pending.clone(), (0, 0, 999), false, None).unwrap();
+            PendingRegistration::new(pending.clone(), (0, 0, 999), false, true, None).unwrap();
         let (_, dropped_before) = FRAME_DROPS.counts();
         for (kind, body) in [
             (FrameType::Push, br#"{"kind":"keepalive"}"#.to_vec()),
