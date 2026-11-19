@@ -1700,7 +1700,25 @@ async fn completed_run(conn: &SubcConnection, route: &broca_subc::RouteHandle, r
     }
 }
 
+/// The run's segment facts, as stored. Its per-request `model_attempt` facts are
+/// [`attempt_facts`].
 fn fact_bytes(rig: &Rig, run: &str) -> Vec<String> {
+    all_fact_bytes(rig, run)
+        .into_iter()
+        .filter(|bytes| serde_json::from_str::<serde_json::Value>(bytes).unwrap()["kind"].is_null())
+        .collect()
+}
+
+/// The run's `model_attempt` facts: one per provider request it sent.
+fn attempt_facts(rig: &Rig, run: &str) -> Vec<serde_json::Value> {
+    all_fact_bytes(rig, run)
+        .iter()
+        .map(|bytes| serde_json::from_str::<serde_json::Value>(bytes).unwrap())
+        .filter(|fact| fact["kind"] == "model_attempt")
+        .collect()
+}
+
+fn all_fact_bytes(rig: &Rig, run: &str) -> Vec<String> {
     let db = rusqlite::Connection::open_with_flags(
         rig.state_root.join("run-index.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1804,6 +1822,15 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
     assert_eq!(fact["agent_id"], "agent-a");
     assert_eq!(fact["agent_run_id"], "parent-run");
     assert_eq!(fact["run_id"], run);
+    let attempts = attempt_facts(&rig, &run);
+    assert!(
+        !attempts.is_empty(),
+        "the run's request has its attempt fact"
+    );
+    for attempt in &attempts {
+        assert_eq!(attempt["agent_id"], "agent-a");
+        assert_eq!(attempt["agent_run_id"], "parent-run");
+    }
 
     // A finished run makes byte comparison meaningful: no provider is still appending records.
     for (field, extra) in [

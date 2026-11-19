@@ -2019,13 +2019,30 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
             .ok_or_else(|| "no spend fact yet".to_owned())
     })
     .await;
-    assert_eq!(facts.len(), 1, "one completed turn yields one billing fact");
-    assert_eq!(facts[0]["provider"], "meta");
-    assert_eq!(facts[0]["auth_selection"], "oauth:meta:test");
+    // One segment for the turn, and one `model_attempt` fact for its one provider request,
+    // which carries the usage the segment sums and marks it so it isn't billed twice.
+    let (attempts, segments): (Vec<_>, Vec<_>) = facts
+        .into_iter()
+        .partition(|fact| fact["kind"] == "model_attempt");
     assert_eq!(
-        facts[0]["charge_basis"],
-        serde_json::to_value(broca_core::ChargeBasis::SubscriptionIncluded).unwrap()
+        segments.len(),
+        1,
+        "one completed turn yields one billing fact"
     );
+    assert_eq!(
+        attempts.len(),
+        1,
+        "one provider request yields one attempt fact"
+    );
+    assert_eq!(segments[0]["usage_in_attempts"], true);
+    for fact in [&segments[0], &attempts[0]] {
+        assert_eq!(fact["provider"], "meta");
+        assert_eq!(fact["auth_selection"], "oauth:meta:test");
+        assert_eq!(
+            fact["charge_basis"],
+            serde_json::to_value(broca_core::ChargeBasis::SubscriptionIncluded).unwrap()
+        );
+    }
 }
 
 /// An Anthropic OAuth run admitted through the real module speaks as Claude Code: the request the

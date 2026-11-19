@@ -1307,10 +1307,12 @@ async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
             let mut stmt = db
                 .prepare("SELECT segment_json FROM export_facts WHERE run_id = ?1")
                 .unwrap();
+            // The run's segment facts; its per-request `model_attempt` facts are left out.
             let facts: Vec<Value> = stmt
                 .query_map([&run_id], |row| row.get::<_, String>(0))
                 .unwrap()
-                .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+                .map(|row| serde_json::from_str::<Value>(&row.unwrap()).unwrap())
+                .filter(|fact| fact["kind"].is_null())
                 .collect();
             if !facts.is_empty() {
                 return Ok(facts);
