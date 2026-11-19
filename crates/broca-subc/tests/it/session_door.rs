@@ -108,6 +108,8 @@ impl FakeDoor {
                                     serde_json::to_vec(&ClientControlResponse::RouteOpen {
                                         route_channel: 10,
                                         route_epoch: 1,
+                                        request_window: None,
+                                        watch_window: None,
                                     })
                                     .unwrap(),
                                 )

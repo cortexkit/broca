@@ -64,6 +64,8 @@ async fn aft_snapshot_refresh_reenables_the_session_harness_without_per_open_cat
                 serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
                     route_channel: 7,
                     route_epoch: 1,
+                                    request_window: None,
+                                    watch_window: None,
                 })
                 .unwrap()
             ));
@@ -79,6 +81,8 @@ async fn aft_snapshot_refresh_reenables_the_session_harness_without_per_open_cat
                     serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
                         route_channel: 8,
                         route_epoch: 1,
+                                    request_window: None,
+                                    watch_window: None,
                     })
                     .unwrap()
                 ));

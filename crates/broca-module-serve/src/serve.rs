@@ -604,6 +604,7 @@ fn to_bind_scope(
             subc_protocol::scope::ScopeKind::Head => broca_protocol::ScopeKind::Head,
             subc_protocol::scope::ScopeKind::Worker => broca_protocol::ScopeKind::Worker,
             subc_protocol::scope::ScopeKind::Ephemeral => broca_protocol::ScopeKind::Ephemeral,
+            _ => broca_protocol::ScopeKind::Other,
         },
         parent: stamp.parent.as_ref().map(|parent| {
             Box::new(broca_protocol::ScopeParent {
@@ -6357,23 +6358,8 @@ fn bind_role(
 }
 
 #[cfg(test)]
-mod role_selection_tests {
-    use super::{bind_role, RouteRole};
-
-    #[test]
-    fn each_supported_role_selects_its_own_dispatch() {
-        assert_eq!(bind_role(None, true), Ok(RouteRole::LlmRunner));
-        for (name, expected) in [
-            ("llm-runner", RouteRole::LlmRunner),
-            ("classifier", RouteRole::Classifier),
-            ("tool-provider", RouteRole::ToolProvider),
-            ("permissions", RouteRole::Permissions),
-        ] {
-            let roles = [(name.into(), "v1".into())].into_iter().collect();
-            assert_eq!(bind_role(Some(&roles), true), Ok(expected), "{name}");
-        }
-    }
-}
+#[path = "serve_role_selection_tests.rs"]
+mod role_selection_tests;
 
 /// Answer one request on a classifier route, on tasks of its own: never the frame loop, and
 /// none of the connection's request slots, so a slow provider cannot hold up any session's

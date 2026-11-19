@@ -590,6 +590,8 @@ fn answer_route_open(pending: &PendingMap, request: &Frame, channel: u16) {
     let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
         route_channel: channel,
         route_epoch: 1,
+        request_window: None,
+        watch_window: None,
     })
     .unwrap();
     let response = Frame::build(
@@ -1414,6 +1416,8 @@ async fn serve_control_stub_connection(
                     let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
                         route_channel: 9,
                         route_epoch: 1,
+                        request_window: None,
+                        watch_window: None,
                     })
                     .map_err(|error| format!("encode route.open response: {error}"))?;
                     let response = Frame::build(
@@ -2513,6 +2517,8 @@ async fn late_route_open_response_queues_epoch_stamped_goodbye() {
     let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
         route_channel: 9,
         route_epoch: 4,
+        request_window: None,
+        watch_window: None,
     })
     .unwrap();
     let response = Frame::build(FrameType::Response, control_flags(), 0, 0, 5, body).unwrap();
@@ -2554,6 +2560,8 @@ async fn congested_egress_does_not_stop_ingress(cleanup: u8) {
             serde_json::to_vec(&ClientControlResponse::RouteOpen {
                 route_channel: 9,
                 route_epoch: 4,
+                request_window: None,
+                watch_window: None,
             })
             .unwrap(),
         )

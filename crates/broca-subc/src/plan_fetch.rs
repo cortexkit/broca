@@ -590,6 +590,8 @@ mod carrier_catalog_tests {
                     serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
                         route_channel: 1,
                         route_epoch: 1,
+                        request_window: None,
+                        watch_window: None,
                     },)
                     .unwrap()
                 ));
@@ -647,6 +649,8 @@ mod carrier_catalog_tests {
                     serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
                         route_channel: 1,
                         route_epoch: 1,
+                        request_window: None,
+                        watch_window: None,
                     },)
                     .unwrap()
                 ));

@@ -21,6 +21,8 @@ mod call_keepalive {
         let answer = subc_control::ClientControlResponse::RouteOpen {
             route_channel: 7,
             route_epoch: 1,
+            request_window: None,
+            watch_window: None,
         };
         assert!(module.reply(&bind, serde_json::to_vec(&answer).unwrap()));
         (module.next_request().await, keepalive)
@@ -539,6 +541,8 @@ mod call_keepalive {
                         let answer = subc_control::ClientControlResponse::RouteOpen {
                             route_channel: 7,
                             route_epoch: 1,
+                            request_window: None,
+                            watch_window: None,
                         };
                         assert!(module.reply(&bind, serde_json::to_vec(&answer).unwrap()));
                         break;

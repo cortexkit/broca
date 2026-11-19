@@ -20,6 +20,8 @@ async fn followup_congested_reader_cleanup(cleanup: u8) {
         serde_json::to_vec(&ClientControlResponse::RouteOpen {
             route_channel: 9,
             route_epoch: 4,
+                                    request_window: None,
+                                    watch_window: None,
         })
         .unwrap(),
     )
@@ -161,6 +163,8 @@ async fn review_reader_full_handoff_cannot_reenter_retired_generation() {
         serde_json::to_vec(&ClientControlResponse::RouteOpen {
             route_channel: 9,
             route_epoch: 4,
+                                    request_window: None,
+                                    watch_window: None,
         })
         .unwrap(),
     )

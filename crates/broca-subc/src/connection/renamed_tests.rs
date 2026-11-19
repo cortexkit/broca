@@ -50,6 +50,8 @@ fn accept(daemon: &InProcessModuleEnd, request: &Frame) {
         serde_json::to_vec(&ClientControlResponse::RouteOpen {
             route_channel: 7,
             route_epoch: 1,
+            request_window: None,
+            watch_window: None,
         })
         .unwrap()
     ));

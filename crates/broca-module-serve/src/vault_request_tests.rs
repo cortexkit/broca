@@ -434,6 +434,8 @@ async fn serve_capturing_vault(
                         ClientControlResponse::RouteOpen {
                             route_channel: next_route,
                             route_epoch: 1,
+                            request_window: None,
+                            watch_window: None,
                         }
                     }
                     other => return Err(format!("unexpected control request: {other:?}")),

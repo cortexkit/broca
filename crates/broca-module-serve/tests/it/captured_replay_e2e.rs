@@ -1212,6 +1212,7 @@ async fn refused_variant_frame(daemon: &Daemon, _project_root: &Path) -> subc_pr
         admission_facts: None,
         scope: None,
         role_versions: None,
+        busy_refusals: None,
     };
     let frame = Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -1232,6 +1233,7 @@ async fn refused_variant_frame(daemon: &Daemon, _project_root: &Path) -> subc_pr
     let ClientControlResponse::RouteOpen {
         route_channel,
         route_epoch,
+        ..
     } = serde_json::from_slice(&opened.body).unwrap()
     else {
         panic!("expected route open");

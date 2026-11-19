@@ -282,6 +282,10 @@ pub enum ScopeKind {
     Head,
     Worker,
     Ephemeral,
+    /// Any other kind, such as a paired computer's `federated` scope. broca doesn't declare
+    /// `scope-federated/v1`, so the daemon shouldn't stamp one on its binds; if one arrives it
+    /// carries none of the authority a head, worker or ephemeral scope does.
+    Other,
 }
 
 /// A parent reference is owner-local and names one epoch, not just a reusable scope ref.

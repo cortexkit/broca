@@ -671,7 +671,9 @@ fn the_stand_in_pins_the_daemon_wire_versions() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let helper = workspace.join("crates/broca-module-serve/tests/support/fake-surface");
     for crate_name in ["subc-protocol", "subc-transport"] {
-        let built_against = pinned_version(&workspace.join("Cargo.lock"), crate_name);
+        // The workspace pin is the release broca links. Its lock can also hold an older release
+        // a test-only dependency still needs, so the lock alone can't name it.
+        let built_against = required_version(&workspace.join("Cargo.toml"), crate_name);
         let declared = pinned_version(&helper.join("Cargo.lock"), crate_name);
         assert_eq!(
             declared, built_against,

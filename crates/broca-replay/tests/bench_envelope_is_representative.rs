@@ -89,6 +89,11 @@ const ACCEPTED: &[[&str; 2]] = &[
     // 0.33.4: lib.rs, manifest.rs (flow_operations for flow-scopes/v1) and scope.rs only.
     // frame.rs is byte-identical to 0.32.4 and to 0.33.0, so the replay framing is unchanged.
     ["0.32.4", "0.33.4"],
+    // 0.37.5 admitted 2026-11-19 beside 0.34.3, which only the classifier conformance kit (a
+    // test dependency) still links. frame.rs is byte-identical across the two crate trees; the
+    // diff is lib.rs, manifest.rs, peer.rs, scope.rs, session.rs and the new modules (route
+    // busy credits, federated scopes, settings), none of them data-plane framing.
+    ["0.34.3", "0.37.5"],
 ];
 
 // 0.19.0 admitted 2026-09-06. The ENTIRE crate diff over the bump is `src/manifest.rs`, 208

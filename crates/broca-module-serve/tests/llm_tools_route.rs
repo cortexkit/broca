@@ -331,6 +331,7 @@ impl Rig {
             }),
             consumer_capabilities: None,
             admission_facts: None,
+            busy_refusals: None,
         };
         // The regular tool-provider client declares a role; use the wire request to also
         // exercise callers that select their role solely through the route target.
@@ -2110,6 +2111,7 @@ async fn basal_tool_provider_target_without_role_versions_serves_catalog_on_real
     let ClientControlResponse::RouteOpen {
         route_channel,
         route_epoch,
+        ..
     } = serde_json::from_slice(&reply.body).unwrap()
     else {
         panic!("unexpected route.open reply");

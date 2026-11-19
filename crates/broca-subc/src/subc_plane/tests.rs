@@ -3133,6 +3133,8 @@ async fn a_non_compaction_hook_providers_tool_and_hook_routes_share_one_identity
                 serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
                     route_channel: channel,
                     route_epoch: 1,
+                    request_window: None,
+                    watch_window: None,
                 })
                 .unwrap(),
             );

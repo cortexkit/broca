@@ -1737,6 +1737,8 @@ mod tests {
                             ClientControlResponse::RouteOpen {
                                 route_channel: next_route.fetch_add(1, Ordering::SeqCst),
                                 route_epoch: 1,
+                                request_window: None,
+                                watch_window: None,
                             }
                         }
                         other => {
