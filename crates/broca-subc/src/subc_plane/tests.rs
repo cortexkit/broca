@@ -4555,3 +4555,98 @@ mod scope_carrier {
         assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 1);
     }
 }
+
+/// A scope frozen under a renamed module's old id: after the daemon retires the old id, the
+/// scope check finds the twin the owner re-synced under its new id, and only then.
+mod renamed_scope_owner {
+    use super::*;
+
+    /// `scope.describe` answering per owner id.
+    struct ByOwner(HashMap<String, DescribedScope>, Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl ScopeDescriber for ByOwner {
+        async fn describe(&self, owner: &Principal, _: &str) -> Result<DescribedScope, String> {
+            let Principal::Reserved { module_id } = owner else {
+                return Err("not a reserved owner".into());
+            };
+            self.1.lock().unwrap().push(module_id.clone());
+            self.0
+                .get(module_id)
+                .cloned()
+                .ok_or_else(|| "no answer".into())
+        }
+    }
+
+    fn answer(status: ScopeStatus, owner_configured: bool) -> DescribedScope {
+        DescribedScope {
+            status,
+            scope_epoch: Some(3),
+            owner_synced: owner_configured,
+            owner_configured,
+            stamp: None,
+        }
+    }
+
+    fn reserved(module_id: &str) -> Principal {
+        Principal::Reserved {
+            module_id: module_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retired_old_owner_reads_the_twin_under_the_new_id() {
+        let describer = ByOwner(
+            HashMap::from([
+                (
+                    "prefrontal-core".into(),
+                    answer(ScopeStatus::NotLive, false),
+                ),
+                ("prefrontal".into(), answer(ScopeStatus::Live, true)),
+            ]),
+            Mutex::default(),
+        );
+        let read = describe_either_owner(&describer, &reserved("prefrontal-core"), "head")
+            .await
+            .unwrap();
+        assert_eq!(read.status, ScopeStatus::Live);
+        assert_eq!(
+            *describer.1.lock().unwrap(),
+            ["prefrontal-core", "prefrontal"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_scope_or_an_unrenamed_owner_asks_once() {
+        let describer = ByOwner(
+            HashMap::from([
+                ("prefrontal-core".into(), answer(ScopeStatus::Live, true)),
+                ("aft".into(), answer(ScopeStatus::NotLive, false)),
+            ]),
+            Mutex::default(),
+        );
+        for owner in ["prefrontal-core", "aft"] {
+            describe_either_owner(&describer, &reserved(owner), "head")
+                .await
+                .unwrap();
+        }
+        assert_eq!(*describer.1.lock().unwrap(), ["prefrontal-core", "aft"]);
+    }
+
+    /// While the frozen owner is still configured, its "not live" stands when the twin is not
+    /// live either: it may only be waiting to sync.
+    #[tokio::test]
+    async fn a_configured_owner_keeps_its_answer_when_the_twin_is_not_live_either() {
+        let describer = ByOwner(
+            HashMap::from([
+                ("prefrontal-core".into(), answer(ScopeStatus::NotLive, true)),
+                ("prefrontal".into(), answer(ScopeStatus::NotLive, false)),
+            ]),
+            Mutex::default(),
+        );
+        let read = describe_either_owner(&describer, &reserved("prefrontal-core"), "head")
+            .await
+            .unwrap();
+        assert!(read.owner_configured);
+    }
+}

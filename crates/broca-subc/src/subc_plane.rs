@@ -142,6 +142,41 @@ enum ScopeReading {
     Unverifiable(String),
 }
 
+/// `scope.describe` for `scope_ref` under `owner`, or under the owner's other id when `owner`
+/// is a renamed module ([`broca_protocol::RENAMED_MODULES`]) and the scope is not live under the
+/// id the session froze. A renamed owner re-syncs its scopes under its new id, so the scope's
+/// twin (same `ref` and `scope_epoch`) is live there while the old id is not even a configured
+/// module any more; a route open finds the twin the same way
+/// (`SubcConnection::route_open_wire_target`). The twin's answer is used unless it is not live
+/// either while the frozen owner is still configured, which leaves the frozen owner's answer.
+async fn describe_either_owner(
+    describer: &dyn ScopeDescriber,
+    owner: &Principal,
+    scope_ref: &str,
+) -> Result<DescribedScope, String> {
+    let answer = describer.describe(owner, scope_ref).await?;
+    if answer.status != ScopeStatus::NotLive {
+        return Ok(answer);
+    }
+    let Principal::Reserved { module_id } = owner else {
+        return Ok(answer);
+    };
+    let Some(other) = broca_protocol::other_module_name(module_id) else {
+        return Ok(answer);
+    };
+    let twin = Principal::Reserved {
+        module_id: other.to_owned(),
+    };
+    match describer.describe(&twin, scope_ref).await {
+        Ok(twin_answer)
+            if twin_answer.status != ScopeStatus::NotLive || !answer.owner_configured =>
+        {
+            Ok(twin_answer)
+        }
+        _ => Ok(answer),
+    }
+}
+
 /// Read one `scope.describe` answer for a scope a route was opened under at `opened_epoch`.
 fn read_describe(opened_epoch: u64, answer: &DescribedScope) -> ScopeReading {
     match answer.status {
@@ -1665,7 +1700,7 @@ impl SubcToolPlane {
         let deadline = until.map_or(hold_end, |until| until.min(hold_end));
         let mut attempt = 0u32;
         loop {
-            let reading = match describer.describe(&owner, &scope.scope_ref).await {
+            let reading = match describe_either_owner(&*describer, &owner, &scope.scope_ref).await {
                 Ok(answer) => read_describe(scope.scope_epoch, &answer),
                 Err(error) => ScopeReading::Unverifiable(format!("scope.describe failed: {error}")),
             };
