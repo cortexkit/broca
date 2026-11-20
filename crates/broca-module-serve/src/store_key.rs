@@ -291,6 +291,7 @@ async fn recover_sessions(registry: &broca_module::LineageRegistry) -> bool {
             tracing::info!(target: "lifecycle", inspected = sweep.inspected,
                 recovered = sweep.recovered, retired = sweep.retired, lease_held = sweep.lease_held,
                 deferred = sweep.deferred, failed = sweep.failed.len(), %opened_for,
+                warm_armed = sweep.warm_armed,
                 "store restart resume candidate sweep complete");
             for error in sweep.failed {
                 tracing::warn!(target: "lifecycle", %error, "could not recover a store session");

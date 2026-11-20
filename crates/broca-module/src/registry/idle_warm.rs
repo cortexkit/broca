@@ -51,6 +51,17 @@ impl RegistryHandle {
         self.inner.idle_warms.lock().unwrap().contains_key(key)
     }
 
+    /// When the session's idle warming timer is due, if one is armed.
+    #[cfg(test)]
+    pub(crate) fn idle_warm_due_ms(&self, key: &LineageKey) -> Option<u64> {
+        self.inner
+            .idle_warms
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|scheduled| scheduled.due_ms)
+    }
+
     pub(crate) fn arm_idle_warm(&self, key: &LineageKey, due_ms: u64, now_ms: u64) {
         let stops = self.inner.idle_warm_stops.lock().unwrap();
         if self.is_stopping() || stops.contains(key) {

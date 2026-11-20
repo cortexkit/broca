@@ -317,20 +317,27 @@ fn attempted_step(id: &str, text: &str, sent_at_ms: u64) -> Vec<NormalizedEvent>
     step
 }
 
+/// What a restarted module's recovery sweep did for an automatic session run to its end.
+struct Reboot {
+    sweep: crate::store_open::recovery::StoreRecoverySweep,
+    /// The session has its idle warming timer back.
+    warm: bool,
+    /// The sweep loaded the session to do it.
+    opened: bool,
+    /// When the sweep's timer is due, and when the session's own actor, opened afterwards with
+    /// no timer armed, arms it.
+    due_ms: Option<u64>,
+    actor_due_ms: Option<u64>,
+}
+
 /// An automatic head whose last request reached the provider at `sent_at_ms`, run to its end and
-/// its module restarted: what the restarted module's recovery sweep did, and whether the head
-/// has its idle warming timer back.
-async fn reboot_an_automatic_head(
-    sent_at_ms: u64,
-) -> (crate::store_open::recovery::StoreRecoverySweep, bool) {
+/// its module restarted.
+async fn reboot_an_automatic_head(sent_at_ms: u64) -> Reboot {
     reboot_an_automatic_session(sent_at_ms, Some("head")).await
 }
 
 /// As [`reboot_an_automatic_head`], for a session of class `class`.
-async fn reboot_an_automatic_session(
-    sent_at_ms: u64,
-    class: Option<&str>,
-) -> (crate::store_open::recovery::StoreRecoverySweep, bool) {
+async fn reboot_an_automatic_session(sent_at_ms: u64, class: Option<&str>) -> Reboot {
     let dir = scratch();
     let config = warmable();
     let sent = Arc::default();
@@ -383,41 +390,75 @@ async fn reboot_an_automatic_session(
     let sweep = reboot.recover_store_crash_orphans().await.unwrap();
     assert!(sweep.failed.is_empty(), "{sweep:?}");
     let warm = reboot.handle().has_idle_warm(&key);
+    let opened = reboot.slot_state(&key).is_some();
+    let due_ms = reboot.handle().idle_warm_due_ms(&key);
+    // A real run is the one stop that leaves the session free to arm again. A status read of a
+    // closed session answers from the store, so the actor is opened as the sweep used to.
+    reboot.handle().stop_idle_warm(&key, "real_run");
+    let actor = reboot.actor_for_mode(&key, None, None, true).await.unwrap();
+    let (reply, response) = tokio::sync::oneshot::channel();
+    assert!(actor
+        .send(crate::actor::LineageCmd::Status { reply })
+        .await
+        .is_ok());
+    response.await.unwrap();
+    let actor_due_ms = reboot.handle().idle_warm_due_ms(&key);
     assert!(reboot.stop_and_seal().await);
     std::fs::remove_dir_all(dir).unwrap();
-    (sweep, warm)
+    Reboot {
+        sweep,
+        warm,
+        opened,
+        due_ms,
+        actor_due_ms,
+    }
 }
 
 /// Warming follows the session's cache policy, not its class: a session with no class whose
 /// run asked for `keep_warm: auto` is warmed between turns like a head.
 #[tokio::test]
 async fn startup_rearms_a_classless_session_that_asked_for_warming() {
-    let (sweep, warm) = reboot_an_automatic_session(crate::actor::epoch_ms(), None).await;
-    assert_eq!(sweep.opened_for, [("warm_cache", 1)].into_iter().collect());
-    assert!(warm, "{sweep:?}");
+    let reboot = reboot_an_automatic_session(crate::actor::epoch_ms(), None).await;
+    assert_eq!(reboot.sweep.warm_armed, 1, "{:?}", reboot.sweep);
+    assert!(reboot.warm, "{:?}", reboot.sweep);
 }
 
+/// The sweep gives an idle head its warming timer back without loading it: the timer opens the
+/// head when the warm is due, at the time the head's own actor would arm.
 #[tokio::test]
-async fn startup_rearms_an_untouched_automatic_head() {
-    let (sweep, warm) = reboot_an_automatic_head(crate::actor::epoch_ms()).await;
-    assert_eq!(sweep.recovered, 1);
-    assert_eq!(
-        sweep.opened_for,
-        [("warm_cache", 1)].into_iter().collect(),
-        "the sweep says it opened the head for its cache: {sweep:?}"
+async fn startup_rearms_an_untouched_automatic_head_without_opening_it() {
+    let reboot = reboot_an_automatic_head(crate::actor::epoch_ms()).await;
+    assert_eq!(reboot.sweep.recovered, 0, "{:?}", reboot.sweep);
+    assert!(reboot.sweep.opened_for.is_empty(), "{:?}", reboot.sweep);
+    assert_eq!(reboot.sweep.warm_armed, 1, "{:?}", reboot.sweep);
+    assert!(
+        reboot.warm,
+        "startup restores the timer without a session command"
     );
-    assert!(warm, "startup restores the timer without a session command");
+    assert!(!reboot.opened, "the sweep loaded the head to arm its timer");
+    assert!(reboot.due_ms.is_some());
+    assert_eq!(
+        reboot.due_ms, reboot.actor_due_ms,
+        "the sweep's timer is due when the head's actor would arm it"
+    );
 }
 
-/// A head whose cache has expired has nothing to keep warm, so the sweep leaves it closed.
-/// Opening it would only load it: every such head was opened at each restart, 860 at one.
+/// A head whose cache has expired has nothing to keep warm, so the sweep leaves it closed and
+/// arms nothing. Opening it would only load it: every such head was opened at each restart,
+/// 860 at one.
 #[tokio::test]
 async fn startup_leaves_closed_an_automatic_head_whose_cache_expired() {
     let two_hours_ago = crate::actor::epoch_ms() - 2 * 60 * 60 * 1000;
-    let (sweep, warm) = reboot_an_automatic_head(two_hours_ago).await;
-    assert_eq!(sweep.recovered, 0, "{sweep:?}");
-    assert!(sweep.inspected >= 1, "the sweep read the head: {sweep:?}");
-    assert!(!warm);
+    let reboot = reboot_an_automatic_head(two_hours_ago).await;
+    assert_eq!(reboot.sweep.recovered, 0, "{:?}", reboot.sweep);
+    assert_eq!(reboot.sweep.warm_armed, 0, "{:?}", reboot.sweep);
+    assert!(
+        reboot.sweep.inspected >= 1,
+        "the sweep read the head: {:?}",
+        reboot.sweep
+    );
+    assert!(!reboot.warm);
+    assert!(!reboot.opened);
 }
 
 /// The refusals decided before anything is sent answer alike: a warm naming a lineage, a module

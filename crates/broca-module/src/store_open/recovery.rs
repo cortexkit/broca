@@ -20,9 +20,9 @@ pub fn register_candidate(root: &Path, addr: &SessionAddr) -> std::io::Result<()
 
 /// Whether a session's stored state leaves its open-time recovery anything to do: queued sends,
 /// usage billing still owed (when `billing` runs), an unfinished run that opening acts on, or a
-/// session whose latest run asked for warming and so opens once at boot to rebuild its warming
-/// timer. The boot sweep opens such a session only while its cache is live (see
-/// [`LineageRegistry::idle_cache_live`]), and retires its registration once the cache is gone.
+/// session whose latest run asked for warming and so needs its warming timer back at boot. The
+/// boot sweep arms that timer without opening the session, only while its cache is live (see
+/// [`LineageRegistry::idle_warm_due_at`]), and retires its registration once the cache is gone.
 /// Installing a converted old session ([`retire_settled_install`]) happens with no module to ask
 /// for the route's cache policy, so it keeps such a session registered and leaves the decision
 /// to the next boot's sweep.
@@ -211,10 +211,12 @@ pub struct StoreRecoverySweep {
     pub lease_held: usize,
     pub deferred: usize,
     pub failed: Vec<String>,
-    /// The sessions opened, counted by what they owed ([`recovery_owed`]), or `warm_cache` for
-    /// a head opened only to keep its cache warm. A count that stays the same across restarts
-    /// names something opening doesn't settle.
+    /// The sessions opened, counted by what they owed ([`recovery_owed`]). A count that stays
+    /// the same across restarts names something opening doesn't settle.
     pub opened_for: std::collections::BTreeMap<&'static str, usize>,
+    /// Finished sessions that warm themselves and still have a cache to keep, whose warming
+    /// timer was armed without opening them: the session opens when its next warm is due.
+    pub warm_armed: usize,
 }
 
 fn now_ms() -> u64 {
@@ -226,36 +228,33 @@ fn now_ms() -> u64 {
 }
 
 impl crate::registry::LineageRegistry {
-    /// Whether a finished head that warms itself still has a cache to keep warm at `now_ms`:
-    /// its last cached request is within the cache lifetime its route declares. Opening it then
-    /// rebuilds its warming timer. Past that, or when the run's config or its route's cache
-    /// policy can't be read, its actor would arm no timer (see `StoreActor::idle_warm_due`), so
-    /// opening it at boot would do nothing but load it. Every head started on a route that keeps
-    /// its cache warm was opened at each boot, however long ago it last ran: 860 at one restart.
-    fn idle_cache_live(
+    /// When a finished head that warms itself is next due a warm, if it still has a cache to
+    /// keep at `now_ms`: its last cached request is within the cache lifetime its route
+    /// declares. The time is the one its actor arms (see `StoreActor::idle_warm_due`), so the
+    /// boot sweep arms the head's warming timer without opening it, and the timer opens it when
+    /// the warm is due; the actor checks the rest of the head's warming rules then. Past the
+    /// cache lifetime, or when the run's config or its route's cache policy can't be read, the
+    /// actor would arm no timer, so there is nothing to arm. Opening every such head at boot
+    /// to arm its timer loaded about 90 heads at each restart, read most of the gigabytes a
+    /// restart reads, and kept them in memory until each one idled out.
+    fn idle_warm_due_at(
         &self,
         operations: &broca_session_store::fold::operations::Operations,
         parts: &dyn broca_session_loop::parts::Parts,
+        executor: &dyn crate::executor::RunExecutor,
         now_ms: u64,
-    ) -> bool {
-        let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_some()) else {
-            return false;
-        };
-        let (Some(start), Some(send)) = (run.start.as_ref(), operations.last_cache_send.as_ref())
-        else {
-            return false;
-        };
-        let Ok(config) = crate::store_actor::warm_run_config(run, start, parts) else {
-            return false;
-        };
-        let Some(ttl_ms) = self
+    ) -> Option<u64> {
+        let run = operations
+            .run
+            .as_ref()
+            .filter(|run| run.finished.is_some())?;
+        let (start, send) = (run.start.as_ref()?, operations.last_cache_send.as_ref()?);
+        let config = crate::store_actor::warm_run_config(run, start, parts).ok()?;
+        let ttl_ms = self
             .cache_declaration(&config)
             .filter(|declaration| declaration.warm.is_ok())
             .and_then(|declaration| declaration.ttl_ms)
-            .filter(|ttl| *ttl > 0)
-        else {
-            return false;
-        };
+            .filter(|ttl| *ttl > 0)?;
         broca_core::cache_warm::check_warm_expiry(
             Some(broca_core::CacheClockReading {
                 last_sent_at_ms: send.sent_at_ms,
@@ -264,16 +263,23 @@ impl crate::registry::LineageRegistry {
             }),
             now_ms,
         )
-        .is_ok()
+        .ok()?;
+        Some(
+            broca_core::keep_warm_wait::WarmTiming::for_ttl(
+                ttl_ms,
+                executor.warm_after_send_ms(&config),
+            )
+            .next_due_ms(send.sent_at_ms),
+        )
     }
 
     /// Opens candidate store sessions under the ordinary lease in the background. The
     /// actor's open-time recovery seals crash orphans, parks held calls, and finishes pending
     /// durable tool-batch writes before it answers the status command. Finished sessions that
-    /// warm themselves also open once to rebuild their idle cache timers; their actors close on
-    /// the ordinary idle deadline. The flag that closes a one-shot session immediately after its
-    /// run is not durable, so a one-shot session whose cache policy asked for warming is re-armed
-    /// by a restart too, still bounded by its warming's cap.
+    /// warm themselves get their idle cache timers back without opening; each timer opens its
+    /// session when the warm is due. The flag that closes a one-shot session immediately after
+    /// its run is not durable, so a one-shot session whose cache policy asked for warming is
+    /// re-armed by a restart too, still bounded by its warming's cap.
     pub async fn recover_store_crash_orphans(&self) -> Result<StoreRecoverySweep, String> {
         let Some(runtime) = self.store_runtime() else {
             return Ok(StoreRecoverySweep::default());
@@ -334,6 +340,7 @@ impl crate::registry::LineageRegistry {
                     // nothing for an open to do. A registration only says a session might owe
                     // something; when it owes nothing the registration is retired here, without
                     // opening the session.
+                    let mut warm_due = None;
                     let owed = match Session::view(
                         runtime.backend(class),
                         addr.clone(),
@@ -345,12 +352,20 @@ impl crate::registry::LineageRegistry {
                         Ok(view) => {
                             let parts = runtime.parts_for(class, cipher)
                                 as &dyn broca_session_loop::parts::Parts;
-                            recovery_owed(&view.operations, runtime.billing.is_some(), Some(parts))
-                                .or_else(|| {
-                                    (warms_itself(&view.operations)
-                                        && self.idle_cache_live(&view.operations, parts, now_ms()))
-                                    .then_some("warm_cache")
-                                })
+                            let owed = recovery_owed(
+                                &view.operations,
+                                runtime.billing.is_some(),
+                                Some(parts),
+                            );
+                            if owed.is_none() && warms_itself(&view.operations) {
+                                warm_due = self.idle_warm_due_at(
+                                    &view.operations,
+                                    parts,
+                                    runtime.executor.as_ref(),
+                                    now_ms(),
+                                );
+                            }
+                            owed
                         }
                         // The session lives on another machine now, which recovers it if anything
                         // is owed; this machine can't open it.
@@ -358,6 +373,14 @@ impl crate::registry::LineageRegistry {
                         Err(SessionError::NeedsRecovery) => Some("needs_recovery"),
                         Err(error) => return Err(format!("read operational state: {error:?}")),
                     };
+                    if let Some(due_ms) = warm_due {
+                        // It stays registered, so the next boot arms its timer again.
+                        super::recovery_index::insert(&root, &addr)
+                            .map_err(|error| format!("register recovery: {error}"))?;
+                        self.handle().arm_idle_warm(&key, due_ms, now_ms());
+                        sweep.warm_armed += 1;
+                        return Ok(());
+                    }
                     let Some(opened_for) = owed else {
                         if registered.contains(&addr.0) {
                             super::recovery_index::remove(&root, &addr)
