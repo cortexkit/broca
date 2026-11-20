@@ -157,8 +157,12 @@ pub fn compute_attempt_facts<R: ChargeBasisResolver>(
             attempts: Vec::new(),
         };
     };
+    let mut owned: Vec<Vec<&ModelShare>> = vec![Vec::new(); attempts.len()];
+    for (owner, share) in owners {
+        owned[owner].push(share);
+    }
     let mut facts = Vec::with_capacity(attempts.len());
-    for (index, attempt) in attempts.iter().enumerate() {
+    for (attempt, shares) in attempts.iter().zip(&owned) {
         let Some(config) = context.config_at(attempt.seq) else {
             // An attempt before the run's first start belongs to no run here.
             return RunAttemptFacts {
@@ -166,11 +170,6 @@ pub fn compute_attempt_facts<R: ChargeBasisResolver>(
                 attempts: Vec::new(),
             };
         };
-        let shares: Vec<&ModelShare> = owners
-            .iter()
-            .filter(|(owner, _)| *owner == index)
-            .map(|(_, share)| *share)
-            .collect();
         facts.push(attempt_fact(
             source_instance_id,
             run_id,
@@ -178,7 +177,7 @@ pub fn compute_attempt_facts<R: ChargeBasisResolver>(
             &context,
             config,
             attempt,
-            &shares,
+            shares,
             resolver,
         ));
     }
@@ -200,31 +199,34 @@ fn share_owners<'s>(
     attempts: &[AttemptEvidence],
     shares: &'s [ModelShare],
 ) -> Option<Vec<(usize, &'s ModelShare)>> {
+    // Each step's attempts, in seq order, so a share looks only at its own step's.
+    let mut by_step: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (index, attempt) in attempts.iter().enumerate() {
+        by_step.entry(attempt.step_id).or_default().push(index);
+    }
     // The seq of each step's last share record, before which its next shares' attempt can't be.
     let mut claimed: HashMap<u64, u64> = HashMap::new();
+    // The attempt that owns the shares of the record at each seq.
+    let mut owner_at: HashMap<u64, usize> = HashMap::new();
     let mut owners = Vec::with_capacity(shares.len());
     for share in shares {
         let after = claimed.get(&share.step_id).copied();
         if after == Some(share.seq) {
             // Another model's share of the same request.
-            let (owner, _) = owners
-                .iter()
-                .rev()
-                .find(|(_, earlier): &&(usize, &ModelShare)| earlier.seq == share.seq)?;
-            owners.push((*owner, share));
+            owners.push((*owner_at.get(&share.seq)?, share));
             continue;
         }
-        let owner = attempts
+        let owner = by_step
+            .get(&share.step_id)?
             .iter()
-            .enumerate()
             .rev()
-            .find(|(_, attempt)| {
-                attempt.step_id == share.step_id
-                    && attempt.seq < share.seq
-                    && after.is_none_or(|after| attempt.seq > after)
-            })
-            .map(|(index, _)| index)?;
+            .copied()
+            .find(|&index| {
+                let attempt = &attempts[index];
+                attempt.seq < share.seq && after.is_none_or(|after| attempt.seq > after)
+            })?;
         claimed.insert(share.step_id, share.seq);
+        owner_at.insert(share.seq, owner);
         owners.push((owner, share));
     }
     Some(owners)

@@ -350,9 +350,9 @@ impl KeptPrompt {
     /// form (`ContentBlock::released`). Only a block equal to the window message's own block is
     /// released, so reading the window message back restores it exactly; a block the kept prompt
     /// changed (a repetition warning added to a result) stays held. `window_holds` says whether
-    /// the window message at an ordinal holds exactly this block at this index, which a block it
-    /// released earlier doesn't. Returns the released blocks by window ordinal, for the writer to
-    /// release in the window too.
+    /// the window message at an ordinal holds exactly this block at this index, or released
+    /// exactly this block earlier. Returns the released blocks by window ordinal, for the writer
+    /// to release in the window too.
     pub(crate) fn release(
         &mut self,
         blocks: &[(usize, Vec<usize>)],

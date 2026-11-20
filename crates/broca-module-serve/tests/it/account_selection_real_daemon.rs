@@ -2592,8 +2592,10 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
         .send(spec("send-relisted", None))
         .await
         .expect_err("the unserved credential refuses the first attempt");
+    // A permanent refusal goes out as `account_selection_final`, as routing's own
+    // `account_not_authorized` does.
     assert!(
-        refused.to_string().contains("account_selection_refused"),
+        refused.to_string().contains("account_selection_final"),
         "{refused}"
     );
     broca_test_support::wait_until("vault re-list after not_found", || async {

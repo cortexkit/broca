@@ -14,7 +14,9 @@ impl CredentialSource for Key {
     fn credential_id(&self) -> Option<String> {
         Some(self.0.clone())
     }
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(
+        &self,
+    ) -> Result<Option<String>, crate::system_one::credential::CredentialError> {
         panic!("stand-in must not read a secret")
     }
 }

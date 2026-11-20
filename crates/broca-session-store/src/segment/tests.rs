@@ -106,6 +106,32 @@ fn a_group_never_splits_across_blocks(cipher: Cipher) {
     assert_eq!(segment.index.blocks[0].records, 39);
 }
 
+/// A group no block can hold (65 records of 1 MiB joining one input) is refused, never sealed
+/// into a block the reader would refuse.
+#[test]
+fn a_group_too_large_for_a_block_is_refused() {
+    let mut records = vec![(1, input("start"))];
+    for seq in 2..67 {
+        records.push((
+            seq,
+            Record::ResultAppend(crate::record::ResultAppend {
+                send_id: None,
+                run_id: "r".into(),
+                tool_call_id: broca_protocol::ToolCallId(format!("c{seq}")),
+                text: "y".repeat(1 << 20),
+                notice: None,
+                written_at_ms: None,
+                ride: None,
+            }),
+        ));
+    }
+    assert_eq!(groups(&records).len(), 1);
+    assert!(matches!(
+        build(&key(Cipher::None), b"n", &records, meta()),
+        Err(SegmentError::BadRecords(_))
+    ));
+}
+
 /// Facts for `ordinal`, as a writer places them after its messages.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(std::sync::Arc::new(crate::record::EntryFacts {

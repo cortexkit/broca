@@ -2178,6 +2178,9 @@ pub struct LiveLoopExecutor<W = FileWalStore> {
     tool_name_aliases: broca_module_serve::config::ToolNameAliasesConfig,
     /// Boot-loaded wait bound shared by routing admission and new account-limit pauses.
     max_same_account_wait: broca_core::SameAccountWait,
+    /// Fork attempts whose routing admission `call_fork` couldn't release, by admission id,
+    /// until the fork manager asks (`fork_release_failed`).
+    unreleased_forks: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// The executor also needs the file store's bounded prompt reader and installation path.
@@ -2220,6 +2223,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
             anthropic_fallbacks: Default::default(),
             tool_name_aliases: Default::default(),
             max_same_account_wait: Default::default(),
+            unreleased_forks: Default::default(),
         }
     }
 
@@ -3905,7 +3909,10 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                             resets_at_ms: None,
                             routing_detail: None,
                             decision_id: decision.decision_id.clone(),
-                            class: ErrorClass::Auth,
+                            // As routing's own `account_not_authorized` is classed: operator
+                            // policy keeps the credential from this principal, and signing in
+                            // can't change that.
+                            class: ErrorClass::Permanent,
                         },
                     ));
                 }
@@ -4112,6 +4119,13 @@ impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
         job: broca_module::executor::ForkReleaseJob,
     ) -> Result<(), String> {
         self.release_fork(job).await
+    }
+
+    fn fork_release_failed(&self, admission_id: &str) -> bool {
+        self.unreleased_forks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(admission_id)
     }
     fn head_selection_wire(
         &self,

@@ -517,26 +517,42 @@ impl LateResultsIntake {
     }
 
     /// Run the module's puller until nothing keeps it, then do one last pull and ack, release the
-    /// slot and stop. It never restarts itself.
+    /// slot and stop.
+    ///
+    /// A hold that arrives while the puller is finishing finds its claim still in place and
+    /// leaves the feed to it ([`Self::ensure_puller`] answers `Held`). So after giving the claim
+    /// up the puller looks once more, and takes the claim back and goes on when the feed is
+    /// needed again and no other puller has started; otherwise that hold's result would never be
+    /// pulled.
     fn spawn(self: &Arc<Self>, module: String, puller: Arc<Puller>) {
         let intake = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                if puller.is_stopped() {
+                loop {
+                    if puller.is_stopped() {
+                        break;
+                    }
+                    let needed = intake.module_needs_feed(&module).await.unwrap_or(true);
+                    if !needed {
+                        break;
+                    }
+                    intake.tick_with(&module, &puller).await;
+                    if puller.is_stopped() {
+                        break;
+                    }
+                    tokio::time::sleep(puller.interval()).await;
+                }
+                let _ = intake.final_pull(&module).await;
+                intake.pullers.lock().expect("pullers").remove(&module);
+                if puller.is_stopped() || !intake.module_needs_feed(&module).await.unwrap_or(true) {
                     break;
                 }
-                let needed = intake.module_needs_feed(&module).await.unwrap_or(true);
-                if !needed {
+                let mut pullers = intake.pullers.lock().expect("pullers");
+                if pullers.contains_key(&module) {
                     break;
                 }
-                intake.tick_with(&module, &puller).await;
-                if puller.is_stopped() {
-                    break;
-                }
-                tokio::time::sleep(puller.interval()).await;
+                pullers.insert(module.clone(), Arc::clone(&puller));
             }
-            let _ = intake.final_pull(&module).await;
-            intake.pullers.lock().expect("pullers").remove(&module);
         });
     }
 

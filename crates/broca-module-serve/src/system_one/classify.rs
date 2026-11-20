@@ -436,6 +436,11 @@ pub(super) fn map_reply(
             errors::AUTH_FAILED,
             format!("the provider credential could not be read: {message}"),
         )),
+        // A local outage, not a sign-in problem: as a routed call answers the same failure.
+        ProviderReply::CredentialUnavailable(message) => Err(ItemError::for_code(
+            errors::PROVIDER_ERROR,
+            format!("credential read unavailable: {message}"),
+        )),
     }
 }
 
@@ -454,7 +459,9 @@ pub(super) fn reply_spend(reply: &ProviderReply) -> ItemSpend {
                 ItemSpend::Nothing
             };
         }
-        ProviderReply::Credential(_) | ProviderReply::Unconnected(_) => return ItemSpend::Nothing,
+        ProviderReply::Credential(_)
+        | ProviderReply::CredentialUnavailable(_)
+        | ProviderReply::Unconnected(_) => return ItemSpend::Nothing,
         ProviderReply::Answered(_)
         | ProviderReply::AttributedAnswer { .. }
         | ProviderReply::Transport(_) => return ItemSpend::Unknown,
@@ -533,6 +540,7 @@ async fn call_provider(
                 Some("transport_error".into())
             }
             ProviderReply::Credential(_) => Some("auth_failed".into()),
+            ProviderReply::CredentialUnavailable(_) => Some("credential_unavailable".into()),
         };
         if let Some(code) = code {
             service

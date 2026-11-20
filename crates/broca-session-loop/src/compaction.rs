@@ -1328,7 +1328,12 @@ async fn release_unread<W: Writer>(
         conversation
             .window_message(ordinal)
             .and_then(|message| message.blocks().nth(index))
-            .is_some_and(|held| matches!(held, BlockRef::Held(held) if held == block))
+            .is_some_and(|window| match window {
+                BlockRef::Held(held) => held == block,
+                // Released by an earlier run: this run's prompt copied the block in whole when it
+                // read the window back, and releases it again when it is that same block.
+                BlockRef::Released(shape) => shape.is_of(block),
+            })
     });
     if !released.is_empty() {
         writer.release(&released).await?;

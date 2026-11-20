@@ -18,17 +18,19 @@ pub(crate) fn first_answer(
     start: usize,
     session: &str,
 ) -> Option<usize> {
-    let episode = conversation
-        .episodes
-        .iter()
-        .find(|episode| episode.start as usize == start + 1)?;
+    // The window's runs are in the order they started, so their starts never decrease: a
+    // binary search finds the first run starting at `start` and the first one after it. A
+    // request asks this for every run on every step.
+    let episodes = &conversation.episodes;
+    let at = episodes.partition_point(|episode| (episode.start as usize) < start + 1);
+    let episode = episodes
+        .get(at)
+        .filter(|episode| episode.start as usize == start + 1)?;
     if let Some(ordinal) = episode.first_model_answer {
         return Some(ordinal as usize - 1);
     }
-    let end = conversation
-        .episodes
-        .iter()
-        .find(|next| next.start > episode.start)
+    let end = episodes[at..]
+        .get(episodes[at..].partition_point(|next| next.start <= episode.start))
         .map_or(u64::MAX, |next| next.start);
     let mut missing = None;
     for ordinal in episode.start.max(conversation.window_start())..end.min(conversation.placed + 1)

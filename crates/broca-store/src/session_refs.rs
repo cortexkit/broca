@@ -1,12 +1,13 @@
 //! Additive, durable agent-data discovery projection. No WAL payload is cached.
 use crate::{SessionInventory, SqliteStore, StoreError};
+use broca_core::agent_session_ref;
+#[cfg(test)]
+use broca_core::session_addr;
 use broca_core::SessionRefIndex;
-#[cfg(test)]
-use broca_core::{agent_session_ref, session_addr};
 use broca_protocol::BindIdentity;
-#[cfg(test)]
 use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 
 pub use broca_core::SessionRefs;
@@ -49,6 +50,7 @@ fn init_schema_measured(
             PRIMARY KEY(session_ref,address)
          ) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS agent_data_session_address ON agent_data_session_ref(address)",
+        "CREATE TABLE IF NOT EXISTS agent_data_session_ref_v2_rule (id INTEGER PRIMARY KEY CHECK(id=1), probe TEXT NOT NULL, sessions INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS agent_data_projection (id INTEGER PRIMARY KEY CHECK(id=1), backfilled INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS agent_data_census (address TEXT PRIMARY KEY, covered INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS agent_data_census_pending ON agent_data_census(address) WHERE covered=0",
@@ -98,7 +100,32 @@ fn init_schema_measured(
 /// Rebuild external aliases at startup without changing stored WAL addresses.
 /// Multiple addresses deliberately survive under one alias so resolution can
 /// refuse a pair of harness/session names shared by different roots.
+///
+/// Every insert keeps the aliases current, so a rebuild is needed only when the rule deriving an
+/// alias changed since the last one, or when sessions were added by a build that keeps no rule
+/// (an older one, after a rollback). The table records the alias of a fixed identity under the
+/// rule of the build that rebuilt, and how many sessions there were: a start that finds both
+/// unchanged skips the walk.
 fn rekey_v2(conn: &Connection) -> Result<(), StoreError> {
+    let probe = agent_session_ref(&BindIdentity::new(
+        "/alias-rule-probe",
+        "alias-rule-probe",
+        "alias-rule-probe",
+    ));
+    let sessions: i64 =
+        conn.query_row("SELECT count(*) FROM agent_data_session_ref", [], |row| {
+            row.get(0)
+        })?;
+    let recorded: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT probe, sessions FROM agent_data_session_ref_v2_rule WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if recorded == Some((probe.clone(), sessions)) {
+        return Ok(());
+    }
     let rows = conn
         .prepare("SELECT address,project_root,harness,session FROM agent_data_session_ref")?
         .query_map([], |row| {
@@ -115,6 +142,10 @@ fn rekey_v2(conn: &Connection) -> Result<(), StoreError> {
     for (address, session) in rows {
         write::insert_v2(conn, &address, &session)?;
     }
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_data_session_ref_v2_rule(id,probe,sessions) VALUES(1,?1,?2)",
+        params![probe, sessions],
+    )?;
     Ok(())
 }
 

@@ -69,6 +69,8 @@ pub(crate) use warming::Warming;
 pub use warming::{warm_count, warm_spend};
 mod close_out;
 use close_out::{never_dispatched_close_out, open_batch_close_out};
+mod call_plan;
+use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
 mod start_config;
@@ -1055,7 +1057,7 @@ where
     let compaction = compaction_ctx(writer, parts, &admission, seams, false).await?;
     let finished = match resolution {
         Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
-        Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
+        Resolution::Idle(reason) => finish_idle(writer, seams, &admission, reason).await,
         Resolution::Interrupted(_) => {
             close_interrupted(writer, seams, &admission.run_id, None).await
         }
@@ -2217,6 +2219,25 @@ where
         let started = run_state(writer).open_batch.is_some();
         let known = known_calls(writer);
         let planned = planned_calls(writer);
+        // A stop asked for now and acknowledged before the crash owes the calls nothing, as a
+        // live stop between the answer and the batch does: they close as not run. The durable
+        // request is read here too, so a resume never sends after that acknowledgement even if
+        // its cancel token was made fresh.
+        let cancelled_now = seams.cancel.is_cancelled()
+            || run_state(writer).cancel == Some(broca_session_store::record::CancelPoint::Now);
+        if cancelled_now || seams.stop.is_cancelled() {
+            let calls = if started { &unsent } else { &planned };
+            return stopped_batch_in(
+                writer,
+                seams,
+                &admission.run_id,
+                step_id,
+                calls,
+                cancelled_now,
+                !started,
+            )
+            .await;
+        }
         match batch(
             writer,
             seams,
@@ -2237,14 +2258,19 @@ where
         )
         .await?
         {
-            BatchOutcome::Closed { unknown: false } => {}
-            BatchOutcome::Closed { unknown: true } => {
+            BatchOutcome::Closed { interrupted: false } => {}
+            BatchOutcome::Closed { interrupted: true } => {
                 return finish_in_doubt(writer, seams, &admission.run_id).await;
             }
             BatchOutcome::Held(finished) | BatchOutcome::Stopped(finished) => return Ok(finished),
             BatchOutcome::Cancelled(closed) => {
                 let finished =
                     finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await?;
+                withdraw(seams, &closed).await;
+                return Ok(finished);
+            }
+            BatchOutcome::InDoubt(closed) => {
+                let finished = finish_in_doubt(writer, seams, &admission.run_id).await?;
                 withdraw(seams, &closed).await;
                 return Ok(finished);
             }
@@ -3363,14 +3389,19 @@ where
         )
         .await?
         {
-            BatchOutcome::Closed { unknown: false } => {}
-            BatchOutcome::Closed { unknown: true } => {
+            BatchOutcome::Closed { interrupted: false } => {}
+            BatchOutcome::Closed { interrupted: true } => {
                 return finish_in_doubt(writer, seams, &admission.run_id).await;
             }
             BatchOutcome::Held(finished) | BatchOutcome::Stopped(finished) => return Ok(finished),
             BatchOutcome::Cancelled(closed) => {
                 let finished =
                     finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await?;
+                withdraw(seams, &closed).await;
+                return Ok(finished);
+            }
+            BatchOutcome::InDoubt(closed) => {
+                let finished = finish_in_doubt(writer, seams, &admission.run_id).await?;
                 withdraw(seams, &closed).await;
                 return Ok(finished);
             }
@@ -3710,6 +3741,10 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
         runs.push(((episode.start - 1) as usize, render, clean));
     }
     let mut high = sealed_high;
+    // The run that placed a message is the last one starting at or before it. Runs are in the
+    // order they started and messages in the order they were placed, so one pass finds each.
+    let mut placing = (false, false);
+    let mut next_run = runs.iter().peekable();
     for (index, message) in conversation.messages.iter().enumerate() {
         if let Some(base) = conversation
             .entries
@@ -3720,12 +3755,10 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
             high = high.max(base);
         }
         let index = index + (start - 1) as usize;
-        // The run that placed this message is the last one starting at or before it.
-        let (render, clean) = runs
-            .iter()
-            .rev()
-            .find(|(first, _, _)| *first <= index)
-            .map_or((false, false), |(_, render, clean)| (*render, *clean));
+        while let Some((_, render, clean)) = next_run.next_if(|(first, _, _)| *first <= index) {
+            placing = (*render, *clean);
+        }
+        let (render, clean) = placing;
         high = crate::window_shape::runner_high(message, ComputedRules { render, clean }, high)
             .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
     }
@@ -4483,16 +4516,20 @@ pub(crate) struct Known {
 
 /// How a tool batch ended.
 enum BatchOutcome {
-    /// Every call has its outcome; `unknown` when one may have run without its result coming
-    /// back, which stops the run, because feeding that call's failure to the model would invite
-    /// it to run the call again.
-    Closed { unknown: bool },
+    /// Every call has its outcome; `interrupted` when the run must stop for review after the
+    /// batch: a call may have run without its result coming back (feeding that call's failure
+    /// to the model would invite it to run the call again), or the batch's scope was gone when
+    /// it started, so none of its calls could run and later ones won't either.
+    Closed { interrupted: bool },
     /// Only calls a provider holds were still waiting, so the run paused for their late
     /// results.
     Held(Finished),
     /// The caller cancelled while a provider held calls: they were closed and the run must end
     /// cancelled, then ask each provider to withdraw its call.
     Cancelled(Vec<ProviderHeldReply>),
+    /// A call's outcome is unknown while a provider held others: they were closed and the run
+    /// must end interrupted for review, then ask each provider to withdraw its call.
+    InDoubt(Vec<ProviderHeldReply>),
     /// A stop or the caller's cancel cut a pre-tool hook short: the batch closed unsent and
     /// the run ended.
     Stopped(Finished),
@@ -4548,6 +4585,12 @@ where
         .batch_started_guarded(&ctx, planned, manifest, &guard)
         .await
         .err();
+    // The scope was gone when the batch started: each call gets its `route_drained` result
+    // (`plan_call`) and the run stops interrupted after the batch.
+    let scope_drained = matches!(
+        refusal,
+        Some(broca_core::tool_plane::ToolPlaneError::ScopeDrained { .. })
+    );
     let sequential = calls.iter().any(|call| {
         manifest
             .get(&call.tool_name)
@@ -4757,7 +4800,9 @@ where
         if let Some(changes) = changes {
             changes.tell(writer, seams).await;
         }
-        return Ok(BatchOutcome::Closed { unknown: false });
+        return Ok(BatchOutcome::Closed {
+            interrupted: scope_drained,
+        });
     }
     // The calls that are sent, with their keys: a known call's from its intent, a new call's
     // from the intent just written.
@@ -4830,6 +4875,16 @@ where
         Dispatched::All { answers, closed } => (answers, false, closed),
         Dispatched::Held(answers) => (answers, true, Vec::new()),
     };
+    // Calls a provider still holds. A synthesized terminal for a repeat of one of their ids
+    // waits until the held call's own result is stored: an outcome names only its id, and
+    // reading the session back gives it to the first copy still open, which would be the held
+    // call.
+    let still_held: std::collections::HashSet<&ToolCallId> = sending
+        .iter()
+        .zip(&answers)
+        .filter(|(_, answer)| answer.is_none())
+        .map(|(call, _)| &call.tool_call_id)
+        .collect();
     // The answers, back in the message's order, with each synthesized terminal in its place.
     let mut answers = answers.into_iter();
     let mut records = Vec::new();
@@ -4843,6 +4898,8 @@ where
                 };
                 unknown |= answer.outcome == CallOutcome::Unknown;
             }
+            CallPlan::Synthetic { result, .. }
+                if paused && still_held.contains(&result.tool_call_id) => {}
             CallPlan::Synthetic { result, reason } => terminal_with_reason(
                 &mut records,
                 run_id,
@@ -4923,284 +4980,16 @@ where
         changes.tell(writer, seams).await;
     }
     if !closed.is_empty() {
-        return Ok(BatchOutcome::Cancelled(closed));
-    }
-    Ok(BatchOutcome::Closed { unknown })
-}
-
-/// What a batch does with one call, decided before anything is written.
-enum CallPlan {
-    /// Sent to the tool plane; its intent records what the pre-tool hooks did, if any.
-    Dispatch(Option<Value>),
-    /// Never sent, durable at once: the plane can't be reached, the call is invalid, or the
-    /// approval policy denied it. The outcome records what the pre-tool hooks did, if any.
-    NoDispatch(NoDispatchReason, Option<Value>),
-    /// Never sent because a pre-tool hook refused it, durable at once with the refusal's result
-    /// and reason code, and what the hooks did.
-    HookTerminal {
-        result: ToolResult,
-        reason: String,
-        hooks: Option<Value>,
-    },
-    /// Never sent, answered by the loop with `result`: a repeated call id, or a refusal the
-    /// plane named.
-    Synthetic {
-        result: ToolResult,
-        reason: Option<String>,
-    },
-}
-
-/// Decides each call's plan in the message's order, or `None` when a stop or the caller's
-/// cancel cuts a pre-tool hook short, as today's gate does: a call a resume
-/// already knows is sent as recorded; a repeated call id gets an error; a refused batch refuses
-/// every call; a call the run's manifest doesn't allow is never sent. A valid call then goes
-/// through the pre-tool mutate hooks, a second manifest check, the approval policy and the
-/// validate hooks; its input in `calls` becomes what those left, so its intent records it.
-#[allow(clippy::too_many_arguments)]
-async fn plan_calls(
-    calls: &mut [ToolCall],
-    known: &[Known],
-    refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
-    manifest: &ToolManifest,
-    approval: &dyn ApprovalPolicy,
-    hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
-    step_id: u64,
-) -> Result<Option<Vec<CallPlan>>, LoopError> {
-    let mut seen = std::collections::HashSet::new();
-    let mut plans = Vec::with_capacity(calls.len());
-    for call in calls.iter_mut() {
-        let first = seen.insert(call.tool_call_id.clone());
-        let plan = match gate_call(call, first, known, refusal, manifest) {
-            Some(plan) => plan,
-            None => match gate_hooked(call, manifest, approval, hooks, step_id).await? {
-                Some(plan) => plan,
-                // A stop or the caller's cancel cut a pre-tool hook short: no call of the
-                // batch is sent.
-                None => return Ok(None),
-            },
-        };
-        plans.push(plan);
-    }
-    Ok(Some(plans))
-}
-
-/// A valid call through the pre-tool hooks and the approval policy.
-async fn gate_hooked(
-    call: &mut ToolCall,
-    manifest: &ToolManifest,
-    approval: &dyn ApprovalPolicy,
-    hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
-    step_id: u64,
-) -> Result<Option<CallPlan>, LoopError> {
-    use broca_core::hooks::{Subject, Trace};
-    use cortexkit_role_step_transform_provider::subscription::Phase;
-    let original = call.input.clone();
-    let mut trace = Trace::default();
-    let metadata = |trace: &Trace, input: &Value, intentless: bool| {
-        trace
-            .metadata(original.clone().parse(), input.clone(), intentless)
-            .map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes"))
-    };
-    if let Some(runtime) = hooks {
-        let output = runtime
-            .chain(
-                broca_core::tool_results::pre_tool_subject(StepId(step_id), call, Phase::Mutate),
-                trace,
-                |_| true,
-            )
-            .await;
-        trace = output.trace;
-        if output.cancellation.is_some() {
-            return Ok(None);
-        }
-        if let Subject::PreTool { input, .. } = output.subject {
-            call.input = input.into();
-        }
-        if let Some((provider, text, unavailable)) = output.refusal {
-            return Ok(Some(hook_refused(
-                call,
-                &trace,
-                &provider,
-                &text,
-                unavailable,
-                &metadata,
-            )));
-        }
-    }
-    if let Err(invalid) = manifest.validate_call(call) {
-        return Ok(Some(CallPlan::NoDispatch(
-            NoDispatchReason::ValidationFailed {
-                detail: invalid.to_string(),
-            },
-            metadata(&trace, &(call.input).parse(), true),
-        )));
-    }
-    match approval.decide(call).await {
-        ApprovalResponse::Allow { .. } => {}
-        ApprovalResponse::AllowNarrowed { input, .. } => call.input = input.into(),
-        ApprovalResponse::Deny { reason, .. } => {
-            return Ok(Some(CallPlan::NoDispatch(
-                NoDispatchReason::Denied { reason },
-                metadata(&trace, &(call.input).parse(), true),
-            )));
-        }
-    }
-    if let Some(runtime) = hooks {
-        let output = runtime
-            .chain(
-                broca_core::tool_results::pre_tool_subject(StepId(step_id), call, Phase::Validate),
-                trace,
-                |_| true,
-            )
-            .await;
-        trace = output.trace;
-        if output.cancellation.is_some() {
-            return Ok(None);
-        }
-        if let Some((provider, text, unavailable)) = output.refusal {
-            return Ok(Some(hook_refused(
-                call,
-                &trace,
-                &provider,
-                &text,
-                unavailable,
-                &metadata,
-            )));
-        }
-    }
-    Ok(Some(CallPlan::Dispatch(metadata(
-        &trace,
-        &(call.input).parse(),
-        false,
-    ))))
-}
-
-/// The plan for a call a pre-tool hook refused: today's refusal result and reason code.
-fn hook_refused(
-    call: &ToolCall,
-    trace: &broca_core::hooks::Trace,
-    provider: &str,
-    text: &str,
-    unavailable: bool,
-    metadata: &dyn Fn(&broca_core::hooks::Trace, &Value, bool) -> Option<Value>,
-) -> CallPlan {
-    let (result, reason) =
-        broca_core::tool_results::pre_tool_refusal(call, provider, text, unavailable);
-    CallPlan::HookTerminal {
-        result,
-        reason: reason.into(),
-        hooks: metadata(trace, &(call.input).parse(), true),
-    }
-}
-
-/// The run's hook plan, from its frozen manifest. A plan that declares hooks without a plane to
-/// call them refuses the run, as today's loop does; one whose hooks ask a person to approve a
-/// call isn't supported yet.
-fn hook_plan<P, T>(
-    admission: &Admission,
-    seams: &Seams<'_, P, T>,
-) -> Result<Option<broca_core::hooks::HookPlan>, LoopError> {
-    let Some(plan) = broca_core::fresh_start::admitted_hook_plan(
-        admission.manifest.as_ref(),
-        seams.hook_plane.is_some(),
-    )
-    .map_err(LoopError::Refused)?
-    else {
-        return Ok(None);
-    };
-    if plan.approves() {
-        return Err(LoopError::Unsupported(
-            "hooks that ask a person to approve a call",
-        ));
-    }
-    Ok(Some(plan))
-}
-
-/// The checks that come before the approval policy. `None` means the call reaches the policy. A
-/// call a resume already knows is sent as it was, without asking the policy again.
-fn gate_call(
-    call: &ToolCall,
-    first: bool,
-    known: &[Known],
-    refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
-    manifest: &ToolManifest,
-) -> Option<CallPlan> {
-    use broca_core::tool_plane::ToolPlaneError;
-    if known.iter().any(|known| known.id == call.tool_call_id) {
-        return Some(CallPlan::Dispatch(None));
-    }
-    if !first {
-        return Some(CallPlan::Synthetic {
-            result: error_result(&call.tool_call_id, "duplicate tool_call_id from provider"),
-            reason: None,
+        // Held calls close on the caller's cancel, or because another call's outcome is unknown.
+        return Ok(if unknown && !seams.cancel.is_cancelled() {
+            BatchOutcome::InDoubt(closed)
+        } else {
+            BatchOutcome::Cancelled(closed)
         });
     }
-    match refusal {
-        None => {}
-        Some(ToolPlaneError::Permanent { code, detail }) => {
-            return Some(CallPlan::Synthetic {
-                result: ToolResult {
-                    tool_call_id: call.tool_call_id.clone(),
-                    output: broca_core::tool_plane::permanent_refusal_output(code, detail.as_ref()),
-                    is_error: true,
-                },
-                reason: Some(code.clone()),
-            });
-        }
-        Some(ToolPlaneError::Unavailable(_)) => {
-            // The stable message, which sessions already on disk hold as their reason.
-            return Some(CallPlan::NoDispatch(
-                NoDispatchReason::Unavailable {
-                    detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
-                    module: None,
-                    code: None,
-                    refusal_detail: None,
-                },
-                None,
-            ));
-        }
-        Some(ToolPlaneError::ModuleUnavailable {
-            module,
-            code,
-            detail,
-        }) => {
-            return Some(CallPlan::NoDispatch(
-                NoDispatchReason::Unavailable {
-                    detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
-                    module: Some(module.clone()),
-                    code: Some(code.clone()),
-                    refusal_detail: (!detail.is_empty()).then(|| detail.clone()),
-                },
-                None,
-            ));
-        }
-        Some(error @ ToolPlaneError::ScopeRefused { .. }) => {
-            return Some(CallPlan::NoDispatch(
-                NoDispatchReason::Unavailable {
-                    detail: error.to_string(),
-                    module: None,
-                    code: None,
-                    refusal_detail: None,
-                },
-                None,
-            ));
-        }
-        Some(ToolPlaneError::ScopeDrained { reason }) => {
-            return Some(CallPlan::Synthetic {
-                result: broca_core::tool_results::route_drained_result(&call.tool_call_id, reason),
-                reason: Some(reason.clone()),
-            });
-        }
-    }
-    if let Err(invalid) = manifest.validate_call(call) {
-        return Some(CallPlan::NoDispatch(
-            NoDispatchReason::ValidationFailed {
-                detail: invalid.to_string(),
-            },
-            None,
-        ));
-    }
-    None
+    Ok(BatchOutcome::Closed {
+        interrupted: unknown || scope_drained,
+    })
 }
 
 /// A call that was never sent: today's no-dispatch result in the transcript and its reason in
@@ -5726,16 +5515,36 @@ async fn stopped_batch<W: Writer, P, T>(
     calls: &[ToolCall],
     cancelled: bool,
 ) -> Result<Finished, LoopError> {
-    let batch_id = format!("{run_id}-b{step_id}");
+    stopped_batch_in(writer, seams, run_id, step_id, calls, cancelled, true).await
+}
+
+/// [`stopped_batch`], also for a batch that already started (`start_batch` false), whose
+/// start is already durable: then only `calls`, the ones never sent, are closed.
+async fn stopped_batch_in<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    step_id: u64,
+    calls: &[ToolCall],
+    cancelled: bool,
+    start_batch: bool,
+) -> Result<Finished, LoopError> {
+    let batch_id = match run_state(writer).open_batch.as_ref() {
+        Some(open) if !start_batch => open.batch_id.clone(),
+        _ => format!("{run_id}-b{step_id}"),
+    };
     let now = (seams.now_ms)();
-    let mut records = vec![Record::BatchStart(BatchStart {
-        run_id: run_id.into(),
-        batch_id: batch_id.clone(),
-        step_id,
-        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-        mid: None,
-        shown_tags: Vec::new(),
-    })];
+    let mut records = Vec::new();
+    if start_batch {
+        records.push(Record::BatchStart(BatchStart {
+            run_id: run_id.into(),
+            batch_id: batch_id.clone(),
+            step_id,
+            planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+            mid: None,
+            shown_tags: Vec::new(),
+        }));
+    }
     let mut seen = std::collections::HashSet::new();
     for call in calls {
         // A repeated call id still gets today's duplicate error, not "not run".
@@ -6227,13 +6036,23 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
         // A caller's cancel closes every call a provider holds: it gets the close result, durable
         // at once, and its provider is asked to withdraw it after the run's end. Calls still
         // running finish as usual.
-        if seams.cancel.is_cancelled() && !open_held.is_empty() {
+        //
+        // A batch with a call whose outcome is unknown closes its held calls the same way once
+        // only they still run: the run ends interrupted for review, and a late answer can't
+        // resume a run in doubt, so waiting on them would wait forever.
+        let in_doubt = tripped && jobs.len() == open_held.len();
+        if (seams.cancel.is_cancelled() || in_doubt) && !open_held.is_empty() {
+            let reason = if seams.cancel.is_cancelled() {
+                RunFinishReason::Cancelled
+            } else {
+                RunFinishReason::Interrupted
+            };
             for id in std::mem::take(&mut open_held) {
                 let index = calls
                     .iter()
                     .position(|call| call.tool_call_id == id)
                     .expect("a held call is one of the batch's");
-                let (result, outcome, code) = held_close_result(&id);
+                let (result, outcome, code) = held_close_result(&id, reason);
                 let mut records = Vec::new();
                 terminal_with_reason(
                     &mut records,
@@ -6268,11 +6087,11 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                         .into()
                 } else if let Some(reply) = held {
                     match seams.held {
-                        Some(lifecycle) => resolve(
-                            call,
-                            checked(plan.ctx, lifecycle.wait(plan.ctx, call, reply).await),
-                        )
-                        .into(),
+                        Some(lifecycle) => {
+                            let waited =
+                                checked(plan.ctx, lifecycle.wait(plan.ctx, call, reply).await);
+                            answered(plan, call, key, waited).await
+                        }
                         None => std::future::pending().await,
                     }
                 } else {
@@ -6401,29 +6220,18 @@ async fn settle<W: Writer, P, T: ToolPlane>(
     let durable = open_held.contains(&id) || yielded;
     if durable {
         let mut records = Vec::new();
-        if yielded {
-            terminal_with_reason(
-                &mut records,
-                plan.run_id,
-                plan.batch_id,
-                result,
-                outcome,
-                reason,
-                Some((seams.now_ms)()),
-            );
-            if let Some(Record::ToolOutcome(record)) = records.last_mut() {
-                record.hooks = hooks.map(Into::into);
-                record.yielded_by = yielded_by.clone();
-            }
-        } else {
-            terminal(
-                &mut records,
-                plan.run_id,
-                plan.batch_id,
-                result,
-                outcome,
-                (seams.now_ms)(),
-            );
+        terminal_with_reason(
+            &mut records,
+            plan.run_id,
+            plan.batch_id,
+            result,
+            outcome,
+            reason,
+            Some((seams.now_ms)()),
+        );
+        if let Some(Record::ToolOutcome(record)) = records.last_mut() {
+            record.hooks = hooks.map(Into::into);
+            record.yielded_by = yielded_by.clone();
         }
         writer.append(&records, true).await?;
         open_held.retain(|held| *held != id);
@@ -6474,9 +6282,11 @@ async fn withdraw<P, T>(seams: &Seams<'_, P, T>, closed: &[ProviderHeldReply]) {
 
 /// The result, outcome and code a held call gets when a cancel closes it, as today's loop
 /// closes one.
-fn held_close_result(id: &ToolCallId) -> (ToolResult, CallOutcome, &'static str) {
-    let (result, _, code) =
-        broca_core::tool_results::provider_held_close_result(id, RunFinishReason::Cancelled);
+fn held_close_result(
+    id: &ToolCallId,
+    reason: RunFinishReason,
+) -> (ToolResult, CallOutcome, &'static str) {
+    let (result, _, code) = broca_core::tool_results::provider_held_close_result(id, reason);
     (result, CallOutcome::Interrupted, code)
 }
 
@@ -6535,12 +6345,25 @@ async fn dispatch_one<T: ToolPlane>(
         call_key,
         held_recorder: Some(recorder),
     };
-    match checked(
+    let sent = checked(
         plan.ctx,
         tools
             .dispatch_guarded(plan.ctx, call, Some(key), plan.guard)
             .await,
-    ) {
+    );
+    answered(plan, call, call_key, sent).await
+}
+
+/// What a call's provider answered, as the batch takes it. A result goes through the post-tool
+/// hooks the plan subscribes for its tool, whether it came back on the dispatch or later, after
+/// a hold: a hook that edits or withholds a result must see every result the model will.
+async fn answered(
+    plan: &DispatchPlan<'_>,
+    call: &ToolCall,
+    call_key: &str,
+    answer: DispatchResult,
+) -> Resolved {
+    match answer {
         DispatchResult::Completed(result) => {
             post_tool(plan.hooks, plan.step_id, call, call_key, result).await
         }
@@ -6549,6 +6372,13 @@ async fn dispatch_one<T: ToolPlane>(
             yielded_by: Some(carrier),
             ..post_tool(plan.hooks, plan.step_id, call, call_key, result).await
         },
+        DispatchResult::ScopeDrained { ref reason, .. } => {
+            let reason = Some(reason.clone());
+            Resolved {
+                reason,
+                ..resolve(call, answer).into()
+            }
+        }
         other => resolve(call, other).into(),
     }
 }
@@ -6673,10 +6503,19 @@ fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome)
             )),
             CallOutcome::Unknown,
         ),
-        // A drained scope route ends the run differently; not handled by this build.
-        DispatchResult::ScopeDrained { reason, .. } => (
+        // Never sent, so the refusal is definite: the model sees it and the run goes on.
+        DispatchResult::ScopeDrained {
+            reason,
+            sent: false,
+        } => (
+            broca_core::tool_results::route_drained_result(&call.tool_call_id, &reason),
+            CallOutcome::Completed,
+        ),
+        // Sent with no result: the side effect may have applied, as with any lost reply.
+        DispatchResult::ScopeDrained { reason, sent: true } => (
             error(format!(
-                "tool outcome unknown (interrupted for review): {reason}"
+                "tool outcome unknown (interrupted for review): its route was drained \
+                 ({reason}) after the call was sent"
             )),
             CallOutcome::Unknown,
         ),
@@ -6812,6 +6651,40 @@ async fn finish<W: Writer, P, T>(
 ) -> Result<Finished, LoopError> {
     let record = run_end(writer, run_id, reason, (seams.now_ms)());
     append_end(writer, run_id, vec![record]).await?;
+    Ok(finished(writer, reason))
+}
+
+/// Ends a run a crash left idle: its last step answered without calls, and the run's end was
+/// never written. A completed run admitted with structured output records what it produced with
+/// that end, as the step would have: the step writes both in one barrier, so neither is durable.
+async fn finish_idle<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    reason: RunFinishReason,
+) -> Result<Finished, LoopError> {
+    let mut records = Vec::new();
+    if reason == RunFinishReason::Completed {
+        if let Some(frozen) = structured_of(admission) {
+            let text = (frozen.mode == broca_protocol::structured_output::Mode::FinalText)
+                .then(|| writer.conversation().newest().cloned())
+                .flatten()
+                .filter(|message| message.role == Role::Assistant)
+                .map(|message| broca_core::structured_output::joined_text_of(&message.content));
+            records.push(structured_result(
+                &admission.run_id,
+                broca_protocol::structured_output::result(
+                    &frozen,
+                    true,
+                    None,
+                    text.as_deref(),
+                    Vec::new(),
+                ),
+            ));
+        }
+    }
+    records.push(run_end(writer, &admission.run_id, reason, (seams.now_ms)()));
+    append_end(writer, &admission.run_id, records).await?;
     Ok(finished(writer, reason))
 }
 

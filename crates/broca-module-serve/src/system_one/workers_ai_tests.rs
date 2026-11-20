@@ -214,11 +214,15 @@ impl CredentialSource for Vaulted {
         Some(CREDENTIAL_ID.to_owned())
     }
 
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(
+        &self,
+    ) -> Result<Option<String>, crate::system_one::credential::CredentialError> {
         Ok(Some(TOKEN.to_owned()))
     }
 
-    async fn secret(&self) -> Result<Option<ProviderSecret>, String> {
+    async fn secret(
+        &self,
+    ) -> Result<Option<ProviderSecret>, crate::system_one::credential::CredentialError> {
         Ok(Some(ProviderSecret {
             token: TOKEN.to_owned(),
             account_id: self.account_id.clone(),

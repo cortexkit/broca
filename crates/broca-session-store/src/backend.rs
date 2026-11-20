@@ -1053,6 +1053,28 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     crate::durable::sync_dir(path)
 }
 
+/// `create_dir_all` that also makes each folder it creates durable in its parent. A new
+/// session's `heads/<addr>`, `logs/<addr>` and object folders are entries in folders that
+/// already existed; syncing the new folder itself doesn't keep its entry through a power loss.
+fn create_dir_durably(dir: &Path) -> io::Result<()> {
+    let mut created = Vec::new();
+    let mut at = Some(dir);
+    while let Some(path) = at.filter(|path| !path.exists()) {
+        created.push(path);
+        at = path.parent();
+    }
+    if created.is_empty() {
+        return Ok(());
+    }
+    broca_owner_only::create_dir_all(dir)?;
+    for path in created {
+        if let Some(parent) = path.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 /// Writes a head file, its version then its bytes, as `name` in `dir`: to the temporary file
 /// `temp` first, synced, then renamed into place, and the folder synced.
 fn write_head_file(
@@ -1148,7 +1170,7 @@ impl SessionBackend for LocalBackend {
         }
         let dir = self.head_dir(s);
         let versions = dir.join(VERSIONS_DIR);
-        broca_owner_only::create_dir_all(&versions)?;
+        create_dir_durably(&versions)?;
         // The version's own file first, so `head` never names a version that isn't kept.
         write_head_file(
             &versions,
@@ -1180,7 +1202,7 @@ impl SessionBackend for LocalBackend {
     ) -> Result<(), BackendError> {
         self.fence(s, at)?;
         let dir = self.log_dir(s);
-        broca_owner_only::create_dir_all(&dir)?;
+        create_dir_durably(&dir)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1298,7 +1320,7 @@ impl SessionBackend for LocalBackend {
         let dir = path
             .parent()
             .expect("an object lives in its change's folder");
-        broca_owner_only::create_dir_all(dir)?;
+        create_dir_durably(dir)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)

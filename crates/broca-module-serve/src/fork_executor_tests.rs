@@ -269,6 +269,33 @@ async fn fork_digest_refusal_releases_without_model_call() {
     assert!(server.requests.lock().unwrap().is_empty());
 }
 
+/// A release routing couldn't be told of stays owed. After the attempt, the fork manager asks
+/// the executor once whether its release may not have reached routing (`fork_release_failed`).
+/// The answer is yes, so the manager records no release and asks routing again when the fork next
+/// opens. A second question answers no, since the first took the answer.
+#[tokio::test]
+async fn a_fork_release_routing_never_received_is_reported_once() {
+    let router = Arc::new(ForkRouting {
+        requests: Mutex::new(Vec::new()),
+        reply: fork_chosen("head-account", "apikey:anthropic", None),
+        release_fails: true,
+        fork_of: false,
+    });
+    let (root, _vault, executor, server) = fork_fixture("unreleased", router.clone()).await;
+    let mut job = fork_job(&root, &server.url);
+    job.base.request_body_sha256 = "not-the-recorded-digest".into();
+    assert!(matches!(
+        executor.fork_call(job).await,
+        ForkCallOutcome::Refused(ForkCallRefusal::BaseUnavailable(_))
+    ));
+    assert_fork_release(&router, 1);
+    assert!(executor.fork_release_failed("fork-admission"));
+    assert!(
+        !executor.fork_release_failed("fork-admission"),
+        "asking takes the answer"
+    );
+}
+
 #[tokio::test]
 async fn fork_restart_release_only_routed_and_reports_delivery_failure() {
     let router = fork_routing(fork_chosen("head-account", "apikey:anthropic", None));

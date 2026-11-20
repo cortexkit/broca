@@ -918,10 +918,13 @@ impl ForkManager {
             }
         };
         // The executor released the attempt's admission, if routing granted one, before it
-        // returned.
-        let mut released = record(&fork_id, ForkEvent::Released, now);
-        released.admission_id = Some(admission_id);
-        facts.push(released);
+        // returned. A release routing may not have heard of stays owed: with no `Released`
+        // record the fork's next opening asks for it again.
+        if !executor.fork_release_failed(&admission_id) {
+            let mut released = record(&fork_id, ForkEvent::Released, now);
+            released.admission_id = Some(admission_id);
+            facts.push(released);
+        }
         let finished = (facts[0].event == ForkEvent::AskFinished).then(|| fork.session.next_seq());
         fork.append(facts).await?;
         // A model call's spend goes to the usage export once its end is stored. An insert that

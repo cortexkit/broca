@@ -198,7 +198,7 @@ impl ClassifierProvider for WorkersAi {
     async fn call(&self, body: String) -> ProviderReply {
         let secret = match self.credential.secret().await {
             Ok(secret) => secret,
-            Err(message) => return ProviderReply::Credential(message),
+            Err(error) => return error.into(),
         };
         let auth_selection = secret.as_ref().and_then(|s| s.auth_selection.clone());
         let account_ref = secret.as_ref().and_then(|s| s.account_id.clone());

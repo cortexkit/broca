@@ -283,16 +283,16 @@ impl LateResultsFeed {
             through: through.clone(),
         };
         let body = self.body(LATE_RESULTS_ACK, &request).await?;
-        if !body.is_empty() {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-                if let Some(value) = value.as_object() {
-                    if !value.is_empty() {
-                        return Err(LateResultsError::Protocol(format!(
-                            "late_results.ack answered {value:?} where an empty object was expected"
-                        )));
-                    }
-                }
-            }
+        // Only an empty body or an empty object acknowledges: the caller then records the
+        // cursor and stops asking for those entries, so anything else must not read as success.
+        let acknowledged = body.is_empty()
+            || serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|value| value.as_object().is_some_and(serde_json::Map::is_empty));
+        if !acknowledged {
+            return Err(LateResultsError::Protocol(format!(
+                "late_results.ack answered {:?} where an empty object was expected",
+                String::from_utf8_lossy(&body)
+            )));
         }
         Ok(())
     }
@@ -595,21 +595,29 @@ mod tests {
 
     #[tokio::test]
     async fn an_ack_that_answers_a_body_is_not_taken_for_success() {
-        let (feed, mut module) = feed(Duration::from_millis(500));
-        let provider = tokio::spawn(async move {
-            let request = module.next_request().await;
-            module.reply(&request, br#"{"acknowledged": false}"#.to_vec());
-            module
-        });
-        let error = feed
-            .ack(&Cursor {
-                provider_incarnation: "inc-1".into(),
-                seq: 2,
-            })
-            .await
-            .unwrap_err();
-        assert!(error.is_permanent(), "{error}");
-        provider.await.unwrap();
+        // A nonempty object, a value that isn't an object, and text that isn't JSON.
+        for body in [
+            &br#"{"acknowledged": false}"#[..],
+            b"false",
+            b"[]",
+            b"not json",
+        ] {
+            let (feed, mut module) = feed(Duration::from_millis(500));
+            let provider = tokio::spawn(async move {
+                let request = module.next_request().await;
+                module.reply(&request, body.to_vec());
+                module
+            });
+            let error = feed
+                .ack(&Cursor {
+                    provider_incarnation: "inc-1".into(),
+                    seq: 2,
+                })
+                .await
+                .unwrap_err();
+            assert!(error.is_permanent(), "{error}");
+            provider.await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -188,6 +188,10 @@ struct Call<'a> {
     batch_committed: bool,
     run_ended: bool,
     closing: bool,
+    /// Whether the call's own terminal is the close the run wrote for it while its provider
+    /// held it (a cancel or stop), not the provider's answer: the provider may still be working
+    /// on it, so a withdrawal is owed.
+    held_closed: bool,
     /// The provider the call was handed back from for the person's steer, whose terminal for
     /// it is delivered as a notice.
     yielded_by: Option<&'a str>,
@@ -275,6 +279,7 @@ impl StoredLineage {
             batch_committed: false,
             run_ended: false,
             closing: false,
+            held_closed: false,
             yielded_by: None,
             noticed: false,
         };
@@ -290,6 +295,11 @@ impl StoredLineage {
                     {
                         call.terminal = true;
                         call.yielded_by = outcome.yielded_by.as_deref();
+                        call.held_closed = held.is_some()
+                            && matches!(
+                                outcome.outcome,
+                                CallOutcome::Interrupted | CallOutcome::MaxSteps
+                            );
                     }
                     if matches!(
                         outcome.outcome,
@@ -349,12 +359,13 @@ impl StoredLineage {
             .is_some_and(|call| call.terminal && call.held.is_none() && call.yielded_by.is_none())
     }
 
-    /// Whether no withdrawal can ever be owed for the call: it finished with a result, or no
-    /// provider ever held it. A held call left unfinished when its run ended may be owed one,
-    /// since a cancelled hold is withdrawn, so its watch stays for withdrawal to settle.
+    /// Whether no withdrawal can ever be owed for the call: its provider answered it, or no
+    /// provider ever held it. A held call the run closed itself (a cancel or stop wrote its
+    /// terminal), or one left unfinished when its run ended, may be owed one, since a closed
+    /// hold is withdrawn, so its watch stays for withdrawal to settle.
     pub(super) fn withdrawal_never_owed(&self, key: &str) -> bool {
         self.call(key)
-            .is_some_and(|call| call.terminal || call.held.is_none())
+            .is_some_and(|call| call.held.is_none() || (call.terminal && !call.held_closed))
     }
 
     pub(super) fn retirement_reason(&self, key: &str) -> Option<&'static str> {

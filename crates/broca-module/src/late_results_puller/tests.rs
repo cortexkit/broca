@@ -708,6 +708,38 @@ async fn a_held_call_its_run_left_unfinished_keeps_its_withdrawal_watch() {
     assert_eq!(watched, ["lineage:6"]);
 }
 
+/// A held call the run closed itself when it was cancelled (its terminal is the run's own
+/// interrupted close, not the provider's answer) still owes its provider a withdrawal, so the
+/// sweep keeps its watch even though the call has a terminal: the provider may still be working
+/// on it.
+#[tokio::test]
+async fn a_held_call_the_run_closed_keeps_its_withdrawal_watch() {
+    let bind = session("sweep-held-closed");
+    let rig = Rig::new("sweep-held-closed", None, Vec::new()).await;
+    let mut records = inline_then_held_records();
+    records.push(outcome("run", "b", "b", CallOutcome::Interrupted));
+    records.push(batch_end("run", "b"));
+    records.push(run_end("run", RunFinishReason::Cancelled));
+    rig.seed(&bind, &records).await;
+    register_more(
+        &rig.store,
+        &[
+            registration("lineage:4", "basal", &bind),
+            registration("lineage:6", "basal", &bind),
+        ],
+    )
+    .await;
+    assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 2);
+    let watched: Vec<String> = rig
+        .store
+        .withdrawal_rows()
+        .unwrap()
+        .into_iter()
+        .map(|(call, _, _)| call.call_key)
+        .collect();
+    assert_eq!(watched, ["lineage:6"]);
+}
+
 struct NoInlineWithdrawal;
 
 #[async_trait]

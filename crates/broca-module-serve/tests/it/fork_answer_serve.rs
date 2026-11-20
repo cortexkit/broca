@@ -84,6 +84,8 @@ struct ForkScript {
     /// Usage each call reports before it answers.
     report: Mutex<Option<RunUsage>>,
     released: Mutex<Vec<String>>,
+    /// The next call's own release didn't reach routing (`fork_release_failed`).
+    release_fails: std::sync::atomic::AtomicBool,
 }
 
 impl ForkScript {
@@ -356,6 +358,12 @@ impl RunExecutor for StoreLoop {
     async fn fork_release(&self, job: ForkReleaseJob) -> Result<(), String> {
         self.forks.released.lock().unwrap().push(job.admission_id);
         Ok(())
+    }
+
+    fn fork_release_failed(&self, _admission_id: &str) -> bool {
+        self.forks
+            .release_fails
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1359,6 +1367,33 @@ async fn a_caller_dropped_from_the_plan_loses_its_forks_for_good() {
     let next = rig.prepare(1).await.unwrap();
     assert!(next != fork && next != held_fork);
     assert_eq!(rig.forks.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn a_release_routing_never_heard_of_stays_owed_and_is_sent_again() {
+    let mut rig = Rig::head("unreleased", vec![text_step("a", "head reply")]).await;
+    let fork = rig.prepare(1).await.unwrap();
+    rig.forks.answer(answered("an answer"));
+    rig.forks
+        .release_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.ask(1, &fork, "first", "first question").await.unwrap();
+    assert!(rig.forks.released.lock().unwrap().is_empty());
+    let image = scratch("unreleased-image");
+    crash_image(&rig.dir, &image);
+
+    let forks = Arc::new(ForkScript::default());
+    let mut restarted = Rig::open(image, vec![], Arc::clone(&forks), true).await;
+    restarted.bind(1, asker()).await;
+    restarted
+        .ask(1, &fork, "first", "first question")
+        .await
+        .unwrap();
+    assert_eq!(
+        *forks.released.lock().unwrap(),
+        [broca_module::executor::fork_admission_id(&fork, "first", 1)],
+        "the owed release is sent again when the fork opens"
+    );
 }
 
 #[tokio::test]

@@ -123,7 +123,9 @@ impl CredentialSource for Token {
     fn credential_id(&self) -> Option<String> {
         Some(CREDENTIAL_ID.to_owned())
     }
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(
+        &self,
+    ) -> Result<Option<String>, broca_module_serve::system_one::credential::CredentialError> {
         Ok(Some(self.0.clone()))
     }
 }
@@ -277,7 +279,7 @@ async fn main() -> Result<(), String> {
                 "{name}: adapter-classified error {} in {elapsed} ms, which this client never returns",
                 error.code
             ),
-            ProviderReply::Credential(message) => {
+            ProviderReply::Credential(message) | ProviderReply::CredentialUnavailable(message) => {
                 format!("{name}: credential unavailable ({message}); nothing sent")
             }
         };

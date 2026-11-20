@@ -38,6 +38,10 @@ const INDEX_POSITION: u32 = u32::MAX;
 const FOOTER_LEN: usize = 8 + 4 + 4;
 /// The most a block may decompress to.
 pub const MAX_BLOCK: usize = 64 << 20;
+/// The most a group's records may take in a block, leaving room for the block's own encoding.
+/// A block never splits a group, so a larger group (an imported tool turn with tens of MiB of
+/// results) can't be sealed: the reader would refuse the block it made.
+const MAX_GROUP: usize = MAX_BLOCK - (64 << 10);
 
 crate::message! {
     /// One record inside a block.
@@ -287,6 +291,11 @@ pub fn build(
             .iter()
             .map(|record| record.body.0.len() + 16)
             .sum();
+        if group_bytes > MAX_GROUP {
+            return Err(SegmentError::BadRecords(
+                "a group of records too large for one block",
+            ));
+        }
         if !block.is_empty() && block_bytes + group_bytes > BLOCK_TARGET {
             flush(&mut block, &mut block_bytes, block_first, &mut out)?;
         }

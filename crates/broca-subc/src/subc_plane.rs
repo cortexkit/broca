@@ -143,19 +143,20 @@ enum ScopeReading {
 }
 
 /// `scope.describe` for `scope_ref` under `owner`, or under the owner's other id when `owner`
-/// is a renamed module ([`broca_protocol::RENAMED_MODULES`]) and the scope is not live under the
+/// is a renamed module ([`broca_protocol::RENAMED_MODULES`]) and the scope isn't live under the
 /// id the session froze. A renamed owner re-syncs its scopes under its new id, so the scope's
-/// twin (same `ref` and `scope_epoch`) is live there while the old id is not even a configured
-/// module any more; a route open finds the twin the same way
-/// (`SubcConnection::route_open_wire_target`). The twin's answer is used unless it is not live
-/// either while the frozen owner is still configured, which leaves the frozen owner's answer.
+/// twin (same `ref` and `scope_epoch`) is live there while the old id's record is not live, or
+/// ended by the handover, or no longer a configured module at all; a route open finds the twin
+/// the same way (`SubcConnection::route_open_wire_target`). A live twin's answer is used. A
+/// twin that isn't live either replaces a "not live" answer only when it says more (ended), or
+/// when the frozen owner isn't configured any more; otherwise the frozen owner's answer stands.
 async fn describe_either_owner(
     describer: &dyn ScopeDescriber,
     owner: &Principal,
     scope_ref: &str,
 ) -> Result<DescribedScope, String> {
     let answer = describer.describe(owner, scope_ref).await?;
-    if answer.status != ScopeStatus::NotLive {
+    if answer.status == ScopeStatus::Live {
         return Ok(answer);
     }
     let Principal::Reserved { module_id } = owner else {
@@ -168,8 +169,10 @@ async fn describe_either_owner(
         module_id: other.to_owned(),
     };
     match describer.describe(&twin, scope_ref).await {
+        Ok(twin_answer) if twin_answer.status == ScopeStatus::Live => Ok(twin_answer),
         Ok(twin_answer)
-            if twin_answer.status != ScopeStatus::NotLive || !answer.owner_configured =>
+            if answer.status == ScopeStatus::NotLive
+                && (twin_answer.status != ScopeStatus::NotLive || !answer.owner_configured) =>
         {
             Ok(twin_answer)
         }

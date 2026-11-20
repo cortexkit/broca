@@ -2529,7 +2529,9 @@ async fn provider_call(
         };
         // The observation and its reset deadline must use the same refusal receipt time.
         let received_at_ms = (service.clock)();
-        let mapped = if let super::ProviderReply::Credential(message) = &reply {
+        let mapped = if let super::ProviderReply::Credential(message)
+        | super::ProviderReply::CredentialUnavailable(message) = &reply
+        {
             Err(ItemError::for_code(
                 errors::PROVIDER_ERROR,
                 format!("credential read unavailable: {message}"),
@@ -2563,7 +2565,11 @@ async fn provider_call(
             }
             if (error.code == errors::ACCOUNT_NOT_ENTITLED
                 || (error.code == errors::AUTH_FAILED && attempt > 1))
-                && !matches!(reply, super::ProviderReply::Credential(_))
+                && !matches!(
+                    reply,
+                    super::ProviderReply::Credential(_)
+                        | super::ProviderReply::CredentialUnavailable(_)
+                )
                 && run.choice.describe.serves("observe_credential_refused")
             {
                 observation["kind"] = json!("credential_refused");
@@ -2583,12 +2589,19 @@ async fn provider_call(
                 observation["terminal_reason"] = json!("transport_failure");
             }
         }
-        if !matches!(reply, super::ProviderReply::Credential(_)) {
+        if !matches!(
+            reply,
+            super::ProviderReply::Credential(_) | super::ProviderReply::CredentialUnavailable(_)
+        ) {
             journal.observe(observation);
         }
         // Terminal answers and observations are committed together by the caller.
         if journal.runs[run_index].renew_failed
-            || matches!(reply, super::ProviderReply::Credential(_))
+            || matches!(
+                reply,
+                super::ProviderReply::Credential(_)
+                    | super::ProviderReply::CredentialUnavailable(_)
+            )
         {
             return Ok(mapped);
         }

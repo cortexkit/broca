@@ -70,10 +70,16 @@ impl Rig {
         std::fs::create_dir_all(&root).unwrap();
         let leases = Arc::new(FileLeaseStore::new(root.join("leases")));
         let service = Arc::new(RetentionService::new(&root, leases.clone()).unwrap());
+        // The runtime exports spend, as broca's does: only then does owed spend hold a session.
+        let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
         let runtime = Arc::new(
             StoreRuntime::open(&root, deployment(), Arc::new(NoRuns), idle_ttl)
                 .await
-                .unwrap(),
+                .unwrap()
+                .with_billing(crate::store_billing::StoreBilling {
+                    index: export as Arc<dyn broca_core::ExportIndex>,
+                    resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 4)),
+                }),
         );
         let opener = Arc::new(
             DefaultOpener::new(leases, Arc::new(NoRuns)).with_store_runtime(runtime.clone()),
@@ -190,6 +196,11 @@ fn store_end(run: &str, ts: u64) -> Record {
         interrupt_reason: None,
         error: None,
     })
+}
+
+/// The export holds run `run`'s spend.
+fn store_billed(run: &str) -> Record {
+    Record::Billed(broca_session_store::record::Billed { run_id: run.into() })
 }
 
 fn store_queued(retention: Option<u64>, ts: u64) -> Record {
@@ -321,6 +332,7 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
         &[
             store_start("r1", Some(SECONDS), STARTED_MS),
             store_end("r1", ENDED_MS),
+            store_billed("r1"),
             Record::Moved(Moved {
                 move_id: "store-move:1".into(),
                 source_activity_ms: ENDED_MS,
@@ -369,21 +381,25 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
 }
 
 /// A session whose policy hasn't expired is kept until its deadline; one whose lease is held is
-/// kept by the sweep past it; one with a run still going, or whose first
-/// run set no retention, has no deadline at all. Only the expired session nobody uses is deleted.
+/// kept by the sweep past it, and so is one whose run's spend isn't exported yet, since only
+/// the session records it; one with a run still going, or whose first run set no retention,
+/// has no deadline at all. Only the expired session nobody uses is deleted.
 #[tokio::test]
 async fn unexpired_and_leased_sessions_in_the_new_storage_are_kept() {
     let rig = Rig::new("kept", Duration::from_secs(600)).await;
     let finished = [
         store_start("r1", Some(SECONDS), STARTED_MS),
         store_end("r1", ENDED_MS),
+        store_billed("r1"),
     ];
     let idle = rig.key("idle");
     let open = rig.key("open");
+    let owed = rig.key("owed");
     let running = rig.key("running");
     let forever = rig.key("forever");
     rig.seed(&idle, &finished, false).await;
     rig.seed(&open, &finished, false).await;
+    rig.seed(&owed, &finished[..2], false).await;
     rig.seed(
         &running,
         &[store_start("r1", Some(SECONDS), STARTED_MS)],
@@ -404,20 +420,20 @@ async fn unexpired_and_leased_sessions_in_the_new_storage_are_kept() {
         broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&open)).unwrap();
 
     assert_eq!(rig.registry.sweep_once(DEADLINE_MS - 1).await.unwrap(), 0);
-    for key in [&idle, &open, &running, &forever] {
+    for key in [&idle, &open, &owed, &running, &forever] {
         assert!(rig.holds(key), "{} before its deadline", key.session);
     }
 
     assert_eq!(rig.registry.sweep_once(DEADLINE_MS).await.unwrap(), 1);
     assert!(!rig.holds(&idle), "the expired session nobody uses");
-    for key in [&open, &running, &forever] {
+    for key in [&open, &owed, &running, &forever] {
         assert!(rig.holds(key), "{} at the deadline", key.session);
     }
     assert_eq!(
         rig.registry.sweep_once(DEADLINE_MS * 1_000).await.unwrap(),
         0
     );
-    for key in [&open, &running, &forever] {
+    for key in [&open, &owed, &running, &forever] {
         assert!(rig.holds(key), "{} long after", key.session);
     }
 }

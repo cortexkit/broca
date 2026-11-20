@@ -176,8 +176,13 @@ pub enum ProviderReply {
     /// setup): nothing reached the provider. Answered exactly as [`Self::Transport`]; only the
     /// model tools' refusal spend tells the two apart.
     Unconnected(String),
-    /// The credential could not be read, so nothing was sent.
+    /// The vault refused the credential (it needs a new sign-in, isn't granted, is unreadable),
+    /// so nothing was sent.
     Credential(String),
+    /// The credential could not be read right now (the vault's listing hasn't loaded, or the
+    /// vault couldn't be reached or couldn't refresh), so nothing was sent. Nothing is known to
+    /// be wrong with the credential, and a later attempt may read it.
+    CredentialUnavailable(String),
 }
 
 /// One provider's classification endpoint.

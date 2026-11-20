@@ -309,11 +309,19 @@ async fn delayed_key_continues_all_restart_candidates_once_and_logs_each_run() {
     .unwrap();
     assert!(!rig.slot.key_loaded());
     assert_eq!(rig.executor.0.load(Ordering::SeqCst), 0);
-    let initial = logs.events();
-    assert!(initial.iter().any(|event| event.message()
-        == "store restart resume candidate sweep complete"
-        && event.fields.get("deferred").map(String::as_str) == Some("2")
-        && event.fields.get("failed").map(String::as_str) == Some("0")));
+    // The key is read beside the first pass, not after it, so the pass may still be running
+    // when the key is asked for; it defers both encrypted sessions either way.
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        while !logs.events().iter().any(|event| {
+            event.message() == "store restart resume candidate sweep complete"
+                && event.fields.get("deferred").map(String::as_str) == Some("2")
+                && event.fields.get("failed").map(String::as_str) == Some("0")
+        }) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first pass deferred both encrypted sessions");
     source.release.notify_one();
     tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, loader)
         .await

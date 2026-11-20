@@ -6,8 +6,12 @@ use broca_protocol::{AssistantMessage, ContentBlock, ToolCall, ToolResult};
 /// The text parts of `message` joined exactly as `run.result` joins them: in order, with
 /// nothing inserted. This is the answer a `final_text` run validates.
 pub fn joined_text(message: &AssistantMessage) -> String {
-    message
-        .content
+    joined_text_of(&message.content)
+}
+
+/// [`joined_text`] of an answer's content blocks.
+pub fn joined_text_of(content: &[ContentBlock]) -> String {
+    content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {

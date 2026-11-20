@@ -82,9 +82,10 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
             };
             if let Some(refusal) = refusal {
                 if let Some((account, credential)) = &admitted_account {
-                    let _ = routing
+                    let released = routing
                         .finish_fork(&job.admission_id, &job.run_id, Some((account, credential)))
                         .await;
+                    self.note_fork_release(&job.admission_id, released);
                 }
                 return ForkCallOutcome::Refused(refusal);
             }
@@ -94,11 +95,25 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         // failure releases the fork's admission before returning to its manager.
         let outcome = self.send_fork(&job).await;
         if let (Some(routing), Some((account, credential))) = (routing, &admitted_account) {
-            let _ = routing
+            let released = routing
                 .finish_fork(&job.admission_id, &job.run_id, Some((account, credential)))
                 .await;
+            self.note_fork_release(&job.admission_id, released);
         }
         outcome
+    }
+
+    /// Remembers a fork admission routing wasn't told was released, so the fork manager keeps
+    /// it owed and releases it again later (`fork_release_failed`).
+    fn note_fork_release(&self, admission_id: &str, released: Result<(), String>) {
+        if let Err(error) = released {
+            tracing::warn!(target: "fork", admission_id, %error,
+                "a fork attempt's routing admission wasn't released; it is released again when the fork next opens");
+            self.unreleased_forks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(admission_id.to_owned());
+        }
     }
 
     async fn release_fork(

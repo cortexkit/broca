@@ -88,9 +88,22 @@ impl FeedRoutes {
         Ok(feed)
     }
 
-    /// Forget a module's route after a failure, so the next pull opens a fresh one.
-    fn forget(&self, module: &str) {
-        self.feeds.lock().unwrap().remove(module);
+    /// Forget a module's route `failed` after a failure, so the next pull opens a fresh one, and
+    /// close it: a refused or unreadable answer leaves the route open on the daemon. A route
+    /// another caller already replaced is left to that caller.
+    fn forget(&self, module: &str, failed: &Arc<broca_subc::LateResultsFeed>) {
+        let removed = {
+            let mut feeds = self.feeds.lock().unwrap();
+            match feeds.get(module) {
+                Some(cached) if Arc::ptr_eq(cached, failed) => feeds.remove(module),
+                _ => None,
+            }
+        };
+        if let Some(feed) = removed {
+            tokio::spawn(async move {
+                let _ = feed.close().await;
+            });
+        }
     }
 }
 
@@ -111,7 +124,7 @@ impl LateResultsFeed for FeedRoutes {
             }),
             Err(error) => {
                 if !error.is_cursor_incarnation_changed() {
-                    self.forget(module);
+                    self.forget(module, &feed);
                 }
                 Err(feed_error(error))
             }
@@ -121,7 +134,7 @@ impl LateResultsFeed for FeedRoutes {
     async fn ack(&self, module: &str, through: &Cursor) -> Result<(), FeedError> {
         let feed = self.feed(module).await?;
         feed.ack(through).await.map_err(|error| {
-            self.forget(module);
+            self.forget(module, &feed);
             feed_error(error)
         })
     }

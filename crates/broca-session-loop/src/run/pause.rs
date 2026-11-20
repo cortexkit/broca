@@ -106,21 +106,53 @@ pub(super) async fn pause_for_sign_in<W: Writer, P, T>(
             scope: admission.send.scope.clone(),
             media_capture: writer.media(),
         };
+        // A deposited result is taken as a held wait takes it: its media checked against what
+        // the batch captured, then through the post-tool hooks subscribed for its tool.
+        let hook_plan = hook_plan(admission, seams)?;
+        let hooks = hook_plan
+            .as_ref()
+            .map(|plan| broca_core::hooks::HookRuntime {
+                plan,
+                plane: seams.hook_plane.as_ref().expect("checked with the plan"),
+                bind: &seams.bind,
+                scope: admission.send.scope.as_ref(),
+                cancel: Some(&seams.cancel),
+                stop: Some(&seams.stop),
+                seal: None,
+            });
+        let step_id = batch.step_id;
+        let planned = planned_calls(writer);
         let mut records = Vec::new();
         let mut delivered = Vec::new();
         for held in known_calls(writer).into_iter().filter_map(|call| call.held) {
-            if let Some(result) = lifecycle.deposited_result(&ctx, &held) {
-                terminal_with_reason(
-                    &mut records,
-                    &admission.run_id,
-                    &ctx.batch_id.0,
-                    result,
-                    CallOutcome::Completed,
-                    None,
-                    Some((seams.now_ms)()),
-                );
-                delivered.push(held.tool_call_id);
+            let Some(result) = lifecycle.deposited_result(&ctx, &held) else {
+                continue;
+            };
+            let Some(call) = planned
+                .iter()
+                .find(|call| call.tool_call_id == held.tool_call_id)
+            else {
+                continue;
+            };
+            let resolved = match checked(&ctx, DispatchResult::Completed(result)) {
+                DispatchResult::Completed(result) => {
+                    post_tool(hooks.as_ref(), step_id, call, &held.call_key, result).await
+                }
+                other => resolve(call, other).into(),
+            };
+            terminal_with_reason(
+                &mut records,
+                &admission.run_id,
+                &ctx.batch_id.0,
+                resolved.result,
+                resolved.outcome,
+                resolved.reason,
+                Some((seams.now_ms)()),
+            );
+            if let Some(Record::ToolOutcome(record)) = records.last_mut() {
+                record.hooks = resolved.hooks.map(Into::into);
             }
+            delivered.push(held.tool_call_id);
         }
         // Acknowledge only after the terminal barrier, independently of the auth pause.
         writer.append(&records, true).await?;

@@ -1077,6 +1077,59 @@ fn session_ref_v2_startup_rekey_is_idempotent_and_keeps_v1() {
     assert_eq!(found.sessions[&v2], (address, session));
 }
 
+/// A start skips the alias walk when the alias rule and the session count are as the last walk
+/// left them, and walks again for a session an older build added without its alias.
+#[test]
+fn session_ref_v2_rekey_runs_only_after_a_change() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let conn = store.conn.lock().unwrap();
+    let add = |name: &str| {
+        let session = BindIdentity::new("/synthetic/project", "runner", name);
+        let v1 = broca_core::wal_writer::legacy_session_ref(
+            &session.harness,
+            &session.project_root.to_string_lossy(),
+            &session.session,
+        );
+        conn.execute(
+            "INSERT INTO agent_data_session_ref VALUES(?1,?2,?3,?4,?5)",
+            params![
+                v1,
+                session_addr(&session),
+                "/synthetic/project",
+                "runner",
+                name
+            ],
+        )
+        .unwrap();
+        agent_session_ref(&session)
+    };
+    let aliased = |alias: &str| -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM agent_data_session_ref_v2 WHERE session_ref=?1",
+            [alias],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    };
+    let first = add("first");
+    init_schema(&conn).unwrap();
+    assert!(aliased(&first));
+    // An older build adds a session and no alias; the count tells the next start to walk.
+    let second = add("second");
+    assert!(!aliased(&second));
+    init_schema(&conn).unwrap();
+    assert!(aliased(&second));
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT sessions FROM agent_data_session_ref_v2_rule WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 2);
+}
+
 #[test]
 fn session_ref_v2_ambiguous_roots_refuse_but_v1_stays_exact() {
     let store = SqliteStore::open_in_memory().unwrap();

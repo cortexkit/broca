@@ -168,64 +168,78 @@ impl KeyLoader {
             }
         };
         // Plain sessions need no vault. Encrypted candidates stay registered until the
-        // second pass can read them; refusals from client traffic are not our inventory.
-        let deferred = recover_sessions(&registry).await || !runtime_ready;
+        // second pass can read them; refusals from client traffic are not our inventory. The
+        // first pass runs beside the key read rather than before it: it reads every stored head
+        // of the durable class, and every encrypted session would wait for that walk to end.
+        let first_pass = tokio::spawn({
+            let registry = registry.clone();
+            async move { recover_sessions(&registry).await }
+        });
         let stop_deferred = || {
             tracing::info!(target: "lifecycle", "store recovery deferred until next startup: module stopping before deployment key recovery");
         };
-        if stopping.is_cancelled() {
-            stop_deferred();
-            return;
-        }
-        let Some(source) = self.source else {
-            warn_missing(key_id, KeyUnavailable::NoVault);
-            return;
-        };
-        let mut wait = self.backoff.first;
-        let mut warned = false;
-        loop {
+        let loaded = async {
             if stopping.is_cancelled() {
                 stop_deferred();
-                return;
+                return false;
             }
-            let read = tokio::select! {
-                biased;
-                _ = stopping.cancelled() => {
-                    stop_deferred();
-                    return;
-                }
-                read = read_key(source.as_ref(), key_id) => read,
+            let Some(source) = self.source.as_ref() else {
+                warn_missing(key_id, KeyUnavailable::NoVault);
+                return false;
             };
-            let loaded = match read {
-                Ok(key) => self
-                    .slot
-                    .load(&self.setup, key)
-                    .await
-                    .map_err(|_| KeyUnavailable::Open),
-                Err(reason) => Err(reason),
-            };
-            match loaded {
-                Ok(()) => break,
-                Err(reason) if !warned => {
-                    warn_missing(key_id, reason);
-                    warned = true;
-                }
-                Err(reason) => tracing::debug!(
-                    target: "session_storage",
-                    key_id,
-                    reason = reason.as_str(),
-                    "the new storage's deployment key is still not loaded"
-                ),
-            }
-            tokio::select! {
-                biased;
-                _ = stopping.cancelled() => {
+            let mut wait = self.backoff.first;
+            let mut warned = false;
+            loop {
+                if stopping.is_cancelled() {
                     stop_deferred();
-                    return;
-                },
-                _ = tokio::time::sleep(wait) => {}
+                    return false;
+                }
+                let read = tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => {
+                        stop_deferred();
+                        return false;
+                    }
+                    read = read_key(source.as_ref(), key_id) => read,
+                };
+                let loaded = match read {
+                    Ok(key) => self
+                        .slot
+                        .load(&self.setup, key)
+                        .await
+                        .map_err(|_| KeyUnavailable::Open),
+                    Err(reason) => Err(reason),
+                };
+                match loaded {
+                    Ok(()) => return true,
+                    Err(reason) if !warned => {
+                        warn_missing(key_id, reason);
+                        warned = true;
+                    }
+                    Err(reason) => tracing::debug!(
+                        target: "session_storage",
+                        key_id,
+                        reason = reason.as_str(),
+                        "the new storage's deployment key is still not loaded"
+                    ),
+                }
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => {
+                        stop_deferred();
+                        return false;
+                    },
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                wait = (wait * 2).min(self.backoff.max);
             }
-            wait = (wait * 2).min(self.backoff.max);
+        }
+        .await;
+        // The first pass always finishes, key or no key: plain sessions need none. The second
+        // pass waits for it, so the two never recover one session at once.
+        let deferred = first_pass.await.unwrap_or(true) || !runtime_ready;
+        if !loaded {
+            return;
         }
         tracing::info!(
             target: "session_storage",

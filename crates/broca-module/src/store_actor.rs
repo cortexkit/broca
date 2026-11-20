@@ -2529,7 +2529,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         match self.recovery_start(run) {
             Ok(start) => {
-                if run.cancel.is_some() && run.paused.is_some() {
+                // A stop acknowledged before the restart is owed at once: a stop asked for now,
+                // or any stop of a paused run, which has no step boundary left to wait for.
+                let stop_now = run.cancel == Some(broca_session_store::record::CancelPoint::Now)
+                    || (run.cancel.is_some() && run.paused.is_some());
+                if stop_now {
                     let cancel = CancellationToken::new();
                     cancel.cancel();
                     self.start_run_under(start, None, None, mode, cancel).await;

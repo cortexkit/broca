@@ -33,7 +33,9 @@ impl CredentialSource for Token {
     fn credential_id(&self) -> Option<String> {
         Some(CREDENTIAL_ID.into())
     }
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(
+        &self,
+    ) -> Result<Option<String>, crate::system_one::credential::CredentialError> {
         Ok(Some("test-token-not-a-secret".into()))
     }
 }

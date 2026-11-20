@@ -166,10 +166,15 @@ impl CredentialSource for Held {
     fn credential_id(&self) -> Option<String> {
         Some(CREDENTIAL_ID.to_owned())
     }
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(
+        &self,
+    ) -> Result<Option<String>, broca_module_serve::system_one::credential::CredentialError> {
         Ok(Some(self.0.token.clone()))
     }
-    async fn secret(&self) -> Result<Option<ProviderSecret>, String> {
+    async fn secret(
+        &self,
+    ) -> Result<Option<ProviderSecret>, broca_module_serve::system_one::credential::CredentialError>
+    {
         Ok(Some(self.0.clone()))
     }
 }
@@ -345,7 +350,7 @@ async fn main() -> Result<(), String> {
             ProviderReply::Transport(message) | ProviderReply::Unconnected(message) => format!(
                 "{name} ({at}): no reply in {elapsed} ms ({message}), so broca would record provider_error"
             ),
-            ProviderReply::Credential(message) => {
+            ProviderReply::Credential(message) | ProviderReply::CredentialUnavailable(message) => {
                 format!("{name} ({at}): credential unusable ({message}); nothing sent")
             }
         };

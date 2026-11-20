@@ -22,6 +22,7 @@ mod routed;
 #[derive(Clone)]
 enum Script {
     Credential,
+    CredentialUnavailable,
     AccountError,
     AccountLimit(u64),
     Attributed(String),
@@ -92,7 +93,10 @@ impl ClassifierProvider for StandIn {
                 .map(|list| list[(n - 1).min(list.len() - 1)].clone())
         };
         match script {
-            Some(Script::Credential) => ProviderReply::Credential("vault offline".into()),
+            Some(Script::Credential) => ProviderReply::Credential("needs a new sign-in".into()),
+            Some(Script::CredentialUnavailable) => {
+                ProviderReply::CredentialUnavailable("the vault couldn't be reached".into())
+            }
             Some(Script::AccountError) => ProviderReply::ClassifiedError {
                 error: cortexkit_role_classifier::errors::ItemError::for_code(
                     cortexkit_role_classifier::errors::ACCOUNT_NOT_ENTITLED,
@@ -759,6 +763,29 @@ async fn an_auth_failure_on_the_first_provider_call_is_a_refusal_that_writes_not
     rig.stand_in
         .script("z", vec![Script::Answer(noul("0.3", None))]);
     admitted(&rig, params("first", JEV, &["z"], None)).await;
+}
+
+/// A vault that can't answer now isn't a sign-in problem: the item fails retryably, as a
+/// routed call's would, and the batch goes on instead of refusing with `auth_failed`.
+#[tokio::test]
+async fn an_unreadable_credential_is_a_provider_error_not_an_auth_refusal() {
+    let rig = rig();
+    rig.stand_in
+        .script("a", vec![Script::CredentialUnavailable]);
+    rig.stand_in
+        .script("b", vec![Script::Answer(noul("0.2", None))]);
+    let first = admitted(&rig, params("vault-down", JEV, &["a", "b"], None)).await;
+    assert_eq!(items(&first)[0]["error"]["code"], "provider_error");
+    assert!(items(&first)[1]["error"].is_null(), "{first}");
+}
+
+/// A credential the vault refuses still refuses the batch on its first item.
+#[tokio::test]
+async fn a_refused_credential_on_the_first_item_is_an_auth_refusal() {
+    let rig = rig();
+    rig.stand_in.script("a", vec![Script::Credential]);
+    let refusal = refused(&rig, params("refused-key", JEV, &["a"], None)).await;
+    assert_eq!(refusal["code"], "auth_failed");
 }
 
 #[tokio::test]

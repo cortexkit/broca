@@ -94,7 +94,7 @@ impl ClassifierProvider for TypeSafe {
     async fn call(&self, body: String) -> ProviderReply {
         let secret = match self.credential.secret().await {
             Ok(secret) => secret,
-            Err(message) => return ProviderReply::Credential(message),
+            Err(error) => return error.into(),
         };
         let mut request = self
             .http

@@ -681,6 +681,12 @@ impl ToolPlane for Spy {
         if calls.iter().any(|call| call.tool_name == "down") {
             return Err(ToolPlaneError::Unavailable("route closed".into()));
         }
+        // A batch with a `scope_gone` call finds its scope ended before anything is sent.
+        if calls.iter().any(|call| call.tool_name == "scope_gone") {
+            return Err(ToolPlaneError::ScopeDrained {
+                reason: "scope_ended".into(),
+            });
+        }
         self.inner
             .batch_started_guarded(ctx, calls, manifest, guard)
             .await
@@ -982,6 +988,12 @@ tokio::task_local! {
 tokio::task_local! {
     /// When set, the new side ends the cut log's run with this seal instead of resuming it.
     static SEALING: broca_core::seal::SealCause;
+}
+
+tokio::task_local! {
+    /// When set, a run [`new_with_actions`] resumes finds its account signed out at the start of
+    /// the resume, so it pauses for sign-in instead of going on.
+    static SIGNED_OUT_ON_RESUME: ();
 }
 
 tokio::task_local! {
@@ -2152,6 +2164,14 @@ impl Scenario {
                 })
                 .with_tool("write", |_| {
                     StubReply::OutcomeUnknown("connection reset".into())
+                })
+                .with_tool("drained", |_| StubReply::ScopeDrained {
+                    reason: "scope_ended".into(),
+                    sent: false,
+                })
+                .with_tool("drained_sent", |_| StubReply::ScopeDrained {
+                    reason: "scope_ended".into(),
+                    sent: true,
                 }),
         )
     }
@@ -4499,6 +4519,15 @@ async fn new_with_actions(
         let restarted = Seams {
             person_steers: None,
             stop: Default::default(),
+            pause_for_auth_at_start: SIGNED_OUT_ON_RESUME
+                .try_with(|()| {
+                    serde_json::from_value(json!({
+                        "class": "auth_required",
+                        "message": "the account is signed out",
+                    }))
+                    .expect("a provider error decodes")
+                })
+                .ok(),
             ..seams
         };
         let second = through!(writer, |w| finishes(resume(w, &parts, &restarted)).await)
@@ -6207,10 +6236,15 @@ fn harness_hooks_cancelling(cancel: CancellationToken) -> Arc<dyn broca_core::ho
 /// when unavailable) and validate phase (refusing when unavailable), and to post-tool hooks for
 /// `read` (passing when unavailable) and `post_down` (refusing when unavailable).
 fn hooked_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+    hooked_manifest_with(tools, &["read"])
+}
+
+/// [`hooked_manifest`], with the passing post-tool hook subscribed for `post_tools`.
+fn hooked_manifest_with(tools: &[Tool], post_tools: &[&str]) -> Arc<broca_wal::PlanManifest> {
     let subscriptions = json!([
         {"hook": "pre_tool", "phase": "mutate", "ops": [], "on_unavailable": "pass", "budget_ms": 500},
         {"hook": "pre_tool", "phase": "validate", "ops": [], "on_unavailable": "refuse", "budget_ms": 500},
-        {"hook": "post_tool", "tools": ["read"], "ops": ["append", "prepend", "replace"], "on_unavailable": "pass", "budget_ms": 500},
+        {"hook": "post_tool", "tools": post_tools, "ops": ["append", "prepend", "replace"], "on_unavailable": "pass", "budget_ms": 500},
         {"hook": "post_tool", "tools": ["post_down"], "ops": ["append", "prepend", "replace"], "on_unavailable": "refuse", "budget_ms": 500},
         {"hook": "post_assistant", "ops": ["append", "prepend"], "on_unavailable": "pass", "budget_ms": 500},
     ]);
@@ -11071,4 +11105,426 @@ async fn a_replaced_tool_output_is_released_and_reads_back_whole() {
         },
         "the output reads back whole"
     );
+}
+
+/// A crash after the caller's stop-now was acknowledged, and before the step's calls were sent:
+/// the resume closes them as not run and ends cancelled, even with a fresh cancel token. Sending
+/// them would act after the caller was told the run stopped.
+#[tokio::test]
+async fn a_resume_after_an_acknowledged_stop_now_sends_none_of_its_calls() {
+    use broca_session_store::record::{CancelPoint, CancelRequest};
+    let scenario = unsent_call();
+    let source = new_source(&scenario, None, scenario.steps.clone()).await;
+    // The cut just after the step that asked for the call: its answer is durable, no batch.
+    let cut = source
+        .batch_ends
+        .iter()
+        .copied()
+        .find(|&end| {
+            let kept = &source.records[..end];
+            kept.iter()
+                .any(|record| matches!(record, Record::StepEnd(_)))
+                && !kept
+                    .iter()
+                    .any(|record| matches!(record, Record::BatchStart(_)))
+        })
+        .expect("a cut after the call's step and before its batch");
+    let run_id = source
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunStart(start) => Some(start.run_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut start = source.cut(cut);
+    let backend = start.snapshot.take().expect("the cut keeps its backend");
+    let stop = Record::CancelRequest(CancelRequest {
+        run_id,
+        at: CancelPoint::Now,
+    });
+    {
+        let mut session = Session::load(
+            &backend,
+            SessionAddr("0123456789abcdef".into()),
+            &SessionTriple {
+                project_root: "/project".into(),
+                harness: "differential".into(),
+                session: "s1".into(),
+            },
+            &DeploymentKey::new(1, &[7; 32]),
+        )
+        .await
+        .unwrap();
+        session
+            .append(std::slice::from_ref(&stop), true)
+            .await
+            .unwrap();
+    }
+    start.snapshot = Some(backend);
+    start.records.push(stop);
+    let resumed = new_source(&scenario, Some(start), scenario.steps[1..].to_vec()).await;
+    assert!(
+        resumed
+            .outcome
+            .calls
+            .iter()
+            .all(|call| !call.contains("dispatch")),
+        "a call was sent after the acknowledged stop: {:?}",
+        resumed.outcome.calls
+    );
+    assert!(
+        resumed.outcome.requests.is_empty(),
+        "the resume asked the model again"
+    );
+    let end = resumed
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunEnd(end) => Some(end.reason),
+            _ => None,
+        })
+        .expect("the resume ends the run");
+    assert_eq!(end, RunFinishReason::Cancelled);
+}
+
+/// A held call's late result goes through the post-tool hooks subscribed for its tool, as a
+/// result returned on the dispatch does: a hold must not let the model see a result a hook
+/// would have edited or withheld.
+#[tokio::test]
+async fn a_held_result_goes_through_the_post_tool_hooks() {
+    let tools = vec![
+        tool("hold", ExecutionMode::Parallel),
+        tool("read", ExecutionMode::Parallel),
+    ];
+    let scenario = Scenario {
+        input: vec![user("run both")],
+        manifest: Some(hooked_manifest_with(&tools, &["read", "hold"])),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold", json!({"job": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
+    // A reply carries the result itself; an outcome only its digest.
+    let outcomes: Vec<String> = ran
+        .source
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolReply(reply) => Some(format!("{reply:?}")),
+            _ => None,
+        })
+        .collect();
+    let held = outcomes
+        .iter()
+        .find(|outcome| outcome.contains("\"c1\""))
+        .unwrap_or_else(|| panic!("no result for the held call: {outcomes:?}"));
+    assert!(
+        held.contains("[checked by the harness hook]"),
+        "the held result skipped its post-tool hook: {held}"
+    );
+}
+
+/// A late result already deposited when the resume finds the account signed out is written at
+/// the sign-in pause, and through the same post-tool hooks as a result the wait takes.
+#[tokio::test]
+async fn a_held_result_taken_at_a_sign_in_pause_goes_through_the_post_tool_hooks() {
+    let tools = vec![tool("hold", ExecutionMode::Parallel)];
+    let scenario = Scenario {
+        input: vec![user("hold it")],
+        manifest: Some(hooked_manifest_with(&tools, &["hold"])),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "hold", json!({"job": 1}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = SIGNED_OUT_ON_RESUME
+        .scope(
+            (),
+            Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+        )
+        .await;
+    let records = &ran.source.records;
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            Record::Pause(pause) if pause.reason == PauseReason::AuthRequired
+        )),
+        "the resume didn't pause for sign-in: {records:?}"
+    );
+    // A reply carries the result itself; an outcome only its digest.
+    let held = records
+        .iter()
+        .find_map(|record| match record {
+            Record::ToolReply(reply) if reply.result.tool_call_id.0 == "c1" => {
+                Some(format!("{reply:?}"))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the deposited result wasn't written: {records:?}"));
+    assert!(
+        held.contains("[checked by the harness hook]"),
+        "the held result skipped its post-tool hook: {held}"
+    );
+}
+
+/// A held call beside a call whose outcome is unknown: the run can't pause on the held call
+/// (a late answer can't resume a run in doubt), so it closes the held call and ends interrupted
+/// for review instead of waiting on it forever.
+#[tokio::test]
+async fn a_held_call_beside_an_unknown_outcome_ends_the_run_for_review() {
+    let scenario = Scenario {
+        input: vec![user("hold and write")],
+        tools: vec![
+            tool("hold", ExecutionMode::Parallel),
+            tool("write", ExecutionMode::Parallel),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold", json!({"job": 1})),
+                    call("c2", "write", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "should not be reached"),
+        ],
+    };
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+    )
+    .await
+    .expect("the run waited forever on the held call");
+    let records = &ran.source.records;
+    let end = records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunEnd(end) => Some(end.reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the run never ended: {records:?}"));
+    assert_eq!(end, RunFinishReason::Interrupted);
+    let held = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolOutcome(outcome) => Some(format!("{outcome:?}")),
+            _ => None,
+        })
+        .find(|outcome| outcome.contains("\"c1\""))
+        .expect("the held call is closed");
+    assert!(held.contains("provider_held_interrupted"), "{held}");
+}
+
+/// What a run of one step calling `tool_name` beside a `read`, then answering "done", left: its
+/// outcome records, how it ended, and how many answers the model gave.
+async fn ran_one_call(tool_name: &str) -> (Vec<String>, RunFinishReason, usize) {
+    let scenario = Scenario {
+        input: vec![user("call it")],
+        tools: vec![
+            tool(tool_name, ExecutionMode::Parallel),
+            tool("read", ExecutionMode::Parallel),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", tool_name, json!({"x": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
+    let records = &ran.source.records;
+    let outcomes = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolOutcome(outcome) => Some(format!("{outcome:?}")),
+            _ => None,
+        })
+        .collect();
+    let end = records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunEnd(end) => Some(end.reason),
+            _ => None,
+        })
+        .expect("the run ends");
+    let steps = records
+        .iter()
+        .filter(|record| matches!(record, Record::Assistant(_)))
+        .count();
+    (outcomes, end, steps)
+}
+
+/// A batch whose scope was gone when it started sends nothing: every call gets the error naming
+/// why its route drained, and the run stops interrupted instead of asking the model again.
+#[tokio::test]
+async fn a_batch_whose_scope_was_gone_at_its_start_stops_the_run() {
+    let (outcomes, end, steps) = ran_one_call("scope_gone").await;
+    assert_eq!(end, RunFinishReason::Interrupted);
+    assert_eq!(
+        steps, 1,
+        "the model was asked again after the drained batch"
+    );
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    // An outcome shows its result only by digest: the drained result is the error naming why
+    // the route drained.
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.contains("is_error: true")
+                && outcome.contains("reason: Some(\"scope_ended\")")),
+        "{outcomes:?}"
+    );
+}
+
+/// A call whose route drained before it was sent was definitely not run: the model gets the
+/// error naming why, and the run goes on. Only a drain after the call was sent leaves its
+/// outcome unknown and stops the run.
+#[tokio::test]
+async fn a_drained_call_is_unknown_only_when_it_was_sent() {
+    let (outcomes, end, steps) = ran_one_call("drained").await;
+    assert_eq!(end, RunFinishReason::Completed, "{outcomes:?}");
+    assert_eq!(steps, 2);
+    let unsent = outcomes
+        .iter()
+        .find(|outcome| outcome.contains("\"c1\""))
+        .unwrap();
+    assert!(
+        unsent.contains("outcome: Completed")
+            && unsent.contains("is_error: true")
+            && unsent.contains("reason: Some(\"scope_ended\")"),
+        "{unsent}"
+    );
+
+    let (outcomes, end, _) = ran_one_call("drained_sent").await;
+    assert_eq!(end, RunFinishReason::Interrupted, "{outcomes:?}");
+    let sent = outcomes
+        .iter()
+        .find(|outcome| outcome.contains("\"c1\""))
+        .unwrap();
+    assert!(
+        sent.contains("outcome: Unknown") && sent.contains("reason: Some(\"scope_ended\")"),
+        "{sent}"
+    );
+}
+
+/// A crash after a `final_text` run's answer is durable and before its end: the resume ends the
+/// run completed with the structured result the step would have written beside its end, not a
+/// completed run with no result.
+#[tokio::test]
+async fn a_final_text_run_cut_before_its_end_keeps_its_result() {
+    STRUCTURED
+        .scope(Some(unconstrained("final_text")), async {
+            let scenario = single(vec![text_step("a1", r#"{"answer":1}"#)]);
+            let source = new_source(&scenario, None, scenario.steps.clone()).await;
+            let cut = source
+                .batch_ends
+                .iter()
+                .copied()
+                .find(|&end| {
+                    let kept = &source.records[..end];
+                    kept.iter()
+                        .any(|record| matches!(record, Record::StepEnd(_)))
+                        && !kept.iter().any(|record| {
+                            matches!(record, Record::RunEnd(_) | Record::StructuredResult(_))
+                        })
+                })
+                .expect("a cut after the answer and before the run's end");
+            let resumed = new_source(&scenario, Some(source.cut(cut)), Vec::new()).await;
+            let result = resumed
+                .records
+                .iter()
+                .find_map(|record| match record {
+                    Record::StructuredResult(result) => Some(result.result.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no structured result: {:?}", resumed.records));
+            assert!(
+                result.to_string().contains("answer"),
+                "the result lost the answer: {result}"
+            );
+            assert!(
+                resumed.outcome.requests.is_empty(),
+                "the resume asked the model again"
+            );
+        })
+        .await;
+}
+
+/// A reply that repeats a held call's id: the repeat's duplicate error must not be stored
+/// before the held call's own result, or reading the session back would end the held call with it
+/// and the provider's answer could no longer resume the run.
+#[tokio::test]
+async fn a_repeated_id_beside_a_held_call_waits_for_the_held_result() {
+    let tools = vec![tool("hold", ExecutionMode::Parallel)];
+    let scenario = Scenario {
+        input: vec![user("hold twice")],
+        manifest: None,
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("h", "hold", json!({"job": 1})),
+                    call("h", "hold", json!({"job": 2})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
+    let records = &ran.source.records;
+    // A reply carries the result itself; an outcome only its digest.
+    let outcomes: Vec<String> = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolReply(reply) => Some(format!("{reply:?}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    assert!(
+        !outcomes[0].contains("duplicate tool_call_id"),
+        "the duplicate error came before the held call's result: {outcomes:?}"
+    );
+    assert!(
+        outcomes[1].contains("duplicate tool_call_id"),
+        "{outcomes:?}"
+    );
+    let end = records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunEnd(end) => Some(end.reason),
+            _ => None,
+        })
+        .expect("the run ends");
+    assert_eq!(end, RunFinishReason::Completed);
 }

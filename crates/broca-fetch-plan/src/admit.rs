@@ -1214,12 +1214,23 @@ struct CatalogFetch<'a> {
 }
 
 impl CatalogFetch<'_> {
-    /// An optional tool's absence also removes any text from that provider.
+    /// An optional tool's absence also removes any text from that provider. The persona's
+    /// provider is never optional: its text is required, whatever its tool item says.
     fn optional(&self) -> bool {
+        if self.text_item.is_some_and(|item| {
+            broca_protocol::same_module(&item.provider, crate::plan::PERSONA_PROVIDER)
+        }) {
+            return false;
+        }
         self.tool_item.map_or_else(
             || self.text_item.is_some_and(|item| item.optional),
             |item| item.optional,
         )
+    }
+
+    /// Whether the provider's tools are optional and may be left out, with its text.
+    fn optional_tools(&self) -> bool {
+        self.tool_item.is_some_and(|item| item.optional) && self.optional()
     }
 }
 
@@ -1280,7 +1291,7 @@ pub async fn admit(
     }
     let catalogs = futures::future::join_all(catalog_fetches.iter().map(|fetch| {
         let request = catalog_request(plan, fetch.tool_item, fetch.text_item);
-        let fetch_deadline = if fetch.tool_item.is_some_and(|item| item.optional) {
+        let fetch_deadline = if fetch.optional_tools() {
             deadline.min(started + OPTIONAL_TOOL_BUDGET)
         } else {
             deadline
@@ -1358,7 +1369,7 @@ pub async fn admit(
         if let Err(missed) = outcome {
             outcomes.insert(fetch.provider, Err(missed));
         }
-        if fetch.tool_item.is_some_and(|item| item.optional) && outcomes[fetch.provider].is_err() {
+        if fetch.optional_tools() && outcomes[fetch.provider].is_err() {
             absent_tools.insert(fetch.provider);
         }
     }
@@ -1421,10 +1432,9 @@ pub async fn admit(
         let mut text_plan = admitted_plan.clone();
         text_plan.composed.values_mut().for_each(Vec::clear);
         for (provider, text) in texts {
-            let optional_tool = plan
-                .tool_items
+            let optional_tool = catalog_fetches
                 .iter()
-                .any(|item| item.provider == provider && item.optional);
+                .any(|fetch| fetch.provider == provider && fetch.optional_tools());
             match text {
                 Ok(text) => {
                     let stale = differences_of(&text_plan, provider, &text);
@@ -1793,6 +1803,37 @@ mod tests {
     use super::*;
     use crate::plan::parse_plan;
     use async_trait::async_trait;
+
+    fn item(provider: &str, optional: bool) -> Item {
+        Item {
+            provider: provider.into(),
+            preset: None,
+            params: serde_json::Map::new(),
+            optional,
+            output_refs: false,
+        }
+    }
+
+    /// An optional tool makes its provider's fetch optional, text included, unless that
+    /// provider's text is the persona's, which is required under either of its ids.
+    #[test]
+    fn the_persona_providers_fetch_is_required_even_with_an_optional_tool() {
+        for (provider, optional) in [
+            ("plexus", true),
+            ("prefrontal-core", false),
+            ("prefrontal", false),
+        ] {
+            let tool = item(provider, true);
+            let text = item(provider, false);
+            let fetch = CatalogFetch {
+                provider,
+                tool_item: Some(&tool),
+                text_item: Some(&text),
+            };
+            assert_eq!(fetch.optional(), optional, "{provider}");
+            assert_eq!(fetch.optional_tools(), optional, "{provider}");
+        }
+    }
 
     struct ScriptedFetcher {
         catalog_result: Result<Value, FetchError>,

@@ -44,16 +44,42 @@ impl std::fmt::Debug for ProviderSecret {
     }
 }
 
+/// Why a credential couldn't be read. Either way nothing was sent to the provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialError {
+    /// The vault refused it: a new sign-in is needed, the record isn't there or isn't granted
+    /// to broca, or it can't be used. Asking again won't help.
+    Refused(String),
+    /// It couldn't be read right now: the vault's listing hasn't loaded yet, or the vault
+    /// couldn't be reached, was locked, or failed a refresh it may manage later.
+    Unavailable(String),
+}
+
+impl From<String> for CredentialError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
+impl From<CredentialError> for super::ProviderReply {
+    fn from(error: CredentialError) -> Self {
+        match error {
+            CredentialError::Refused(message) => Self::Credential(message),
+            CredentialError::Unavailable(message) => Self::CredentialUnavailable(message),
+        }
+    }
+}
+
 /// Where a provider's credential comes from.
 #[async_trait]
 pub trait CredentialSource: Send + Sync {
     /// The credential's id (never its secret), for `auth_failed`'s detail.
     fn credential_id(&self) -> Option<String>;
     /// The bearer token, `None` to send no `authorization` header.
-    async fn bearer(&self) -> Result<Option<String>, String>;
+    async fn bearer(&self) -> Result<Option<String>, CredentialError>;
     /// The token with the account it belongs to; `None` when there is no credential at all.
     /// A source that knows no account (a plain API key) needs only [`Self::bearer`].
-    async fn secret(&self) -> Result<Option<ProviderSecret>, String> {
+    async fn secret(&self) -> Result<Option<ProviderSecret>, CredentialError> {
         Ok(self.bearer().await?.map(|token| ProviderSecret {
             token,
             account_id: None,
@@ -73,7 +99,7 @@ impl CredentialSource for NoCredential {
         None
     }
 
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(&self) -> Result<Option<String>, CredentialError> {
         Ok(None)
     }
 }
@@ -98,18 +124,23 @@ impl CredentialSource for VaultCredential {
         Some(self.credential_id.clone())
     }
 
-    async fn bearer(&self) -> Result<Option<String>, String> {
+    async fn bearer(&self) -> Result<Option<String>, CredentialError> {
         Ok(self.secret().await?.map(|secret| secret.token))
     }
 
-    async fn secret(&self) -> Result<Option<ProviderSecret>, String> {
+    async fn secret(&self) -> Result<Option<ProviderSecret>, CredentialError> {
         let vault_id = match &self.addressing {
             Some(addressing) => {
                 let key = crate::CredentialId::parse(&self.credential_id)
                     .ok_or_else(|| format!("invalid credential key {}", self.credential_id))?;
                 addressing
                     .vault_id_for(&key)
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| match error {
+                        broca_core::RunError::CredentialsUnavailable => {
+                            CredentialError::Unavailable(error.to_string())
+                        }
+                        other => CredentialError::Refused(other.to_string()),
+                    })?
                     .ok_or_else(|| format!("credential {} not found", self.credential_id))?
             }
             None => self.credential_id.clone(),
@@ -130,6 +161,56 @@ impl CredentialSource for VaultCredential {
                     ),
                 })
             })
-            .map_err(|error| error.to_string())
+            .map_err(read_error)
+    }
+}
+
+/// A failed vault read as System One answers it: a vault that couldn't answer now
+/// (unreachable, locked, a refresh that failed transiently) is unavailable; every other answer
+/// means this credential can't be used as it is.
+fn read_error(error: broca_subc::VaultError) -> CredentialError {
+    let message = error.to_string();
+    match error {
+        broca_subc::VaultError::RefreshFailed
+        | broca_subc::VaultError::VaultLocked
+        | broca_subc::VaultError::Transport(_) => CredentialError::Unavailable(message),
+        _ => CredentialError::Refused(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broca_subc::VaultError;
+
+    #[test]
+    fn an_unavailable_credential_answers_as_unavailable_and_a_refused_one_as_refused() {
+        use super::super::ProviderReply;
+        assert!(matches!(
+            ProviderReply::from(CredentialError::Unavailable("down".into())),
+            ProviderReply::CredentialUnavailable(_)
+        ));
+        assert!(matches!(
+            ProviderReply::from(CredentialError::Refused("revoked".into())),
+            ProviderReply::Credential(_)
+        ));
+    }
+
+    #[test]
+    fn only_a_vault_that_cannot_answer_now_is_unavailable() {
+        for error in [
+            VaultError::RefreshFailed,
+            VaultError::VaultLocked,
+            VaultError::Transport("reset".into()),
+        ] {
+            assert!(matches!(read_error(error), CredentialError::Unavailable(_)));
+        }
+        for error in [
+            VaultError::NeedsReauth,
+            VaultError::NotFound,
+            VaultError::Corrupt,
+        ] {
+            assert!(matches!(read_error(error), CredentialError::Refused(_)));
+        }
     }
 }

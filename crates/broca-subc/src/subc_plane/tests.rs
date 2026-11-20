@@ -4616,6 +4616,23 @@ mod renamed_scope_owner {
         );
     }
 
+    /// The handover may leave the old owner's record ended rather than gone: the live twin
+    /// under the new id still answers.
+    #[tokio::test]
+    async fn an_old_owner_record_the_handover_ended_reads_the_live_twin() {
+        let describer = ByOwner(
+            HashMap::from([
+                ("prefrontal-core".into(), answer(ScopeStatus::Ended, true)),
+                ("prefrontal".into(), answer(ScopeStatus::Live, true)),
+            ]),
+            Mutex::default(),
+        );
+        let read = describe_either_owner(&describer, &reserved("prefrontal-core"), "head")
+            .await
+            .unwrap();
+        assert_eq!(read.status, ScopeStatus::Live);
+    }
+
     #[tokio::test]
     async fn a_live_scope_or_an_unrenamed_owner_asks_once() {
         let describer = ByOwner(

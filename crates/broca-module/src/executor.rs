@@ -269,6 +269,14 @@ pub trait RunExecutor: Send + Sync + 'static {
     async fn fork_release(&self, _job: ForkReleaseJob) -> Result<(), String> {
         Ok(())
     }
+
+    /// Whether the routing admission of the fork attempt `admission_id`, whose
+    /// [`RunExecutor::fork_call`] just returned, may not have been released because routing
+    /// couldn't be told. The fork manager then records no release, so it asks again with
+    /// [`RunExecutor::fork_release`] the next time it opens the fork. Asking takes the answer.
+    fn fork_release_failed(&self, _admission_id: &str) -> bool {
+        false
+    }
 }
 
 /// One run of a session, as the store actor hands it to the executor. The actor builds the

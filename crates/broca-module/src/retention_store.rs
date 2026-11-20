@@ -211,8 +211,13 @@ impl RetentionService {
             .retain(|address, _| listed.contains(address.as_str()));
         let mut deleted = Vec::new();
         for addr in addresses {
+            // A backend of its own for each session: a backend keeps every log it opens open
+            // until it is dropped, and one shared across the whole pass held a file open for
+            // each of the tens of thousands of sessions it read.
+            let session_backend =
+                LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
             match self
-                .expire_store_session(runtime, &backend, &addr, now_ms)
+                .expire_store_session(runtime, &session_backend, &addr, now_ms)
                 .await
             {
                 Ok(Some(key)) => deleted.push(key),
@@ -365,6 +370,13 @@ impl RetentionService {
         {
             return Ok(false);
         }
+        // A session frozen for a move, or moved away, waits for the move: deleting it here would
+        // take the source a move still exports, or the moved head that refuses it here. Without
+        // that head a later send could start the session again on this computer while it runs
+        // on the other.
+        if residence_blocks_deletion(runtime, key)?.is_some() {
+            return Ok(false);
+        }
         // Under the lease no writer moves the head, so the session read here is the one deleted:
         // the store refuses the deletion if the head has moved past this position since.
         let deployment = runtime.deployment();
@@ -385,6 +397,13 @@ impl RetentionService {
             return Ok(false);
         };
         if deadline > now_ms {
+            return Ok(false);
+        }
+        // Spend not exported yet is recorded only in the session; it expires once the export
+        // has it, which the session's next opening or run end retries. A runtime that exports no
+        // spend never will, so there owed spend doesn't hold the session back: waiting would keep
+        // a session that can't be deleted, which every later send to it would open again.
+        if runtime.billing().is_some() && !view.operations.billing_owed.is_empty() {
             return Ok(false);
         }
         self.remove_read_session(
@@ -434,6 +453,9 @@ impl RetentionService {
         {
             return Ok(OperatorDeletion::Held);
         }
+        if let Some(why) = residence_blocks_deletion(runtime, key)? {
+            return Ok(OperatorDeletion::Busy(why));
+        }
         let Ok(lease) = self.lease(key) else {
             return Ok(OperatorDeletion::Held);
         };
@@ -463,7 +485,7 @@ impl RetentionService {
         if !operations.queue.is_empty() {
             return Ok(OperatorDeletion::Busy("sends are queued"));
         }
-        if !operations.billing_owed.is_empty() {
+        if runtime.billing().is_some() && !operations.billing_owed.is_empty() {
             return Ok(OperatorDeletion::Busy("a run's spend is not exported yet"));
         }
         let records = view.records_from(0).await.map_err(described)?;
@@ -573,3 +595,23 @@ impl RetentionService {
 #[cfg(test)]
 #[path = "retention_store_tests.rs"]
 mod tests;
+
+/// Why the session `key` may not be deleted because of where it lives: it is frozen for a move
+/// (a move between requests holds no lease, so the lease alone doesn't stop a deletion), or it
+/// has moved to another computer and only its moved head is left here, refusing it so it can't
+/// start again on both computers. `None` when it lives here.
+fn residence_blocks_deletion(
+    runtime: &StoreRuntime,
+    key: &BindIdentity,
+) -> Result<Option<&'static str>, String> {
+    match runtime.check_move(key, true) {
+        Ok(()) => Ok(None),
+        Err(crate::registry::OpenError::SessionMoving { .. }) => {
+            Ok(Some("the session is being moved to another computer"))
+        }
+        Err(crate::registry::OpenError::SessionMoved { .. }) => {
+            Ok(Some("the session moved to another computer"))
+        }
+        Err(error) => Err(format!("{error:?}")),
+    }
+}

@@ -120,6 +120,12 @@ pub struct BlockShape {
 }
 
 impl BlockShape {
+    /// Whether `block` is the block this shape was taken from: reading the released block back
+    /// gives exactly `block`.
+    pub fn is_of(&self, block: &ContentBlock) -> bool {
+        self.digest == block_digest(block)
+    }
+
     /// The shape of `block`, in a message of `role`.
     pub fn of(role: Role, block: &ContentBlock) -> Self {
         let held = BlockRef::Held(block);
@@ -439,5 +445,23 @@ impl Value for WindowMessage {
 impl crate::fuzzing::gen::Gen for WindowMessage {
     fn gen(g: &mut crate::fuzzing::gen::G<'_>) -> Self {
         Self::new(crate::fuzzing::gen::gen(g))
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    /// A released block is recognised again by its digest, not by its kind or ids alone.
+    #[test]
+    fn a_shape_is_of_its_own_block_only() {
+        let block = ContentBlock::Text {
+            text: "x".repeat(4_000).into(),
+        };
+        let shape = BlockShape::of(Role::Tool, &block);
+        assert!(shape.is_of(&block));
+        assert!(!shape.is_of(&ContentBlock::Text {
+            text: "y".repeat(4_000).into(),
+        }));
     }
 }

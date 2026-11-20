@@ -229,3 +229,19 @@ fn local_backend_temporary_files_are_owner_only_before_rename() {
     }
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// Folders are created whole, and asking again for one that exists changes nothing.
+#[test]
+fn new_folders_are_created_with_their_parents() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("create-dir-durably-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("heads/addr/v");
+    super::create_dir_durably(&dir).unwrap();
+    assert!(dir.is_dir());
+    super::create_dir_durably(&dir).unwrap();
+    super::create_dir_durably(&root.join("heads/other")).unwrap();
+    assert!(root.join("heads/other").is_dir());
+    std::fs::remove_dir_all(&root).unwrap();
+}
