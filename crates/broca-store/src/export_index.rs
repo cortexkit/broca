@@ -525,13 +525,17 @@ fn insert_segment(
 }
 
 /// Inserts `fact` unless its run was imported or a fact is already stored under its id, which
-/// stays as shipped.
+/// stays as shipped. Returns how a stored fact compares with `fact`, as `insert_segment` judges
+/// a segment. A run's facts are derived again each time its spend is written, which happens
+/// again for every prompt-cache refresh broca sends while the session is idle. So a field
+/// added since a fact shipped makes every later derivation differ, which is expected and
+/// logged at info; only a value that changed or went missing is a real disagreement, and warns.
 fn insert_attempt(
     tx: &rusqlite::Transaction<'_>,
     fact: &broca_core::billing::attempt::AttemptFact,
-) -> Result<(), ExportError> {
+) -> Result<CollisionKind, ExportError> {
     if imported_run(tx, &fact.session, &fact.run_id)? {
-        return Ok(());
+        return Ok(CollisionKind::Identical);
     }
     let json = serde_json::to_string(fact).map_err(storage)?;
     tx.execute(
@@ -546,14 +550,42 @@ fn insert_attempt(
             |row| row.get(0),
         )
         .map_err(storage)?;
-    if stored != json {
-        tracing::warn!(
+    let collision = classify_collision(&stored, &json);
+    match &collision {
+        CollisionKind::Identical => {}
+        CollisionKind::SchemaEvolution => tracing::info!(
             target: "store",
-            "immutable attempt fact {} re-derives to different bytes; keeping shipped fact",
+            "immutable attempt fact {} predates a field the current fact adds; keeping shipped \
+             fact (expected after any additive attempt-fact change)",
             fact.fact_id
-        );
+        ),
+        CollisionKind::EquivalentBytes => tracing::info!(
+            target: "store",
+            "immutable attempt fact {} re-derives to the same data in different bytes; keeping \
+             shipped fact (a serialization change, not a schema change)",
+            fact.fact_id
+        ),
+        CollisionKind::DerivationVersionChange { stamps, added } => tracing::info!(
+            target: "store",
+            "immutable attempt fact {} re-derives with moved derivation stamp(s) {}{}; keeping \
+             shipped fact (expected after the shipped value for those moved)",
+            fact.fact_id,
+            stamps.join(", "),
+            if added.is_empty() {
+                String::new()
+            } else {
+                format!(" and added field(s) {}", added.join(", "))
+            }
+        ),
+        CollisionKind::ValueDisagreement { fields } => tracing::warn!(
+            target: "store",
+            "immutable attempt fact {} disagrees on {}; keeping shipped fact. Same identity and \
+             a different answer means a derivation moved under a fact that cannot",
+            fact.fact_id,
+            fields.join(", ")
+        ),
     }
-    Ok(())
+    Ok(collision)
 }
 
 /// Whether a segment is already stored under `fact_id` without
@@ -1212,6 +1244,47 @@ pub(crate) mod tests {
         assert_eq!(
             exported(&store, "older"),
             vec![("segment", false), ("segment", false)]
+        );
+    }
+
+    /// A run's facts are derived again each time its spend is written. A field added since an
+    /// attempt fact shipped is expected and stays quiet; a changed value is told apart and
+    /// names its field.
+    #[test]
+    fn a_rederived_attempt_fact_tells_an_added_field_from_a_changed_value() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (frames, attempts) = records_with_attempts("rederived");
+        let run = RunId("rederived".into());
+        store
+            .emit_export_run_with_attempts(&frames, &run, &attempts, &resolver)
+            .unwrap();
+        let facts = broca_core::billing::attempt::compute_attempt_facts(
+            &frames,
+            &run,
+            &attempts,
+            store.source_instance_id(),
+            &ResolverRef(&resolver),
+        )
+        .attempts;
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            insert_attempt(&tx, &facts[0]).unwrap(),
+            CollisionKind::Identical
+        );
+        let mut added = facts[0].clone();
+        added.input_transformations = Some(Vec::new());
+        assert_eq!(
+            insert_attempt(&tx, &added).unwrap(),
+            CollisionKind::SchemaEvolution
+        );
+        let mut changed = facts[0].clone();
+        changed.response_bytes += 1;
+        assert_eq!(
+            insert_attempt(&tx, &changed).unwrap(),
+            CollisionKind::ValueDisagreement {
+                fields: vec!["response_bytes".into()]
+            }
         );
     }
 
