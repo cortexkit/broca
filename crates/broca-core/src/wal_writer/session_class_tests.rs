@@ -107,6 +107,16 @@ fn native_file_identity_distinguishes_aliases_from_equal_bytes() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn missing_native_identity_never_establishes_aliasing() {
+    assert!(!same_native_file_identity(None, None));
+    assert!(!same_native_file_identity(Some((1, 2)), None));
+    assert!(!same_native_file_identity(None, Some((1, 2))));
+    assert!(!same_native_file_identity(Some((1, 2)), Some((2, 2))));
+    assert!(!same_native_file_identity(Some((1, 2)), Some((1, 3))));
+    assert!(same_native_file_identity(Some((1, 2)), Some((1, 2))));
+}
+
 #[cfg(any(unix, windows))]
 fn linked_overhaul_wal(tag: &str) -> (PathBuf, BindIdentity, FileWalStore, Vec<u8>) {
     let (root, session, _) = fixture(tag);

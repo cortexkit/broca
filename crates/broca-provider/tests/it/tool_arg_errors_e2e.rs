@@ -77,20 +77,6 @@ fn text_deltas(outcome: &RunOutcome) -> Vec<&str> {
         .collect()
 }
 
-fn tool_input_delta_text(outcome: &RunOutcome) -> String {
-    let mut rendered = String::new();
-    for event in &outcome.events {
-        match event {
-            OutputEvent::Display(DisplayEvent::DisplayReset) => rendered.clear(),
-            OutputEvent::Display(DisplayEvent::ToolInputDelta { delta, .. }) => {
-                rendered.push_str(delta);
-            }
-            _ => {}
-        }
-    }
-    rendered
-}
-
 fn provider_finish_reason_for_openai_chat(raw_finish_reason: &str) -> FinishReason {
     let recorded = format!(
         "data: {{\"id\":\"chatcmpl-finish\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n\
@@ -194,20 +180,21 @@ async fn unparseable_tool_call_arguments() {
         error.message
     );
     assert_eq!(outcome.summary.reason, RunFinishReason::Error);
-    assert_eq!(
-        outcome
-            .events
-            .iter()
-            .filter(|event| matches!(event, OutputEvent::Display(DisplayEvent::DisplayReset)))
-            .count(),
-        1,
-        "the malformed response is retried once with a full display reset"
-    );
-    assert_eq!(
-        tool_input_delta_text(&outcome),
-        r#"{"pat"#,
-        "display lane still carries the raw truncated argument bytes"
-    );
+    // Each attempt streams its raw truncated argument bytes to the display lane. A reset
+    // abandons them before the one retry, and another when the run ends on the error, so
+    // arguments the model never finished don't stay on screen.
+    let display: Vec<String> = outcome
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OutputEvent::Display(DisplayEvent::DisplayReset) => Some("reset".to_owned()),
+            OutputEvent::Display(DisplayEvent::ToolInputDelta { delta, .. }) => {
+                Some(delta.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(display, [r#"{"pat"#, "reset", r#"{"pat"#, "reset"]);
     assert!(caller_step_finish_reasons(&outcome).is_empty());
 }
 

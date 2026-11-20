@@ -25,3 +25,4 @@ mod scope_outbound_real_daemon;
 mod session_door;
 mod subc_guard;
 mod tool_call_cancel_real_daemon;
+mod tool_route_lifecycle;

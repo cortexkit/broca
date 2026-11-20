@@ -1476,6 +1476,12 @@ impl SubcToolPlane {
             .clone()
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_mint_lifecycle_token_uncancelled(&self, bind: &BindIdentity) -> bool {
+        !self.capture_session_lifecycle_token(bind).is_cancelled()
+    }
+
     fn frozen_preset(&self, ctx: &BatchCtx, module_id: &str) -> Option<String> {
         self.batch_presets
             .lock()

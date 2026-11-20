@@ -140,14 +140,19 @@ if os.environ.get('FAIL_DOC') and any('/' + os.environ['FAIL_DOC'] + '/' in arg 
         self.assertIn("package(=beta) & (kind(lib) | kind(bin)) & not ((package(=beta) & test(=other::sweep)))",
                       only_beta)
 
-    def test_the_real_slow_list_names_existing_workspace_packages(self):
+    def test_the_real_slow_list_names_existing_workspace_tests(self):
         packages = {p.name for p in (ROOT / "crates").iterdir() if (p / "Cargo.toml").exists()}
-        listed = list(LANE.rows("quickcheck-slow-tests.list"))
-        self.assertTrue(listed)
-        for package, name, seconds in listed:
+        for package, name, seconds in LANE.rows("quickcheck-slow-tests.list"):
             self.assertIn(package, packages)
             self.assertIn("::", name)
             self.assertGreater(int(seconds), 60)
+            # A listed test that no longer exists would hide nothing and mislead the reader.
+            function = f"fn {name.rsplit('::', 1)[1]}("
+            sources = (ROOT / "crates" / package).rglob("*.rs")
+            self.assertTrue(
+                any(function in source.read_text() for source in sources),
+                f"{package} has no test {name}",
+            )
 
     def test_outside_lint_and_doctest_failures_do_not_fail_attestation(self):
         result, _ = self.run_lane(LINT_PACKAGE="beta", FAIL_DOC="beta")

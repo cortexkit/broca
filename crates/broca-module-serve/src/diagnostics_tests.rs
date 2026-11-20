@@ -12,15 +12,18 @@ const NOW: i64 = 200_000_000;
 /// process, so each test installing its own folder would silently keep whichever folder was
 /// installed first. Sharing one folder and serializing installs with `INSTALL_LOCK` means an
 /// installing test always sees the folder it prepared.
+#[cfg(feature = "test-clock")]
 fn installed_root() -> PathBuf {
     broca_test_support::scratch_root().join("diagnostics-installed")
 }
 
 /// Serializes tests that install a decided root, because installation is process-wide. Each
 /// holder rebuilds `installed_root()` from empty, so it starts from its own contents.
+#[cfg(feature = "test-clock")]
 static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take `INSTALL_LOCK` and leave an empty `installed_root()`.
+#[cfg(feature = "test-clock")]
 fn install_lock() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
     let guard = INSTALL_LOCK
         .lock()

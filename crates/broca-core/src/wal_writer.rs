@@ -586,31 +586,10 @@ fn state_root_of(root: &Path) -> PathBuf {
     }
 }
 
-#[cfg(unix)]
-fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
-    use std::os::unix::fs::MetadataExt;
-    let left = broca_wal::fs_ops::metadata(left).map_err(WalError::Io)?;
-    let right = broca_wal::fs_ops::metadata(right).map_err(WalError::Io)?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
-}
-
-#[cfg(windows)]
-fn same_wal_file(left: &Path, right: &Path) -> Result<bool, WalError> {
-    let left = broca_wal::fs_ops::File::open(left).map_err(WalError::Io)?;
-    let right = broca_wal::fs_ops::File::open(right).map_err(WalError::Io)?;
-    // Placement repair may remove an alias, so compare the complete handle identities,
-    // not the lossy hashes used to invalidate read caches.
-    Ok(same_native_file_identity(
-        left.native_file_identity(),
-        right.native_file_identity(),
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_wal_file(_left: &Path, _right: &Path) -> Result<bool, WalError> {
-    // Never guess whether paths are aliases when native file identity is unavailable.
-    Ok(false)
-}
+mod file_identity;
+#[cfg(any(windows, test))]
+use file_identity::same_native_file_identity;
+use file_identity::same_wal_file;
 
 impl FileWalStore {
     /// [`Self::owned_by_store`] for a session known only by its address.
@@ -3582,6 +3561,7 @@ impl WalHandle {
     }
 
     /// Keep the per-run lease on the writer thread, including if its owner is cancelled.
+    #[cfg(any(test, feature = "test-clock"))]
     pub(crate) fn spawn_with_lease(
         wal: Box<dyn Wal + Send>,
         lease: Box<dyn LeaseHandle>,
@@ -3591,6 +3571,7 @@ impl WalHandle {
         Self::spawn_proven_observed(wal, last_seq, fence, None, Some(lease))
     }
 
+    #[cfg(any(test, feature = "test-clock"))]
     pub(crate) fn spawn_in_store<W: WalStore>(
         wal: Box<dyn Wal + Send>,
         store: &W,

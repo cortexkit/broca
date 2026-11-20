@@ -32,7 +32,7 @@ aimock = { max-threads = 4 }
 # share the crate's `it` binary and are selected by module prefix. A prefix that matches nothing is not a nextest error, so
 # scripts/test-nextest-groups.py checks that every prefix names a module of the
 # binary and that every module starting a daemon rig is listed here.
-filter = 'package(=broca-subc) and binary(=it) and test(/^(aimock_real_aft|call_keepalive_latency_real_daemon|compaction_routes|consent_ops|dogfood|hook_routes|multi_module_spine|resume_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_fault_spine)::/)'
+filter = 'package(=broca-subc) and binary(=it) and test(/^(call_keepalive_latency_real_daemon|compaction_routes|consent_ops|hook_routes|multi_module_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_route_lifecycle)::/)'
 test-group = 'subc_spine'
 
 [[profile.default.overrides]]
