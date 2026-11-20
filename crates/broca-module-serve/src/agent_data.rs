@@ -110,7 +110,7 @@ impl AgentDataService {
     ) -> Self {
         wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
-            store: registry.store_runtime(),
+            registry: registry.clone(),
             root: root.clone(),
             wal: wal.clone(),
             index: index.clone(),
@@ -147,7 +147,7 @@ impl AgentDataService {
     ) -> Self {
         wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
-            store: registry.store_runtime(),
+            registry: registry.clone(),
             root: root.clone(),
             wal: wal.clone(),
             index: index.clone(),
@@ -188,6 +188,14 @@ impl AgentDataService {
             })?;
         self.inventory_readiness.start();
         Ok(())
+    }
+
+    /// Finishes the move operations boot reconciliation had to leave pending because a session
+    /// they name couldn't be read yet: an encrypted session needs the storage key, which loads
+    /// only after boot. Run once the key has loaded. A cut with nothing pending is left alone, so
+    /// running this again changes nothing.
+    pub async fn reconcile_pending_cuts(&self) -> Result<(), ErrorBody> {
+        self.cuts.reconcile_boot(&self.artifacts).await
     }
 }
 
@@ -287,7 +295,9 @@ pub(crate) async fn dispatch(
 }
 
 struct Driver {
-    store: Option<Arc<broca_module::store_open::StoreRuntime>>,
+    /// Read for the new storage's runtime at each use rather than once: a runtime that failed to
+    /// open at boot can open later, when the key loader retries it.
+    registry: LineageRegistry,
     root: PathBuf,
     wal: Arc<FileWalStore>,
     index: Arc<dyn broca_core::SessionInventory>,
@@ -396,6 +406,11 @@ fn wal_format(bytes: &[u8]) -> Result<(String, String), ErrorBody> {
 }
 
 impl Driver {
+    /// The new storage's runtime, when it has opened.
+    fn store(&self) -> Option<Arc<broca_module::store_open::StoreRuntime>> {
+        self.registry.store_runtime()
+    }
+
     fn activation_bytes(
         &self,
         reference: &str,
@@ -541,8 +556,7 @@ impl MoveDriver for Driver {
         staged: &std::path::Path,
     ) -> Result<(), ErrorBody> {
         let runtime = self
-            .store
-            .as_ref()
+            .store()
             .ok_or_else(|| unavailable("store runtime unavailable"))?;
         let addr =
             broca_session_store::backend::SessionAddr(broca_core::session_addr(&plan.session));
@@ -705,7 +719,7 @@ impl MoveDriver for Driver {
             {
                 return Err(refusal(
                     "not_exportable",
-                    "retention session must not leave this Mac",
+                    "retention session must not leave this computer",
                     Value::Null,
                 ));
             }
@@ -1165,7 +1179,7 @@ mod operational_port_tests {
                     )]))
                     .unwrap();
                 let driver = Driver {
-                    store: None,
+                    registry: LineageRegistry::new(Arc::new(NeverOpen)),
                     root: root.clone(),
                     wal,
                     index: index.clone(),

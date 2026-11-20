@@ -656,6 +656,19 @@ impl<B: SessionBackend> Pages<'_, B> {
         root: Option<&PageRef>,
         seq: u64,
     ) -> Result<Vec<DirEntry>, DirectoryError> {
+        self.entries_between(root, seq, u64::MAX).await
+    }
+
+    /// Every entry whose segment holds a record in `first..=last`, in seq order. Walks only the
+    /// pages whose range overlaps it, so a range early in a long history reads none of the pages
+    /// after it.
+    pub async fn entries_between(
+        &self,
+        root: Option<&PageRef>,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<DirEntry>, DirectoryError> {
+        let seq = first;
         let mut out = Vec::new();
         let Some(root) = root else {
             return Ok(out);
@@ -668,13 +681,13 @@ impl<B: SessionBackend> Pages<'_, B> {
                 out.extend(
                     page.entries
                         .into_iter()
-                        .filter(|entry| entry.last_seq >= seq),
+                        .filter(|entry| entry.last_seq >= seq && entry.first_seq <= last),
                 );
             } else {
                 pending.extend(
                     page.children
                         .into_iter()
-                        .filter(|child| child.last_seq >= seq)
+                        .filter(|child| child.last_seq >= seq && child.first_seq <= last)
                         .rev(),
                 );
             }

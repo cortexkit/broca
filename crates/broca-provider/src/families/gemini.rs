@@ -226,11 +226,7 @@ pub(crate) fn with_request_body<R>(
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
-        &opts.tools,
-        &opts.prompt,
-        &frozen.tool_name_aliases,
-    );
+    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
     let contents = convert_contents_with_provenance(
         &opts.prompt,
         frozen,

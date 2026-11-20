@@ -896,7 +896,19 @@ async fn run(args: Args) -> Result<i32, String> {
             restore_report(json, &body, &mut |line| println!("{line}"))
         }
         Cmd::TagMap { out, limit } => {
-            let mut pages = Vec::new();
+            // The output opens first, so an existing file refuses before any page is read, and
+            // each page's rows are written as it arrives: memory holds one page at a time.
+            let output: Box<dyn Write> = match out {
+                Some(path) => {
+                    let mut options = broca_owner_only::OpenOptions::new();
+                    options.write(true).create_new(true);
+                    Box::new(std::io::BufWriter::new(options.open(&path).map_err(|_| {
+                        "cannot create the tag map output (existing files are never overwritten)"
+                    })?))
+                }
+                None => Box::new(std::io::stdout().lock()),
+            };
+            let mut document = TagMapDocument::start(output, &session.session)?;
             let mut after_ordinal = None;
             loop {
                 let params = broca_wire::tag_map::TagMapParams {
@@ -923,27 +935,13 @@ async fn run(args: Args) -> Result<i32, String> {
                 };
                 let page = tag_map_page(&body)?;
                 let next = next_tag_map_page(after_ordinal, &page)?;
-                pages.push(page);
+                document.rows(&page.rows)?;
                 match next {
                     Some(next) => after_ordinal = Some(next),
                     None => break,
                 }
             }
-            let document = tag_map_document(&session.session, pages);
-            let mut output: Box<dyn Write> = match out {
-                Some(path) => {
-                    let mut options = broca_owner_only::OpenOptions::new();
-                    options.write(true).create_new(true);
-                    Box::new(options.open(&path).map_err(|_| {
-                        "cannot create the tag map output (existing files are never overwritten)"
-                    })?)
-                }
-                None => Box::new(std::io::stdout().lock()),
-            };
-            serde_json::to_writer(&mut output, &document)
-                .map_err(|_| "cannot write the tag map")?;
-            writeln!(output).map_err(|_| "cannot write the tag map")?;
-            output.flush().map_err(|_| "cannot flush the tag map")?;
+            document.finish()?;
             Ok(0)
         }
         Cmd::Memory => {
@@ -2554,13 +2552,38 @@ fn next_tag_map_page(
     }
 }
 
-/// The document `tag-map` writes: the session's name and every page's rows, in order.
-fn tag_map_document(
-    session: &str,
-    pages: Vec<broca_wire::tag_map::TagMapResponse>,
-) -> serde_json::Value {
-    let rows: Vec<_> = pages.into_iter().flat_map(|page| page.rows).collect();
-    serde_json::json!({ "session": session, "rows": rows })
+/// The document `tag-map` writes, `{"session": <name>, "rows": [...]}` with every page's rows in
+/// order, written a page at a time so the whole map is never held.
+struct TagMapDocument<W: Write> {
+    out: W,
+    first: bool,
+}
+
+impl<W: Write> TagMapDocument<W> {
+    fn start(mut out: W, session: &str) -> Result<Self, String> {
+        let name = serde_json::to_string(session).map_err(|_| "cannot write the tag map")?;
+        write!(out, "{{\"session\":{name},\"rows\":[").map_err(|_| "cannot write the tag map")?;
+        Ok(Self { out, first: true })
+    }
+
+    fn rows(&mut self, rows: &[broca_wire::tag_map::TagMapRow]) -> Result<(), String> {
+        for row in rows {
+            if !self.first {
+                self.out
+                    .write_all(b",")
+                    .map_err(|_| "cannot write the tag map")?;
+            }
+            self.first = false;
+            serde_json::to_writer(&mut self.out, row).map_err(|_| "cannot write the tag map")?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<W, String> {
+        writeln!(self.out, "]}}").map_err(|_| "cannot write the tag map")?;
+        self.out.flush().map_err(|_| "cannot flush the tag map")?;
+        Ok(self.out)
+    }
 }
 
 /// The answer inside a management reply. The daemon frames every unary reply as
@@ -3042,7 +3065,7 @@ mod tests {
         parse_tools, run_id_for_combined_turn, ControlRenderMode, RunTurnAction, RunTurnRefusal,
         RunTurnTracker,
     };
-    use super::{next_tag_map_page, tag_map_document};
+    use super::{next_tag_map_page, TagMapDocument};
     use broca_module_serve::client::SendOutcome;
     use broca_module_serve::client::{
         decode_subscribe_event, SubscribeEvent, UnrecognizedRunState,
@@ -3449,8 +3472,13 @@ mod tests {
         assert_eq!(next_tag_map_page(Some(2), &last), Ok(None));
         // A reply naming a page that doesn't move forward is refused rather than read forever.
         assert!(next_tag_map_page(Some(2), &first).is_err());
+        let mut document = TagMapDocument::start(Vec::new(), "s1").unwrap();
+        document.rows(&first.rows).unwrap();
+        document.rows(&last.rows).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&document.finish().unwrap()).unwrap();
         assert_eq!(
-            tag_map_document("s1", vec![first, last]),
+            written,
             serde_json::json!({"session": "s1", "rows": [
                 {"tag": 1, "mid": "m1", "ordinal": 1, "part": 0, "role": "user"},
                 {"tag": 2, "mid": "m3", "ordinal": 3, "part": 1, "role": "assistant"},

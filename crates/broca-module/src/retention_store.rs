@@ -192,8 +192,8 @@ impl RetentionService {
         now_ms: u64,
     ) -> Vec<BindIdentity> {
         let backend = LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
-        let addresses = match backend.stored_sessions() {
-            Ok(addresses) => addresses,
+        let (addresses, cut_short) = match backend.stored_sessions_and_deletions() {
+            Ok(found) => found,
             Err(error) => {
                 tracing::warn!(target: "retention", error = ?error,
                     "retention pass over the new storage deferred; its ephemeral root can't be listed");
@@ -209,6 +209,12 @@ impl RetentionService {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|address, _| listed.contains(address.as_str()));
+        for addr in cut_short {
+            if let Err(error) = self.finish_store_deletion(runtime, &backend, &addr) {
+                tracing::warn!(target: "retention", session = %addr.0, %error,
+                    "a deletion a crash cut short is left to finish on the next pass");
+            }
+        }
         let mut deleted = Vec::new();
         for addr in addresses {
             // A backend of its own for each session: a backend keeps every log it opens open
@@ -229,6 +235,47 @@ impl RetentionService {
             }
         }
         deleted
+    }
+
+    /// Removes what remains of the session at `addr` after a crash cut its deletion short: its
+    /// head is gone, so it reads as expired, but its logs and objects are still on disk. Under the
+    /// session's lease, so no session is created at the address meanwhile; a lease held elsewhere
+    /// leaves it to the next pass.
+    fn finish_store_deletion(
+        &self,
+        runtime: &StoreRuntime,
+        backend: &LocalBackend,
+        addr: &SessionAddr,
+    ) -> Result<(), String> {
+        let Some(stored) = backend.deleted_head(addr).map_err(described)? else {
+            return Ok(());
+        };
+        let triple = head::stored_triple(&stored).map_err(described)?;
+        let key = BindIdentity::new(
+            triple.project_root.clone(),
+            triple.harness.clone(),
+            triple.session.clone(),
+        );
+        if broca_core::session_addr(&key) != addr.0 {
+            return Err(
+                "the deleted session's head names a session filed under another address".into(),
+            );
+        }
+        let Ok(_lease) = self.lease(&key) else {
+            return Ok(());
+        };
+        broca_wal::migration::unlink(
+            &runtime
+                .state_root()
+                .join("session-store-moves/streams")
+                .join(&addr.0),
+        )
+        .map_err(|error| error.to_string())?;
+        if backend.finish_deletion(addr).map_err(described)? {
+            tracing::info!(target: "retention", session = %addr.0,
+                "finished a deletion a crash had cut short");
+        }
+        Ok(())
     }
 
     /// Deletes the session at `addr` in the ephemeral root when its policy expired at or before
@@ -568,11 +615,13 @@ impl RetentionService {
             deployment,
         )
         .map_err(described)?;
+        // The cached move stream copies the session's content, so it goes before the session: a
+        // crash between the two leaves the session to be deleted again, never the copy behind.
+        broca_wal::migration::unlink(&state_root.join("session-store-moves/streams").join(&addr.0))
+            .map_err(|error| error.to_string())?;
         Session::delete(backend, addr, version)
             .await
             .map_err(described)?;
-        broca_wal::migration::unlink(&state_root.join("session-store-moves/streams").join(&addr.0))
-            .map_err(|error| error.to_string())?;
         self.store
             .deadlines
             .lock()

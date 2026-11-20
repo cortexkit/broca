@@ -276,6 +276,48 @@ fn operator_aliases_empty_map_is_omitted_and_composes_with_grammar_aliases() {
 }
 
 #[test]
+fn a_tool_name_gemini_cant_take_first_gets_a_letter_first_alias_there_only() {
+    // Gemini's function names start with a letter or an underscore. A declared tool named
+    // `7day` renders unchanged where any first character is taken, and under an alias that
+    // starts with `_` in Gemini, in both its declaration and its history call; the alias maps
+    // back to the tool's own name.
+    use broca_provider::tool_name_alias::{normalize_in, NameGrammar};
+    let mut opts = options();
+    std::sync::Arc::make_mut(&mut opts.tools)[0].name = "7day".into();
+    let ContentBlock::ToolCall(call) = &mut opts.prompt[0].content[0] else {
+        unreachable!()
+    };
+    call.tool_name = "7day".into();
+    let render = |family: &dyn Fn() -> Vec<u8>| -> Value {
+        serde_json::from_slice(&family()).expect("rendered JSON")
+    };
+    let responses =
+        render(&|| OpenAiResponses.render(&openai_responses_frozen_config("gpt-4o"), &opts));
+    assert_alias(&responses, &["tools", "0", "name"], "7day");
+
+    let alias = normalize_in("7day", NameGrammar::LetterFirst);
+    assert!(alias.starts_with('_'), "{alias}");
+    let gemini = render(&|| Gemini.render(&gemini_frozen_config("gemini-2.5-flash"), &opts));
+    assert_alias(
+        &gemini,
+        &["tools", "0", "functionDeclarations", "0", "name"],
+        &alias,
+    );
+    assert_alias(
+        &gemini,
+        &["contents", "0", "parts", "0", "functionCall", "name"],
+        &alias,
+    );
+    // The transport restores echoed names from the same map the renderer used.
+    let map = broca_provider::tool_name_alias::map_for(
+        &gemini_frozen_config("gemini-2.5-flash"),
+        &opts.tools,
+        &opts.prompt,
+    );
+    assert_eq!(map.canonical_name(&alias), "7day");
+}
+
+#[test]
 fn operator_alias_validation_uses_the_selected_family_name_grammar() {
     use broca_provider::{spec::WireFamilyId, tool_name_alias::validate_operator_aliases};
     let opts = operator_options();

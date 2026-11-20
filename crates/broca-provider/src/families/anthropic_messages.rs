@@ -713,11 +713,7 @@ fn render_placed<R>(
     // the arc still pairs. This is render-edge ONLY: the map is built from a read-only scan
     // and the canonical id stays the sole persisted form.
     let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
-    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
-        &opts.tools,
-        &opts.prompt,
-        &frozen.tool_name_aliases,
-    );
+    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
     // The index of the first message whose thinking may be echoed, computed in ONE place
     // (`first_echoed_message`) so the request body and the tests' reference renderer read the
     // same positional cutoff and cannot drift.
@@ -1661,11 +1657,7 @@ mod tests {
             .filter(|message| message.role != Role::System)
             .collect::<Vec<_>>();
         let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
-        let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
-            &opts.tools,
-            &opts.prompt,
-            &frozen.tool_name_aliases,
-        );
+        let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
         let first_echoed = echo_scope.and_then(|scope| first_echoed_message(scope, &non_system));
 
         non_system

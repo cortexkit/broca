@@ -1213,7 +1213,8 @@ fn stored_cipher(
 
 /// The triple a session is created and loaded under: the bind identity's, spelled as
 /// `broca_core::session_addr` spells it, so the triple and the address name one session.
-pub(crate) fn triple(key: &BindIdentity) -> SessionTriple {
+/// The session triple a stored session's log names, from its bind identity.
+pub fn triple(key: &BindIdentity) -> SessionTriple {
     SessionTriple {
         project_root: key.project_root.display().to_string(),
         harness: key.harness.clone(),

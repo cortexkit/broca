@@ -9,6 +9,7 @@ cipher_tests!(
     appends_build_a_tree_whose_lookups_find_every_entry,
     an_out_of_order_entry_refuses,
     ordinal_lookups_walk_a_deep_tree,
+    a_range_walk_reads_only_the_pages_that_overlap_it,
 );
 
 use super::{DirEntry, DirectoryError, Pages};
@@ -159,6 +160,47 @@ fn ordinal_lookups_walk_a_deep_tree(cipher: Cipher) {
         assert_eq!(
             pages.find_ordinal(Some(&root), placed + 1).await.unwrap(),
             None
+        );
+    });
+}
+
+/// A range of entries early in a deep tree reads only the pages on the paths to those entries,
+/// none of the pages after the range, and finds exactly the entries the range touches.
+fn a_range_walk_reads_only_the_pages_that_overlap_it(cipher: Cipher) {
+    block_on(async {
+        let backend = MemoryBackend::default();
+        let addr = SessionAddr("a".into());
+        backend.write_head(&addr, b"h", None, 1).await.unwrap();
+        let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
+        let pages = Pages {
+            backend: &backend,
+            addr: &addr,
+            session: Id128([1; 16]),
+            key: &key,
+            fanout: 3,
+        };
+        let mut root = None;
+        for n in 1..=40u64 {
+            root = Some(
+                pages
+                    .append(root.as_ref(), entry(n), &format!("c{n}/d"), 1)
+                    .await
+                    .unwrap()
+                    .root,
+            );
+        }
+        let root = root.unwrap();
+        let before = backend.object_reads();
+        let found = pages.entries_between(Some(&root), 15, 25).await.unwrap();
+        let read = backend.object_reads() - before;
+        assert_eq!(found, vec![entry(1), entry(2)]);
+        // Four levels: the root, then one page per level down to the leaf holding entries 1-3.
+        assert_eq!(read, 4, "the range read {read} pages");
+        let before = backend.object_reads();
+        assert_eq!(pages.entries_from(Some(&root), 15).await.unwrap().len(), 40);
+        assert!(
+            backend.object_reads() - before > 20,
+            "the walk to the tip reads every page"
         );
     });
 }

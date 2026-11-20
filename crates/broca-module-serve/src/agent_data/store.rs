@@ -117,7 +117,7 @@ impl Driver {
         } = incoming;
         let frame = moves::last_export(&bytes).map_err(failure)?;
         let header = moves::header(frame).map_err(failure)?;
-        let Some(runtime) = &self.store else {
+        let Some(runtime) = self.store() else {
             return Err(header.deployment_key.map_or_else(
                 || unavailable("store runtime unavailable"),
                 |id| failure(moves::Error::DeploymentKeyMissing(id)),
@@ -189,7 +189,7 @@ impl Driver {
         cut: &str,
         op: Op,
     ) -> Result<Option<PlannedSession>, ErrorBody> {
-        let Some(runtime) = &self.store else {
+        let Some(runtime) = self.store() else {
             return Ok(None);
         };
         let held = runtime.class_of(session).map_err(unavailable)?;
@@ -232,6 +232,15 @@ impl Driver {
                 .await
                 .map_err(|error| error.refusal)?;
             return self.incoming_store_plan(reference, bytes).await.map(Some);
+        }
+        // A session kept with retention lives in the ephemeral class and is deleted when its
+        // deadline passes; a move would keep a copy of it beyond that on another computer.
+        if op == Op::Prepare && class == broca_wal::StorageClass::Ephemeral {
+            return Err(refusal(
+                "not_exportable",
+                "retention session must not leave this computer",
+                Value::Null,
+            ));
         }
         let backend = LocalBackend::new(class.store_root(&self.root));
         let addr = SessionAddr(broca_core::session_addr(session));
@@ -285,6 +294,12 @@ impl Driver {
                 }
             }
         }
+        if op == Op::Busy && freeze.is_none() && version == current {
+            return self
+                .busy_store_plan(reference, session, &backend, &addr, runtime.deployment())
+                .await
+                .map(Some);
+        }
         let mut export =
             Export::pinned(&backend, &addr, version, class.name(), runtime.deployment())
                 .await
@@ -302,7 +317,8 @@ impl Driver {
         .await
         .map_err(|e| unavailable(format!("{e:?}")))?;
         let busy = store_busy(&view);
-        if busy.is_none() {
+        // The move checks travel with an export; `busy` and `diverged` send none.
+        if busy.is_none() && !matches!(op, Op::Busy | Op::Diverged) {
             export.checks = super::snapshot::store_snapshot(&export, runtime.deployment())
                 .await
                 .map_err(unavailable)?;
@@ -310,9 +326,8 @@ impl Driver {
         let (head, _) = export.head(&addr, runtime.deployment()).map_err(failure)?;
         let cached = self.root.join("session-store-moves/streams").join(&addr.0);
         let (bytes, end_offset, digest, store_prefix) = if op == Op::Busy {
-            let bytes = moves::append_stream(&[], &export);
-            let digest = broca_wal::migration::digest(&bytes);
-            (bytes.clone(), bytes.len() as u64, digest, None)
+            // A busy answer names only the session's state and format, never a stream.
+            (Vec::new(), 0, String::new(), None)
         } else if op == Op::Prepare {
             // The door's offsets carry no digest, so prepare checks only the local frame hashes.
             // Import checks the whole-prefix digest returned by session.read {cutId}; admit
@@ -335,7 +350,15 @@ impl Driver {
         };
         let divergence = if op == Op::Diverged {
             let incoming = self.incoming(reference, cut).await.map_err(|e| e.refusal)?;
-            Some(if incoming.end == end_offset && incoming.digest == digest {
+            // The cached stream is what the move brought; the session itself can have gone on
+            // here since, which the stream never shows. So the copy is at the cut only when the
+            // door's bytes match the stream and the session holds no record past the stream's
+            // last export.
+            let at_cut = incoming.end == end_offset
+                && incoming.digest == digest
+                && view.next_seq()
+                    == exported_next_seq(&bytes, &addr, runtime.deployment()).await?;
+            Some(if at_cut {
                 LocalDivergence::AtCut
             } else {
                 LocalDivergence::Advanced
@@ -358,4 +381,66 @@ impl Driver {
             divergence_reason: busy.map(str::to_owned),
         }))
     }
+
+    /// The plan a `busy` probe needs for a stored session that lives here, unfrozen: its state
+    /// read from a view of the session's open window and its format from the head. A probe never
+    /// builds an export, so it costs what reading the session's window costs, whatever the
+    /// length of the history behind it.
+    async fn busy_store_plan(
+        &self,
+        reference: &str,
+        session: &BindIdentity,
+        backend: &LocalBackend,
+        addr: &SessionAddr,
+        deployment: &broca_session_store::keys::DeploymentKey,
+    ) -> Result<PlannedSession, ErrorBody> {
+        let view = Session::view(
+            backend,
+            addr.clone(),
+            &broca_module::store_open::triple(session),
+            deployment,
+        )
+        .await
+        .map_err(|e| unavailable(format!("{e:?}")))?;
+        let (stored, _) = backend
+            .read_stored_head(addr)
+            .map_err(|e| unavailable(format!("{e:?}")))?
+            .ok_or_else(|| unavailable("store head missing"))?;
+        let (head, _) = broca_session_store::head::open(&stored, deployment)
+            .map_err(|e| unavailable(format!("{e:?}")))?;
+        Ok(PlannedSession {
+            store_prefix: None,
+            reference: reference.into(),
+            session: session.clone(),
+            end_offset: 0,
+            digest: String::new(),
+            sealed_digest: None,
+            bytes: Vec::new(),
+            format: format!("{};features={}", moves::FORMAT, head.features.join(",")),
+            lineage_id: broca_session_store::codec::hex(&head.session_id.0),
+            local_archive: None,
+            divergence: None,
+            divergence_reason: store_busy(&view).map(str::to_owned),
+        })
+    }
+}
+
+/// The sequence number the next record of the session at `addr` would take, as the last export
+/// in the move stream `stream` holds it.
+async fn exported_next_seq(
+    stream: &[u8],
+    addr: &SessionAddr,
+    deployment: &broca_session_store::keys::DeploymentKey,
+) -> Result<u64, ErrorBody> {
+    let export = Export::decode(
+        moves::last_export(stream).map_err(failure)?,
+        addr,
+        deployment,
+    )
+    .map_err(failure)?;
+    let memory = export.memory(addr, deployment).await.map_err(failure)?;
+    let view = Session::view(&memory, addr.clone(), &export.header.triple, deployment)
+        .await
+        .map_err(|e| unavailable(format!("{e:?}")))?;
+    Ok(view.next_seq())
 }

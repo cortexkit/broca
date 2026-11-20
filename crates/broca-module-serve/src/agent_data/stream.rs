@@ -157,6 +157,10 @@ mod tests {
         }
         stream
     }
+    struct NoRuns;
+    #[async_trait::async_trait]
+    impl broca_module::executor::RunExecutor for NoRuns {}
+
     fn driver(bytes: Vec<u8>) -> (Driver, Arc<Door>) {
         let door = Arc::new(Door {
             bytes,
@@ -165,7 +169,13 @@ mod tests {
         (
             Driver {
                 root: "target/scratch".into(),
-                store: None,
+                // A registry with no new storage open.
+                registry: broca_module::registry::LineageRegistry::new(Arc::new(
+                    broca_module::opener::DefaultOpener::new(
+                        Arc::new(broca_core::FileLeaseStore::new("target/scratch/leases")),
+                        Arc::new(NoRuns),
+                    ),
+                )),
                 wal: Arc::new(FileWalStore::new("target/scratch/wal")),
                 index: Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
                 door: door.clone(),

@@ -1,6 +1,34 @@
 //! Shared tool-name allocation and provider-specific admission validation.
 pub use broca_protocol::tool_name_alias::*;
 
+/// The tool-name map a request rendered under `frozen` uses, for the tools `tools` and the calls
+/// in `prompt`: the operator's aliases, then names allocated under the family's grammar. The
+/// renderer and the transport, which restores echoed names, both take it from here, so they
+/// always agree.
+pub fn map_for(
+    frozen: &crate::wire::FrozenRenderConfig,
+    tools: &[broca_protocol::request::Tool],
+    prompt: &[broca_protocol::content::Message],
+) -> ToolNameMap {
+    ToolNameMap::build_with_aliases_in(
+        tools,
+        prompt,
+        &frozen.tool_name_aliases,
+        grammar_for(frozen.family_id),
+    )
+}
+
+/// The tool-name grammar of wire family `family`: Gemini and Code Assist, which sends Gemini's
+/// request body, take only a letter or an underscore first.
+pub fn grammar_for(family: crate::spec::WireFamilyId) -> NameGrammar {
+    match family {
+        crate::spec::WireFamilyId::Gemini | crate::spec::WireFamilyId::GoogleCodeAssist => {
+            NameGrammar::LetterFirst
+        }
+        _ => NameGrammar::Any,
+    }
+}
+
 /// Explicit wire names must already fit the selected family's grammar; unlike generated
 /// grammar aliases, operator aliases are never repaired or suffixed to resolve collisions.
 #[cfg(any(feature = "live", test))]

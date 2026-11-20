@@ -227,11 +227,7 @@ fn with_request_body<R>(
     let marker_policy = bedrock_marker_policy(frozen);
     let mut body = Map::new();
 
-    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
-        &opts.tools,
-        &opts.prompt,
-        &frozen.tool_name_aliases,
-    );
+    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
     let id_map = crate::tool_id_alias::ToolIdMap::build(
         &opts.prompt,
         &crate::tool_id_alias::IdGrammar::bedrock(),

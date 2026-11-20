@@ -772,10 +772,10 @@ impl<F: WireFamily + 'static> RenderJob<F> {
                     .push(crate::structured_output::submit_tool(so.schema()));
             }
         }
-        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        let name_map = Arc::new(crate::tool_name_alias::map_for(
+            &self.frozen,
             &tools,
             &self.opts.prompt,
-            &self.frozen.tool_name_aliases,
         ));
         let body = if let Some(renderer) = &self.media_renderer {
             renderer(

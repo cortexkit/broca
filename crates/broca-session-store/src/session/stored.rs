@@ -107,11 +107,9 @@ impl<B: SessionBackend> Place<'_, B> {
                 continue;
             }
             for entry in pages
-                .entries_from(dir.as_ref(), first)
+                .entries_between(dir.as_ref(), first, last)
                 .await
                 .map_err(SessionError::Directory)?
-                .into_iter()
-                .filter(|entry| entry.first_seq <= last)
             {
                 let bytes = self
                     .backend

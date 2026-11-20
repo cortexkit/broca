@@ -2003,9 +2003,9 @@ impl SubcConnection {
     /// records nothing rewrites. So an open naming the old id meets `unknown_module` once the
     /// module runs under its new one, and one under a scope registered by the old owner meets
     /// `scope_not_live` once only its re-synced twin (same `ref` and `scope_epoch`, new owner)
-    /// is live. Each such open is tried once more under the other id. A refused open created no
-    /// route, so the retry cannot deliver twice; when it is refused too, the first refusal is
-    /// returned.
+    /// is live. Each such open is tried again under the other id, the target and the owner each
+    /// renamed at most once. A refused open created no route, so a retry cannot deliver twice;
+    /// when the retries are refused too, the first refusal is returned.
     async fn route_open_wire_target(
         &self,
         target: RouteTarget,
@@ -2026,28 +2026,42 @@ impl SubcConnection {
         let Err(ConnError::Rejected(ref refusal)) = first else {
             return first;
         };
-        let (target, scope) = match renamed_target(refusal.code(), &target, scope.as_ref()) {
-            Some(Renamed::Module(target)) => (target, scope),
-            Some(Renamed::ScopeOwner(renamed)) => (target, Some(renamed)),
-            None => return first,
-        };
-        let opened_as = target.clone();
-        match self
-            .route_open_wire_target_once(
-                target,
-                identity,
-                scope,
-                role_versions,
-                consumer_capabilities,
-            )
-            .await
-        {
-            Ok(handle) => {
-                tracing::info!(target: "subc", code = refusal.code(), opened_as = ?opened_as,
-                    "route opened under a renamed module's other id");
-                Ok(handle)
+        // The target and the scope owner can each name an old id, and the daemon refuses one at
+        // a time, so each is renamed at most once: a second refusal for the other one gets one
+        // more try with both renamed.
+        let (mut target, mut scope) = (target, scope);
+        let (mut module_renamed, mut owner_renamed) = (false, false);
+        let mut code = refusal.code().to_owned();
+        loop {
+            match renamed_target(&code, &target, scope.as_ref()) {
+                Some(Renamed::Module(renamed)) if !module_renamed => {
+                    module_renamed = true;
+                    target = renamed;
+                }
+                Some(Renamed::ScopeOwner(renamed)) if !owner_renamed => {
+                    owner_renamed = true;
+                    scope = Some(renamed);
+                }
+                _ => return first,
             }
-            Err(_) => first,
+            match self
+                .route_open_wire_target_once(
+                    target.clone(),
+                    identity.clone(),
+                    scope.clone(),
+                    role_versions.clone(),
+                    consumer_capabilities.clone(),
+                )
+                .await
+            {
+                Ok(handle) => {
+                    tracing::info!(target: "subc", code = refusal.code(), opened_as = ?target,
+                        owner_renamed, "route opened under a renamed module's other id");
+                    return Ok(handle);
+                }
+                Err(ConnError::Rejected(again)) => code = again.code().to_owned(),
+                Err(_) => return first,
+            }
         }
     }
 
@@ -4052,52 +4066,6 @@ fn route_open_is_retryable(code: &str) -> bool {
     subc_protocol::error_codes::is_retryable_route_open(code)
 }
 
-/// The other id a refused route open is tried under once (see
-/// `SubcConnection::route_open_wire_target`).
-#[derive(Debug, PartialEq)]
-enum Renamed {
-    /// The module is unknown under the id the open named; open the target under the module's
-    /// other id.
-    Module(RouteTarget),
-    /// The scope is not live under the owner the open named; open under the same `ref` and
-    /// `scope_epoch` with the owner module's other id.
-    ScopeOwner(subc_protocol::scope::ScopeSelector),
-}
-
-/// Whether an open of `target` under `scope`, refused with `code`, is worth one more try under
-/// a renamed module's other id, and which.
-fn renamed_target(
-    code: &str,
-    target: &RouteTarget,
-    scope: Option<&subc_protocol::scope::ScopeSelector>,
-) -> Option<Renamed> {
-    match code {
-        "unknown_module" | "module_removed" => {
-            let mut renamed = target.clone();
-            let module_id = match &mut renamed {
-                RouteTarget::ToolProvider { module_id }
-                | RouteTarget::ManagementSurface { module_id }
-                | RouteTarget::InternalService { module_id, .. } => module_id,
-            };
-            *module_id = broca_protocol::other_module_name(module_id)?.to_owned();
-            Some(Renamed::Module(renamed))
-        }
-        "scope_not_live" | "scope_ended" => {
-            let scope = scope?;
-            let subc_protocol::Principal::Reserved { module_id: owner } = &scope.owner else {
-                return None;
-            };
-            let other = broca_protocol::other_module_name(owner)?;
-            let mut renamed = scope.clone();
-            renamed.owner = subc_protocol::Principal::Reserved {
-                module_id: other.to_owned(),
-            };
-            Some(Renamed::ScopeOwner(renamed))
-        }
-        _ => None,
-    }
-}
-
 /// These refusals describe the route or its authority, not the target's harness parser.
 /// The wire has no refusal-origin marker, so an unknown non-retryable code is treated as
 /// the target's. Retrying that refused bind with runner is safe: it is the ordinary tool
@@ -4979,7 +4947,9 @@ fn to_subc_bind(
 
 mod catalog_watch;
 mod probe;
+mod renamed;
 use probe::{channel_zero_probe_blocker, request_liveness_probe};
+use renamed::{renamed_target, Renamed};
 
 /// The far end of an in-process connection with no socket, for tests OUTSIDE this module that
 /// need the real request/terminal path (framing, pending waiters, reply deadlines) behind a

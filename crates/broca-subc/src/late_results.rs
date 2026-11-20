@@ -43,6 +43,11 @@ pub async fn withdraw_held_call(
         Ok(selector) => selector,
         Err(message) => return withdraw_error(ConnError::Protocol(message)),
     };
+    if selector.is_some() {
+        if let Err(error) = scoped_withdrawal_admitted(conn).await {
+            return withdraw_error(error);
+        }
+    }
     let catalog = match conn.catalog_list().await {
         Ok(catalog) => crate::provider_catalog::ProviderCatalog::from(catalog),
         Err(error) => return withdraw_error(error),
@@ -62,6 +67,24 @@ pub async fn withdraw_held_call(
     let result = withdraw_on_route(conn, &route, &call.call_key).await;
     let _ = conn.route_close(&route).await;
     result
+}
+
+/// Whether the daemon admits a scoped withdrawal: one without scopes/v1 drops the selector and
+/// opens an unscoped route, so a scoped withdrawal is refused rather than sent on an unscoped
+/// bind, as scoped dispatch is.
+async fn scoped_withdrawal_admitted(conn: &SubcConnection) -> Result<(), ConnError> {
+    let capabilities = conn.server_capabilities().await?;
+    if capabilities
+        .iter()
+        .any(|cap| cap == subc_protocol::scope::CAP_SCOPES_V1)
+    {
+        Ok(())
+    } else {
+        Err(ConnError::Protocol(format!(
+            "the subc daemon does not advertise {}, so a scoped withdrawal isn't sent",
+            subc_protocol::scope::CAP_SCOPES_V1
+        )))
+    }
 }
 
 async fn withdraw_on_route(
@@ -414,6 +437,30 @@ mod tests {
             raw["detail"],
             json!({"role":"tool-provider", "declared":"v2"})
         );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_withdrawal_needs_a_daemon_that_admits_scopes() {
+        for (capabilities, admitted) in [(vec![], false), (vec!["scopes/v1"], true)] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(5, 3);
+            let (result, ()) = tokio::join!(scoped_withdrawal_admitted(&conn), async {
+                let request = daemon.next_request().await;
+                let reply = subc_control::ClientControlResponse::ServerDescribe {
+                    protocol_ver: 1,
+                    subc_ops: vec![],
+                    capabilities: capabilities.iter().map(|cap| (*cap).into()).collect(),
+                    connected_clients: 1,
+                    counters: None,
+                    build_git_sha: None,
+                    build_lock_digest: None,
+                    capability_requirements: vec![],
+                    machine_id: None,
+                    config_path: None,
+                };
+                assert!(daemon.reply(&request, serde_json::to_vec(&reply).unwrap()));
+            });
+            assert_eq!(result.is_ok(), admitted, "{capabilities:?}: {result:?}");
+        }
     }
 
     fn entry(key: &str, event: &str) -> LateEntry {

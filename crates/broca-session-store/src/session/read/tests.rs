@@ -433,6 +433,21 @@ fn a_sealed_message_read_fetches_its_block_not_the_segment(cipher: Cipher) {
             second < 4 * crate::segment::BLOCK_TARGET,
             "a later read fetched {second} bytes"
         );
+
+        // A range of records, read by a freshly loaded session, fetches the layout and the
+        // blocks holding the range, not the whole segment.
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        let before = backend.object_bytes_read();
+        let records = loaded.records_between(9, 12).await.unwrap();
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|(seq, _)| (9..=12).contains(seq)));
+        let range = backend.object_bytes_read() - before;
+        assert!(
+            range < segment_bytes / 4,
+            "the range read fetched {range} of the segment's {segment_bytes} bytes"
+        );
     });
 }
 

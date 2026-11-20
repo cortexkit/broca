@@ -1296,6 +1296,66 @@ impl<B: SessionBackend> Session<B> {
             .map(|(_, record)| record))
     }
 
+    /// The sealed records of `first` through `last`, as [`Place::sealed_between`] reads them,
+    /// fetching only the directory pages and blocks that overlap the range: a small range in a
+    /// long history reads a few blocks, not every later page and whole segments.
+    async fn sealed_between(
+        &self,
+        first: u64,
+        last: u64,
+    ) -> Result<BTreeMap<u64, Record>, SessionError> {
+        let key = self.key.frame_key();
+        let pages = Pages {
+            backend: &self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let mut records = BTreeMap::new();
+        for dir in [&self.head.ledger_dir, &self.head.transcript_dir] {
+            if dir.as_ref().is_none_or(|root| root.last_seq < first) {
+                continue;
+            }
+            for entry in pages
+                .entries_between(dir.as_ref(), first, last)
+                .await
+                .map_err(SessionError::Directory)?
+            {
+                let layout = self
+                    .sealed_layout(&entry.object, &key)
+                    .await?
+                    .ok_or_else(|| {
+                        SessionError::Fold(format!(
+                            "the directory names a missing segment {}",
+                            entry.object
+                        ))
+                    })?;
+                let blocks = &layout.index.blocks;
+                for position in 0..blocks.len() {
+                    // A block whose successor starts at or before `first` ends before it, and a
+                    // block that starts after `last` holds nothing in the range.
+                    if blocks
+                        .get(position + 1)
+                        .is_some_and(|next| next.first_seq <= first)
+                        || blocks[position].first_seq > last
+                    {
+                        continue;
+                    }
+                    for (seq, record) in self
+                        .sealed_block(&entry.object, &layout, position, &key)
+                        .await?
+                    {
+                        if (first..=last).contains(&seq) && entry.keeps(seq) {
+                            records.insert(seq, record);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(records)
+    }
+
     /// The sealed ledger records with `seqs`, each read from the one block that holds it.
     async fn ledger_records(&self, seqs: &[u64]) -> Result<Vec<(u64, Record)>, SessionError> {
         let key = self.key.frame_key();
@@ -1420,7 +1480,7 @@ impl<B: SessionBackend> Session<B> {
     ) -> Result<Vec<(u64, Record)>, SessionError> {
         let mut records = if self.place().sealed_reach(first) {
             self.storage_read()?;
-            self.place().sealed_between(first, last).await?
+            self.sealed_between(first, last).await?
         } else {
             BTreeMap::new()
         };

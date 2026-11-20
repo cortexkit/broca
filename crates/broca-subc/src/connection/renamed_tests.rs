@@ -96,6 +96,58 @@ async fn a_scope_registered_by_the_old_owner_reopens_under_its_resynced_twin() {
     result.unwrap();
 }
 
+/// A held call made before the rename names the old id both as its target and as its scope's
+/// owner. The daemon refuses one at a time, so the open is retried until both carry the new id;
+/// neither is renamed twice.
+#[tokio::test]
+async fn an_open_naming_the_old_id_as_target_and_owner_reopens_with_both_renamed() {
+    let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+    let frozen = scope("prefrontal-core");
+    // Bounded, so an open that gives up after one rename fails here instead of leaving the
+    // stand-in daemon waiting for the third open.
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(open(&conn, "prefrontal-core", Some(&frozen)), async {
+            let (request, module, owner) = next_open(&mut daemon).await;
+            assert_eq!(
+                (module.as_str(), owner.as_deref()),
+                ("prefrontal-core", Some("prefrontal-core"))
+            );
+            assert!(daemon.refuse(&request, "unknown_module"));
+            let (request, module, owner) = next_open(&mut daemon).await;
+            assert_eq!(
+                (module.as_str(), owner.as_deref()),
+                ("prefrontal", Some("prefrontal-core"))
+            );
+            assert!(daemon.refuse(&request, "scope_not_live"));
+            let (request, module, owner) = next_open(&mut daemon).await;
+            assert_eq!(
+                (module.as_str(), owner.as_deref()),
+                ("prefrontal", Some("prefrontal"))
+            );
+            accept(&daemon, &request);
+        })
+    })
+    .await;
+    let (result, ()) = opened.expect("the open never retried with both ids renamed");
+    result.unwrap();
+}
+
+/// A refusal that would rename a component already renamed ends the retries with the first
+/// refusal, so a pair of ids can never be tried back and forth.
+#[tokio::test]
+async fn a_component_is_renamed_at_most_once() {
+    let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+    let (result, ()) = tokio::join!(open(&conn, "prefrontal-core", None), async {
+        let (request, _, _) = next_open(&mut daemon).await;
+        assert!(daemon.refuse(&request, "unknown_module"));
+        let (request, module, _) = next_open(&mut daemon).await;
+        assert_eq!(module, "prefrontal");
+        assert!(daemon.refuse(&request, "unknown_module"));
+    });
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("unknown_module"), "{error}");
+}
+
 #[tokio::test]
 async fn other_refusals_and_other_modules_are_not_retried() {
     for (module, owner, code) in [

@@ -4,7 +4,7 @@
 15626 crates/broca-core/src/run.rs the run loop of the WAL runner the session store replaced; deleted with the WAL code
 14764 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
 11010 crates/broca-module-serve/src/serve.rs every route's handler; split by operation family
-5009 crates/broca-subc/src/connection.rs subc connection and tool calls; split route opens, calls and yields
+4979 crates/broca-subc/src/connection.rs subc connection and tool calls; split route opens, calls and yields
 8411 crates/broca-core/src/wal_writer.rs the WAL's writer (the write-ahead log the session store replaced); deleted with the WAL code
 7977 crates/broca-core/src/replay.rs replay of the WAL (the write-ahead log the session store replaced); deleted with the WAL code
 6794 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (compaction views, messages sent into a running run)

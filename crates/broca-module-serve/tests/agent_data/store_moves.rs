@@ -55,6 +55,70 @@ async fn rig(path: PathBuf, door: Arc<FakeDoor>, key: DeploymentKey) -> Rig {
     }
 }
 
+/// A rig whose new storage opens without its deployment key, as broca's does at boot before the
+/// vault answers, and the slot and setup that load the key later. With `open_late`, the storage
+/// opens only after the agent-data service is built, as when its first open failed at boot and
+/// the key loader opened it later.
+async fn rig_awaiting_key(
+    path: PathBuf,
+    door: Arc<FakeDoor>,
+    open_late: bool,
+) -> (
+    Rig,
+    Arc<broca_module::store_open::StoreSlot>,
+    broca_module::store_open::StoreRuntimeSetup,
+) {
+    std::fs::create_dir_all(&path).unwrap();
+    broca_wal::migration::durable_dir(&path, &path.join("wal")).unwrap();
+    let slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(&path, 7));
+    let setup = broca_module::store_open::StoreRuntimeSetup {
+        state_root: path.clone(),
+        executor: Arc::new(NoRuns),
+        idle_ttl: std::time::Duration::from_secs(60),
+        import_roots: None,
+        billing: None,
+        run_events: None,
+        send_states: None,
+    };
+    if !open_late {
+        slot.open_without_key(&setup).await.unwrap();
+    }
+    let wal = Arc::new(FileWalStore::new(path.join("wal")));
+    let index = Arc::new(broca_store::SqliteStore::open(path.join("run-index.db")).unwrap());
+    broca_store::session_refs::migrate(
+        &path.join("run-index.db"),
+        &broca_core::ReadOnlyWalReader::new(&path),
+    )
+    .unwrap();
+    let registry = Arc::new(LineageRegistry::new(Arc::new(
+        broca_module::opener::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(path.join("leases"))),
+            Arc::new(NoRuns),
+        )
+        .with_store_slot(slot.clone()),
+    )));
+    registry.set_session_address_inventory(index.clone());
+    let service = Arc::new(AgentDataService::new(
+        path.clone(),
+        registry.as_ref().clone(),
+        wal.clone(),
+        index.clone(),
+        door.clone(),
+    ));
+    if open_late {
+        slot.open_without_key(&setup).await.unwrap();
+    }
+    let rig = Rig {
+        root: path,
+        wal,
+        index,
+        registry,
+        service,
+        door,
+    };
+    (rig, slot, setup)
+}
+
 /// The session triple a session's log names, as broca derives it from its bind identity.
 fn triple(session: &BindIdentity) -> broca_session_store::head::SessionTriple {
     broca_session_store::head::SessionTriple {
@@ -129,8 +193,19 @@ async fn store_session(rig: &Rig, session: &BindIdentity, terminal: bool) {
 /// runs carry a compaction plan version, so a message renders only with its `EntryFacts` record
 /// (its id, time and part numbers).
 async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, contract: bool) {
+    store_session_in(rig, session, terminal, contract, StorageClass::Durable).await;
+}
+
+/// As [`store_session_on`], kept in storage class `class`.
+async fn store_session_in(
+    rig: &Rig,
+    session: &BindIdentity,
+    terminal: bool,
+    contract: bool,
+    class: StorageClass,
+) {
     let runtime = rig.registry.store_runtime().unwrap();
-    let backend = LocalBackend::new(StorageClass::Durable.store_root(&rig.root));
+    let backend = LocalBackend::new(class.store_root(&rig.root));
     let mut writer = Session::create(
         &backend,
         SessionAddr(broca_core::session_addr(session)),
@@ -162,7 +237,7 @@ async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, con
                     .await
                     .unwrap();
                 runtime
-                    .parts_for(StorageClass::Durable, runtime.deployment().new_sessions())
+                    .parts_for(class, runtime.deployment().new_sessions())
                     .clone()
                     .put(
                         part.kind,
@@ -618,9 +693,158 @@ async fn store_prepare_refuses_an_unverifiable_next_request_before_freezing() {
     writer.close().await.unwrap();
     let mut from = Wire::new(&source, entorhinal(), true).await;
     let params = source.params(CUT, std::slice::from_ref(&session));
+    // `busy` reads the session's state and builds no export, so the next request it never
+    // renders can't refuse it; only `prepare`, which exports, checks that request.
+    let busy = from
+        .call("busy", json!({"refs":params["refs"]}))
+        .await
+        .unwrap();
+    assert_eq!(busy["refs"][0]["state"], "idle", "{busy}");
     let error = assert_code(from.call("prepare", params).await, "unavailable");
     assert!(error.to_string().contains("no frozen render config"));
     source.registry.check_move(&session, true).unwrap();
+}
+
+/// A session kept with retention, which lives in the ephemeral class, is refused a move: a copy on
+/// another computer would outlive its deletion deadline here.
+#[tokio::test]
+async fn store_prepare_refuses_a_retention_session() {
+    let source = rig(
+        root("store-retention"),
+        Arc::new(FakeDoor::default()),
+        DeploymentKey::new(7, &[4; 32]),
+    )
+    .await;
+    let session = source.session("retained");
+    store_session_in(&source, &session, true, false, StorageClass::Ephemeral).await;
+    broca_core::SessionRefIndex::record_session(
+        source.index.as_ref(),
+        &broca_core::session_addr(&session),
+        &session,
+    )
+    .unwrap();
+    let mut from = Wire::new(&source, entorhinal(), true).await;
+    let params = source.params(CUT, std::slice::from_ref(&session));
+    assert_code(from.call("prepare", params).await, "not_exportable");
+    source.registry.check_move(&session, true).unwrap();
+}
+
+/// The agent-data service finds a stored session even when the new storage opened only after the
+/// service was built: it reads the storage's runtime at each request, not once at boot.
+#[tokio::test]
+async fn agent_data_finds_a_store_that_opened_after_it_was_built() {
+    let door = Arc::new(FakeDoor::default());
+    let path = root("store-opened-late");
+    let source = rig(path.clone(), door.clone(), DeploymentKey::new(7, &[4; 32])).await;
+    let session = source.session("late");
+    seed(&source, &session, true).await;
+    let params = source.params(CUT, std::slice::from_ref(&session));
+    drop(source);
+
+    let (late, slot, setup) = rig_awaiting_key(path, door, true).await;
+    slot.load(&setup, DeploymentKey::new(7, &[4; 32]))
+        .await
+        .unwrap();
+    let mut from = Wire::new(&late, entorhinal(), true).await;
+    let busy = from
+        .call("busy", json!({"refs":params["refs"]}))
+        .await
+        .unwrap();
+    assert_eq!(busy["refs"][0]["state"], "idle", "{busy}");
+}
+
+/// After a move lands here, `diverged` for its cut answers `at_cut` only while the session holds
+/// nothing newer than what the move brought. Work done here since makes it `advanced`, though the
+/// move's cached stream still matches the cut byte for byte.
+#[tokio::test]
+async fn diverged_sees_work_done_here_after_the_move_landed() {
+    let key = || DeploymentKey::new(7, &[4; 32]);
+    let door = Arc::new(FakeDoor::default());
+    let source = rig(root("store-diverged-source"), door.clone(), key()).await;
+    let receiver = rig(root("store-diverged-receiver"), door.clone(), key()).await;
+    let session = source.session("diverged-here");
+    seed(&source, &session, true).await;
+    let params = source.params(CUT, std::slice::from_ref(&session));
+    let mut from = Wire::new(&source, entorhinal(), true).await;
+    from.call("prepare", params.clone()).await.unwrap();
+    from.call("export", params.clone()).await.unwrap();
+    door.seal(CUT);
+    let mut to = Wire::new(&receiver, entorhinal(), true).await;
+    to.call("import", params.clone()).await.unwrap();
+    to.call("activate", params.clone()).await.unwrap();
+    let state = |reply: Value| reply["refs"][0]["state"].clone();
+    assert_eq!(
+        state(to.call("diverged", params.clone()).await.unwrap()),
+        "at_cut"
+    );
+
+    let run_id = seed_history(true)
+        .records
+        .iter()
+        .find_map(|record| match record {
+            broca_session_store::record::Record::RunStart(start) => Some(start.run_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let runtime = receiver.registry.store_runtime().unwrap();
+    let backend = LocalBackend::new(StorageClass::Durable.store_root(&receiver.root));
+    let mut writer = Session::load(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session)),
+        &triple(&session),
+        runtime.deployment(),
+    )
+    .await
+    .unwrap();
+    writer
+        .append(
+            &[broca_session_store::record::Record::Billed(
+                broca_session_store::record::Billed { run_id },
+            )],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        state(to.call("diverged", params).await.unwrap()),
+        "advanced"
+    );
+}
+
+/// A receiver that stopped mid-activation of an encrypted session can't finish it at boot: the
+/// session can't be read before the storage key loads, so the activation stays pending and the
+/// session fenced. Once the key loads, the pending activation finishes without a retry of the
+/// move.
+#[tokio::test]
+async fn an_encrypted_activation_left_at_boot_finishes_once_the_key_loads() {
+    use contract::step::Step;
+    let key = || DeploymentKey::new(7, &[4; 32]).creating(Cipher::XChaCha20Poly1305);
+    let door = Arc::new(FakeDoor::default());
+    let source = rig(root("store-key-source"), door.clone(), key()).await;
+    let session = source.session("key-activation");
+    seed(&source, &session, true).await;
+    let params = source.params(CUT, std::slice::from_ref(&session));
+    let mut from = Wire::new(&source, entorhinal(), true).await;
+    from.call("prepare", params.clone()).await.unwrap();
+    from.call("export", params.clone()).await.unwrap();
+    door.seal(CUT);
+    let receiver_root = root("store-key-receiver");
+    let receiver = rig(receiver_root.clone(), door.clone(), key()).await;
+    let mut to = Wire::new(&receiver, entorhinal(), true).await;
+    to.call("import", params.clone()).await.unwrap();
+    to.call("activate", params.clone()).await.unwrap();
+    pending(&receiver, "activate", Step::Imported, params.clone());
+
+    let (receiver, slot, setup) = rig_awaiting_key(receiver_root, door.clone(), false).await;
+    receiver.service.reconcile_boot().await.unwrap();
+    assert!(
+        receiver.registry.check_move(&session, true).is_err(),
+        "the activation finished before the key could read the session"
+    );
+    slot.load(&setup, key()).await.unwrap();
+    receiver.service.reconcile_pending_cuts().await.unwrap();
+    receiver.registry.check_move(&session, true).unwrap();
 }
 
 #[tokio::test]

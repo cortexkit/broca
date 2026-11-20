@@ -22,6 +22,25 @@ fn is_allowed(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
 }
 
+/// A provider family's tool-name grammar, beyond the characters and length every family takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NameGrammar {
+    /// Any allowed character may come first.
+    #[default]
+    Any,
+    /// The first character is a letter or an underscore, as Gemini's function names require.
+    LetterFirst,
+}
+
+impl NameGrammar {
+    fn first_fits(self, name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::LetterFirst => name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'),
+        }
+    }
+}
+
 /// Normalize a canonical tool name for a model-facing request.
 ///
 /// Valid names are returned byte-for-byte unchanged. Any mutation replaces invalid characters
@@ -29,17 +48,34 @@ fn is_allowed(character: char) -> bool {
 /// derived from the original name. The suffix preserves distinct aliases for ordinary
 /// sanitization collisions while keeping the common valid-name path byte-identical.
 pub fn normalize(name: &str) -> String {
-    if is_valid_wire_name(name) {
+    normalize_in(name, NameGrammar::Any)
+}
+
+/// [`normalize`] under `grammar`.
+pub fn normalize_in(name: &str, grammar: NameGrammar) -> String {
+    if is_valid_wire_name_in(name, grammar) {
         return name.to_owned();
     }
-    alias_for_attempt(name, 0)
+    alias_for_attempt_in(name, 0, grammar)
 }
 
+#[cfg(test)]
 fn is_valid_wire_name(name: &str) -> bool {
-    name.len() <= MAX_TOOL_NAME_BYTES && name.chars().all(is_allowed)
+    is_valid_wire_name_in(name, NameGrammar::Any)
 }
 
+fn is_valid_wire_name_in(name: &str, grammar: NameGrammar) -> bool {
+    name.len() <= MAX_TOOL_NAME_BYTES && name.chars().all(is_allowed) && grammar.first_fits(name)
+}
+
+#[cfg(test)]
 fn alias_for_attempt(name: &str, attempt: u64) -> String {
+    alias_for_attempt_in(name, attempt, NameGrammar::Any)
+}
+
+/// The alias of `name` on probe `attempt`, under `grammar`: a name that would start with a
+/// character the grammar doesn't take first gets a leading `_`.
+fn alias_for_attempt_in(name: &str, attempt: u64, grammar: NameGrammar) -> String {
     let sanitized: String = name
         .chars()
         .map(|character| {
@@ -52,7 +88,13 @@ fn alias_for_attempt(name: &str, attempt: u64) -> String {
         .collect();
     let suffix = hash_suffix_for_attempt(name, attempt);
     let prefix_budget = MAX_TOOL_NAME_BYTES - 1 - HASH_SUFFIX_LEN;
-    let mut alias: String = sanitized.chars().take(prefix_budget).collect();
+    let lead = if grammar.first_fits(&sanitized) {
+        ""
+    } else {
+        "_"
+    };
+    let mut alias: String = lead.to_owned();
+    alias.extend(sanitized.chars().take(prefix_budget - lead.len()));
     if alias.is_empty() {
         alias.push('_');
     }
@@ -90,10 +132,20 @@ impl ToolNameMap {
         prompt: &[Message],
         aliases: &BTreeMap<String, String>,
     ) -> Self {
+        Self::build_with_aliases_in(tools, prompt, aliases, NameGrammar::Any)
+    }
+
+    /// [`Self::build_with_aliases`], allocating names under `grammar`.
+    pub fn build_with_aliases_in(
+        tools: &[Tool],
+        prompt: &[Message],
+        aliases: &BTreeMap<String, String>,
+        grammar: NameGrammar,
+    ) -> Self {
         if aliases.is_empty() {
-            return Self::build(tools, prompt);
+            return Self::build_in(tools, prompt, grammar);
         }
-        let original = Self::build(tools, prompt);
+        let original = Self::build_in(tools, prompt, grammar);
         let names: Vec<_> = original.canonical_to_wire.keys().cloned().collect();
         let mut reserved: BTreeSet<_> = names
             .iter()
@@ -110,7 +162,7 @@ impl ToolNameMap {
                     // must not steal a newly configured alias's reverse mapping.
                     let mut attempt = 0;
                     loop {
-                        let candidate = alias_for_attempt(name, attempt);
+                        let candidate = alias_for_attempt_in(name, attempt, grammar);
                         if reserved.insert(candidate.clone()) {
                             break candidate;
                         }
@@ -122,7 +174,7 @@ impl ToolNameMap {
                 (name.clone(), wire)
             })
             .collect();
-        let substituted = Self::from_names(intermediate.values());
+        let substituted = Self::from_names_in(intermediate.values(), grammar);
         let mut map = Self::default();
         for canonical in names {
             let wire = substituted.wire_name(&intermediate[&canonical]).to_owned();
@@ -139,6 +191,11 @@ impl ToolNameMap {
     /// a partial tool list. Valid names reserve their own bytes before aliases are allocated, so
     /// distinct canonical names always receive distinct wire names.
     pub fn build(tools: &[Tool], prompt: &[Message]) -> Self {
+        Self::build_in(tools, prompt, NameGrammar::Any)
+    }
+
+    /// [`Self::build`], allocating names under `grammar`.
+    pub fn build_in(tools: &[Tool], prompt: &[Message], grammar: NameGrammar) -> Self {
         let mut names = Vec::with_capacity(tools.len());
         names.extend(tools.iter().map(|tool| tool.name.as_str()));
         for message in prompt {
@@ -148,12 +205,21 @@ impl ToolNameMap {
                 }
             }
         }
-        Self::from_names(names)
+        Self::from_names_in(names, grammar)
     }
 
     /// Build a map from arbitrary canonical names. This is useful for render-edge tests and
     /// keeps the collision invariant independent of a particular request shape.
     pub fn from_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::from_names_in(names, NameGrammar::Any)
+    }
+
+    /// [`Self::from_names`], allocating names under `grammar`.
+    pub fn from_names_in<I, S>(names: I, grammar: NameGrammar) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -168,7 +234,7 @@ impl ToolNameMap {
         // name's generated alias can occupy bytes belonging to a valid name encountered later.
         for canonical in canonicals
             .iter()
-            .filter(|canonical| normalize(canonical) == canonical.as_str())
+            .filter(|canonical| normalize_in(canonical, grammar) == canonical.as_str())
         {
             let previous = map
                 .wire_to_canonical
@@ -185,14 +251,14 @@ impl ToolNameMap {
         // deterministic probe path, so every previously working render remains byte-identical.
         for canonical in canonicals
             .iter()
-            .filter(|canonical| normalize(canonical) != canonical.as_str())
+            .filter(|canonical| normalize_in(canonical, grammar) != canonical.as_str())
         {
             let mut attempt = 0u64;
             let wire = loop {
-                let candidate = alias_for_attempt(canonical, attempt);
+                let candidate = alias_for_attempt_in(canonical, attempt, grammar);
                 if attempt > 0 {
                     assert!(
-                        is_valid_wire_name(&candidate),
+                        is_valid_wire_name_in(&candidate, grammar),
                         "probed tool-name alias escaped the wire grammar: {candidate:?}"
                     );
                 }

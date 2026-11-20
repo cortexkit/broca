@@ -181,8 +181,8 @@ pub trait SessionBackend {
     ) -> Result<(), BackendError>;
     /// Deletes the session `s` whole, if the stored head is still at `at`: its head first, so
     /// from then on the session reads as one that never existed, then its logs and objects.
-    /// Durable on return. A crash part way leaves the session absent, with at most some of its
-    /// logs and objects behind, which nothing reads.
+    /// Durable on return. A crash part way leaves the session absent; a backend that can leave
+    /// some of its logs and objects behind marks them so they are found and removed later.
     async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError>;
     /// Stores setup part `name`, unless a part of that name is already stored: names are derived
     /// from content, so the stored part already holds these bytes. Durable on return, name
@@ -796,6 +796,8 @@ const VERSION_LEN: usize = 8;
 
 /// The folder of a session's head folder that keeps every head version.
 const VERSIONS_DIR: &str = "v";
+/// What a deleted session's head is renamed to until the rest of its folders are removed.
+const DELETING: &str = "head.deleting";
 
 /// How long a head version is kept after the version after it was written: far longer than any
 /// backup's walk of the store, so the version that was current when a walk began is still there
@@ -919,13 +921,63 @@ impl LocalBackend {
     /// Every session this store holds a head for. A session folder without a head, such as one a
     /// creation or a move left before its head was written, holds no session.
     pub fn stored_sessions(&self) -> Result<Vec<SessionAddr>, BackendError> {
+        Ok(self.stored_sessions_and_deletions()?.0)
+    }
+
+    /// As [`Self::stored_sessions`], with every session whose deletion a crash cut short, which
+    /// [`Self::finish_deletion`] completes. One pass over the folders finds both: a folder without
+    /// a head costs a second lookup, and only those do.
+    pub fn stored_sessions_and_deletions(
+        &self,
+    ) -> Result<(Vec<SessionAddr>, Vec<SessionAddr>), BackendError> {
         let mut sessions = Vec::new();
+        let mut deletions = Vec::new();
         for name in self.session_folders()? {
-            if self.head_dir(&name).join("head").is_file() {
+            let dir = self.head_dir(&name);
+            if dir.join("head").is_file() {
                 sessions.push(name);
+            } else if dir.join(DELETING).is_file() {
+                deletions.push(name);
             }
         }
-        Ok(sessions)
+        Ok((sessions, deletions))
+    }
+
+    /// The head of the deleted session whose deletion at `s` a crash cut short: it names the
+    /// session in the clear, so its lease can be taken before [`Self::finish_deletion`] runs.
+    /// `None` when no deletion is unfinished there.
+    pub fn deleted_head(&self, s: &SessionAddr) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(read_head_at(&self.head_dir(s).join(DELETING))?.map(|(bytes, _)| bytes))
+    }
+
+    /// Removes what a deletion of `s` that a crash cut short left behind: the session's logs,
+    /// objects and kept head versions. Nothing when no deletion is unfinished there, or when a
+    /// session has been created there since. The caller holds the session's lease, so no session
+    /// is being created there meanwhile. Durable on return; `true` when it removed anything.
+    pub fn finish_deletion(&self, s: &SessionAddr) -> Result<bool, BackendError> {
+        let heads = self.head_dir(s);
+        if heads.join("head").is_file() || !heads.join(DELETING).is_file() {
+            return Ok(false);
+        }
+        self.remove_session_folders(s)?;
+        Ok(true)
+    }
+
+    /// Removes the session folders of `s`, its head folder last: the head folder holds the
+    /// deletion mark, so a crash part way leaves it to be found again.
+    fn remove_session_folders(&self, s: &SessionAddr) -> Result<(), BackendError> {
+        for dir in [self.log_dir(s), self.object_dir(s), self.head_dir(s)] {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    if let Some(parent) = dir.parent() {
+                        sync_dir(parent)?;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// The name of every session folder in this store, sorted, without checking each for a head:
@@ -1167,6 +1219,11 @@ impl SessionBackend for LocalBackend {
         let current = self.read_head_file(s)?.map(|(_, version)| version);
         if current != expected || expected.is_some_and(|expected| next <= expected) {
             return Err(BackendError::Fenced);
+        }
+        if expected.is_none() {
+            // A session created where a deletion was cut short: what that session left goes
+            // first, so none of it is mistaken for the new session's.
+            self.finish_deletion(s)?;
         }
         let dir = self.head_dir(s);
         let versions = dir.join(VERSIONS_DIR);
@@ -1423,9 +1480,10 @@ impl SessionBackend for LocalBackend {
     async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
         self.fence(s, at)?;
         // The head goes first and alone decides whether the session exists, so whatever a crash
-        // leaves of the rest belongs to no session.
+        // leaves of the rest belongs to no session. It is renamed to the deletion mark rather
+        // than removed, so the rest is found and removed after a crash (see `finish_deletion`).
         let heads = self.head_dir(s);
-        match std::fs::remove_file(heads.join("head")) {
+        match std::fs::rename(heads.join("head"), heads.join(DELETING)) {
             Ok(()) => sync_dir(&heads)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -1435,18 +1493,7 @@ impl SessionBackend for LocalBackend {
             .lock()
             .unwrap()
             .retain(|(addr, _), _| addr != s);
-        for dir in [self.log_dir(s), self.object_dir(s), heads] {
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {
-                    if let Some(parent) = dir.parent() {
-                        sync_dir(parent)?;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+        self.remove_session_folders(s)
     }
 
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {

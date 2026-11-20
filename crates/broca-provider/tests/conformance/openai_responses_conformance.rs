@@ -691,6 +691,92 @@ fn a_complete_message_item_does_not_duplicate_parts_already_streamed() {
     assert_eq!(assembled_text(&normalize_responses(recorded, 6)), "AAABBB");
 }
 
+/// The tool call of an assembled message, `None` when it carries none.
+fn assembled_call(events: &[NormalizedEvent]) -> Option<&broca_protocol::ToolCall> {
+    events.iter().find_map(|event| match event {
+        NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call),
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn a_terminal_response_supplies_content_its_stream_never_completed() {
+    // A Responses-compatible backend can send the final content only in the terminal
+    // response's `output`, omitting the item events that would have built it. The answer and
+    // the call's arguments come from that output, not from what the stream left: an empty
+    // answer, or the `added` event's placeholder arguments, would run the tool with `{}`.
+    let recorded = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_final\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_f\",\"name\":\"get_time\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_final\",\"status\":\"completed\",\"output\":[",
+        "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"final answer\"}]},",
+        "{\"type\":\"function_call\",\"call_id\":\"call_f\",\"name\":\"get_time\",\"arguments\":\"{\\\"tz\\\":\\\"UTC\\\"}\"}",
+        "]}}\n\n",
+    );
+    let events = normalize_responses(recorded, 7);
+    assert_eq!(assembled_text(&events), "final answer");
+    let call = assembled_call(&events).expect("the call");
+    assert_eq!(call.tool_call_id.0, "call_f");
+    assert_eq!(call.input, json!({"tz": "UTC"}));
+}
+
+#[test]
+fn a_completed_item_finishes_text_whose_stream_was_cut_short() {
+    // One delta arrived, its `output_text.done` didn't, and the completed message item carries
+    // the whole text. The streamed prefix is replaced, not kept.
+    let recorded = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cut\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hel\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello there\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cut\",\"status\":\"completed\"}}\n\n",
+    );
+    assert_eq!(
+        assembled_text(&normalize_responses(recorded, 8)),
+        "Hello there"
+    );
+}
+
+#[test]
+fn a_completed_item_joining_streamed_parts_into_one_does_not_repeat_them() {
+    // Text that streamed as two parts can come back in the completed item as one. Taken
+    // joined, the two agree, so nothing is replaced and the answer isn't doubled.
+    let recorded = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_join\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello \"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":1,\"delta\":\"world\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_join\",\"status\":\"completed\"}}\n\n",
+    );
+    assert_eq!(
+        assembled_text(&normalize_responses(recorded, 9)),
+        "Hello world"
+    );
+}
+
+#[test]
+fn a_call_finalized_by_its_own_done_event_keeps_those_arguments_at_the_terminal() {
+    // `function_call_arguments.done` is the call's authoritative arguments; a terminal output
+    // that lists the call without completing it through `output_item.done` doesn't change them.
+    let recorded = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_args\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"get_time\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{\\\"tz\\\":\\\"Europe/Madrid\\\"}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_args\",\"status\":\"completed\",\"output\":[",
+        "{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"get_time\",\"arguments\":\"{}\"}",
+        "]}}\n\n",
+    );
+    let events = normalize_responses(recorded, 10);
+    assert_eq!(
+        assembled_call(&events).expect("the call").input,
+        json!({"tz": "Europe/Madrid"})
+    );
+}
+
 #[test]
 fn output_item_done_message_text_is_recovered_when_text_events_are_omitted() {
     // A backend can deliver the assistant's text only inside the completed message

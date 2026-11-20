@@ -288,11 +288,7 @@ fn render_prepared_body<'a>(
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> ResponsesBody<'a> {
-    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
-        &opts.tools,
-        &opts.prompt,
-        &frozen.tool_name_aliases,
-    );
+    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
     let instructions = instructions_from_policy(&opts.prompt, frozen.system_prompt.clone());
     let developer_message = frozen.system_prompt == SystemPromptPolicy::DeveloperMessage;
     let mut provenance = provenance;
@@ -982,6 +978,9 @@ pub struct OpenAiResponsesNormalizer {
     arguments_guard: crate::wire::ToolArgsGuard,
     completed_items: std::collections::HashSet<u64>,
     completed_text_parts: std::collections::HashSet<(u64, u64)>,
+    /// Output indices of function calls whose complete arguments arrived in their own
+    /// `function_call_arguments.done` event.
+    finalized_calls: std::collections::HashSet<u64>,
     refusal_completed: bool,
     private_error_diagnostics: bool,
     step_id: StepId,
@@ -1038,6 +1037,7 @@ impl OpenAiResponsesNormalizer {
             arguments_guard: Default::default(),
             completed_items: Default::default(),
             completed_text_parts: Default::default(),
+            finalized_calls: Default::default(),
             refusal_completed: false,
             step_id,
             private_error_diagnostics: false,
@@ -1118,6 +1118,7 @@ impl OpenAiResponsesNormalizer {
                 .ok()
                 .and_then(ResponsesTerminalEvent::response);
             if let Some(response) = response {
+                self.complete_from_terminal(payload, out)?;
                 return self.handle_terminal_response(response, out);
             }
         }
@@ -1384,6 +1385,7 @@ impl OpenAiResponsesNormalizer {
             "response.function_call_arguments.done" => {
                 let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                 if let Some(args) = v.get("arguments").and_then(Value::as_str) {
+                    self.finalized_calls.insert(idx);
                     let buf = self.tool_calls.entry(idx).or_default();
                     buf.arguments = args.to_owned();
                     self.arguments_guard
@@ -1396,88 +1398,7 @@ impl OpenAiResponsesNormalizer {
             "response.output_item.done" => {
                 if let Some(item) = v.get("item") {
                     let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
-                    self.completed_items.insert(idx);
-                    self.capture_text_state(idx, item);
-                    let kind = match item.get("type").and_then(Value::as_str) {
-                        Some("reasoning") => Some(0),
-                        Some("function_call") => Some(3),
-                        _ if message_item_output_text_parts(item)
-                            .iter()
-                            .any(|(_, text)| !text.is_empty())
-                            || self.text_states.contains_key(&idx) =>
-                        {
-                            Some(1)
-                        }
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
-                        self.display_parts.reserve(
-                            (idx, kind),
-                            "openai_responses",
-                            self.step_id,
-                            out,
-                        );
-                    }
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("function_call") => {
-                            let buf = self.tool_calls.entry(idx).or_default();
-                            if let Some(id) = item.get("call_id").and_then(Value::as_str) {
-                                buf.call_id = id.to_owned();
-                            }
-                            if let Some(name) = item.get("name").and_then(Value::as_str) {
-                                buf.name = name.to_owned();
-                            }
-                            // Presence is authoritative even when the final value is empty:
-                            // `decode_tool_arguments` maps an empty string to `{}` for a
-                            // zero-argument call. Absence alone preserves accumulated deltas.
-                            if let Some(args) = item.get("arguments").and_then(Value::as_str) {
-                                buf.arguments = args.to_owned();
-                                self.arguments_guard.replace(
-                                    idx,
-                                    &buf.call_id,
-                                    &buf.name,
-                                    &buf.arguments,
-                                );
-                            }
-                        }
-                        Some("reasoning") => {
-                            // Preserve the provider's complete item token rather than rebuilding
-                            // it: id, summary, encrypted_content, metadata, and key order all
-                            // survive persistence. Request rendering later extracts the fields
-                            // needed for continuation and removes response-only fields.
-                            let raw_item = raw_output_item(payload)?;
-                            self.reasoning_items.insert(idx, raw_item);
-                        }
-                        _ => {
-                            // A completed message item repeats its full content array. Recover any
-                            // output_text parts as a fallback when granular output_text.delta /
-                            // output_text.done events were omitted. Fallback-only (entry / or_insert):
-                            // a present entry means a granular event already supplied this part index,
-                            // so a part that arrived through streamed events is never double-counted.
-                            for (part_idx, text) in message_item_output_text_parts(item) {
-                                self.text_items
-                                    .entry((idx, part_idx))
-                                    .or_insert_with(|| text.to_owned());
-                            }
-                            if let Some(refusal) = message_item_refusal(item) {
-                                self.refusal_completed = true;
-                                // A completed message item repeats the full refusal content. Use
-                                // it as the authoritative fallback if refusal delta/done events
-                                // were omitted, matching the function-call completion behavior.
-                                self.saw_refusal = true;
-                                self.refusal_output_index = Some(idx);
-                                self.refusal = refusal;
-                                if !self.refusal.is_empty() {
-                                    self.display_parts.reserve(
-                                        (idx, 2),
-                                        "openai_responses",
-                                        self.step_id,
-                                        out,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    self.complete_item(idx, item, RawItem::Envelope(payload), out)?;
                 }
             }
             // Escaped or unusually ordered type discriminators miss the terminal prefilter but
@@ -1530,6 +1451,7 @@ impl OpenAiResponsesNormalizer {
                         }
                     }
                 }
+                self.complete_from_terminal(payload, out)?;
                 self.finish_terminal(out)?;
             }
             _ => {}
@@ -1537,6 +1459,158 @@ impl OpenAiResponsesNormalizer {
         if self.arguments_guard.fired() && !self.completed {
             self.finish_reason = FinishReason::ToolCalls;
             self.finish_terminal(out)?;
+        }
+        Ok(())
+    }
+
+    /// Takes a completed output item at `idx` as the authoritative final state of what its
+    /// streamed events built: from its `response.output_item.done` event, or from the terminal
+    /// response's `output` when the stream never sent that event.
+    fn complete_item(
+        &mut self,
+        idx: u64,
+        item: &Value,
+        raw: RawItem<'_>,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<(), NormalizeError> {
+        self.completed_items.insert(idx);
+        self.capture_text_state(idx, item);
+        let kind = match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => Some(0),
+            Some("function_call") => Some(3),
+            _ if message_item_output_text_parts(item)
+                .iter()
+                .any(|(_, text)| !text.is_empty())
+                || self.text_states.contains_key(&idx) =>
+            {
+                Some(1)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            self.display_parts
+                .reserve((idx, kind), "openai_responses", self.step_id, out);
+        }
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let buf = self.tool_calls.entry(idx).or_default();
+                if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    buf.call_id = id.to_owned();
+                }
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    buf.name = name.to_owned();
+                }
+                // Presence is authoritative even when the final value is empty:
+                // `decode_tool_arguments` maps an empty string to `{}` for a
+                // zero-argument call. Absence alone preserves accumulated deltas.
+                if let Some(args) = item.get("arguments").and_then(Value::as_str) {
+                    buf.arguments = args.to_owned();
+                    self.arguments_guard
+                        .replace(idx, &buf.call_id, &buf.name, &buf.arguments);
+                }
+            }
+            Some("reasoning") => {
+                // Preserve the provider's complete item token rather than rebuilding
+                // it: id, summary, encrypted_content, metadata, and key order all
+                // survive persistence. Request rendering later extracts the fields
+                // needed for continuation and removes response-only fields.
+                let raw_item = match raw {
+                    RawItem::Envelope(payload) => raw_output_item(payload)?,
+                    RawItem::Item(item) => item.to_owned(),
+                };
+                self.reasoning_items.insert(idx, raw_item);
+            }
+            _ => {
+                self.complete_text(idx, message_item_output_text_parts(item));
+                if let Some(refusal) = message_item_refusal(item) {
+                    self.refusal_completed = true;
+                    // A completed message item repeats the full refusal content. Use
+                    // it as the authoritative fallback if refusal delta/done events
+                    // were omitted, matching the function-call completion behavior.
+                    self.saw_refusal = true;
+                    self.refusal_output_index = Some(idx);
+                    self.refusal = refusal;
+                    if !self.refusal.is_empty() {
+                        self.display_parts
+                            .reserve((idx, 2), "openai_responses", self.step_id, out);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the `output_text` parts of a completed message item at `idx`. A part no streamed
+    /// event supplied is filled in. When no part of the item was finalized by its own
+    /// `output_text.done` and the streamed text is a strict prefix of the completed text, the
+    /// stream was cut short and the completed parts replace the streamed ones. Parts are
+    /// compared joined, since a completed item may carry as one part text that streamed as
+    /// several: replacing per part would repeat it.
+    fn complete_text(&mut self, idx: u64, parts: Vec<(u64, &str)>) {
+        let item = (idx, 0)..=(idx, u64::MAX);
+        let finalized = self
+            .completed_text_parts
+            .iter()
+            .any(|(index, _)| *index == idx);
+        let streamed: String = self
+            .text_items
+            .range(item.clone())
+            .map(|(_, text)| text.as_str())
+            .collect();
+        let complete: String = parts.iter().map(|(_, text)| *text).collect();
+        if !finalized
+            && !streamed.is_empty()
+            && complete.len() > streamed.len()
+            && complete.starts_with(&streamed)
+        {
+            let streamed_parts: Vec<_> = self.text_items.range(item).map(|(key, _)| *key).collect();
+            for key in streamed_parts {
+                self.text_items.remove(&key);
+            }
+            for (part_idx, text) in parts {
+                self.text_items.insert((idx, part_idx), text.to_owned());
+            }
+            return;
+        }
+        for (part_idx, text) in parts {
+            self.text_items
+                .entry((idx, part_idx))
+                .or_insert_with(|| text.to_owned());
+        }
+    }
+
+    /// Takes the terminal response's `output` items the stream never completed with their own
+    /// `response.output_item.done` event, so content that arrived only in the terminal response
+    /// isn't lost. A function call whose `function_call_arguments.done` already arrived keeps
+    /// those arguments. A terminal without an `output` array, or one that doesn't decode, adds
+    /// nothing: its other members were already read.
+    fn complete_from_terminal(
+        &mut self,
+        payload: &str,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<(), NormalizeError> {
+        let Ok(TerminalOutputEnvelope {
+            response: Some(TerminalOutput {
+                output: Some(items),
+            }),
+        }) = serde_json::from_str::<TerminalOutputEnvelope>(payload)
+        else {
+            return Ok(());
+        };
+        for (idx, raw) in items.iter().enumerate() {
+            let idx = idx as u64;
+            if self.completed_items.contains(&idx) {
+                continue;
+            }
+            let Ok(mut item) = serde_json::from_str::<Value>(raw.get()) else {
+                continue;
+            };
+            if self.finalized_calls.contains(&idx) {
+                if let Some(item) = item.as_object_mut() {
+                    item.remove("arguments");
+                }
+            }
+            self.complete_item(idx, &item, RawItem::Item(raw.get()), out)?;
         }
         Ok(())
     }
@@ -1853,6 +1927,25 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
 #[derive(Deserialize)]
 struct RawOutputItemEnvelope {
     item: Box<RawValue>,
+}
+
+/// Where a completed output item's own bytes come from: the `response.output_item.done` event
+/// that carries it, or the item itself, taken from a terminal response's `output`.
+enum RawItem<'a> {
+    Envelope(&'a str),
+    Item(&'a str),
+}
+
+/// The `output` items of a terminal `response.completed` or `response.incomplete` event, each
+/// kept as its own bytes.
+#[derive(Deserialize)]
+struct TerminalOutputEnvelope {
+    response: Option<TerminalOutput>,
+}
+
+#[derive(Deserialize)]
+struct TerminalOutput {
+    output: Option<Vec<Box<RawValue>>>,
 }
 
 fn raw_output_item(payload: &str) -> Result<String, NormalizeError> {

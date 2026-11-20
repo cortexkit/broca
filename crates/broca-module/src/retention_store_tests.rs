@@ -380,6 +380,60 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     assert!(view.operations.owner.first_start.is_none(), "a new session");
 }
 
+/// A deletion a crash cut short, after the session's head was marked deleted and before its logs
+/// and objects went, leaves expired content on disk. The next sweep finds it and removes the
+/// rest, with the move's cached stream; a session created at the address first removes it too.
+#[tokio::test]
+async fn a_deletion_a_crash_cut_short_is_finished_by_the_next_sweep_or_a_new_session() {
+    for finished_by_sweep in [true, false] {
+        let rig = Rig::new("cut-short", Duration::from_secs(600)).await;
+        let key = rig.key("cut-short");
+        rig.seed(
+            &key,
+            &[
+                store_start("r1", Some(SECONDS), STARTED_MS),
+                store_end("r1", ENDED_MS),
+                store_billed("r1"),
+            ],
+            true,
+        )
+        .await;
+        let owned = rig.folders(&key);
+        let stream = rig
+            .root
+            .join("session-store-moves/streams")
+            .join(addr(&key).0);
+        std::fs::create_dir_all(stream.parent().unwrap()).unwrap();
+        std::fs::write(&stream, b"ciphertext stream fixture").unwrap();
+        // Where a crash right after the head's deletion mark leaves a session.
+        let heads = rig.ephemeral().join("heads").join(addr(&key).0);
+        std::fs::rename(heads.join("head"), heads.join("head.deleting")).unwrap();
+        let log = rig.ephemeral().join("logs").join(addr(&key).0);
+        assert!(log.exists(), "the deleted session's logs are still on disk");
+
+        if finished_by_sweep {
+            assert_eq!(rig.registry.sweep_once(DEADLINE_MS).await.unwrap(), 0);
+            assert!(!stream.exists(), "the cached stream is left");
+            for path in &owned {
+                assert!(!path.exists(), "{} is left", path.display());
+            }
+        } else {
+            let handle = rig.registry.handle();
+            handle.mark_store_eligible(&key, StoreCreation::Send);
+            rig.opener
+                .open_with_class(&key, 1, handle, Some(SECONDS), None)
+                .await
+                .unwrap();
+            assert!(
+                !heads.join("head.deleting").exists(),
+                "the deletion mark is left"
+            );
+            let view = rig.runtime.current_view(&key).await.unwrap().unwrap();
+            assert!(view.operations.owner.first_start.is_none(), "a new session");
+        }
+    }
+}
+
 /// A session whose policy hasn't expired is kept until its deadline; one whose lease is held is
 /// kept by the sweep past it, and so is one whose run's spend isn't exported yet, since only
 /// the session records it; one with a run still going, or whose first run set no retention,

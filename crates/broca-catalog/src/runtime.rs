@@ -1,7 +1,4 @@
-use broca_owner_only::OpenOptions;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
@@ -20,7 +17,9 @@ use crate::family::{resolve_provider_family, FamilyResolution};
 use crate::Catalog;
 use crate::{CatalogError, OVERLAY};
 
+mod lkg;
 mod reasoning_facts;
+use lkg::{load_lkg, persist_bootable_lkg};
 use reasoning_facts::{reasoning_default_effort_fact, reasoning_fact, reasoning_options_fact};
 
 // Snapshot replacement bypasses refresh validation and must not be available to shipping code.
@@ -2330,7 +2329,7 @@ impl CatalogCache {
                         Some(&current.catalog),
                     )?);
                     if let Some(path) = &self.lkg_path {
-                        persist_lkg(path, &response)?;
+                        persist_bootable_lkg(path, &response, &rebuilt.excluded_rows)?;
                     }
                     self.install(rebuilt);
                     return Ok(());
@@ -2339,7 +2338,7 @@ impl CatalogCache {
                 // Persist even though no fact changed: the LKG carries resolved_at_ms, and a
                 // restart should recover the freshest proof that fusiform answered.
                 if let Some(path) = &self.lkg_path {
-                    persist_lkg(path, &response)?;
+                    persist_bootable_lkg(path, &response, &current.excluded_rows)?;
                 }
                 let refreshed = Arc::new(LoadedCatalog {
                     carries_routing_facts: current.carries_routing_facts,
@@ -2401,7 +2400,7 @@ impl CatalogCache {
             }
         }
         if let Some(path) = &self.lkg_path {
-            persist_lkg(path, &response)?;
+            persist_bootable_lkg(path, &response, &next.excluded_rows)?;
         }
         self.install(next);
         Ok(())
@@ -2702,51 +2701,6 @@ fn legacy_catalog(response: &FusiformCatalogResponse) -> Result<Catalog, Catalog
     Ok(catalog)
 }
 
-fn load_lkg(path: &Path) -> Result<Option<FusiformCatalogResponse>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("read {}: {error}", path.display())),
-    };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| format!("decode {}: {error}", path.display()))
-}
-
-fn persist_lkg(path: &Path, response: &FusiformCatalogResponse) -> Result<(), CatalogRefreshError> {
-    let bytes = serde_json::to_vec(response)
-        .map_err(|error| CatalogRefreshError::Serialize(error.to_string()))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let create_parent = broca_owner_only::create_dir_all(parent);
-    create_parent.map_err(|error| CatalogRefreshError::Persist {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let temp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("catalog-lkg"),
-        std::process::id()
-    ));
-    let write_result = (|| {
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        let mut file = options.open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp);
-        return Err(CatalogRefreshError::Persist {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -2885,6 +2839,7 @@ fn warm_cost_fact(facts: &BTreeMap<String, Value>) -> CostSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn temperature_fusiform_real_shaped_facts_decode_without_other_fields() {
@@ -3679,6 +3634,51 @@ mod tests {
             .model_for_serving("anthropic", "claude-sonnet-4-5")
             .expect("kept across refreshes");
         assert_eq!(kept.limits.context, Some(200_000));
+    }
+
+    /// The LKG a refresh writes is the catalog a restart serves: a row kept from the replaced
+    /// catalog because it arrived malformed keeps its earlier row on disk too, and a same-version
+    /// response a restart couldn't load at all is refused rather than written over a good LKG.
+    #[test]
+    fn the_lkg_a_refresh_writes_reopens_to_the_catalog_it_served() {
+        let path = temp_lkg("kept-row-reopens");
+        let cache = CatalogCache::open(&path);
+        cache.refresh(response(100)).expect("first install");
+        let mut page = response(200);
+        page.catalog_version += 1;
+        page.models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .expect("fixture row")
+            .insert("capability.tool_call".into(), serde_json::json!("yes"));
+        cache
+            .refresh(page.clone())
+            .expect("a malformed row isn't a refusal");
+        let reopened = CatalogCache::open(&path);
+        let (_, kept) = reopened
+            .snapshot()
+            .expect("the LKG reopens")
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .expect("the kept row serves after a restart");
+        assert_eq!(kept.capabilities.tool_call, CapabilityFlag::Known(true));
+
+        // Same version, same rows, but one row's existence is gone: the document as a whole is
+        // unusable at boot, so it is refused and the good LKG stays.
+        let mut broken = page;
+        broken.resolved_at_ms = 300;
+        broken
+            .models
+            .values_mut()
+            .next()
+            .expect("a row")
+            .remove("existence");
+        assert!(
+            cache.refresh(broken).is_err(),
+            "an unbootable document is refused"
+        );
+        assert!(
+            CatalogCache::open(&path).snapshot().is_ok(),
+            "the earlier LKG still opens"
+        );
     }
 
     /// A row never served before that arrives malformed is left out, with one WARN naming the
@@ -6090,8 +6090,8 @@ mod windows_acl_tests {
                 output.set(output.get() + 1);
             },
             || {
-                persist_lkg(&path, &response).unwrap();
-                persist_lkg(&path, &response).unwrap();
+                super::lkg::persist_lkg(&path, &response).unwrap();
+                super::lkg::persist_lkg(&path, &response).unwrap();
             },
         );
         assert_eq!(

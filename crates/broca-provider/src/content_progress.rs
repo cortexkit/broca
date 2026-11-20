@@ -281,10 +281,14 @@ impl ContentObserver {
         if self.suffix_bytes_unknown {
             progress.non_content_bytes_after_last_content = None;
         }
-        let mut types: Vec<_> = self.types.values().cloned().collect();
-        types.sort_by(|a, b| b.count.cmp(&a.count).then(a.event_type.cmp(&b.event_type)));
-        if types.len() > 16 {
-            let rest = types.split_off(16);
+        // Sorted by reference and only the sixteen reported cloned: a snapshot is taken on every
+        // network read, and a stream of many distinct event types would otherwise copy every
+        // tally, name included, each time.
+        let mut sorted: Vec<&EventTypeTally> = self.types.values().collect();
+        sorted.sort_by(|a, b| b.count.cmp(&a.count).then(a.event_type.cmp(&b.event_type)));
+        let rest = sorted.split_off(sorted.len().min(16));
+        let mut types: Vec<EventTypeTally> = sorted.into_iter().cloned().collect();
+        if !rest.is_empty() {
             types.push(EventTypeTally {
                 event_type: "other".into(),
                 count: rest.iter().map(|t| t.count).sum(),

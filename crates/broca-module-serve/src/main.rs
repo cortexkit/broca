@@ -1022,17 +1022,26 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let registry = registry.as_ref().clone();
         let store_slot = Arc::clone(&store_slot);
         let ready = scope_describer.clone();
+        let agent_data = agent_data.clone();
         tokio::spawn(async move {
             ready.wait_registered().await;
             registry.enable_restart_resumes();
             broca_module_serve::store_key::KeyLoader {
                 source: store_key_source,
-                slot: store_slot,
+                slot: Arc::clone(&store_slot),
                 setup: store_setup,
                 backoff: Default::default(),
             }
             .run(registry)
             .await;
+            // A move into this computer that stopped mid-way recovers at boot, except for an
+            // encrypted session, which can't be read until the key has loaded.
+            if store_slot.key_loaded() {
+                if let Err(error) = agent_data.reconcile_pending_cuts().await {
+                    tracing::warn!(target: "lifecycle", error = %error.message,
+                        "agent-data move recovery after the storage key loaded failed; a retry of the move finishes it");
+                }
+            }
         })
     };
     // Late results reach a run through its session's actor, so delivery waits for the registry.
