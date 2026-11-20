@@ -753,6 +753,7 @@ mod tests {
             tool_name: "test_tool".into(),
             input: json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         })
     }
 

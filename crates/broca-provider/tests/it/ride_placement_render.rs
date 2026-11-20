@@ -16,6 +16,7 @@ fn call(id: &str) -> ContentBlock {
         tool_name: "read".into(),
         input: json!({ "path": id }).into(),
         thought_signature: None,
+        provider_state: None,
     })
 }
 

@@ -48,6 +48,7 @@ fn cross_family_prompt(id: &str) -> Vec<Message> {
         Message::assistant_from(
             vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId(id.into()),
                 tool_name: "get_time".into(),
                 input: json!({"tz": "UTC"}).into(),
@@ -114,12 +115,14 @@ fn two_arc_prompt(first: &str, second: &str) -> Vec<Message> {
             vec![
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(first.into()),
                     tool_name: "first".into(),
                     input: json!({}).into(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(second.into()),
                     tool_name: "second".into(),
                     input: json!({}).into(),
@@ -274,12 +277,14 @@ fn distinct_long_ids_sharing_a_64_char_prefix_get_distinct_aliases() {
             vec![
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(id1.clone()),
                     tool_name: "a".into(),
                     input: json!({}).into(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(id2.clone()),
                     tool_name: "b".into(),
                     input: json!({}).into(),

@@ -410,6 +410,7 @@ async fn finish_reason_uses_only_the_last_native_step_and_survives_restart() {
         tool_name: "work".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     });
     let oversized = "x".repeat(65);
     let mut receipts = Vec::new();
@@ -750,6 +751,7 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
                     tool_name: "work".into(),
                     input: serde_json::json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 }),
             ],
             usage: Default::default(),
@@ -866,6 +868,7 @@ async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
                     tool_name: "work".into(),
                     input: serde_json::json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 }),
             ],
             usage: Default::default(),
@@ -2393,6 +2396,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
                 tool_name: "work".into(),
                 input: serde_json::json!({"path": "/synthetic/input.txt"}).into(),
                 thought_signature: Some("synthetic-tool-signature".into()),
+                provider_state: None,
             }),
         ];
         let mut rig = Rig::start(&format!("subscribe-stateful-{name}")).await;
@@ -2552,6 +2556,7 @@ async fn live_display_samples_match_stored_parts_and_attach_replays_current_step
         tool_call_id: ToolCallId("sample-call".into()),
         tool_name: "work".into(),
         input: serde_json::json!({}).into(),
+        provider_state: None,
     });
     for name in ["text", "tool", "reasoning", "steer", "attach"] {
         let mut rig = Rig::start(&format!("live-sample-{name}")).await;
@@ -2678,6 +2683,7 @@ async fn live_finalize_filter_restreams_the_stored_block_indices() {
         Step::Stream(vec![
             ContentBlock::ToolCall(broca_protocol::ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: broca_protocol::ToolCallId("omitted-call".into()),
                 tool_name: "work".into(),
                 input: serde_json::json!({}).into(),
@@ -2781,6 +2787,7 @@ async fn live_display_after_steer_uses_the_next_step_placement() {
     rig.script.push(&[
         Step::Stream(vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: broca_protocol::ToolCallId("steer-call".into()),
             tool_name: "work".into(),
             input: serde_json::json!({}).into(),

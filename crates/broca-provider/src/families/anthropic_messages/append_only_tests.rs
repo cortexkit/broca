@@ -120,6 +120,7 @@ fn tool_step(id: &str, input: Value) -> Vec<NormalizedEvent> {
             thinking(id),
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId(format!("call|{id}")),
                 tool_name: TOOL.into(),
                 input: input.into(),

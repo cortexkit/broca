@@ -95,6 +95,7 @@ async fn gated_batch(mode: ExecutionMode, unknown_fast: bool) -> (Vec<WalRecord>
             tool_name: "work".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         })
         .collect();
     let manifest = ToolManifest::from_tools(vec![Tool {

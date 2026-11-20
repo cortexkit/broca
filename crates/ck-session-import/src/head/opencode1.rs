@@ -406,6 +406,7 @@ fn assistant(
                         state["input"].clone().into()
                     },
                     thought_signature: None,
+                    provider_state: None,
                 }));
                 keys.push(Some(format!("{mid}/{id}")));
                 results.push(ContentBlock::ToolResult(ToolResult {

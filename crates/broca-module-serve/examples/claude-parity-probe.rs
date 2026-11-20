@@ -381,6 +381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Answer {
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("toolu_dry_run".into()),
                 tool_name: TOOL.into(),
                 input: json!({}).into(),

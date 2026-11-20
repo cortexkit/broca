@@ -173,6 +173,7 @@ pub(super) fn call(id: &str) -> ToolCall {
         tool_name: "edit".into(),
         input: json!({"f":"original"}).into(),
         thought_signature: Some("signed".into()),
+        provider_state: None,
     }
 }
 fn append(text: &str) -> HookAnswer {

@@ -34,6 +34,7 @@ async fn ordinary_send_certainty_tracks_the_real_enqueue_boundary() {
             tool_name: "edit".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let result = if pre_enqueue {
             plane.dispatch(&ctx, &call).await
@@ -135,6 +136,7 @@ async fn approved_failure_after_real_push_remains_unknown() {
         tool_name: "edit".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     let signals = Default::default();
     let (result, ()) = tokio::join!(
@@ -177,6 +179,7 @@ async fn approved_closed_writer_queue_is_not_sent() {
         tool_name: "edit".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     let result = plane
         .dispatch_approved(&ctx, &call, "{}", "call-key", &Default::default())
@@ -215,6 +218,7 @@ async fn approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
             tool_name: "edit".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let token = CancellationToken::new();
         let signals = broca_core::tool_plane::DispatchSignals::new(
@@ -280,6 +284,7 @@ async fn ordinary_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
             tool_name: "read".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let token = CancellationToken::new();
         let guard = ToolOpenGuard::new(

@@ -63,12 +63,17 @@ fn every_block() -> Vec<ContentBlock> {
             tool_name: "read".into(),
             input: serde_json::Value::Null.into(),
             thought_signature: Some("QUI=".into()),
+            provider_state: None,
         }),
         ContentBlock::ToolCall(ToolCall {
             tool_call_id: ToolCallId("call_1".into()),
             tool_name: "bash".into(),
             input: serde_json::json!({"command": "ls", "n": 1.5, "z": [true, null]}).into(),
             thought_signature: None,
+            provider_state: Some(TextProviderState {
+                format: TextProviderFormat::OpenAiResponsesChatgpt,
+                data: r#"{"arguments":"{\"command\": \"ls\"}","status":"completed"}"#.into(),
+            }),
         }),
         ContentBlock::ToolResult(ToolResult {
             tool_call_id: ToolCallId("call_1".into()),

@@ -9,6 +9,7 @@ async fn approved_connection_omits_approval_digest_and_preserves_saved_bytes() {
         tool_name: "edit".into(),
         input: serde_json::from_str(saved).unwrap(),
         thought_signature: None,
+        provider_state: None,
     };
     let args = ApprovedArgs {
         bytes: saved.into(),

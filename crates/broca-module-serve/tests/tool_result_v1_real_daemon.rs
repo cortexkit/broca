@@ -107,6 +107,7 @@ async fn capture(
                 tool_name: "read".into(),
                 input: json!({"fixture":fixture}).into(),
                 thought_signature: None,
+                provider_state: None,
             })
         })
         .collect();

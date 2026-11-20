@@ -154,6 +154,7 @@ fn compare(input_pair: bool, page_size: u64, already_guided: bool, held_count: O
             tool_name: "read".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         assert_eq!(
             observer.observe(&call, b"ok", false),

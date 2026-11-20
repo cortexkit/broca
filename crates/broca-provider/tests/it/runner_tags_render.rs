@@ -44,6 +44,7 @@ fn prompt(with_tags: bool) -> Vec<Message> {
         tool_name: "lookup".into(),
         input: serde_json::json!({"q": "tags"}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     vec![
         tag(

@@ -436,6 +436,7 @@ fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 fn call(id: &str, name: &str, input: Value) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         thought_signature: None,
+        provider_state: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: name.into(),
         input: input.into(),
@@ -3308,6 +3309,68 @@ async fn a_tool_call_then_an_answer() {
         ],
     })
     .await;
+}
+
+/// A call's provider state survives the session's storage: a run resumed from its log after
+/// the call's batch, as after a restart, sends the call back with the state the provider gave
+/// it. A restart resends the whole history, so this is when a provider that checks replayed
+/// calls against its own copy sees the stored form (see `ToolCall::provider_state`).
+#[tokio::test]
+async fn a_calls_provider_state_survives_a_resume() {
+    let state = broca_protocol::content::TextProviderState {
+        format: broca_protocol::content::TextProviderFormat::OpenAiResponses,
+        data: r#"{"status":"completed"}"#.into(),
+    };
+    let mut first = call("c1", "read", json!({"path": "a"}));
+    if let ContentBlock::ToolCall(call) = &mut first {
+        call.provider_state = Some(state.clone());
+    }
+    let scenario = Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Sequential)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer("a1", vec![first], FinishReason::ToolCalls),
+            text_step("a2", "done"),
+        ],
+    };
+    for layout in LAYOUTS {
+        let scenario = scenario.clone();
+        let state = state.clone();
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(async move {
+                    let source = new_source(&scenario, None, scenario.steps.clone()).await;
+                    // The first cut that keeps the call's step: the resume reads it from storage.
+                    let cut = source
+                        .batch_ends
+                        .iter()
+                        .copied()
+                        .find(|&cut| source.answered(cut) == 1)
+                        .expect("a cut after the call's batch");
+                    let start = source.cut(cut);
+                    assert!(
+                        start.snapshot.is_some(),
+                        "the resume reopens the stored session"
+                    );
+                    let steps = scenario.steps[source.answered(cut)..].to_vec();
+                    let resumed = Box::pin(new_from(&scenario, Some(start), steps)).await;
+                    let sent: Vec<_> = resumed.requests[0]
+                        .prompt
+                        .iter()
+                        .flat_map(|message| message.content.iter())
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolCall(call) => Some(call.provider_state.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(sent, [Some(state)]);
+                }),
+            )
+            .await;
+    }
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ fn call(id: &str, n: u64) -> ContentBlock {
         tool_name: "work".into(),
         input: serde_json::json!({ "n": n }).into(),
         thought_signature: None,
+        provider_state: None,
     })
 }
 

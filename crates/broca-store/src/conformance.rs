@@ -2329,6 +2329,7 @@ pub(crate) fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
                         tool_name: "lookup".into(),
                         input: serde_json::json!({}).into(),
                         thought_signature: None,
+                        provider_state: None,
                     })],
                 }
                 .into(),

@@ -261,6 +261,7 @@ fn reads_with(id: &str, calls: &[(&str, Value)]) -> Vec<NormalizedEvent> {
         .map(|(call, input)| {
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId((*call).into()),
                 tool_name: "read".into(),
                 input: input.clone().into(),

@@ -92,6 +92,7 @@ fn tool_turn(mid: &str, id: &str) -> Vec<NormalizedEvent> {
                 message_id: MessageId(mid.into()),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: "edit".into(),
                     input: json!({ "f": id }).into(),

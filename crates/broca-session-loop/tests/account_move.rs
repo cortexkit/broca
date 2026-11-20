@@ -184,6 +184,7 @@ fn message(step: u64, tool: bool) -> AssistantMessage {
     if tool {
         content.push(ContentBlock::ToolCall(ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId(format!("call-{step}")),
             tool_name: "read".into(),
             input: json!({"path": "src/main.rs"}).into(),

@@ -498,6 +498,7 @@ fn dry_run(provider: &dyn broca_core::provider::Provider, seed_only: bool) {
             },
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("toolu_dry_run".into()),
                 tool_name: TOOL.into(),
                 input: json!({"path": "sample.txt"}).into(),

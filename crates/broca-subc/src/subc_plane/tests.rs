@@ -1832,6 +1832,7 @@ fn catalog_entry(module_id: &str, tool_names: &[&str]) -> CatalogEntry {
 fn call(tool_name: &str) -> ToolCall {
     ToolCall {
         thought_signature: None,
+        provider_state: None,
         tool_call_id: ToolCallId(format!("call-{tool_name}")),
         tool_name: tool_name.into(),
         input: serde_json::json!({}).into(),
@@ -3235,6 +3236,7 @@ async fn reply_deadline_vectors_reach_real_dispatch_selection() {
             tool_name: "read".into(),
             input: case["arguments"].clone().into(),
             thought_signature: None,
+            provider_state: None,
         };
         let ctx = batch_ctx("deadline-vector");
         plane
@@ -3334,6 +3336,7 @@ async fn send_declared_reply_reaches_dispatch_deadline() {
             tool_name: "read".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let ctx = batch_ctx("declared-reply");
         plane
@@ -3461,6 +3464,7 @@ async fn dispatch_with_slow_aft_reply(
         tool_call_id: ToolCallId("call-slow".into()),
         tool_name: tool_name.into(),
         input: input.into(),
+        provider_state: None,
     };
     let ctx = batch_ctx("batch-slow");
     let fake_module = tokio::spawn(async move {

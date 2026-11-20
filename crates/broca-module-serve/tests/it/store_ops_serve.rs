@@ -1087,6 +1087,7 @@ fn read_step(id: &str) -> Vec<NormalizedEvent> {
                     tool_name: "read".into(),
                     input: json!({"path": "notes.md"}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             },
         }),

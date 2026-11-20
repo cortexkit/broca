@@ -29,6 +29,7 @@ fn cross_family_prompt(id: &str) -> Vec<Message> {
                 tool_name: "get_time".into(),
                 input: json!({"tz": "UTC"}).into(),
                 thought_signature: None,
+                provider_state: None,
             })],
             ModelHandle::new("openai", "gpt-5"),
         ),

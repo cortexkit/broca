@@ -205,6 +205,7 @@ async fn run_cases(family: WireFamilyId, accepts_images: bool) -> (Vec<u8>, Fram
                 tool_name: "work".into(),
                 input: json!({ "case": case }).into(),
                 thought_signature: None,
+                provider_state: None,
             })
         })
         .collect();

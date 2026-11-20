@@ -67,6 +67,7 @@ fn tool_step(id: &str, name: &str, input: Value) -> Vec<NormalizedEvent> {
                 message_id: MessageId(id.into()),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: name.into(),
                     input: input.into(),

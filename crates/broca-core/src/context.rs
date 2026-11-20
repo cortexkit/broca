@@ -3221,6 +3221,7 @@ mod tests {
                     message_id: MessageId("m1".into()),
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("t1".into()),
                         tool_name: "edit".into(),
                         input: serde_json::json!({}).into(),
@@ -3572,6 +3573,7 @@ mod tests {
                     message_id: MessageId("m3".into()),
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("t2".into()),
                         tool_name: "read".into(),
                         input: serde_json::json!({}).into(),

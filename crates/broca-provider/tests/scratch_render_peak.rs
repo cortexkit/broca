@@ -34,6 +34,7 @@ fn prompt(turns: usize) -> Vec<Message> {
                     tool_name: "bash".into(),
                     input: (&input).into(),
                     thought_signature: None,
+                    provider_state: None,
                 }),
             ],
         ));

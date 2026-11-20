@@ -1080,6 +1080,7 @@ mod episode_page_tests {
             tool_name: tool.into(),
             input: serde_json::json!({ "q": query }).into(),
             thought_signature: None,
+            provider_state: None,
         })
     }
 

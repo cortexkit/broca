@@ -251,6 +251,7 @@ fn call(id: &str) -> ToolCall {
         tool_name: "tool".into(),
         input: json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     }
 }
 /// The batch's frozen plan as the run freezes it: a module in the plan, the tool it offers,

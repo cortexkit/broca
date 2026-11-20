@@ -23,12 +23,14 @@ fn step(tool: bool) -> Vec<NormalizedEvent> {
                 tool_name: "work".into(),
                 input: serde_json::json!({}).into(),
                 thought_signature: None,
+                provider_state: None,
             }),
             ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId("two".into()),
                 tool_name: "work".into(),
                 input: serde_json::json!({}).into(),
                 thought_signature: None,
+                provider_state: None,
             }),
         ]
     } else {

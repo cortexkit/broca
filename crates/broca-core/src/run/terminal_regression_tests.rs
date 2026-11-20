@@ -121,6 +121,7 @@ fn tool_step(id: &str, cut: bool) -> Vec<NormalizedEvent> {
                 message_id: MessageId(id.into()),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(id.into()),
                     tool_name: "lookup".into(),
                     input: serde_json::json!({}).into(),

@@ -229,6 +229,7 @@ fn broca_request(case: &Value) -> CallOptions {
                 }),
                 "tool_use" => blocks.push(ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(block["id"].as_str().unwrap().to_string()),
                     tool_name: host_tool_name(block["name"].as_str().unwrap()),
                     input: block["input"].clone().into(),

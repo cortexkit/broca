@@ -509,6 +509,7 @@ fn photo_step(id: &str) -> Vec<NormalizedEvent> {
                 message_id: MessageId(id.into()),
                 content: vec![ContentBlock::ToolCall(broca_protocol::content::ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: broca_protocol::ToolCallId("c1".into()),
                     tool_name: "photo".into(),
                     input: json!({}).into(),

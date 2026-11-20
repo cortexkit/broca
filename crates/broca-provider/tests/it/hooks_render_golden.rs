@@ -24,6 +24,7 @@ fn request() -> CallOptions {
             tool_name: "read".into(),
             input: json!({"path":"a"}).into(),
             thought_signature: None,
+            provider_state: None,
         }),
         ContentBlock::Text {
             text: "tail".into(),
@@ -50,6 +51,7 @@ fn tool_call_only_request() -> CallOptions {
         tool_name: "read".into(),
         input: json!({"path":"a"}).into(),
         thought_signature: None,
+        provider_state: None,
     })];
     let before = content.clone();
     let ops: Vec<_> =

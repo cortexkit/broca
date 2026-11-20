@@ -617,6 +617,7 @@ fn an_import_seed_and_its_interrupted_cut_both_ways() {
             tool_name: "screen".into(),
             input: json!({"long": "x".repeat(1_000)}).into(),
             thought_signature: None,
+            provider_state: None,
         })],
     );
     let imported = [

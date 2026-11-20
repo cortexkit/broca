@@ -386,6 +386,7 @@ impl Writer {
                 tool_name: name.clone(),
                 input: input.clone().into(),
                 thought_signature: None,
+                provider_state: None,
             })
         }));
         let step_start = Record::StepStart(StepStart {

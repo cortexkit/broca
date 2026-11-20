@@ -1115,6 +1115,7 @@ fn tool_step(run: &str, step: usize, tool: &str) -> Vec<NormalizedEvent> {
                 message_id: MessageId(format!("msg-{run}-c{step}")),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(format!("call-{run}-{step}")),
                     tool_name: tool.into(),
                     input: json!({"query": "fixed"}).into(),

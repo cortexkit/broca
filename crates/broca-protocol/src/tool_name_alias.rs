@@ -432,6 +432,7 @@ mod tests {
                     tool_name: wire,
                     input: json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             },
         });

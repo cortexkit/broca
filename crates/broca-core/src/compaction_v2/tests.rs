@@ -102,6 +102,7 @@ fn call() -> Message {
                 tool_name: "read".into(),
                 input: json!({"path":"a"}).into(),
                 thought_signature: Some("thought".into()),
+                provider_state: None,
             }),
         ],
     )
@@ -179,6 +180,7 @@ fn rides_after_results_are_held_beside_the_tool_message() {
             tool_name: "read".into(),
             input: json!({ "path": path }).into(),
             thought_signature: None,
+            provider_state: None,
         })
     };
     let answer = |id: &str, text: &str| {

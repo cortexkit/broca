@@ -69,6 +69,7 @@ fn read_step(call: &str) -> Vec<NormalizedEvent> {
                 message_id: MessageId(format!("m-{call}")),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(call.into()),
                     tool_name: "read".into(),
                     input: serde_json::json!({"path": format!("src/{call}.rs")}).into(),

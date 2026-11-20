@@ -255,6 +255,7 @@ fn tool_scripts() -> Vec<Vec<NormalizedEvent>> {
             "tool-reply",
             vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("edit-1".into()),
                 tool_name: "edit".into(),
                 input: json!({}).into(),
@@ -586,6 +587,7 @@ fn signed_scripts() -> Vec<Vec<NormalizedEvent>> {
                 signed("plan"),
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId("edit-1".into()),
                     tool_name: "edit".into(),
                     input: json!({}).into(),

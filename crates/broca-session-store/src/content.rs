@@ -650,6 +650,7 @@ impl Value for ToolCall {
             tool_name,
             input,
             thought_signature,
+            provider_state,
         } = self;
         put_req(out, 1, false, tool_call_id);
         put_req(out, 2, false, tool_name);
@@ -658,15 +659,22 @@ impl Value for ToolCall {
         if let Some(signature) = thought_signature {
             put_opaque(out, 4, signature);
         }
+        // An older reader skips this field and replays the call in its canonical form, as it
+        // did before the field existed.
+        if let Some(state) = provider_state {
+            crate::codec::put_one(out, 5, false, state);
+        }
     }
     fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
         const AT: &str = "ToolCall";
         let (mut id, mut name, mut input, mut signature) = (None, None, None, None);
+        let mut provider_state = None;
         read_fields(raw, AT, |field| match field.number {
             1 => take_req(&mut id, field, AT),
             2 => take_req(&mut name, field, AT),
             3 => take_one(&mut input, field, AT),
             4 => take_opaque(&mut signature, field, AT),
+            5 => take_one(&mut provider_state, field, AT),
             _ => skip_unknown(field, AT),
         })?;
         Ok(ToolCall {
@@ -674,6 +682,7 @@ impl Value for ToolCall {
             tool_name: finish_req(name, AT)?,
             input: finish_req(input, AT)?,
             thought_signature: signature,
+            provider_state,
         })
     }
 }

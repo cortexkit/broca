@@ -424,6 +424,7 @@ fn fake_tool_call(name: &str, id: &str) -> ToolCall {
         tool_name: name.into(),
         input: input.into(),
         thought_signature: None,
+        provider_state: None,
     }
 }
 

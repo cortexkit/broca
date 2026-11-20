@@ -862,6 +862,7 @@ mod tests {
                         tool_name: "t".into(),
                         input: serde_json::json!({"a": 1}).into(),
                         thought_signature: Some("ts".into()),
+                        provider_state: None,
                     }),
                 ],
             ),
@@ -986,6 +987,7 @@ mod tests {
                 tool_name: "t".into(),
                 input: serde_json::json!({"a": "§1§ arg"}).into(),
                 thought_signature: Some("ts".into()),
+                provider_state: None,
             }),
             ContentBlock::TextWithState {
                 text: "stateful".into(),
@@ -1060,6 +1062,7 @@ mod tests {
                     tool_name: "t".into(),
                     input: serde_json::json!({"a": 1}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 }),
             ],
         );

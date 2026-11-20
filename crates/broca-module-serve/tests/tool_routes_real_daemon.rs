@@ -336,6 +336,7 @@ async fn failed_goodbye_is_retried_and_counted() {
         tool_name: "echo".into(),
         input: json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     f.plane
         .batch_started(

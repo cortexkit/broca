@@ -396,6 +396,7 @@ mod tests {
             tool_name: "ask".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         }
     }
 

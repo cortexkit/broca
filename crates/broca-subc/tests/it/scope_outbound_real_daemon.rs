@@ -458,6 +458,7 @@ fn manifest() -> ToolManifest {
 fn call(marker: &str, delay_ms: u64) -> ToolCall {
     ToolCall {
         thought_signature: None,
+        provider_state: None,
         tool_call_id: ToolCallId(format!("call-{marker}")),
         tool_name: TOOL.into(),
         input: serde_json::json!({ "marker": marker, "delay_ms": delay_ms }).into(),

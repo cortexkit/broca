@@ -59,6 +59,7 @@ fn rich_request() -> CallOptions {
                 },
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId("t1".into()),
                     tool_name: "a_tool".into(),
                     input: json!({"x": 1}).into(),

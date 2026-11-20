@@ -10215,17 +10215,6 @@ impl From<ToolCall> for PlannedDispatch {
     }
 }
 
-impl PlannedDispatch {
-    fn into_tool_call(self) -> ToolCall {
-        ToolCall {
-            tool_call_id: self.tool_call_id,
-            tool_name: self.tool_name,
-            input: self.text,
-            thought_signature: self.thought_signature,
-        }
-    }
-}
-
 /// Resume context for `dispatch_batch` (`None` for a fresh batch). On resume, the
 /// `tool_batch_started` may already be durable (don't rewrite it — that would
 /// reset the batch if we crash and replay again), and the already-terminated
@@ -12419,6 +12408,7 @@ mod display_text;
 mod future_size_tests;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
+mod planned_dispatch;
 use hook_dispatch::{
     pre_tool_terminal, record_hook_stage, record_model_hook, resolve_hooked, restream_message,
 };
@@ -12470,6 +12460,7 @@ mod approval_gate {
                 tool_name: tool.clone(),
                 input: serde_json::from_str(args_jcs).expect("Prepared contains valid JSON"),
                 thought_signature: None,
+                provider_state: None,
             }
         }
         fn expires(&self) -> u64 {

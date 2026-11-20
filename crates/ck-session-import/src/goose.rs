@@ -364,6 +364,7 @@ fn convert_tool_request(part: &Value) -> Option<ToolCall> {
             .unwrap_or(Value::Null)
             .into(),
         thought_signature: None,
+        provider_state: None,
     })
 }
 

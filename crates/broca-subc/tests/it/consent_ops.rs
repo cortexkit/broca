@@ -344,6 +344,7 @@ async fn approved_raw_dispatch_reaches_a_real_provider_without_reserializing_sav
         tool_name: "edit".into(),
         input: serde_json::from_str(bytes).unwrap(),
         thought_signature: None,
+        provider_state: None,
     };
     assert_ne!(
         call.input.to_string(),

@@ -41,6 +41,7 @@ fn head_request() -> CallOptions {
             Role::Assistant,
             vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("toolu_1".into()),
                 tool_name: "read".into(),
                 input: json!({ "path": "src/lib.rs" }).into(),

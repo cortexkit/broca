@@ -761,7 +761,7 @@ fn convert_assistant_items<'a>(
                 flush_text(&mut out, &mut text);
                 // The arguments are the input's JSON text: the text `Json` holds is what
                 // serializing the input writes.
-                out.push(Node::object([
+                let mut item = Node::object([
                     ("type", Node::str("function_call")),
                     ("call_id", Node::str(&call.tool_call_id.0)),
                     (
@@ -769,7 +769,11 @@ fn convert_assistant_items<'a>(
                         Node::string(name_map.wire_name(&call.tool_name).to_owned()),
                     ),
                     ("arguments", Node::str(call.input.text())),
-                ]));
+                ]);
+                if replay.provider_text_state {
+                    replay_call_state(&mut item, message, call, replay);
+                }
+                out.push(item);
             }
             ContentBlock::Reasoning { .. }
             | ContentBlock::RedactedReasoning { .. }
@@ -780,6 +784,47 @@ fn convert_assistant_items<'a>(
     }
     flush_text(&mut out, &mut text);
     out
+}
+
+/// Puts back the provider's own fields of a call it wrote, so the call matches the provider's
+/// copy: the Responses API drops every later reasoning item when a call before it differs
+/// from that copy, which happens to every earlier call on a request that resends the history
+/// (a restart, a retry on a new socket, a compaction view). The call's identity stays the
+/// canonical one, and the model's own `arguments` text is used only while it still says what
+/// the stored input says, so a view that edited the input sends the edit.
+fn replay_call_state<'a>(
+    item: &mut Node<'a>,
+    message: &Message,
+    call: &broca_protocol::content::ToolCall,
+    replay: &ReplayPolicy<'_>,
+) {
+    let Some(state) = call.provider_state.as_ref().filter(|state| {
+        super::text_state_is_echo_safe(
+            message,
+            replay.target_model,
+            state.format,
+            replay.target_family,
+        )
+    }) else {
+        return;
+    };
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&state.data) else {
+        return;
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("type" | "id" | "call_id" | "name", _) => {}
+            ("arguments", Value::String(raw)) => {
+                if broca_protocol::json::Json::from_text(&raw)
+                    .is_ok_and(|canonical| canonical.text() == call.input.text())
+                {
+                    item.insert("arguments", Node::string(raw));
+                }
+            }
+            ("arguments", _) => {}
+            (_, value) => item.insert(key, Node::value(value)),
+        }
+    }
 }
 
 fn convert_tool_output_items<'a>(
@@ -907,6 +952,9 @@ struct ToolCallBuf {
     call_id: String,
     name: String,
     arguments: String,
+    /// The completed item's other fields (`status`, and any the API adds), kept when the
+    /// endpoint replays provider state; see `replay_call_state`.
+    state: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -1088,6 +1136,37 @@ impl OpenAiResponsesNormalizer {
     pub(crate) fn with_text_state(mut self, enabled: bool) -> Self {
         self.provider_text_state = enabled;
         self
+    }
+
+    /// The provider state a completed call keeps: its other item fields, plus the model's own
+    /// `arguments` text when it is spelled differently from the canonical input text, which
+    /// is what a replay writes otherwise. Most calls keep only `status`.
+    fn call_state(
+        &self,
+        fields: Option<serde_json::Map<String, Value>>,
+        arguments: &str,
+        input: &broca_protocol::json::Json,
+    ) -> Option<broca_protocol::content::TextProviderState> {
+        let mut fields = fields?;
+        if arguments != input.text() {
+            fields.insert("arguments".into(), Value::String(arguments.to_owned()));
+        }
+        if fields.is_empty() {
+            return None;
+        }
+        let format = match self.reasoning_format {
+            EncryptedReasoningFormat::OpenAiResponses => {
+                broca_protocol::content::TextProviderFormat::OpenAiResponses
+            }
+            EncryptedReasoningFormat::OpenAiResponsesChatgpt => {
+                broca_protocol::content::TextProviderFormat::OpenAiResponsesChatgpt
+            }
+            EncryptedReasoningFormat::OpenRouter => return None,
+        };
+        Some(broca_protocol::content::TextProviderState {
+            format,
+            data: Value::Object(fields).to_string(),
+        })
     }
 
     fn capture_text_state(&mut self, index: u64, item: &Value) {
@@ -1529,6 +1608,20 @@ impl OpenAiResponsesNormalizer {
                     self.arguments_guard
                         .replace(idx, &buf.call_id, &buf.name, &buf.arguments);
                 }
+                if self.provider_text_state {
+                    buf.state = item.as_object().map(|fields| {
+                        fields
+                            .iter()
+                            .filter(|(key, _)| {
+                                !matches!(
+                                    key.as_str(),
+                                    "type" | "id" | "call_id" | "name" | "arguments"
+                                )
+                            })
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect()
+                    });
+                }
             }
             Some("reasoning") => {
                 // Preserve the provider's complete item token rather than rebuilding
@@ -1853,14 +1946,17 @@ impl OpenAiResponsesNormalizer {
             else {
                 continue;
             };
+            let input: broca_protocol::json::Json = input.into();
+            let provider_state = self.call_state(buf.state, &buf.arguments, &input);
             ordered.push((
                 index,
                 3,
                 ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(buf.call_id),
                     tool_name: buf.name,
-                    input: input.into(),
+                    input,
                     thought_signature: None,
+                    provider_state,
                 }),
             ));
         }

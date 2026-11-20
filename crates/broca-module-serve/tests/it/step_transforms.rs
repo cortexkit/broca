@@ -183,6 +183,7 @@ fn call(id: &str, input: Value) -> ContentBlock {
         tool_name: "work".into(),
         input: input.into(),
         thought_signature: Some("tool-signature".into()),
+        provider_state: None,
     })
 }
 fn text(value: &str) -> ContentBlock {

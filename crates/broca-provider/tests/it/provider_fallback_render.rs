@@ -43,6 +43,7 @@ fn prompt(with_handoff: bool) -> CallOptions {
             tool_name: "lookup".into(),
             input: serde_json::json!({"id": 1}).into(),
             thought_signature: None,
+            provider_state: None,
         }),
     ];
     let mut last = vec![ContentBlock::Text {

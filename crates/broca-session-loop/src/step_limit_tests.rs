@@ -46,6 +46,7 @@ fn read_step(n: usize) -> Vec<NormalizedEvent> {
             message_id: MessageId(format!("m-{n}")),
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId(format!("c{n}")),
                 tool_name: "read".into(),
                 input: serde_json::json!({"path": format!("src/{n}.rs")}).into(),

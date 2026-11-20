@@ -39,6 +39,7 @@ fn read_call(id: &str, call: &str) -> Vec<NormalizedEvent> {
                 message_id: MessageId(id.into()),
                 content: vec![ContentBlock::ToolCall(broca_protocol::content::ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: broca_protocol::ToolCallId(call.into()),
                     tool_name: "read".into(),
                     input: serde_json::json!({}).into(),

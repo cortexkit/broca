@@ -173,12 +173,14 @@ fn calls() -> Vec<ToolCall> {
     vec![
         ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("call-a".into()),
             tool_name: TOOL_A.into(),
             input: json!({"module": "a"}).into(),
         },
         ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("call-b".into()),
             tool_name: TOOL_B.into(),
             input: json!({"module": "b"}).into(),

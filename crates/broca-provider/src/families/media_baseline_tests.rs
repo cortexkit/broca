@@ -90,6 +90,7 @@ fn every_family_renders_parts_as_ordered_carrier_markers() {
                                 tool_name: "screenshot".into(),
                                 input: json!({}).into(),
                                 thought_signature: None,
+                                provider_state: None,
                             })],
                         ),
                         Message::new(

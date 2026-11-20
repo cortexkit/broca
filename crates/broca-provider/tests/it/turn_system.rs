@@ -41,6 +41,7 @@ fn message(value: &Value) -> Message {
                 tool_name: part["name"].as_str().unwrap().into(),
                 input: part["input"].clone().into(),
                 thought_signature: None,
+                provider_state: None,
             })),
             Some("tool_result") => {
                 message.role = Role::Tool;
@@ -253,6 +254,7 @@ fn anthropic_template_outside_a_user_to_reply_gap_renders_as_a_user_note() {
                 tool_name: "read".into(),
                 input: json!({"path": id}).into(),
                 thought_signature: None,
+                provider_state: None,
             })],
         )
     };

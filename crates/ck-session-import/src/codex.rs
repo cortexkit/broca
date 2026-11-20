@@ -486,6 +486,7 @@ fn convert_response_item(
                 tool_name: tool_name.to_string(),
                 input: input.into(),
                 thought_signature: None,
+                provider_state: None,
             });
             conversion.batch.push(
                 messages,

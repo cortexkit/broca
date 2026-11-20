@@ -548,6 +548,7 @@ fn convert_tool(part: &Value) -> (ToolCall, Option<ToolResult>) {
         tool_name: tool_name.to_string(),
         input: input.into(),
         thought_signature: None,
+        provider_state: None,
     };
     let status = state.get("status").and_then(Value::as_str).unwrap_or("");
     let result = match status {

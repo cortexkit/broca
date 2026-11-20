@@ -411,6 +411,7 @@ mod tests {
             tool_name: name.to_string(),
             input: input.into(),
             thought_signature: None,
+            provider_state: None,
         }
     }
 
@@ -687,6 +688,7 @@ mod prompt_fold_tests {
             tool_name: name.to_string(),
             input: input.into(),
             thought_signature: None,
+            provider_state: None,
         })
     }
 
@@ -723,6 +725,7 @@ mod prompt_fold_tests {
             tool_name: "read".into(),
             input: json!({"filePath": "a.rs"}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let mut live = RepetitionObserver::new();
         live.observe(&c, b"boom", true);
@@ -767,6 +770,7 @@ mod prompt_fold_tests {
             tool_name: "read".into(),
             input: json!({"filePath": "a.rs"}).into(),
             thought_signature: None,
+            provider_state: None,
         });
         assert_eq!(
             observer.exact_failures.get(&signature).copied(),
@@ -786,12 +790,14 @@ mod prompt_fold_tests {
             tool_name: "read".into(),
             input: json!({"filePath": "A"}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let second = ToolCall {
             tool_call_id: ToolCallId("call_0".into()),
             tool_name: "read".into(),
             input: json!({"filePath": "B"}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let continuation = [
             ToolCall {
@@ -799,12 +805,14 @@ mod prompt_fold_tests {
                 tool_name: "read".into(),
                 input: json!({"filePath": "C"}).into(),
                 thought_signature: None,
+                provider_state: None,
             },
             ToolCall {
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "read".into(),
                 input: json!({"filePath": "D"}).into(),
                 thought_signature: None,
+                provider_state: None,
             },
         ];
 

@@ -176,6 +176,7 @@ fn step(tool: bool) -> Vec<NormalizedEvent> {
                 content: if tool {
                     vec![ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("bash-call".into()),
                         tool_name: "bash".into(),
                         input: json!({}).into(),

@@ -86,6 +86,7 @@ fn script(tool: bool) -> Vec<NormalizedEvent> {
                 content: if tool {
                     vec![ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("once".into()),
                         tool_name: "edit".into(),
                         input: serde_json::json!({}).into(),

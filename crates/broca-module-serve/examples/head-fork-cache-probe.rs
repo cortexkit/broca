@@ -246,6 +246,7 @@ fn head_options(corpus: &Corpus, result_bytes: usize) -> CallOptions {
             let id = ToolCallId(format!("call_reference_{call_index:03}"));
             calls.push(ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: id.clone(),
                 tool_name: catalog[call_index % catalog.len()].name.clone(),
                 input: json!({"path":"reference.md", "query":"contract", "start_line":1,

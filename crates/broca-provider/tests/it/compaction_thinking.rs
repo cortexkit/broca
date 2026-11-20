@@ -45,6 +45,7 @@ fn seed() -> Vec<Message> {
         tool_name: "record_note".into(),
         input: json!({"value": 599}).into(),
         thought_signature: None,
+        provider_state: None,
     }));
     vec![
         text(Role::User, "original prefix"),
@@ -615,6 +616,7 @@ fn an_asynchronous_view_strips_invalidated_thinking_or_waits_for_the_open_tool_t
         tool_name: "record_note".into(),
         input: json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     }));
     open.truncate(1);
     open.push(pending);

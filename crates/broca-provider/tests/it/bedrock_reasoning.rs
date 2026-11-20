@@ -43,6 +43,7 @@ fn canonical_blocks() -> Vec<ContentBlock> {
             tool_name: "lookup".into(),
             input: json!({"key":"A"}).into(),
             thought_signature: None,
+            provider_state: None,
         }),
         ContentBlock::Text {
             text: "Checking.".into(),

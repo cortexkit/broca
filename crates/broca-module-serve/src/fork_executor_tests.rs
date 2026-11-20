@@ -593,6 +593,7 @@ fn fork_reply_call() -> broca_protocol::content::ContentBlock {
         tool_name: "forbidden".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     })
 }
 

@@ -25,6 +25,7 @@ fn call(id: &str, tool: &str, input: Value) -> ContentBlock {
         tool_name: tool.into(),
         input: input.into(),
         thought_signature: None,
+        provider_state: None,
     })
 }
 

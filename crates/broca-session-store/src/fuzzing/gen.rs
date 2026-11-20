@@ -395,6 +395,7 @@ impl Gen for ToolCall {
             tool_name: gen(g),
             input: gen(g),
             thought_signature: gen(g),
+            provider_state: gen(g),
         }
     }
 }

@@ -5919,6 +5919,7 @@ pub(crate) mod deferred_tests {
                         .map(|id| {
                             ContentBlock::ToolCall(ToolCall {
                                 thought_signature: None,
+                                provider_state: None,
                                 tool_call_id: ToolCallId((*id).into()),
                                 tool_name: "edit".into(),
                                 input: serde_json::json!({"n":1}).into(),
@@ -6484,28 +6485,7 @@ pub(crate) mod provider_held_tests {
 }
 
 #[cfg(test)]
-mod projected_episode_tests {
-    use super::episodes_with_first_steps;
-    use broca_protocol::request::EpisodeRenderInput;
-
-    #[test]
-    fn an_episode_without_a_model_step_takes_no_other_episodes_step() {
-        let render = |start: usize| EpisodeRenderInput {
-            prompt_start: start,
-            first_user: Some(start),
-            frozen_config: serde_json::json!({}),
-        };
-        // The first episode ended before any model step; only the second has one.
-        let projected = episodes_with_first_steps(&[render(0), render(3)], &[4]);
-        assert_eq!(
-            projected
-                .iter()
-                .map(|episode| episode.first_step)
-                .collect::<Vec<_>>(),
-            vec![Some(None), Some(Some(4))]
-        );
-    }
-}
+mod projected_episode_tests;
 
 /// Offset tail replay: the indexed prefix holds messages by offset and the
 /// tail is replayed from the indexed sequence with held steers seeded.
@@ -6727,12 +6707,14 @@ mod offset_tail_tests {
                         tool_name: "work".into(),
                         input: serde_json::json!({}).into(),
                         thought_signature: None,
+                        provider_state: None,
                     }),
                     ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId("b".into()),
                         tool_name: "work".into(),
                         input: serde_json::json!({}).into(),
                         thought_signature: None,
+                        provider_state: None,
                     }),
                 ],
             }),
@@ -7367,6 +7349,7 @@ mod offset_tail_tests {
                     tool_name: "work".into(),
                     input: serde_json::json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             }),
             usage: Usage::default(),

@@ -23,6 +23,7 @@ pub(crate) fn records(session: &BindIdentity) -> Vec<FramedRecord> {
                     tool_name: "edit".into(),
                     input: serde_json::json!({"f":"a"}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })
             })
             .collect();

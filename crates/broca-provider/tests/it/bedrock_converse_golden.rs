@@ -51,6 +51,7 @@ fn fixed_request() -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("tooluse_01".into()),
                 tool_name: "get_time".into(),
                 input: json!({"timezone": "Europe/Madrid"}).into(),

@@ -667,6 +667,7 @@ fn dry_run(model: &str, variant: Option<&str>) -> Result<i32, String> {
         ),
         ContentBlock::ToolCall(ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("call_dry_run".into()),
             tool_name: TOOL.into(),
             input: json!({"path": "sample.txt"}).into(),

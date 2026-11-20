@@ -698,6 +698,7 @@ fn anthropic_tail_marker_skips_a_final_turn_system_message_under_order_two() {
         tool_name: "bash".into(),
         input: broca_protocol::json::Json::from_value(&json!({"command": "ls"})),
         thought_signature: None,
+        provider_state: None,
     });
     let result = ContentBlock::ToolResult(broca_protocol::content::ToolResult {
         tool_call_id: broca_protocol::ToolCallId("call_1".into()),

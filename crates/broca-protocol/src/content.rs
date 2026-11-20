@@ -479,7 +479,7 @@ mod fallback_compatibility_tests {
 }
 
 /// An assembled, complete tool call (input is the full JSON args, not deltas).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
@@ -489,6 +489,30 @@ pub struct ToolCall {
     /// the same model. It is omitted for providers and model versions that do not sign calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// The provider's own fields of this call that the canonical form above doesn't carry, for
+    /// a provider that checks a replayed call against its own copy. OpenAI's Responses API
+    /// drops every later reasoning item when a call comes back without its `status`, or with
+    /// an `arguments` string other than the one the model wrote. Only the format that wrote it
+    /// replays it. Stored by the session store's own codec and kept out of every reply: it is
+    /// the provider's state, not part of the conversation.
+    #[serde(skip)]
+    pub provider_state: Option<TextProviderState>,
+}
+
+/// Leaves an absent provider state out, so a call without one prints as it did before the
+/// field existed: test pins record these prints, and most calls have none.
+impl std::fmt::Debug for ToolCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut call = f.debug_struct("ToolCall");
+        call.field("tool_call_id", &self.tool_call_id)
+            .field("tool_name", &self.tool_name)
+            .field("input", &self.input)
+            .field("thought_signature", &self.thought_signature);
+        if let Some(state) = &self.provider_state {
+            call.field("provider_state", state);
+        }
+        call.finish()
+    }
 }
 
 /// A tool result fed back to the model. Produced by the runner (via subc→AFT),

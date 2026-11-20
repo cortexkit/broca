@@ -270,6 +270,7 @@ fn imported_messages() -> Vec<Message> {
         tool_name: "read".into(),
         input: serde_json::json!({"path": "a"}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     vec![
         user("Look."),

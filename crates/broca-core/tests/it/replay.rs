@@ -120,6 +120,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
         message_id: MessageId("m".into()),
         content: vec![ContentBlock::ToolCall(ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId(id.into()),
             tool_name: name.into(),
             input: json!({}).into(),
@@ -799,12 +800,14 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         content: vec![
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("t1".into()),
                 tool_name: "edit".into(),
                 input: json!({"f": "a"}).into(),
             }),
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("t2".into()),
                 tool_name: "edit".into(),
                 input: json!({"f": "b"}).into(),
@@ -3296,12 +3299,14 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
                 content: vec![
                     ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("c1".into()),
                         tool_name: "edit".into(),
                         input: json!({}).into(),
                     }),
                     ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("c2".into()),
                         tool_name: "edit".into(),
                         input: json!({}).into(),

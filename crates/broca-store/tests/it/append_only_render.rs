@@ -68,6 +68,7 @@ fn read_step(id: &str, input: Value) -> Vec<NormalizedEvent> {
         id,
         ContentBlock::ToolCall(ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId(id.into()),
             tool_name: "read".into(),
             input: input.into(),

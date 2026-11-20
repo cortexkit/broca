@@ -34,6 +34,7 @@ fn call(id: &str, name: &str) -> ToolCall {
         tool_name: name.into(),
         input: json!({"n":1e-6}).into(),
         thought_signature: None,
+        provider_state: None,
     }
 }
 fn scope() -> SessionScope {

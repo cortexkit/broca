@@ -333,11 +333,13 @@ impl HeldBytes for ToolCall {
             tool_name,
             input,
             thought_signature,
+            provider_state,
         } = self;
         tool_call_id.heap_bytes()
             + tool_name.heap_bytes()
             + input.heap_bytes()
             + thought_signature.heap_bytes()
+            + provider_state.heap_bytes()
     }
 }
 

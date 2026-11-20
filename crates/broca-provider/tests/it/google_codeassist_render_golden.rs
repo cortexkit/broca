@@ -51,6 +51,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("call_01".into()),
                 tool_name: "get_time".into(),
                 input: json!({"timezone": "Europe/Madrid"}).into(),
@@ -109,6 +110,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "search".into(),
                 input: json!({"query": "broca"}).into(),
@@ -138,6 +140,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("call_0".into()),
                 tool_name: "read".into(),
                 input: json!({"path": "README.md"}).into(),

@@ -184,6 +184,7 @@ mod tests {
             tool_name: "read".into(),
             input: serde_json::json!({}).into(),
             thought_signature: None,
+            provider_state: None,
         }
     }
 

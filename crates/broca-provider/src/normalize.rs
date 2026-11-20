@@ -861,6 +861,7 @@ impl AnthropicNormalizer {
                         tool_name: name,
                         input: input.into(),
                         thought_signature: None,
+                        provider_state: None,
                     }));
                 }
             }

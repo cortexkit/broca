@@ -632,6 +632,7 @@ fn convert_message(
                     .unwrap_or(Value::Null)
                     .into(),
                 thought_signature: None,
+                provider_state: None,
             })),
             other => push_unique(skipped_blocks, other),
         }

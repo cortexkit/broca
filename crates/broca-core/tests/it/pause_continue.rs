@@ -155,6 +155,7 @@ fn tool_reply(message_id: &str, tool_call_id: &str) -> Vec<NormalizedEvent> {
                 message_id: MessageId(message_id.into()),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(tool_call_id.into()),
                     tool_name: "edit".into(),
                     input: json!({}).into(),
@@ -313,6 +314,7 @@ fn seed_resume_without_terminal(
                 message_id: MessageId("m1".into()),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId("t1".into()),
                     tool_name: "edit".into(),
                     input: json!({}).into(),

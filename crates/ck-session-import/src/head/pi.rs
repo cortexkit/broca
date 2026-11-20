@@ -339,6 +339,7 @@ fn assistant(mid: &str, row: &Value, content: &Value) -> Result<Option<Draft>, H
                         .unwrap_or(Value::Null)
                         .into(),
                     thought_signature: None,
+                    provider_state: None,
                 }));
             }
             other => {

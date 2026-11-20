@@ -48,6 +48,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("call_01".into()),
                 tool_name: "get_time".into(),
                 input: json!({"timezone": "Europe/Madrid"}).into(),
@@ -110,6 +111,7 @@ fn json_tool_result_request(value: Value) -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("call_json".into()),
                 tool_name: "get_data".into(),
                 input: json!({}).into(),
@@ -156,6 +158,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId(first_id.into()),
                 tool_name: "search".into(),
                 input: json!({"query": "broca"}).into(),
@@ -185,6 +188,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId(second_id.into()),
                 tool_name: "read".into(),
                 input: json!({"path": "README.md"}).into(),
@@ -352,6 +356,7 @@ fn signed_call_request(target_model: &str) -> CallOptions {
                 tool_name: "get_time".into(),
                 input: json!({"timezone": "Europe/Madrid"}).into(),
                 thought_signature: Some("gemini-signed-call".into()),
+                provider_state: None,
             })],
             ModelHandle::new(PROVIDER, MODEL_X),
         ),
@@ -423,6 +428,7 @@ fn signed_reasoning_request(origin: Option<ModelHandle>, target_model: &str) -> 
                     tool_name: "get_weather".into(),
                     input: json!({"city": "Madrid"}).into(),
                     thought_signature: Some("call-sig".into()),
+                    provider_state: None,
                 }),
             ],
             origin,

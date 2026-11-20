@@ -36,6 +36,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
         .map(|(id, name, input)| {
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId((*id).into()),
                 tool_name: (*name).into(),
                 input: input.clone().into(),

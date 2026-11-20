@@ -241,6 +241,7 @@ pub(super) fn call(name: &str, input: Value, id: &str) -> ToolCall {
         tool_name: name.into(),
         input: input.into(),
         thought_signature: None,
+        provider_state: None,
     }
 }
 

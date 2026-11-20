@@ -2183,6 +2183,7 @@ impl crate::held_slots::HeldRunResumer for LosesFirstResume {
                 tool_name: "ask".into(),
                 input: json!({}).into(),
                 thought_signature: None,
+                provider_state: None,
             };
             let reply = broca_core::tool_plane::ProviderHeldReply {
                 tool_call_id: ToolCallId("a".into()),

@@ -102,6 +102,7 @@ fn with_call(mut opts: CallOptions) -> CallOptions {
                 tool_name: "screenshot".into(),
                 input: json!({}).into(),
                 thought_signature: None,
+                provider_state: None,
             })],
         ),
     );

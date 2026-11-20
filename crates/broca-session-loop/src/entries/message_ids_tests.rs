@@ -29,6 +29,7 @@ fn multi_message_batch() -> Vec<Record> {
                 Role::Assistant,
                 vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId("call".into()),
                     tool_name: "read".into(),
                     input: serde_json::json!({}).into(),

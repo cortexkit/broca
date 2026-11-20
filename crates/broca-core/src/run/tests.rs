@@ -1607,6 +1607,7 @@ async fn provider_held_dispatch_syncs_its_record_before_acting() {
         tool_name: "tool".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     });
     dispatch.call_key = Some("lineage:19".into());
     let plan = CallPlan::Dispatch(dispatch);
@@ -1645,6 +1646,7 @@ async fn malformed_provider_held_reply_is_recorded_as_refused_without_pausing() 
         tool_name: "tool".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     let manifest = ToolManifest::from_tools(vec![serde_json::from_value(serde_json::json!({"name":"tool","description":"","input_schema":{},"execution_mode":"parallel"})).unwrap()]);
     let plane = crate::StubToolPlane::new().with_tool("tool", |_| {
@@ -2469,6 +2471,7 @@ async fn provider_held_pause_stops_keep_warm_for_a_day() {
         tool_name: "edit".into(),
         input: serde_json::json!({}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     let batch = dispatch_batch(
         &run,
@@ -2892,12 +2895,14 @@ async fn tripped_sequential_resume_preserves_already_durable_terminal() {
     let calls = vec![
         ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("call_a".into()),
             tool_name: "edit".into(),
             input: serde_json::json!({"path": "a"}).into(),
         },
         ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("call_b".into()),
             tool_name: "edit".into(),
             input: serde_json::json!({"path": "b"}).into(),

@@ -773,6 +773,7 @@ mod tests {
             tool_name: name.into(),
             input: serde_json::Value::Null.into(),
             thought_signature: None,
+            provider_state: None,
         })
     }
 
@@ -859,6 +860,7 @@ mod tests {
                     })
                     .into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             ),
         ];
@@ -955,6 +957,7 @@ mod tests {
                     tool_name: name.into(),
                     input: serde_json::Value::Null.into(),
                     thought_signature: None,
+                    provider_state: None,
                 })
             };
             let source = Message::new(
@@ -1161,6 +1164,7 @@ mod tests {
                     tool_name: "work".into(),
                     input: serde_json::Value::Null.into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             ),
             Message::new(Role::Tool, vec![result("orphan-inside")]),

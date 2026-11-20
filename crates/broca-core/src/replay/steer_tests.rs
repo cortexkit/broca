@@ -170,6 +170,7 @@ fn call_step(step: u64, call: &str) -> WalRecord {
                 tool_name: "work".into(),
                 input: serde_json::json!({}).into(),
                 thought_signature: None,
+                provider_state: None,
             })],
         }),
         usage: Usage::default(),

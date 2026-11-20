@@ -262,6 +262,7 @@ mod tests {
             Message::assistant_from(
                 vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(foreign.clone()),
                     tool_name: "edit".into(),
                     input: json!({}).into(),
@@ -293,12 +294,14 @@ mod tests {
             vec![
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(INVALID.into()),
                     tool_name: "first".into(),
                     input: json!({}).into(),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(VALID_LEGACY_ALIAS.into()),
                     tool_name: "second".into(),
                     input: json!({}).into(),

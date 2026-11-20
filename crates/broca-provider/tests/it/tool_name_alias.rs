@@ -26,6 +26,7 @@ fn options() -> CallOptions {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolCall(ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("call-1".into()),
             tool_name: CANONICAL.into(),
             input: json!({}).into(),

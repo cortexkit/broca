@@ -320,6 +320,7 @@ impl Provider for DispatchAllocationProbeProvider {
                     tool_name: "allocation_probe".into(),
                     input: serde_json::json!({ "entries": entries }).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
                 FinishReason::ToolCalls,
             )

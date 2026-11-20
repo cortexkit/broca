@@ -555,6 +555,7 @@ fn provider_scripts(episode: usize, tool_turn: bool) -> Vec<Vec<NormalizedEvent>
                     message_id: MessageId(format!("message-{episode:04}-tool")),
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId(call_id.clone()),
                         tool_name: "lookup".into(),
                         input: json!({"query": "fixed"}).into(),

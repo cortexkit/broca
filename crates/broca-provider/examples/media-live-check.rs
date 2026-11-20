@@ -152,6 +152,7 @@ fn add_exchange(
                     MediaProfileId::Gemini3 | MediaProfileId::CodeAssistGemini3
                 )
                 .then(|| "skip_thought_signature_validator".into()),
+                provider_state: None,
             })],
         ));
         history.push(Message::new(

@@ -1653,6 +1653,7 @@ impl BedrockStreamNormalizer {
                         tool_name: name,
                         input: input.into(),
                         thought_signature: None,
+                        provider_state: None,
                     }));
                 }
             }
@@ -1953,6 +1954,7 @@ mod tests {
                     tool_name: "lookup".into(),
                     input: json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             ),
             Message::new(

@@ -1049,6 +1049,7 @@ fn deepseek_history() -> broca_protocol::CallOptions {
                 ContentBlock::Reasoning { text: "read the file first".into(), signature: None },
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId("call_0".into()),
                     tool_name: "read".into(),
                     input: serde_json::json!({}).into(),

@@ -667,6 +667,7 @@ fn tool_step(id: &str) -> Vec<NormalizedEvent> {
                     },
                     ContentBlock::ToolCall(broca_protocol::content::ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: broca_protocol::ToolCallId("c1".into()),
                         tool_name: "read".into(),
                         input: json!({"path": "a"}).into(),

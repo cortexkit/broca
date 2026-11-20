@@ -627,6 +627,7 @@ fn convert_block(
                 .to_string(),
             input: block.get("input").cloned().unwrap_or(Value::Null).into(),
             thought_signature: None,
+            provider_state: None,
         })),
         "tool_result" => {
             let mut content = block.get("content").cloned().unwrap_or(Value::Null);

@@ -50,6 +50,7 @@ fn assistant(
 pub fn tool_call(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         thought_signature: None,
+        provider_state: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: name.into(),
         input: input.into(),

@@ -669,6 +669,7 @@ fn frozen_profiles_leave_text_only_request_bytes_unchanged_in_every_family() {
                 tool_name: "inspect".into(),
                 input: json!({}).into(),
                 thought_signature: None,
+                provider_state: None,
             })],
         ),
         Message::new(

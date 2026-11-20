@@ -365,6 +365,7 @@ mod tests {
                     tool_name: "read".into(),
                     input: input.into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
                 origin: None,
                 ordinal: None,

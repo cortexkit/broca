@@ -221,6 +221,7 @@ async fn reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend() {
                     tool_name: "work".into(),
                     input: json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 },
             )],
             usage: broca_protocol::Usage {

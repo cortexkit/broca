@@ -1794,6 +1794,7 @@ mod tests {
                     },
                     ContentBlock::ToolCall(broca_protocol::content::ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: call_id.clone(),
                         tool_name: "tick".into(),
                         input: json!({ "n": n }).into(),

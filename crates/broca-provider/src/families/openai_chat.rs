@@ -1231,6 +1231,7 @@ impl OpenAiChatNormalizer {
                 tool_name: buf.name,
                 input: input.into(),
                 thought_signature: None,
+                provider_state: None,
             }));
             keys.push((2, slot as u64));
         }

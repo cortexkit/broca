@@ -123,6 +123,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
         .map(|(id, name, input)| {
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId((*id).into()),
                 tool_name: (*name).into(),
                 input: input.clone().into(),
@@ -4123,6 +4124,7 @@ async fn finalize_turn_tool_calls_are_not_dispatched() {
         tool_call_id: ToolCallId("before".into()),
         tool_name: "lookup".into(),
         input: json!({}).into(),
+        provider_state: None,
     };
     let model_steps: Vec<_> = records
         .iter()

@@ -47,6 +47,7 @@ fn finished(message: AssistantMessage, finish_reason: FinishReason) -> Vec<Norma
 fn call(id: &str, tool: &str) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         thought_signature: None,
+        provider_state: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: tool.into(),
         input: serde_json::json!({}).into(),

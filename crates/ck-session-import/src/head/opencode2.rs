@@ -431,6 +431,7 @@ fn tool(
         tool_name: name.to_owned(),
         input: input.into(),
         thought_signature: None,
+        provider_state: None,
     };
     let mut media = Vec::new();
     let (output, is_error) = match state["status"].as_str() {

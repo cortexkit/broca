@@ -1193,6 +1193,7 @@ async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
     let call = |n: u64| {
         ContentBlock::ToolCall(ToolCall {
             thought_signature: None,
+            provider_state: None,
             tool_call_id: ToolCallId("c1".into()),
             tool_name: "read".into(),
             input: json!({ "n": n }).into(),

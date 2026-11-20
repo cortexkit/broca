@@ -542,6 +542,7 @@ fn synthetic_replies() -> (Vec<ContentBlock>, Vec<ContentBlock>) {
                 tool_name: TOOL.into(),
                 input: json!({"path":"sample.txt"}).into(),
                 thought_signature: Some("dry-call-signature".into()),
+                provider_state: None,
             }),
         ],
         vec![synthetic_text(

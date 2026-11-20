@@ -47,6 +47,7 @@ fn assistant() -> Message {
                 tool_name: "read".into(),
                 input: json!({"path":"a"}).into(),
                 thought_signature: None,
+                provider_state: None,
             }),
         ],
     )

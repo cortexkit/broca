@@ -180,6 +180,7 @@ impl Rig {
                         tool_name: "read_file".into(),
                         input: json!({"path":"fixture.txt"}).into(),
                         thought_signature: None,
+                        provider_state: None,
                     })],
                 }
                 .into(),

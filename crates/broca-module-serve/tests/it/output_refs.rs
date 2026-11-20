@@ -464,6 +464,7 @@ async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
             tool_name: "work".into(),
             input: json!({"data":"$$tc(99)","marker":marker}).into(),
             thought_signature: None,
+            provider_state: None,
         })
     };
     rig.script.push(&[
@@ -933,6 +934,7 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
                     })
                     .into(),
                     thought_signature: None,
+                    provider_state: None,
                 }),
             ],
             usage: Default::default(),
@@ -1061,6 +1063,7 @@ async fn a_call_without_opt_in_has_no_set() {
                     tool_name: "work".into(),
                     input: json!({"data": "$$tc(2)"}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 },
             )],
             usage: Default::default(),

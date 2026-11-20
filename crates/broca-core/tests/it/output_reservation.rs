@@ -87,6 +87,7 @@ impl WindowProvider {
             (
                 vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId("t1".into()),
                     tool_name: "read".into(),
                     input: json!({"path": "src/lib.rs"}).into(),
@@ -459,6 +460,7 @@ fn tool_step(step: u64, usage: Usage) -> Vec<NormalizedEvent> {
                 message_id: MessageId(format!("m{step}")),
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(format!("t{step}")),
                     tool_name: "read".into(),
                     input: json!({"path": "src/lib.rs"}).into(),

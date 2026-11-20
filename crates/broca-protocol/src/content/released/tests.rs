@@ -63,6 +63,7 @@ fn released_blocks_keep_their_kind_ids_and_emptiness() {
         tool_name: "read".into(),
         input: Json::from_text(r#"{"path":"a"}"#).unwrap(),
         thought_signature: None,
+        provider_state: None,
     });
     let ContentBlock::ToolCall(released_call) = call.released().unwrap() else {
         panic!("a call stays a call");

@@ -799,6 +799,7 @@ mod tests {
                     tool_name: "lookup".into(),
                     input: json!({}).into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             ),
             Message::new(

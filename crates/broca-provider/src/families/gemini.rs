@@ -1277,6 +1277,7 @@ impl GeminiNormalizer {
                         tool_name: buf.name,
                         input: buf.args.into(),
                         thought_signature: buf.thought_signature,
+                        provider_state: None,
                     })
                 }
             })
@@ -1465,6 +1466,7 @@ mod tests {
                 tool_name: name.to_string(),
                 input: json!({"query": "broca"}).into(),
                 thought_signature: None,
+                provider_state: None,
             })],
         )
     }

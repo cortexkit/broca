@@ -119,12 +119,14 @@ fn assistant_two_calls() -> AssistantMessage {
             },
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("c1".into()),
                 tool_name: "alpha".into(),
                 input: serde_json::json!({"x": 1}).into(),
             }),
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("c2".into()),
                 tool_name: "beta".into(),
                 input: serde_json::json!({"y": 2}).into(),

@@ -136,12 +136,14 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
                     content: vec![
                         ContentBlock::ToolCall(ToolCall {
                             thought_signature: None,
+                            provider_state: None,
                             tool_call_id: ToolCallId("t1".into()),
                             tool_name: "edit".into(),
                             input: json!({"f": "a"}).into(),
                         }),
                         ContentBlock::ToolCall(ToolCall {
                             thought_signature: None,
+                            provider_state: None,
                             tool_call_id: ToolCallId("t2".into()),
                             tool_name: "edit".into(),
                             input: json!({"f": "b"}).into(),

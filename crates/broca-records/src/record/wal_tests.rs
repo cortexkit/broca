@@ -1765,6 +1765,7 @@ mod schema_tests {
                     tool_name: "read".into(),
                     input: json!({"path": "x"}).into(),
                     thought_signature: Some("gemini-signed-call".into()),
+                    provider_state: None,
                 })],
             })
             .into(),
@@ -1787,6 +1788,7 @@ mod schema_tests {
             tool_name: "read".into(),
             input: json!({"path": "x"}).into(),
             thought_signature: None,
+            provider_state: None,
         };
         let encoded_call = serde_json::to_vec(&call).expect("serialize unsigned call");
         assert_eq!(

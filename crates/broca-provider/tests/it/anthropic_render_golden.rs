@@ -104,6 +104,7 @@ mod gated {
                     },
                     ContentBlock::ToolCall(ToolCall {
                         thought_signature: None,
+                        provider_state: None,
                         tool_call_id: ToolCallId("toolu_01".into()),
                         tool_name: "get_time".into(),
                         input: json!({"timezone": "Europe/Madrid"}).into(),
@@ -411,6 +412,7 @@ mod gated {
                 },
                 ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
+                    provider_state: None,
                     tool_call_id: ToolCallId(format!("toolu_step_{n}")),
                     tool_name: "tick".into(),
                     input: json!({ "n": n }).into(),
@@ -769,6 +771,7 @@ mod gated {
         let call = |label: &str| {
             ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId(format!("toolu_{label}")),
                 tool_name: "tick".into(),
                 input: json!({ "label": label }).into(),

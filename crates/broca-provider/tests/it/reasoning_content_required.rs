@@ -30,6 +30,7 @@ fn deepseek() -> ModelHandle {
 fn read_call(id: &str, path: &str) -> ContentBlock {
     ContentBlock::ToolCall(ToolCall {
         thought_signature: None,
+        provider_state: None,
         tool_call_id: ToolCallId(id.into()),
         tool_name: "read".into(),
         input: json!({ "path": path }).into(),
@@ -501,6 +502,7 @@ fn tool_call_only_prompt() -> Vec<Message> {
         Message::assistant_from(
             vec![ContentBlock::ToolCall(ToolCall {
                 thought_signature: None,
+                provider_state: None,
                 tool_call_id: ToolCallId("call_1".into()),
                 tool_name: "get_time".into(),
                 input: json!({}).into(),

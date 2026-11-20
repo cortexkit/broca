@@ -116,6 +116,7 @@ fn tool_step(message_id: &str, tool_call_id: &str, input: Value) -> Vec<Normaliz
                     tool_name: TOOL_NAME.into(),
                     input: input.into(),
                     thought_signature: None,
+                    provider_state: None,
                 })],
             },
         }),

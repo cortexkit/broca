@@ -124,6 +124,7 @@ async fn run(name: &str, render_tags: bool) -> Run {
         tool_name: "lookup".into(),
         input: json!({"q": "tags"}).into(),
         thought_signature: None,
+        provider_state: None,
     };
     let provider = StubProvider::new(vec![
         step(

@@ -121,6 +121,7 @@ fn call(id: &str) -> ContentBlock {
         tool_name: "lookup".into(),
         input: json!({"q": "tags"}).into(),
         thought_signature: None,
+        provider_state: None,
     })
 }
 

@@ -693,6 +693,7 @@ fn dry_message(step: Step) -> AssistantMessage {
             tool_name: "read_file".into(),
             input: json!({"path":FILES[index]}).into(),
             thought_signature: None,
+            provider_state: None,
         })],
         _ => vec![ContentBlock::Text {
             text: "Synthetic dry-run answer; not a provider observation.".into(),
