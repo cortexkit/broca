@@ -704,58 +704,120 @@ fn replay_with_labels(
     identity: &CursorIdentity,
     labels: crate::store_awaits::Labels,
 ) -> Result<Replay, String> {
-    let LogFrom {
-        checkpoint,
-        records,
-    } = log;
-    let mut control = StoreControl::at_checkpoint(
-        &checkpoint.conversation,
-        &checkpoint.operational,
-        checkpoint.covers_through,
-    )
-    .with_labels(labels);
-    let delivered_from = match from {
-        AttachFrom::Live => None,
-        AttachFrom::Cursor(cursor) => Some(cursor),
-    };
-    let resume = match from {
-        AttachFrom::Cursor(FromCursor::Resume { cursor, proof }) => Some((cursor, proof)),
-        _ => None,
-    };
-    // A cursor past the durable end names no record the session holds; one whose record is gone
-    // is never found.
-    let mut cursor_valid = resume.is_none_or(|(cursor, _)| cursor.wal_seq <= head);
-    let mut found = resume.is_none();
-    let mut units = Vec::new();
-    for (at, (seq, record)) in records.iter().enumerate() {
-        let next = records.get(at + 1).map(|(_, next)| next);
-        let projected = control.project(*seq, record, next)?;
+    let mut replayer = Replayer::new(&log.checkpoint, from, head, identity, labels);
+    let mut units = replayer.feed(log.records)?;
+    units.extend(replayer.finish()?);
+    Ok(Replay {
+        units,
+        cursor_valid: replayer.cursor_valid(),
+    })
+}
+
+/// A replay of a session's records for an attach from `from`, fed in order a chunk at a time:
+/// it keeps the projection, the resume cursor's check and the record whose successor the next
+/// chunk brings, so a long catch-up never holds more than one chunk of records.
+struct Replayer<'a> {
+    control: StoreControl,
+    from: AttachFrom,
+    identity: &'a CursorIdentity,
+    cursor_valid: bool,
+    found: bool,
+    /// The last record fed, projected only once its successor (or the end) is known.
+    carried: Option<(u64, Record)>,
+}
+
+impl<'a> Replayer<'a> {
+    fn new(
+        checkpoint: &broca_session_store::checkpoint::Checkpoint,
+        from: AttachFrom,
+        head: u64,
+        identity: &'a CursorIdentity,
+        labels: crate::store_awaits::Labels,
+    ) -> Self {
+        let resume = Self::resume_of(from);
+        Self {
+            control: StoreControl::at_checkpoint(
+                &checkpoint.conversation,
+                &checkpoint.operational,
+                checkpoint.covers_through,
+            )
+            .with_labels(labels),
+            from,
+            identity,
+            // A cursor past the durable end names no record the session holds; one whose record
+            // is gone is never found.
+            cursor_valid: resume.is_none_or(|(cursor, _)| cursor.wal_seq <= head),
+            found: resume.is_none(),
+            carried: None,
+        }
+    }
+
+    fn resume_of(from: AttachFrom) -> Option<(Cursor, crate::fanout::ResumeCursorProof)> {
+        match from {
+            AttachFrom::Cursor(FromCursor::Resume { cursor, proof }) => Some((cursor, proof)),
+            _ => None,
+        }
+    }
+
+    /// Projects `records`, the next records in seq order, and returns the units they yield past
+    /// the attach point. The last of them waits for the next chunk, which holds its successor.
+    fn feed(&mut self, records: Vec<(u64, Record)>) -> Result<Vec<ControlEvent>, String> {
+        let mut units = Vec::new();
+        for record in records {
+            if let Some(previous) = self.carried.take() {
+                units.extend(self.project(&previous, Some(&record.1))?);
+            }
+            self.carried = Some(record);
+        }
+        Ok(units)
+    }
+
+    /// Projects the record held back for its successor, at the end of the replay.
+    fn finish(&mut self) -> Result<Vec<ControlEvent>, String> {
+        match self.carried.take() {
+            Some(last) => self.project(&last, None),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Whether a resume cursor named a unit of the record it names, as the session holds it.
+    /// Final once the replay has passed the cursor's record.
+    fn cursor_valid(&self) -> bool {
+        self.cursor_valid && self.found
+    }
+
+    fn project(
+        &mut self,
+        (seq, record): &(u64, Record),
+        next: Option<&Record>,
+    ) -> Result<Vec<ControlEvent>, String> {
+        let projected = self.control.project(*seq, record, next)?;
+        let resume = Self::resume_of(self.from);
         let named = resume.filter(|(cursor, _)| cursor.wal_seq == *seq);
         if projected.is_empty() && named.is_none() {
-            continue;
+            return Ok(Vec::new());
         }
-        let digest = identity.key.digest(record);
+        let digest = self.identity.key.digest(record);
         if let Some((cursor, proof)) = named {
-            found = true;
+            self.found = true;
             // Every unit the record yields counts here, notices hidden from subscribers too.
-            cursor_valid &= projected.iter().any(|unit| {
-                unit.sub_index == cursor.sub_index && proof.matches(identity.cursor(unit, digest))
+            self.cursor_valid &= projected.iter().any(|unit| {
+                unit.sub_index == cursor.sub_index
+                    && proof.matches(self.identity.cursor(unit, digest))
             });
         }
-        let Some(delivered_from) = delivered_from else {
-            continue;
+        let AttachFrom::Cursor(delivered_from) = self.from else {
+            return Ok(Vec::new());
         };
+        let mut units = Vec::new();
         for unit in projected {
-            let cursor = identity.cursor(&unit, digest);
+            let cursor = self.identity.cursor(&unit, digest);
             if unit.visible && delivered_from.includes(cursor) {
                 units.push((cursor, unit.unit, unit.event));
             }
         }
+        Ok(units)
     }
-    Ok(Replay {
-        units,
-        cursor_valid: cursor_valid && found,
-    })
 }
 
 /// Where a projection reads a session's logs from: the writer's session itself, or a handle that
@@ -945,6 +1007,96 @@ pub async fn catch_up_from<B: SessionBackend>(
     Ok(replayed.units.len())
 }
 
+/// Records a catch-up reads and projects at a time, so one attaching far back in a long session
+/// holds one chunk of records, not its whole history. Tests use chunks of a few records, so every
+/// catch-up they run crosses chunk boundaries.
+#[cfg(not(test))]
+const CATCH_UP_CHUNK: u64 = 4096;
+#[cfg(test)]
+const CATCH_UP_CHUNK: u64 = 3;
+
+/// What a catch-up hands its subscriber, in order.
+enum CatchUp {
+    /// The units of one chunk past the attach point.
+    Units(Vec<ControlEvent>),
+    /// The catch-up reached the barrier.
+    Done,
+    /// The resume cursor names no unit of the record it names, as the session holds it.
+    CursorExpired,
+    Failed(String),
+}
+
+/// Replays `reader`'s records from `start` through `head` for an attach from `from`, a chunk at
+/// a time, sending each chunk's units on `chunks`. A resume cursor is checked before any unit
+/// goes: its record is the first the replay reaches. Stops when the subscriber stops reading.
+#[allow(clippy::too_many_arguments)]
+fn catch_up<R: SessionBackend>(
+    runtime: &tokio::runtime::Handle,
+    reader: &StoredRecords<R>,
+    start: u64,
+    head: u64,
+    from: AttachFrom,
+    identity: &CursorIdentity,
+    labels: crate::store_awaits::Labels,
+    chunks: &mpsc::Sender<CatchUp>,
+) {
+    let failed = |error: broca_session_store::session::SessionError| {
+        CatchUp::Failed(format!("the session's records can't be read: {error:?}"))
+    };
+    let mut through = head.min(start.saturating_add(CATCH_UP_CHUNK));
+    let log = match runtime.block_on(reader.from_log_holding(start, through)) {
+        Ok(log) => log,
+        Err(error) => {
+            let _ = chunks.blocking_send(failed(error));
+            return;
+        }
+    };
+    let mut replayer = Replayer::new(&log.checkpoint, from, head, identity, labels);
+    let mut fed = replayer.feed(log.records);
+    let mut checked = false;
+    loop {
+        let finished = through >= head;
+        if finished {
+            fed = fed.and_then(|mut units| {
+                units.extend(replayer.finish()?);
+                Ok(units)
+            });
+        }
+        let units = match fed {
+            Ok(units) => units,
+            Err(error) => {
+                let _ = chunks.blocking_send(CatchUp::Failed(error));
+                return;
+            }
+        };
+        // The cursor's record is projected once its successor is fed, so past it the check is
+        // final; no unit is sent before it is.
+        if !checked && (through > start || finished) {
+            checked = true;
+            if !replayer.cursor_valid() {
+                let _ = chunks.blocking_send(CatchUp::CursorExpired);
+                return;
+            }
+        }
+        if !units.is_empty() && chunks.blocking_send(CatchUp::Units(units)).is_err() {
+            return;
+        }
+        if finished {
+            let _ = chunks.blocking_send(CatchUp::Done);
+            return;
+        }
+        let first = through + 1;
+        through = head.min(through.saturating_add(CATCH_UP_CHUNK));
+        fed = match runtime.block_on(reader.records_between(first, through)) {
+            Ok(records) => replayer.feed(records),
+            Err(error) => {
+                let _ = chunks.blocking_send(failed(error));
+                return;
+            }
+        };
+    }
+}
+
 /// One subscriber: its catch-up through the barrier, then the live stream.
 async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>) {
     let Attach {
@@ -993,40 +1145,53 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
                 .min(head + 1),
         };
         // The catch-up reads and projects on the blocking pool, off the runtime worker carrying
-        // other sessions' streams; the read is driven there by the runtime's handle.
+        // other sessions' streams; the read is driven there by the runtime's handle. It reads a
+        // chunk at a time and hands each chunk's units over before reading on, so the first units
+        // go out after one chunk, and a subscriber that leaves stops the reading.
         let read_identity = identity.clone();
         let runtime = tokio::runtime::Handle::current();
-        let replayed = match spawn_blocking(JobKind::Projection, move || {
-            let log = runtime
-                .block_on(reader.from_log_holding(start, head))
-                .map_err(|error| format!("the session's records can't be read: {error:?}"))?;
-            replay_with_labels(log, from, head, &read_identity, labels)
-        })
-        .await
-        {
-            Ok(replayed) => replayed,
-            Err(error) => Err(format!("the catch-up task failed: {error}")),
-        };
-        let units = match replayed {
-            Ok(Replay {
-                cursor_valid: false,
-                ..
-            }) => {
-                let _ = deliver(&sink, &cancel, Delivery::CursorExpired).await;
-                return;
-            }
-            Ok(Replay { units, .. }) => units,
-            Err(error) => {
-                let _ = deliver(&sink, &cancel, Delivery::Error(error)).await;
-                return;
-            }
-        };
-        if matches!(from, AttachFrom::Cursor(_)) {
-            for unit in units {
-                if deliver(&sink, &cancel, Delivery::Control(Arc::new(unit)))
-                    .await
-                    .is_break()
-                {
+        let (chunks_tx, mut chunks) = mpsc::channel(1);
+        let _reading = spawn_blocking(JobKind::Projection, move || {
+            catch_up(
+                &runtime,
+                &reader,
+                start,
+                head,
+                from,
+                &read_identity,
+                labels,
+                &chunks_tx,
+            )
+        });
+        loop {
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = sink.closed() => return,
+                chunk = chunks.recv() => chunk,
+            };
+            match chunk {
+                Some(CatchUp::Units(units)) => {
+                    for unit in units {
+                        if deliver(&sink, &cancel, Delivery::Control(Arc::new(unit)))
+                            .await
+                            .is_break()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Some(CatchUp::Done) => break,
+                Some(CatchUp::CursorExpired) => {
+                    let _ = deliver(&sink, &cancel, Delivery::CursorExpired).await;
+                    return;
+                }
+                Some(CatchUp::Failed(error)) => {
+                    let _ = deliver(&sink, &cancel, Delivery::Error(error)).await;
+                    return;
+                }
+                None => {
+                    let error = "the catch-up task failed".to_owned();
+                    let _ = deliver(&sink, &cancel, Delivery::Error(error)).await;
                     return;
                 }
             }
