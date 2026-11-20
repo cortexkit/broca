@@ -485,7 +485,7 @@ impl RetentionService {
         if !operations.queue.is_empty() {
             return Ok(OperatorDeletion::Busy("sends are queued"));
         }
-        if runtime.billing().is_some() && !operations.billing_owed.is_empty() {
+        if !operations.billing_owed.is_empty() {
             return Ok(OperatorDeletion::Busy("a run's spend is not exported yet"));
         }
         let records = view.records_from(0).await.map_err(described)?;
