@@ -320,7 +320,8 @@ echo "        and provider-declarations/v1 (not inferred from the session reply)
 # ASK OF EVERY GAUGE: WHEN DID THIS LAST SHOW A DIFFERENT VALUE?
 #
 # ALF's framing, and it has a retroactive hit on the sharpest instance in this repo.
-# `projection_failures` read 0 in production for weeks -- not because projections succeeded, but
+# `projection_failures` (a health metric since removed with the store projection it counted)
+# read 0 in production for weeks -- not because projections succeeded, but
 # because both fetch_add sites carried #[cfg(test)] while the reader did not, so the release
 # binary published 0 regardless (r126, e269833). The test PASSED, because cfg(test) enabled the
 # increments it asserted on: it proved the counter works in a configuration production never
@@ -334,7 +335,6 @@ echo "        and provider-declarations/v1 (not inferred from the session reply)
 #
 # As of 2026-09-03 these have never shown a second value in production:
 #
-#     projection_failures                was the r126 defect; covered by regression tests
 #     frames_dropped_stale_epoch         0 since v0.3.33
 #     frames_dropped_unmatched_terminal  0 since v0.3.33
 #     catalog_refusals / _total          0 since v0.3.43
@@ -349,7 +349,7 @@ echo "        and provider-declarations/v1 (not inferred from the session reply)
 # question gets asked on a schedule rather than when something already feels wrong.
 echo
 echo "  gauges with no second value ever observed (candidates for fault injection, not faults):"
-echo "    projection_failures, frames_dropped_stale_epoch, frames_dropped_unmatched_terminal,"
-echo "    catalog_refusals -- see the note above this line before concluding they are healthy"
+echo "    frames_dropped_stale_epoch, frames_dropped_unmatched_terminal, catalog_refusals"
+echo "    -- see the note above this line before concluding they are healthy"
 
 exit "$fail"

@@ -1875,10 +1875,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // Present at zero for the same reason as the drop counters: absent-versus-zero is
         // the distinction an operator needs, and a field that appears only on failure
         // cannot say "this process has projected cleanly since boot".
-        "projection_failures",
         // The current-state counterpart: unlike the lifetime counter, successful projection
         // removes only the recovered session's entry and leaves other sessions behind.
-        "projection_behind_sessions",
         // The ck-bus run-event publisher: off by default, so a healthy default daemon reads
         // `enabled: false` with every counter at zero; `enabled` is what separates that from an
         // enabled publisher that has simply had nothing to send.
@@ -1981,7 +1979,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "provider_held",
         // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
         // writer that lost its channel without a shutdown (`disconnect`) never happens here.
-        "wal_fsyncs",
         // Cached tool routes and the route Goodbyes sent when sessions close. Asserted below:
         // no route outlives its session, and no Goodbye failed, was dropped or is still owed.
         "tool_routes",
@@ -2085,21 +2082,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         launch.contains('-') && !launch.starts_with('-') && !launch.ends_with('-'),
         "launch_id must carry both nonce components, got {launch:?}"
     );
-    let fsyncs = metrics["wal_fsyncs"]
-        .as_object()
-        .expect("wal_fsyncs is an object");
-    assert_eq!(
-        fsyncs.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["barrier", "deadline", "disconnect", "shutdown"],
-        "wal_fsyncs carries one counter per sync cause"
-    );
-    assert!(
-        fsyncs.values().all(serde_json::Value::is_u64),
-        "every wal_fsyncs counter is a count, got {fsyncs:?}"
-    );
-    // Every writer here is shut down through its handle. A disconnect sync would mean one was
-    // dropped without that, which a healthy daemon never does.
-    assert_eq!(fsyncs["disconnect"], serde_json::json!(0));
     let routes = metrics["tool_routes"]
         .as_object()
         .expect("tool_routes is an object");
@@ -2198,8 +2180,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         serde_json::json!(0)
     );
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
-    assert_eq!(metrics["projection_failures"], serde_json::json!(0));
-    assert_eq!(metrics["projection_behind_sessions"], serde_json::json!(0));
     assert_eq!(
         metrics["bus_events"],
         serde_json::json!({

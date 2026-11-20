@@ -350,47 +350,6 @@ struct VaultReading {
     serving_cached: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ProjectionHealthReport {
-    failures: u64,
-    behind_sessions: u64,
-    detail: Option<String>,
-}
-
-fn projection_health_report(failures: u64, behind_sessions: u64) -> ProjectionHealthReport {
-    let detail = (behind_sessions > 0).then(|| {
-        format!(
-            "store projection behind on {behind_sessions} session(s); their reads replay the WAL tail until a projection succeeds"
-        )
-    });
-    ProjectionHealthReport {
-        failures,
-        behind_sessions,
-        detail,
-    }
-}
-
-/// Per-cause fsync totals for the writer sync deadline, reported under
-/// `wal_fsyncs`: barriers the owner asked for, deadline syncs the loop issued
-/// on its own, and the final sync of each close path. A healthy writer that
-/// appends without barriers shows deadline syncs and little else.
-fn wal_fsync_health_metrics() -> serde_json::Value {
-    wal_fsync_health_json(broca_core::durability_counters::snapshot())
-}
-
-/// Render one durability snapshot as the `wal_fsyncs` health object. Pure so
-/// tests can pin the exact shape and values.
-fn wal_fsync_health_json(
-    snapshot: broca_core::durability_counters::DurabilitySnapshot,
-) -> serde_json::Value {
-    serde_json::json!({
-        "barrier": snapshot.barrier,
-        "deadline": snapshot.deadline,
-        "shutdown": snapshot.shutdown,
-        "disconnect": snapshot.disconnect,
-    })
-}
-
 fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
     if details.is_empty() {
         subc_protocol::session::HealthStatus::Ok
@@ -2107,15 +2066,6 @@ async fn handle_control_request(
                 }
                 _ => "disconnected",
             };
-            // Failure attempts remain visible in the counter after recovery; only unresolved
-            // sessions degrade health because their reads still replay the WAL tail.
-            let projection_health = projection_health_report(
-                broca_core::run::projection_failures(),
-                broca_core::run::projection_behind_sessions(),
-            );
-            if let Some(detail) = &projection_health.detail {
-                details.push(detail.clone());
-            }
             let catalog_health = catalog_cache.map(|cache| cache.health(now_ms));
             if let Some(Err(error)) = &catalog_health {
                 details.push(error.to_string());
@@ -2253,12 +2203,6 @@ async fn handle_control_request(
                     // reverse_request_unhandled because broca fronts no person who could answer.
                     // Non-zero means some module is asking and not getting what it wants.
                     "reverse_requests_refused": broca_subc::FRAME_DROPS.reverse_requests_refused(),
-                    // Lifetime attempts this process saw fail; recovery clears only the separate
-                    // behind-session gauge, never this historical counter.
-                    "projection_failures": projection_health.failures,
-                    "projection_behind_sessions": projection_health.behind_sessions,
-                    // Fsyncs the writer loop issued, by the path that issued them.
-                    "wal_fsyncs": wal_fsync_health_metrics(),
                     // Lifetime operation counts for THIS process. They reset on restart and are not
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
@@ -7420,50 +7364,6 @@ mod tests {
         assert_eq!(logs[1].fields["phase"], "close");
         assert_eq!(logs[1].fields["outcome"], "cancelled");
         assert_eq!(logs[0].fields["session"], logs[1].fields["session"]);
-    }
-
-    #[test]
-    fn projection_health_degrades_only_for_sessions_still_behind() {
-        let recovered = projection_health_report(1, 0);
-        assert_eq!(recovered.failures, 1);
-        assert_eq!(recovered.behind_sessions, 0);
-        assert_eq!(recovered.detail, None);
-        assert_eq!(health_status(&[]), subc_protocol::session::HealthStatus::Ok);
-
-        let lagging = projection_health_report(2, 1);
-        let detail = lagging.detail.expect("a behind session degrades health");
-        assert_eq!(
-            health_status(std::slice::from_ref(&detail)),
-            subc_protocol::session::HealthStatus::Degraded
-        );
-        assert_eq!(
-            detail,
-            "store projection behind on 1 session(s); their reads replay the WAL tail until a projection succeeds"
-        );
-        assert!(
-            !detail.contains("  "),
-            "health detail contains an accidental run of spaces: {detail:?}"
-        );
-    }
-
-    #[test]
-    fn wal_fsync_health_metrics_reports_named_causes() {
-        let metrics = wal_fsync_health_json(broca_core::durability_counters::DurabilitySnapshot {
-            barrier: 2,
-            deadline: 3,
-            shutdown: 1,
-            disconnect: 4,
-        });
-        assert_eq!(
-            metrics,
-            serde_json::json!({
-                "barrier": 2,
-                "deadline": 3,
-                "shutdown": 1,
-                "disconnect": 4,
-            }),
-            "health reports each fsync cause with its exact total"
-        );
     }
 
     #[tokio::test]

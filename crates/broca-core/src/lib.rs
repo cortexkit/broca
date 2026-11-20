@@ -51,7 +51,6 @@ pub mod output_events;
 pub mod output_reservation;
 pub mod placement;
 pub mod projection;
-mod projection_health;
 pub mod projection_plan;
 pub mod provider;
 pub mod provider_errors;

@@ -608,46 +608,6 @@ pub(crate) fn first_system_message(messages: &[Message]) -> Option<&Message> {
     first_system_index(messages).and_then(|index| messages.get(index))
 }
 
-/// Project the session's durable WAL into the configured materialized store. Reads a
-/// SEPARATE WAL handle bounded by the last fsynced sequence, then projects up to the latest
-/// replay-safe boundary. Best-effort: a projection
-/// failure is reported but remains non-fatal because full-WAL replay keeps resume
-/// correct regardless.
-/// SWEPT 2026-08-12: this was the only OBSERVATION among the workspace's process-global
-/// atomics; the other five are mechanism (id minting, token allocation, a single-sweep latch,
-/// and two throttle fields that reset to zero after firing) and are correctly file-local.
-/// The discriminator, so a later sweep does not re-derive it: does the value describe SOMETHING
-/// THAT HAPPENED, or does it drive a decision? A value that is reset after use is state; a
-/// value that only ever accumulates is an observation, and an observation with no reader is a
-/// signal nobody receives.
-///
-/// Failed projection attempts by THIS process since boot.
-///
-/// Compiled into production deliberately. A projection failure leaves the store's watermark
-/// where it was, so every later read of that session merges its prefix with a WAL tail that
-/// grows each turn -- and until this counter existed the only trace was one stderr line in a
-/// log shared with every other module, where roughly one line in twelve is spliced by a
-/// concurrent writer. A condition whose only record is a line in a shared log is one nobody
-/// finds until a reader complains about latency, days later, pointing at the wrong subsystem.
-///
-/// It is honest on a self-reported surface because it counts what this process OBSERVED ITSELF
-/// DOING. Zero means "this process has seen no failures since boot", never "the store is
-/// current" -- a freshly started process reads zero with an arbitrarily stale store behind it.
-/// Naming it for the attempt rather than for the store is what keeps it inside that bound.
-static PROJECTION_WARNING_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Failed projection attempts by this process since boot. A count of attempts, never a
-/// statement about whether the store is current; see [`PROJECTION_WARNING_COUNT`].
-pub fn projection_failures() -> u64 {
-    PROJECTION_WARNING_COUNT.load(std::sync::atomic::Ordering::Relaxed) as u64
-}
-
-/// Sessions whose latest projection attempt failed and have not projected successfully since.
-pub fn projection_behind_sessions() -> u64 {
-    crate::projection_health::behind_sessions()
-}
-
 // Pairs the terminal state with any explicitly recorded interrupt reason.
 
 /// Facts known at a physical send site, independent of rendering and retry policy.
