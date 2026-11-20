@@ -595,8 +595,11 @@ fn publish_copy(source: &mut Source, directory: &Path, name: &OsString) -> io::R
 /// so the copy already in place serves everyone. A copy of the wrong length is still replaced, so
 /// a damaged copy is repaired as before.
 ///
-/// Unix renames replace the name without disturbing an open or running executable, so they
-/// keep the plain atomic rename.
+/// On Unix a replacing rename doesn't disturb a running executable, but it gives the name a new
+/// file. A rig that checks a running module's image against the path it launched (the scope
+/// tests do) then finds two different files when another rig published the same build in
+/// between. So Unix publishes with a hard link, which never replaces, and the temporary name is
+/// removed afterwards. Where the hard link fails for any other reason, the rename is used.
 fn place_copy(temporary: &Path, destination: &Path, size: u64) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -606,7 +609,18 @@ fn place_copy(temporary: &Path, destination: &Path, size: u64) -> io::Result<()>
             Err(_) => {}
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    match fs::hard_link(temporary, destination) {
+        Ok(()) => return Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && has_right_size(destination, size) =>
+        {
+            return Ok(())
+        }
+        Err(_) => {}
+    }
+    #[cfg(not(any(windows, unix)))]
     let _ = size;
     fs::rename(temporary, destination)
 }
@@ -1450,12 +1464,12 @@ mod tests {
         }
     }
 
-    /// A replacing rename briefly opens the existing copy for deletion, which makes a daemon's
-    /// launch of that copy fail with a sharing violation. A complete copy that another publisher
-    /// put in place while this one was copying must therefore be left exactly as it is.
-    #[cfg(windows)]
+    /// A complete copy that another publisher put in place while this one was copying is left
+    /// exactly as it is. On Windows a replacing rename would briefly open it for deletion and
+    /// fail a daemon's launch of it; on Unix it would swap the file under a rig that compares a
+    /// running module's image with its path.
     #[test]
-    fn windows_publication_keeps_a_complete_copy_a_racing_publisher_placed() {
+    fn publication_keeps_a_complete_copy_a_racing_publisher_placed() {
         let scratch = fixture("racing-publisher");
         let built = source(
             &scratch,
