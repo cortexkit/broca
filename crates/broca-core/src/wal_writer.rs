@@ -587,7 +587,7 @@ fn state_root_of(root: &Path) -> PathBuf {
 }
 
 mod file_identity;
-#[cfg(any(windows, test))]
+#[cfg(test)] // On Windows `same_wal_file` calls it inside its own module.
 use file_identity::same_native_file_identity;
 use file_identity::same_wal_file;
 
