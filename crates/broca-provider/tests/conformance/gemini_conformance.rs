@@ -361,3 +361,39 @@ fn gemini_clean_eof_without_finish_reason_is_truncation() {
         "unexpected error: {error}"
     );
 }
+
+/// Two usage objects that each carry one of the two output counters add up, in either order: a
+/// later object with only the thinking count keeps the visible output an earlier one reported.
+#[test]
+fn gemini_usage_keeps_each_counter_across_partial_reports() {
+    for (first, second) in [
+        (
+            serde_json::json!({"promptTokenCount": 10, "candidatesTokenCount": 100}),
+            serde_json::json!({"promptTokenCount": 10, "thoughtsTokenCount": 40}),
+        ),
+        (
+            serde_json::json!({"promptTokenCount": 10, "thoughtsTokenCount": 40}),
+            serde_json::json!({"promptTokenCount": 10, "candidatesTokenCount": 100}),
+        ),
+    ] {
+        let recorded = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"o\"}}],\"role\":\"model\"}},\"index\":0}}],\"usageMetadata\":{first}}}\n\n\
+             data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"k\"}}],\"role\":\"model\"}},\"finishReason\":\"STOP\",\"index\":0}}],\"usageMetadata\":{second}}}\n\n",
+        );
+        let frozen = gemini_frozen_config("gemini-2.5-flash");
+        let mut normalizer = Gemini.normalizer(&frozen, StepId(1));
+        let mut events = normalizer.push(recorded.as_bytes()).unwrap();
+        events.extend(normalizer.finish().unwrap());
+        let usage = events
+            .into_iter()
+            .find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::StepFinished { usage, .. }) => {
+                    Some(usage)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(usage.output_tokens, Some(140), "{first} then {second}");
+        assert_eq!(usage.reasoning_tokens, Some(40));
+    }
+}

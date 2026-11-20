@@ -899,6 +899,9 @@ pub(crate) struct GeminiNormalizer {
     parts: Vec<GeminiPartBuf>,
     next_call_index: u32,
     usage: Usage,
+    /// The last `candidatesTokenCount` the stream reported: a later usage object can carry only
+    /// the thinking count, and the answer's visible output still counts.
+    visible_output: Option<u64>,
     finish_reason: FinishReason,
     raw_finish_reason: Option<String>,
     started: bool,
@@ -928,6 +931,7 @@ impl GeminiNormalizer {
             parts: Vec::new(),
             next_call_index: 0,
             usage: Usage::default(),
+            visible_output: None,
             finish_reason: FinishReason::Other,
             raw_finish_reason: None,
             started: false,
@@ -1222,14 +1226,20 @@ impl GeminiNormalizer {
         // output = candidates alone and reasoning unreported. A lone sibling is a
         // reported lower bound; when neither is present, retain the prior measurement.
         // Code-Assist inherits this via its delegation to the Gemini decode.
+        // Each counter keeps its latest report: one usage object can carry only one of them.
         let candidates = g("candidatesTokenCount");
         let thoughts = g("thoughtsTokenCount");
         if let Some(thoughts) = thoughts {
             self.usage.reasoning_tokens = Some(thoughts);
         }
+        if let Some(candidates) = candidates {
+            self.visible_output = Some(candidates);
+        }
         if candidates.is_some() || thoughts.is_some() {
-            self.usage.output_tokens =
-                broca_protocol::usage::sum_reported(candidates, self.usage.reasoning_tokens);
+            self.usage.output_tokens = broca_protocol::usage::sum_reported(
+                self.visible_output,
+                self.usage.reasoning_tokens,
+            );
         }
         if let Some(evidence) = &self.response_evidence {
             let mut evidence = evidence.lock().unwrap();

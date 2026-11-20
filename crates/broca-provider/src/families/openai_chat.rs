@@ -741,6 +741,9 @@ pub struct OpenAiChatNormalizer {
     saw_refusal: bool,
     tool_calls: Vec<ToolCallBuf>,
     usage: Usage,
+    /// The last `completion_tokens` a reasoning-separate stream reported, kept for a later
+    /// usage object that carries only the reasoning count.
+    visible_output: Option<u64>,
     usage_policy: UsagePolicy,
     finish_reason: Option<FinishReason>,
     /// The provider's `finish_reason`, verbatim, for naming an output-ceiling cut.
@@ -771,6 +774,7 @@ impl OpenAiChatNormalizer {
             saw_refusal: false,
             tool_calls: Vec::new(),
             usage: Usage::default(),
+            visible_output: None,
             usage_policy,
             finish_reason: None,
             raw_finish_reason: None,
@@ -1118,7 +1122,14 @@ impl OpenAiChatNormalizer {
         // they name the same counter, so summing them would report one write twice. A response
         // carrying both is a gateway translating between spellings, not a provider counting two
         // separate kinds of writes.
-        let written = at("cache_write_tokens").or_else(|| at("cache_creation_input_tokens"));
+        //
+        // A later usage object that leaves the write out (a trailing usage-only chunk) keeps
+        // the write an earlier object reported for this completion, and takes it out of fresh
+        // input again: the counters are cumulative, so the write didn't go away, and counting it
+        // as fresh too would report more input than the prompt held.
+        let written = at("cache_write_tokens")
+            .or_else(|| at("cache_creation_input_tokens"))
+            .or(self.usage.cache_write_tokens);
         match written {
             Some(written) => merge_inclusive_input_tokens_with_writes(
                 &mut self.usage,
@@ -1143,9 +1154,12 @@ impl OpenAiChatNormalizer {
                 // `completion_tokens = 1` beside `reasoning_tokens = 21`. Canonical reasoning
                 // is a subset of output, so xAI's sibling counts must be added; otherwise
                 // reasoning exceeds output immediately.
+                if let Some(completion) = completion {
+                    self.visible_output = Some(completion);
+                }
                 if completion.is_some() || reasoning.is_some() {
                     self.usage.output_tokens = broca_protocol::usage::sum_reported(
-                        completion,
+                        self.visible_output,
                         self.usage.reasoning_tokens,
                     );
                 }

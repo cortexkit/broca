@@ -130,10 +130,15 @@ mod cache_runtime;
 mod content_deadline;
 mod tool_name_restore;
 use tool_name_restore::ToolNameRestoringNormalizer;
+#[path = "transport/completion.rs"]
+mod completion;
 #[path = "transport/content_gaps.rs"]
 mod content_gaps;
 #[path = "transport/retry_wait.rs"]
 mod retry_wait;
+use completion::{
+    is_step_completion_event, step_closed, tool_args_cut, validate_attempt_completion,
+};
 use content_deadline::content_timeout_error;
 pub(crate) use content_deadline::STREAM_CONTENT_TIMEOUT;
 use content_gaps::{ContentGaps, SseObservationGuard};
@@ -4888,14 +4893,20 @@ where
     loop {
         let next = tokio::select! {
             biased;
-            _ = &mut idle => return Err(AttemptFailure::transport(
-                stream_timeout_error(if split_deadlines {
-                    "waiting for any complete SSE record"
-                } else {
-                    "waiting for a complete event"
-                }),
-                AttemptOutcome::IdleTimeout,
-            )),
+            _ = &mut idle => {
+                // A body left open after the step's last record has nothing more to give.
+                if step_closed(normalizer.last_event_type(), &completion) {
+                    break;
+                }
+                return Err(AttemptFailure::transport(
+                    stream_timeout_error(if split_deadlines {
+                        "waiting for any complete SSE record"
+                    } else {
+                        "waiting for a complete event"
+                    }),
+                    AttemptOutcome::IdleTimeout,
+                ));
+            }
             _ = &mut content, if split_deadlines => return Err(AttemptFailure::transport(
                 content_timeout_error(content_limit),
                 AttemptOutcome::ContentTimeout,
@@ -4903,6 +4914,11 @@ where
             next = stream.next() => next,
         };
         let Some(chunk) = next else { break };
+        // The step's last record already arrived (a proxy reset the body before its clean end,
+        // say): nothing was lost, and asking the model again would bill a second answer.
+        if chunk.is_err() && step_closed(normalizer.last_event_type(), &completion) {
+            break;
+        }
         let bytes = chunk.map_err(|e| {
             let failure = AttemptFailure::transport(
                 transport_error(&format!("stream chunk: {e}")),
@@ -5072,58 +5088,6 @@ async fn record_attempt_events(
         }
     }
     Ok(true)
-}
-
-fn validate_attempt_completion(
-    completion: Vec<NormalizedEvent>,
-) -> Result<Vec<NormalizedEvent>, AttemptFailure> {
-    let has_message = completion.iter().any(|event| {
-        matches!(
-            event,
-            NormalizedEvent::Control(ProviderControl::AssistantMessage { .. })
-        )
-    });
-    let has_finished = completion.iter().any(|event| {
-        matches!(
-            event,
-            NormalizedEvent::Control(ProviderControl::Finished { .. })
-        )
-    });
-    if has_message && has_finished {
-        return Ok(completion);
-    }
-
-    let missing = match (has_message, has_finished) {
-        (false, false) => "an assembled assistant message and Finished control",
-        (false, true) => "an assembled assistant message",
-        (true, false) => "a Finished control",
-        (true, true) => unreachable!(),
-    };
-    Err(AttemptFailure::transport(
-        transport_error(&format!("provider stream ended without {missing}")),
-        AttemptOutcome::EofBeforeCompletion,
-    ))
-}
-
-fn is_step_completion_event(event: &NormalizedEvent) -> bool {
-    matches!(
-        event,
-        NormalizedEvent::Control(
-            ProviderControl::AssistantMessage { .. }
-                | ProviderControl::ToolArgsTrailingGarbage { .. }
-                | ProviderControl::StepFinished { .. }
-                | ProviderControl::Finished { .. }
-        )
-    )
-}
-
-fn tool_args_cut(events: &[NormalizedEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { .. })
-        )
-    })
 }
 
 fn stream_timeout_error(activity: &str) -> ProviderError {
@@ -14733,6 +14697,10 @@ mod chunk_error_tests;
 #[cfg(test)]
 #[path = "transport_tool_args_tests.rs"]
 mod tool_args_tests;
+
+#[cfg(test)]
+#[path = "transport_closed_step_tests.rs"]
+mod closed_step_tests;
 
 #[cfg(all(test, windows))]
 mod windows_acl_tests {

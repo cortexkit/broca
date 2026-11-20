@@ -2009,6 +2009,9 @@ fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
             | "bio_policy"
             | "misalignment_policy_violation",
         ) => ErrorClass::Permanent,
+        // A credential the backend rejects won't be accepted on a re-send; the caller needs to
+        // sign in again or replace the key.
+        Some("invalid_api_key" | "authentication_error") => ErrorClass::Auth,
         // The Responses backend uses unknown codes for transient failures. Model requests
         // have no side effects, so only codes known to mean the request cannot succeed as
         // sent are permanent. Keep exhausted account allowances permanent as well.

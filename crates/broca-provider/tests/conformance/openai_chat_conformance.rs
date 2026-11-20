@@ -991,3 +991,95 @@ fn openai_chat_done_allows_eof_without_finish_reason() {
     assert_eq!(assembled_text(&events), Some("complete"));
     assert_eq!(completion_reason(&events), Some(FinishReason::Other));
 }
+
+/// A record a gateway leaves after `[DONE]`, in the same read or a later one, is no part of the
+/// reply.
+#[test]
+fn openai_chat_ignores_records_after_done() {
+    let delta = |text: &str| {
+        format!(
+            "data: {}\n\n",
+            json!({"id": "c", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]})
+        )
+    };
+    for split in [false, true] {
+        let frozen = openai_chat_frozen_config("gpt-4o");
+        let mut normalizer = OpenAiChat.normalizer(&frozen, StepId(1));
+        let first = format!("{}data: [DONE]\n\n", delta("first"));
+        if split {
+            normalizer.push(first.as_bytes()).unwrap();
+            normalizer.push(delta("second").as_bytes()).unwrap();
+        } else {
+            normalizer
+                .push(format!("{first}{}", delta("second")).as_bytes())
+                .unwrap();
+        }
+        let events = normalizer.finish().expect("[DONE] is terminal");
+        assert_eq!(
+            assembled_text(&events),
+            Some("first"),
+            "split reads: {split}"
+        );
+    }
+}
+
+/// The usage objects of one completion, in order, as the step reports them.
+fn chat_usage_of(objects: &[serde_json::Value], usage_policy: UsagePolicy) -> Usage {
+    let mut recorded = format!(
+        "data: {}\n\n",
+        json!({"id": "chatcmpl-usage", "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]})
+    );
+    for usage in objects {
+        recorded.push_str(&format!(
+            "data: {}\n\n",
+            json!({"id": "chatcmpl-usage", "choices": [], "usage": usage})
+        ));
+    }
+    recorded.push_str("data: [DONE]\n\n");
+    let mut frozen = openai_chat_frozen_config("gpt-4o");
+    frozen.usage = usage_policy;
+    let mut normalizer = OpenAiChat.normalizer(&frozen, StepId(1));
+    let mut events = normalizer.push(recorded.as_bytes()).unwrap();
+    events.extend(normalizer.finish().unwrap());
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::StepFinished { usage, .. }) => Some(usage),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A trailing usage object that leaves the cache write out keeps the earlier write split out of
+/// fresh input: the classes still add up to the prompt, never more.
+#[test]
+fn openai_chat_usage_keeps_an_earlier_write_split_out() {
+    let usage = chat_usage_of(
+        &[
+            json!({"prompt_tokens": 100, "completion_tokens": 1, "cache_write_tokens": 30}),
+            json!({"prompt_tokens": 100, "completion_tokens": 1}),
+        ],
+        UsagePolicy::OpenAiUsage,
+    );
+    assert_eq!(usage.cache_write_tokens, Some(30));
+    assert_eq!(usage.input_tokens, Some(70));
+}
+
+/// xAI reports reasoning beside completion tokens; a later object with only the reasoning
+/// count keeps the completion count an earlier one reported, in either order.
+#[test]
+fn reasoning_separate_usage_keeps_each_counter_across_partial_reports() {
+    for objects in [
+        [
+            json!({"prompt_tokens": 10, "completion_tokens": 100}),
+            json!({"prompt_tokens": 10, "completion_tokens_details": {"reasoning_tokens": 40}}),
+        ],
+        [
+            json!({"prompt_tokens": 10, "completion_tokens_details": {"reasoning_tokens": 40}}),
+            json!({"prompt_tokens": 10, "completion_tokens": 100}),
+        ],
+    ] {
+        let usage = chat_usage_of(&objects, UsagePolicy::OpenAiUsageReasoningSeparate);
+        assert_eq!(usage.output_tokens, Some(140), "{objects:?}");
+    }
+}

@@ -18,7 +18,13 @@ pub const CREDENTIAL_HOST_NOT_ALLOWED: &str = "credential_host_not_allowed";
 /// The hosts a credential's vault record lists, as exact lowercase host names (no scheme, port,
 /// path or wildcard). Empty when the record lists none.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CredentialHosts(Arc<[String]>);
+pub struct CredentialHosts {
+    hosts: Arc<[String]>,
+    /// Tests only: lets a credential go over plain `http` to a listed host, for a test whose
+    /// stand-in server answers under a production host name and can't speak TLS.
+    #[cfg(test)]
+    plain_http: bool,
+}
 
 /// The local machine only: what a provider built without a vault record may reach, such as a
 /// stand-in server in a test. Every credential read from the vault replaces it with its
@@ -26,24 +32,47 @@ pub struct CredentialHosts(Arc<[String]>);
 /// its record lists that host too.
 impl Default for CredentialHosts {
     fn default() -> Self {
-        Self(
-            ["127.0.0.1", "localhost", "[::1]"]
+        Self {
+            hosts: ["127.0.0.1", "localhost", "[::1]"]
                 .map(str::to_owned)
                 .into(),
-        )
+            #[cfg(test)]
+            plain_http: false,
+        }
     }
 }
 
 impl CredentialHosts {
     /// The hosts a record lists, lowercased. `None` (the record has no host fact) admits nothing.
     pub fn from_record(hosts: Option<&[String]>) -> Self {
-        Self(
-            hosts
+        Self {
+            hosts: hosts
                 .unwrap_or_default()
                 .iter()
                 .map(|host| host.to_ascii_lowercase())
                 .collect(),
-        )
+            #[cfg(test)]
+            plain_http: false,
+        }
+    }
+
+    /// These hosts, reachable over plain `http` too. Tests only.
+    #[cfg(test)]
+    pub(crate) fn over_plain_http(self) -> Self {
+        Self {
+            plain_http: true,
+            ..self
+        }
+    }
+
+    /// Whether a request over plain `http` may carry the credential to `host`: only when it
+    /// goes to the local machine.
+    fn plain_http_allowed(&self, host: &str) -> bool {
+        #[cfg(test)]
+        if self.plain_http {
+            return true;
+        }
+        Self::default().hosts.iter().any(|local| local == host)
     }
 
     /// Refuses `url` unless `auth` carries no credential or the credential's record lists the
@@ -57,20 +86,31 @@ impl CredentialHosts {
     }
 
     /// Refuses `url` unless the credential's record lists its host exactly, for a caller that
-    /// is about to attach the credential to a request for `url`.
+    /// is about to attach the credential to a request for `url`. The request must also be
+    /// encrypted (`https` or `wss`) unless it goes to the local machine: a listed host reached
+    /// over plain `http` would send the credential and the prompt in the clear.
     pub fn check_url(&self, url: &str) -> Result<(), Box<ProviderError>> {
-        let host = reqwest::Url::parse(url)
-            .ok()
+        let parsed = reqwest::Url::parse(url).ok();
+        let host = parsed
+            .as_ref()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+        let encrypted = parsed
+            .as_ref()
+            .is_some_and(|url| matches!(url.scheme(), "https" | "wss"));
         if let Some(host) = &host {
-            if self.0.iter().any(|listed| listed == host) {
+            if !encrypted && !self.plain_http_allowed(host) {
+                return Err(Box::new(host_refused(format!(
+                    "the request to '{host}' isn't encrypted (https), so its credential was not sent"
+                ))));
+            }
+            if self.hosts.iter().any(|listed| listed == host) {
                 return Ok(());
             }
             if rig_allows(host) {
                 return Ok(());
             }
         }
-        let message = match (&host, self.0.is_empty()) {
+        let message = match (&host, self.hosts.is_empty()) {
             (None, _) => "the request URL names no host; its credential was not sent".to_owned(),
             (Some(host), true) => format!(
                 "the credential's vault record lists no hosts, so it was not sent to '{host}'"
@@ -112,7 +152,7 @@ fn host_refused(message: String) -> ProviderError {
 fn rig_allows(host: &str) -> bool {
     std::hint::black_box("BROCA_TEST_LOOPBACK_CREDENTIALS_V1");
     CredentialHosts::default()
-        .0
+        .hosts
         .iter()
         .any(|local| local == host)
 }
@@ -190,6 +230,27 @@ mod tests {
         assert!(local
             .check(&key(), "https://api.anthropic.com/v1/messages")
             .is_err());
+    }
+
+    #[test]
+    fn a_listed_host_over_plain_http_is_refused_unless_it_is_the_local_machine() {
+        let hosts = listed(&["api.anthropic.com", "localhost"]);
+        let error = hosts
+            .check(&key(), "http://api.anthropic.com/v1/messages")
+            .unwrap_err();
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some(CREDENTIAL_HOST_NOT_ALLOWED)
+        );
+        assert!(
+            error.message.contains("isn't encrypted"),
+            "{}",
+            error.message
+        );
+        assert!(hosts
+            .check(&key(), "ws://api.anthropic.com/socket")
+            .is_err());
+        assert!(hosts.check(&key(), "http://localhost:4000/v1").is_ok());
     }
 
     #[test]

@@ -297,9 +297,11 @@ impl SseDecoder {
                         &mut self.event_type_counts,
                         safe_event_type_name(event_type),
                     );
+                    // `[DONE]` ends the stream: a record after it (a gateway's leftover) is no
+                    // part of the reply, in this read or a later one.
                     if payload == "[DONE]" {
                         self.saw_done = true;
-                    } else {
+                    } else if !self.saw_done {
                         payloads.push(payload);
                     }
                 } else if record_has_comment(record) {

@@ -296,6 +296,20 @@ fn response_failed_preserves_transient_nested_error() {
     assert_eq!(error.message, "generation backend failed");
 }
 
+/// A stream that says its credential was rejected is a sign-in problem, not something a re-send
+/// with the same credential can fix.
+#[test]
+fn response_failed_with_a_rejected_key_needs_sign_in() {
+    let recorded = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_key\"}}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_key\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_api_key\",\"message\":\"Incorrect API key provided.\"}},\"sequence_number\":1}\n\n",
+    );
+    let events = normalize_responses(recorded, 11);
+    let error = response_error(&events);
+    assert_eq!(error.class, ErrorClass::Auth);
+    assert_eq!(error.provider_code.as_deref(), Some("invalid_api_key"));
+}
+
 #[test]
 fn nested_error_event_preserves_transient_message() {
     let events = normalize_responses(
