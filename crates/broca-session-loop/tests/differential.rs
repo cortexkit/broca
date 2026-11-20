@@ -2596,10 +2596,20 @@ impl Source {
 
     /// How many model steps the first `kept` records hold an answer for, so a resume is served
     /// only the steps after them.
+    /// How many scripted provider steps the first `kept` records answer: each answered step,
+    /// each step the provider refused, which the run then sent to its fallback, and each step whose
+    /// failure paused the run for a sign-in or an account limit.
     fn answered(&self, kept: usize) -> usize {
         self.records[..kept]
             .iter()
-            .filter(|record| matches!(record, Record::Assistant(_)))
+            .filter(|record| match record {
+                Record::Assistant(_) | Record::StepRefused(_) => true,
+                Record::Pause(pause) => matches!(
+                    pause.reason,
+                    PauseReason::AuthRequired | PauseReason::AccountLimit
+                ),
+                _ => false,
+            })
             .count()
     }
 }
@@ -2910,6 +2920,14 @@ async fn new_source(
             snapshots: Vec::new(),
             parts: parts.parts,
         };
+    }
+    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+        eprintln!(
+            "loop result: {:?}",
+            result
+                .as_ref()
+                .map(|finished| (finished.reason, finished.paused))
+        );
     }
     result.expect("the new loop runs");
     let records = writer.records.clone();
@@ -3518,6 +3536,14 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
         .await;
     let records = source.records.len();
     assert!(records > 2, "the scenario wrote a log to cut");
+    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+        for (index, record) in source.outcome.records.iter().enumerate() {
+            eprintln!("source {index}: {record}");
+        }
+        for call in &source.outcome.calls {
+            eprintln!("source call  {call}");
+        }
+    }
     for cut in source
         .batch_ends
         .iter()
@@ -3526,13 +3552,18 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
     {
         // The provider serves the steps the cut log has no answer for yet.
         let steps = scenario.steps[source.answered(cut)..].to_vec();
-        let new = Box::pin(new_from(&scenario, Some(source.cut(cut)), steps)).await;
+        let resumed = Box::pin(new_source(&scenario, Some(source.cut(cut)), steps)).await;
         let context = format!("cut after record {cut} of {records}");
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
-            for (index, record) in new.records.iter().enumerate() {
+            for (index, record) in resumed.outcome.records.iter().enumerate() {
                 eprintln!("{context} new   {index}: {record}");
             }
+            for call in &resumed.outcome.calls {
+                eprintln!("{context} call  {call}");
+            }
         }
+        resume_invariants(&context, &source, cut, &resumed, Requests::Same);
+        let new = resumed.outcome;
         pin_outcome(
             &format!("{context}: "),
             &new.requests,
@@ -3541,6 +3572,154 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
             Clone::clone,
         );
     }
+}
+
+/// What a resume from a crash cut must do whatever its pins say, checked from the records and
+/// the tool plane rather than from the loop's own reading of the log:
+///
+/// - It dispatches no call the cut log holds a dispatch intent for: that call may already have
+///   run, so running it again could repeat its side effect.
+/// - No call gets a second result, and no run a second end.
+/// - A resume that leaves a call's outcome unknown sends no further request.
+/// - With [`Requests::Same`], every request a resume sends is the one the uninterrupted run sent
+///   for that step, so the provider sees the same conversation and its prompt cache still holds.
+///
+/// `source` is the uninterrupted run, `cut` how many of its records the crash kept, and
+/// `resumed` the session after the resume, its records starting with the cut ones.
+fn resume_invariants(
+    context: &str,
+    source: &Source,
+    cut: usize,
+    resumed: &Source,
+    requests: Requests,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let kept = &source.records[..cut];
+    assert_eq!(
+        &resumed.records[..cut],
+        kept,
+        "{context}: the resume starts from the cut log"
+    );
+    let added = &resumed.records[cut..];
+    let intended: BTreeSet<&str> = kept
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolIntent(intent) => Some(intent.tool_call_id.0.as_str()),
+            _ => None,
+        })
+        .collect();
+    // The scenario's tool plane (`Spy`) logs each dispatch as `dispatch… <call id> …`.
+    for call in &resumed.outcome.calls {
+        let mut words = call.split(' ');
+        if words
+            .next()
+            .is_some_and(|word| word.starts_with("dispatch"))
+        {
+            let id = words.next().unwrap_or_default();
+            assert!(
+                !intended.contains(id),
+                "{context}: the resume dispatched {id} again, though the cut log shows it may \
+                 have run: {call}"
+            );
+        }
+    }
+    let mut results: BTreeMap<(Option<&str>, &str), usize> = BTreeMap::new();
+    let mut ends: BTreeMap<&str, usize> = BTreeMap::new();
+    for record in &resumed.records {
+        match record {
+            Record::ToolReply(reply) => {
+                *results
+                    .entry((
+                        reply.batch_id.as_deref(),
+                        reply.result.tool_call_id.0.as_str(),
+                    ))
+                    .or_default() += 1;
+            }
+            Record::RunEnd(end) => *ends.entry(end.run_id.as_str()).or_default() += 1,
+            _ => {}
+        }
+    }
+    for ((batch, call), count) in results {
+        assert_eq!(
+            count, 1,
+            "{context}: call {call} of batch {batch:?} has {count} results"
+        );
+    }
+    for (run, count) in ends {
+        assert_eq!(count, 1, "{context}: run {run} ended {count} times");
+    }
+    if let Some(unknown) = added.iter().position(|record| {
+        matches!(record, Record::ToolOutcome(outcome)
+            if outcome.outcome == broca_session_store::record::CallOutcome::Unknown)
+    }) {
+        assert!(
+            !added[unknown..]
+                .iter()
+                .any(|record| matches!(record, Record::Attempt(_))),
+            "{context}: the resume asked the model again after a call's outcome became unknown"
+        );
+    }
+    let requests = RESUME_REQUESTS
+        .try_with(|requests| *requests)
+        .unwrap_or(requests);
+    if requests == Requests::MayDiffer {
+        return;
+    }
+    let sent = &resumed.outcome.requests;
+    let Some(first) = sent.first() else {
+        return;
+    };
+    // The uninterrupted run sent the steps the cut log answered first, so the resume's requests
+    // start at or after those. A refused or retried attempt leaves no answer, so where exactly
+    // is found by the first request itself.
+    let answered = source.answered(cut);
+    let original = &source.outcome.requests;
+    let start = (answered..original.len())
+        .find(|&index| original[index] == *first)
+        .unwrap_or_else(|| {
+            panic!(
+                "{context}: the resume's first request is none the uninterrupted run sent after \
+                 its first {answered} answered step(s)"
+            )
+        });
+    assert!(
+        start + sent.len() <= original.len(),
+        "{context}: the resume sent {} request(s) from request {start}; the uninterrupted run \
+         sent {}",
+        sent.len(),
+        original.len()
+    );
+    for (index, resent) in sent.iter().enumerate() {
+        if *resent != original[start + index] && std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+            eprintln!(
+                "{context}: resent request\n{}\noriginal request\n{}",
+                serde_json::to_string_pretty(resent).unwrap(),
+                serde_json::to_string_pretty(&original[start + index]).unwrap()
+            );
+        }
+        assert!(
+            *resent == original[start + index],
+            "{context}: request {} differs from the uninterrupted run's",
+            start + index
+        );
+    }
+}
+
+/// Whether a resume's requests must match the uninterrupted run's (see [`resume_invariants`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requests {
+    /// The resume sees everything the uninterrupted run saw, so it sends the same requests.
+    Same,
+    /// The uninterrupted run was given something the resume isn't: a steer or a cancel that
+    /// wasn't durable when the crash came, or a compaction view the restarted compaction
+    /// provider builds afresh.
+    MayDiffer,
+}
+
+tokio::task_local! {
+    /// Set to [`Requests::MayDiffer`] around a crash-cut test whose uninterrupted run is given
+    /// something its resumes aren't (see [`Requests`]).
+    static RESUME_REQUESTS: Requests;
 }
 
 /// At every cut of the new loop's log of `scenario` where the run was still running (no pause,
@@ -3741,6 +3920,118 @@ async fn every_cut_of_a_step_limit_resumes_alike() {
         tools: vec![tool("read", ExecutionMode::Parallel)],
         manifest: None,
         stop_when: vec![StopCondition::StepCount { n: 1 }],
+        steps: vec![answer(
+            "a1",
+            vec![call("c1", "read", json!({"path": "a"}))],
+            FinishReason::ToolCalls,
+        )],
+    })
+    .await;
+}
+
+/// A run paused for a sign-in after its tool step: a resume from any cut reaches the pause or,
+/// past it, the run's end, and never sends the tool call again.
+#[tokio::test]
+async fn every_cut_of_a_sign_in_pause_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            auth_failure(),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+/// A run paused on its account's limit after its tool step, the limit resetting before the
+/// session's cache expires: a resume from any cut reaches the pause or the run's end, and never
+/// sends the tool call again.
+#[tokio::test]
+async fn every_cut_of_an_account_limit_pause_resumes_alike() {
+    compare_routed(
+        AccountScript {
+            selection: routed("acct-1"),
+            wait: broca_core::SameAccountWait::default(),
+            wait_for_reset: true,
+        },
+        compare_every_cut(tool_then_limited(account_limited())),
+    )
+    .await;
+}
+
+/// A run the runner stops between its answer and its tool batch: the calls close as not run and
+/// the run ends interrupted, both in one append, so a resume from any cut either runs the step
+/// on or finds the run ended.
+#[tokio::test]
+async fn every_cut_of_a_stop_before_a_batch_resumes_alike() {
+    compare_actions_cut(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        vec![(1, Action::Stop)],
+        Cuts {
+            on_restart: Some(OnRestart::Resume),
+            ..Cuts::default()
+        },
+    )
+    .await;
+}
+
+/// A run the runner stops at a step boundary, under a policy that resumes it after the restart,
+/// with a message steered in for its next step: a resume from any cut reaches the pause or, past
+/// it, runs the steered step.
+#[tokio::test]
+async fn every_cut_of_a_restart_pause_resumes_alike() {
+    compare_actions_cut(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
+        },
+        vec![
+            (1, Action::Steer(vec![user("one more")])),
+            (1, Action::Stop),
+        ],
+        Cuts {
+            on_restart: Some(OnRestart::Resume),
+            ..Cuts::default()
+        },
+    )
+    .await;
+}
+
+/// A run that stops at a step calling a named tool: a crash after that step's answer resumes to
+/// the same stop, closing the call as not run instead of sending it.
+#[tokio::test]
+async fn every_cut_of_a_tool_call_stop_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: vec![StopCondition::HasToolCall {
+            name: Some("read".into()),
+        }],
         steps: vec![answer(
             "a1",
             vec![call("c1", "read", json!({"path": "a"}))],
@@ -4665,6 +4956,8 @@ struct Cuts {
     /// The route the resumes judge and render turn-scoped system messages by, when it isn't the
     /// one the run delivered under, as after a switch to another model.
     resume_route: Option<Option<broca_provider::wire::FrozenRenderConfig>>,
+    /// What the run does with itself when the runner stops it: pause for the restart, or end.
+    on_restart: Option<OnRestart>,
 }
 
 async fn compare_actions_cut(scenario: Scenario, steers: Vec<(usize, Action)>, cuts: Cuts) {
@@ -4689,11 +4982,16 @@ async fn compare_actions_every_cut_once(
     steers: Vec<(usize, Action)>,
     cuts: Cuts,
 ) {
-    let source = Box::pin(new_with_actions(&scenario, steers, None, false))
+    let source = Box::pin(new_with_actions(&scenario, steers, cuts.on_restart, false))
         .await
         .source;
     let records = source.records.len();
     assert!(records > 2, "the scenario wrote a log to cut");
+    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+        for (index, record) in source.outcome.records.iter().enumerate() {
+            eprintln!("source {index}: {record}");
+        }
+    }
     let first = match cuts.after {
         Some(kind) => {
             source
@@ -4714,13 +5012,16 @@ async fn compare_actions_every_cut_once(
     {
         // The provider serves the steps the cut log has no answer for yet.
         let steps = scenario.steps[source.answered(cut)..].to_vec();
-        let new = TURN_SYSTEM
+        let resumed = TURN_SYSTEM
             .scope(
                 route.clone(),
-                Box::pin(new_from(&scenario, Some(source.cut(cut)), steps)),
+                Box::pin(new_source(&scenario, Some(source.cut(cut)), steps)),
             )
             .await;
         let context = format!("cut after record {cut} of {records}");
+        // The actions aren't replayed into the resume, so its requests may lack what they added.
+        resume_invariants(&context, &source, cut, &resumed, Requests::MayDiffer);
+        let new = resumed.outcome;
         if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
             for (index, record) in new.records.iter().enumerate() {
                 eprintln!("{context} new   {index}: {record}");
@@ -5670,6 +5971,7 @@ async fn a_stored_system_entry_after_a_switch_to_a_route_without_it() {
                 Cuts {
                     after: Some("Delivery"),
                     resume_route: Some(Some(anthropic_route(false))),
+                    ..Cuts::default()
                 },
             ),
         )
@@ -6609,7 +6911,14 @@ async fn a_cancel_before_the_batch_refuses_it() {
 
 #[tokio::test]
 async fn every_cut_of_a_cancel_before_the_batch_resumes_alike() {
-    compare_every_cut(cancel_before_batch_scenario()).await;
+    // The cancel is the hook's, made in memory during the step; a resume from a cut before the
+    // run recorded it never sees it, and carries on.
+    RESUME_REQUESTS
+        .scope(
+            Requests::MayDiffer,
+            compare_every_cut(cancel_before_batch_scenario()),
+        )
+        .await;
 }
 
 /// The same refused batch, with the model repeating a call id.
@@ -6853,21 +7162,28 @@ async fn an_over_limit_step_rides_and_renders_from_the_view_it_gets() {
 
 #[tokio::test]
 async fn every_cut_of_an_over_limit_ride_resumes_alike() {
-    compare_compacted_every_cut(
-        compacted_scenario(vec![
-            answer(
-                "a1",
-                vec![call("c1", "big", json!({}))],
-                FinishReason::ToolCalls,
+    // The stand-in compaction provider reads the session's entries when a resume starts, not
+    // after its Setup as Magic Context does. A resume that writes tool results before its Setup
+    // leaves the stand-in unable to edit them, so its ride builds a different view.
+    RESUME_REQUESTS
+        .scope(
+            Requests::MayDiffer,
+            compare_compacted_every_cut(
+                compacted_scenario(vec![
+                    answer(
+                        "a1",
+                        vec![call("c1", "big", json!({}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    text_step("a2", "done"),
+                ]),
+                CompactionScript {
+                    context_limit: 1_200,
+                    rides: vec![Ride::Trim(2)],
+                },
             ),
-            text_step("a2", "done"),
-        ]),
-        CompactionScript {
-            context_limit: 1_200,
-            rides: vec![Ride::Trim(2)],
-        },
-    )
-    .await;
+        )
+        .await;
 }
 
 /// The over-limit ride with every send fact set: the compaction provider's Setup names the run's
@@ -7342,7 +7658,15 @@ async fn a_run_after_a_cut_through_an_earlier_run_continues_alike() {
 
 #[tokio::test]
 async fn every_cut_of_a_run_split_by_a_compaction_cut_resumes_alike() {
-    compare_compacted_every_cut(repetition_across_a_cut_scenario(), repetition_cut()).await;
+    // The stand-in compaction provider reads the session's entries when a resume starts, not
+    // after its Setup as Magic Context does. A resume that writes tool results before its Setup
+    // leaves the stand-in unable to edit them, so its ride builds a different view.
+    RESUME_REQUESTS
+        .scope(
+            Requests::MayDiffer,
+            compare_compacted_every_cut(repetition_across_a_cut_scenario(), repetition_cut()),
+        )
+        .await;
 }
 
 /// A view lands in the first run, then the new loop seals its ledger before the second run, which

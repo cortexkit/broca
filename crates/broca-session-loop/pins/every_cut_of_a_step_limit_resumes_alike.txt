@@ -19,20 +19,20 @@ sha256:d0093648cc301b3832d614c96db7c41a76489a17996f8f3331d570de99bca4e3 (3307 by
 == cut after record 5 of 15: tool calls
 []
 == cut after record 8 of 15: request count
-1
-== cut after record 8 of 15: request 0
-sha256:ed6f77d4987143d49d7930fc197acd97188524f0701b4c7328cdb81bbe92bafb (5172 bytes)
+0
 == cut after record 8 of 15: record count
-10
+8
 == cut after record 8 of 15: records
-sha256:b13efb4aaa3a5eeaed0e090076cfd92287de9cbf2c41922ee9f21c134f74b4f6 (2375 bytes)
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"BatchStart":{"batch_id":"r1-b1","kind":"BatchStart","mid":"mid#2","planned":["c1"],"run_id":"r1","step_id":1}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: max steps reached before dispatch"},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":"<normalized>","detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"MaxSteps","reason":null,"result_digest":"a637833e6a891daa4651c8e2cf39f1fa4aa799738199cd21f3eef73f69b3fd4b","run_id":"r1","tool_call_id":"c1","yielded_by":null}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Cancelled"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 8 of 15: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
+[]
 == cut after record 4 of 15: request count
 1
 == cut after record 4 of 15: request 0
@@ -54,20 +54,20 @@ sha256:d0093648cc301b3832d614c96db7c41a76489a17996f8f3331d570de99bca4e3 (3307 by
 == cut after record 5 of 15: tool calls
 []
 == cut after record 8 of 15: request count
-1
-== cut after record 8 of 15: request 0
-sha256:ed6f77d4987143d49d7930fc197acd97188524f0701b4c7328cdb81bbe92bafb (5172 bytes)
+0
 == cut after record 8 of 15: record count
-10
+8
 == cut after record 8 of 15: records
-sha256:b13efb4aaa3a5eeaed0e090076cfd92287de9cbf2c41922ee9f21c134f74b4f6 (2375 bytes)
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"BatchStart":{"batch_id":"r1-b1","kind":"BatchStart","mid":"mid#2","planned":["c1"],"run_id":"r1","step_id":1}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: max steps reached before dispatch"},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":"<normalized>","detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"MaxSteps","reason":null,"result_digest":"a637833e6a891daa4651c8e2cf39f1fa4aa799738199cd21f3eef73f69b3fd4b","run_id":"r1","tool_call_id":"c1","yielded_by":null}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":0,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Cancelled"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 8 of 15: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
+[]
 == cut after record 4 of 15: request count
 1
 == cut after record 4 of 15: request 0
@@ -89,20 +89,20 @@ sha256:80300338e9a7d922d58d06606bb7d3d9461ebc62d1fe7572dc36a96873bed966 (3418 by
 == cut after record 5 of 15: tool calls
 []
 == cut after record 8 of 15: request count
-1
-== cut after record 8 of 15: request 0
-sha256:e243c7e16d842cd66501966a920ee22695bbc17dc6b97b18c83a78149f10e9d4 (5174 bytes)
+0
 == cut after record 8 of 15: record count
-10
+8
 == cut after record 8 of 15: records
-sha256:aae498b99dd94465b55fd13c5ff86b46ef7bcc43f987368520d8fd8ab186758c (2375 bytes)
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"BatchStart":{"batch_id":"r1-b1","kind":"BatchStart","mid":"mid#2","planned":["c1"],"run_id":"r1","step_id":1}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: max steps reached before dispatch"},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":"<normalized>","detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"MaxSteps","reason":null,"result_digest":"a637833e6a891daa4651c8e2cf39f1fa4aa799738199cd21f3eef73f69b3fd4b","run_id":"r1","tool_call_id":"c1","yielded_by":null}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Cancelled"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 8 of 15: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
+[]
 == cut after record 4 of 15: request count
 1
 == cut after record 4 of 15: request 0
@@ -124,17 +124,17 @@ sha256:80300338e9a7d922d58d06606bb7d3d9461ebc62d1fe7572dc36a96873bed966 (3418 by
 == cut after record 5 of 15: tool calls
 []
 == cut after record 8 of 15: request count
-1
-== cut after record 8 of 15: request 0
-sha256:e243c7e16d842cd66501966a920ee22695bbc17dc6b97b18c83a78149f10e9d4 (5174 bytes)
+0
 == cut after record 8 of 15: record count
-10
+8
 == cut after record 8 of 15: records
-sha256:aae498b99dd94465b55fd13c5ff86b46ef7bcc43f987368520d8fd8ab186758c (2375 bytes)
+{"Resumed":{"indeterminate":[],"kind":"Resumed","messages":1,"model_steps":1,"redone":[],"resumed_from_seq":"<normalized>","run_id":"r1","tool_results":0}}
+{"BatchStart":{"batch_id":"r1-b1","kind":"BatchStart","mid":"mid#2","planned":["c1"],"run_id":"r1","step_id":1}}
+{"ToolReply":{"batch_id":"r1-b1","finished_at_ms":"<normalized>","kind":"ToolReply","media":[],"result":{"is_error":true,"output":{"kind":"error","message":"tool not run: max steps reached before dispatch"},"tool_call_id":"c1"},"run_id":"r1","tags_v1":null}}
+{"ToolOutcome":{"batch_id":"r1-b1","call_key":"<normalized>","detail":null,"finished_at_ms":"<normalized>","hooks":null,"is_error":true,"kind":"ToolOutcome","outcome":"MaxSteps","reason":null,"result_digest":"a637833e6a891daa4651c8e2cf39f1fa4aa799738199cd21f3eef73f69b3fd4b","run_id":"r1","tool_call_id":"c1","yielded_by":null}}
+{"EntryFacts":{"clean_reply":false,"client_message_id":null,"created_at_ms":null,"delivery_mode":null,"delivery_tool_call_id":null,"generated_under":null,"kind":"EntryFacts","legacy_view_seq":null,"marks":null,"mid":"mid#2","named_speaker":null,"native":true,"no_display_facts":null,"notice":null,"notices":[],"ordinal":3,"reasoning_summaries":[],"render_tags":false,"rich_ui":null,"run_id":"r1","runner_tag_base":0,"send_id":null,"sender":null,"tag_base":2,"usage":null,"written_at_ms":"<normalized>"}}
+{"TurnFacts":{"calls":[{"call_key":"<normalized>","carrier":null,"dispatched_at_ms":null,"dispatched_to":null,"finished_at_ms":null,"schema_pin":null,"tool_call_id":"c1","unanswered":"Cancelled"}],"kind":"TurnFacts","ordinal":2}}
+{"BatchEnd":{"batch_id":"r1-b1","kind":"BatchEnd","run_id":"r1"}}
+{"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"max_steps","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":100,"output_tokens":20}}}
 == cut after record 8 of 15: tool calls
-[
-    "\"batch_started_guarded [\\\"c1\\\"]\"",
-    "\"register [\\\"c1 key#1 approved=false\\\"]\"",
-    "\"dispatch_guarded c1 {\\\"path\\\":\\\"a\\\"} key#1 recorder=true\"",
-    "\"batch_finished\"",
-]
+[]

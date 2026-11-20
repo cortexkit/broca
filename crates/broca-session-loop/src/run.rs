@@ -73,6 +73,8 @@ mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
+mod stops;
+use stops::{hard_stop, stop_before_batch, stopped_batch, stopped_batch_in};
 mod start_config;
 pub use start_config::{
     run_config_members, run_config_of_run, run_config_of_start, run_frozen_facts, ConfigMembers,
@@ -956,7 +958,11 @@ where
     };
     let mut resumed = resumed_record(writer, &resolution);
     // A resume that ends the run instead of redoing anything records nothing to redo.
-    if submit.is_some() || drift.is_some() || cancelling_held {
+    if submit.is_some()
+        || drift.is_some()
+        || cancelling_held
+        || stop_before_batch(writer, &admission.stop_when).is_some()
+    {
         resumed.redone.clear();
     }
     // A held call's provider may already have answered: the batch closes with what it holds,
@@ -1257,7 +1263,6 @@ fn unsent_calls<W: Writer>(writer: &W) -> Option<Vec<ToolCall>> {
     )
 }
 
-/// Every call the open tool turn's assistant message asked for.
 fn planned_calls<W: Writer>(writer: &W) -> Vec<ToolCall> {
     writer
         .conversation()
@@ -2225,6 +2230,9 @@ where
         // its cancel token was made fresh.
         let cancelled_now = seams.cancel.is_cancelled()
             || run_state(writer).cancel == Some(broca_session_store::record::CancelPoint::Now);
+        if let Some(stop) = stop_before_batch(writer, &stop_when) {
+            return hard_stop(writer, seams, &admission.run_id, step_id, &planned, &stop).await;
+        }
         if cancelled_now || seams.stop.is_cancelled() {
             let calls = if started { &unsent } else { &planned };
             return stopped_batch_in(
@@ -5438,164 +5446,6 @@ async fn submitted<W: Writer, P, T>(
     records.push(run_end(writer, run_id, RunFinishReason::Completed, now));
     append_end(writer, run_id, records).await?;
     Ok(finished(writer, RunFinishReason::Completed))
-}
-
-async fn hard_stop<W: Writer, P, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    run_id: &str,
-    step_id: u64,
-    calls: &[ToolCall],
-    stop: &StopCondition,
-) -> Result<Finished, LoopError> {
-    let (outcome, message, reason) = match stop {
-        StopCondition::StepCount { .. } => (
-            CallOutcome::MaxSteps,
-            "tool not run: max steps reached before dispatch",
-            RunFinishReason::MaxSteps,
-        ),
-        _ => (
-            CallOutcome::Interrupted,
-            "tool not run: interrupted before dispatch",
-            RunFinishReason::Completed,
-        ),
-    };
-    let batch_id = format!("{run_id}-b{step_id}");
-    let mut records = vec![Record::BatchStart(BatchStart {
-        run_id: run_id.into(),
-        batch_id: batch_id.clone(),
-        step_id,
-        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-        mid: None,
-        shown_tags: Vec::new(),
-    })];
-    let now = (seams.now_ms)();
-    for call in calls {
-        let result = ToolResult {
-            tool_call_id: call.tool_call_id.clone(),
-            output: ToolOutput::error(message.to_string()),
-            is_error: true,
-        };
-        terminal(&mut records, run_id, &batch_id, result, outcome, now);
-    }
-    records.push(Record::BatchEnd(BatchEnd {
-        run_id: run_id.into(),
-        batch_id,
-    }));
-    // The budget firings the step's calls made due go in the same barrier, after the repaired
-    // batch, as today's hard stop writes them.
-    let end = run_end(writer, run_id, reason, now);
-    let run_id = run_id.to_string();
-    let mut records = Some(records);
-    let mut end = Some(end);
-    writer
-        .append_with(
-            &mut |conversation, operations, first_seq| {
-                let mut batch = records.take().expect("one batch");
-                let placing = closing_places(conversation);
-                let firings =
-                    crate::budget::due(conversation, operations, first_seq, batch.len(), placing);
-                batch.extend(firings);
-                batch.extend(placed_copies(operations, &run_id));
-                batch.extend(end.take());
-                batch
-            },
-            true,
-        )
-        .await?;
-    Ok(finished(writer, reason))
-}
-
-/// The runner asked the run to stop, or the caller cancelled it, before its batch was
-/// dispatched. No call is sent: each gets a result saying so, the tool plane is never told the
-/// batch started, and the run ends cancelled (`cancelled`) or interrupted whatever its restart
-/// policy, as today's loop does. The batch and the run's end are two barriers, as there.
-async fn stopped_batch<W: Writer, P, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    run_id: &str,
-    step_id: u64,
-    calls: &[ToolCall],
-    cancelled: bool,
-) -> Result<Finished, LoopError> {
-    stopped_batch_in(writer, seams, run_id, step_id, calls, cancelled, true).await
-}
-
-/// [`stopped_batch`], also for a batch that already started (`start_batch` false), whose
-/// start is already durable: then only `calls`, the ones never sent, are closed.
-async fn stopped_batch_in<W: Writer, P, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    run_id: &str,
-    step_id: u64,
-    calls: &[ToolCall],
-    cancelled: bool,
-    start_batch: bool,
-) -> Result<Finished, LoopError> {
-    let batch_id = match run_state(writer).open_batch.as_ref() {
-        Some(open) if !start_batch => open.batch_id.clone(),
-        _ => format!("{run_id}-b{step_id}"),
-    };
-    let now = (seams.now_ms)();
-    let mut records = Vec::new();
-    if start_batch {
-        records.push(Record::BatchStart(BatchStart {
-            run_id: run_id.into(),
-            batch_id: batch_id.clone(),
-            step_id,
-            planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-            mid: None,
-            shown_tags: Vec::new(),
-        }));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for call in calls {
-        // A repeated call id still gets today's duplicate error, not "not run".
-        if !seen.insert(call.tool_call_id.clone()) {
-            terminal_with_reason(
-                &mut records,
-                run_id,
-                &batch_id,
-                error_result(&call.tool_call_id, "duplicate tool_call_id from provider"),
-                CallOutcome::Completed,
-                None,
-                Some(now),
-            );
-            continue;
-        }
-        let result = ToolResult {
-            tool_call_id: call.tool_call_id.clone(),
-            output: ToolOutput::error(NOT_DISPATCHED.to_string()),
-            is_error: true,
-        };
-        terminal(
-            &mut records,
-            run_id,
-            &batch_id,
-            result,
-            CallOutcome::Interrupted,
-            now,
-        );
-    }
-    records.push(Record::BatchEnd(BatchEnd {
-        run_id: run_id.into(),
-        batch_id,
-    }));
-    writer.append(&records, true).await?;
-    // A caller's cancel ends the run cancelled; a stop ends it interrupted by the shutdown.
-    let reason = if cancelled {
-        RunFinishReason::Cancelled
-    } else {
-        RunFinishReason::Interrupted
-    };
-    let mut end = run_end(writer, run_id, reason, now);
-    if let Record::RunEnd(end) = &mut end {
-        if !cancelled {
-            end.interrupt_reason = Some("runner_shutdown".into());
-        }
-    }
-    append_end(writer, run_id, vec![end]).await?;
-    Ok(finished(writer, reason))
 }
 
 /// A queued send with a delivery order, as a boundary delivers it.
