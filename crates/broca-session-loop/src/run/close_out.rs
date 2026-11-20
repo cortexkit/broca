@@ -137,8 +137,7 @@ pub(super) fn never_dispatched_close_out<W: Writer>(
     records
 }
 
-/// The result, outcome and code a held call gets when a cancel closes it, as today's loop
-/// closes one.
+/// The result, outcome and code a held call gets when a cancel closes it.
 pub(super) fn held_close_result(
     id: &ToolCallId,
     reason: RunFinishReason,

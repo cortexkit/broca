@@ -1505,7 +1505,7 @@ impl Owner {
 }
 
 crate::message! {
-    /// The facts compaction's request-size estimate reads, as today's loop folds them.
+    /// The facts compaction's request-size estimate reads.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct Estimate {
         /// The current run's model.

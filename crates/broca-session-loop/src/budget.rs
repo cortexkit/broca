@@ -1,7 +1,7 @@
 //! A run's tool-call budget: the reminders its caller asked for once the model has made so many
 //! tool calls, and the finalize reminder after which the run takes one last step with tools
-//! disabled. Today's budget kernel decides which firings are due; this module turns them into
-//! the records a batch's barrier carries, as today's loop writes them.
+//! disabled. The budget kernel (`broca_core::budget_kernel`) decides which firings are due; this
+//! module turns them into the records a batch's barrier carries.
 
 use broca_core::budget_kernel::{self, BudgetReplayStateV1};
 use broca_protocol::content::{ContentBlock, Message, Role};

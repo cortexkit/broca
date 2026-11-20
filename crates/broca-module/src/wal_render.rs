@@ -289,8 +289,8 @@ fn boundary_options_with_media_tags(
         .map_err(|e| format!("decode frozen_render_config: {e}"))?;
     // Copy the runner's frozen tools, tool choice, response format, generation settings and
     // provider options. The replayed prompt and step identity are the per-step inputs. A step
-    // after a finalize budget firing keeps the tools and disables calls, as today's loop sends
-    // it on every log, whether or not the log's runs froze a compaction plan version.
+    // after a finalize budget firing keeps the tools and disables calls, on every log, whether or
+    // not the log's runs froze a compaction plan version.
     let mut opts = CallOptions {
         declared_markers: Vec::new(),
         ephemeral_session: false,

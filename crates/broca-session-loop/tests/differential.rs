@@ -1016,7 +1016,7 @@ tokio::task_local! {
 tokio::task_local! {
     /// Whether the send sets every field a run's start records about it (its key, labels,
     /// principal, scope, input hooks, routing decision, tier, variant and the rest), so the
-    /// comparison checks each one reaches the start as today's loop records it.
+    /// test's recorded expectations check that each one reaches the run's start record.
     static SEND_FACTS: bool;
 }
 
@@ -7381,7 +7381,7 @@ async fn a_view_dropping_the_final_tool_turn_is_refused() {
 
 /// A tool result pushes the next request over the window, and the provider answers with no view,
 /// so the request still doesn't fit: the run ends at the context ceiling without sending it, with
-/// the ceiling's decision recorded as today's loop records it.
+/// the ceiling's decision recorded.
 fn ceiling_scenario() -> Scenario {
     compacted_scenario(vec![
         answer(
@@ -7412,8 +7412,8 @@ async fn every_cut_of_a_run_ending_at_the_ceiling_resumes_alike() {
 
 /// A plan with no compaction provider that asks for part numbers in the model's view: on the
 /// established layout each run's user and tool-result text goes out with its numbers in front,
-/// numbered by that run's own frozen rules, as today's loop numbers it. The real-data request
-/// check found the new loop sending these without their numbers.
+/// numbered by that run's own frozen rules. A run that sends this text without its numbers
+/// fails it.
 fn tagged_scenario() -> Scenario {
     let tools = vec![tool("read", ExecutionMode::Parallel)];
     let mut manifest = planned_manifest(&tools).as_ref().clone();
@@ -7458,7 +7458,8 @@ async fn two_runs_frozen_with_part_numbers_number_on_from_the_first() {
 
 /// A new-loop run whose requests can't be rendered until it waited for something (as a store
 /// run's media renderer renders nothing until its run waited for the session's media) waits
-/// before its first compacted step is prepared and sent, and makes the same run as today's loop.
+/// before its first compacted step is prepared and sent, and makes the run the test's recorded
+/// expectations describe.
 #[tokio::test]
 async fn a_compacted_step_waits_for_its_request_to_be_ready_before_sending_it() {
     READY
@@ -8297,7 +8298,7 @@ async fn an_account_limit_pause_stays_paused_before_the_reset() {
 /// A resume whose requests can't be rendered until it waited for something (as a store run's
 /// media renderer renders nothing until its run waited for the session's media) waits before it
 /// renders the step the account-limit pause refused, to check it is the same request, and resumes
-/// as today's loop does.
+/// as the test's recorded expectations describe.
 #[tokio::test]
 async fn an_account_limit_resume_waits_for_its_request_to_be_ready_before_checking_it() {
     READY
@@ -10204,8 +10205,8 @@ async fn an_enrolling_run_whose_request_cant_be_ready_ends_with_the_error_and_se
 #[tokio::test]
 async fn a_converted_session_with_a_joined_ride_enrolls_and_keeps_its_bytes() {
     in_each_cipher(|| async {
-        // One run with a tool call, and text delivered with its result, as today's loop wrote
-        // it and the converter converted it.
+        // One run with a tool call, and text delivered with its result, as the old storage
+        // wrote it and the converter converted it.
         let converted = converted_fixture("joined-ride");
 
         // The converted session joins delivered text into results, as today's storage did.
@@ -10991,8 +10992,8 @@ async fn a_reading_with_no_view_ever_names_none() {
 /// facts carry that view, so the first run on the new storage names it with the step's reading.
 #[tokio::test]
 async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
-    // A run that called a tool and answered, measured at 900 tokens, as today's loop wrote it
-    // under view 1 and the converter converted it.
+    // A run that called a tool and answered, measured at 900 tokens, as the old storage wrote
+    // it under view 1 and the converter converted it.
     let converted = converted_fixture("view-reading");
     let backend: &'static MemoryBackend = Box::leak(Box::default());
     let mut session = enrollment_session(backend).await;

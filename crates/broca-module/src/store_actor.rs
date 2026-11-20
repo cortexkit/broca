@@ -330,8 +330,7 @@ struct Start {
     message_marks: Option<broca_protocol::MessageMarks>,
 }
 
-/// What happened to a run's input before the run, which the run's control hands the loop, as
-/// today's actor hands it to today's loop.
+/// What happened to a run's input before the run, which the run's control hands the loop.
 #[derive(Default)]
 struct Prepared {
     retention: Option<u64>,
@@ -4716,7 +4715,7 @@ fn frozen_media(
 
 /// What a send asks for, where this actor doesn't serve it yet. On a session that never ran (`ran`
 /// false), as on a send creating one, a send resuming after sign-in has no paused run to resume:
-/// today's loop starts its run fresh, as it starts any other send's, and so does this actor.
+/// this actor starts its run fresh, as it starts any other send's.
 fn unserved_request(kind: RunKind, _retention: bool, ran: bool) -> Option<&'static str> {
     if kind == RunKind::ResumeAfterAuth && ran {
         Some("resuming after sign-in")
