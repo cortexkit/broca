@@ -10,10 +10,12 @@ static INPUT_TRANSFORMATIONS_UNMEASURED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// How many entries providers have listed in `input_transformations` since this process started.
-/// Every entry means the provider changed what the model saw, for Anthropic by dropping (or
-/// letting through) a signed thinking block whose earlier context no longer matched: the
-/// rendered conversation was not append-only. Zero is the healthy reading only for the attempts
-/// that asked for the report: see [`input_transformations_unmeasured_attempts`].
+/// Every entry means the provider changed what the model saw: Anthropic drops (or lets through)
+/// a signed thinking block whose earlier context no longer matched, and OpenAI's Responses API
+/// removes a reasoning item whose earlier context changed (`prefix_mismatch`) or that it won't
+/// carry for another reason. Either way the rendered conversation was not append-only. Zero is
+/// the healthy reading only for the attempts that asked for the report: see
+/// [`input_transformations_unmeasured_attempts`].
 pub fn input_transformations_reported() -> u64 {
     INPUT_TRANSFORMATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -75,11 +77,18 @@ pub fn report_input_transformations(
     let reasons: Vec<String> = entries
         .iter()
         .map(|entry| {
+            // Anthropic places an entry by its path in the request; OpenAI by the item's id and
+            // says what it did (`removed`).
             format!(
-                "{}:{}@{}",
+                "{}{}:{}@{}",
                 entry.kind.as_deref().unwrap_or("?"),
+                entry
+                    .action
+                    .as_deref()
+                    .map(|action| format!("/{action}"))
+                    .unwrap_or_default(),
                 entry.reason.as_deref().unwrap_or("?"),
-                entry.path.as_deref().unwrap_or("?"),
+                entry.path.as_deref().or(entry.id.as_deref()).unwrap_or("?"),
             )
         })
         .collect();

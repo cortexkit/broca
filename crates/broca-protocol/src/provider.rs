@@ -487,17 +487,46 @@ impl CredentialRefresh {
 
 /// One entry of a provider's report of how it altered the request input, kept as the provider
 /// wrote it: every field is optional and an unrecognised `type` or `reason` is carried verbatim.
+/// Anthropic names the changed block by `path`; OpenAI's Responses API names the dropped
+/// reasoning item by `id` and says what it did in `action`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputTransformation {
-    /// The kind of change, for example `thinking_dropped`.
+    /// The kind of change, for example `thinking_dropped` (Anthropic) or `reasoning` (OpenAI).
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Where in the request the changed block sat, for example `messages.1.content.0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Why, for example `prefix_binding_mismatch`.
+    /// The changed input item's id, for example the `rs_…` id of a reasoning item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// What the provider did to it, for example `removed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Why, for example `prefix_binding_mismatch` (Anthropic) or `prefix_mismatch` (OpenAI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+impl InputTransformation {
+    /// Reads one entry as the provider wrote it. An entry whose shape can't be read field by
+    /// field still counts as an entry, with every field unknown.
+    pub fn from_entry(entry: &serde_json::Value) -> Self {
+        serde_json::from_value(entry.clone()).unwrap_or(Self {
+            kind: None,
+            path: None,
+            id: None,
+            action: None,
+            reason: None,
+        })
+    }
+
+    /// Reads a provider's `input_transformations` member: `None` when it isn't an array.
+    pub fn from_report(report: &serde_json::Value) -> Option<Vec<Self>> {
+        report
+            .as_array()
+            .map(|entries| entries.iter().map(Self::from_entry).collect())
+    }
 }
 
 /// How one provider HTTP attempt ended. Serialized as a bare string.

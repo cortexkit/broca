@@ -458,6 +458,10 @@ impl StreamNormalizer for ChatgptNormalizer {
         Some(CHATGPT_CONTENT_DEADLINE)
     }
 
+    fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
+        self.inner.input_transformations()
+    }
+
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         self.inner.finish()
     }
@@ -747,6 +751,26 @@ mod tests {
             .collect();
         assert_eq!(text, "I can’t help with that.");
         assert_eq!(finish_reason, Some(FinishReason::ContentFilter));
+    }
+
+    /// The ChatGPT backend's report of reasoning items it removed reaches the attempt record
+    /// through this family's own normalizer, which wraps the Responses one.
+    #[test]
+    fn codex_normalizer_forwards_removed_reasoning() {
+        let recorded = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",",
+            "\"input_transformations\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"action\":\"removed\",\"reason\":\"prefix_mismatch\"}]}}\n\n",
+        );
+        let frozen = openai_responses_chatgpt_frozen_config("gpt-5.5");
+        let mut normalizer = OpenAiResponsesChatgpt.normalizer(&frozen, StepId(6));
+        normalizer.push(recorded.as_bytes()).expect("normalizes");
+        normalizer.finish().expect("clean EOF");
+        let report = normalizer.input_transformations().expect("a report");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].id.as_deref(), Some("rs_1"));
+        assert_eq!(report[0].reason.as_deref(), Some("prefix_mismatch"));
+        assert!(!normalizer.input_transformations_unmeasured());
     }
 
     #[test]

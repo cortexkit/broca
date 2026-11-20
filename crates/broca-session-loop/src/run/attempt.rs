@@ -97,3 +97,67 @@ pub(super) fn attempt_record(
         requested_cache_ttl_ms: requested_ttl_ms.filter(|_| reached),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broca_protocol::InputTransformation;
+
+    fn model_attempt(report: Option<Vec<InputTransformation>>, unmeasured: bool) -> ModelAttempt {
+        ModelAttempt {
+            content_progress: Default::default(),
+            attempt: 1,
+            request_body_len: 1,
+            request_body_sha256: "aa".repeat(32),
+            http_status: Some(200),
+            content_type: None,
+            response_body_len: 0,
+            response_body_sha256: "bb".repeat(32),
+            response_body_cap: None,
+            outcome: broca_protocol::provider::AttemptOutcome::Complete,
+            ts_ms: 10,
+            sent_at_ms: None,
+            transport: None,
+            websocket_request: None,
+            cache_evidence: None,
+            websocket_close_code: None,
+            input_transformations: report,
+            input_transformations_unmeasured: unmeasured,
+            credential_refresh: None,
+            served_account_ref: None,
+            account_observation: Default::default(),
+        }
+    }
+
+    /// What the attempt's evidence for the usage export reads back from the record.
+    fn read_back(attempt: ModelAttempt) -> Option<Vec<InputTransformation>> {
+        let record = attempt_record("run", 1, attempt, None, false).unwrap();
+        let evidence = crate::billing::attempt_evidence(&[(5, record)], "run");
+        assert_eq!(evidence.len(), 1);
+        evidence.into_iter().next().unwrap().input_transformations
+    }
+
+    /// A provider's input-transformation report survives the attempt's record and reaches the
+    /// usage export's evidence verbatim; a request that didn't ask for the report reads as no
+    /// report even if one were present, and a missing report stays missing.
+    #[test]
+    fn the_input_transformation_report_survives_the_attempt_record() {
+        let removed = InputTransformation {
+            kind: Some("reasoning".into()),
+            path: None,
+            id: Some("rs_1".into()),
+            action: Some("removed".into()),
+            reason: Some("prefix_mismatch".into()),
+        };
+        assert_eq!(
+            read_back(model_attempt(Some(vec![removed.clone()]), false)),
+            Some(vec![removed.clone()])
+        );
+        assert_eq!(
+            read_back(model_attempt(Some(Vec::new()), false)),
+            Some(Vec::new())
+        );
+        assert_eq!(read_back(model_attempt(Some(vec![removed]), true)), None);
+        assert_eq!(read_back(model_attempt(None, false)), None);
+    }
+}

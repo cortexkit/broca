@@ -28,6 +28,7 @@ fn attempt(
         sent_at_ms: Some(1_000 + seq),
         recorded_at_ms: 2_000 + seq,
         served_account_ref: None,
+        input_transformations: None,
     }
 }
 
@@ -274,6 +275,71 @@ fn pooled_fast_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
     (records, attempts)
 }
 
+/// A ChatGPT-login run of two steps on `gpt-6.2-sol`. Before step 1's model ran, the provider
+/// removed two reasoning items whose earlier context had changed; step 2's response reported no
+/// change.
+fn reasoning_removed_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
+    let mut start = started(10, "reasoning", Some(100));
+    if let WalRecord::RunStarted { config, .. } = &mut start.record {
+        **config = crate::billing::tests::config("openai", "gpt-6.2-sol", Some("chatgpt:openai"));
+    }
+    let records = vec![
+        start,
+        step(20, 1, usage(40, 900), 0),
+        step(40, 2, usage(30, 200), 0),
+        terminal(50, Some(300), usage(70, 1_100)),
+    ];
+    let removed = |id: &str| broca_protocol::InputTransformation {
+        kind: Some("reasoning".into()),
+        path: None,
+        id: Some(id.into()),
+        action: Some("removed".into()),
+        reason: Some("prefix_mismatch".into()),
+    };
+    let mut attempts = vec![
+        attempt(15, 1, 1, "complete", true),
+        attempt(30, 2, 1, "complete", true),
+    ];
+    attempts[0].input_transformations = Some(vec![removed("rs_1"), removed("rs_2")]);
+    attempts[1].input_transformations = Some(Vec::new());
+    (records, attempts)
+}
+
+/// An attempt's fact carries the provider's input-transformation report verbatim: each removed
+/// item when there were some, an empty list for a report of no change, and nothing at all when
+/// there was no report, so the three never read alike.
+#[test]
+fn an_attempt_fact_carries_its_reported_input_transformations() {
+    let (records, mut attempts) = reasoning_removed_run();
+    attempts.push(attempt(45, 3, 1, "complete", true));
+    let facts = compute_attempt_facts(
+        &records,
+        &RunId("reasoning".into()),
+        &attempts,
+        "instance-a",
+        &resolver,
+    );
+    let facts: Vec<serde_json::Value> = facts
+        .attempts
+        .iter()
+        .map(|fact| serde_json::to_value(fact).unwrap())
+        .collect();
+    assert_eq!(
+        facts[0]["input_transformations"],
+        json!([
+            {"type": "reasoning", "id": "rs_1", "action": "removed", "reason": "prefix_mismatch"},
+            {"type": "reasoning", "id": "rs_2", "action": "removed", "reason": "prefix_mismatch"},
+        ])
+    );
+    assert_eq!(facts.len(), 3, "{facts:?}");
+    assert_eq!(facts[1]["input_transformations"], json!([]));
+    assert!(
+        facts[2].get("input_transformations").is_none(),
+        "{}",
+        facts[2]
+    );
+}
+
 /// Writes the facts of the runs above, as the usage export stores them, to
 /// `$BROCA_ATTEMPT_FACT_SAMPLES` for the export's readers to check: each run's segments and
 /// attempts in export order, one fact per line.
@@ -322,6 +388,15 @@ fn write_attempt_fact_samples_when_requested() {
             RunId("run".into()),
             vec![attempt(25, 1, 1, "complete", true)],
         ),
+        {
+            let (records, attempts) = reasoning_removed_run();
+            (
+                "reasoning-removed-before-the-model-ran",
+                records,
+                RunId("reasoning".into()),
+                attempts,
+            )
+        },
     ];
     for (name, records, run_id, attempts) in cases {
         let facts = compute_attempt_facts(&records, &run_id, &attempts, "instance-a", &resolver);

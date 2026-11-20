@@ -51,6 +51,10 @@ pub struct AttemptEvidence {
     pub recorded_at_ms: u64,
     /// The account the provider reported serving the request, when it reported one.
     pub served_account_ref: Option<String>,
+    /// The provider's report of how it changed the request's input before the model ran, as the
+    /// attempt's record keeps it; `None` when there was no report, or the request didn't ask for
+    /// one.
+    pub input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
 }
 
 /// One model's share of an attempt's usage.
@@ -122,6 +126,15 @@ pub struct AttemptFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at_ms: Option<u64>,
     pub recorded_at_ms: u64,
+    /// The provider's report of how it changed this request's input before the model ran,
+    /// verbatim and in input order: for OpenAI, each reasoning item it removed (`type`
+    /// `reasoning`, its `id`, `action` `removed`, and a `reason` such as `prefix_mismatch`); for
+    /// Anthropic, each signed thinking block it dropped (`type` `thinking_dropped`, its `path`,
+    /// and a `reason`). Removed reasoning means the model reasoned again, at the cost of more
+    /// output tokens. An empty list is a report of no change. Absent when the provider sent no
+    /// report or the request didn't ask for one, which is unknown, never "no change".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
 }
 
 /// A run's export facts with its attempts: its segments, and one fact per attempt.
@@ -404,6 +417,7 @@ fn attempt_fact<R: ChargeBasisResolver>(
         charge_basis_overrides: resolver.charge_basis_overrides(),
         sent_at_ms: attempt.sent_at_ms,
         recorded_at_ms: attempt.recorded_at_ms,
+        input_transformations: attempt.input_transformations.clone(),
     }
 }
 

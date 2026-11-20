@@ -209,10 +209,34 @@ pub fn attempt_evidence(records: &[(u64, Record)], run_id: &str) -> Vec<AttemptE
                 sent_at_ms: attempt.sent_at_ms,
                 recorded_at_ms: attempt.ts_ms,
                 served_account_ref: attempt.served_account_ref.clone(),
+                input_transformations: attempt
+                    .telemetry
+                    .as_ref()
+                    .and_then(reported_input_transformations),
             }),
             _ => None,
         })
         .collect()
+}
+
+/// The provider's input-transformation report an attempt record's telemetry keeps, under the
+/// names the provider's evidence gives them: `None` when the record has none, or when the
+/// request didn't ask for one (`input_transformations_unmeasured`), which is unknown rather
+/// than "no change".
+fn reported_input_transformations(
+    telemetry: &broca_protocol::json::Json,
+) -> Option<Vec<broca_protocol::InputTransformation>> {
+    #[derive(serde::Deserialize)]
+    struct Report {
+        #[serde(default)]
+        input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
+        #[serde(default)]
+        input_transformations_unmeasured: bool,
+    }
+    let report: Report = serde_json::from_str(telemetry.text()).ok()?;
+    report
+        .input_transformations
+        .filter(|_| !report.input_transformations_unmeasured)
 }
 
 #[cfg(test)]

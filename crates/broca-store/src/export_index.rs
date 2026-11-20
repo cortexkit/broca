@@ -1145,6 +1145,7 @@ pub(crate) mod tests {
                         sent_at_ms: Some(150),
                         recorded_at_ms: 160,
                         served_account_ref: None,
+                        input_transformations: None,
                     })
                 }
                 _ => None,

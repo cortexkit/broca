@@ -943,6 +943,8 @@ struct ResponsesTerminalResponse {
     usage: Option<ResponsesTerminalUsage>,
     incomplete_details: Option<ResponsesIncompleteDetails>,
     service_tier: Option<String>,
+    /// Kept as a raw value, so a report of an unexpected shape can't fail this typed parse.
+    input_transformations: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1019,6 +1021,10 @@ pub struct OpenAiResponsesNormalizer {
     /// requested value (`auto` in recorded codex streams) before the tier is decided, while
     /// the terminal response reports the tier that served and billed the request.
     service_tier_used: Option<String>,
+    /// The terminal response's `input_transformations`, verbatim: the reasoning items sent back
+    /// in `input` that the API removed before the model ran, and why (`prefix_mismatch` when
+    /// something before the item changed). `None` when the response carried no report.
+    input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
 }
 
 impl OpenAiResponsesNormalizer {
@@ -1061,6 +1067,14 @@ impl OpenAiResponsesNormalizer {
             started: false,
             completed: false,
             service_tier_used: None,
+            input_transformations: None,
+        }
+    }
+
+    /// Keeps a terminal response's `input_transformations` report, when it carries one.
+    fn observe_input_transformations(&mut self, report: Option<&Value>) {
+        if let Some(entries) = report.and_then(broca_protocol::InputTransformation::from_report) {
+            self.input_transformations = Some(entries);
         }
     }
 
@@ -1130,6 +1144,12 @@ impl OpenAiResponsesNormalizer {
             if let (Some(evidence), Some(response)) = (&self.response_evidence, v.get("response")) {
                 evidence.lock().unwrap().observe_response(response);
             }
+        }
+        if event_type == "response.failed" {
+            self.observe_input_transformations(
+                v.get("response")
+                    .and_then(|response| response.get("input_transformations")),
+            );
         }
         if self.response_evidence.is_some() && event_type == "response.failed" {
             if let Some(response) = v.get("response") {
@@ -1430,6 +1450,7 @@ impl OpenAiResponsesNormalizer {
                     if let Some(tier) = resp.get("service_tier").and_then(Value::as_str) {
                         self.service_tier_used = Some(tier.to_owned());
                     }
+                    self.observe_input_transformations(resp.get("input_transformations"));
                     if let Some(details) = resp.get("incomplete_details") {
                         if let Some(reason) = details.get("reason").and_then(Value::as_str) {
                             self.finish_reason = map_incomplete_reason(reason);
@@ -1662,6 +1683,7 @@ impl OpenAiResponsesNormalizer {
         if let Some(tier) = response.service_tier {
             self.service_tier_used = Some(tier);
         }
+        self.observe_input_transformations(response.input_transformations.as_ref());
         if let Some(reason) = response
             .incomplete_details
             .and_then(|details| details.reason)
@@ -1910,6 +1932,10 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
 
     fn liveness_marker(&self) -> Option<u64> {
         Some(self.sse.liveness_records())
+    }
+
+    fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
+        self.input_transformations.clone()
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
@@ -2382,6 +2408,110 @@ mod tests {
                     text: "All good.".into()
                 },
             ]
+        );
+    }
+
+    /// One stream, pushed event by event, with `terminal` as its last event.
+    fn stream_ending_with(normalizer: &mut OpenAiResponsesNormalizer, terminal: &str) {
+        let events_in = [
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Done."}"#,
+            terminal,
+        ];
+        for event in events_in {
+            normalizer
+                .push(format!("data: {event}\n\n").as_bytes())
+                .unwrap();
+        }
+        normalizer.finish().unwrap();
+    }
+
+    /// The shape OpenAI documents for a reasoning item it removed before the model ran.
+    fn removed(id: &str, reason: &str) -> broca_protocol::InputTransformation {
+        broca_protocol::InputTransformation {
+            kind: Some("reasoning".into()),
+            path: None,
+            id: Some(id.into()),
+            action: Some("removed".into()),
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// A terminal response's `input_transformations` report is kept verbatim, in input order, on
+    /// both the typed terminal parse and the permissive one an unusual discriminator falls to. An
+    /// entry of an unexpected shape still counts, with its fields unknown.
+    #[test]
+    fn a_terminal_report_of_removed_reasoning_is_kept_verbatim() {
+        let report = r#"[{"type":"reasoning","id":"rs_1","action":"removed","reason":"prefix_mismatch"},{"type":"reasoning","id":"rs_2","action":"removed","reason":"model_mismatch"},7]"#;
+        let unknown = broca_protocol::InputTransformation {
+            kind: None,
+            path: None,
+            id: None,
+            action: None,
+            reason: None,
+        };
+        let expected = vec![
+            removed("rs_1", "prefix_mismatch"),
+            removed("rs_2", "model_mismatch"),
+            unknown,
+        ];
+        for terminal in [
+            format!(
+                r#"{{"type":"response.completed","response":{{"id":"resp_1","status":"completed","input_transformations":{report}}}}}"#
+            ),
+            // An escaped discriminator misses the typed parse and takes the permissive one.
+            format!(
+                r#"{{"type":"response.complet\u0065d","response":{{"id":"resp_1","status":"completed","input_transformations":{report}}}}}"#
+            ),
+        ] {
+            let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+            stream_ending_with(&mut normalizer, &terminal);
+            assert_eq!(
+                normalizer.input_transformations(),
+                Some(expected.clone()),
+                "{terminal}"
+            );
+        }
+    }
+
+    /// A response that carries no report reads as no report, never as an empty one, and an empty
+    /// report reads as empty: the two say different things.
+    #[test]
+    fn no_report_and_an_empty_report_stay_apart() {
+        let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+        stream_ending_with(
+            &mut normalizer,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#,
+        );
+        assert_eq!(normalizer.input_transformations(), None);
+
+        let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+        stream_ending_with(
+            &mut normalizer,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","input_transformations":[]}}"#,
+        );
+        assert_eq!(normalizer.input_transformations(), Some(Vec::new()));
+    }
+
+    /// A failed response's report is kept too: the removal happened before the model ran.
+    #[test]
+    fn a_failed_response_keeps_its_report() {
+        let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+        normalizer
+            .push(
+                concat!(
+                    r#"data: {"type":"response.created","response":{"id":"resp_1"}}"#,
+                    "\n\n",
+                    r#"data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"x"},"input_transformations":[{"type":"reasoning","id":"rs_9","action":"removed","reason":"prefix_mismatch"}]}}"#,
+                    "\n\n",
+                )
+                .as_bytes(),
+            )
+            .ok();
+        assert_eq!(
+            normalizer.input_transformations(),
+            Some(vec![removed("rs_9", "prefix_mismatch")])
         );
     }
 }

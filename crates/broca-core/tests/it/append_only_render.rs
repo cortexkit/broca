@@ -306,6 +306,8 @@ impl Provider for TransformingProvider {
                 input_transformations: Some(vec![broca_protocol::InputTransformation {
                     kind: Some("thinking_dropped".into()),
                     path: Some("messages.1.content.0".into()),
+                    id: None,
+                    action: None,
                     reason: Some("prefix_binding_mismatch".into()),
                 }]),
                 input_transformations_unmeasured: false,

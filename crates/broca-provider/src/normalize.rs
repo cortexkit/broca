@@ -359,22 +359,9 @@ impl AnthropicNormalizer {
                 // read field by field still counts as a report.
                 if let Some(entries) = msg
                     .and_then(|m| m.get("input_transformations"))
-                    .and_then(Value::as_array)
+                    .and_then(broca_protocol::InputTransformation::from_report)
                 {
-                    self.input_transformations = Some(
-                        entries
-                            .iter()
-                            .map(|entry| {
-                                serde_json::from_value(entry.clone()).unwrap_or(
-                                    broca_protocol::InputTransformation {
-                                        kind: None,
-                                        path: None,
-                                        reason: None,
-                                    },
-                                )
-                            })
-                            .collect(),
-                    );
+                    self.input_transformations = Some(entries);
                 }
                 self.started = true;
                 out.push(NormalizedEvent::Control(ProviderControl::StreamStart {
