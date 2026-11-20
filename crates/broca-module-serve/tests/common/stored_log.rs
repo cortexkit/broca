@@ -40,7 +40,7 @@ pub async fn stored_log_records(state_root: &Path, identity: &BindIdentity) -> V
     let Some(class) = broca_wal::session_storage_class(state_root, &address).unwrap() else {
         return Vec::new();
     };
-    let view = Session::view(
+    let view = match Session::view(
         LocalBackend::new(class.store_root(state_root)),
         SessionAddr(address),
         &SessionTriple {
@@ -51,7 +51,13 @@ pub async fn stored_log_records(state_root: &Path, identity: &BindIdentity) -> V
         &DeploymentKey::unloaded(1),
     )
     .await
-    .expect("a plain session reads without a writer");
+    {
+        Ok(view) => view,
+        // A refused creating send removes the session it made. Its storage class is found until
+        // the removal finishes, so a read in between finds no head: the session doesn't exist.
+        Err(broca_session_store::session::SessionError::Missing) => return Vec::new(),
+        Err(error) => panic!("a plain session reads without a writer: {error:?}"),
+    };
     view.open_log_records().await.expect("the open log reads")
 }
 
