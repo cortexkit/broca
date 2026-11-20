@@ -404,13 +404,35 @@ impl LateResultsStore {
             .transpose()
     }
 
-    /// Registrations on one provider module.
+    /// Registrations on one provider module, under either id of a renamed module. Read by the
+    /// table's key, so an idle poll of one module doesn't decode every other module's rows.
     pub fn registrations_for(&self, module: &str) -> Result<Vec<RegistrationRow>, String> {
-        Ok(self
-            .registration_rows()?
-            .into_iter()
-            .filter(|row| canonical_module(&row.call.module) == canonical_module(module))
-            .collect())
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT registration, state FROM registrations WHERE module = ?1
+                 ORDER BY lineage, call_key",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![canonical_module(module)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<_> = rows
+            .map(|row| {
+                let (json, state) = row.map_err(|error| error.to_string())?;
+                Ok(RegistrationRow {
+                    call: serde_json::from_str(&json).map_err(|error| error.to_string())?,
+                    state: RegistrationState::from_str(&state),
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        if !rows.is_empty() {
+            self.held_history
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(rows)
     }
 
     /// Forget a registration: its call is settled for good (terminal and batch commit durable),

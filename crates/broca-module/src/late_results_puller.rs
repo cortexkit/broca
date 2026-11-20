@@ -769,10 +769,14 @@ impl LateResultsIntake {
         entries: &[LateEntry],
         views: &mut HashMap<BindIdentity, LineageView>,
     ) -> Result<(usize, Vec<IntakeKey>), FeedError> {
-        let rows = self
-            .store
-            .registration_rows()
-            .map_err(FeedError::Retryable)?;
+        // Only this module's registrations can match its entries, and an empty pull needs none.
+        let rows = if entries.is_empty() {
+            Vec::new()
+        } else {
+            self.store
+                .registrations_for(module)
+                .map_err(FeedError::Retryable)?
+        };
         let mut settled = 0usize;
         let mut pinned = Vec::new();
         for entry in entries {
@@ -1084,7 +1088,7 @@ impl LateResultsIntake {
         }
         let rows = self
             .store
-            .registration_rows()
+            .registrations_for(module)
             .map_err(FeedError::Retryable)?;
         self.deliver_settled(module, &reply.entries, &rows, views)
             .await

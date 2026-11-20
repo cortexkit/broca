@@ -103,6 +103,16 @@ impl DisplayEvent {
         }
     }
 
+    /// The id of the message a delta belongs to, when it names one.
+    pub fn mid(&self) -> Option<&str> {
+        match self {
+            Self::TextDelta { mid, .. }
+            | Self::ReasoningDelta { mid, .. }
+            | Self::ToolInputDelta { mid, .. } => mid.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn set_mid(&mut self, value: Option<String>) {
         match self {
             Self::TextDelta { mid, .. }

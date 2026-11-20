@@ -652,7 +652,11 @@ pub(crate) fn drain_display(
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             if let broca_core::OutputEvent::Display(mut delta) = event {
-                delta.set_mid(display_mid.lock().unwrap().clone());
+                // The run names its deltas by their step's message; one it didn't name takes
+                // the message the session is on.
+                if delta.mid().is_none() {
+                    delta.set_mid(display_mid.lock().unwrap().clone());
+                }
                 let _ = display.send(Arc::new(delta));
             }
         }

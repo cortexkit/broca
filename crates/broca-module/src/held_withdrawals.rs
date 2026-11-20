@@ -244,13 +244,26 @@ impl HeldWithdrawals {
         };
         if let (true, Some(runtime)) = (held, runtime) {
             tally.sessions_read += 1;
+            // Whether each call was cancelled while held, from one read of the session's ledger
+            // back to the oldest of their intents, rather than one read per call.
+            let calls: Vec<_> = rows.iter().map(|(call, _, _)| call.clone()).collect();
+            let mut identities = match store::cancellation_identities(&runtime, &calls).await {
+                Ok(identities) => Some(identities),
+                Err(error) => {
+                    tally.failure = Some(error);
+                    None
+                }
+            };
             for (call, state, attempts) in &rows {
                 let attempts = if state == "failed" {
                     None
                 } else {
                     Some(*attempts)
                 };
-                match self.drive(call.clone(), attempts).await {
+                let known = identities
+                    .as_mut()
+                    .and_then(|identities| identities.remove(&call.call_key));
+                match self.drive_with(call.clone(), attempts, known).await {
                     Ok(sent) => tally.withdrawals_sent += sent,
                     // Named, so a failure the sweep reports can be traced to its session.
                     Err(error) => {
@@ -315,6 +328,16 @@ impl HeldWithdrawals {
         call: LateResultRegistration,
         attempts: Option<u32>,
     ) -> Result<u32, String> {
+        self.drive_with(call, attempts, None).await
+    }
+
+    /// [`Self::drive`], with the call's cancellation identity already read when `known` holds it.
+    async fn drive_with(
+        &self,
+        call: LateResultRegistration,
+        attempts: Option<u32>,
+        known: Option<Result<Option<bool>, String>>,
+    ) -> Result<u32, String> {
         let stopping = self
             .stopping
             .get()
@@ -359,7 +382,11 @@ impl HeldWithdrawals {
         };
         // Live callers arrive only after sync. Recovery reads the same sealed log: an open
         // hold, a shutdown pause, or an interrupted restart is never a withdrawal intent.
-        let Some(session_identity) = self.cancellation_identity(&call).await? else {
+        let identity = match known {
+            Some(identity) => identity?,
+            None => self.cancellation_identity(&call).await?,
+        };
+        let Some(session_identity) = identity else {
             return Ok(0);
         };
         if stopping.is_cancelled() {

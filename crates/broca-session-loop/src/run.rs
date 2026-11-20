@@ -68,7 +68,7 @@ mod warming;
 pub(crate) use warming::Warming;
 pub use warming::{warm_count, warm_spend};
 mod close_out;
-use close_out::{never_dispatched_close_out, open_batch_close_out};
+use close_out::{held_close_result, never_dispatched_close_out, open_batch_close_out};
 mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
@@ -3177,7 +3177,8 @@ where
         // Words that streamed live and won't be stored are abandoned: the display lane is reset
         // and given the answer as it will be stored.
         if streamed.is_some_and(|streamed| streamed != step.message.content) {
-            restream(seams.out, &step.message, live_display).await;
+            let mid = display::step_mid(writer);
+            restream(seams.out, &step.message, mid.as_deref(), live_display).await;
         }
         // What the step records about the refusal fallback. A refusal after a completed tool
         // call commits as a tool step and arms the schedule, as today's loop commits it.
@@ -4297,6 +4298,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     let mut served = Served::default();
     let mut cuts = Vec::new();
     let mut join = display::ToolInputJoin::default();
+    let step_mid = display::step_mid(writer);
     let outcome = loop {
         // Biased: the cancel is checked before each event, as broca-core's run loop checks it
         // before its step.
@@ -4306,19 +4308,20 @@ async fn model_step<W: Writer, P: Provider, T>(
             _ = seams.cancel.cancelled() => break Err(StepFailure::Cancelled),
             event = events.recv() => event,
             () = display::until(deadline) => {
-                join.flush(seams.out).await;
+                join.flush(seams.out, step_mid.as_deref()).await;
                 continue;
             }
         };
         // A held tool-input delta goes out before anything else the step does.
         if !matches!(event, Some(NormalizedEvent::Display(_))) {
-            join.flush(seams.out).await;
+            join.flush(seams.out, step_mid.as_deref()).await;
         }
         match event {
             Some(NormalizedEvent::Display(display)) => {
                 display::note_live(&display, live_display);
                 if let Some(out) = seams.out {
                     for display in join.take(display, tokio::time::Instant::now()) {
+                        let display = display::stamp(display, step_mid.as_deref());
                         let _ = out.send(OutputEvent::Display(display)).await;
                     }
                 }
@@ -6278,16 +6281,6 @@ async fn withdraw<P, T>(seams: &Seams<'_, P, T>, closed: &[ProviderHeldReply]) {
             let _ = lifecycle.withdraw_held(reply).await;
         }
     }
-}
-
-/// The result, outcome and code a held call gets when a cancel closes it, as today's loop
-/// closes one.
-fn held_close_result(
-    id: &ToolCallId,
-    reason: RunFinishReason,
-) -> (ToolResult, CallOutcome, &'static str) {
-    let (result, _, code) = broca_core::tool_results::provider_held_close_result(id, reason);
-    (result, CallOutcome::Interrupted, code)
 }
 
 /// The provider's held reply for the open held call `id`, as the run recorded it.

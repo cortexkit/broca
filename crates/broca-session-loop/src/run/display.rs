@@ -83,10 +83,14 @@ impl ToolInputJoin {
         self.held.take().map(|(event, _)| event)
     }
 
-    /// Sends the held delta, if any, on `out`.
-    pub(super) async fn flush(&mut self, out: Option<&mpsc::Sender<OutputEvent>>) {
+    /// Sends the held delta, if any, on `out`, named as a delta of message `mid` (see [`stamp`]).
+    pub(super) async fn flush(
+        &mut self,
+        out: Option<&mpsc::Sender<OutputEvent>>,
+        mid: Option<&str>,
+    ) {
         if let (Some(out), Some(held)) = (out, self.release()) {
-            let _ = out.send(OutputEvent::Display(held)).await;
+            let _ = out.send(OutputEvent::Display(stamp(held, mid))).await;
         }
     }
 
@@ -95,6 +99,28 @@ impl ToolInputJoin {
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.held.as_ref().map(|(_, since)| *since + HOLD)
     }
+}
+
+/// The message the step under way writes, minted when its start was written: its deltas are
+/// named by it (see [`stamp`]).
+pub(super) fn step_mid<W: crate::writer::Writer>(writer: &W) -> Option<String> {
+    writer
+        .operations()
+        .run
+        .as_ref()
+        .and_then(|run| run.step_mid.clone())
+}
+
+/// Names `event`, a delta of the step that writes message `mid`, as that message's. The display
+/// lane otherwise names a delta by the message the session is on when it takes the delta, and a
+/// delta still queued when the next step starts would be named as the next step's.
+pub(super) fn stamp(mut event: DisplayEvent, mid: Option<&str>) -> DisplayEvent {
+    if let Some(mid) = mid {
+        if event.delta().is_some() && event.mid().is_none() {
+            event.set_mid(Some(mid.to_owned()));
+        }
+    }
+    event
 }
 
 /// Notes in `live` whether `event` leaves streamed words on the display lane: a reset clears them,
@@ -120,6 +146,7 @@ pub(super) async fn until(deadline: Option<Instant>) {
 pub(super) async fn restream(
     out: Option<&mpsc::Sender<OutputEvent>>,
     message: &AssistantMessage,
+    mid: Option<&str>,
     live: &mut bool,
 ) {
     use broca_protocol::content::ContentBlock;
@@ -158,7 +185,7 @@ pub(super) async fn restream(
             _ => continue,
         };
         event.set_part(index as u64);
-        let _ = out.send(OutputEvent::Display(event)).await;
+        let _ = out.send(OutputEvent::Display(stamp(event, mid))).await;
         *live = true;
     }
 }

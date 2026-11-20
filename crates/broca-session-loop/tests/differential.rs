@@ -8605,7 +8605,26 @@ fn text_delta(id: &str, text: &str) -> NormalizedEvent {
     })
 }
 
+/// The display events the run sent, each delta's message id checked and then cleared: every
+/// delta names the message its step writes, and the tests compare everything else.
 fn display_events(events: &mut mpsc::Receiver<OutputEvent>) -> Vec<DisplayEvent> {
+    raw_display_events(events)
+        .into_iter()
+        .map(without_mid)
+        .collect()
+}
+
+/// `event` with its message id cleared, after checking a delta names one.
+fn without_mid(mut event: DisplayEvent) -> DisplayEvent {
+    if event.delta().is_some() {
+        assert!(event.mid().is_some(), "a delta names no message: {event:?}");
+        event.set_mid(None);
+    }
+    event
+}
+
+/// The display events the run sent, as it sent them.
+fn raw_display_events(events: &mut mpsc::Receiver<OutputEvent>) -> Vec<DisplayEvent> {
     let mut display = Vec::new();
     while let Ok(event) = events.try_recv() {
         if let OutputEvent::Display(event) = event {
@@ -8613,6 +8632,38 @@ fn display_events(events: &mut mpsc::Receiver<OutputEvent>) -> Vec<DisplayEvent>
         }
     }
     display
+}
+
+/// Each step's deltas name the message that step writes, not whichever message the session is
+/// on when the display lane takes them: a delta still queued when the next step starts would
+/// otherwise be shown as part of the next step's answer.
+#[tokio::test]
+async fn each_steps_deltas_name_the_message_that_step_writes() {
+    let (out, mut events) = mpsc::channel(64);
+    let mut first = answer(
+        "a0",
+        vec![
+            ContentBlock::Text { text: "one".into() },
+            call("c1", "read", json!({})),
+        ],
+        FinishReason::ToolCalls,
+    );
+    first.insert(0, text_delta("a0", "one"));
+    let mut second = text_step("a1", "two");
+    second.insert(0, text_delta("a1", "two"));
+    DISPLAY_OUT
+        .scope(out, async {
+            new_loop(&single(vec![first, second])).await;
+        })
+        .await;
+    let mids: Vec<_> = raw_display_events(&mut events)
+        .into_iter()
+        .filter(|event| event.delta().is_some())
+        .map(|event| event.mid().map(str::to_owned))
+        .collect();
+    assert_eq!(mids.len(), 2, "{mids:?}");
+    assert!(mids.iter().all(Option::is_some), "{mids:?}");
+    assert_ne!(mids[0], mids[1], "each step's delta names its own message");
 }
 
 fn expected_delta(id: &str, text: &str) -> DisplayEvent {
@@ -8737,7 +8788,7 @@ async fn a_tool_input_fragment_goes_out_while_its_provider_pauses() {
         first
     };
     let (_, first) = tokio::join!(run, observe);
-    assert_eq!(first, fragment);
+    assert_eq!(without_mid(first), fragment);
 }
 
 #[tokio::test]
@@ -8761,7 +8812,7 @@ async fn cancelled_stream_is_reset() {
                 if matches!(event, DisplayEvent::TextDelta { .. }) {
                     cancel.cancel();
                 }
-                display.push(event);
+                display.push(without_mid(event));
             }
         }
         display

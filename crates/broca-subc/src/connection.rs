@@ -1337,7 +1337,7 @@ impl SubcConnection {
         // open to that module waits on it.
         let attempt_deadline = time::Instant::now() + deadline;
         let corr = self.next_corr();
-        let (runtime, mut registration, mut rx) = self.register_control((0, 0, corr), true)?;
+        let (runtime, mut registration, rx) = self.register_control((0, 0, corr), true)?;
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
             .map_err(|e| ConnError::Transport(e.to_string()))?;
         match time::timeout_at(attempt_deadline, self.send(&runtime, frame)).await {
@@ -1356,9 +1356,9 @@ impl SubcConnection {
         }
         registration.arm_late_route_open_cleanup();
         let remaining = attempt_deadline.saturating_duration_since(time::Instant::now());
-        let result = self
-            .await_terminal_deadline(&runtime, &mut rx, remaining)
-            .await;
+        let mut reply = OpenReply::new(rx, &self.shared, runtime.conn);
+        let result = (self.await_terminal_deadline(&runtime, reply.receiver(), remaining)).await;
+        let mut rx = reply.taken();
         if matches!(&result, Err(ConnError::Transport(message)) if message.starts_with("timed out after"))
         {
             // A successful late route.open committed a daemon route. Keep its identity so the
@@ -3383,32 +3383,6 @@ async fn run_liveness_probe(
     }
 }
 
-fn retry_late_goodbye(generation: Option<&ReaderGeneration>, frame: Frame) {
-    let Some(binding) = generation else {
-        return;
-    };
-    let Some(shared) = binding.shared.upgrade() else {
-        return;
-    };
-    let route = RouteHandle::new(frame.header.channel, frame.header.epoch, binding.conn);
-    // Publish a non-dispatchable closing identity before the reader drops its live epoch.
-    // No await and no egress wait occurs on ingress.
-    if prepare_goodbye(&shared, route).is_ok() {
-        let closer = route_closer_for(&shared);
-        #[cfg(test)]
-        let hook = shared.late_goodbye_handoff.lock().unwrap().take();
-        #[cfg(test)]
-        if let Some(hook) = &hook {
-            hook(LateGoodbyeHandoffStage::Prepared);
-        }
-        let _admitted = closer.enqueue_failed(route);
-        #[cfg(test)]
-        if let Some(hook) = hook {
-            hook(LateGoodbyeHandoffStage::Admitted(_admitted));
-        }
-    }
-}
-
 async fn reader_task<R>(
     mut read_half: R,
     pending: PendingMap,
@@ -4946,8 +4920,10 @@ fn to_subc_bind(
 }
 
 mod catalog_watch;
+mod late_open;
 mod probe;
 mod renamed;
+use late_open::{retry_late_goodbye, OpenReply};
 use probe::{channel_zero_probe_blocker, request_liveness_probe};
 use renamed::{renamed_target, Renamed};
 
