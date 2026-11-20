@@ -16,8 +16,12 @@ broca-owner-only = { path = "../broca-owner-only" }
 broca-protocol = { path = "../broca-protocol" }
 serde.workspace = true
 serde_json.workspace = true
-# Decision S3: XChaCha20-Poly1305 on every platform, with random 192-bit nonces.
+# XChaCha20-Poly1305 on every platform, with random 192-bit nonces. Frames seal
+# through HChaCha20 (from chacha20) and ring's ChaCha20-Poly1305, which runs on the CPU's vector
+# unit; the RustCrypto AEAD seals the smaller key records and checks the frame path in tests.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20 = { version = "0.9", default-features = false }
+ring = "0.17"
 crc32c = "0.6"
 getrandom = "0.2"
 # Sealed blocks. zstd binds the C library, so it builds natively only; the Cloudflare backend

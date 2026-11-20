@@ -238,3 +238,54 @@ proptest! {
         );
     }
 }
+
+/// A unit sealed through HChaCha20 and ring's ChaCha20-Poly1305 is the bytes the RustCrypto
+/// XChaCha20-Poly1305 seals, in both directions and at every length from empty to past a block:
+/// units stored before the frame path moved to ring read after it, and the reverse, so a build
+/// either side of the change reads the other's logs.
+#[test]
+fn a_unit_is_the_bytes_the_rustcrypto_aead_seals_and_opens() {
+    use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+    use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
+    let raw = [0x5a_u8; 32];
+    let ours = FrameKey::new(1, &raw);
+    let reference = XChaCha20Poly1305::new(Key::from_slice(&raw));
+    let aad = b"session log 7";
+    for len in [0, 1, 15, 16, 63, 64, 65, 1000, 4096, 70_000] {
+        let plaintext: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
+
+        let sealed = ours.seal_unit(aad, &plaintext);
+        let (nonce, rest) = sealed.split_at(NONCE_LEN);
+        let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
+        let mut buffer = ciphertext.to_vec();
+        reference
+            .decrypt_in_place_detached(
+                XNonce::from_slice(nonce),
+                aad,
+                &mut buffer,
+                Tag::from_slice(tag),
+            )
+            .unwrap_or_else(|_| panic!("the reference AEAD opens our {len}-byte unit"));
+        assert_eq!(buffer, plaintext);
+
+        let nonce = [len as u8; NONCE_LEN];
+        let mut buffer = plaintext.clone();
+        let tag = reference
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut buffer)
+            .unwrap();
+        let theirs = [&nonce[..], &buffer, &tag].concat();
+        assert_eq!(
+            ours.open_unit(aad, &theirs).as_deref(),
+            Some(&plaintext[..]),
+            "we open the reference AEAD's {len}-byte unit"
+        );
+        let mut forged = theirs.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!(ours.open_unit(aad, &forged), None, "a changed tag fails");
+        assert_eq!(
+            ours.open_unit(b"another log", &theirs),
+            None,
+            "other aad fails"
+        );
+    }
+}
