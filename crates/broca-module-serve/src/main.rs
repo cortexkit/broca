@@ -1281,6 +1281,60 @@ struct Gated {
     consumer_routes: ConsumerRoutes,
 }
 
+/// Puts broca's settings file where the settings gate's daemon reads it,
+/// `<config home>/cortexkit/broca.jsonc`, rewritten into the schema's shapes (see
+/// `settings::rewrite`), and returns that path. `old` is the file broca read before the gate; it
+/// is left as it was. `Err` stops the start: with the file not moved, the daemon would serve broca
+/// the defaults in place of the settings the old file holds.
+fn move_settings_file(
+    old: Option<&std::path::Path>,
+    conn_path: &std::path::Path,
+) -> Result<std::path::PathBuf, ServeIoError> {
+    use broca_module_serve::settings::rewrite;
+    let new = rewrite::daemon_settings_file().map_err(ServeIoError)?;
+    let Some(old) = old else {
+        return Ok(new);
+    };
+    let data_dir = broca_module_serve::state_root::resolve_for_launch(conn_path)
+        .map_err(|error| {
+            ServeIoError(format!(
+                "broca.jsonc not moved: no state root for its old copy: {error}"
+            ))
+        })?
+        .path;
+    let moved = rewrite::move_old_file(old, &new, &data_dir).map_err(|error| {
+        ServeIoError(format!(
+            "broca.jsonc at {} could not be moved to {}: {error}",
+            old.display(),
+            new.display()
+        ))
+    })?;
+    let (notes, saved, stale_old) = match moved {
+        rewrite::Moved::Nothing => (Vec::new(), None, None),
+        rewrite::Moved::Moved { notes, saved } => {
+            tracing::warn!(target: "config", from = %old.display(), to = %new.display(), "broca.jsonc copied to the path the settings gate reads; the old file is kept for older builds");
+            (notes, Some(saved), None)
+        }
+        rewrite::Moved::InPlace {
+            rewritten,
+            stale_old,
+        } => match rewritten {
+            Some(done) => (done.notes, Some(done.saved), stale_old),
+            None => (Vec::new(), None, stale_old),
+        },
+    };
+    for note in &notes {
+        tracing::warn!(target: "config", "broca.jsonc rewritten: {note}");
+    }
+    if let Some(saved) = saved {
+        tracing::warn!(target: "config", saved = %saved.display(), "broca.jsonc's previous bytes are saved");
+    }
+    if let Some(stale) = stale_old {
+        tracing::warn!(target: "config", stale = %stale.display(), file = %new.display(), "an older broca.jsonc is still in broca's own folder; broca no longer reads it, so edit the other file");
+    }
+    Ok(new)
+}
+
 /// Registers broca unready and gets its settings: the daemon's view when it has a settings gate,
 /// else `broca.jsonc`. `None` when the daemon stopped broca before any view arrived.
 async fn start_gated(
@@ -1299,6 +1353,14 @@ async fn start_gated(
     )
     .with_account_selection(&Default::default())
     .with_bus_events(true);
+    let old_file = match broca_module_serve::config_home::config_file(
+        broca_module_serve::cache_routing::CONFIG_PATH_ENV,
+        "broca.jsonc",
+    ) {
+        broca_module_serve::config_home::ConfigHome::Resolved { path, .. } => Some(path),
+        broca_module_serve::config_home::ConfigHome::Unresolvable => None,
+    };
+    let user_file = move_settings_file(old_file.as_deref(), conn_path)?;
     let (mut read_half, mut write_half) = tokio::io::split(connect(conn_path).await?);
     let ack = broca_module_serve::serve::register_unready(
         &mut read_half,
@@ -1312,20 +1374,7 @@ async fn start_gated(
         .iter()
         .any(|capability| capability == subc_protocol::config::CONFIG_GATE_CAPABILITY);
     let (settings, gate) = if gated {
-        let user_file = match broca_module_serve::config_home::config_file(
-            broca_module_serve::cache_routing::CONFIG_PATH_ENV,
-            "broca.jsonc",
-        ) {
-            broca_module_serve::config_home::ConfigHome::Resolved { path, .. } => {
-                path.display().to_string()
-            }
-            broca_module_serve::config_home::ConfigHome::Unresolvable => {
-                return Err(ServeIoError(
-                    "the settings gate needs broca.jsonc's path, and no config home resolves"
-                        .into(),
-                ))
-            }
-        };
+        let user_file = user_file.display().to_string();
         match gate::wait_for_settings(
             &mut read_half,
             &mut write_half,
@@ -1341,8 +1390,9 @@ async fn start_gated(
             }
         }
     } else {
+        // A daemon without the gate: the moved file is read as broca read the old one.
         broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-        let settings = Settings::read_file().map_err(ServeIoError)?;
+        let settings = Settings::read(&user_file).map_err(ServeIoError)?;
         (settings, gate::Gate::ungated(ack.negotiated_ver))
     };
     let registration = broca_module_serve::serve::GatedRegistration { ack, gate };

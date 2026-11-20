@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 pub mod convert;
 pub mod gate;
 pub mod review;
+pub mod rewrite;
 
 use crate::config_home::ConfigHome;
 

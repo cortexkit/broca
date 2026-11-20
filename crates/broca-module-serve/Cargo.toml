@@ -92,6 +92,8 @@ futures.workspace = true
 clap = { version = "4", features = ["derive"] }
 # The daemon's settings contract: broca's settings schema and the review of a proposed view.
 subc-config = { workspace = true }
+cortexkit-store-types = "=0.2.2"
+subc-jsonc = { workspace = true }
 
 # Re-raising SIGTERM after the seal needs the default disposition restored first, which is an
 # unsafe libc call; this crate forbids unsafe, and signal-hook's `emulate_default_handler` is

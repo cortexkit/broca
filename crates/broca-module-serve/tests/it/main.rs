@@ -77,6 +77,7 @@ mod scope_workdir;
 mod seal_line_is_filterable_e2e;
 mod send_delivery;
 mod session_client;
+mod settings_gate_real_daemon;
 mod single_turn_module_e2e;
 mod state_root_isolation;
 mod state_root_lock;
