@@ -167,6 +167,34 @@ async fn gated_daemon_test() {{
             inventory=inventory,
         )
 
+    def _file_gated_rig_test(self, cfg: str) -> list[str]:
+        main = self.source.parent / "main.rs"
+        main.write_text("mod gated;\n")
+        (self.source.parent / "gated.rs").write_text(
+            f"""//! A suite compiled only with a feature.
+#![{cfg}]
+
+#[tokio::test]
+async fn gated_daemon_test() {{
+    broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
+}}
+"""
+        )
+        inventory = {"rust-suites": {"sample::it": {"status": "listed", "testcases": {}}}}
+        return selection.check_selection(
+            self.root,
+            targets=[selection.Target("sample", "it", main)],
+            inventory=inventory,
+        )
+
+    def test_a_file_behind_a_feature_the_preflight_lacks_is_not_compiled_there(self) -> None:
+        self.assertEqual(self._file_gated_rig_test('cfg(all(unix, feature = "settings-gate"))'), [])
+
+    def test_a_file_behind_a_preflight_feature_is_still_classified(self) -> None:
+        problems = self._file_gated_rig_test('cfg(all(unix, feature = "test-clock"))')
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("cannot classify rig-dependent test", problems[0])
+
     def test_a_test_behind_a_feature_the_preflight_lacks_is_not_compiled_there(self) -> None:
         self.assertEqual(self._feature_gated_rig_test("test-attachments"), [])
 

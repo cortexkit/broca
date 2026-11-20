@@ -35,9 +35,14 @@ PREFLIGHT_FEATURE_FLAGS = (
     "broca-module-serve/test-clock",
 )
 PREFLIGHT_FEATURES = {flag.split("/", 1)[1] for flag in PREFLIGHT_FEATURE_FLAGS}
-# A plain `cfg(feature = "x")` gate. Compound cfg expressions are not parsed, so a test behind one
-# is still checked.
+# A `cfg(feature = "x")` gate, or a `cfg(all(...))` with one or more `feature = "x"` members: each
+# named feature must be on for the item to be compiled. Other cfg expressions (`any`, `not`) are not
+# parsed, so a test behind one is still checked.
 FEATURE_GATE = re.compile(r'^\s*cfg\s*\(\s*feature\s*=\s*"([^"]+)"\s*\)\s*$')
+ALL_GATE = re.compile(r'^\s*cfg\s*\(\s*all\s*\((.*)\)\s*\)\s*$', re.S)
+FEATURE_MEMBER = re.compile(r'\bfeature\s*=\s*"([^"]+)"')
+# A file's inner attributes, before its first item: `#![cfg(...)]` gates the whole file.
+INNER_ATTRIBUTE = re.compile(r'#!\s*\[([^\]]*)\]')
 GENERIC_HELPERS = {
     "build", "check", "connect", "default", "drop", "from", "get", "new",
     "required", "resolve", "run", "setup", "start", "wait", "with",
@@ -226,6 +231,35 @@ def _body_open(mask: str, match: re.Match[str], pairs: dict[int, int]) -> int | 
     return open_at
 
 
+def _compiled_out(attr: str) -> bool:
+    """Whether the cfg attribute `attr` needs a feature the preflight does not enable."""
+    gate = FEATURE_GATE.match(attr)
+    if gate:
+        return gate.group(1) not in PREFLIGHT_FEATURES
+    every = ALL_GATE.match(attr)
+    if every and "(" not in every.group(1):
+        return any(name not in PREFLIGHT_FEATURES for name in FEATURE_MEMBER.findall(every.group(1)))
+    return False
+
+
+def _file_compiled_out(source: str) -> bool:
+    """Whether a file's inner `#![cfg(...)]` attributes leave it out of the preflight build."""
+    for match in INNER_ATTRIBUTE.finditer(source):
+        if not _only_comments_and_inner(source[:match.start()]):
+            break
+        if _compiled_out(match.group(1)):
+            return True
+    return False
+
+
+def _only_comments_and_inner(prefix: str) -> bool:
+    """Whether `prefix` holds only comments and inner attributes, so what follows is still in the
+    file's inner attribute block."""
+    rest = re.sub(r"//[^\n]*", "", prefix)
+    rest = INNER_ATTRIBUTE.sub("", rest)
+    return not rest.strip()
+
+
 def _is_test_attribute(mask: str, scope_start: int, item_start: int, source: str) -> bool:
     prefix = mask[scope_start:item_start]
     boundary = max(prefix.rfind("}"), prefix.rfind(";"))
@@ -236,8 +270,7 @@ def _is_test_attribute(mask: str, scope_start: int, item_start: int, source: str
     # literals, so the feature name is read from the source.
     unmasked = source[scope_start + boundary + 1:item_start]
     for attr in re.findall(r"#\s*\[([^\]]*)\]", unmasked):
-        gate = FEATURE_GATE.match(attr)
-        if gate and gate.group(1) not in PREFLIGHT_FEATURES:
+        if _compiled_out(attr):
             return False
     return any(TEST_ATTRIBUTE.search(attr) for attr in attributes)
 
@@ -283,6 +316,9 @@ def discover_rig_tests(target: Target, root: Path) -> tuple[list[RigTest], list[
             source = path.read_text()
         except OSError as error:
             errors.append(f"cannot read test module {path.relative_to(root)}: {error}")
+            return
+        # A file the preflight doesn't compile holds no test it could select.
+        if _file_compiled_out(source):
             return
         mask = _mask_rust(source)
         pairs = _pairs(mask)
